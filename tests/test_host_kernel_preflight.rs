@@ -254,3 +254,117 @@ fn install_host_kernel_stops_when_the_repeated_check_fails() {
         "recipe must pass the checked directory: {recipe:?}"
     );
 }
+
+/// Stubs for a build directory whose filesystem is on a loop device: `findmnt`
+/// reports `/dev/nvme9n1` for the directory holding `backing` and `/dev/loop9`
+/// for every other path, `losetup` names `backing` as that
+/// device's backing file, and `df` reports `backing_free_gib` for the
+/// directory holding the backing file and 100000 GiB for anything else.
+fn stub_loop_backed(dir: &Path, backing: &Path, backing_free_gib: u64) {
+    let write = |name: &str, body: String| {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let backing_dir = backing.parent().unwrap();
+    write(
+        "findmnt",
+        format!(
+            "#!/bin/sh\nfor a; do last=$a; done\ncase \"$last\" in\n  '{}'*) echo /dev/nvme9n1 ;;\n  *) echo /dev/loop9 ;;\nesac\n",
+            backing_dir.display()
+        ),
+    );
+    write(
+        "losetup",
+        format!(
+            "#!/bin/sh\nfor a; do last=$a; done\n[ \"$last\" = /dev/loop9 ] || exit 1\nprintf '%s\\n' '{}'\n",
+            backing.display()
+        ),
+    );
+    write(
+        "df",
+        format!(
+            "#!/bin/sh\nfor a; do last=$a; done\necho Avail\ncase \"$last\" in\n  '{}'*) echo {backing_free_gib} ;;\n  *) echo 100000 ;;\nesac\n",
+            backing_dir.display()
+        ),
+    );
+}
+
+/// The setup-btrfs scratch filesystem can be a sparse image on the root disk,
+/// mounted through a loop device. Its own free space says nothing about the
+/// root disk, which the image grows into as the build writes, so the check
+/// also needs room on the filesystem holding the backing file (#1333).
+#[test]
+fn a_loop_backed_build_directory_needs_room_where_its_backing_file_lives() {
+    let stubs = tempfile::tempdir().unwrap();
+    stub_dpkg_query(stubs.path(), &[]);
+    let backing_dir = tempfile::tempdir().unwrap();
+    let backing = backing_dir.path().join("fcvm-btrfs.img");
+    stub_loop_backed(stubs.path(), &backing, 3);
+    let build = tempfile::tempdir().unwrap();
+    let out = run(
+        stubs.path(),
+        &[
+            ("FCVM_HOST_KERNEL_BUILD_DIR", build.path().to_str().unwrap()),
+            ("FCVM_HOST_KERNEL_MIN_FREE_GIB", "40"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("/dev/loop9"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(backing.to_str().unwrap()),
+        "the error must name the backing file: {stderr}"
+    );
+    assert!(stderr.contains("3 GiB free"), "stderr: {stderr}");
+    assert!(out.stdout.is_empty(), "no build directory on failure");
+}
+
+#[test]
+fn a_loop_backed_build_directory_with_room_behind_it_passes() {
+    let stubs = tempfile::tempdir().unwrap();
+    stub_dpkg_query(stubs.path(), &[]);
+    let backing_dir = tempfile::tempdir().unwrap();
+    let backing = backing_dir.path().join("fcvm-btrfs.img");
+    stub_loop_backed(stubs.path(), &backing, 500);
+    let build = tempfile::tempdir().unwrap();
+    let out = run(
+        stubs.path(),
+        &[
+            ("FCVM_HOST_KERNEL_BUILD_DIR", build.path().to_str().unwrap()),
+            ("FCVM_HOST_KERNEL_MIN_FREE_GIB", "40"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        build.path().to_str().unwrap()
+    );
+}
+
+/// A loop device whose backing file cannot be named leaves the root disk's room
+/// unknown, so the check fails closed instead of passing on the image's own
+/// free space.
+#[test]
+fn a_loop_device_without_a_readable_backing_file_fails_the_check() {
+    let stubs = tempfile::tempdir().unwrap();
+    stub_dpkg_query(stubs.path(), &[]);
+    let backing_dir = tempfile::tempdir().unwrap();
+    stub_loop_backed(stubs.path(), &backing_dir.path().join("x.img"), 500);
+    std::fs::write(stubs.path().join("losetup"), "#!/bin/sh\nexit 1\n").unwrap();
+    let build = tempfile::tempdir().unwrap();
+    let out = run(
+        stubs.path(),
+        &[
+            ("FCVM_HOST_KERNEL_BUILD_DIR", build.path().to_str().unwrap()),
+            ("FCVM_HOST_KERNEL_MIN_FREE_GIB", "40"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("backing file"), "stderr: {stderr}");
+}
