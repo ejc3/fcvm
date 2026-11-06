@@ -460,6 +460,9 @@ pub struct RoutedNetwork {
     /// that names it.
     address_lease: Option<AddressLease>,
     default_iface: Option<String>,
+    /// The published ports' host listeners, bound first in `setup` and handed to their
+    /// relays by its step 14.
+    port_listeners: tcp_proxy::PortListeners,
     proxy_handles: Vec<tcp_proxy::Relay>,
 }
 
@@ -483,6 +486,7 @@ impl RoutedNetwork {
             vm_ipv6: None,
             address_lease: None,
             default_iface: None,
+            port_listeners: tcp_proxy::PortListeners::default(),
             proxy_handles: Vec::new(),
         }
     }
@@ -846,6 +850,19 @@ impl RoutedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for RoutedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
+        // 0. Bind the published ports' host listeners before anything is created, so a
+        //    host address in use fails the run with nothing to undo (#1025). A mapping
+        //    listens on the host address its HOSTIP names, or on this VM's loopback IP
+        //    when it names none (allocated by StateManager with lock-based
+        //    coordination). The listeners are plain values until step 14 starts their
+        //    relays.
+        let loopback_ip = self
+            .loopback_ip
+            .clone()
+            .unwrap_or_else(|| "127.0.0.2".to_string());
+        self.port_listeners = tcp_proxy::bind_port_forwards(&loopback_ip, &self.port_mappings)
+            .context("binding the published ports' host listeners")?;
+
         // Resolve the IPv6 subnet: explicit --ipv6-prefix or auto-detect a /64
         // from host interfaces.
         let (host_ipv6, network, prefix_len) = if let Some(ref prefix) = self.ipv6_prefix {
@@ -1286,25 +1303,17 @@ impl NetworkManager for RoutedNetwork {
             info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
         }
 
-        // 14. Port forwarding: TCP proxy listens on the host and connects to the VM
-        //     inside the namespace via setns(2). A mapping listens on the host
-        //     address its HOSTIP names, or on this VM's loopback IP when it names
-        //     none. The veth is a bridge member so host-side IPv4 routing to
-        //     10.0.2.100 doesn't work, and the connect side must run inside the
-        //     namespace where the bridge is directly reachable. Loopback IP is
-        //     allocated by StateManager with lock-based coordination.
-        let loopback_ip = self
-            .loopback_ip
-            .clone()
-            .unwrap_or_else(|| "127.0.0.2".to_string());
+        // 14. Port forwarding: relay each connection on the listeners step 0 bound to
+        //     the VM inside the namespace via setns(2). The veth is a bridge member so
+        //     host-side IPv4 routing to 10.0.2.100 doesn't work, and the connect side
+        //     must run inside the namespace where the bridge is directly reachable.
         if !self.port_mappings.is_empty() {
             let handles = tcp_proxy::start_port_forwards(
-                &loopback_ip,
+                std::mem::take(&mut self.port_listeners),
                 &self.port_mappings,
                 &ns_name,
                 GUEST_IP,
             )
-            .await
             .context("starting port forward proxies")?;
             self.proxy_handles.extend(handles);
         }
@@ -1402,6 +1411,8 @@ impl NetworkManager for RoutedNetwork {
         // When this returns their listeners are closed and their connection tasks have
         // finished.
         tcp_proxy::stop_relays(self.proxy_handles.drain(..)).await;
+        // Listeners a setup that failed before step 14 bound.
+        self.port_listeners = tcp_proxy::PortListeners::default();
 
         // Remove IPv6 MASQUERADE and proxy NDP
         let mut address_left = false;
@@ -2041,6 +2052,49 @@ mod tests {
             lease_address(dir.path(), "2001:db8::12".parse().unwrap(), "vm-e").unwrap()
         )
         .is_none());
+    }
+
+    /// A published host address that is in use fails setup before setup creates
+    /// anything: no namespace, veth pair, route, proxy NDP entry or ip6tables rule
+    /// (#1025). Setup does not undo what it created, so a bind late in setup would leave
+    /// the namespace and the veth for `cleanup` to remove.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn a_host_address_in_use_fails_setup_before_anything_exists() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = squatter.local_addr().unwrap();
+        let vm_id = format!("vm-{}", uuid::Uuid::new_v4().simple());
+        let owners = tempfile::tempdir().unwrap();
+        let _owner = crate::reclaim::Owner::begin_in(owners.path(), &vm_id).unwrap();
+        let mut net = RoutedNetwork::new(
+            vm_id.clone(),
+            "tap-unused".to_string(),
+            vec![PortMapping {
+                host_ip: Some(taken.ip().to_string()),
+                host_port: taken.port(),
+                guest_port: 80,
+                proto: Protocol::Tcp,
+            }],
+        )
+        // A documentation prefix: what a late bind creates is routed nowhere.
+        .with_ipv6_prefix("2001:db8:1025::/64".to_string());
+
+        let error = format!(
+            "{:#}",
+            net.setup().await.expect_err("the address is in use")
+        );
+        let created = (
+            net.namespace_id().map(str::to_string),
+            net.host_veth.clone(),
+        );
+        net.cleanup().await.unwrap();
+
+        assert_eq!(
+            created,
+            (None, None),
+            "setup created a namespace and veth before binding the host listeners: {error}"
+        );
+        assert!(error.contains(&taken.to_string()), "{error}");
     }
 
     /// An address the host itself holds has its /128 only in table `local`, and the
