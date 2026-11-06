@@ -1090,4 +1090,44 @@ mod tests {
             "the panic line was also logged under the console's target: {console_target:?}"
         );
     }
+
+    /// fc-agent's FATAL and WARNING lines say why a guest is about to shut itself down or what
+    /// it skipped. A caller that runs fcvm with RUST_LOG=fcvm=info kept none of them while they
+    /// were logged under the console's `firecracker` target, so a failed restore showed only the
+    /// host's side (#1080). They are logged once, at WARN under fcvm::guest; fc-agent's other
+    /// lines stay at INFO under the console's target.
+    #[test]
+    fn fc_agent_fatal_and_warning_lines_reach_a_log_filtered_to_fcvm() {
+        use crate::utils::log_capture::logged;
+        let fatal =
+            "[fc-agent] FATAL: restore-completion ACK failed closed (epoch=e phase=notify-host)";
+        let warning = "[fc-agent] WARNING: failed to set clock: EPERM";
+        let ordinary = "[fc-agent] remounting 1 NFS share(s) after restore";
+        for filter in ["warn", "fcvm=info"] {
+            let log = logged(filter, || {
+                super::log_firecracker_line(fatal, false);
+                super::log_firecracker_line(warning, false);
+                super::log_firecracker_line(ordinary, false);
+            });
+            assert_eq!(
+                log.matches("FATAL: restore-completion").count(),
+                1,
+                "{filter}: {log:?}"
+            );
+            assert_eq!(
+                log.matches("WARNING: failed to set clock").count(),
+                1,
+                "{filter}: {log:?}"
+            );
+            // fc-agent's other lines are INFO under fcvm::console, below the default filter.
+            if filter == "warn" {
+                assert!(!log.contains("remounting"), "{filter}: {log:?}");
+            }
+        }
+        let console_target = logged("firecracker=trace", || {
+            super::log_firecracker_line(fatal, false);
+            super::log_firecracker_line(ordinary, false);
+        });
+        assert!(!console_target.contains("FATAL"), "{console_target:?}");
+    }
 }

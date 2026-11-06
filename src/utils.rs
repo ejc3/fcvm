@@ -454,16 +454,25 @@ fn printk_timestamps(line: &str) -> Vec<(usize, usize)> {
 /// `[fcvm-vitals]` sample of every VM to a job log (#1104).
 pub const CONSOLE_TARGET: &str = "fcvm::console";
 
-/// Whether an agent line reports an error: fc-agent's fatal block (`FATAL ERROR`,
-/// and `Error:` from its `fatal_error_line`) and its `ERROR:` lines. These are
-/// WARN, so fcvm's default filter (`warn`) shows why a guest failed.
+/// Whether an agent line reports an error or a warning: fc-agent's fatal lines (`FATAL
+/// ERROR`, `FATAL:` from a restore that failed closed, and `Error:` from its
+/// `fatal_error_line`), its `ERROR:` lines, and its `WARNING:` lines, which name a step it
+/// could not take. These are WARN, so fcvm's default filter (`warn`) shows why a guest failed:
+/// a restore that failed closed in the guest otherwise left only the host's "the
+/// acknowledgement connection closed without a frame" at that level (#1080).
 fn console_line_is_an_agent_error(clean: &str) -> bool {
-    clean.find("[fc-agent] ").is_some_and(|at| {
-        let message = &clean[at + "[fc-agent] ".len()..];
-        ["FATAL ERROR", "ERROR", "Error: "]
-            .iter()
-            .any(|word| message.starts_with(word))
-    })
+    let Some(at) = clean.find("[fc-agent] ") else {
+        return false;
+    };
+    // fc-agent's own line names it before any container marker, so a container cannot print
+    // a host warning by echoing fc-agent's words.
+    if clean.find("[ctr:").is_some_and(|ctr| ctr < at) {
+        return false;
+    }
+    let message = &clean[at + "[fc-agent] ".len()..];
+    ["FATAL", "ERROR", "Error: ", "WARNING"]
+        .iter()
+        .any(|word| message.starts_with(word))
 }
 
 /// Log a guest console line under fcvm's own targets when it is one fcvm keeps
@@ -1870,6 +1879,42 @@ mod tests {
             "[    9.843756] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---",
         ] {
             assert!(!is_kernel_crash_headline(line), "taken for a crash headline: {line}");
+        }
+    }
+
+    /// fc-agent's own FATAL and WARNING lines reach fcvm's default filter (`warn`). The same
+    /// words in container output or in a vitals line do not: a container must not be able to
+    /// write a host warning.
+    #[test]
+    fn fc_agent_fatal_and_warning_lines_are_warnings() {
+        use log_capture::logged;
+        for line in [
+            "[fc-agent] FATAL: restore-completion ACK failed closed",
+            "[fc-agent] FATAL ERROR: Container failed to start",
+            "[fc-agent] WARNING: failed to set clock: EPERM",
+        ] {
+            let log = logged("warn", || {
+                log_console_line_under_fcvm(line);
+            });
+            assert_eq!(
+                log.matches(line).count(),
+                1,
+                "not a warning: {line}: {log:?}"
+            );
+        }
+        for line in [
+            "[fc-agent] remounting 1 NFS share(s) after restore",
+            "[ctr:out] [fc-agent] FATAL: spoofed",
+            "[ctr:err] [fc-agent] WARNING: spoofed",
+            "[fcvm-vitals] thread fc-agent [fc-agent] FATAL",
+        ] {
+            let log = logged("warn", || {
+                log_console_line_under_fcvm(line);
+            });
+            assert!(
+                !log.contains("spoofed") && !log.contains(line),
+                "taken for a warning: {line}: {log:?}"
+            );
         }
     }
 
