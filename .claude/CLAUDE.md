@@ -2771,6 +2771,22 @@ fcvm snapshot run --pid <serve_pid> --name clone1
     minor fault is resolved with `UFFDIO_CONTINUE`, which maps the shared page
     read-only. Clean pages have one physical copy across all clones; a page a clone
     writes becomes private to it.
+  - Copy mode answers demand faults on fault workers (`FCVM_UFFD_FAULT_WORKERS`, default
+    16 per clone, 0 for none; #1050). The handler reads events up to 64 at a time with one
+    `read()` and decides each fault's answer; a free worker reads the source page, which is
+    where a page that is not in the host page cache waits on the disk, and fills it. A read
+    held up by the disk holds up one worker instead of every fault behind it, and the
+    copies run on several threads. A worker takes the replay gate from its generation check
+    through one fill, after the source read, so a REMOVE read after the answer was decided
+    sends the job back to the handler, which decides it again as it does a parked fault's
+    retry, and every REMOVE of a read is recorded before any fault of that read is
+    answered. Faults on pages the balloon gave back, parked faults, fault-around (which
+    turns the workers off) and minor mode stay on the handler. Measured on a 32 GiB,
+    32-vCPU guest whose first heavy allocation after a restore reclaimed its page cache
+    (6.5 M faults, memory file evicted, 1 ms read latency): 21.0 to 21.5 s with one event
+    per read and no workers, 12.7 to 13.1 s with 8 to 32 workers; the same work run again
+    in that guest took 1.0 s. With one event per read the workers gained 5 percent: the
+    handler spent about 28 s of CPU per run in the kernel's read and wake paths.
 - Server uses tokio AsyncFd to handle UFFD events non-blocking
 - tokio::select! multiplexes: accept new VMs + monitor VM exits
 - Each VM gets dedicated async task (JoinSet) for page faults

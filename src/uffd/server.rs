@@ -67,6 +67,9 @@ const _: () = assert!(
 /// after every populate call, measured a few microseconds per yield) — while the clones waiting behind it are vCPUs stopped dead on a fault.
 const MAX_EVENTS_PER_BATCH: usize = 128;
 
+/// Events one read of the userfaultfd returns at most.
+const READ_BATCH: usize = 64;
+
 /// How long a connecting VMM has to complete the UFFD handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2298,6 +2301,403 @@ impl RemovedPages {
     }
 }
 
+/// Fault workers per copy-mode clone, unless [`FAULT_WORKERS_ENV`] says otherwise.
+const DEFAULT_FAULT_WORKERS: usize = 16;
+
+/// Overrides [`DEFAULT_FAULT_WORKERS`]: a whole number of threads, 0 to answer every fault on
+/// the handler as before.
+pub const FAULT_WORKERS_ENV: &str = "FCVM_UFFD_FAULT_WORKERS";
+
+fn fault_worker_count(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        None => DEFAULT_FAULT_WORKERS,
+        Some(raw) => raw.parse().unwrap_or_else(|_| {
+            warn!(
+                target: "uffd",
+                value = raw,
+                "{FAULT_WORKERS_ENV} is not a whole number; using {DEFAULT_FAULT_WORKERS}"
+            );
+            DEFAULT_FAULT_WORKERS
+        }),
+    }
+}
+
+/// How a fault worker answers a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerAnswer {
+    /// Read the page out of the snapshot mapping and `UFFDIO_COPY` it.
+    Snapshot,
+    /// A hole in the memory file, filled as [`VmContext::zero_fill`] picked.
+    Hole(ZeroFill),
+}
+
+/// A demand fault handed to a fault worker.
+#[derive(Debug, Clone, Copy)]
+struct FaultJob {
+    page: usize,
+    offset: usize,
+    write: bool,
+    trace_t0: u64,
+    answer: WorkerAnswer,
+    /// The [`ReplayGate`] generation the handler decided the answer under. A REMOVE read
+    /// since may have given the page back, so a worker that finds a later generation answers
+    /// nothing and returns the job.
+    generation: u64,
+}
+
+/// What a fault worker sends back to the handler. A fault it answered sends nothing back
+/// unless the clone is traced.
+enum WorkerReturn {
+    /// A REMOVE was read after the handler decided this answer; the handler decides again.
+    Stale(FaultJob),
+    /// The kernel refused the fill while a REMOVE is unread (`EAGAIN`); the handler parks it.
+    Retry(FaultJob),
+    /// `UFFDIO_ZEROPAGE` was refused with EINVAL and the fault was answered with a copy of
+    /// zeros; the clone's later zero answers are copies from the start.
+    ZeroPageRefused,
+    /// The trace interval of an answered fault (`FCVM_UFFD_FAULT_TRACE`).
+    Traced { offset: usize, t0: u64, t1: u64 },
+    /// The clone's address space is gone.
+    VmGone,
+    /// The ioctl failed: the fail-closed path kills the VMM.
+    Failed(String),
+}
+
+/// The threads that answer a copy-mode clone's demand faults (#1050).
+///
+/// The handler reads the events, decides each fault's answer (the snapshot's bytes, or zeros
+/// for a hole) and queues it; any free worker takes it, reads its source page, which is where
+/// a page that is not in the host page cache waits on the disk, and fills it. So a read held
+/// up by the disk holds up one worker, not every fault behind it, and the copies run on as
+/// many threads as there are workers instead of on the handler alone: one handler answered
+/// about 280,000 faults a second at one core.
+///
+/// What stays on the handler: reading events, REMOVEs and every fault on a page the balloon
+/// gave back, parked faults, fault-around, and minor mode. A worker holds the [`ReplayGate`]
+/// from its generation check through one fill, as a replay worker does, so a REMOVE the
+/// handler reads after deciding a fault's answer makes the job stale and it comes back.
+/// The source read happens before the gate is taken, so the handler never waits on the disk
+/// to read an event.
+struct FaultWorkers {
+    jobs: Option<std::sync::mpsc::Sender<FaultJob>>,
+    back: tokio::sync::mpsc::UnboundedReceiver<WorkerReturn>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Faults handed to the workers.
+    handed: u64,
+    /// Faults the workers answered, and of those how many were holes they filled with zeros.
+    answered: Arc<std::sync::atomic::AtomicU64>,
+    holes: Arc<std::sync::atomic::AtomicU64>,
+    stale: u64,
+}
+
+impl FaultWorkers {
+    /// Start the workers for a copy-mode clone, or `None` when there are none to start
+    /// (minor mode, fault-around on, [`FAULT_WORKERS_ENV`] at 0, or a failed spawn, which is
+    /// logged and leaves every fault on the handler).
+    fn start(
+        uffd: &Uffd,
+        source: &Arc<PageSource>,
+        ctx: &VmContext<'_>,
+        trace_origin: Option<std::time::Instant>,
+    ) -> Option<Self> {
+        if !matches!(**source, PageSource::Copy { .. }) || ctx.fault_around().is_some() {
+            return None;
+        }
+        let count = fault_worker_count(std::env::var(FAULT_WORKERS_ENV).ok().as_deref());
+        if count == 0 {
+            return None;
+        }
+        match Self::spawn(count, uffd, source, ctx, trace_origin) {
+            Ok(workers) => Some(workers),
+            Err(error) => {
+                warn!(
+                    target: "uffd",
+                    vm_id = %ctx.vm_id,
+                    error = %format!("{error:#}"),
+                    "fault workers could not start; the handler answers every fault"
+                );
+                None
+            }
+        }
+    }
+
+    fn spawn(
+        count: usize,
+        uffd: &Uffd,
+        source: &Arc<PageSource>,
+        ctx: &VmContext<'_>,
+        trace_origin: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        use std::os::fd::AsFd;
+        let (jobs, queue) = std::sync::mpsc::channel::<FaultJob>();
+        let queue = Arc::new(std::sync::Mutex::new(queue));
+        let (back_tx, back) = tokio::sync::mpsc::unbounded_channel();
+        let answered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let holes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut workers = Self {
+            jobs: Some(jobs),
+            back,
+            handles: Vec::with_capacity(count),
+            handed: 0,
+            answered: Arc::clone(&answered),
+            holes: Arc::clone(&holes),
+            stale: 0,
+        };
+        for index in 0..count {
+            // F_DUPFD_CLOEXEC: a child the server spawns meanwhile must not inherit it.
+            let fd = uffd
+                .as_fd()
+                .try_clone_to_owned()
+                .context("duplicating the clone's userfaultfd for a fault worker")?;
+            let worker = FaultWorker {
+                fd,
+                source: Arc::clone(source),
+                gate: Arc::clone(ctx.gate),
+                vm_id: ctx.vm_id.to_string(),
+                page_size: ctx.page_size,
+                trace_origin,
+                queue: Arc::clone(&queue),
+                back: back_tx.clone(),
+                answered: Arc::clone(&answered),
+                holes: Arc::clone(&holes),
+            };
+            let handle = std::thread::Builder::new()
+                .name(format!("fcvm-fault-{index}"))
+                .spawn(move || worker.run())
+                .context("spawning a fault worker thread")?;
+            workers.handles.push(handle);
+        }
+        Ok(workers)
+    }
+
+    /// Queue `job` for the next free worker. `false` when every worker has exited, which
+    /// leaves the fault to the handler.
+    fn submit(&mut self, job: FaultJob) -> bool {
+        let sent = self
+            .jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok());
+        self.handed += u64::from(sent);
+        sent
+    }
+}
+
+impl Drop for FaultWorkers {
+    /// Close the queue and join the workers. A worker finishes the fault it holds, if any:
+    /// one source read and one fill, which with the clone gone fails at once.
+    fn drop(&mut self) {
+        self.jobs.take();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One fault worker thread's share of [`FaultWorkers`].
+struct FaultWorker {
+    fd: OwnedFd,
+    /// Keeps the snapshot mapping alive while the worker reads it.
+    source: Arc<PageSource>,
+    gate: Arc<ReplayGate>,
+    vm_id: String,
+    page_size: usize,
+    trace_origin: Option<std::time::Instant>,
+    queue: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<FaultJob>>>,
+    back: tokio::sync::mpsc::UnboundedSender<WorkerReturn>,
+    answered: Arc<std::sync::atomic::AtomicU64>,
+    holes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FaultWorker {
+    fn run(self) {
+        use std::os::fd::IntoRawFd;
+        let Self {
+            fd,
+            source,
+            gate,
+            vm_id,
+            page_size,
+            trace_origin,
+            queue,
+            back,
+            answered,
+            holes,
+        } = self;
+        // SAFETY: `fd` is a userfaultfd this thread now owns.
+        let uffd = unsafe { Uffd::from_raw_fd(fd.into_raw_fd()) };
+        let PageSource::Copy { mmap, .. } = &*source else {
+            return;
+        };
+        loop {
+            // One worker waits for a job and the rest wait for the lock, which is released
+            // before the fault is answered.
+            let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(job) = job else { return };
+            if job.answer == WorkerAnswer::Snapshot {
+                read_source_range(mmap, job.offset, page_size);
+            }
+            let filled = {
+                let _copying = gate.copying();
+                if gate.generation() != job.generation {
+                    None
+                } else {
+                    Some(fill_on_worker(&uffd, &vm_id, mmap, &job, page_size))
+                }
+            };
+            let reply = match filled {
+                None => Some(WorkerReturn::Stale(job)),
+                Some(Ok((FaultOutcome::Resolved | FaultOutcome::AlreadyPresent, refused))) => {
+                    answered.fetch_add(1, Ordering::Relaxed);
+                    if matches!(job.answer, WorkerAnswer::Hole(_)) {
+                        holes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if refused {
+                        let _ = back.send(WorkerReturn::ZeroPageRefused);
+                    }
+                    trace_origin.map(|origin| WorkerReturn::Traced {
+                        offset: job.offset,
+                        t0: job.trace_t0,
+                        t1: origin.elapsed().as_nanos() as u64,
+                    })
+                }
+                Some(Ok((FaultOutcome::Retry, _))) => Some(WorkerReturn::Retry(job)),
+                Some(Ok((FaultOutcome::VmGone, _))) => Some(WorkerReturn::VmGone),
+                Some(Err(error)) => Some(WorkerReturn::Failed(format!("{error:#}"))),
+            };
+            if let Some(reply) = reply {
+                if back.send(reply).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Fill one fault on a worker. Returns the outcome and whether `UFFDIO_ZEROPAGE` was refused
+/// with EINVAL and the fault got a copy of zeros instead.
+fn fill_on_worker(
+    uffd: &Uffd,
+    vm_id: &str,
+    mmap: &[u8],
+    job: &FaultJob,
+    page_size: usize,
+) -> Result<(FaultOutcome, bool)> {
+    let copy_zeros = || copy_page(uffd, vm_id, zero_granule()?, job.page, 0, page_size);
+    Ok(match job.answer {
+        WorkerAnswer::Snapshot => (
+            copy_page(uffd, vm_id, mmap, job.page, job.offset, page_size)?,
+            false,
+        ),
+        WorkerAnswer::Hole(ZeroFill::PrivateCopy) => (copy_zeros()?, false),
+        WorkerAnswer::Hole(ZeroFill::SharedZeroPage) => {
+            match zero_page(uffd, vm_id, job.page, page_size)? {
+                Some(outcome) => (outcome, false),
+                None => (copy_zeros()?, true),
+            }
+        }
+    })
+}
+
+/// Touch every host page of `[offset, offset + len)` of the snapshot mapping, which reads it
+/// into the page cache, before the fill takes the gate.
+fn read_source_range(mmap: &[u8], offset: usize, len: usize) {
+    let host_page = host_page_size() as usize;
+    let end = offset.saturating_add(len).min(mmap.len());
+    let mut at = offset;
+    while at < end {
+        // SAFETY: `at` is inside the mapping.
+        unsafe { std::ptr::read_volatile(mmap.as_ptr().add(at)) };
+        at += host_page;
+    }
+}
+
+/// Handle what the fault workers sent back. `Ok(false)` means the clone is gone.
+///
+/// A stale job is decided again as a parked fault's retry is: a REMOVE read since the handler
+/// decided it makes it a fault on a given-back page, answered here with zeros.
+fn finish_worker_returns(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result<bool> {
+    let mut back = Vec::new();
+    if let Some(workers) = state.fault_workers.as_mut() {
+        while back.len() < MAX_EVENTS_PER_BATCH {
+            match workers.back.try_recv() {
+                Ok(reply) => back.push(reply),
+                Err(_) => break,
+            }
+        }
+    }
+    handle_worker_returns(uffd, ctx, state, back)
+}
+
+fn handle_worker_returns(
+    uffd: &Uffd,
+    ctx: &VmContext<'_>,
+    state: &mut VmState,
+    back: Vec<WorkerReturn>,
+) -> Result<bool> {
+    for reply in back {
+        match reply {
+            WorkerReturn::Traced { offset, t0, t1 } => {
+                if let Some(t) = state.trace.as_mut() {
+                    t.record(offset as u64, t0, t1);
+                }
+            }
+            WorkerReturn::ZeroPageRefused => state.zero_page_refused = true,
+            WorkerReturn::VmGone => return Ok(false),
+            WorkerReturn::Failed(error) => {
+                return Err(anyhow!(
+                    "a fault worker of vm {} could not answer a fault: {error}",
+                    ctx.vm_id
+                ))
+            }
+            WorkerReturn::Retry(job) => {
+                let trace_t0 = state.trace.is_some().then_some(job.trace_t0);
+                state
+                    .parked_faults
+                    .park(job.page, job.offset, job.write, trace_t0);
+            }
+            WorkerReturn::Stale(job) => {
+                if let Some(workers) = state.fault_workers.as_mut() {
+                    workers.stale += 1;
+                }
+                let zero = zero_answer(ctx, &state.removed, job.offset);
+                let fill = zero.map(|_| ctx.zero_fill(job.write, state.zero_page_refused));
+                match resolve_fault(
+                    uffd,
+                    ctx,
+                    job.page,
+                    job.offset,
+                    fill,
+                    &mut state.zero_page_refused,
+                )? {
+                    outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
+                        if let Some(t) = state.trace.as_mut() {
+                            let t1 = t.now_ns();
+                            t.record(job.offset as u64, job.trace_t0, t1);
+                        }
+                        state.count_zero_fill(zero, matches!(outcome, FaultOutcome::Resolved));
+                    }
+                    FaultOutcome::VmGone => return Ok(false),
+                    FaultOutcome::Retry => {
+                        let trace_t0 = state.trace.is_some().then_some(job.trace_t0);
+                        state
+                            .parked_faults
+                            .park(job.page, job.offset, job.write, trace_t0);
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Resolves when a fault worker has sent something back, and never for a clone without them.
+async fn worker_returned(state: &mut VmState) -> Option<WorkerReturn> {
+    match state.fault_workers.as_mut() {
+        Some(workers) => workers.back.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// What a clone's balloon gave back and what the handler did about it, logged when the
 /// handler exits.
 #[derive(Default)]
@@ -2419,6 +2819,11 @@ struct VmState {
     /// recorded set is the better prediction, and the two compete for the one task that
     /// serves faults (#978).
     replaying: bool,
+    /// Copy mode: the threads that answer demand faults beside the handler (#1050).
+    fault_workers: Option<FaultWorkers>,
+    /// Events one read of the userfaultfd returns at most: [`READ_BATCH`]. A test that
+    /// needs a fault read ahead of a REMOVE queued behind it reads one at a time.
+    read_batch: usize,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -2623,6 +3028,8 @@ async fn handle_vm_page_faults(
         hole_zero_filled: 0,
         zero_page_refused: false,
         replaying: false,
+        read_batch: READ_BATCH,
+        fault_workers: None,
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -2631,6 +3038,14 @@ async fn handle_vm_page_faults(
         started,
         trace: FaultTrace::from_env(&vm_id, started),
     };
+    // After the state, so the trace origin exists; dropped with the state at the end of this
+    // function, which joins the workers.
+    state.fault_workers = FaultWorkers::start(
+        async_uffd.get_ref(),
+        &source,
+        &ctx,
+        state.trace.as_ref().map(|trace| trace.origin),
+    );
 
     let result = replay_then_serve(
         &ctx,
@@ -3022,6 +3437,13 @@ impl ReplayWorkers {
                 outcome
             }
             _ = self.room.notified() => DrainOutcome::QueueDrained,
+            Some(reply) = worker_returned(state) => {
+                if handle_worker_returns(async_uffd.get_ref(), ctx, state, vec![reply])? {
+                    DrainOutcome::QueueDrained
+                } else {
+                    DrainOutcome::VmExited
+                }
+            }
             outcome = self.results.recv() => match outcome {
                 Some(outcome) => {
                     self.tally(outcome);
@@ -3098,6 +3520,11 @@ impl ReplayWorkers {
                     Some(outcome) => self.tally(outcome),
                     None => break,
                 },
+                Some(reply) = worker_returned(state) => {
+                    if !handle_worker_returns(async_uffd.get_ref(), ctx, state, vec![reply])? {
+                        self.vm_gone = true;
+                    }
+                }
                 _ = retry_due => {}
             }
             if !self.vm_gone && !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
@@ -3627,6 +4054,9 @@ fn drain_if_readable(
         events: libc::POLLIN,
         revents: 0,
     };
+    if !finish_worker_returns(uffd, ctx, state)? {
+        return Ok(DrainOutcome::VmExited);
+    }
     // SAFETY: one initialised pollfd on a userfaultfd this handler owns; a zero timeout.
     let ready = unsafe { libc::poll(&mut readiness, 1, 0) };
     if ready < 0 {
@@ -3978,6 +4408,15 @@ async fn serve_faults(
                 }
             }
 
+            Some(reply) = worker_returned(state) => {
+                if !handle_worker_returns(async_uffd.get_ref(), ctx, state, vec![reply])?
+                    || !finish_worker_returns(async_uffd.get_ref(), ctx, state)?
+                {
+                    log_clone_finished(ctx, state, "clone exited while a fault worker answered");
+                    return Ok(());
+                }
+            }
+
             _ = retry_due => {}
         }
 
@@ -4011,6 +4450,18 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             uncached_skipped_mib = stats.uncached_bytes / (1024 * 1024),
             faults_during_replay = stats.during_replay,
             "fault-around populated pages beyond the demanded ones"
+        );
+    }
+    if let Some(workers) = state.fault_workers.as_ref().filter(|w| w.handed > 0) {
+        info!(
+            target: "uffd",
+            vm_id = %ctx.vm_id,
+            fault_workers = workers.handles.len(),
+            handed = workers.handed,
+            answered = workers.answered.load(Ordering::Relaxed),
+            holes = workers.holes.load(Ordering::Relaxed),
+            stale = workers.stale,
+            "faults answered by the fault workers"
         );
     }
     if state.given_back.events > 0 {
@@ -4146,7 +4597,7 @@ fn populate_around_fault(
             // A source page that is not in the host page cache is left to demand paging:
             // copying it would wait on the disk inside the task that serves every fault
             // (#978).
-            let (cached, run) = source_residency_run(mmap, at, run, ctx.page_size);
+            let (cached, run) = source_residency_run(mmap, at, run);
             if !cached {
                 stats.uncached_bytes += run as u64;
                 done += run;
@@ -4187,25 +4638,20 @@ fn populate_around_fault(
 }
 
 /// Whether the memory file's bytes from `offset` are in the host page cache, and how many
-/// bytes from there, up to `max_len`, get the same answer, in whole pages of `page_size`.
-/// `offset` is page aligned and `max_len` is a positive multiple of `page_size`.
+/// bytes from there, up to `max_len`, get the same answer, in whole host pages. `offset` is
+/// host-page aligned and `max_len` is a positive multiple of the host page size.
 ///
 /// `mincore` reads the page cache without touching it, so asking does not read the file. A
 /// range `mincore` does not answer for, or one outside the mapping, counts as not cached:
 /// fault-around is speculation, and stepping over a page only leaves it to demand paging.
 /// A page that is in the cache but still being read counts as cached; a copy from it waits
 /// only for a read already in flight.
-fn source_residency_run(
-    mmap: &[u8],
-    offset: usize,
-    max_len: usize,
-    page_size: usize,
-) -> (bool, usize) {
+fn source_residency_run(mmap: &[u8], offset: usize, max_len: usize) -> (bool, usize) {
     const PAGES_PER_CALL: usize = 512;
     let not_cached = (false, max_len);
     let host_page = host_page_size() as usize;
-    if page_size != host_page
-        || max_len == 0
+    if max_len == 0
+        || !offset.is_multiple_of(host_page)
         || offset
             .checked_add(max_len)
             .is_none_or(|end| end > mmap.len())
@@ -4370,6 +4816,84 @@ enum DrainOutcome {
     BatchFull,
 }
 
+/// Record a REMOVE the handler read: the balloon gave `[start, end)` back. Called with the
+/// [`ReplayGate`] held, for every REMOVE of a read before any fault of that read is answered:
+/// the kernel lets `madvise` zap the range once the event is read, so a fault of the same
+/// read answered first could install the snapshot's bytes in memory the guest gave back.
+fn record_remove(ctx: &VmContext<'_>, state: &mut VmState, start: usize, end: usize) {
+    let vm_id = ctx.vm_id;
+    let source = ctx.source;
+    state.parked_faults.a_remove_was_read();
+    // The balloon gave these pages back.
+    // Validate bounds: end must be >= start and range must be reasonable
+    let (start_addr, end_addr) = (start, end);
+    if end_addr < start_addr {
+        warn!(
+            target: "uffd",
+            vm_id = %vm_id,
+            start = format!("0x{:x}", start_addr),
+            end = format!("0x{:x}", end_addr),
+            "Remove event with invalid range (end < start), ignoring"
+        );
+        return;
+    }
+    let len = end_addr.saturating_sub(start_addr);
+    if len == 0 {
+        return; // Nothing was removed
+    }
+
+    if matches!(source, PageSource::Minor { .. }) {
+        // This branch is expected to be DEAD in MINOR mode. Remove events are
+        // generated only by madvise(MADV_DONTNEED/MADV_REMOVE) on a registered
+        // range (fs/userfaultfd.c userfaultfd_remove), but a MINOR clone's
+        // guest memory is a file-backed MAP_PRIVATE mapping, and for those
+        // Firecracker's balloon path (vstate/memory.rs discard_range) does NOT
+        // madvise — it mmap()s fresh anonymous MAP_PRIVATE|MAP_FIXED memory
+        // over the range. That replaces the VMA: the range reads back as
+        // zeros (correct balloon semantics), the MINOR registration for it is
+        // torn down with the old VMA, and no uffd event is generated at all,
+        // so this server is simply never involved in that range again.
+        //
+        // If a Remove event nevertheless arrives (a future Firecracker
+        // switching that path back to madvise), no action is needed or
+        // possible: UFFDIO_ZEROPAGE is EINVAL on hugetlb VMAs and would
+        // defeat page sharing on shmem, and after MADV_DONTNEED on a private
+        // file mapping the next touch minor-faults again and gets served the
+        // pristine snapshot page — an acceptable post-discard state, since
+        // balloon-discarded contents are undefined for the guest. Warn so
+        // drift from the expected Firecracker behaviour is visible.
+        warn!(
+            target: "uffd",
+            vm_id = %vm_id,
+            start = format!("0x{:x}", start_addr),
+            len,
+            "unexpected Remove event in MINOR mode (Firecracker balloon \
+             discard should replace the VMA, not madvise) - ignoring; \
+             still-registered pages will minor-fault normally"
+        );
+        return;
+    }
+
+    // The range is remembered, and nothing is installed here. The kernel
+    // drops these pages only after this event has been read, and it refuses
+    // every populate ioctl until the thread inside `madvise` has run again
+    // (`mmap_changing`), so a page installed now is refused or dropped a
+    // moment later. The guest's next touch of a page in the range is a
+    // fault on a remembered granule, answered with zeros.
+    let bytes = remember_removed(ctx, &mut state.removed, start_addr, end_addr);
+    ctx.gate.removed();
+    state.given_back.events += 1;
+    state.given_back.bytes += bytes as u64;
+    debug!(
+        target: "uffd",
+        vm_id = %vm_id,
+        start = format!("0x{:x}", start_addr),
+        len,
+        remembered = bytes,
+        "balloon gave a range back"
+    );
+}
+
 /// Drain up to MAX_EVENTS_PER_BATCH ready events from the uffd.
 ///
 /// A read error is a service failure, not proof of process exit: the pidfd is the sole
@@ -4380,34 +4904,61 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
     let source = ctx.source;
     let page_size = ctx.page_size;
     let page_mask = ctx.page_mask;
+    if !finish_worker_returns(uffd, ctx, state)? {
+        return Ok(DrainOutcome::VmExited);
+    }
     {
         let mut handled = 0usize;
+        // Events are read up to READ_BATCH at a time, one syscall for all of them.
+        let mut batch: std::collections::VecDeque<Event> = Default::default();
+        // Held across the read, and across the recording of every REMOVE the read returned:
+        // no replay or fault worker is between its check and its copy while a REMOVE is read
+        // ([`ReplayGate`]).
+        let mut gate: Option<ReadingGuard<'_>> = None;
         // Read available events (non-blocking), bounded by the batch size
         loop {
             if handled >= MAX_EVENTS_PER_BATCH {
                 return Ok(DrainOutcome::BatchFull);
             }
-            // Held across the read, and across the recording of a REMOVE: no replay worker
-            // is between its check and its copy while a REMOVE is read ([`ReplayGate`]).
-            let mut gate = Some(ctx.gate.reading());
-            let event = match uffd.read_event() {
-                Ok(Some(event)) => event,
-                Ok(None) => break, // No more events ready
-                Err(error) => {
-                    return Err(anyhow!(
-                        "reading userfaultfd events for vm {} failed after {} faults and {:?}: {:?}",
-                        vm_id,
-                        state.fault_count,
-                        state.started.elapsed(),
-                        error
-                    ));
+            if batch.is_empty() {
+                // The previous batch's hold goes first: taking the gate while still holding it,
+                // and then dropping the old hold, would clear the flag under the new one.
+                drop(gate.take());
+                gate = Some(ctx.gate.reading());
+                let room = (MAX_EVENTS_PER_BATCH - handled).min(state.read_batch.max(1));
+                let mut buf = userfaultfd::EventBuffer::new(room);
+                let read = uffd.read_events(&mut buf).and_then(|events| {
+                    events.collect::<std::result::Result<std::collections::VecDeque<Event>, _>>()
+                });
+                batch = match read {
+                    Ok(events) => events,
+                    Err(error) => {
+                        return Err(anyhow!(
+                            "reading userfaultfd events for vm {} failed after {} faults and {:?}: {:?}",
+                            vm_id,
+                            state.fault_count,
+                            state.started.elapsed(),
+                            error
+                        ));
+                    }
+                };
+                if batch.is_empty() {
+                    break; // No more events ready
                 }
+                for event in &batch {
+                    if let Event::Remove { start, end } = event {
+                        record_remove(ctx, state, *start as usize, *end as usize);
+                    }
+                }
+                gate.take();
+            }
+            let Some(event) = batch.pop_front() else {
+                break;
             };
             handled += 1;
 
             match event {
                 Event::Pagefault { addr, kind, rw, .. } => {
-                    gate.take();
                     state.fault_count += 1;
                     let write = matches!(rw, ReadWrite::Write);
 
@@ -4486,6 +5037,30 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     }
 
                     let fill = zero.map(|_| ctx.zero_fill(write, state.zero_page_refused));
+
+                    // A fault answered with the snapshot's bytes or with zeros for a hole
+                    // goes to a fault worker, so a source read held up by the disk holds up
+                    // one worker and the copies run on several threads (#1050). A fault on a
+                    // page the balloon gave back stays here, with the given-back pages.
+                    let answer = match (zero, fill) {
+                        (None, _) => Some(WorkerAnswer::Snapshot),
+                        (Some(ZeroReason::Hole), Some(fill)) => Some(WorkerAnswer::Hole(fill)),
+                        _ => None,
+                    };
+                    if let (Some(answer), Some(workers)) = (answer, state.fault_workers.as_mut()) {
+                        let job = FaultJob {
+                            page: fault_page,
+                            offset: offset_in_file,
+                            write,
+                            trace_t0,
+                            answer,
+                            generation: ctx.gate.generation(),
+                        };
+                        if workers.submit(job) {
+                            continue;
+                        }
+                    }
+
                     match resolve_fault(
                         uffd,
                         ctx,
@@ -4560,78 +5135,8 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         }
                     }
                 }
-                Event::Remove { start, end } => {
-                    state.parked_faults.a_remove_was_read();
-                    // The balloon gave these pages back.
-                    // Validate bounds: end must be >= start and range must be reasonable
-                    let start_addr = start as usize;
-                    let end_addr = end as usize;
-                    if end_addr < start_addr {
-                        warn!(
-                            target: "uffd",
-                            vm_id = %vm_id,
-                            start = format!("0x{:x}", start_addr),
-                            end = format!("0x{:x}", end_addr),
-                            "Remove event with invalid range (end < start), ignoring"
-                        );
-                        continue;
-                    }
-                    let len = end_addr.saturating_sub(start_addr);
-                    if len == 0 {
-                        continue; // Nothing was removed
-                    }
-
-                    if matches!(source, PageSource::Minor { .. }) {
-                        // This branch is expected to be DEAD in MINOR mode. Remove events are
-                        // generated only by madvise(MADV_DONTNEED/MADV_REMOVE) on a registered
-                        // range (fs/userfaultfd.c userfaultfd_remove), but a MINOR clone's
-                        // guest memory is a file-backed MAP_PRIVATE mapping, and for those
-                        // Firecracker's balloon path (vstate/memory.rs discard_range) does NOT
-                        // madvise — it mmap()s fresh anonymous MAP_PRIVATE|MAP_FIXED memory
-                        // over the range. That replaces the VMA: the range reads back as
-                        // zeros (correct balloon semantics), the MINOR registration for it is
-                        // torn down with the old VMA, and no uffd event is generated at all,
-                        // so this server is simply never involved in that range again.
-                        //
-                        // If a Remove event nevertheless arrives (a future Firecracker
-                        // switching that path back to madvise), no action is needed or
-                        // possible: UFFDIO_ZEROPAGE is EINVAL on hugetlb VMAs and would
-                        // defeat page sharing on shmem, and after MADV_DONTNEED on a private
-                        // file mapping the next touch minor-faults again and gets served the
-                        // pristine snapshot page — an acceptable post-discard state, since
-                        // balloon-discarded contents are undefined for the guest. Warn so
-                        // drift from the expected Firecracker behaviour is visible.
-                        warn!(
-                            target: "uffd",
-                            vm_id = %vm_id,
-                            start = format!("0x{:x}", start_addr),
-                            len,
-                            "unexpected Remove event in MINOR mode (Firecracker balloon \
-                             discard should replace the VMA, not madvise) - ignoring; \
-                             still-registered pages will minor-fault normally"
-                        );
-                        continue;
-                    }
-
-                    // The range is remembered, and nothing is installed here. The kernel
-                    // drops these pages only after this event has been read, and it refuses
-                    // every populate ioctl until the thread inside `madvise` has run again
-                    // (`mmap_changing`), so a page installed now is refused or dropped a
-                    // moment later. The guest's next touch of a page in the range is a
-                    // fault on a remembered granule, answered with zeros.
-                    let bytes = remember_removed(ctx, &mut state.removed, start_addr, end_addr);
-                    ctx.gate.removed();
-                    gate.take();
-                    state.given_back.events += 1;
-                    state.given_back.bytes += bytes as u64;
-                    debug!(
-                        target: "uffd",
-                        vm_id = %vm_id,
-                        start = format!("0x{:x}", start_addr),
-                        len,
-                        remembered = bytes,
-                        "balloon gave a range back"
-                    );
+                Event::Remove { .. } => {
+                    // Recorded when the read returned it, before any fault of the read.
                 }
                 Event::Fork { .. } | Event::Remap { .. } | Event::Unmap { .. } => {
                     // Ignore these events
@@ -5141,6 +5646,8 @@ mod tests {
             hole_zero_filled: 0,
             zero_page_refused: false,
             replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
             recorded: None,
             record_until: None,
             started: origin,
@@ -5342,6 +5849,8 @@ mod tests {
             hole_zero_filled: 0,
             zero_page_refused: false,
             replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -5367,6 +5876,8 @@ mod tests {
             hole_zero_filled: 0,
             zero_page_refused: false,
             replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -5410,6 +5921,8 @@ mod tests {
             hole_zero_filled: 0,
             zero_page_refused: false,
             replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -6542,6 +7055,8 @@ mod tests {
                 hole_zero_filled: 0,
                 zero_page_refused: false,
                 replaying: false,
+                read_batch: READ_BATCH,
+                fault_workers: None,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -7681,6 +8196,8 @@ mod tests {
                 hole_zero_filled: 0,
                 zero_page_refused: false,
                 replaying: false,
+                read_batch: READ_BATCH,
+                fault_workers: None,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -7763,6 +8280,8 @@ mod tests {
         let (clone, uffd) = BalloonedCopyClone::new(3);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
         let balloon = clone.inflate_page_zero(&uffd);
 
         // A vCPU touches page 2 and sleeps in the kernel until the fault is resolved.
@@ -8820,6 +9339,8 @@ mod tests {
                 hole_zero_filled: 0,
                 zero_page_refused: false,
                 replaying: false,
+                read_batch: READ_BATCH,
+                fault_workers: None,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -9039,32 +9560,268 @@ mod tests {
             anon[page * PAGE] = 1;
         }
         let mmap = anon.make_read_only().unwrap();
+        assert_eq!(source_residency_run(&mmap, 0, 8 * PAGE), (true, 2 * PAGE));
         assert_eq!(
-            source_residency_run(&mmap, 0, 8 * PAGE, PAGE),
-            (true, 2 * PAGE)
-        );
-        assert_eq!(
-            source_residency_run(&mmap, 2 * PAGE, 6 * PAGE, PAGE),
+            source_residency_run(&mmap, 2 * PAGE, 6 * PAGE),
             (false, 2 * PAGE)
         );
         assert_eq!(
-            source_residency_run(&mmap, 4 * PAGE, 4 * PAGE, PAGE),
+            source_residency_run(&mmap, 4 * PAGE, 4 * PAGE),
             (true, PAGE)
         );
         assert_eq!(
-            source_residency_run(&mmap, 5 * PAGE, 3 * PAGE, PAGE),
+            source_residency_run(&mmap, 5 * PAGE, 3 * PAGE),
             (false, 3 * PAGE)
         );
         assert_eq!(
-            source_residency_run(&mmap, 6 * PAGE, 4 * PAGE, PAGE),
+            source_residency_run(&mmap, 6 * PAGE, 4 * PAGE),
             (false, 4 * PAGE),
             "past the end of the mapping"
         );
         assert_eq!(
-            source_residency_run(&mmap, 0, 2 * PAGE, 2 * PAGE),
-            (false, 2 * PAGE),
-            "a page size that is not the host's"
+            source_residency_run(&mmap, 1, PAGE),
+            (false, PAGE),
+            "an offset that is not page aligned"
         );
+    }
+
+    /// A clone whose snapshot mapping is itself served by a test userfaultfd, so the test
+    /// decides when a read of a source page completes: the stand-in for a disk read that a
+    /// slow device holds. Source page `i` holds the byte `i + 1` once the test serves it.
+    struct HeldSourceClone {
+        source: Arc<PageSource>,
+        source_uffd: Uffd,
+        source_base: usize,
+        guest: usize,
+        uffd: Uffd,
+        mappings: [GuestRegionUffdMapping; 1],
+    }
+
+    impl HeldSourceClone {
+        const PAGE: usize = 4096;
+        const PAGES: usize = 8;
+
+        fn new(features: userfaultfd::FeatureFlags) -> Self {
+            let mut anon = memmap2::MmapMut::map_anon(Self::PAGES * Self::PAGE).unwrap();
+            // Not user-mode only: the handler's own UFFDIO_COPY reads the source from the
+            // kernel, and that read must wait here like a disk read, not fail.
+            let source_uffd = userfaultfd::UffdBuilder::new()
+                .close_on_exec(true)
+                .non_blocking(true)
+                .user_mode_only(false)
+                .create()
+                .expect("creating the source's userfaultfd");
+            source_uffd
+                .register(anon.as_mut_ptr().cast(), Self::PAGES * Self::PAGE)
+                .expect("registering the source");
+            let mmap = anon.make_read_only().unwrap();
+            let source_base = mmap.as_ptr() as usize;
+            let (guest, uffd) = missing_guest_memory(Self::PAGES * Self::PAGE, features);
+            Self {
+                source: Arc::new(PageSource::Copy {
+                    mmap,
+                    fault_around: 0,
+                    replay_threads: 1,
+                    holes: FileHoles::default(),
+                    nv2: false,
+                }),
+                source_uffd,
+                source_base,
+                guest,
+                uffd,
+                mappings: [GuestRegionUffdMapping {
+                    base_host_virt_addr: guest as u64,
+                    size: Self::PAGES * Self::PAGE,
+                    offset: 0,
+                    page_size: Self::PAGE,
+                }],
+            }
+        }
+
+        /// Serve source page `page`: the read of it completes.
+        fn serve_source(&self, page: usize) {
+            let bytes = vec![(page + 1) as u8; Self::PAGE];
+            // SAFETY: the destination is a page of the registered source mapping.
+            unsafe {
+                self.source_uffd
+                    .copy(
+                        bytes.as_ptr().cast(),
+                        (self.source_base + page * Self::PAGE) as *mut libc::c_void,
+                        Self::PAGE,
+                        true,
+                    )
+                    .expect("serving a source page");
+            }
+        }
+
+        fn ctx(&self) -> VmContext<'_> {
+            VmContext {
+                vm_id: "held-source-clone",
+                mappings: &self.mappings,
+                source: &self.source,
+                page_size: Self::PAGE,
+                page_mask: !(Self::PAGE - 1),
+                mem_size: Self::PAGES * Self::PAGE,
+                gate: test_gate(),
+            }
+        }
+
+        fn state(&self) -> VmState {
+            VmState {
+                fault_count: 0,
+                fault_around: FaultAroundStats::default(),
+                parked_faults: ParkedFaults::default(),
+                removed: RemovedPages::default(),
+                given_back: GivenBackStats::default(),
+                hole_zero_filled: 0,
+                zero_page_refused: false,
+                replaying: false,
+                read_batch: READ_BATCH,
+                fault_workers: FaultWorkers::start(&self.uffd, &self.source, &self.ctx(), None),
+                recorded: None,
+                record_until: None,
+                started: std::time::Instant::now(),
+                trace: None,
+            }
+        }
+
+        fn guest_addr(&self, page: usize) -> usize {
+            self.guest + page * Self::PAGE
+        }
+
+        /// Answer returned source reads until `vcpu` wakes, or panic after five seconds.
+        fn finish_reads_until<T: Send + 'static>(
+            &self,
+            state: &mut VmState,
+            vcpu: FaultingThread<T>,
+        ) -> T {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut vcpu = vcpu;
+            loop {
+                assert!(finish_worker_returns(&self.uffd, &self.ctx(), state).unwrap());
+                match vcpu.finish_within(Duration::from_millis(5)) {
+                    Ok(report) => return report,
+                    Err(still) if std::time::Instant::now() < deadline => vcpu = still,
+                    Err(_) => panic!("the fault was never answered after its read came back"),
+                }
+            }
+        }
+    }
+
+    /// A fault whose source page is cached is answered while another fault's source read is
+    /// held. Before #1050 the handler copied the uncached page itself and every fault behind
+    /// it waited for that read: 1.9 percent of faults took 1 ms and over, and they were 82
+    /// percent of the time inside a copy.
+    #[test]
+    fn a_cached_fault_is_answered_while_another_faults_source_read_is_held() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::empty());
+        clone.serve_source(6);
+        let mut state = clone.state();
+
+        let held = FaultingReader::spawn(clone.guest_addr(2));
+        held.wait_until_asleep();
+        let cached = FaultingReader::spawn(clone.guest_addr(6));
+        cached.wait_until_asleep();
+
+        let (drained, cached_answered) = std::thread::scope(|scope| {
+            let ctx = clone.ctx();
+            let state = &mut state;
+            let uffd = &clone.uffd;
+            let handler = scope.spawn(move || drain_events(uffd, &ctx, state));
+            let cached_answered = cached.finish_within(Duration::from_secs(2));
+            // Whatever happened, let the held read complete so the handler can return.
+            wait_for_uffd_event(&clone.source_uffd, "the read of source page 2");
+            clone.serve_source(2);
+            (handler.join().unwrap(), cached_answered)
+        });
+        let (got, _) = cached_answered.unwrap_or_else(|_| {
+            panic!("the cached fault was not answered while page 2's source read was held")
+        });
+        assert_eq!(got, 7);
+        assert_eq!(drained.unwrap(), DrainOutcome::QueueDrained);
+        assert_eq!(state.fault_workers.as_ref().unwrap().handed, 2);
+
+        let (got, _) = clone.finish_reads_until(&mut state, held);
+        assert_eq!(
+            got, 3,
+            "the held fault gets the snapshot's bytes once its read is back"
+        );
+        assert_eq!(state.fault_count, 2);
+    }
+
+    /// A REMOVE that is read while a fault's source page is being read leaves what it leaves
+    /// for a parked fault: the page is given back, so the fault is answered with zeros and the
+    /// snapshot's bytes are not installed in memory the guest gave back.
+    #[test]
+    fn a_remove_read_while_a_source_read_is_held_answers_the_fault_with_zeros() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        let held = FaultingReader::spawn(clone.guest_addr(3));
+        held.wait_until_asleep();
+        // A handler that reads the source itself sleeps in that read until the test serves
+        // it, so the drain runs on a thread of its own and the test gives up after 2 s.
+        let drained_in_time = std::thread::scope(|scope| {
+            let ctx = clone.ctx();
+            let state = &mut state;
+            let uffd = &clone.uffd;
+            let handler = scope.spawn(move || drain_events(uffd, &ctx, state));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !handler.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let in_time = handler.is_finished();
+            if !in_time {
+                clone.serve_source(3);
+            }
+            assert_eq!(handler.join().unwrap().unwrap(), DrainOutcome::QueueDrained);
+            in_time
+        });
+        assert!(
+            drained_in_time,
+            "the handler waited for page 3's source read instead of reading on"
+        );
+        assert_eq!(state.fault_workers.as_ref().unwrap().handed, 1);
+
+        // The balloon gives page 3 back while its read is held.
+        let addr = clone.guest_addr(3);
+        let balloon = std::thread::spawn(move || {
+            // SAFETY: advising the test's own live mapping.
+            unsafe {
+                libc::madvise(
+                    addr as *mut libc::c_void,
+                    HeldSourceClone::PAGE,
+                    libc::MADV_DONTNEED,
+                )
+            }
+        });
+        wait_for_uffd_event(&clone.uffd, "the REMOVE event");
+        assert_eq!(
+            drain_events(&clone.uffd, &clone.ctx(), &mut state).unwrap(),
+            DrainOutcome::QueueDrained
+        );
+        assert_eq!(balloon.join().unwrap(), 0);
+        assert_eq!(state.given_back.events, 1);
+
+        wait_for_uffd_event(&clone.source_uffd, "the read of source page 3");
+        clone.serve_source(3);
+        let (got, _) = clone.finish_reads_until(&mut state, held);
+        assert_eq!(
+            got, 0,
+            "a page given back is answered with zeros, not the snapshot"
+        );
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert_eq!(state.fault_workers.as_ref().unwrap().stale, 1);
+    }
+
+    /// The worker count: the default, a number, 0 for none, and the default for a value that
+    /// is not a number.
+    #[test]
+    fn the_fault_worker_count_reads_its_environment_value() {
+        assert_eq!(fault_worker_count(None), DEFAULT_FAULT_WORKERS);
+        assert_eq!(fault_worker_count(Some(" 4\n")), 4);
+        assert_eq!(fault_worker_count(Some("0")), 0);
+        assert_eq!(fault_worker_count(Some("many")), DEFAULT_FAULT_WORKERS);
     }
 
     /// The region maps file pages 2..10, so with 4-page granules both of its ends fall inside
@@ -9180,6 +9937,8 @@ mod tests {
     fn a_vcpu_asleep_inside_the_granule_is_woken_by_the_populate() {
         let (clone, uffd) = FaultAroundClone::new(4, 0, 8);
         let mut state = clone.state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
 
         let first = FaultingReader::spawn(clone.region_addr(1));
         first.wait_until_asleep();
@@ -9933,7 +10692,7 @@ mod tests {
             .find("ctx.gate.reading()")
             .expect("drain_events takes the gate");
         let read = drain
-            .find("uffd.read_event()")
+            .find("uffd.read_events(")
             .expect("drain_events reads events");
         assert!(gate < read, "the gate is taken before the read");
         let worker = source
@@ -10171,6 +10930,8 @@ mod tests {
         let (clone, uffd) =
             FaultAroundClone::with_features(4, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let mut state = clone.state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
         // Pages 0..4 hold the balloon's page, which the handler leaves unmapped. Every
         // assertion below is about the other three granules.
         let resident = |clone: &FaultAroundClone| -> Vec<usize> {
@@ -10451,6 +11212,43 @@ mod tests {
         clone.unmap();
     }
 
+    /// With events read in batches, a fault and the REMOVE queued behind it come out of one
+    /// read, and the gate is held until that REMOVE is recorded. Whether the fault's first
+    /// fill is refused depends on whether the thread inside `madvise` has run again, so it
+    /// may park; either way the fault ends answered with zeros, never with the snapshot.
+    #[test]
+    fn a_fault_read_with_the_remove_behind_it_is_answered_with_zeros() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        assert_eq!(state.read_batch, READ_BATCH);
+
+        let balloon = clone.inflate(&uffd, 2);
+        let vcpu = FaultingReader::spawn(clone.region_addr(2));
+        vcpu.wait_until_asleep();
+
+        assert_eq!(
+            drain_events(&uffd, &ctx, &mut state).expect("serving the fault"),
+            DrainOutcome::QueueDrained
+        );
+        assert_eq!(state.given_back.events, 1, "one read took the REMOVE too");
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved"
+            );
+            assert!(retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying"));
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its fault was answered");
+        assert_eq!(got, 0, "a page given back is answered with zeros");
+        assert_eq!(state.given_back.zero_filled, 1);
+        clone.unmap();
+    }
+
     /// The REMOVE that covers a page can be read after a fault on that page was parked. The
     /// set is asked at every retry, so that fault is answered with zeros too.
     #[test]
@@ -10460,6 +11258,8 @@ mod tests {
             FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let ctx = clone.ctx();
         let mut state = clone.state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
 
         // The balloon gives page 2 back while a vCPU reads it. The REMOVE is queued first
         // and left unread, so the fault is read ahead of it and its populate is refused.
@@ -10994,6 +11794,8 @@ mod tests {
         mark_holes(&mut clone.source, &[2]);
         let ctx = clone.ctx();
         let mut state = clone.state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
 
         // A REMOVE left unread: the kernel refuses every populate ioctl until the event is
         // read and the thread inside madvise has run again.
@@ -11080,6 +11882,8 @@ mod tests {
         mark_holes(&mut clone.source, &[2]);
         let ctx = clone.ctx();
         let mut state = clone.state();
+        // One event a read: the fault is read ahead of the event queued behind it.
+        state.read_batch = 1;
 
         let balloon = clone.inflate(&uffd, 0);
         let writer = FaultingWriter::spawn(clone.region_addr(2), 0x5A);
