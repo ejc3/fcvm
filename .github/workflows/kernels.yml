@@ -294,17 +294,10 @@ jobs:
 
       - name: Setup btrfs for fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
-        run: |
-          # Create btrfs filesystem if needed
-          if [ ! -d /mnt/fcvm-btrfs ]; then
-            sudo mkdir -p /mnt/fcvm-btrfs
-            sudo truncate -s 50G /var/fcvm-btrfs.img
-            sudo mkfs.btrfs /var/fcvm-btrfs.img
-            sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
-          fi
-          sudo chown $USER:$USER /mnt/fcvm-btrfs
-          # Heal root-owned store entries (see the script header for why)
-          ./fcvm/scripts/normalize-store-ownership.sh /mnt/fcvm-btrfs
+        working-directory: fcvm
+        # The target a developer runs, so the two cannot drift. It also heals root-owned
+        # store entries (scripts/normalize-store-ownership.sh).
+        run: make setup-btrfs
 
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
@@ -575,17 +568,10 @@ jobs:
 
       - name: Setup btrfs for fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
-        run: |
-          # Create btrfs filesystem if needed
-          if [ ! -d /mnt/fcvm-btrfs ]; then
-            sudo mkdir -p /mnt/fcvm-btrfs
-            sudo truncate -s 50G /var/fcvm-btrfs.img
-            sudo mkfs.btrfs /var/fcvm-btrfs.img
-            sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
-          fi
-          sudo chown $USER:$USER /mnt/fcvm-btrfs
-          # Heal root-owned store entries (see the script header for why)
-          ./fcvm/scripts/normalize-store-ownership.sh /mnt/fcvm-btrfs
+        working-directory: fcvm
+        # The target a developer runs, so the two cannot drift. It also heals root-owned
+        # store entries (scripts/normalize-store-ownership.sh).
+        run: make setup-btrfs
 
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true

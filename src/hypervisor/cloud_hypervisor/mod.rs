@@ -169,6 +169,12 @@ impl CloudHypervisorBackend {
     /// in-process — the guest boot-loops and fcvm's `vm_manager.wait()` never returns.
     /// The token tells fc-agent this VMM honors ACPI/PSCI power-off (CH exits its
     /// process on either), so it must power off instead of triple-faulting.
+    ///
+    /// Also appends `net.ifnames=0`, as the Firecracker PCI profiles do: CH puts the guest's
+    /// virtio-net NIC on PCI, which udev renames to `enp0s<slot>` under predictable naming,
+    /// while fc-agent and fcvm configure `eth0` (its IPv6 address and route, the gateway's
+    /// neighbour entry, the snapshot gate) and the rootfs's networkd unit matches
+    /// `Name=eth0` (#806).
     fn ch_cmdline(fc_boot_args: &str, runtime_boot_args: &str) -> String {
         let combined = if runtime_boot_args.is_empty() {
             fc_boot_args.to_string()
@@ -186,6 +192,9 @@ impl CloudHypervisorBackend {
                 other => Some(other),
             })
             .collect();
+        if !tokens.contains(&"net.ifnames=0") {
+            tokens.push("net.ifnames=0");
+        }
         tokens.push("fcvm_shutdown=acpi");
         tokens.join(" ")
     }
@@ -1303,13 +1312,31 @@ mod tests {
         let toks: Vec<&str> = out.split_whitespace().collect();
         assert_eq!(
             toks,
-            vec!["console=ttyS0extra", "fcpci=offx", "fcvm_shutdown=acpi"]
+            vec![
+                "console=ttyS0extra",
+                "fcpci=offx",
+                "net.ifnames=0",
+                "fcvm_shutdown=acpi"
+            ]
         );
     }
 
     #[test]
     fn ch_cmdline_handles_empty_runtime_args() {
         let out = CloudHypervisorBackend::ch_cmdline("console=ttyAMA0 root=/dev/vda", "");
-        assert_eq!(out, "console=hvc0 root=/dev/vda fcvm_shutdown=acpi");
+        assert_eq!(
+            out,
+            "console=hvc0 root=/dev/vda net.ifnames=0 fcvm_shutdown=acpi"
+        );
+    }
+
+    /// The guest keeps the kernel's `eth0` for its PCI virtio-net NIC, which fc-agent and the
+    /// rootfs's networkd unit configure by that name (#806). Given once, it is not repeated.
+    #[test]
+    fn ch_cmdline_keeps_the_kernel_s_interface_name() {
+        let out = CloudHypervisorBackend::ch_cmdline("console=ttyS0 root=/dev/vda", "");
+        assert_eq!(out.matches("net.ifnames=0").count(), 1, "{out}");
+        let given = CloudHypervisorBackend::ch_cmdline("net.ifnames=0", "");
+        assert_eq!(given.matches("net.ifnames=0").count(), 1, "{given}");
     }
 }
