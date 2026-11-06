@@ -82,8 +82,8 @@ export interface SeamReport {
   shown: Record<string, string>;
   /** Mean absolute error per tile against the pattern at T, 0..255. */
   perTile: Record<string, number>;
-  /** Mean absolute difference across each internal boundary, against the pattern's own. */
-  boundaries: { a: string; b: string; err: number }[];
+  /** Mean absolute difference across each internal boundary, against the pattern's own, over `n` smooth pairs. */
+  boundaries: { a: string; b: string; err: number; n: number }[];
   samples: number;
 }
 
@@ -99,6 +99,18 @@ export async function settledCapture(page: Page, points: { x: number; y: number 
     if (!Object.values(res.shown).some((s) => s.startsWith("fade@")) || Date.now() > deadline) return res;
   }
 }
+
+/**
+ * Sample pairs placed along each boundary (a pair: a point 3 px before it and 2 px after it).
+ * Only pairs where the picture is smooth count, and with 12 a boundary was often left with 1
+ * to 3 of them, so its mean error was one or two pixels' compression noise: on 30 runs of the
+ * aggregated check, 26 had a boundary with fewer than 4, and CI failed one at 3.35 (#1348).
+ * With 64, over 60 runs of this and the direct check, the fewest was 5 and the worst boundary
+ * 1.59 (2.31 with 12, on 30 runs of the aggregated check alone).
+ */
+const SEAM_PAIRS = 64;
+/** A boundary's error is a mean over at least this many smooth pairs. */
+export const SEAM_MIN_PAIRS = 4;
 
 /**
  * Read back pixels on both sides of every boundary between two drawn tiles, in
@@ -122,8 +134,8 @@ export async function seamReport(page: Page): Promise<SeamReport> {
           const y0 = Math.max(l.box.y, r.box.y);
           const y1 = Math.min(l.box.y + l.box.h, r.box.y + r.box.h);
           if (y1 - y0 < 8) continue;
-          for (let k = 1; k <= 12; k++) {
-            const y = Math.floor(y0 + ((y1 - y0) * k) / 13) + 0.5;
+          for (let k = 1; k <= SEAM_PAIRS; k++) {
+            const y = Math.floor(y0 + ((y1 - y0) * k) / (SEAM_PAIRS + 1)) + 0.5;
             const x = r.box.x;
             const pair = `${l.id}|${r.id}`;
             pts.push({ x: x - 3 + 0.5, y, tile: l.id, pair }, { x: x + 2 + 0.5, y, tile: r.id, pair });
@@ -135,8 +147,8 @@ export async function seamReport(page: Page): Promise<SeamReport> {
           const x0 = Math.max(t.box.x, u.box.x);
           const x1 = Math.min(t.box.x + t.box.w, u.box.x + u.box.w);
           if (x1 - x0 < 8) continue;
-          for (let k = 1; k <= 12; k++) {
-            const x = Math.floor(x0 + ((x1 - x0) * k) / 13) + 0.5;
+          for (let k = 1; k <= SEAM_PAIRS; k++) {
+            const x = Math.floor(x0 + ((x1 - x0) * k) / (SEAM_PAIRS + 1)) + 0.5;
             const y = u.box.y;
             const pair = `${t.id}|${u.id}`;
             pts.push({ x, y: y - 3 + 0.5, tile: t.id, pair }, { x, y: y + 2 + 0.5, tile: u.id, pair });
@@ -212,7 +224,7 @@ export async function seamReport(page: Page): Promise<SeamReport> {
   for (const [id, s] of Object.entries(sums)) perTile[id] = s.s / s.n;
   const boundaries = Object.entries(pairSums).map(([k, s]) => {
     const [a, b] = k.split("|") as [string, string];
-    return { a, b, err: s.s / s.n };
+    return { a, b, err: s.s / s.n, n: s.n };
   });
   return { T: res.T, shown: res.shown, perTile, boundaries, samples };
 }

@@ -3,7 +3,7 @@ import { seconds, thousands, utcDate } from "../core/format.ts";
 import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
-import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
+import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -148,6 +148,7 @@ test("no seam: pixels on both sides of every boundary match the picture at the d
   expect(r.samples).toBeGreaterThanOrEqual(60);
   for (const [id, s] of Object.entries(r.shown)) if (s !== "dark") expect(s, id).toBe(`sync@${r.T}`);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
+  for (const b of r.boundaries) expect(b.n, `smooth pairs on ${b.a} | ${b.b}`).toBeGreaterThanOrEqual(SEAM_MIN_PAIRS);
   for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
 });
 
@@ -458,7 +459,12 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await expect(page.getByTestId("timeline")).toContainText("GPU reset and driver loaded");
   await expect(page.getByTestId("timeline-total")).toHaveText(/^\d\.\d s$/);
   await page.waitForTimeout(1000);
-  const fe = await focusError(page, "fcvm:3");
+  // The opened VM's own stream (its detail height) can be a frame late at the moment of a
+  // capture, which the sync rule draws as behind: CI, 2026-11-04, behind@155.1 at T 155.2, one
+  // frame at 10 fps; twice in local runs at a load of 150 on 64 cores. What must hold is that
+  // it draws at T, so the check takes captures until one is not mid-catch-up.
+  let fe = await focusError(page, "fcvm:3");
+  await expect.poll(async () => (fe = await focusError(page, "fcvm:3")).shown === `sync@${fe.T}`, { timeout: 5_000 }).toBe(true);
   console.log(`opened VM: error ${fe.err.toFixed(2)} shown ${fe.shown} brightness around it ${fe.around.toFixed(2)}`);
   expect(fe.shown).toBe(`sync@${fe.T}`);
   expect(fe.err).toBeLessThan(6);
@@ -857,6 +863,7 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   for (const [id, sh] of Object.entries(r.shown)) if (sh !== "dark") expect(sh, id).toBe(`sync@${r.T}`);
   expect(Object.keys(r.shown).every((k) => k.startsWith("a:") || r.shown[k] === "dark")).toBe(true);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
+  for (const b of r.boundaries) expect(b.n, `smooth pairs on ${b.a} | ${b.b}`).toBeGreaterThanOrEqual(SEAM_MIN_PAIRS);
   for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
   await page.getByTestId("play").click();
   await expect(page.getByTestId("streams-switch")).toHaveAttribute("aria-checked", "false");
