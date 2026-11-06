@@ -15,21 +15,25 @@
 #                      and first_frame_at_ms (the wall clock, in ms since the epoch, when it
 #                      saw the frame; a restore steps the guest clock to the host's)
 #
-# No emulator running is not an error: there is nothing to let go of. Each call's output is
-# also appended to /tmp/gpu-hook.log.
+# No emulator started is not an error: there is nothing to let go of. An emulator that was
+# started and exited fails a retake (the phone is gone) but not a release. Each call's
+# output is also appended to /tmp/gpu-hook.log.
 set -euo pipefail
 # The test (scripts/phone/test-gpu-hook.sh) points these at stubs.
 ADB=${GPU_HOOK_ADB:-/android/platform-tools/adb}
 STATE=${GPU_HOOK_STATE:-/tmp}
 exec > >(tee -a "$STATE/gpu-hook.log") 2>&1
+log_tee=$!
+# `podman exec`, which runs the hook, ends the session's other processes once the hook exits:
+# close the pipe and wait for tee, or the last lines may never reach the log.
+trap 'exec >&- 2>&-; wait "$log_tee" 2> /dev/null || true' EXIT
 ms() { date +%s%3N; }
 console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
-running() { [ -f "$STATE/emulator.pid" ] && kill -0 "$(cat "$STATE/emulator.pid")" 2> /dev/null; }
-
-# A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
-# a container whose first process reaps nothing) is not.
-alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
-any_alive() { local p; for p in $(pgrep -x "$1"); do alive "$p" && return 0; done; return 1; }
+. "$(dirname "$0")/phone-proc.sh"
+# Whether an emulator was started (phone.sh writes its pid), and whether it still runs: one
+# that exited is not running, reaped or not.
+started() { [ -f "$STATE/emulator.pid" ]; }
+running() { started && alive "$(cat "$STATE/emulator.pid")"; }
 # The phone streamer (phone.sh serve) holds a CUDA context on the GPU: stop it before the
 # release, and keep phone.sh's loop from starting it again until the retake. The loop checks
 # the hold file and starts the streamer under streamer.lock, so taking the lock here means a
@@ -41,9 +45,7 @@ hold_streamer() {
   flock 8
   touch "$STATE/streamer.hold"
   pid=$(cat "$STATE/streamer.pid" 2> /dev/null || true)
-  if [ -n "$pid" ]; then kill "$pid" 2> /dev/null || true; fi
-  pkill -x phone-streamer 2> /dev/null || true
-  while { [ -n "$pid" ] && alive "$pid"; } || any_alive phone-streamer; do sleep 0.05; done
+  stop_procs "$pid" phone-streamer
   flock -u 8
   exec 8>&-
 }
@@ -52,13 +54,15 @@ free_streamer() { rm -f "$STATE/streamer.hold"; }
 case "${1:-}" in
 release)
   hold_streamer
-  running || { echo "no emulator running"; exit 0; }
+  running || { started && echo "the emulator exited: nothing to let go of" || echo "no emulator running"; exit 0; }
   out=$(console gpu release)
   echo "$out"
   grep -q '^released_ms=' <<< "$out"
   ;;
 retake)
-  running || { echo "no emulator running"; free_streamer; exit 0; }
+  # an emulator that exited leaves no phone to take the GPU up for: the restore fails
+  started || { echo "no emulator running"; free_streamer; exit 0; }
+  running || { echo "the emulator (pid $(cat "$STATE/emulator.pid")) exited: no phone to take the GPU up for"; exit 1; }
   # Only an answer of "held" means there is nothing to take up again; a console that
   # does not answer is an error, or a released phone would stay paused.
   status=$(console gpu status) || { echo "the emulator's console did not answer 'gpu status'"; exit 1; }

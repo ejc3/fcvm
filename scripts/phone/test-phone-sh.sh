@@ -9,7 +9,10 @@
 set -euo pipefail
 phone=$(cd "$(dirname "$0")/../../fleet/phone" && pwd)/phone.sh
 dir=$(mktemp -d)
-trap 'rm -rf "$dir"' EXIT
+# stand-ins a failing check left running end with the test (their paths are under $dir)
+trap 'pkill -9 -f -- "$dir/" 2> /dev/null || true; rm -rf "$dir"' EXIT
+# running, not a zombie, as phone.sh's alive() counts it
+running_pid() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2> /dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
 # The stub prints $dir/last_id for `shell getprop dumpstate.last_id`, and fails when it is absent.
 cat > "$dir/adb" <<STUB
 #!/bin/bash
@@ -64,8 +67,15 @@ EOF
   cat > "$D/bin/phone-streamer" <<'EOF'
 #!/bin/bash
 D=$FAKE_DIR
-if [ "$1" = fail ]; then echo "streamer fail: $2" >> "$D/log"; exit 0; fi
-trap 'sleep 0.3; echo "streamer serve exited" >> "$D/log"; exit 0' TERM
+if [ "$1" = fail ]; then
+  # failure mode names a serving streamer still running when it starts
+  p=$(cat "$D/serve.pid" 2> /dev/null || true)
+  st=$( [ -n "$p" ] && sed 's/.*) //' "/proc/$p/stat" 2> /dev/null | cut -d' ' -f1 || true)
+  if [ -n "$st" ] && [ "$st" != Z ]; then echo "a serving streamer still runs at failure mode" >> "$D/log"; fi
+  echo "streamer fail: $2" >> "$D/log"; exit 0
+fi
+echo $$ > "$D/serve.pid"
+if [ -n "${FAKE_STREAMER_STUCK:-}" ]; then trap '' TERM; else trap 'sleep 0.3; echo "streamer serve exited" >> "$D/log"; exit 0' TERM; fi
 echo "streamer serve" >> "$D/log"
 while :; do
   [ -e "$PHONE_GO_FILE" ] && [ ! -e "$D/streaming" ] && { touch "$D/streaming"; echo "streamer streaming" >> "$D/log"; }
@@ -132,6 +142,12 @@ has "$D" "streamer fail: nvidia-smi names no GPU" && ok "a failed GPU query repo
   || bad "a failed GPU query: $(cat "$D/log" "$D/out")"
 before "$D" "streamer serve exited" "streamer fail:" && ok "failure mode starts after the serving streamer exited" \
   || bad "failure mode did not wait for the serving streamer: $(cat "$D/log")"
+# a streamer stuck in its teardown (one that ignores SIGTERM) is killed after STOP_TERM_MS,
+# so failure mode still starts
+D=$(FAKE_NO_GPU=1 FAKE_STREAMER_STUCK=1 STOP_TERM_MS=500 serve)
+has "$D" "streamer fail: nvidia-smi names no GPU" && grep -q "SIGKILL" "$D/out" \
+  && ! has "$D" "a serving streamer still runs at failure mode" && ! running_pid "$(cat "$D/serve.pid")" && ok "a streamer that ignores SIGTERM is killed and failure mode starts" \
+  || bad "a streamer that ignores SIGTERM: $(cat "$D/log" "$D/out")"
 D=$(FAKE_RENDERER=SwiftShader serve)
 has "$D" "streamer fail: SurfaceFlinger does not render on Tesla T4" && ok "a software SurfaceFlinger is reported failed" \
   || bad "a software SurfaceFlinger: $(cat "$D/log" "$D/out")"

@@ -951,6 +951,7 @@ phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	./scripts/phone/test-gpu-hook.sh
 	./scripts/phone/test-phone-sh.sh
 	./scripts/phone/test-run-checks.sh
+	./scripts/phone/test-seam.sh
 	./scripts/phone/aosp.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	./scripts/phone/app.sh > /dev/null

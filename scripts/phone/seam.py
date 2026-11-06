@@ -11,11 +11,10 @@ each with the reply's `path` (a local copy of the raw RGBA file), `w`, `h`, `x0`
      "repeats": [[{...}, {...}]]}
 
 For every tile pixel, the whole image's pixel at the same whole-image position must be the
-same bytes; that makes the tiles stitch into the whole image with no seam. One allowance,
-measured on the T4 through the emulator: in some runs a pixel where a light's glow is blended
-comes out 1 level apart (the same pixel at t=41.5 in 3 of 10 runs, while 96 repeat captures of
-the same frames were identical), so a tile may have up to ONE_LEVEL_MAX pixels 1 level apart.
-Anything more, or any pixel more than 1 level apart, fails. Each `repeats` pair is one rect
+same bytes; that makes the tiles stitch into the whole image with no seam. Any pixel apart
+fails. (An allowance of 9 pixels a tile 1 level apart, for one glow pixel seen 1 level apart in
+3 of the first 10 runs of the final rendering, is gone: on the emulator built from source it
+came out identical in every later run and in 60 app restarts in a row, 2026-11-07.) Each `repeats` pair is one rect
 drawn twice, which must match byte for byte. Prints a JSON summary with the exact counts,
 writes the whole image and the stitched tiles as PNG into OUTDIR, and exits 1 on a failure.
 """
@@ -25,7 +24,6 @@ import struct
 import sys
 import zlib
 
-ONE_LEVEL_MAX = 9  # 0.001% of a 720 x 1280 tile
 
 def load(c):
     data = open(c["path"], "rb").read()
@@ -78,7 +76,7 @@ def main():
                         maxd = max(maxd, max(abs(p[k] - q[k]) for k in range(3)))
             r["tiles"].append({"x0": x0, "y0": y0, "w": w, "h": h, "pixels": n, "differ": diff,
                                "differ_at_edges": edge, "max_diff": maxd})
-            report["ok"] &= maxd <= 1 and diff <= ONE_LEVEL_MAX
+            report["ok"] &= diff == 0
             report["exact"] = report.get("exact", True) and diff == 0
         name = f"t{fr['t']:g}".replace(".", "_")
         png(os.path.join(out, f"{name}-whole.png"), W, H, wp)
