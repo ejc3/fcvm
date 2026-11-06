@@ -3487,6 +3487,66 @@ class ZeroBasis(unittest.TestCase):
             with self.assertRaises(bench_report.CgroupReadError):
                 bench_report.measure_cgroup_set(missing, "serve-")
 
+    def _forensics_box(self, tmp, pasta_pid):
+        """A results dir, a clone's vm-disks/<id>/pasta.pid, a fake `ss` that
+        lists two listeners on the DevTools port and a fake fcvm whose exec
+        prints what the guest would."""
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        vm_id = "vm-" + "7" * 32
+        os.makedirs(os.path.join(tmp, "vm-disks", vm_id))
+        with open(os.path.join(tmp, "vm-disks", vm_id, "pasta.pid"), "w") as f:
+            f.write(f"{pasta_pid}\n")
+        with open(os.path.join(bindir, "ss"), "w") as f:
+            f.write("#!/bin/sh\n"
+                    "echo 'LISTEN 0 128 127.0.0.74:9222 0.0.0.0:* users:((\"pasta\",pid=5001,fd=7))'\n"
+                    "echo 'LISTEN 0 128 127.0.0.75:9222 0.0.0.0:* users:((\"pasta\",pid=5002,fd=7))'\n")
+        fcvm = os.path.join(bindir, "fcvm")
+        with open(fcvm, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FCVM_ARGV\"\n"
+                    "echo http=000; echo curl_rc=7; echo 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*'\n")
+        for name in ("ss", "fcvm"):
+            os.chmod(os.path.join(bindir, name), 0o755)
+        args = SimpleNamespace(results=os.path.join(tmp, "results"), data_root=tmp, fcvm=fcvm,
+                               state_dir=os.path.join(tmp, "state"), op="screenshot",
+                               cdp_port=9222, urls=["https://example.com/"])
+        clone = {"i": 0, "name": "mem-run-fcvm96r4-72", "vm_id": vm_id, "fcvm_pid": 4242,
+                 "endpoint": "127.0.0.75:9222", "log": os.path.join(tmp, "clone.log")}
+        return args, clone, dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
+                                 FCVM_ARGV=os.path.join(tmp, "argv"))
+
+    def test_a_failed_render_records_who_answered_on_the_port_before_teardown(self):
+        """RED BEFORE THE FIX (#1135): a clone whose published DevTools port
+        reset every connect stopped the cell with nothing recorded about the
+        listener; the record must name the listener's owner, say whether it is
+        this clone's pasta, and hold the guest's own view of the port."""
+        for pasta_pid, ours in ((5002, True), (5001, False)):
+            with self.subTest(pasta_pid=pasta_pid), tempfile.TemporaryDirectory() as tmp:
+                args, clone, env = self._forensics_box(tmp, pasta_pid)
+                side = corpus_mem.FcvmSide(args, SimpleNamespace(base="/cgroup"), "run")
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(corpus_mem, "find_clone_state",
+                                          return_value=({"vm_id": clone["vm_id"], "pid": 4242},
+                                                        "127.0.0.75")), \
+                        mock.patch.object(corpus_mem, "port_open", return_value=True), \
+                        mock.patch.object(corpus_mem, "spawn_in_cgroup", return_value=mock.Mock()), \
+                        mock.patch.object(corpus_mem, "render",
+                                          return_value=(False, "ConnectionError: os-ECONNRESET")), \
+                        mock.patch.object(side.cg, "leaf", create=True, return_value="/cgroup/x"):
+                    side.serve_pid = 1
+                    with self.assertRaises(SystemExit):
+                        side.bring_up(1, "fcvm96r4", [0])
+                path = os.path.join(args.results, "logs", f"mem-run-fcvm96r4-0.forensics.json")
+                self.assertTrue(os.path.exists(path), os.listdir(tmp))
+                with open(path) as f:
+                    record = json.load(f)
+                self.assertEqual(record["endpoint_listener_owners"], [{"comm": "pasta", "pid": 5002}])
+                self.assertEqual(record["clone_pasta_pid"], pasta_pid)
+                self.assertIs(record["endpoint_listener_is_this_clones_pasta"], ours)
+                self.assertIn("curl_rc=7", record["guest"]["stdout"])
+                with open(env["FCVM_ARGV"]) as f:
+                    self.assertTrue(f.read().startswith("exec --pid 4242 --vm -- /bin/sh -c"))
+
     def test_a_serve_sample_with_no_process_basis_is_refused(self):
         args = SimpleNamespace(state_dir="/state")
         side = corpus_mem.FcvmSide(args, SimpleNamespace(base="/cgroup"), "run")
