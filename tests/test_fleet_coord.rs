@@ -3833,6 +3833,14 @@ struct FakeEc2Api {
     run_delay: Duration,
     /// An unpromoted latest version has a different host type from the default.
     unpublished_template: bool,
+    /// The template's default names g4dn.metal at its first read and g5g.metal after.
+    template_changes: bool,
+    /// How many CreateFleet calls launch and then answer 503, as a request whose answer is lost.
+    lose_fleet_answers: Arc<std::sync::atomic::AtomicU32>,
+    /// Each CreateFleet ClientToken seen, with the request it came with: a later request with
+    /// that token and other parameters is refused with IdempotentParameterMismatch, as EC2 does.
+    fleet_tokens:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3918,7 +3926,14 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     // An instant EC2 Fleet: spot is refused per pool where the region has no spot
                     // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
                     "DescribeLaunchTemplateVersions" => {
-                        let ty = if api.unpublished_template && params["LaunchTemplateVersion.1"] != "$Default" { "g4dn.xlarge" } else { "g4dn.metal" };
+                        let reads = api.calls.lock().unwrap().iter().filter(|(_, p)| p["Action"] == "DescribeLaunchTemplateVersions").count();
+                        let ty = if api.unpublished_template && params["LaunchTemplateVersion.1"] != "$Default" {
+                            "g4dn.xlarge"
+                        } else if api.template_changes && reads > 1 {
+                            "g5g.metal"
+                        } else {
+                            "g4dn.metal"
+                        };
                         (StatusCode::OK, format!("<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>{ty}</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>"))
                     }
                     // IAM's FleetTypesOnly checks ec2:InstanceType on the fleet's instances, and
@@ -3935,6 +3950,26 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                         "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation.</Message></Error></Errors></Response>".into(),
                     ),
                     "CreateFleet" => {
+                        if let Some(token) = params.get("ClientToken") {
+                            let mut seen = api.fleet_tokens.lock().unwrap();
+                            match seen.get(token) {
+                                Some(first) if *first != params => return error("IdempotentParameterMismatch"),
+                                Some(_) => {}
+                                None => {
+                                    seen.insert(token.clone(), params.clone());
+                                }
+                            }
+                        }
+                        let lost = api
+                            .lose_fleet_answers
+                            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                        if lost {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "<Response><Errors><Error><Code>InternalError</Code><Message>An internal error has occurred.</Message></Error></Errors></Response>".into(),
+                            );
+                        }
                         let spot = params["TargetCapacitySpecification.DefaultTargetCapacityType"] == "spot";
                         if spot && !api.spot_capacity.contains(&region) {
                             return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
@@ -4041,6 +4076,66 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     assert_eq!(list["Filter.2.Value.1"], "stage");
     // A template with no subnet in its region is refused at start.
     assert!(AwsHosts::new(&["us-east-1:t".parse().unwrap()], &[], "stage".into()).is_err());
+}
+
+/// A CreateFleet whose answer is lost is asked again with the same ClientToken (#1329). If the
+/// template's instance type changed and the cached type expired in between, the retry must
+/// still send the first request's parameters: EC2 refuses a token with other parameters
+/// (IdempotentParameterMismatch), and the region would launch nothing until a restart.
+#[tokio::test]
+async fn a_lost_create_fleet_is_asked_again_with_the_same_parameters() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        template_changes: true,
+        lose_fleet_answers: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::new(
+        &["us-east-1:fcvm-fleet-host-x86_64".parse().unwrap()],
+        &["us-east-1:subnet-0000000000000000a".parse().unwrap()],
+        "stage".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    // Every launch reads the template again, as one after the cache's five minutes does.
+    d.template_type_ttl = Duration::ZERO;
+    d.launch("us-east-1", Market::OnDemand, 1, "token-lost")
+        .await
+        .expect_err("the first answer is lost");
+    let again = d
+        .launch("us-east-1", Market::OnDemand, 1, "token-lost")
+        .await
+        .expect("the retry with the same token is answered");
+    assert_eq!(again.ids, vec!["i-1234567890abcdef0".to_string()]);
+    let calls = api.calls.lock().unwrap().clone();
+    let fleets: Vec<_> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "CreateFleet")
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert_eq!(fleets.len(), 2, "{calls:?}");
+    assert_eq!(fleets[0], fleets[1], "the retry changed the request");
+    assert_eq!(
+        fleets[1]["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g4dn.metal"
+    );
+    // A new launch reads the changed type.
+    d.launch("us-east-1", Market::OnDemand, 1, "token-new")
+        .await
+        .unwrap();
+    let calls = api.calls.lock().unwrap().clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .unwrap();
+    assert_eq!(
+        last.1["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g5g.metal"
+    );
 }
 
 /// `alive` reads the instance's state and asks its renderer: a running tile whose renderer
