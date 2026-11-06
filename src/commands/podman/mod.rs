@@ -894,7 +894,7 @@ async fn verify_prepared_snapshot_in(
     if let Err(error) =
         crate::storage::pmem::check_snapshot_pmem_images(data_dir, &config.metadata.pmem_devices)
     {
-        if !is_snapshot_load_failure(&error) {
+        if classify_restore_failure(&error) != RestoreFault::UnusableSnapshot {
             return Err(error.context(format!("checking prepared snapshot {snapshot_key}")));
         }
         info!(
@@ -1130,32 +1130,82 @@ fn snapshot_restore_args(
     }
 }
 
-/// True when an error chain ends at Firecracker's `PUT /snapshot/load` step —
-/// i.e. the cached snapshot artifact itself is unusable (most commonly: it was
-/// created by an incompatible Firecracker version and no longer deserializes).
+/// What a failed restore of a cached snapshot says about that snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreFault {
+    /// The artifact itself can never load: delete it and boot fresh, which builds a new one.
+    UnusableSnapshot,
+    /// Firecracker's load failed for a reason of this run or this host (a socket left at a
+    /// listener path, a memory server that went away): boot fresh and keep the entry, which
+    /// the next run can still restore (#988).
+    LoadFailed,
+    /// Not a load fault: the run fails.
+    Other,
+}
+
+/// What Firecracker or fcvm says when the cached artifact itself is unusable.
 ///
-/// Firecracker prefixes every snapshot-load fault with "Load snapshot error",
-/// which fcvm's API client embeds verbatim in the error message.
-fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
+/// - "Failed to load snapshot state from file" wraps every error of reading vmstate.bin
+///   (`SnapshotError`: CRC, magic, format version, bitcode, a short read, the size cap).
+///   "Invalid data version" and "An error occurred during bitcode serialization" are two of
+///   them, kept on their own because v1.17.0 reports a format 11 snapshot with the latter.
+/// - "Invalid snapshot state" is the vmstate's sanity check (no DRAM, too many slots).
+/// - "Unknown ... Device" is an override naming a device the vmstate does not hold, which
+///   fcvm builds from the snapshot's own metadata, so the two disagree.
+/// - "frequency not present in the given snapshot" is a snapshot with no TSC frequency.
+/// - "image disk build changed" is `verify_image_disk_identity`'s marker: the snapshot names a
+///   disk build that no longer exists at that path. "snapshot pmem image changed" is
+///   `check_snapshot_pmem_images`', for the same reason: Firecracker reopens the recorded path.
+const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
+    "Failed to load snapshot state from file",
+    "Invalid data version",
+    "An error occurred during bitcode serialization",
+    "Invalid snapshot state",
+    "Unknown Network Device",
+    "Unknown Vsock Device",
+    "Unknown Block Device",
+    "frequency not present in the given snapshot",
+    "image disk build changed",
+    "snapshot pmem image changed",
+];
+
+/// Classify a failed restore of a cached snapshot.
+///
+/// Firecracker prefixes every snapshot-load fault with "Load snapshot error", which fcvm's
+/// API client embeds verbatim, whether the cause is in the artifact or on the host. Matching
+/// only the prefix deleted good snapshots: a stale socket at a clone's `--vsock-dir` made the
+/// load fail with "Address already in use", and both cached entries were removed (#988). So
+/// only the markers in [`UNUSABLE_SNAPSHOT_MARKERS`] delete an entry. A --gpu device that
+/// Firecracker could not attach (busy, or the host is not set up) is a fault of this run that
+/// a fresh boot would hit too, so it fails the run.
+fn classify_restore_failure(err: &anyhow::Error) -> RestoreFault {
     let rendered = format!("{err:#}");
-    // "image disk build changed" is verify_image_disk_identity's marker: the
-    // snapshot references a disk build that no longer exists at that path, so
-    // it is permanently unusable — invalidate it and fall back to a fresh
-    // boot, which re-stats the disk and provisions coherently.
-    // "snapshot pmem image changed" is check_snapshot_pmem_images' marker, for
-    // the same reason: Firecracker reopens the recorded image path on restore.
-    // A --gpu device that Firecracker could not attach (the device is busy, the
-    // host is not set up) is a fault of this run, not of the shared snapshot:
-    // Firecracker reports it inside its "Load snapshot error", with the two
-    // markers below (vmm::persist::RestoreFromSnapshotError).
     if rendered.contains("passthrough device on restore")
         || rendered.contains("Device passthrough on restore")
     {
-        return false;
+        return RestoreFault::Other;
     }
-    rendered.contains("Load snapshot error")
-        || rendered.contains("image disk build changed")
-        || rendered.contains("snapshot pmem image changed")
+    if UNUSABLE_SNAPSHOT_MARKERS
+        .iter()
+        .any(|marker| rendered.contains(marker))
+    {
+        return RestoreFault::UnusableSnapshot;
+    }
+    if rendered.contains("Load snapshot error") {
+        return RestoreFault::LoadFailed;
+    }
+    RestoreFault::Other
+}
+
+/// A restore that failed for a reason of this run or host: the run boots fresh, and the
+/// cached snapshot stays for the next run.
+fn keep_snapshot_after_load_fault(snapshot_key: &str, err: &anyhow::Error) {
+    warn!(
+        snapshot_key = %snapshot_key,
+        error = %format!("{err:#}"),
+        "cached snapshot failed to load for a reason outside the snapshot; keeping it and \
+         falling back to a fresh boot"
+    );
 }
 
 /// Delete a cached snapshot that failed to load so the run can fall back to a
@@ -1896,12 +1946,15 @@ async fn prepare_vm_for_lifecycle(
                     complete_unused_owner(reclaim_owner).await;
                     return Ok(VmPreparation::RunCompleted);
                 }
-                Err(e) if is_snapshot_load_failure(&e) => {
-                    invalidate_unusable_snapshot(&startup_key, attempt.generation.as_ref(), &e)
-                        .await;
-                    // fall through to the pre-start check / fresh boot
-                }
-                Err(e) => return Err(e),
+                Err(e) => match classify_restore_failure(&e) {
+                    RestoreFault::UnusableSnapshot => {
+                        invalidate_unusable_snapshot(&startup_key, attempt.generation.as_ref(), &e)
+                            .await;
+                        // fall through to the pre-start check / fresh boot
+                    }
+                    RestoreFault::LoadFailed => keep_snapshot_after_load_fault(&startup_key, &e),
+                    RestoreFault::Other => return Err(e),
+                },
             }
         }
 
@@ -1951,11 +2004,14 @@ async fn prepare_vm_for_lifecycle(
                     }
                     return Ok(VmPreparation::RunCompleted);
                 }
-                Err(e) if is_snapshot_load_failure(&e) => {
-                    invalidate_unusable_snapshot(&key, attempt.generation.as_ref(), &e).await;
-                    // fall through to a fresh boot (which re-creates the snapshot)
-                }
-                Err(e) => return Err(e),
+                Err(e) => match classify_restore_failure(&e) {
+                    RestoreFault::UnusableSnapshot => {
+                        invalidate_unusable_snapshot(&key, attempt.generation.as_ref(), &e).await;
+                        // fall through to a fresh boot (which re-creates the snapshot)
+                    }
+                    RestoreFault::LoadFailed => keep_snapshot_after_load_fault(&key, &e),
+                    RestoreFault::Other => return Err(e),
+                },
             }
         }
 
@@ -6943,37 +6999,91 @@ mod tests {
 }
 
 #[cfg(test)]
-mod image_disk_identity_classifier_tests {
-    #[test]
-    fn identity_mismatch_is_a_snapshot_load_failure() {
-        // The restore-time identity check must trigger invalidate-and-fresh-boot,
-        // not a hard run failure: its marker string is classified as a load failure.
-        let err = anyhow::anyhow!(
-            "image disk build changed during launch: /x is now a, snapshot/key was computed against b"
-        );
-        assert!(super::is_snapshot_load_failure(&err));
-        let pmem = anyhow::anyhow!("snapshot pmem image changed: /x (mounted at /m) is missing");
-        assert!(super::is_snapshot_load_failure(&pmem));
-        let unrelated = anyhow::anyhow!("some other failure");
-        assert!(!super::is_snapshot_load_failure(&unrelated));
+mod restore_fault_classifier_tests {
+    use super::{classify_restore_failure, RestoreFault};
+
+    fn classify(text: &str) -> RestoreFault {
+        classify_restore_failure(&anyhow::anyhow!("{text}"))
     }
 
     #[test]
-    fn a_gpu_that_cannot_attach_keeps_the_snapshot() {
+    fn identity_mismatch_is_an_unusable_snapshot() {
+        // The restore-time identity check must trigger invalidate-and-fresh-boot,
+        // not a hard run failure.
+        assert_eq!(
+            classify(
+                "image disk build changed during launch: /x is now a, snapshot/key was \
+                 computed against b"
+            ),
+            RestoreFault::UnusableSnapshot
+        );
+        assert_eq!(
+            classify("snapshot pmem image changed: /x (mounted at /m) is missing"),
+            RestoreFault::UnusableSnapshot
+        );
+        assert_eq!(classify("some other failure"), RestoreFault::Other);
+    }
+
+    /// A format or version rejection is the artifact: it can never load with this binary.
+    #[test]
+    fn a_format_rejection_is_an_unusable_snapshot() {
+        for text in [
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: 11",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: An error occurred \
+             during bitcode serialization: invalid",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: CRC64 validation failed",
+            "Load snapshot error: Failed to restore from snapshot: Invalid snapshot state: \
+             No DRAM memory region defined.",
+        ] {
+            assert_eq!(classify(text), RestoreFault::UnusableSnapshot, "{text}");
+        }
+    }
+
+    /// The load fault from #988: a stale socket at a clone's `--vsock-dir` listener. The
+    /// snapshot is intact, so the run boots fresh and the entry stays.
+    #[test]
+    fn a_host_side_load_fault_keeps_the_snapshot() {
+        assert_eq!(
+            classify(
+                "Load snapshot error: Failed to restore from snapshot: Failed to build microVM \
+                 from snapshot: Failed to restore devices: Error restoring MMIO devices: \
+                 VsockUnixBackend: Error binding to the host-side Unix socket: Address already \
+                 in use (os error 98)"
+            ),
+            RestoreFault::LoadFailed
+        );
+        assert_eq!(
+            classify(
+                "Load snapshot error: Failed to restore from snapshot: Failed to load guest \
+                 memory: Error creating guest memory from uffd: Failed to connect to UDS Unix \
+                 stream: Connection refused (os error 111)"
+            ),
+            RestoreFault::LoadFailed
+        );
+    }
+
+    #[test]
+    fn a_gpu_that_cannot_attach_fails_the_run_and_keeps_the_snapshot() {
         // Firecracker's rendering of a VFIO attach failure during PUT /snapshot/load.
-        // The snapshot is fine; invalidating it would delete a shared cache entry.
-        let attach = anyhow::anyhow!(
-            "Load snapshot error: Failed to restore from snapshot: Failed to attach a \
-             passthrough device on restore: Attaching the passthrough device failed: busy"
+        // The snapshot is fine; invalidating it would delete a shared cache entry, and a
+        // fresh boot would hit the same busy device.
+        assert_eq!(
+            classify(
+                "Load snapshot error: Failed to restore from snapshot: Failed to attach a \
+                 passthrough device on restore: Attaching the passthrough device failed: busy"
+            ),
+            RestoreFault::Other
         );
-        assert!(!super::is_snapshot_load_failure(&attach));
-        let kvm = anyhow::anyhow!(
-            "Load snapshot error: Failed to restore from snapshot: Device passthrough on \
-             restore requires a KVM VM"
+        assert_eq!(
+            classify(
+                "Load snapshot error: Failed to restore from snapshot: Device passthrough on \
+                 restore requires a KVM VM"
+            ),
+            RestoreFault::Other
         );
-        assert!(!super::is_snapshot_load_failure(&kvm));
-        let other = anyhow::anyhow!("Load snapshot error: Failed to restore from snapshot: bad");
-        assert!(super::is_snapshot_load_failure(&other));
     }
 }
 
