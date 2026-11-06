@@ -2288,15 +2288,85 @@ def markdown_report(analysis: dict) -> str:
     return "\n".join(lines)
 
 
+# What this analyzer imports from its own directory, itself included. A run's
+# runtime bundle must hold every one of them for the analysis to run from it.
+ANALYSIS_SOURCES = (
+    "reqscale_analyze.py", "reqscale.py", "reqbench.py", "reqanalyze.py",
+    "campaign_summary.py", "records.py",
+)
+FROM_RUN_BUNDLE = "--from-run-bundle"
+
+
+def run_bundle(run_dir: str) -> str:
+    """The runtime bundle a scale run was measured from, checked whole.
+
+    reqbench.sh stages the bundle at <campaign>/runtime/<sha256 of its
+    MANIFEST.sha256>, and reqscale.py records that hash in the run's
+    provenance.json as runtime_bundle_sha256; the run directory sits beside
+    runtime/ in the same campaign directory. The bundle is refused when it is
+    missing, when its manifest hashes to anything else, when a file it lists no
+    longer matches, or when it does not hold every source the analysis runs.
+    """
+    provenance = _load_json(os.path.join(run_dir, "provenance.json"))
+    digest = provenance.get("runtime_bundle_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise AnalysisInvalid(f"the run records no runtime bundle: runtime_bundle_sha256={digest!r}")
+    bundle = os.path.join(os.path.dirname(run_dir), "runtime", digest)
+    manifest = os.path.join(bundle, "MANIFEST.sha256")
+    if not os.path.isfile(manifest):
+        raise AnalysisInvalid(f"the run's runtime bundle is missing: {manifest}")
+    if reqscale.sha256_file(manifest) != digest:
+        raise AnalysisInvalid(f"the run's runtime bundle manifest no longer hashes to {digest}: {manifest}")
+    listed = set()
+    with open(manifest) as stream:
+        for number, line in enumerate(stream, 1):
+            parts = line.rstrip("\n").split("  ", 1)
+            if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]) or "/" in parts[1]:
+                raise AnalysisInvalid(f"{manifest}:{number}: not a sha256sum line")
+            expected, name = parts
+            path = os.path.join(bundle, name)
+            if not os.path.isfile(path) or reqscale.sha256_file(path) != expected:
+                raise AnalysisInvalid(f"the run's runtime bundle changed: {path} does not match {manifest}")
+            listed.add(name)
+    missing = [name for name in ANALYSIS_SOURCES if name not in listed]
+    if missing:
+        raise AnalysisInvalid(
+            f"the run's runtime bundle {bundle} does not hold {', '.join(missing)}; "
+            "it predates analysis from the bundle, so its analysis cannot run from it")
+    return bundle
+
+
+def exec_from_run_bundle(run_dir: str, argv: list[str]) -> None:
+    """Return when this process already runs from the run's bundle; otherwise
+    replace it with the bundle's analyzer on the same arguments."""
+    bundle = run_bundle(run_dir)
+    if os.path.realpath(HERE) == os.path.realpath(bundle):
+        return
+    script = os.path.join(bundle, "reqscale_analyze.py")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, script, *argv])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--json-out")
     parser.add_argument("--markdown-out")
+    parser.add_argument(
+        FROM_RUN_BUNDLE, action="store_true",
+        help="run the analysis from the runtime bundle the run was measured from "
+             "(what the make targets do), refusing when that bundle is missing or changed")
     args = parser.parse_args()
     if not args.json_out and not args.markdown_out:
         parser.error("at least one of --json-out or --markdown-out is required")
     run_dir = os.path.abspath(args.run_dir)
+    if args.from_run_bundle:
+        try:
+            exec_from_run_bundle(run_dir, sys.argv[1:])
+        except (AnalysisInvalid, reqscale.MeasurementInvalid, OSError, ValueError) as error:
+            print(f"{type(error).__name__}: {error}", file=sys.stderr)
+            return 4
     # The reader side of the WITHDRAWN protocol in AGENTS.md: shared locks on
     # the run directory and the directory holding it (for a corpus run, the
     # campaign whose marker and DNS evidence authorize it) from the first read

@@ -1428,16 +1428,20 @@ bench-chromium-scale: check-chromium-scale
 	TAG="$(SCALE_TAG)" RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh scale \
 		$(SCALE_REQSCALE_ARGS)
 
+# Both run the analyzer the run was measured with: the checkout's copy checks
+# the run's runtime bundle (reqscale_analyze.run_bundle) and execs the bundle's
+# own reqscale_analyze.py, so an edit to the checkout during a long campaign
+# cannot produce or authorize the analysis that names that bundle.
 analyze-chromium-scale:
 	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
 	@test -n "$(SCALE_ANALYSIS_JSON)" || (echo "ERROR: SCALE_ANALYSIS_JSON required"; exit 1)
-	python3 bench/chromium/reqscale_analyze.py \
+	python3 bench/chromium/reqscale_analyze.py --from-run-bundle \
 		--run-dir "$(SCALE_RUN_DIR)" --json-out "$(SCALE_ANALYSIS_JSON)"
 
 report-chromium-scale:
 	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)
 	@test -n "$(SCALE_REPORT)" || (echo "ERROR: SCALE_REPORT required"; exit 1)
-	python3 bench/chromium/reqscale_analyze.py \
+	python3 bench/chromium/reqscale_analyze.py --from-run-bundle \
 		--run-dir "$(SCALE_RUN_DIR)" --markdown-out "$(SCALE_REPORT)"
 
 # Run three ordinary nextest lanes concurrently. Each lane keeps the repository's

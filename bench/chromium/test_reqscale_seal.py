@@ -192,10 +192,167 @@ class ScaleShell(unittest.TestCase):
                 sealed = {line.split()[1] for line in f}
             self.assertLessEqual({"fcvm", "reqscale.py", "reqscale_analyze.py", "guardexec.py",
                                   "guardsupervise.py", "faulttrace.bt"}, sealed)
+            self.assertLessEqual(set(reqscale_analyze.ANALYSIS_SOURCES), sealed,
+                                 "the bundle cannot run the scale analysis")
             self.assertIn(f"REQBENCH_RUNTIME_BUNDLE={bundle}", argv)
             self.assertEqual(argv[argv.index("--snapshot-tag") + 1], "cb-scale")
             self.assertEqual(argv[argv.index("--url") + 1], "http://127.0.0.1/x")
 
+
+
+REPO = os.path.dirname(os.path.dirname(HERE))
+ANALYZER = os.path.join(HERE, "reqscale_analyze.py")
+
+
+def write_bundle(campaign, files):
+    """A runtime bundle at campaign/runtime/<sha256 of its manifest>, as
+    reqbench.sh stages one, holding files {name: bytes}; returns its path."""
+    stage = os.path.join(campaign, "runtime", ".stage")
+    os.makedirs(stage)
+    lines = []
+    for name, data in files.items():
+        with open(os.path.join(stage, name), "wb") as f:
+            f.write(data)
+        lines.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+    manifest = "".join(lines).encode()
+    with open(os.path.join(stage, "MANIFEST.sha256"), "wb") as f:
+        f.write(manifest)
+    bundle = os.path.join(campaign, "runtime", hashlib.sha256(manifest).hexdigest())
+    os.rename(stage, bundle)
+    return bundle
+
+
+# A bundled analyzer that records it ran, and with which arguments.
+STUB = b"""import json, os, sys
+with open(os.environ["STUB_MARK"], "w") as f:
+    json.dump({"here": os.path.dirname(os.path.abspath(__file__)), "argv": sys.argv[1:]}, f)
+"""
+
+
+class ScaleAnalysisRunsFromTheRunsBundle(unittest.TestCase):
+    """#1101: the scale campaign's analysis passes, and the report target, run
+    the analyzer sealed with the run, not the checkout's, and refuse when that
+    bundle is missing or no longer matches its manifest."""
+
+    def _campaign(self, d, files):
+        campaign = os.path.join(d, "campaign")
+        bundle = write_bundle(campaign, files)
+        run = os.path.join(campaign, "scale-attempt")
+        os.makedirs(run)
+        with open(os.path.join(run, "provenance.json"), "w") as f:
+            json.dump({"runtime_bundle_sha256": os.path.basename(bundle)}, f)
+        return bundle, run
+
+    def _stub_files(self, analyzer=STUB):
+        files = {name: b"# sealed\n" for name in reqscale_analyze.ANALYSIS_SOURCES}
+        files["reqscale_analyze.py"] = analyzer
+        return files
+
+    def _make(self, target, run, out_var, out, mark):
+        return subprocess.run(
+            ["make", "--no-print-directory", "-C", REPO, target,
+             f"SCALE_RUN_DIR={run}", f"{out_var}={out}"],
+            env=dict(os.environ, STUB_MARK=mark), capture_output=True, text=True, timeout=120)
+
+    def test_the_make_targets_run_the_bundled_analyzer(self):
+        """RED BEFORE THE FIX: both targets ran the checkout's
+        reqscale_analyze.py, which never wrote the bundled stub's mark."""
+        for target, out_var in (("analyze-chromium-scale", "SCALE_ANALYSIS_JSON"),
+                                ("report-chromium-scale", "SCALE_REPORT")):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as d:
+                bundle, run = self._campaign(d, self._stub_files())
+                mark = os.path.join(d, "mark.json")
+                out = os.path.join(d, "out")
+                result = self._make(target, run, out_var, out, mark)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(os.path.exists(mark),
+                                f"{target} did not run the run's bundled analyzer: {result.stdout}{result.stderr}")
+                with open(mark) as f:
+                    ran = json.load(f)
+                self.assertEqual(os.path.realpath(ran["here"]), os.path.realpath(bundle))
+                self.assertEqual(ran["argv"][ran["argv"].index("--run-dir") + 1], run)
+                self.assertIn(out, ran["argv"])
+
+    def test_a_missing_changed_or_old_bundle_is_refused(self):
+        """Each refusal exits 4 with the reason and writes no output, and the
+        bundled analyzer never runs."""
+        def missing(bundle, run):
+            os.rename(bundle, bundle + ".gone")
+
+        def changed(bundle, run):
+            path = os.path.join(bundle, "campaign_summary.py")
+            with open(path, "wb") as f:
+                f.write(b"# edited\n")
+
+        def renamed(bundle, run):
+            with open(os.path.join(bundle, "MANIFEST.sha256"), "ab") as f:
+                f.write(b"")
+            other = "0" * 64
+            with open(os.path.join(run, "provenance.json"), "w") as f:
+                json.dump({"runtime_bundle_sha256": other}, f)
+            os.rename(bundle, os.path.join(os.path.dirname(bundle), other))
+
+        def unrecorded(bundle, run):
+            with open(os.path.join(run, "provenance.json"), "w") as f:
+                json.dump({}, f)
+
+        cases = {"missing": (missing, None, "bundle is missing"),
+                 "changed": (changed, None, "bundle changed"),
+                 "manifest": (renamed, None, "no longer hashes"),
+                 "unrecorded": (unrecorded, None, "records no runtime bundle"),
+                 "old": (None, "campaign_summary.py", "predates")}
+        for case, (spoil, drop, expected) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as d:
+                files = self._stub_files()
+                if drop:
+                    del files[drop]
+                bundle, run = self._campaign(d, files)
+                if spoil:
+                    spoil(bundle, run)
+                mark = os.path.join(d, "mark.json")
+                out = os.path.join(d, "analysis.json")
+                result = subprocess.run(
+                    [sys.executable, ANALYZER, "--from-run-bundle", "--run-dir", run, "--json-out", out],
+                    env=dict(os.environ, STUB_MARK=mark), capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertFalse(os.path.exists(mark), "the analyzer of a refused bundle ran")
+                self.assertFalse(os.path.exists(out))
+
+    def test_a_staged_bundle_analyzes_its_run(self):
+        """The bundle reqbench.sh stages holds everything the analysis imports:
+        a complete run analyzed through make from that bundle produces its
+        analysis, and the bundled analyzer does not exec itself again."""
+        with tempfile.TemporaryDirectory() as d:
+            sources = {}
+            for name in reqscale_analyze.ANALYSIS_SOURCES:
+                with open(os.path.join(HERE, name), "rb") as f:
+                    sources[name] = f.read()
+            campaign = os.path.join(d, "campaign")
+            bundle = write_bundle(campaign, sources)
+            run = os.path.join(campaign, "scale-attempt")
+            os.makedirs(run)
+            CompleteAnalyzerFixture.build_run(run)
+            path = os.path.join(run, "provenance.json")
+            with open(path) as f:
+                provenance = json.load(f)
+            digest = os.path.basename(bundle)
+            provenance["runtime_bundle_sha256"] = digest
+            provenance.setdefault("golden_creator", {
+                "creator_fcvm_sha256": provenance["fcvm_sha256"],
+                "source_revision": provenance["source_revision"]})
+            provenance["golden_creator"]["creator_runtime_bundle_sha256"] = digest
+            with open(path, "w") as f:
+                json.dump(provenance, f, sort_keys=True)
+            expected = reqscale_analyze.analyze(run)
+            out = os.path.join(d, "analysis.json")
+            result = subprocess.run(
+                ["make", "--no-print-directory", "-C", REPO, "analyze-chromium-scale",
+                 f"SCALE_RUN_DIR={run}", f"SCALE_ANALYSIS_JSON={out}"],
+                capture_output=True, text=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with open(out) as f:
+                self.assertEqual(json.load(f), json.loads(json.dumps(expected)))
 
 
 class ScaleOutputOwnership(unittest.TestCase):

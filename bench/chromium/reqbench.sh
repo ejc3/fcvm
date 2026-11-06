@@ -130,9 +130,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
     source_revision_before=$(git -C "$REPO" rev-parse HEAD)
     mkdir -p "$RESULTS/runtime"
     stage_dir=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
-    # The request harness, then the scale harness (reqscale.HARNESS_SOURCES).
+    # The request harness, then the scale harness (reqscale.HARNESS_SOURCES),
+    # whose analysis also runs from here and reads the campaign's evidence
+    # through campaign_summary.py and records.py.
     runtime_sources=(reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py
-        reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py)
+        reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py
+        campaign_summary.py records.py)
     for source in "${runtime_sources[@]}"; do
         cp --reflink=auto "$HERE/$source" "$stage_dir/$source"
     done
