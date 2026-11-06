@@ -8,7 +8,8 @@
 # Then it serves the Worker again with a test service token in front of a stand-in
 # coordinator (scripts/worker-proxy-check.ts) and requires the page to connect to its own
 # origin, and /live and /poster.jpg to reach the coordinator with the token and without the
-# viewer's Access cookie (core/live-proxy.ts).
+# viewer's Access cookie (core/live-proxy.ts), and without leaking coordinator Access
+# credentials back to the viewer on either the HTTP or the WebSocket response.
 #
 # Usage: scripts/worker-smoke.sh <port>   (run from fleet/web; uses <port> to <port>+2)
 set -euo pipefail
