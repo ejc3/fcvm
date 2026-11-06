@@ -1008,8 +1008,10 @@ pub struct RunArgs {
     /// Routed mode connects to the guest address from inside the VM's named namespace.
     /// Bridged mode connects from the host to the VM's own veth address, which the guest
     /// holds in a VM that booted and which forwards to the guest in a restored VM.
+    /// Only http:// URLs: an https:// one is refused, since the probe would speak plain HTTP
+    /// to a TLS port.
     /// Example: --health-check http://myapp.example.com/status
-    #[arg(long)]
+    #[arg(long, value_parser = parse_health_check)]
     pub health_check: Option<String>,
 
     /// Take a startup snapshot of the running container at its first Healthy, and restore
@@ -1790,6 +1792,12 @@ fn parse_mem(s: &str) -> Result<u32, String> {
 }
 
 /// Parse --cpu value: either an integer or "unlimited" (all host CPUs, capped at 32).
+fn parse_health_check(s: &str) -> Result<String, String> {
+    crate::health::parse_health_check_url(s)
+        .map(|_| s.to_string())
+        .map_err(|e| format!("{e:#}"))
+}
+
 fn parse_cpu(s: &str) -> Result<u8, String> {
     if s.eq_ignore_ascii_case("unlimited") {
         let cpus = std::thread::available_parallelism()
@@ -1836,6 +1844,29 @@ mod tests {
             panic!("expected podman prepare command");
         };
         args
+    }
+
+    /// `--health-check https://...` is refused when the command is parsed: the probe is plain
+    /// HTTP, and it used to send that to port 443, where the VM read unhealthy with nothing
+    /// naming the cause (#958).
+    #[test]
+    fn a_health_check_url_that_is_not_http_is_refused_at_parse_time() {
+        for command in ["run", "prepare"] {
+            let refused = Cli::try_parse_from([
+                "fcvm",
+                "podman",
+                command,
+                "--name",
+                "web",
+                "--health-check",
+                "https://web.internal/ready",
+                "nginx:alpine",
+            ])
+            .err()
+            .unwrap_or_else(|| panic!("podman {command} accepted an https health check"))
+            .to_string();
+            assert!(refused.contains("plain HTTP"), "{command}: {refused}");
+        }
     }
 
     #[test]
