@@ -55,6 +55,40 @@ fn simple_nested_smoke_test_propagates_the_snapshot_mode_into_l2() {
     );
 }
 
+/// #1393: every fcvm a nested test runs in L1 has a data dir of its own. The host's data
+/// dir reaches L1 through the fuse-pipe map of /mnt/fcvm-btrfs, and flock over fuse-pipe is
+/// granted in each guest kernel, so an L1 fcvm using it would see the host's owner locks as
+/// free and its reclaim pass would undo a live host fcvm's resources.
+///
+/// RED BEFORE THE FIX: the smoke test's `timeout 600 fcvm podman run` had no FCVM_DATA_DIR.
+#[test]
+fn every_inner_fcvm_run_has_a_data_dir_of_its_own() {
+    let source = nested_test_source();
+    let mut runs = 0;
+    for (at, _) in source.match_indices("fcvm podman run \\") {
+        let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line = &source[line_start..at];
+        // The host's own run of a built binary (`./target/release/fcvm`) is not in L1.
+        if line.ends_with('/') {
+            continue;
+        }
+        runs += 1;
+        assert!(
+            line.contains("FCVM_DATA_DIR=$NESTED_DATA"),
+            "an inner fcvm run in tests/test_kvm.rs uses the host's data dir: {line}fcvm podman run"
+        );
+        let before = &source[..line_start];
+        let defined = before
+            .rfind("NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)")
+            .expect("FCVM_DATA_DIR=$NESTED_DATA with no NESTED_DATA defined before it");
+        assert!(
+            !before[defined..].contains("fcvm podman run"),
+            "an inner fcvm run reuses the NESTED_DATA of an earlier run"
+        );
+    }
+    assert!(runs >= 4, "found {runs} inner fcvm runs in tests/test_kvm.rs, expected at least 4");
+}
+
 /// #875: an L1 whose resolv.conf sources name only a loopback stub fails the
 /// inner fcvm with an error about the host's DNS, naming nothing about L1. The
 /// smoke test must reach its own verdict on L1 before the inner run.

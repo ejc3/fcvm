@@ -548,7 +548,14 @@ except OSError as e:
         # would block the capture even after timeout(1) reaps the inner fcvm.
         # SIGTERM from timeout(1) lets the inner fcvm tear the L2 VM down.
         inner_log=/tmp/inner-fcvm-run.log
-        timeout 600 fcvm podman run \
+        # A data dir of L1's own on the mapped store (the same filesystem as the
+        # base rootfs, so the L2 disk is a reflink). The host's data dir holds
+        # host root's owner records, and flock over fuse-pipe is granted in each
+        # guest kernel, so an L1 reclaim pass there could take a live host
+        # owner's lock and undo its resources (#1393).
+        NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)
+        mkdir -p $NESTED_DATA/state $NESTED_DATA/vm-disks
+        FCVM_DATA_DIR=$NESTED_DATA timeout 600 fcvm podman run \
             --name inner-test \
             --network bridged \
             --cmd "printf '%s_%s\n' NESTED_SUCCESS INNER_VM_WORKS" \
@@ -556,6 +563,7 @@ except OSError as e:
         rc=$?
         echo "INNER_FCVM_EXIT_CODE=$rc"
         tail -c 131072 "$inner_log"
+        rm -rf "$NESTED_DATA"
         if [ "$rc" -ne 0 ]; then
             echo "=== L1 dmesg tail ==="
             dmesg | tail -80
