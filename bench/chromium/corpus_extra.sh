@@ -153,7 +153,7 @@ stage_runtime_bundle() {
         corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py
         corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py
         owned_process.py phase_supervisor.py host_resource_finalizer.py
-        serve_guardian.py corpus_campaign.sh
+        serve_guardian.py cleanup_owner.py corpus_campaign.sh
         reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py
         campaign_summary.py records.py
     )
@@ -590,7 +590,7 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
     for f in corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py \
             corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py \
             owned_process.py phase_supervisor.py host_resource_finalizer.py \
-            serve_guardian.py corpus_campaign.sh; do
+            serve_guardian.py cleanup_owner.py corpus_campaign.sh; do
         echo " \"$f\": \"$(sha256sum "$BENCH/$f" | cut -d' ' -f1)\","
     done
     echo " \"fcvm\": \"$(sha256sum "$BENCH/fcvm" | cut -d' ' -f1)\""
@@ -1166,7 +1166,15 @@ python3 "$BENCH/serve_guardian.py" \
         phase_command=$7
         export FCVM_FINALIZER_MODE=dnsmasq
         export FCVM_DNSMASQ_WAS_ACTIVE="$dnsmasq_was_active"
-        exec python3 "$supervisor" --expected-parent "$PPID" \
+        # cleanup_owner.py, beside the supervisor, is its parent and subreaper:
+        # a supervisor killed after it armed completion leaves it to drain the
+        # replay process set, restore dnsmasq and publish completion, so the
+        # guardian releases the lease only after both (#895).
+        exec python3 "${supervisor%/*}/cleanup_owner.py" \
+            --completion-path "$completion_path" \
+            --completion-token "$completion_token" \
+            --finalizer "$finalizer" --finalizer-timeout 60 -- \
+            python3 "$supervisor" --expected-parent "$$" \
             --control-path "$control_path" --return-command-status-on-signal \
             --completion-path "$completion_path" \
             --completion-token "$completion_token" \
