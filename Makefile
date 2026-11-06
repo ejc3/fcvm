@@ -879,18 +879,26 @@ setup-default: build setup-btrfs
 # storage setup, config synchronisation and any future build routing stay in one
 # place rather than being duplicated in YAML.
 #
-# FORCE=1 makes a forced rebuild actually rebuild, via --force-build-kernels.
-# Deleting the cached file is NOT enough: the release being replaced is still
-# published at build time, so `--build-kernels` (which only builds after a FAILED
-# download) downloads it again and the job republishes the exact artifact the
-# operator asked to replace. A post-run existence check cannot catch that, since
-# a download leaves the same file. KERNEL_FILE names the artifact to assert on.
+# It always rebuilds from source (--force-build-kernels). The workflow runs it
+# only when the release is missing or a rebuild was forced, and either way the
+# file it publishes must come from this build: --build-kernels takes a file a
+# persistent runner kept under the same content-addressed name, or downloads
+# the release a forced rebuild was asked to replace (#957). KERNEL_FILE names
+# the artifact to assert on.
 release-default-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 release-default-kernel: build setup-btrfs
-	@if [ "$(FORCE)" = "1" ] && [ -z "$(KERNEL_FILE)" ]; then 		echo "ERROR: FORCE=1 needs KERNEL_FILE=<vmlinux-...bin> to assert the rebuild produced it"; 		exit 1; 	fi
+	@if [ -z "$(KERNEL_FILE)" ]; then \
+		echo "ERROR: release-default-kernel needs KERNEL_FILE=<vmlinux-...bin> to assert the build produced it"; \
+		exit 1; \
+	fi
 	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
-	@if [ "$(FORCE)" = "1" ]; then 		echo "==> FORCE: rebuilding from source, bypassing the published release"; 		$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --force-build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	else 		$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	fi
-	@if [ -n "$(KERNEL_FILE)" ] && [ ! -f "/mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)" ]; then 		echo "ERROR: setup finished without producing /mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)"; 		ls -la /mnt/fcvm-btrfs/kernels/; 		exit 1; 	fi
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --force-build-kernels \
+		--config "$(CURDIR)/rootfs-config.toml"
+	@if [ ! -f "/mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)" ]; then \
+		echo "ERROR: setup finished without producing /mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)"; \
+		ls -la /mnt/fcvm-btrfs/kernels/; \
+		exit 1; \
+	fi
 
 setup-fcvm: private SHELL := $(TARGET_LEASE_SHELL)
 setup-fcvm: setup-default

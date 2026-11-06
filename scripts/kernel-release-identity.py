@@ -118,14 +118,21 @@ def identity(profile_name, config_arch, check_runner=True):
     if not REPO.fullmatch(repo):
         raise IdentityError(f"kernel_repo '{repo}' is not an owner/name pair")
 
+    if table.get("published", True) is not True:
+        raise IdentityError(
+            f"{profile_name}.{config_arch} sets published = false, so `fcvm setup` never "
+            "downloads a release of it; there is nothing to publish"
+        )
+
     sha = build_inputs_sha(table.get("build_inputs", []))
     manifest = table.get("kernel_sha")
-    if manifest is None and profile_name == "default":
+    if manifest is None:
         # An installed binary has no kernel/ tree to hash, so it finds the
-        # default release only through this value.
+        # release only through this value.
         raise IdentityError(
-            f"kernel_profiles.default.{config_arch} has no kernel_sha; without it an installed "
-            "binary cannot name the release this would publish"
+            f"kernel_profiles.{profile_name}.{config_arch} has no kernel_sha; without it an "
+            f"installed binary cannot name the release this would publish. Set it to {sha}, "
+            "the build_inputs hash this printed"
         )
     if manifest is not None:
         if not (isinstance(manifest, str) and re.fullmatch(r"[0-9a-f]{12}", manifest)):
@@ -134,8 +141,8 @@ def identity(profile_name, config_arch, check_runner=True):
             )
         if manifest != sha:
             raise IdentityError(
-                f"kernel_sha '{manifest}' does not match build_inputs hash '{sha}'; update the "
-                "manifest"
+                f"kernel_sha '{manifest}' does not match build_inputs hash '{sha}'; set "
+                f"kernel_sha = \"{sha}\" in [kernel_profiles.{profile_name}.{config_arch}]"
             )
 
     # The client names the artifact after the machine it runs on, so a leg that

@@ -339,6 +339,14 @@ fn get_custom_kernel_path(profile: &KernelProfile, profile_name: &str) -> Result
     Ok(paths::kernel_dir().join(filename))
 }
 
+/// What setup says for a table with `published = false` and no --build-kernels.
+fn unpublished_kernel_message(profile_name: &str) -> String {
+    format!(
+        "kernel profile '{profile_name}' is not published as a release (published = false in \
+         rootfs-config.toml). Build it: fcvm setup --kernel-profile {profile_name} --build-kernels"
+    )
+}
+
 async fn ensure_custom_kernel(
     profile: &KernelProfile,
     profile_name: &str,
@@ -371,6 +379,10 @@ async fn ensure_custom_kernel(
         );
     }
 
+    if !profile.is_published() && !allow_build {
+        bail!("{}", unpublished_kernel_message(profile_name));
+    }
+
     // Create directory and acquire lock
     let flock =
         super::lock_store_dir(&kernel_dir.join(format!("{}.lock", filename)), "kernel").await?;
@@ -379,6 +391,19 @@ async fn ensure_custom_kernel(
     if kernel_path.exists() {
         debug!(path = %kernel_path.display(), "kernel exists (created by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
+        return Ok(kernel_path);
+    }
+
+    // A table no job publishes has no release to ask for.
+    if !profile.is_published() {
+        println!(
+            "  → Building kernel profile '{}' locally (no release is published; may take 10-20 minutes)...",
+            profile_name
+        );
+        let built = build_kernel_locally(profile, profile_name, &kernel_path).await;
+        flock.unlock().map_err(|(_, err)| err)?;
+        built?;
+        println!("  ✓ Kernel built (profile: {})", profile_name);
         return Ok(kernel_path);
     }
 
@@ -3205,6 +3230,29 @@ cp vmlinux arch/arm64/boot/Image
                 .success(),
             "the final cache entry must be a complete xz stream"
         );
+    }
+
+    /// A table with `published = false` never reaches the release download: without
+    /// --build-kernels setup fails before asking GitHub for a release no job builds
+    /// (#957), and says how to build it.
+    #[tokio::test]
+    async fn an_unpublished_profile_is_never_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kernel.conf");
+        std::fs::write(&input, "CONFIG_KVM=y\n").unwrap();
+        let profile = KernelProfile {
+            kernel_version: "6.18.60".into(),
+            // Nothing answers here: a download attempt fails with a connection error,
+            // not with the message below.
+            kernel_repo: "invalid.example/none".into(),
+            build_inputs: vec![input.display().to_string()],
+            published: Some(false),
+            ..Default::default()
+        };
+        let err = ensure_custom_kernel(&profile, "experiment", true, false)
+            .await
+            .expect_err("an unpublished profile without --build-kernels has no kernel");
+        assert_eq!(err.to_string(), unpublished_kernel_message("experiment"));
     }
 
     fn profile_with_inputs(build_inputs: Vec<String>) -> KernelProfile {

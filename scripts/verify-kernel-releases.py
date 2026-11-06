@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that every kernel Build Kernels publishes has its release asset.
 
-usage: verify-kernel-releases.py [--list-legs] [--base-url URL]
+usage: verify-kernel-releases.py [--list-legs] [--base-url URL] [--leg PROFILE ARCH]...
 
 `fcvm setup --kernel-profile <profile>` downloads
 <base>/<kernel_repo>/releases/download/<tag>/<file>. Every automated consumer
@@ -10,12 +10,16 @@ passes --build-kernels, so a missing asset becomes a silent local build and the
 tag and file name scripts/kernel-release-identity.py derives, and names every
 one that is missing.
 
+--leg limits the check to the named legs; Build Runner AMI checks only the
+kernel its image downloads.
+
 Exit status: 0 when every asset is there, 1 when at least one is missing, 2 when
 it could not check, which is never reported as missing or as present.
 """
 
 import http.client
 import importlib.util
+import os
 import pathlib
 import sys
 import time
@@ -43,7 +47,11 @@ LEGS = [
 # redirect is an answer about the asset: a renamed or transferred repository
 # answers 301 for every path under its old name, present or not.
 FOUND = {200, 302}
-ATTEMPTS = 2
+# Four attempts, RETRY_DELAY seconds before the second and doubling after, so
+# two dropped requests in a row do not fail a run whose kernels are all
+# published (#957).
+ATTEMPTS = 4
+RETRY_DELAY = float(os.environ.get("FCVM_RELEASE_CHECK_RETRY_DELAY", "2"))
 
 
 def load_identity():
@@ -69,7 +77,7 @@ def probe(url):
     reason = "no attempt made"
     for attempt in range(ATTEMPTS):
         if attempt:
-            time.sleep(1)
+            time.sleep(RETRY_DELAY * 2 ** (attempt - 1))
         try:
             with opener.open(request, timeout=30) as response:
                 status = response.status
@@ -95,21 +103,32 @@ def main(argv):
         print("\n".join(f"{profile} {arch}" for profile, arch in LEGS))
         return 0
     base_url = "https://github.com"
-    if len(arguments) == 2 and arguments[0] == "--base-url":
-        base_url = arguments[1].rstrip("/")
-        if not base_url.startswith(("http://", "https://")):
-            print(
-                f"ERROR: --base-url must be an http or https URL, got '{base_url}'",
-                file=sys.stderr,
-            )
+    legs = []
+    while arguments:
+        if len(arguments) >= 2 and arguments[0] == "--base-url":
+            base_url = arguments[1].rstrip("/")
+            if not base_url.startswith(("http://", "https://")):
+                print(
+                    f"ERROR: --base-url must be an http or https URL, got '{base_url}'",
+                    file=sys.stderr,
+                )
+                return 2
+            arguments = arguments[2:]
+        elif len(arguments) >= 3 and arguments[0] == "--leg":
+            leg = (arguments[1], arguments[2])
+            if leg not in LEGS:
+                print(f"ERROR: Build Kernels publishes no leg {leg[0]} {leg[1]}", file=sys.stderr)
+                return 2
+            legs.append(leg)
+            arguments = arguments[3:]
+        else:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
             return 2
-    elif arguments:
-        print(__doc__.split("\n\n")[1], file=sys.stderr)
-        return 2
+    legs = legs or LEGS
 
     identity = load_identity()
     missing, unknown = [], []
-    for profile, arch in LEGS:
+    for profile, arch in legs:
         try:
             fields = identity.identity(profile, arch, check_runner=False)
         except (identity.IdentityError, OSError, ValueError) as error:
@@ -130,19 +149,19 @@ def main(argv):
 
     if unknown:
         print(
-            f"ERROR: could not check {len(unknown)} of {len(LEGS)} assets, so this run "
+            f"ERROR: could not check {len(unknown)} of {len(legs)} assets, so this run "
             "proves nothing about them",
             file=sys.stderr,
         )
         return 2
     if missing:
         print(
-            f"ERROR: {len(missing)} of {len(LEGS)} kernel release assets are missing; "
+            f"ERROR: {len(missing)} of {len(legs)} kernel release assets are missing; "
             "`fcvm setup` gets a 404 for each and builds locally or fails",
             file=sys.stderr,
         )
         return 1
-    print(f"all {len(LEGS)} kernel release assets are published")
+    print(f"all {len(legs)} kernel release assets are published")
     return 0
 
 
