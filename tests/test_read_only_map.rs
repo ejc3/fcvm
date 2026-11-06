@@ -749,12 +749,13 @@ async fn test_map_inside_read_only_map_is_mounted_over_it() -> Result<()> {
 /// set up, so a run still going after this booted a VM.
 const REFUSAL_LIMIT: Duration = Duration::from_secs(240);
 
-/// Run `fcvm podman run --name <vm_name> --network rootless <maps> <image>`
+/// Run `fcvm podman run --name <vm_name> --network rootless <maps> <extra> <image>`
 /// to its end and return its output. The run is killed, and this fails, when
 /// it is still going after `REFUSAL_LIMIT`.
 async fn run_to_its_end(
     vm_name: &str,
     maps: &[String],
+    extra: &[String],
     image: &str,
 ) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::new(common::find_fcvm_binary()?);
@@ -763,6 +764,7 @@ async fn run_to_its_end(
         command.args(["--map", map]);
     }
     command
+        .args(extra)
         .arg(image)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -835,6 +837,7 @@ async fn test_mount_point_missing_from_read_only_map_is_refused_before_boot() ->
         let output = run_to_its_end(
             &vm_name,
             &[inner.clone(), outer.clone()],
+            &[],
             common::TEST_IMAGE,
         )
         .await?;
@@ -879,6 +882,7 @@ async fn test_read_only_map_around_image_store_is_refused_before_boot() -> Resul
         let output = run_to_its_end(
             &vm_name,
             std::slice::from_ref(&map),
+            &[],
             "localhost/fcvm-test-image-that-is-never-built:latest",
         )
         .await?;
@@ -903,5 +907,52 @@ async fn test_read_only_map_around_image_store_is_refused_before_boot() -> Resul
     .await;
 
     std::fs::remove_dir_all(&host_dir).ok();
+    result
+}
+
+/// A map whose guest path lies inside a `--disk-dir` guest path is refused
+/// before any VM boots, and the error names both arguments. fc-agent mounts
+/// the maps before the disks, so the disk would cover the map.
+///
+/// RED BEFORE THE FIX (#1044): the run became healthy, and `ls /data/conf`
+/// listed the disk's file in the guest OS and in the container instead of the
+/// map's.
+#[tokio::test]
+async fn test_map_inside_disk_dir_is_refused_before_boot() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("map-in-disk");
+    let disk_host = fresh_dir("map-in-disk-disk")?;
+    let map_host = fresh_dir("map-in-disk-map")?;
+    std::fs::create_dir(disk_host.join("conf"))?;
+    std::fs::write(disk_host.join("conf/from-disk.txt"), "disk")?;
+    std::fs::write(map_host.join("from-map.txt"), "map")?;
+
+    let result = async {
+        let map = format!("{}:/data/conf:ro", map_host.display());
+        let disk_dir = format!("{}:/data", disk_host.display());
+        let output = run_to_its_end(
+            &vm_name,
+            std::slice::from_ref(&map),
+            &["--disk-dir".to_string(), disk_dir.clone()],
+            common::TEST_IMAGE,
+        )
+        .await?;
+        let wrong = left_by_refused_run(
+            &output,
+            &vm_name,
+            &[format!("--map {map}"), format!("--disk-dir {disk_dir}")],
+            &[(&map_host, &["from-map.txt"]), (&disk_host, &["conf"])],
+        )
+        .await?;
+        anyhow::ensure!(
+            wrong.is_empty(),
+            "a map inside a --disk-dir guest path was not refused before boot:\n{}",
+            wrong.join("\n")
+        );
+        Ok(())
+    }
+    .await;
+
+    std::fs::remove_dir_all(&disk_host).ok();
+    std::fs::remove_dir_all(&map_host).ok();
     result
 }

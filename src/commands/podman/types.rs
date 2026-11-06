@@ -416,7 +416,50 @@ pub(crate) fn checked_volume_mappings(
     let mount_points = guest_mount_points(args, &maps, mounts_image_store);
     check_mount_points_inside_read_only_maps(&maps, &mount_points)?;
     check_pmem_mount_points(&mount_points)?;
+    check_mount_order(&mount_points)?;
     Ok(maps)
+}
+
+/// Refuse a mount point that a mount fc-agent makes later would cover.
+///
+/// fc-agent mounts in a fixed order, the order `guest_mount_points` lists: the maps, ordered
+/// among themselves so that an outer map comes before a map inside it, then the `--disk` and
+/// `--disk-dir` disks as given, the pmem devices, the NFS shares and the image store. A mount
+/// at or above a path that was mounted before it covers that mount: the guest and the
+/// container see the later filesystem's directory where they asked for the earlier one, and
+/// writes meant for one land in the other (#1044). A mount point inside a mount made before it
+/// is mounted over that mount's directory, which is what was asked. Two mounts at one path
+/// cover one another whatever their order.
+///
+/// The comparisons are lexical. A symlink in the guest that joins two paths is caught by
+/// fc-agent at boot (`MountRecord::check_none_covered`).
+fn check_mount_order(mount_points: &[(String, String)]) -> Result<()> {
+    let is_map = |argument: &str| argument.starts_with("--map ");
+    for (earlier_at, (earlier, earlier_path)) in mount_points.iter().enumerate() {
+        for (later, later_path) in &mount_points[earlier_at + 1..] {
+            let (earlier_guest, later_guest) = (Path::new(earlier_path), Path::new(later_path));
+            if earlier_guest == later_guest {
+                bail!(
+                    "{later} and {earlier} both mount at the guest path {later_path}, so one \
+                     would cover the other. Mount one of them somewhere else."
+                );
+            }
+            // fc-agent mounts the maps by nesting, so an outer map always comes first.
+            if is_map(earlier) && is_map(later) {
+                continue;
+            }
+            if earlier_guest.starts_with(later_guest) {
+                bail!(
+                    "{earlier}: the guest path {earlier_path} is inside {later_path}, where \
+                     {later} is mounted. fc-agent mounts maps, then disks, pmem devices, NFS \
+                     shares and the image store, in that order, so {later} would be mounted \
+                     after it and cover it. Mount one of them somewhere else, or put the one \
+                     inside on a path that is not under the other."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every guest path fc-agent creates and mounts something at for this run,
@@ -626,6 +669,92 @@ mod tests {
 
     fn mount_point(argument: &str, guest: &str) -> (String, String) {
         (argument.to_string(), guest.to_string())
+    }
+
+    /// A mount point that a later mount would cover is refused before boot, and the error
+    /// names both arguments. fc-agent mounts maps, then disks, pmem devices and NFS shares, so a
+    /// map inside a disk's or a share's guest path, or a disk inside a share's, is covered.
+    ///
+    /// RED BEFORE THE FIX (#1044): `--disk-dir D:/data --map C:/data/conf:ro` passed, the VM
+    /// booted, and the guest and the container listed the disk's files at /data/conf.
+    #[test]
+    fn a_mount_point_a_later_mount_would_cover_is_refused_and_names_both() {
+        let covered = [
+            (
+                mount_point("--map /c:/data/conf:ro", "/data/conf"),
+                mount_point("--disk-dir /d:/data", "/data"),
+            ),
+            (
+                mount_point("--map /c:/data/conf", "/data/conf"),
+                mount_point("--disk /d.raw:/data", "/data"),
+            ),
+            (
+                mount_point("--map /c:/srv/share/conf", "/srv/share/conf"),
+                mount_point("--nfs /exports:/srv/share", "/srv/share"),
+            ),
+            (
+                mount_point("--disk /d.raw:/srv/share/db", "/srv/share/db"),
+                mount_point("--nfs /exports:/srv/share", "/srv/share"),
+            ),
+            (
+                mount_point("--disk /inner.raw:/data/db", "/data/db"),
+                mount_point("--disk-dir /outer:/data", "/data"),
+            ),
+        ];
+        for (earlier, later) in covered {
+            let error = check_mount_order(&[earlier.clone(), later.clone()])
+                .expect_err(&format!(
+                    "{} would cover {}, and it passed",
+                    later.0, earlier.0
+                ))
+                .to_string();
+            for named in [&earlier.0, &later.0] {
+                assert!(
+                    error.contains(named.as_str()),
+                    "the error does not name {named}: {error}"
+                );
+            }
+        }
+
+        let same_path = check_mount_order(&[
+            mount_point("--map /a:/data", "/data"),
+            mount_point("--map /b:/data/", "/data/"),
+        ])
+        .expect_err("two maps at one guest path passed")
+        .to_string();
+        assert!(same_path.contains("--map /a:/data") && same_path.contains("--map /b:/data/"));
+    }
+
+    /// What fc-agent mounts first may hold what it mounts later, and maps nest in either
+    /// order on the command line because fc-agent orders them itself.
+    #[test]
+    fn a_mount_inside_one_mounted_before_it_is_accepted() {
+        let accepted = [
+            [
+                mount_point("--map /c:/data", "/data"),
+                mount_point("--disk-dir /d:/data/db", "/data/db"),
+            ],
+            [
+                mount_point("--map /c:/data/inner", "/data/inner"),
+                mount_point("--map /o:/data:ro", "/data"),
+            ],
+            [
+                mount_point("--disk /d.raw:/data", "/data"),
+                mount_point("--nfs /exports:/data/share", "/data/share"),
+            ],
+            [
+                mount_point("--disk /outer.raw:/data", "/data"),
+                mount_point("--disk-dir /inner:/data/db", "/data/db"),
+            ],
+            [
+                mount_point("--map /c:/data", "/data"),
+                mount_point("--disk /d.raw:/database", "/database"),
+            ],
+        ];
+        for mount_points in accepted {
+            check_mount_order(&mount_points)
+                .unwrap_or_else(|error| panic!("{mount_points:?} was refused: {error:#}"));
+        }
     }
 
     /// A spec is HOST:GUEST or HOST:GUEST:ro. Anything else after GUEST is refused,
