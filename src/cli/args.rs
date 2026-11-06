@@ -894,15 +894,18 @@ pub struct RunArgs {
     /// 2 MiB, and it cannot be on tmpfs, ramfs, hugetlbfs, FUSE, NFS, SMB or 9p, where
     /// fcvm cannot see a write to it, or on overlayfs, which hides the filesystem that
     /// holds it.
-    /// fcvm copies each version of the image (its inode, length, modification and
-    /// change time) into <data_dir>/pmem once: a reflink when that directory is on the
+    /// fcvm copies each content of the image into <data_dir>/pmem once, named by the
+    /// SHA-256 of its bytes, so two paths with the same bytes, or an image touched without
+    /// a change, share one copy and one snapshot: a reflink when that directory is on the
     /// image's filesystem and the filesystem shares extents (btrfs, XFS with reflink),
-    /// otherwise a copy of the image's non-zero blocks that keeps it sparse. VMs,
-    /// snapshots and clones map the copy: writes to HOST_IMAGE after a run starts never
-    /// reach them, and the next run copies the new version. A run is refused if the
-    /// image changes while it is copied. On a kernel or filesystem without multigrain
-    /// timestamps, a write within one timestamp tick of the image's previous change
-    /// keeps its version, so neither check sees it. Copies are not deleted yet.
+    /// otherwise a copy of the image's non-zero blocks that keeps it sparse. It hashes and
+    /// copies under a read lease, which the kernel grants only to the image's owner or
+    /// root and refuses while a process has the image open for writing; a run that opens
+    /// it for writing meanwhile makes the run fail, and waits for the copy to finish. An
+    /// image whose inode, length, modification and change time were recorded at least
+    /// 2 s after its last change is not read again. VMs, snapshots and clones map the
+    /// copy: writes to HOST_IMAGE after a run starts never reach them, and the next run
+    /// copies the new content. Copies are not deleted yet.
     /// Firecracker only.
     /// Example: --pmem /data/cache.ext4:/mnt/cache:ro
     #[arg(long, action = clap::ArgAction::Append)]

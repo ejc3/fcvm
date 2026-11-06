@@ -3237,7 +3237,8 @@ data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/{vm_id}.json            # VM state files
 ├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
-├── pmem/{sha}.img                # --pmem copies, one per image version, read-only
+├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
+├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots
     └── disk/                     # the snapshot's disks, a btrfs subvolume (clones snapshot it)
 ```
