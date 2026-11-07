@@ -1496,6 +1496,8 @@ pub(crate) fn build_launch_config(
         fuse_max_write: boot_inputs.fuse_max_write,
         no_writeback_cache: boot_inputs.no_writeback_cache,
         hypervisor: args.hypervisor.into(),
+        // A launch config without a snapshot key; the key's builder names the binary.
+        cloud_hypervisor_bin: None,
     }
 }
 

@@ -201,6 +201,91 @@ async fn test_cloud_hypervisor_reboot_recovers_and_then_exits() -> Result<()> {
     result
 }
 
+/// A cached Cloud Hypervisor `podman run` reboots in place like a cold one. The second run
+/// restores the first one's pre-start snapshot, so it is supervised by the restore path,
+/// which relaunched only Firecracker clones: a guest reboot there ended the run.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_cloud_hypervisor_cached_run_reboots_in_place() -> Result<()> {
+    fcvm::commands::common::find_cloud_hypervisor()
+        .context("CH reboot test requires the backend")?;
+    let (first, second, token, _) = common::unique_names("ch-reboot-cached");
+    let script = format!("echo {token}; while [ ! -e /stop ]; do sleep 1; done");
+    let args = |name: &str| -> Vec<String> {
+        [
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            "nginx:alpine",
+            "sh",
+            "-c",
+            &script,
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect()
+    };
+
+    let first_args = args(&first);
+    let first_args: Vec<&str> = first_args.iter().map(String::as_str).collect();
+    let (mut child, pid, log) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&first_args, &[]).await?;
+    let created = async {
+        common::poll_health_by_pid(pid, 180).await?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("Pre-start snapshot created successfully")
+        {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the first run took no pre-start snapshot ({})",
+                log.display()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+    created?;
+
+    let second_args = args(&second);
+    let second_args: Vec<&str> = second_args.iter().map(String::as_str).collect();
+    let (mut child, pid, log) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&second_args, &[]).await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        anyhow::ensure!(
+            std::fs::read_to_string(&log)?.contains("Pre-start snapshot hit"),
+            "the second run did not restore the first one's snapshot ({})",
+            log.display()
+        );
+        let marker = format!("ch-reboot-cached-token-{pid}");
+        write_work_marker(pid, &marker).await?;
+        reboot_and_assert_relaunch(pid, &marker).await?;
+        let _ = common::exec_in_container(pid, &["touch", "/stop"]).await;
+        let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+            .await
+            .context("the cached CH VM did not terminate after its container exited")??;
+        anyhow::ensure!(
+            status.success(),
+            "the cached CH VM's final exit must be zero: {status}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if child.try_wait()?.is_none() {
+        common::kill_process(pid).await;
+        let _ = child.kill().await;
+    }
+    result
+}
+
 /// Data-disk preservation: an in-place reboot must NOT rebuild --disk-dir
 /// images from the host directory — guest writes to the data disk live only in
 /// the per-VM image and would be silently destroyed (confirmed review finding).

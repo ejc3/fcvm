@@ -37,16 +37,23 @@ pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
         .ok()
 }
 
-/// The VM id of the state whose fcvm process is `(parent, parent_start)`.
+/// The VM id of the state whose fcvm process is `(parent, parent_start)`. None when no state
+/// is, and when more than one is: a process running several VMs (a library caller) does not
+/// say which of them owns this VMM, and recording the kill in the wrong one would make that
+/// clone report a failure it did not have.
 pub(crate) fn clone_of_parent(
     states: &[crate::state::VmState],
     parent: u32,
     parent_start: u64,
 ) -> Option<String> {
-    states
+    let mut owners = states
         .iter()
-        .find(|state| state.pid == Some(parent) && state.pid_start_time == Some(parent_start))
-        .map(|state| state.vm_id.clone())
+        .filter(|state| state.pid == Some(parent) && state.pid_start_time == Some(parent_start));
+    let owner = owners.next()?;
+    match owners.next() {
+        Some(_) => None,
+        None => Some(owner.vm_id.clone()),
+    }
 }
 
 /// Write `reason` to `dir`'s failure file, atomically.
@@ -86,10 +93,16 @@ mod tests {
         let mut live = crate::state::VmState::new("vm-live".into(), "alpine".into(), 1, 128);
         live.pid = Some(100);
         live.pid_start_time = Some(2);
-        let states = vec![stale, live];
+        let mut states = vec![stale, live];
         assert_eq!(clone_of_parent(&states, 100, 2).as_deref(), Some("vm-live"));
         assert_eq!(clone_of_parent(&states, 100, 3), None);
         assert_eq!(clone_of_parent(&states, 101, 2), None);
+        // Two VMs of one process: the VMM's owner is not known, so neither is chosen.
+        let mut sibling = crate::state::VmState::new("vm-sibling".into(), "alpine".into(), 1, 128);
+        sibling.pid = Some(100);
+        sibling.pid_start_time = Some(2);
+        states.push(sibling);
+        assert_eq!(clone_of_parent(&states, 100, 2), None);
     }
 
     #[test]

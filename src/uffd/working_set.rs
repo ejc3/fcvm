@@ -51,7 +51,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Bitmap granularity, in bytes.
@@ -386,20 +387,69 @@ struct PersistRequest {
 pub(crate) struct WorkingSetPersistence {
     store: Arc<WorkingSetStore>,
     requests: SyncSender<PersistRequest>,
+    pending: Arc<Pending>,
+}
+
+/// Requests sent to the worker that it has not finished. A request that coalesces behind a
+/// queued one is covered by that one, so it is not counted.
+#[derive(Default)]
+struct Pending {
+    count: Mutex<u64>,
+    finished: Condvar,
+}
+
+impl Pending {
+    fn add(&self) {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+
+    fn done(&self) {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        self.finished.notify_all();
+    }
+
+    /// Wait up to `timeout` for every counted request to finish. True when none is left.
+    fn wait(&self, timeout: Duration) -> bool {
+        let count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        let (count, _) = self
+            .finished
+            .wait_timeout_while(count, timeout, |count| *count > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *count == 0
+    }
 }
 
 impl WorkingSetPersistence {
     pub(crate) fn new(store: Arc<WorkingSetStore>) -> Result<Self> {
         let (requests, receiver) = sync_channel(1);
         let worker_store = Arc::clone(&store);
+        let pending = Arc::new(Pending::default());
+        let worker_pending = Arc::clone(&pending);
         let worker = std::thread::Builder::new()
             .name("fcvm-ws-write".to_string())
-            .spawn(move || persistence_worker(worker_store, receiver))
+            .spawn(move || persistence_worker(worker_store, receiver, worker_pending))
             .context("spawning working-set persistence worker")?;
         // Deliberately detach: unlike Tokio's blocking pool, a stuck hint writer must not be
-        // joined during runtime/process teardown.
+        // joined during runtime/process teardown. Shutdown waits for it with a bound instead
+        // (`drain`).
         drop(worker);
-        Ok(Self { store, requests })
+        Ok(Self {
+            store,
+            requests,
+            pending,
+        })
+    }
+
+    /// Wait up to `timeout` for the publications already scheduled to finish, so a server
+    /// that stops right after its last clone exits still writes what that clone recorded.
+    /// Without the wait the process exits with the union only in memory, and the next
+    /// server finds no working set: on a 128 GiB guest stopped this way after each clone,
+    /// four restores in a row replayed nothing. True when nothing is left to write; false
+    /// when the writer is still busy at the deadline (a stuck filesystem), in which case the
+    /// union is lost, as before.
+    pub(crate) fn drain(&self, timeout: Duration) -> bool {
+        self.pending.wait(timeout)
     }
 
     /// Merge `observed` into memory and non-blockingly prompt the worker to publish it.
@@ -411,55 +461,73 @@ impl WorkingSetPersistence {
             faulted_pages,
             learned_pages,
         };
+        // Counted before the send, so the worker cannot finish it first.
+        self.pending.add();
         match self.requests.try_send(request) {
             Ok(()) => {}
-            Err(TrySendError::Full(request)) => debug!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                "coalesced working-set persistence behind the queued union"
-            ),
-            Err(TrySendError::Disconnected(request)) => warn!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                "working-set persistence worker is unavailable; restore remains demand-page safe"
-            ),
+            Err(TrySendError::Full(request)) => {
+                self.pending.done();
+                debug!(
+                    target: "uffd",
+                    vm_id = %request.vm_id,
+                    faulted_pages = request.faulted_pages,
+                    learned_pages = request.learned_pages,
+                    "coalesced working-set persistence behind the queued union"
+                )
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                self.pending.done();
+                warn!(
+                    target: "uffd",
+                    vm_id = %request.vm_id,
+                    faulted_pages = request.faulted_pages,
+                    learned_pages = request.learned_pages,
+                    "working-set persistence worker is unavailable; restore remains demand-page safe"
+                )
+            }
         }
     }
 }
 
-fn persistence_worker(store: Arc<WorkingSetStore>, receiver: Receiver<PersistRequest>) {
+fn persistence_worker(
+    store: Arc<WorkingSetStore>,
+    receiver: Receiver<PersistRequest>,
+    pending: Arc<Pending>,
+) {
     while let Ok(request) = receiver.recv() {
-        match store.try_persist_known() {
-            Ok(Some(outcome)) => info!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                known_pages = outcome.total,
-                persisted = outcome.persisted,
-                superseded = outcome.superseded,
-                "merged this clone's faults into the snapshot's working set"
-            ),
-            Ok(None) => debug!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                "working-set sidecar is busy; retained the union in memory"
-            ),
-            Err(error) => warn!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                error = ?error,
-                "could not persist the working set; restore remains demand-page safe"
-            ),
-        }
+        failpoint::hit("working_set.pre_persist");
+        persist_one(&store, &request);
+        pending.done();
+    }
+}
+
+fn persist_one(store: &WorkingSetStore, request: &PersistRequest) {
+    match store.try_persist_known() {
+        Ok(Some(outcome)) => info!(
+            target: "uffd",
+            vm_id = %request.vm_id,
+            faulted_pages = request.faulted_pages,
+            learned_pages = request.learned_pages,
+            known_pages = outcome.total,
+            persisted = outcome.persisted,
+            superseded = outcome.superseded,
+            "merged this clone's faults into the snapshot's working set"
+        ),
+        Ok(None) => debug!(
+            target: "uffd",
+            vm_id = %request.vm_id,
+            faulted_pages = request.faulted_pages,
+            learned_pages = request.learned_pages,
+            "working-set sidecar is busy; retained the union in memory"
+        ),
+        Err(error) => warn!(
+            target: "uffd",
+            vm_id = %request.vm_id,
+            faulted_pages = request.faulted_pages,
+            learned_pages = request.learned_pages,
+            error = ?error,
+            "could not persist the working set; restore remains demand-page safe"
+        ),
     }
 }
 
@@ -1139,6 +1207,40 @@ mod tests {
             end <= mem_len,
             "runs must stay inside the image (got end {end} > {mem_len})"
         );
+    }
+
+    /// A drain returns once the worker has written what was scheduled, so a server that
+    /// stops right after its last clone leaves the recording on disk. Each schedule here is
+    /// drained before the next, and a later one that coalesces is covered too.
+    #[test]
+    fn drain_waits_for_every_scheduled_publication() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("drain", mem_len);
+        let store = Arc::new(open_store(&image, mem_len));
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let sidecar = WorkingSetStore::path_for(&image);
+        assert!(
+            persistence.drain(Duration::ZERO),
+            "nothing scheduled, nothing to wait for"
+        );
+
+        for round in 0..20u64 {
+            let mut observed = store.recorder();
+            observed.insert_range(round * GRANULE, GRANULE);
+            persistence.schedule("vm-drain", observed.clone());
+            persistence.schedule("vm-drain", observed);
+            assert!(
+                persistence.drain(Duration::from_secs(10)),
+                "round {round}: the writer did not finish within the bound"
+            );
+            let reopened = open_store(&image, mem_len);
+            assert_eq!(
+                reopened.to_prefetch().len(),
+                round + 1,
+                "round {round}: the drained publication is not on disk ({})",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]

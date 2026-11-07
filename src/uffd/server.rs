@@ -70,6 +70,12 @@ const MAX_EVENTS_PER_BATCH: usize = 128;
 /// How long a connecting VMM has to complete the UFFD handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a stopping server waits for its working-set writer. A publication writes one
+/// bitmap of 32 KiB per GiB of guest memory (4 MiB for 128 GiB) and renames it into place;
+/// the bound is for a filesystem that has stopped answering, which must not hold the server
+/// past it.
+const WORKING_SET_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long the handler keeps retrying parked faults without sleeping, after a fault is parked
 /// and after every REMOVE event it reads.
 ///
@@ -356,8 +362,16 @@ impl PeerVmm {
                 .await
                 .context("listing VM states")?;
             let vm_id = super::failure::clone_of_parent(&states, parent, parent_start)
-                .with_context(|| format!("no VM state names fcvm PID {parent} as its process"))?;
-            super::failure::write_failure(&crate::paths::vm_runtime_dir(&vm_id), reason)
+                .with_context(|| {
+                    format!("no single VM state names fcvm PID {parent} as its process")
+                })?;
+            // A blocking write on a thread of its own, so a filesystem that stops answering
+            // cannot hold this task past the timeout and keep the kill below from running.
+            let dir = crate::paths::vm_runtime_dir(&vm_id);
+            let reason = reason.to_string();
+            tokio::task::spawn_blocking(move || super::failure::write_failure(&dir, &reason))
+                .await
+                .context("joining the failure write")?
         })
         .await;
         match recorded {
@@ -1491,6 +1505,29 @@ impl UffdServer {
             match result {
                 Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
                 Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
+            }
+        }
+        // Every handler has scheduled its clone's faults by now. Give the writer a bounded
+        // time to publish them before the process exits with them only in memory.
+        if let Some(persistence) = self.working_set_persistence.clone() {
+            let started = std::time::Instant::now();
+            let drained =
+                tokio::task::spawn_blocking(move || persistence.drain(WORKING_SET_DRAIN_TIMEOUT))
+                    .await
+                    .unwrap_or(false);
+            if drained {
+                debug!(
+                    target: "uffd",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "working-set publications finished before shutdown"
+                );
+            } else {
+                warn!(
+                    target: "uffd",
+                    timeout_secs = WORKING_SET_DRAIN_TIMEOUT.as_secs(),
+                    "the working-set writer was still busy at shutdown; this server's \
+                     recording stays unpublished"
+                );
             }
         }
 
@@ -5056,6 +5093,20 @@ mod tests {
         assert!(
             recorded < killed,
             "the VMM is killed before the failure is recorded"
+        );
+        // The record's timeout bounds it only if the blocking write runs off this task: a
+        // write the filesystem never answers would otherwise hold the kill forever.
+        let start = code
+            .find("async fn record_failure(")
+            .expect("no record_failure");
+        let body = &code[start..start + code[start..].find("\n    }\n").unwrap()];
+        assert!(
+            body.contains("spawn_blocking(move || super::failure::write_failure("),
+            "record_failure writes the failure file on the async task: {body}"
+        );
+        assert!(
+            !body.contains("\n            super::failure::write_failure("),
+            "record_failure still writes the failure file inline"
         );
     }
 
