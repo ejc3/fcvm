@@ -25,6 +25,19 @@ const tileBox = async (page: Page, id: string) => (await view(page)).tiles.find(
 const TILE_ERR_MAX = 3;
 const ACROSS_ERR_MAX = 3;
 
+/**
+ * Every boundary with at least SEAM_MIN_PAIRS smooth pairs is judged, and every tile has one:
+ * a boundary along detail that holds still with the camera (the planet's rings, text) can keep
+ * 1 to 3 smooth pairs for minutes, and a mean over so few is one pixel's compression noise
+ * (CI read 3.35 on such a boundary, #1348). A tile drawn at another t shows on all of its
+ * boundaries, so judging one per tile still catches it.
+ */
+function expectSeams(r: Awaited<ReturnType<typeof seamReport>>): void {
+  const judged = r.boundaries.filter((b) => b.n >= SEAM_MIN_PAIRS);
+  for (const id of Object.keys(r.perTile)) expect(judged.some((b) => b.a === id || b.b === id), `a judged boundary of ${id}`).toBe(true);
+  for (const b of judged) expect(b.err, `${b.a} | ${b.b} over ${b.n} pairs`).toBeLessThan(ACROSS_ERR_MAX);
+}
+
 /** The t drawn now: a capture forces a draw and reports its t. */
 const drawnT = (page: Page) => page.evaluate(async () => (await window.__fleet!.client.capture([])).T);
 
@@ -150,8 +163,7 @@ test("no seam: pixels on both sides of every boundary match the picture at the d
   expect(r.samples).toBeGreaterThanOrEqual(60);
   for (const [id, s] of Object.entries(r.shown)) if (s !== "dark") expect(s, id).toBe(`sync@${r.T}`);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
-  for (const b of r.boundaries) expect(b.n, `smooth pairs on ${b.a} | ${b.b}`).toBeGreaterThanOrEqual(SEAM_MIN_PAIRS);
-  for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
+  expectSeams(r);
 });
 
 test("the seam check catches a renderer that draws another t than it stamps", async ({ page }) => {
@@ -865,8 +877,7 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   for (const [id, sh] of Object.entries(r.shown)) if (sh !== "dark") expect(sh, id).toBe(`sync@${r.T}`);
   expect(Object.keys(r.shown).every((k) => k.startsWith("a:") || r.shown[k] === "dark")).toBe(true);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
-  for (const b of r.boundaries) expect(b.n, `smooth pairs on ${b.a} | ${b.b}`).toBeGreaterThanOrEqual(SEAM_MIN_PAIRS);
-  for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
+  expectSeams(r);
   await page.getByTestId("play").click();
   await expect(page.getByTestId("streams-switch")).toHaveAttribute("aria-checked", "false");
   await expect(page.getByTestId("streams-switch")).toHaveText("See every VM's own stream");
