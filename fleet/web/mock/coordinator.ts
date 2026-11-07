@@ -1003,17 +1003,22 @@ export class MockCoordinator {
     return best;
   }
 
+  /** Where the camera holds for a stop: the viewers' words stop is the latest word. */
+  private stopPose(target: (typeof NUDGE_TARGETS)[number]): { x: number; y: number; zoom: number } {
+    const words = target.id === "words" && this.words.length > 0 ? this.words[this.words.length - 1]!.pos : null;
+    return { x: words?.x ?? target.x, y: words?.y ?? target.y, zoom: target.zoom };
+  }
+
   /** The camera leaves for the leading stop. */
   private nextStop(now: number): void {
     const best = this.leadingStop();
     const target = NUDGE_TARGETS.find((x) => x.id === best)!;
     const t = sceneT(this.opts.epochUnixMs, now);
     const here = cameraAt(this.camera, t);
-    const words = target.id === "words" && this.words.length > 0 ? this.words[this.words.length - 1]!.pos : null;
     this.camera = [
       ...this.camera.filter((k) => k.t < t && k.t >= t - 30).slice(-2),
       { t, x: here["x"] ?? 0, y: here["y"] ?? 0, zoom: here["zoom"] ?? 1 },
-      { t: t + this.opts.travelSecs, x: words?.x ?? target.x, y: words?.y ?? target.y, zoom: target.zoom },
+      { t: t + this.opts.travelSecs, ...this.stopPose(target) },
     ];
     this.nudge = { holding: best, nextHoldAt: now + (this.opts.holdSecs + this.opts.travelSecs) * 1000, openedAt: now, votes: new Map() };
     this.markDirty();
@@ -1637,15 +1642,20 @@ export class MockCoordinator {
           if (typeof b["hold_in_ms"] === "number") this.nudge.nextHoldAt = this.now() + b["hold_in_ms"];
           if (typeof b["gpu_scrub"] === "boolean") this.gpuScrub = b["gpu_scrub"];
           // The directed camera leaves for this stop now, as if it had every vote (tests that
-          // measure pixels hold it on the stop they were measured at). A no-op when it holds there.
+          // measure pixels hold it on the stop they were measured at). When it holds there
+          // already it stays, and its hold starts again.
           if (typeof b["camera_stop"] === "string") {
             const stop = NUDGE_TARGETS.find((x) => x.id === b["camera_stop"]);
             if (!stop) throw new Error(`no stop ${b["camera_stop"]}`);
             const last = this.camera[this.camera.length - 1]!;
-            const atRest = last.t <= this.sceneNow() && last.x === stop.x && last.y === stop.y && last.zoom === stop.zoom;
+            const pose = this.stopPose(stop);
+            const atRest = last.t <= this.sceneNow() && last.x === pose.x && last.y === pose.y && last.zoom === pose.zoom;
             if (!atRest) {
               this.nudge.votes = new Map([["mock-admin", stop.id]]);
               this.nextStop(this.now());
+            } else {
+              // Holding there already: a full hold from now, so it does not leave mid-measurement.
+              this.nudge.nextHoldAt = this.now() + this.opts.holdSecs * 1000;
             }
           }
           // The director sets the time of day per hold; tests set it here.
