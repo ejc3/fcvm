@@ -81,12 +81,21 @@ pub enum Resource {
         iface: String,
         masquerade: bool,
     },
+    /// A kind this build does not know, such as a `mount_target` an fcvm before #1311
+    /// recorded for a source directory it recreated. It is dropped from the record, so the
+    /// record's other resources are still undone; without it, one unknown entry made the
+    /// whole record unreadable and every resource in it stayed.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Resource {
     /// An object of the running kernel, which a reboot discards.
     fn is_kernel_object(&self) -> bool {
-        !matches!(self, Resource::RuntimeDir { .. } | Resource::Temp { .. })
+        !matches!(
+            self,
+            Resource::RuntimeDir { .. } | Resource::Temp { .. } | Resource::Unknown
+        )
     }
 
     /// Part of a VM's network, which its teardown removes (`forget`).
@@ -99,6 +108,7 @@ impl std::fmt::Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
+            Resource::Unknown => write!(f, "a resource of a kind this build does not know"),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
             Resource::Netns { name } => write!(f, "network namespace {name}"),
             Resource::Link { name } => write!(f, "interface {name}"),
@@ -849,6 +859,7 @@ async fn undo_all(
 async fn undo(resource: &Resource) -> Undo {
     match resource {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
+        Resource::Unknown => Undo::Done,
         Resource::Temp { path } => undo_temp(path).await,
         Resource::Netns { name } => {
             undo_result(crate::network::namespace::delete_namespace(name).await)
@@ -1242,6 +1253,38 @@ mod tests {
             "a completed owner accepted a record"
         );
         drop(owner);
+    }
+
+    /// A record that holds a resource of a kind this build does not know (here a
+    /// `mount_target`, which fcvm wrote before #1311) is still reclaimed: the unknown entry
+    /// is dropped and the runtime directory beside it is removed.
+    #[tokio::test]
+    async fn a_record_with_an_unknown_resource_kind_is_still_reclaimed() {
+        let (root, dir) = test_dir();
+        let runtime_dir = root.path().join("vm-disks/vm-old");
+        std::fs::create_dir_all(runtime_dir.join("disks")).unwrap();
+        let owner = Owner::begin_in(&dir, "vm-old").unwrap();
+        owner
+            .record(Resource::RuntimeDir {
+                path: runtime_dir.clone(),
+            })
+            .unwrap();
+        drop(owner);
+        let path = dir.join("vm-old.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"kind": "mount_target", "path": "/nonexistent/vm-src"}));
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
+        assert!(
+            !runtime_dir.exists(),
+            "the runtime directory beside it was left"
+        );
+        assert!(files_in(&dir).is_empty());
     }
 
     #[test]
