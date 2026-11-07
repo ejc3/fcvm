@@ -1645,6 +1645,7 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         release: (major, minor, patch),
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
+        pagemap_dirty: build.first() == Some(&"fcvm") && build.contains(&"pagemap-dirty"),
     })
 }
 
@@ -1658,6 +1659,28 @@ pub(crate) struct FirecrackerVersion {
     /// Whether the build metadata says the snapshot load takes `drive_overrides`
     /// (`+fcvm.drive-overrides`, ejc3/firecracker).
     pub drive_overrides: bool,
+    /// Whether the build metadata says a Diff snapshot of a VM that maps its memory file
+    /// privately, with dirty tracking off, takes the pages the guest wrote from
+    /// /proc/self/pagemap (`pagemap-dirty`, ejc3/firecracker).
+    pub pagemap_dirty: bool,
+}
+
+/// Whether a restore loads with KVM dirty tracking: what the caller asked for, except on a
+/// build that reads a private file mapping's written pages from /proc/self/pagemap
+/// (`FirecrackerVersion::pagemap_dirty`) when the memory maps a file privately (the File
+/// backend, and UFFD minor's memfd). A later diff of the clone then needs no dirty log, and
+/// the restored guest's first writes do not fault into KVM to be logged: a potato wake's
+/// guest restore acknowledgement took 217 ms with tracking and 84 ms without.
+fn load_tracks_dirty_pages(
+    requested: bool,
+    firecracker_version: FirecrackerVersion,
+    memory_backend: &MemoryBackend,
+) -> bool {
+    let maps_a_file = matches!(
+        memory_backend,
+        MemoryBackend::File { .. } | MemoryBackend::UffdMinor { .. }
+    );
+    requested && !(firecracker_version.pagemap_dirty && maps_a_file)
 }
 
 impl FirecrackerVersion {
@@ -3717,6 +3740,11 @@ pub async fn restore_from_snapshot(
     // pure validation and must not create a process that a later `?` can detach.
     let (firecracker_bin, firecracker_version) =
         restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
+    let track_dirty_pages = load_tracks_dirty_pages(
+        track_dirty_pages,
+        firecracker_version,
+        &restore_config.memory_backend,
+    );
     let clone_vsock_socket_path = vm_state
         .config
         .vsock_socket_path
@@ -8516,6 +8544,57 @@ mod tests {
         assert!(dev.prerelease && dev.drive_overrides);
     }
 
+    /// Only an ejc3/firecracker build that says pagemap-dirty reads a private file mapping's
+    /// written pages from /proc/self/pagemap.
+    #[test]
+    fn the_version_says_whether_a_diff_reads_pagemap() {
+        let fork =
+            parse_firecracker_version("Firecracker v1.17.0+fcvm.drive-overrides.pagemap-dirty")
+                .unwrap();
+        assert!(fork.drive_overrides && fork.pagemap_dirty);
+        for other in [
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+other.pagemap-dirty",
+            "Firecracker v1.17.0",
+        ] {
+            assert!(!parse_firecracker_version(other).unwrap().pagemap_dirty, "{other}");
+        }
+    }
+
+    /// A clone whose memory maps a file privately loads without dirty tracking on a build
+    /// that reads its written pages from pagemap; one of anonymous memory, or on an older
+    /// build, keeps what it asked for.
+    ///
+    /// RED BEFORE THE FIX: every load took the requested tracking, so a File clone on the
+    /// pagemap build was write-protected by KVM's dirty log.
+    #[test]
+    fn a_private_file_restore_loads_without_dirty_tracking_on_a_pagemap_build() {
+        let pagemap = FirecrackerVersion {
+            release: (1, 17, 0),
+            prerelease: false,
+            drive_overrides: true,
+            pagemap_dirty: true,
+        };
+        let older = FirecrackerVersion {
+            pagemap_dirty: false,
+            ..pagemap
+        };
+        let file = MemoryBackend::File {
+            memory_path: PathBuf::from("/s/memory.bin"),
+        };
+        let minor = MemoryBackend::UffdMinor {
+            socket_path: PathBuf::from("/s/uffd.sock"),
+        };
+        let copy = MemoryBackend::Uffd {
+            socket_path: PathBuf::from("/s/uffd.sock"),
+        };
+        assert!(!load_tracks_dirty_pages(true, pagemap, &file));
+        assert!(!load_tracks_dirty_pages(true, pagemap, &minor));
+        assert!(load_tracks_dirty_pages(true, pagemap, &copy));
+        assert!(load_tracks_dirty_pages(true, older, &file));
+        assert!(!load_tracks_dirty_pages(false, older, &copy));
+    }
+
     /// A load overrides the drives only when the binary takes the field, the vsock path is
     /// overridden too, and the vmstate names nothing else under a source directory.
     #[test]
@@ -8524,6 +8603,7 @@ mod tests {
             release: (1, 17, 0),
             prerelease: false,
             drive_overrides: true,
+            pagemap_dirty: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
@@ -8578,6 +8658,7 @@ mod tests {
 
         let upstream = FirecrackerVersion {
             drive_overrides: false,
+            pagemap_dirty: false,
             ..capable
         };
         assert!(snapshot_load_drive_overrides(

@@ -1336,9 +1336,12 @@ pub struct SnapshotRunArgs {
     pub exec: Option<String>,
 
     /// Disable KVM dirty page tracking, avoiding its logging overhead.
-    /// Tradeoff: diff snapshots from this VM won't work. Note: file-backed
-    /// clone memory is shared through the host page cache with tracking on
-    /// OR off (measured in #632) — this flag does not change sharing.
+    /// Tradeoff: diff snapshots from this VM won't work. A clone that maps its
+    /// memory file (no --pid, or a minor-mode serve) on the pinned Firecracker
+    /// build loads without tracking anyway: a diff reads the pages it wrote from
+    /// /proc/self/pagemap. Note: file-backed clone memory is shared through the
+    /// host page cache with tracking on OR off (measured in #632); this flag
+    /// does not change sharing.
     #[arg(long)]
     pub no_dirty_tracking: bool,
 
