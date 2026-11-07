@@ -329,7 +329,7 @@ fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, Str
 /// Until a fixed 7.x release is verified, the pin stays on the 6.18 longterm
 /// line.
 ///
-/// Within that line the pin has a floor and, for now, a ceiling.
+/// Within that line the pin has a floor.
 ///
 /// The floor is 6.18.45. Older releases re-place the running entity in
 /// `reweight_entity()` with `place_entity()`, which upstream reverted
@@ -339,13 +339,14 @@ fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, Str
 /// worker among them, no CPU for as long as the flood lasts.
 /// `tests/test_exec_flood.rs` holds the behaviour.
 ///
-/// The ceiling is 6.18.50. 6.18.52 carries upstream's own rework of the VNCR
-/// fixmap fix, so `kernel/patches-arm64/vncr-fixmap-state.patch` does not
-/// apply to it, and 6.18.51 already changes `arch/arm64/kvm/nested.c`. That
-/// file is byte-identical from 6.18.44 to 6.18.50, which is the source the
-/// patch and its fixture (`tests/fixtures/vncr/`) were verified against.
-/// Moving past 6.18.50 means dropping that patch and verifying nested guests
-/// on arm64 hardware.
+/// The exact pin is 6.18.60. The arm64 patches that touch
+/// `arch/arm64/kvm/nested.c` are verified against excerpts of the pinned
+/// release (`tests/fixtures/vncr/`, `tests/fixtures/nv2-s2-tracking/`), and
+/// each fixture's test fails when its header names another release, so a pin
+/// move has to cut them again. 6.18.52 took upstream's VNCR fixmap fix
+/// (5949004d7032 and two follow-ups), which replaced the patch fcvm carried for
+/// it, and 6.18.56 took the nested_mmus lifetime rework (e5843f4effaa), which
+/// `nv2-targeted-shadow-s2-unmap.patch` is ported onto.
 ///
 /// The mountinfo A/B pair stays on 6.16.1 on purpose. It times reads of
 /// /proc/self/mountinfo, runs no container, and is not deployable.
@@ -389,12 +390,6 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
              harness that leaves such floods behind stalled in 8 of 28 runs on 6.18.44, \
              and in 28 of 28 with NO_DELAY_DEQUEUE, against 0 of 71 and 0 of 70 on 6.18.50"
         );
-        assert!(
-            release <= 50,
-            "[{profile}] pins 6.18.{release}. 6.18.51 changes arch/arm64/kvm/nested.c and \
-             kernel/patches-arm64/vncr-fixmap-state.patch does not apply to 6.18.52; see the \
-             doc comment on this test before moving past 6.18.50"
-        );
     }
 
     for profile in [
@@ -411,8 +406,8 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         assert!(
             section
                 .lines()
-                .any(|line| line.trim() == "kernel_version = \"6.18.50\""),
-            "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.50"
+                .any(|line| line.trim() == "kernel_version = \"6.18.60\""),
+            "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.60"
         );
     }
 }
