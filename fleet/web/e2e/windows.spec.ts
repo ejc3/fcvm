@@ -272,3 +272,40 @@ test("nothing on the page sends an intent but the four, and none carries a point
   const got = (await record()).intents;
   expect(got.map((i) => [i.name, i.outcome])).toEqual([["windows_reset", "committed"], ["claim_windows", "committed"], ["windows_action", "committed"], ["release_windows", "committed"]]);
 });
+
+test.describe("on a 390 px phone", () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
+
+  /** Whether `inner` lies wholly inside `outer`, with a pixel's slack for rounding. */
+  const inside = (inner: { x: number; y: number; width: number; height: number } | null, outer: { x: number; y: number; width: number; height: number } | null) =>
+    inner !== null && outer !== null && inner.x >= outer.x - 1 && inner.y >= outer.y - 1 && inner.x + inner.width <= outer.x + outer.width + 1 && inner.y + inner.height <= outer.y + outer.height + 1;
+
+  async function everyTileShowsTheLabel(page: Page): Promise<void> {
+    for (const slot of SLOTS) {
+      const label = page.getByTestId(`sandbox-label-${slot}`);
+      await expect(label).toHaveText(LABEL);
+      await expect(label).toBeVisible();
+      const caption = await page.getByTestId(`sandbox-caption-${slot}`).boundingBox();
+      expect(inside(await label.boundingBox(), caption), `${slot}'s label is clipped by its caption`).toBe(true);
+    }
+  }
+
+  test("every tile keeps the demonstration label with the panel open or closed, and Take over is never clipped", async ({ page }) => {
+    await openWindows(page);
+    await everyTileShowsTheLabel(page);
+    for (const slot of SLOTS) {
+      const take = page.getByTestId(`sandbox-take-${slot}`);
+      await expect(take).toBeVisible();
+      const caption = await page.getByTestId(`sandbox-caption-${slot}`).boundingBox();
+      expect(inside(await take.boundingBox(), caption), `${slot}'s Take over is clipped by its caption`).toBe(true);
+      // the label inside the button is whole too
+      expect(await take.evaluate((b) => b.scrollWidth <= b.clientWidth + 1)).toBe(true);
+    }
+    await page.getByTestId("sandbox-take-win-2").click();
+    await expect(page.getByTestId("win-panel")).toBeVisible();
+    await expect(page.getByTestId("win-panel-label")).toHaveText(LABEL);
+    await everyTileShowsTheLabel(page);
+    await page.getByTestId("win-give-back").click();
+    await expect(page.getByTestId("win-panel")).toHaveCount(0);
+  });
+});

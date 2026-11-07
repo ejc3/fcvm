@@ -71,16 +71,17 @@ function Caption({ c, onTake }: { c: WindowCard; onTake: () => void }) {
           </button>
         ) : null}
       </div>
+      {!c.compact && c.edition ? (
+        <p className="edition" title={c.edition} data-testid={`sandbox-edition-${c.slot}`}>
+          {c.edition}
+        </p>
+      ) : null}
+      {/* On every tile in every layout: the evaluation's terms ask for it. */}
+      <p className="label" data-testid={`sandbox-label-${c.slot}`}>
+        {c.label}
+      </p>
       {!c.compact ? (
         <>
-          {c.edition ? (
-            <p className="edition" title={c.edition} data-testid={`sandbox-edition-${c.slot}`}>
-              {c.edition}
-            </p>
-          ) : null}
-          <p className="label" data-testid={`sandbox-label-${c.slot}`}>
-            {c.label}
-          </p>
           {c.lentText ? (
             <p className="lent" data-testid={`sandbox-lent-${c.slot}`}>
               {c.lentText}

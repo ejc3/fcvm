@@ -20,8 +20,8 @@ export const NO_WINDOWS = "This fleet runs no Windows sandboxes.";
 export const WINDOWS_TILE_GAP = 12;
 /** Room under a tile for its slot, edition, time to desktop and label, and the same with the panel open on a narrow screen. */
 export const WINDOWS_CAPTION_H = 96;
-export const WINDOWS_CAPTION_H_NARROW = 104;
-export const WINDOWS_CAPTION_H_COMPACT = 52;
+export const WINDOWS_CAPTION_H_NARROW = 120;
+export const WINDOWS_CAPTION_H_COMPACT = 84;
 /** One action a second from a holder (PROTOCOL.md, "Windows mode": Actions). */
 export const WINDOWS_ACTION_INTERVAL_MS = 1000;
 
@@ -191,7 +191,7 @@ export interface WindowCard {
   box: Box | null;
   caption: Box | null;
   dark: boolean;
-  /** Only the slot and the time, for the room a narrow screen leaves beside the panel. */
+  /** Only the slot, the time and the label, for the room a narrow screen leaves beside the panel. */
   compact: boolean;
   /** Clicking the tile resets this sandbox. */
   reset: { label: string; disabled: boolean };
