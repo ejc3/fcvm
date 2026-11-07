@@ -95,11 +95,12 @@ endif
 # Nested tests are the arm64 long pole and do NOT parallelize — they degrade ~3.7x under
 # mutual contention (system-wide dsb(sy) on every nested guest-exit + NV2 overhead; see the
 # [test-groups.nested-tests] comment in .config/nextest.toml), so concurrency can't shrink
-# them. Instead CI runs three that cover the distinct nested risks and skips the rest
+# them. Instead CI runs four that cover the distinct nested risks and skips the rest
 # (which still run locally with a normal `make test-root`):
 #   - test_nested_run_fcvm_inside_vm  : nesting works at all + /dev/kvm usable in the guest
 #   - test_nested_l2_with_large_files : FUSE-over-FUSE cache coherency (the #630 DSB regression guard)
 #   - test_nested_l2_nfs              : the NFS-share data path under nesting
+#   - test_vsock_integrity_nested     : 2.5 GB of L2 vsock traffic checked byte for byte (arm64)
 # Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
 # test_nested_l2_network_fuse / _network_nfs (iperf throughput — the slowest AND flakiest under
 # any contention), and test_utimensat_pjdfstest_nested_kernel. The L3/L4, benchmark, and
@@ -112,7 +113,7 @@ CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
 # Base test-root CI filter: the nested subset (exclude all nested except the 3 kept).
-CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs))
+CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested))
 ifeq ($(FCVM_NO_SNAPSHOT),)
 # SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
 # It guards FUSE-over-FUSE DATA INTEGRITY (the #630 DSB cache-coherency fix) — a live-traffic
