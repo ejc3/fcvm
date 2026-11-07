@@ -1262,31 +1262,6 @@ impl PastaNetwork {
             .any(|gw| gw == addr)
     }
 
-    /// Refuse an IPv6 HOSTIP when pasta will run with `--ipv4-only`.
-    ///
-    /// Without a global IPv6 address on the host the guest has no IPv6 address, and
-    /// pasta exits on such a forward ("IPv6 forward, but IPv6 not enabled") with
-    /// nothing that names the mapping.
-    fn require_forwardable_host_addresses(&self, host_ipv6: Option<&str>) -> Result<()> {
-        if host_ipv6.is_some() {
-            return Ok(());
-        }
-        for mapping in &self.port_mappings {
-            let Some(host_ip) = mapping.host_ip.as_deref() else {
-                continue;
-            };
-            if host_ip.parse::<std::net::Ipv6Addr>().is_ok() {
-                anyhow::bail!(
-                    "rootless networking cannot publish on the IPv6 host address \
-                     [{host_ip}]:{}: this host has no global IPv6 address, so the guest has \
-                     no IPv6 address to forward to. Publish on an IPv4 address.",
-                    mapping.host_port
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// The complete pasta argument vector for this launch, in invocation order.
     ///
     /// Split out from the spawn so a unit test can assert the wiring: these
@@ -1356,12 +1331,19 @@ impl PastaNetwork {
             push("--no-ra");
             push("--no-dhcpv6");
         } else {
-            // No host IPv6 — disable IPv6 entirely
-            push("--ipv4-only");
-            // NDP/RA/DHCPv6 are moot with --ipv4-only, but be explicit
-            push("--no-ndp");
-            push("--no-dhcpv6");
+            // No host IPv6: pasta runs IPv6 in local mode, with no outbound address, so
+            // the guest reaches the gateway and nothing beyond it. The gateway is mapped
+            // to the host's ::1 explicitly: local mode maps nothing by itself, and the
+            // IPv4 gateway keeps its default mapping to 127.0.0.1. A host service that
+            // listens on ::1 alone is then reachable (#1026).
+            push("-a");
+            push(GUEST_IPV6);
+            push("-g");
+            push(GUEST_IPV6_GATEWAY);
+            push("--map-host-loopback");
+            push(GUEST_IPV6_GATEWAY);
             push("--no-ra");
+            push("--no-dhcpv6");
         }
 
         // pasta reads the HOST's /etc/resolv.conf, and when its first
@@ -1499,7 +1481,6 @@ impl PastaNetwork {
         }
 
         let host_ipv6 = Self::detect_host_ipv6();
-        self.require_forwardable_host_addresses(host_ipv6.as_deref())?;
 
         info!(
             namespace_pid = namespace_pid,
@@ -2053,15 +2034,15 @@ impl NetworkManager for PastaNetwork {
 
         let guest_mac = generate_mac();
 
-        // Check if host has IPv6 — pasta handles it natively
-        let (guest_ipv6, host_ipv6) = if Self::detect_host_ipv6().is_some() {
-            (
-                Some(self.guest_ipv6.clone()),
-                Some(GUEST_IPV6_GATEWAY.to_string()),
-            )
-        } else {
-            (None, None)
-        };
+        // The guest always gets IPv6 to its gateway, which pasta maps to the host's ::1.
+        // Beyond the gateway only when the host has a global IPv6 address; without one
+        // pasta runs IPv6 in local mode and the guest gets no default route
+        // (`build_pasta_args`).
+        let (guest_ipv6, host_ipv6) = (
+            Some(self.guest_ipv6.clone()),
+            Some(GUEST_IPV6_GATEWAY.to_string()),
+        );
+        let guest_ipv6_local_only = Self::detect_host_ipv6().is_none();
 
         // Each scheme gets its own proxy; one without a variable uses the other's, as
         // the guest's single URL did before they could differ.
@@ -2091,6 +2072,7 @@ impl NetworkManager for PastaNetwork {
             dns_server: None,
             guest_ipv6,
             host_ipv6,
+            guest_ipv6_local_only,
             dns_search: None,
             http_proxy,
             https_proxy,
@@ -2435,7 +2417,18 @@ mod tests {
         assert!(contains_run(&args, &["-g", "10.0.2.2"]), "{args:?}");
         assert!(contains_run(&args, &["-n", "255.255.255.0"]), "{args:?}");
         assert!(contains_run(&args, &["--no-dhcp"]), "{args:?}");
-        assert!(contains_run(&args, &["--ipv4-only"]), "{args:?}");
+        // No host IPv6: IPv6 in local mode, the gateway mapped to the host's ::1, and no
+        // outbound address (#1026).
+        assert!(contains_run(&args, &["-a", "fd00::100"]), "{args:?}");
+        assert!(contains_run(&args, &["-g", "fd00::2"]), "{args:?}");
+        assert!(
+            contains_run(&args, &["--map-host-loopback", "fd00::2"]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--ipv4-only" || a == "-o"),
+            "{args:?}"
+        );
         assert!(
             contains_run(&args, &["-P", "/run/pasta-args-plain.pid"]),
             "{args:?}"
@@ -2521,34 +2514,6 @@ mod tests {
             contains_run(&args, &["-u", "127.0.0.9/5300:53"]),
             "{args:?}"
         );
-    }
-
-    /// Without a global IPv6 address on the host pasta runs with --ipv4-only and exits
-    /// on an IPv6 forward. The mapping is refused by name before pasta starts.
-    #[test]
-    fn an_ipv6_host_address_is_refused_when_pasta_runs_ipv4_only() {
-        let mapping = |host_ip: Option<&str>| PortMapping {
-            host_ip: host_ip.map(str::to_string),
-            host_port: 8080,
-            guest_port: 80,
-            proto: Protocol::Tcp,
-        };
-        let network = |mappings| PastaNetwork::new("args-v6".into(), "tap0".into(), mappings);
-
-        let error = network(vec![mapping(None), mapping(Some("::1"))])
-            .require_forwardable_host_addresses(None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("[::1]:8080"), "{error}");
-
-        // With IPv6 on the host the same mapping is pasta's to bind, and an IPv4 address
-        // or none is forwarded either way.
-        network(vec![mapping(Some("::1"))])
-            .require_forwardable_host_addresses(Some("2001:db8::2"))
-            .unwrap();
-        network(vec![mapping(None), mapping(Some("127.0.0.1"))])
-            .require_forwardable_host_addresses(None)
-            .unwrap();
     }
 
     /// pasta reads the HOST's /etc/resolv.conf, and when its first nameserver

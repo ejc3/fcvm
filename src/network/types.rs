@@ -27,6 +27,12 @@ pub struct NetworkConfig {
     /// Gateway IPv6 address (for rootless networking with IPv6)
     #[serde(default)]
     pub host_ipv6: Option<String>,
+    /// The guest's IPv6 reaches its gateway and nothing beyond: no default route. A
+    /// rootless guest on a host without a global IPv6 address gets IPv6 for the gateway
+    /// alone, which pasta maps to the host's ::1, so a host service listening on ::1
+    /// only is reachable (`--forward-localhost`, a proxy on [::1]).
+    #[serde(default)]
+    pub guest_ipv6_local_only: bool,
     /// DNS search domains for the guest
     /// Needed for resolving short hostnames in enterprise networks
     #[serde(default)]

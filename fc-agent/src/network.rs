@@ -781,6 +781,16 @@ fn unconfigured_resolv_conf(reason: &str) -> String {
     format!("# fc-agent configured no DNS: {reason}\n")
 }
 
+/// The `ipv6=<client>|<gateway>[|local]` boot parameter's parts: the guest's address,
+/// its gateway, and whether the gateway is all it reaches (no default route).
+fn parse_ipv6_param(param: &str) -> Option<(&str, &str, bool)> {
+    match param.split('|').collect::<Vec<_>>()[..] {
+        [client, gateway] => Some((client, gateway, false)),
+        [client, gateway, "local"] => Some((client, gateway, true)),
+        _ => None,
+    }
+}
+
 /// Configure IPv6 from kernel ipv6= boot parameter.
 pub fn configure_ipv6_from_cmdline() {
     eprintln!("[fc-agent] checking for IPv6 configuration");
@@ -807,13 +817,10 @@ pub fn configure_ipv6_from_cmdline() {
     };
     eprintln!("[fc-agent] ipv6 param: {}", ipv6_param);
 
-    let parts: Vec<&str> = ipv6_param.split('|').collect();
-    if parts.len() != 2 {
-        eprintln!("[fc-agent] WARNING: invalid ipv6= format, expected <client>|<gateway>");
+    let Some((client_raw, gateway, local_only)) = parse_ipv6_param(ipv6_param) else {
+        eprintln!("[fc-agent] WARNING: invalid ipv6= format, expected <client>|<gateway>[|local]");
         return;
-    }
-    let client_raw = parts[0];
-    let gateway = parts[1];
+    };
 
     // Parse optional prefix length from client address (e.g., "addr/128" or just "addr").
     // Routed mode passes /128 (VM's only neighbor is the bridge, no on-link /64 needed).
@@ -851,6 +858,14 @@ pub fn configure_ipv6_from_cmdline() {
         Err(e) => {
             eprintln!("[fc-agent] WARNING: failed to run ip -6 addr add: {}", e);
         }
+    }
+
+    // A guest on a host without global IPv6 reaches its gateway, on-link in the
+    // /64, and nothing beyond it, so a connection elsewhere fails at once and the
+    // client falls back to IPv4.
+    if local_only {
+        eprintln!("[fc-agent] IPv6 reaches only the gateway {gateway}: no default route");
+        return;
     }
 
     // Use "replace" not "add" — RA may have already installed a default route.
@@ -1903,6 +1918,22 @@ fn enable_route_localnet() -> bool {
 #[cfg(test)]
 mod gateway_arp_tests {
     use super::*;
+
+    /// The boot parameter's optional third part says the gateway is all the guest
+    /// reaches (#1026); anything else after the gateway is refused.
+    #[test]
+    fn the_ipv6_boot_parameter_may_say_local() {
+        assert_eq!(
+            parse_ipv6_param("fd00::100|fd00::2"),
+            Some(("fd00::100", "fd00::2", false))
+        );
+        assert_eq!(
+            parse_ipv6_param("fd00::100|fd00::2|local"),
+            Some(("fd00::100", "fd00::2", true))
+        );
+        assert_eq!(parse_ipv6_param("fd00::100|fd00::2|global"), None);
+        assert_eq!(parse_ipv6_param("fd00::100"), None);
+    }
 
     #[test]
     fn default_route_parses_from_proc_net_route() {

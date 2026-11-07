@@ -348,7 +348,7 @@ pub mod test_child;
 /// Check if we're running inside a container.
 ///
 /// Containers create marker files that we can use to detect containerized environments.
-pub fn is_in_container() -> bool {
+fn is_in_container() -> bool {
     // Podman creates /run/.containerenv
     if std::path::Path::new("/run/.containerenv").exists() {
         return true;

@@ -1414,6 +1414,7 @@ impl NetworkManager for RoutedNetwork {
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
             // The namespace kernel then forwards to the veth → host.
             host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string()),
+            guest_ipv6_local_only: false,
             dns_search: None,
             // The gateway relay (step 16), whose host side goes through the host's
             // connect() hooks.
