@@ -14,6 +14,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -185,12 +186,30 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 v.layoutParams = lp
             }
         }
-        if (lift == 0 && ::gl.isInitialized) gl.barsLifted = false
+        if (lift == 0 && ::gl.isInitialized && gl.barsLifted) lowered()
         val night = night()
         val on = if (night) 0xFFD0BCFF.toInt() else 0xFF6750A4.toInt()
         val off = if (night) 0xFFCAC4D0.toInt() else 0xFF49454F.toInt()
         tabScene.setTextColor(if (Store.screen == "scene") on else off)
         tabInfo.setTextColor(if (Store.screen == "info") on else off)
+    }
+
+    /**
+     * Clears GlThread.barsLifted once the lowered layout has been drawn, not when it is asked
+     * for: a layout change waits for the next traversal, and the stamp keeps its held bit until
+     * the bars are down. A hold again meanwhile keeps it set.
+     */
+    private fun lowered() {
+        val obs = root.viewTreeObserver
+        obs.addOnDrawListener(object : ViewTreeObserver.OnDrawListener {
+            override fun onDraw() {
+                root.post {
+                    root.viewTreeObserver.removeOnDrawListener(this)
+                    if (!heldFromScene) gl.barsLifted = false
+                }
+            }
+        })
+        root.invalidate()
     }
 
     private fun theme() {

@@ -26,6 +26,20 @@ class StampTest {
         assertFalse(h.next(held = false, barsLifted = false))
     }
 
+    /**
+     * The app clears the lifted flag only from a draw callback, after the lowered layout has
+     * been drawn: a layout change waits for the next traversal (a source check of
+     * MainActivity, which has no JVM test of its own).
+     */
+    @Test
+    fun theAppClearsTheLiftedFlagOnlyAfterTheLoweredLayoutIsDrawn() {
+        val src = java.io.File(System.getProperty("appSrcDir"), "MainActivity.kt").readLines()
+        val clears = src.indices.filter { src[it].contains("barsLifted = false") }
+        assertEquals("one place clears it", 1, clears.size)
+        val before = src.subList(maxOf(0, clears[0] - 6), clears[0]).joinToString("\n")
+        assertTrue("cleared inside onDraw's posted callback: $before", before.contains("override fun onDraw()") && before.contains("root.post"))
+    }
+
     /** Given back, the bit stays set for as long as the UI has not lowered the bars, then the tail. */
     @Test
     fun theHeldBitStaysWhileTheBarsAreStillLifted() {
