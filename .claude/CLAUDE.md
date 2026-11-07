@@ -2936,37 +2936,41 @@ separately.
   scattered (a 128 GiB www guest: 72 GiB in 2.55 M runs). From a cold page cache those reads
   took 40.0 s with 8 threads, and 65.7 s when btrfs had compressed the memory file; the same
   bytes packed as zstd frames, read and decompressed by 32 threads, took 4.1 s (2026-11-04).
-  A pack (`<memory.bin>.working-set.pack`, `src/uffd/pack.rs`) holds every recorded run's
-  bytes in first-touch order as independent zstd level-1 frames of 4 MiB, with a content
-  checksum each, keyed by the memory file's image key and the set's order digest (the
-  granules and the tier of each).
+  A pack (`<memory.bin>.working-set.pack`, `src/uffd/pack.rs`) holds every run of the set it
+  was built from, in first-touch order, as independent zstd level-1 frames of 4 MiB with a
+  content checksum each. Its header names the memory file's image key and the order digest
+  of that set, and its tables carry a SHA-256.
   - *When it is built.* After the serve's persistence worker publishes the sidecar, a
-    detached builder thread (`fcvm-ws-pack`, 4 threads) packs exactly the published set; the
-    first publication pass of a serve also asks, so a snapshot whose pack is missing or
-    stale gets one; after that only a changed sidecar asks. A newer set cancels a running
-    build at its next frame. `snapshot create --inherit-working-set` builds the inherited
-    set's pack after it gives the generation lock back, and waits for it: reading and
-    compressing a large set adds minutes to that create. The build reads an open memory file whose identity it checks first, with no lock,
-    into a uuid temporary recorded in `reclaim` before it is created. Installing it is a
-    rename under the shared generation lock and the sidecar's lock, only if the image and
-    generation are still the store's and the sidecar holds that set, so a pack is never
-    installed beside a replaced image or another set (`pack_installation_cannot_race_image_replacement`,
+    detached builder thread (`fcvm-ws-pack`, 4 threads) packs exactly the published set. The
+    first publication pass of a serve asks even when the sidecar did not change, so a
+    snapshot with a set and no pack (an inherited set, `snapshot create
+    --inherit-working-set`, which builds none itself) gets one from its first serve; after
+    that only a grown set asks. A set that grows during a build does not cancel it: the build
+    finishes and installs, and the latest set is built after it. The build reads an open
+    memory file whose identity it checks first, with no lock, into a uuid temporary recorded
+    in `reclaim` before it is created. Installing it is a rename under the shared generation
+    lock and the sidecar's lock, only if the image and generation are still the store's and
+    the set the pack was built from is the sidecar's set or a subset of it
+    (`pack_installation_cannot_race_image_replacement`,
     `a_pack_is_not_installed_beside_another_set`). A build that fails logs a warning.
   - *When it is used.* Copy mode with replay workers (`--uffd-replay-threads` above 1), NV2
-    and hugetlb clones included, when the loaded pack's key and digest match the set being
-    replayed and its run table is that set's runs. The page cache warm-up loads it; a clone's
-    replay only asks for it, without waiting, so a clone that connects before the warm-up
-    loaded it replays from the memory file. Packs fail closed: a store replays one only after
-    its server binds it to the memory file it mapped (`bind_served_image`), so a server whose
-    memory file is not the image its store describes (the snapshot was replaced between the
-    two opens) replays none. The
-    handler still plans every run, steps over given-back pages and maps holes; workers copy a
-    plain run out of decompressed frames instead of the mapping, as many read-ahead threads
-    as workers decompress frames in order a window ahead (2 per worker, at most 64) and drop
-    them behind it, and a run whose frame is gone or failed reads the memory file. A frame
-    that fails to decompress to its table length makes the rest of that replay read the
-    memory file. Minor mode, and a handler replaying alone, keep the memory file: a minor
-    clone's memfd already holds the image and `UFFDIO_CONTINUE` moves no bytes.
+    and hugetlb clones included, whenever the pack's image key matches, whatever set it was
+    built from: replay copies from it every run its own table holds and reads the memory
+    file for the rest, so a set that grew keeps using the old pack until the grown set's pack
+    replaces it. The page cache warm-up loads it (and reloads a pack installed since); a
+    clone's replay only asks for it, without waiting, so a clone that connects before the
+    warm-up loaded it replays from the memory file. Packs fail closed: a store replays one
+    only after its server binds it to the memory file it mapped (`bind_served_image`), so a
+    server whose memory file is not the image its store describes (the snapshot was replaced
+    between the two opens) replays none. The handler still plans every run, steps over
+    given-back pages and maps holes; workers copy a plain run out of decompressed frames
+    instead of the mapping, as many read-ahead threads as workers decompress frames in order
+    a window ahead (2 per worker, at most 64) and drop them behind it, and a run whose frame
+    is gone or failed reads the memory file. A frame that fails to decompress to its table
+    length makes the rest of that replay read the memory file. Minor mode, and a handler
+    replaying alone, keep the memory file: a minor clone's memfd already holds the image and
+    `UFFDIO_CONTINUE` moves no bytes. With a pack the warm-up reads only the pack, so a
+    demand fault on a recorded page that runs ahead of replay reads the memory file cold.
   - *What it logs.* The replay line gains `pack_used`, `pack_frames`, `pack_compressed_mib`,
     `pack_decompress_ms` (summed over threads), `pack_mib` and `pack_failed`; the warm-up
     line's `file` says whether it read the `pack` or the `memory` file's recorded runs.
