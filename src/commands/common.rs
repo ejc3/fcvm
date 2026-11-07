@@ -2978,6 +2978,9 @@ pub struct RestoreParams<'a> {
     /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
     /// configure on eth0, replacing the snapshot's shared guest IPv6.
     pub clone_ipv6: Option<String>,
+    /// For bridged clones with NFS shares: the clone's own host address, at which
+    /// fc-agent remounts the shares (the restore-only vsock document carries it too).
+    pub nfs_host_ip: Option<String>,
     /// Enable KVM dirty page tracking (needed for subsequent diff snapshots
     /// from this VM). File-backed restore memory is mmap'd MAP_PRIVATE either
     /// way, so clones share clean pages through the host page cache in BOTH
@@ -3810,6 +3813,7 @@ pub async fn restore_from_snapshot(
         network_config,
         restore_epoch,
         clone_ipv6,
+        nfs_host_ip,
         track_dirty_pages,
         firecracker_choice,
         balloon_target_mib,
@@ -4147,6 +4151,10 @@ pub async fn restore_from_snapshot(
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
         }
+        // The same NFS server address the restore-only vsock document carries.
+        if let Some(ref ip) = nfs_host_ip {
+            mmds_latest["nfs-host-ip"] = serde_json::Value::String(ip.clone());
+        }
         // The command the guest runs in the container before the restored VM is
         // published (`--on-restore`). The guest skips it when its container has not
         // started yet, which is every restore of a pre-start snapshot.
@@ -4290,6 +4298,7 @@ pub async fn restore_from_snapshot_ch(
         network_config,
         restore_epoch: _,      // delivered by the caller's boot-plan vsock listener
         clone_ipv6: _,         // delivered to the guest via the boot-plan restore-epoch (caller)
+        nfs_host_ip: _,        // delivered by the caller's boot-plan vsock listener
         track_dirty_pages: _,  // CH has no dirty-page tracking
         firecracker_choice: _, // CH restores run find_cloud_hypervisor's binary
         balloon_target_mib,

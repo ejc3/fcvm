@@ -280,6 +280,21 @@ pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
+/// The shares a restore remounts: the boot's, at `host_ip` when the restoring host gave
+/// one (`nfs-host-ip`), so the remount gets an NFS client of its own.
+pub(crate) fn nfs_remounts(
+    shares: &[crate::types::NfsMount],
+    host_ip: Option<&str>,
+) -> Vec<crate::types::NfsMount> {
+    shares
+        .iter()
+        .map(|share| crate::types::NfsMount {
+            host_ip: host_ip.unwrap_or(&share.host_ip).to_string(),
+            ..share.clone()
+        })
+        .collect()
+}
+
 /// Handle clone restore: kill stale sockets, refresh gateway ARP, re-register exec,
 /// and prepare output readiness.
 ///
@@ -528,18 +543,38 @@ pub async fn handle_clone_restore(
                 ..mounted.share.clone()
             });
         }
+        // This guest is a copy of the VM the snapshot was taken of, NFSv4 client
+        // identity included. A twin clone, or that VM while the server still holds its
+        // state, uses the same identity from another address, and the server refuses
+        // the second mount ("Operation not permitted") or never answers it. Mount under
+        // an identity of this clone's own. The identity reaches only a new NFS client,
+        // and the kernel reuses its client for a server address it already holds: a
+        // file the restored workload holds open keeps the snapshot's client alive
+        // through the lazy unmount. So the shares are remounted at the address the
+        // host gave this clone (`nfs_remounts`).
+        if let Err(error) = crate::mounts::fresh_nfs_client_identity() {
+            eprintln!("[fc-agent] WARNING: could not give the clone its own NFS client identity: {error:#}");
+        }
         // No mount record: the boot's check passed the mounts this restore reproduces.
         // A failure fails the restore closed: the hook below may use the share,
         // and a mount point that is an ordinary directory would take its writes;
         // a published clone whose share is missing is the stale state the hook
         // exists to prevent.
-        crate::mounts::mount_nfs_shares(&shares, None)
+        let shares = nfs_remounts(&shares, metadata.nfs_host_ip.as_deref());
+        let remounted_paths = crate::mounts::mount_nfs_shares(&shares, None)
             .context("remounting NFS shares after restore, so the clone stays unpublished")?;
         // The remount made new mounts. Their IDs replace the boot's, so a snapshot of this
         // clone, restored, remounts these and not the ones this restore unmounted.
         let remounted = crate::mounts::record_nfs_mounts(&shares)
             .context("recording the NFS shares remounted after restore")?;
         *signals.nfs_mounts.lock().unwrap_or_else(|e| e.into_inner()) = Some(remounted);
+        // The container bound the snapshot's mounts when it started; give it these.
+        for (pid, path) in crate::mounts::nfs_mounts_in_other_namespaces(&remounted_paths)? {
+            crate::mounts::rebind_into_namespace(pid, &path).context(
+                "giving the container the remounted NFS share, so the clone stays unpublished",
+            )?;
+            eprintln!("[fc-agent] NFS share {path} remounted in the mount namespace of {pid}");
+        }
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
 
@@ -820,6 +855,30 @@ mod restore_side_job_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1009: a restore remounts its NFS shares at the address the host gave this
+    /// clone, and keeps the boot's address when the host gave none.
+    #[test]
+    fn nfs_shares_are_remounted_at_the_clones_own_host_address() {
+        let shares = vec![crate::types::NfsMount {
+            host_ip: "172.30.0.1".to_string(),
+            host_path: "/srv/share".to_string(),
+            mount_path: "/mnt/share".to_string(),
+            read_only: true,
+        }];
+        let moved = nfs_remounts(&shares, Some("10.0.0.5"));
+        assert_eq!(moved[0].host_ip, "10.0.0.5");
+        assert_eq!(moved[0].host_path, "/srv/share");
+        assert_eq!(moved[0].mount_path, "/mnt/share");
+        assert!(moved[0].read_only);
+        assert_eq!(nfs_remounts(&shares, None)[0].host_ip, "172.30.0.1");
+        let metadata: crate::types::LatestMetadata = serde_json::from_value(serde_json::json!({
+            "host-time-ns": "1",
+            "nfs-host-ip": "10.0.0.5",
+        }))
+        .unwrap();
+        assert_eq!(metadata.nfs_host_ip.as_deref(), Some("10.0.0.5"));
+    }
 
     /// The ACK telemetry, with every phase at a large value and the ACK connect time, still
     /// fits the frame budget beside a UUID epoch, so `restore_complete_frame` keeps it.

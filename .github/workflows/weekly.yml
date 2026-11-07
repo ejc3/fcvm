@@ -37,6 +37,9 @@ jobs:
   fuzz:
     name: Lifecycle-Fuzz-arm64
     runs-on: [self-hosted, Linux, ARM64]
+    # The chaos fuzz plus a seventh of the gym's cross product (2376 scenarios in all,
+    # 8 at a time), so seven nights run every valid combination.
+    timeout-minutes: 420
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo test runner)
       - name: Fix workspace permissions (pre-checkout)
@@ -117,6 +120,14 @@ jobs:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
           FUSER: ${{ github.workspace }}/fuser
         run: make fuzz SEEDS=20 OPS=25
+      - name: Run the fuzz gym's full cross product
+        if: always()
+        working-directory: fcvm
+        env:
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
+          FCVM_GYM_SAMPLES: '16'
+        run: FCVM_GYM_SHARD="$(( 10#$(date -u +%j) % 7 ))/7" make fuzz-gym
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
