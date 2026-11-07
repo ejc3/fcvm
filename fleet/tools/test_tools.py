@@ -207,6 +207,15 @@ case "$args" in
   *" ec2 describe-subnets "*) [ -z "${FAKE_SLOW_SUBNETS:-}" ] || sleep 3; echo subnet-fake ;;
   *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
   *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
+  # One gpubox, i-fakebox, lives in FAKE_BOX_REGION: found by id or by its Purpose tag only there.
+  *" ec2 describe-instances "*"--instance-ids "*|*" ec2 describe-instances "*"tag:Purpose"*)
+    region=$(sed -n 's/.*--region \([^ ]*\).*/\1/p' <<<"$args")
+    if [ "$region" != "${FAKE_BOX_REGION:-us-east-1}" ]; then
+      case "$args" in *"--instance-ids "*) echo "An error occurred (InvalidInstanceID.NotFound)" >&2; exit 254 ;; esac
+    else
+      case "$args" in *"--instance-ids "*) echo fcvm-fleet-gpubox ;; *) printf 'i-fakebox\trunning\tsomeone\t2026-11-07T12:00:00Z\tspot\t2026-11-07T08:00:00+00:00\n' ;; esac
+    fi ;;
+  *" ec2 describe-instance-type-offerings "*) printf '%s\n' ${FAKE_OFFER_AZS:-us-west-2a us-west-2c} ;;
   *" ec2 describe-instances "*)
     [ -z "${FAKE_USAGE_FAIL:-}" ] || { echo "An error occurred (RequestLimitExceeded)" >&2; exit 254; }
     case "$args" in *"InstanceLifecycle==\`spot\`"*) m=spot; printf '%b' "$FAKE_SPOT_IN_USE" ;; *) m=on-demand; printf '%b' "$FAKE_OD_IN_USE" ;; esac
@@ -268,13 +277,15 @@ class GpuboxWallReserve(unittest.TestCase):
         os.chmod(os.path.join(d, "aws"), 0o755)
         log = os.path.join(d, "calls")
         env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
-                   GPUBOX_AZS="a", FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
+                   FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
                    FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
-                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **extra)
+                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **{"GPUBOX_REGION": "us-east-1", "GPUBOX_AZS": "a", **extra})
+        env = {k: v for k, v in env.items() if v is not None}
         cmd = cmd or ["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"]
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
+        r.log, r.calls = log, calls
         def named(word):
             return [c for c in calls if f" {word} " in f" {c} "]
         return r, named("run-instances"), named("terminate-instances")
@@ -399,7 +410,8 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertIn("room_for ", src)
                 self.assertIn("admit_held", src)
                 self.assertIn("ledger_add ", src)
-                self.assertIn("$ADMISSION_TAG]", src)
+                # gpubox.sh adds it only in the staging region, the one that has the reserve.
+                self.assertRegex(src, r'\$ADMISSION_TAG\]|adm=",\$ADMISSION_TAG"')
 
     def test_a_ledger_entry_counts_its_own_vcpus(self):
         # An admission a moment ago, not listed yet. 96 listed + 4 + this box's 96 + the wall's
@@ -414,6 +426,64 @@ class GpuboxWallReserve(unittest.TestCase):
             self.assertEqual(len(launches), admitted, (vcpus, r.stderr))
             for c in launches:
                 self.assertNotIn("MarketType=spot", c)
+
+    def gpubox(self, *args, **kw):
+        return self.up(cmd=["bash", os.path.join(HERE, "gpubox.sh"), *args], **kw)
+
+    def test_a_box_in_us_west_2_never_consults_the_staging_reserve(self):
+        # Both markets full by the staging region's reserve; us-west-2 has no wall to leave room for.
+        r, launches, _ = self.up(spot_in_use=boxes(2), od_in_use=boxes(4), GPUBOX_REGION="us-west-2")
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertEqual(r.stdout.split(), ["i-fakebox", "us-west-2"])
+        self.assertNotIn("fcvm-admission", launches[0], "a launch outside the staging region skipped the reserve")
+        for call in r.calls:
+            self.assertNotIn("service-quotas", call)
+            self.assertNotIn("gpubox/admission.lock", call)
+            self.assertNotIn("gpubox/admitted", call)
+
+    def test_the_region_is_used_in_every_aws_call(self):
+        for region in ("us-west-2", "us-east-1"):
+            with self.subTest(region=region):
+                r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION=region)
+                self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+                # STS is global and the asset bucket's S3 has its own region (us-east-2).
+                regional = [c for c in r.calls if not c.startswith("sts ") and " s3 " not in f" {c} " and " s3api " not in f" {c} "]
+                self.assertTrue(any(" run-instances " in c for c in regional))
+                for call in regional:
+                    self.assertTrue(call.startswith(f"--region {region} "), call)
+                self.assertTrue(any(f"Values=fcvm-fleet-{region}a" in c for c in r.calls), r.calls)
+
+    def test_agents_default_to_us_west_2_and_its_g4dn_metal_zones(self):
+        r, launches, _ = self.up(GPUBOX_REGION=None, GPUBOX_AZS=None, FAKE_OFFER_AZS="us-west-2a us-west-2c")
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertTrue(launches[0].startswith("--region us-west-2 "), launches[0])
+        subnets = [c for c in r.calls if " describe-subnets " in c]
+        self.assertEqual(len(subnets), 1, "spot in the first zone with g4dn.metal")
+        self.assertIn("Values=fcvm-fleet-us-west-2a", subnets[0])
+
+    def test_down_finds_a_box_in_either_region_and_nowhere_else(self):
+        for home in ("us-west-2", "us-east-1"):
+            with self.subTest(home=home):
+                r, _, ends = self.gpubox("down", "i-fakebox", FAKE_BOX_REGION=home, GPUBOX_REGION=None)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(len(ends), 1, r.calls)
+                self.assertTrue(ends[0].startswith(f"--region {home} "), ends)
+                r, _, ends = self.gpubox("down", "i-fakebox", home, FAKE_BOX_REGION=home, GPUBOX_REGION=None)
+                self.assertEqual((r.returncode, len(ends)), (0, 1), r.stderr)
+                other = "us-east-1" if home == "us-west-2" else "us-west-2"
+                r, _, ends = self.gpubox("down", "i-fakebox", other, FAKE_BOX_REGION=home, GPUBOX_REGION=None)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(ends, [])
+        r, _, ends = self.gpubox("down", "i-fakebox", FAKE_BOX_REGION="us-east-2", GPUBOX_REGION=None)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(ends, [])
+
+    def test_list_shows_both_regions(self):
+        for home in ("us-west-2", "us-east-1"):
+            r, _, _ = self.gpubox("list", FAKE_BOX_REGION=home, GPUBOX_REGION=None)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rows = [line.split() for line in r.stdout.splitlines()]
+            self.assertEqual([(row[0], row[1]) for row in rows], [("i-fakebox", home)], r.stdout)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
