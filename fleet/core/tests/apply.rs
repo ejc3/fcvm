@@ -589,6 +589,19 @@ fn every_launched_host_connected_leaves_no_place_for_a_gpu_no_host_listed() {
     assert!(s.fleet.fcvm_dark.is_empty());
     assert!(view(&s).layout.generation > generation);
     check_layout(&s);
+    // h2 gets a spot notice: still connected, its GPUs leave the wall, and its places hold
+    // for the replacement (one re-tile, not two).
+    let draining = view(&s).layout.generation;
+    s = apply(
+        s,
+        &events(serde_json::json!([{"type": "agent", "at": 2900, "host": "h2", "msg": {"type": "draining", "reason": "spot interruption"}}])).remove(0),
+    );
+    assert_eq!(
+        fcvm(&s).len(),
+        8,
+        "a draining host's places are kept for its replacement"
+    );
+    assert_eq!(view(&s).layout.generation, draining + 1);
     // h2 is reclaimed and the launcher lists its replacement: the places come back for it.
     s = apply(
         s,
@@ -599,6 +612,11 @@ fn every_launched_host_connected_leaves_no_place_for_a_gpu_no_host_listed() {
     );
     s = apply(s, &expected(3100, &["h1", "h3"]));
     assert_eq!(fcvm(&s).len(), 8, "h3 has not connected yet");
+    assert_eq!(
+        view(&s).layout.generation,
+        draining + 1,
+        "the reclaim re-tiled once"
+    );
     // A launcher that cannot say which hosts it expects keeps the configured places.
     s = apply(s, &hello(4000, "h3", 3));
     s = apply(

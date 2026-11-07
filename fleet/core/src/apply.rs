@@ -1649,8 +1649,9 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 /// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs - quarantined GPUs, fcvm
 ///   GPUs)`, where phone GPUs are those connected hosts run phones on and quarantined GPUs
 ///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. Once
-///   every host the launcher keeps (`expected_hosts`) has connected, the first term is at
-///   most the GPUs the wall could place, so a GPU no hello listed leaves no place. The
+///   every host the launcher keeps (`expected_hosts`) has connected and none is draining,
+///   the first term is at most the GPUs the wall could place, so a GPU no hello listed
+///   leaves no place. The
 ///   GPUs are grouped into one band per host and the places left over are one dark band
 ///   below them.
 /// - Asleep, neither side has a place.
@@ -1726,10 +1727,13 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         .filter(|s| is_quarantined(f, s) && !host_draining(&f.hosts, s))
         .filter(|s| s.host.as_ref().is_some_and(|h| f.hosts.contains_key(h)))
         .count();
-    let all_connected = f
-        .expected_hosts
-        .as_ref()
-        .is_some_and(|ids| !ids.is_empty() && ids.iter().all(|id| f.hosts.contains_key(id)));
+    // Connected and staying: a draining host's places are held for its replacement.
+    let all_connected = f.expected_hosts.as_ref().is_some_and(|ids| {
+        !ids.is_empty()
+            && ids
+                .iter()
+                .all(|id| f.hosts.get(id).is_some_and(|h| !h.draining))
+    });
     let fcvm_places = if asleep {
         0
     } else {

@@ -82,18 +82,29 @@ part() {
     "$1" "$2" | zstd -q -d | untar "$M" "$2" && pieces "$M" "$2"
   fi
 }
-# split_files: each split file at its size before its pieces land (a hole until they do),
-# or (`meta`) its mode, owner and time once they have.
+# split_files create: each split file at its size before its pieces land (a hole until they
+# do). split_files meta: its mode, owner and mtime (to the nanosecond, whatever its digits
+# or sign) once they have, all in one process.
 split_files() {
-  local kind size mode uid gid mtime rel
-  while IFS=$'\t' read -r kind size mode uid gid mtime rel; do
+  local kind size rel
+  if [ "$1" = meta ]; then
+    python3 - "$M" "$SEGS" <<'PY'
+import os, sys
+root, segs = sys.argv[1], sys.argv[2]
+for line in open(segs):
+    f = line.rstrip("\n").split("\t", 6)
+    if f[0] != "file":
+        continue
+    path = os.path.join(root, f[6])
+    os.chown(path, int(f[3]), int(f[4]))
+    os.chmod(path, int(f[2], 8))
+    os.utime(path, ns=(os.stat(path).st_atime_ns, int(f[5])))
+PY
+    return
+  fi
+  while IFS=$'\t' read -r kind size _ _ _ _ rel; do
     [ "$kind" = file ] || continue
-    if [ "$1" = create ]; then
-      : > "$M/$rel" && truncate -s "$size" "$M/$rel" || return 1
-    else
-      chown "$uid:$gid" "$M/$rel" && chmod "$mode" "$M/$rel" &&
-        touch -m -d "@${mtime:0:-9}.${mtime: -9}" "$M/$rel" || return 1
-    fi
+    : > "$M/$rel" && truncate -s "$size" "$M/$rel" || return 1
   done < "$SEGS"
 }
 # restore FETCH PART...: every PART at once, each one's .tar.zst written to stdout by
