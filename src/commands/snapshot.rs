@@ -5434,6 +5434,8 @@ async fn cmd_snapshot_run_raw(
     vm_state.config.balloon_mib = meta.balloon_mib;
     vm_state.config.published_guest_ports = Some(Vec::new());
     vm_state.config.vsock_socket_path = None;
+    vm_state.config.firmware = meta.firmware.clone();
+    let ch_bin = super::common::find_cloud_hypervisor()?;
 
     let data_dir = paths::vm_runtime_dir(&vm_id);
     vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
@@ -5454,7 +5456,7 @@ async fn cmd_snapshot_run_raw(
 
     let mut network =
         PastaNetwork::isolated(vm_id.clone(), format!("tap-{}", truncate_id(&vm_id, 8)));
-    let network_config = match network.setup().await.context("setting up network") {
+    let mut network_config = match network.setup().await.context("setting up network") {
         Ok(config) => config,
         Err(e) => {
             if let Err(error) = network.cleanup().await {
@@ -5463,6 +5465,20 @@ async fn cmd_snapshot_run_raw(
             super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
             return Err(e);
         }
+    };
+    // The restored NIC keeps the snapshot's MAC (the restore rewrites only its TAP), and a
+    // relaunch after a guest reset keeps it too, so the guest sees the same adapter.
+    network_config.guest_mac = meta.network_config.guest_mac.clone();
+    let boot = super::vm::RawBoot {
+        ch_bin,
+        vm_name: vm_name.clone(),
+        firmware: meta.firmware.clone(),
+        vcpus: meta.vcpu,
+        mem_mib: meta.memory_mib,
+        disk: data_dir.join("disks/rootfs.raw"),
+        tap_device: network_config.tap_device.clone(),
+        guest_mac: network_config.guest_mac.clone(),
+        balloon_mib: args.balloon.or(meta.balloon_mib),
     };
 
     let restore_config = SnapshotRestoreConfig {
@@ -5541,6 +5557,7 @@ async fn cmd_snapshot_run_raw(
             holder_child,
             network: Box::new(network),
             ns_helper,
+            boot,
             state_manager,
             vm_state,
             reclaim_owner,
@@ -6352,6 +6369,7 @@ mod tests {
             parked_gpus: 0,
             guest: Default::default(),
             health_port: None,
+            firmware: None,
         }
     }
 

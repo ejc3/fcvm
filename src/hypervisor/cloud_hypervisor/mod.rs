@@ -95,6 +95,10 @@ pub struct CloudHypervisorBackend {
     console_lines: Arc<std::sync::atomic::AtomicU64>,
     /// One event reader per VMM child. It must finish before the API path is reused.
     reboot_monitor: Option<JoinHandle<Result<()>>>,
+    /// Set by the event monitor when the guest reset itself (CH's `vm` `rebooting` event),
+    /// before it shuts the VMM down, so the caller can tell a reboot it must relaunch from a
+    /// power-off. Cleared by every spawn.
+    guest_reset: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CloudHypervisorBackend {
@@ -119,7 +123,14 @@ impl CloudHypervisorBackend {
             console_tail: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reboot_monitor: None,
+            guest_reset: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Whether this VMM's guest reset itself, which made the event monitor shut the VMM
+    /// down (as opposed to a guest power-off or a kill). Read after [`Hypervisor::wait`].
+    pub fn guest_reset(&self) -> bool {
+        self.guest_reset.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn client(&self) -> Result<&ChClient> {
@@ -450,15 +461,14 @@ impl Hypervisor for CloudHypervisorBackend {
         self.wait_for_api().await?;
         self.client = Some(ChClient::new(self.api_socket.clone()));
         let client = self.client()?.clone();
+        self.guest_reset
+            .store(false, std::sync::atomic::Ordering::Release);
+        let guest_reset = Arc::clone(&self.guest_reset);
         self.reboot_monitor = Some(tokio::spawn(async move {
-            if read_reboot_event(BufReader::new(events)).await? {
-                // The guest's vsock notification is early intent, before shutdown
-                // writeback. CH emits this event only when it handles the actual
-                // reset. Exit the VMM here so fcvm consumes intent and cold-relaunches.
-                info!("Cloud Hypervisor guest reset, shutting down VMM for host relaunch");
-                client.shutdown_vmm().await?;
-            }
-            Ok(())
+            watch_guest_reset(BufReader::new(events), &guest_reset, || async move {
+                client.shutdown_vmm().await
+            })
+            .await
         }));
 
         // Tail the guest console (hvc0 → file) into fcvm's tracing logs, mirroring the
@@ -682,6 +692,29 @@ impl Drop for CloudHypervisorBackend {
             monitor.abort();
         }
     }
+}
+
+/// Wait for the guest to reset itself (`read_reboot_event`); then record it in `guest_reset`
+/// and call `shutdown`. The guest's vsock notification is early intent, before shutdown
+/// writeback. CH emits this event only when it handles the actual reset. The VMM exits here so
+/// fcvm consumes the intent and cold-relaunches (a Linux guest's run loop, and a raw VM's
+/// `commands::vm::run_until_exit`, which has no other notice). A stream that ends without
+/// the event (a power-off) records nothing and shuts nothing down.
+async fn watch_guest_reset<F, Fut>(
+    events: impl AsyncBufRead + Unpin,
+    guest_reset: &std::sync::atomic::AtomicBool,
+    shutdown: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if read_reboot_event(events).await? {
+        guest_reset.store(true, std::sync::atomic::Ordering::Release);
+        info!("Cloud Hypervisor guest reset, shutting down VMM for host relaunch");
+        shutdown().await?;
+    }
+    Ok(())
 }
 
 /// CH writes pretty-printed JSON objects separated by a blank line, not JSONL.
@@ -1204,6 +1237,39 @@ mod tests {
             .await
             .is_err());
         assert!(read_reboot_event(b"not-json\n\n".as_slice()).await.is_err());
+    }
+
+    /// A guest reset is recorded before the monitor shuts the VMM down, so whoever waits on
+    /// the VMM sees it; a guest power-off records nothing and shuts nothing down.
+    #[tokio::test]
+    async fn a_guest_reset_is_recorded_and_a_power_off_is_not() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reset = AtomicBool::new(false);
+        let shut_down = AtomicBool::new(false);
+        let rebooting = "{\n  \"source\": \"vm\",\n  \"event\": \"rebooting\"\n}\n\n";
+        watch_guest_reset(rebooting.as_bytes(), &reset, || async {
+            assert!(
+                reset.load(Ordering::Acquire),
+                "shut down before the reset was recorded"
+            );
+            shut_down.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(reset.load(Ordering::Acquire) && shut_down.load(Ordering::Acquire));
+
+        let reset = AtomicBool::new(false);
+        let power_off = concat!(
+            "{\n  \"source\": \"vm\",\n  \"event\": \"shutdown\"\n}\n\n",
+            "{\n  \"source\": \"vmm\",\n  \"event\": \"shutdown\"\n}\n\n",
+        );
+        watch_guest_reset(power_off.as_bytes(), &reset, || async {
+            panic!("a power-off shut the VMM down as a reset")
+        })
+        .await
+        .unwrap();
+        assert!(!reset.load(Ordering::Acquire));
     }
 
     fn backend() -> CloudHypervisorBackend {

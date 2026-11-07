@@ -516,6 +516,7 @@ async fn cmd_vm_run(args: VmRunArgs) -> Result<()> {
     let mut vm_slot: Option<Box<dyn Hypervisor>> = None;
     let mut holder_slot: Option<tokio::process::Child> = None;
     let mut helper_slot: Option<NsHelper> = None;
+    let mut boot_slot: Option<RawBoot> = None;
     let booted = boot_raw_vm(
         &args,
         &ch_bin,
@@ -527,6 +528,7 @@ async fn cmd_vm_run(args: VmRunArgs) -> Result<()> {
         &mut vm_slot,
         &mut holder_slot,
         &mut helper_slot,
+        &mut boot_slot,
     )
     .await;
     if let Err(e) = booted {
@@ -556,6 +558,7 @@ async fn cmd_vm_run(args: VmRunArgs) -> Result<()> {
             holder_child: holder_slot,
             network: Box::new(network),
             ns_helper: helper_slot,
+            boot: boot_slot.expect("boot_raw_vm records the boot on success"),
             state_manager,
             vm_state,
             reclaim_owner,
@@ -580,6 +583,7 @@ async fn boot_raw_vm(
     vm_slot: &mut Option<Box<dyn Hypervisor>>,
     holder_slot: &mut Option<tokio::process::Child>,
     helper_slot: &mut Option<NsHelper>,
+    boot_slot: &mut Option<RawBoot>,
 ) -> Result<()> {
     let vm_id = vm_state.vm_id.clone();
     // The disk is the VM's own reflink copy, at the path every VM's disk has, which is
@@ -631,15 +635,59 @@ async fn boot_raw_vm(
     *helper_slot =
         Some(NsHelper::start(user_ns, net_ns, &vm_id, data_dir, args.health_port).await?);
 
+    *boot_slot = Some(RawBoot {
+        ch_bin: ch_bin.to_path_buf(),
+        vm_name: args.name.clone(),
+        firmware: Some(args.firmware.clone()),
+        vcpus: args.cpu,
+        mem_mib: args.mem,
+        disk,
+        tap_device: network_config.tap_device.clone(),
+        guest_mac: network_config.guest_mac.clone(),
+        balloon_mib: args.balloon,
+    });
+    boot_firmware(
+        backend.as_mut(),
+        boot_slot.as_ref().expect("the boot was just recorded"),
+    )
+    .await?;
+
+    crate::commands::common::save_vm_state_with_network(state_manager, vm_state, network_config)
+        .await
+}
+
+/// What boots a raw VM: the same firmware, disk, NIC and memory at its first boot and at
+/// every relaunch after its guest reset itself.
+pub(crate) struct RawBoot {
+    pub ch_bin: PathBuf,
+    pub vm_name: String,
+    /// None for a clone of a snapshot that recorded no firmware, which cannot boot again.
+    pub firmware: Option<PathBuf>,
+    pub vcpus: u8,
+    pub mem_mib: u32,
+    /// The VM's own copy of the disk, which a relaunch boots as it was left.
+    pub disk: PathBuf,
+    pub tap_device: String,
+    /// The guest NIC's MAC, kept across a relaunch so Windows sees the same adapter.
+    pub guest_mac: String,
+    pub balloon_mib: Option<u32>,
+}
+
+/// Configure a freshly spawned Cloud Hypervisor for `boot` and boot its firmware.
+async fn boot_firmware(backend: &mut dyn Hypervisor, boot: &RawBoot) -> Result<()> {
+    let firmware = boot.firmware.as_deref().context(
+        "the raw VM records no firmware (its snapshot predates firmware being recorded), so \
+         it cannot be booted again",
+    )?;
     backend
         .as_any_mut()
         .downcast_mut::<CloudHypervisorBackend>()
         .context("the raw VM's backend is Cloud Hypervisor")?
-        .configure_firmware_boot(&args.firmware, args.cpu, args.mem);
+        .configure_firmware_boot(firmware, boot.vcpus, boot.mem_mib);
     backend
         .add_drive(&DriveSpec {
             drive_id: "rootfs".to_string(),
-            path_on_host: disk,
+            path_on_host: boot.disk.clone(),
             is_root_device: true,
             is_read_only: false,
         })
@@ -647,12 +695,12 @@ async fn boot_raw_vm(
     backend
         .add_network_interface(&NetIfaceSpec {
             iface_id: "eth0".to_string(),
-            host_dev_name: network_config.tap_device.clone(),
-            guest_mac: Some(network_config.guest_mac.clone()),
+            host_dev_name: boot.tap_device.clone(),
+            guest_mac: Some(boot.guest_mac.clone()),
         })
         .await?;
     backend.add_entropy_device().await?;
-    if let Some(target_mib) = args.balloon {
+    if let Some(target_mib) = boot.balloon_mib {
         backend
             .add_balloon(crate::firecracker::BalloonDevice {
                 target_mib,
@@ -660,10 +708,54 @@ async fn boot_raw_vm(
             })
             .await?;
     }
-    backend.boot().await.context("booting the firmware")?;
+    backend.boot().await.context("booting the firmware")
+}
 
-    crate::commands::common::save_vm_state_with_network(state_manager, vm_state, network_config)
+/// What a raw VM does when its VMM exits.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AfterVmmExit {
+    /// The guest reset itself (Windows restarting): boot it again in place, on the same
+    /// disk, namespace and helper.
+    Relaunch,
+    /// The guest powered off, or the VMM ended otherwise: tear the VM down.
+    End,
+}
+
+pub(crate) fn after_vmm_exit(guest_reset: bool) -> AfterVmmExit {
+    if guest_reset {
+        AfterVmmExit::Relaunch
+    } else {
+        AfterVmmExit::End
+    }
+}
+
+/// Whether the VMM that just exited did so because its guest reset itself.
+fn vmm_guest_reset(vm_manager: &dyn Hypervisor) -> bool {
+    vm_manager
+        .as_any()
+        .downcast_ref::<CloudHypervisorBackend>()
+        .is_some_and(CloudHypervisorBackend::guest_reset)
+}
+
+/// Boot a raw VM again after its guest reset itself: a new Cloud Hypervisor in the same
+/// namespaces (the backend keeps them across a spawn), the same firmware, disk and NIC. The
+/// helper keeps serving, and the old acknowledgement goes, so the VM is healthy again only
+/// once the restarted guest has set its clock and Remote Desktop answers.
+async fn relaunch(vm: &mut RawVm) -> Result<()> {
+    match std::fs::remove_file(clock_ack_path(&vm.data_dir)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("removing the old clock acknowledgement"),
+    }
+    vm.vm_manager
+        .spawn(&ProcessSpec {
+            binary: vm.boot.ch_bin.clone(),
+            vm_name: Some(vm.boot.vm_name.clone()),
+            ..Default::default()
+        })
         .await
+        .context("starting Cloud Hypervisor for the relaunch")?;
+    boot_firmware(vm.vm_manager.as_mut(), &vm.boot).await
 }
 
 /// What a running raw VM owns, cold-booted or restored.
@@ -674,6 +766,7 @@ pub(crate) struct RawVm {
     pub holder_child: Option<tokio::process::Child>,
     pub network: Box<dyn NetworkManager>,
     pub ns_helper: Option<NsHelper>,
+    pub boot: RawBoot,
     pub state_manager: StateManager,
     pub vm_state: VmState,
     pub reclaim_owner: crate::reclaim::Owner,
@@ -705,24 +798,38 @@ pub(crate) async fn run_until_exit(
             .publish(&vm.state_manager, &mut vm.vm_state)
             .await
         {
-            Ok(LifecycleReadyOutcome::Published) => {
-                tokio::select! {
-                    status = vm.vm_manager.wait() => match status {
-                        Ok(status) if status.success() => {
-                            info!(vm_id = %vm.vm_id, "the raw VM's VMM exited");
-                            Ok(())
-                        }
-                        Ok(status) => Err(anyhow::anyhow!(
-                            "Cloud Hypervisor exited with {status}"
-                        )),
-                        Err(e) => Err(e.context("waiting for Cloud Hypervisor")),
-                    },
+            Ok(LifecycleReadyOutcome::Published) => loop {
+                let status = tokio::select! {
+                    status = vm.vm_manager.wait() => status,
                     _ = cancel.cancelled() => {
                         info!(vm_id = %vm.vm_id, "shutdown requested, stopping the raw VM");
-                        Ok(())
+                        break Ok(());
+                    }
+                };
+                match (
+                    after_vmm_exit(vmm_guest_reset(vm.vm_manager.as_ref())),
+                    status,
+                ) {
+                    (AfterVmmExit::Relaunch, _) => {
+                        info!(vm_id = %vm.vm_id, "the raw VM's guest restarted; booting it again");
+                        if let Err(e) = relaunch(&mut vm).await {
+                            break Err(
+                                e.context("booting the raw VM again after its guest restarted")
+                            );
+                        }
+                    }
+                    (AfterVmmExit::End, Ok(status)) if status.success() => {
+                        info!(vm_id = %vm.vm_id, "the raw VM's guest powered off");
+                        break Ok(());
+                    }
+                    (AfterVmmExit::End, Ok(status)) => {
+                        break Err(anyhow::anyhow!("Cloud Hypervisor exited with {status}"))
+                    }
+                    (AfterVmmExit::End, Err(e)) => {
+                        break Err(e.context("waiting for Cloud Hypervisor"))
                     }
                 }
-            }
+            },
             Ok(LifecycleReadyOutcome::Cancelled) => {
                 Err(anyhow::anyhow!("interrupted by signal during VM setup"))
             }
@@ -1070,6 +1177,37 @@ mod tests {
         guest_side.read_exact(&mut byte).await.unwrap();
         assert_eq!(&byte, b"x");
         relay.abort();
+    }
+
+    /// A raw VM whose guest reset itself is booted again in place, and one whose guest
+    /// powered off is torn down. The relaunch keeps the namespace helper, the disk and the
+    /// data directory (no teardown before it), and drops the old clock acknowledgement.
+    #[test]
+    fn a_guest_reboot_relaunches_and_a_power_off_ends_the_vm() {
+        assert_eq!(after_vmm_exit(true), AfterVmmExit::Relaunch);
+        assert_eq!(after_vmm_exit(false), AfterVmmExit::End);
+        let source = include_str!("vm.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let relaunch = &code[code.find("async fn relaunch(").unwrap()..];
+        let relaunch = &relaunch[..relaunch.find("\n}\n").unwrap()];
+        for absent in [
+            "stop_ns_helper",
+            "cleanup_vm",
+            "remove_dir",
+            "create_cow_disk",
+        ] {
+            assert!(!relaunch.contains(absent), "the relaunch calls {absent}");
+        }
+        let removed = relaunch.find("clock_ack_path(").unwrap();
+        let spawned = relaunch.find(".spawn(").unwrap();
+        let booted = relaunch.find("boot_firmware(").unwrap();
+        assert!(removed < spawned && spawned < booted);
+        let run = &code[code.find("pub(crate) async fn run_until_exit(").unwrap()..];
+        let waited = run.find("vm.vm_manager.wait()").unwrap();
+        let decided = run.find("after_vmm_exit(vmm_guest_reset(").unwrap();
+        let relaunched = run.find("relaunch(&mut vm)").unwrap();
+        let torn_down = run.find("cleanup_vm(").unwrap();
+        assert!(waited < decided && decided < relaunched && relaunched < torn_down);
     }
 
     /// The sockets this process holds open, from /proc/self/fd.

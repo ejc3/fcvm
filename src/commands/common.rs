@@ -4827,6 +4827,7 @@ pub fn build_snapshot_config(
             parked_gpus: 0,
             guest: vm_state.config.guest,
             health_port: vm_state.config.health_port,
+            firmware: vm_state.config.firmware.clone(),
         },
     })
 }

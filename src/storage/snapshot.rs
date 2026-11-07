@@ -363,6 +363,10 @@ pub struct SnapshotMetadata {
     /// (`VmConfig::health_port`). None for a Linux guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_port: Option<u16>,
+    /// The UEFI firmware a raw guest booted (`VmConfig::firmware`), which a raw clone boots
+    /// again when its guest restarts. None for a Linux guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<PathBuf>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -977,6 +981,7 @@ mod tests {
                 parked_gpus: 0,
                 guest: Default::default(),
                 health_port: None,
+                firmware: None,
             },
         };
 
@@ -1191,6 +1196,7 @@ mod tests {
                 parked_gpus: 0,
                 guest: Default::default(),
                 health_port: None,
+                firmware: None,
             },
         };
 
@@ -1288,6 +1294,7 @@ mod tests {
                     parked_gpus: 0,
                     guest: Default::default(),
                     health_port: None,
+                    firmware: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1372,6 +1379,7 @@ mod tests {
                 parked_gpus: 0,
                 guest: Default::default(),
                 health_port: None,
+                firmware: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1581,6 +1589,7 @@ mod tests {
                 parked_gpus: 0,
                 guest: Default::default(),
                 health_port: None,
+                firmware: None,
             },
         };
 
@@ -1778,6 +1787,7 @@ mod tests {
             parked_gpus: 0,
             guest: Default::default(),
             health_port: None,
+            firmware: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
