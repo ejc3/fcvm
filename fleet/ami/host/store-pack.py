@@ -25,6 +25,7 @@ excluded directory is left out with everything under it. Paths are passed to tar
 NUL-separated with --no-recursion, so tar writes exactly what this lists.
 """
 import argparse
+import errno
 import fnmatch
 import io
 import os
@@ -80,8 +81,10 @@ def extents(path):
         while off < size:
             try:
                 data = os.lseek(fd, off, os.SEEK_DATA)
-            except OSError:
-                break  # ENXIO: no data after off
+            except OSError as e:
+                if e.errno != errno.ENXIO:
+                    raise  # an extent map that cannot be read packs nothing, not zeros
+                break  # no data after off
             hole = os.lseek(fd, data, os.SEEK_HOLE)
             out.append((data, hole - data))
             off = hole

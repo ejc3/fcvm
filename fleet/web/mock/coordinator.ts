@@ -628,16 +628,16 @@ export class MockCoordinator {
   // ---- intents ----------------------------------------------------------------
 
   private async intent(client: Client, id: string, name: string, args: Record<string, unknown>): Promise<void> {
+    // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
+    // stream: the coordinator refuses both before anything else, a repeated intent id included
+    // (its receipt is not looked up), and records nothing (src/fleet/coord/live.rs, LATE_CLAIM).
+    if (client.late && (name === "claim_gpu" || name === "claim_phone")) {
+      this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
+      return;
+    }
     const seen = this.receipts.get(id);
     if (seen) {
       this.sendTo(client, await seen);
-      return;
-    }
-    // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
-    // stream: the coordinator refuses both before applying anything, and records no receipt
-    // (src/fleet/coord/live.rs, LATE_CLAIM).
-    if (client.late && (name === "claim_gpu" || name === "claim_phone")) {
-      this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
       return;
     }
     const act = { viewer: client.viewer, id, name, args };

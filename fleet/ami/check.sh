@@ -247,6 +247,8 @@ fx=$(mktemp -d)
     head -c $((1 << 20)) /dev/urandom | dd of="$fx/src/d/big" bs=1M seek=$at conv=notrunc status=none || exit 1
   done
   chmod 0640 "$fx/src/d/big" && touch -d '2026-01-04 05:06:07.987654321' "$fx/src/d/big" || exit 1
+  # Split too, with an mtime of fewer than ten digits of nanoseconds (0.1 s after the epoch).
+  head -c $((2 << 20)) /dev/urandom > "$fx/src/d/old" && touch -d @0.1 "$fx/src/d/old" || exit 1
   chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05.123456789' "$fx/src/d/a" || exit 1
   # A directory that holds a file (so a part creates it) and an empty directory (which only
   # the directory pass creates): its mtime must survive the empty one being made in it.
@@ -256,7 +258,7 @@ fx=$(mktemp -d)
   tar -c --sparse --numeric-owner --format=posix "${ex[@]}" -C "$fx/src" . > "$fx/one.tar" || exit 1
   mkdir "$fx/one" && tar -x --sparse --same-owner --numeric-owner -C "$fx/one" < "$fx/one.tar" || exit 1
   python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 --split-mib 1 "${ex[@]}" > "$fx/pack.out" || exit 1
-  grep -qx 'store-pack: 1 files split into 5 pieces of at most 1 MiB' "$fx/pack.out" || exit 1
+  grep -qx 'store-pack: 2 files split into 7 pieces of at most 1 MiB' "$fx/pack.out" || exit 1
   # The pieces are spread: at least two parts hold one.
   [ "$(grep -c ' [1-9][0-9]* pieces' "$fx/pack.out")" -ge 2 ] || exit 1
   mapfile -t parts < "$fx/pack/parts"
@@ -290,9 +292,30 @@ fx=$(mktemp -d)
     [ "$(stat -c %b "$fx/$mode/d/sparse")" -lt 1024 ] || exit 1
     [ "$(stat -c %b "$fx/$mode/d/big")" -le $(( (4 << 20) / 512 + 64 )) ] || exit 1
     [ "$(stat -c %y "$fx/$mode/d/big")" = "$(stat -c %y "$fx/src/d/big")" ] || { touch "$fx/mtime-lost"; exit 1; }
+    [ "$(stat -c %y "$fx/$mode/d/old")" = "$(stat -c %y "$fx/src/d/old")" ] || { touch "$fx/mtime-lost"; exit 1; }
   done
 ) 2>/dev/null || no "store.sh does not restore store-pack.py's parts at once into the tree one tar gives"
 [ -e "$fx/mtime-lost" ] && no "the store parts drop the fraction of a modification time"
+# A data map that cannot be read (SEEK_DATA failing with anything but ENXIO) fails the pack;
+# taken as the end of the data, a split file would come back all zeros.
+python3 - "$fx" <<'PY' 2>/dev/null || no "store-pack.py takes a failed SEEK_DATA as the end of a file's data"
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("store_pack", "fleet/ami/host/store-pack.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+path = os.path.join(sys.argv[1], "src", "d", "big")
+real = os.lseek
+def failing(fd, off, how):
+    if how == os.SEEK_DATA:
+        raise OSError(errno.EIO, "I/O error")
+    return real(fd, off, how)
+m.os.lseek = failing
+try:
+    m.extents(path)
+except OSError as e:
+    sys.exit(0 if e.errno == errno.EIO else 1)
+sys.exit(1)
+PY
 rm -rf "$fx"
 
 # The store waits for the network and nothing else of the boot: with default dependencies

@@ -144,31 +144,28 @@ describe("mock coordinator", () => {
   it("keeps an idle keep-alive connection open longer than a client keeps one (fetch: 4 s)", async () => {
     // A test process stalled past the server's idle limit reused the socket the server had
     // just closed: `fetch failed`, ECONNRESET, on an admin route (#1348).
-    const net = await import("node:net");
-    const s = net.connect(coord.port, "127.0.0.1");
-    let closedAt: number | null = null;
-    s.on("close", () => (closedAt = Date.now()));
-    const ask = () =>
-      new Promise<string>((resolve, reject) => {
-        if (closedAt !== null) return reject(new Error("the server closed the idle connection"));
-        let got = "";
-        const onData = (d: Buffer) => {
-          got += d.toString();
-          if (/\r\n\r\n[\s\S]*\}/.test(got)) {
-            s.off("data", onData);
-            resolve(got);
-          }
-        };
-        s.on("data", onData);
-        s.once("error", reject);
-        s.once("close", () => reject(new Error(`closed after ${JSON.stringify(got.slice(0, 40))}`)));
-        s.write("GET /mock/render-stats HTTP/1.1\r\nHost: mock\r\nConnection: keep-alive\r\n\r\n");
+    const http = await import("node:http");
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    const get = () =>
+      new Promise<{ status: number; body: unknown; reused: boolean }>((resolve, reject) => {
+        const req = http.get({ host: "127.0.0.1", port: coord.port, path: "/mock/render-stats", agent }, (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString()), reused: req.reusedSocket }));
+        });
+        req.on("error", reject);
       });
-    await new Promise((r) => s.once("connect", r));
-    expect(await ask()).toMatch(/^HTTP\/1\.1 200/);
-    await sleep(6500);
-    expect(await ask()).toMatch(/^HTTP\/1\.1 200/);
-    s.destroy();
+    try {
+      const first = await get();
+      expect(first.status).toBe(200);
+      expect(first.body).toHaveProperty("subscribers");
+      await sleep(6500);
+      // The same socket, still open: the server did not close it at 5 s.
+      const second = await get();
+      expect(second).toMatchObject({ status: 200, reused: true });
+    } finally {
+      agent.destroy();
+    }
   }, 15_000);
 
   it("answers a ping with its clock", async () => {
@@ -817,7 +814,13 @@ describe("mock phones", () => {
       expect(actions()).toBe(before);
       expect(phonesNow().tiles.every((t) => t.borrowed === null)).toBe(true);
       // A seated viewer still borrows a phone.
-      expect(await send(seated, "claim_phone")).toMatchObject({ outcome: "committed" });
+      const claim = JSON.stringify({ type: "intent", id: "late-replay-1", name: "claim_phone", args: {} });
+      seated.ws.send(claim);
+      expect(await seated.next((m) => m["type"] === "receipt" && m["id"] === "late-replay-1")).toMatchObject({ outcome: "committed" });
+      // The same intent again from a page admitted late (its receipt lost, the page back as a
+      // late viewer): refused, not the receipt already given.
+      late.ws.send(claim);
+      expect(await late.next((m) => m["type"] === "receipt" && m["id"] === "late-replay-1")).toMatchObject({ outcome: "refused", reason, version: 0 });
     } finally {
       late.ws.close();
       seated.ws.close();
