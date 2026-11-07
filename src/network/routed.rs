@@ -469,6 +469,15 @@ pub struct RoutedNetwork {
     proxy_handles: Vec<tcp_proxy::Relay>,
 }
 
+/// The relays a routed VM needs for the host's proxies and the URL it gets for each
+/// scheme: every proxy is relayed, loopback or not, because the host's connect() hooks
+/// that add proxy auth see the relay's connection and not the guest's. The HTTP and
+/// HTTPS proxies get a relay each on its own port, or share one when they are the same
+/// proxy (#1464).
+fn routed_proxy_relays(http: Option<&str>, https: Option<&str>) -> tcp_proxy::SchemeProxies {
+    tcp_proxy::plan_scheme_proxies(http, https, GUEST_GATEWAY, |_| true)
+}
+
 impl RoutedNetwork {
     /// `tap_device` is the caller's derivation of the TAP name. `setup()`
     /// replaces it with the name from the reservation it makes, for the same
@@ -1370,21 +1379,14 @@ impl NetworkManager for RoutedNetwork {
         //     client certs for proxy auth. Without this relay, the VM's direct
         //     connections bypass these hooks and get rejected (407).
         //     The guest's URL names the relay and keeps the proxy's credentials.
-        let mut guest_proxy = None;
-        if let Some(proxy) = tcp_proxy::host_proxy_from_env() {
-            match tcp_proxy::plan_proxy_relay(&proxy, GUEST_GATEWAY, tcp_proxy::PROXY_RELAY_PORT) {
-                Ok(plan) => {
-                    let handle =
-                        tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, plan.upstream)
-                            .await
-                            .context("starting proxy relay")?;
-                    self.proxy_handles.push(handle);
-                    guest_proxy = Some(plan.guest_url);
-                }
-                Err(e) => {
-                    warn!(error = %format!("{e:#}"), "cannot relay the host's proxy; the guest gets none");
-                }
-            }
+        let (http, https) = tcp_proxy::host_scheme_proxies_from_env();
+        let proxies = routed_proxy_relays(http.as_deref(), https.as_deref());
+        for relay in proxies.relays {
+            let handle =
+                tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, relay.port, relay.upstream)
+                    .await
+                    .context("starting proxy relay")?;
+            self.proxy_handles.push(handle);
         }
 
         let guest_mac = generate_mac();
@@ -1415,8 +1417,8 @@ impl NetworkManager for RoutedNetwork {
             dns_search: None,
             // The gateway relay (step 16), whose host side goes through the host's
             // connect() hooks.
-            http_proxy: guest_proxy,
-            https_proxy: None,
+            http_proxy: proxies.http_url,
+            https_proxy: proxies.https_url,
             namespace_name: self.namespace_id.clone(),
         })
     }
@@ -1768,6 +1770,46 @@ pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Routed relays every host proxy, loopback or not (the host's connect() hooks see
+    /// the relay's connection, not the guest's), the HTTP and HTTPS proxies each on its
+    /// own port, or one relay when they are the same proxy (#1464).
+    #[test]
+    fn routed_relays_each_schemes_proxy() {
+        let gateway_url = |port: u16| format!("http://{GUEST_GATEWAY}:{port}/");
+        let plan =
+            routed_proxy_relays(Some("http://192.0.2.7:3128"), Some("http://127.0.0.1:3129"));
+        assert_eq!(
+            plan.relays,
+            vec![
+                tcp_proxy::PlannedRelay {
+                    port: tcp_proxy::PROXY_RELAY_PORT,
+                    upstream: vec!["192.0.2.7:3128".parse().unwrap()],
+                },
+                tcp_proxy::PlannedRelay {
+                    port: tcp_proxy::HTTPS_PROXY_RELAY_PORT,
+                    upstream: vec!["127.0.0.1:3129".parse().unwrap()],
+                },
+            ]
+        );
+        assert_eq!(
+            plan.http_url,
+            Some(gateway_url(tcp_proxy::PROXY_RELAY_PORT))
+        );
+        assert_eq!(
+            plan.https_url,
+            Some(gateway_url(tcp_proxy::HTTPS_PROXY_RELAY_PORT))
+        );
+
+        let same = Some("http://192.0.2.7:3128");
+        let plan = routed_proxy_relays(same, same);
+        assert_eq!(plan.relays.len(), 1);
+        assert_eq!(plan.http_url, plan.https_url);
+        assert_eq!(
+            routed_proxy_relays(None, None),
+            tcp_proxy::SchemeProxies::default()
+        );
+    }
 
     /// A routed VM's proxy NDP entry and MASQUERADE rule are keyed by its address alone.
     /// While another process holds the address's lease, the reclaim leaves them recorded

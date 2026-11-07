@@ -570,16 +570,12 @@ pub async fn start_localhost_forwards(
 pub async fn start_proxy_relay(
     ns_name: &str,
     gateway_ip: &str,
+    port: u16,
     upstream: Vec<SocketAddr>,
 ) -> Result<Relay> {
-    let bind_addr: SocketAddr = format!("{}:{}", gateway_ip, PROXY_RELAY_PORT)
+    let bind_addr: SocketAddr = format!("{gateway_ip}:{port}")
         .parse()
-        .with_context(|| {
-            format!(
-                "invalid proxy relay bind address {}:{}",
-                gateway_ip, PROXY_RELAY_PORT
-            )
-        })?;
+        .with_context(|| format!("invalid proxy relay bind address {gateway_ip}:{port}"))?;
 
     let listener = bind_in_namespace(ns_name, bind_addr)
         .await
@@ -613,11 +609,17 @@ fn proxy_relay(listener: tokio::net::TcpListener, upstream: Vec<SocketAddr>) -> 
     )
 }
 
-/// The host's proxy, from its variables: the HTTPS proxy first, else the HTTP one.
-pub fn host_proxy_from_env() -> Option<String> {
-    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+/// The host's `(HTTP, HTTPS)` proxies, each from its own scheme's variables.
+pub fn host_scheme_proxies_from_env() -> (Option<String>, Option<String>) {
+    let var = |names: [&str; 2]| {
+        names
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    };
+    (
+        var(["HTTP_PROXY", "http_proxy"]),
+        var(["HTTPS_PROXY", "https_proxy"]),
+    )
 }
 
 /// A relay for the host's proxy: the address it connects to, and the URL a guest uses
