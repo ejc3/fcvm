@@ -245,22 +245,28 @@ Today a Cloud Hypervisor restore reads the whole memory file into anonymous memo
 and holds a private copy of every page, including the zeros. The measurement section gives
 both numbers for 1, 4 and 8 clones.
 
-The target is the memory server Firecracker clones already use (`src/uffd/`): one server per
-snapshot, minor mode (the snapshot in one sealed memfd, every clone mapping it `MAP_PRIVATE`,
-clean pages shared across clones, a page private only once a clone writes it), and the
-recorded working-set replay that populates the pages every clone touches before the vCPUs ask
-for them. Cloud Hypervisor's own lazy restore (`memory_restore_mode=ondemand`) is an
-in-process userfaultfd handler that copies each page per VM, so it gives laziness but no
-sharing. The change is in our Cloud Hypervisor fork, as the external UFFD handshake was in the
-Firecracker fork: register guest memory with a userfaultfd and hand it to fcvm's server over
-its Unix socket with the same mapping message, and in minor mode map guest memory from the
-memfd the server returns. fcvm's server is VMM-agnostic past the handshake. That PR (stack
-PR 5) is measured against copy mode on the same host; it lands only if it wins on time to
-desktop at 8 clones and on private memory per clone.
+The target is the sharing Firecracker's File backend already gives: map the snapshot's
+memory file `MAP_PRIVATE` over guest RAM, so a restore reads nothing before the guest runs, a
+page is read from the page cache when the guest first touches it, clean pages are shared by
+every clone of the snapshot through the page cache, and a page becomes private to a clone
+only when it writes it. Cloud Hypervisor restores by copying (`copy`) or with its own
+in-process userfaultfd handler (`ondemand`), which copies each page into the VM's own memory
+on its first fault, so it gives laziness but no sharing. The change is a third restore mode
+in our Cloud Hypervisor fork, `memory_restore_mode=map`: after the memory manager has created
+guest RAM, each saved range of the memory file is mapped `MAP_PRIVATE | MAP_FIXED` over the
+RAM that backs it, from its offset in the file. KVM's memory slots already point at those
+host addresses and follow the new mapping through its MMU notifiers. It refuses shared and
+hugetlbfs guest RAM. fcvm then restores every Cloud Hypervisor clone with it (stack PR 5),
+measured against `copy` on the same host; it lands only if it wins on time to desktop at 8
+clones and on private memory per clone.
+
+fcvm's UFFD memory server (`src/uffd/`, minor mode with working-set replay) would add
+prefetching on top of the same sharing, at the cost of a userfaultfd handshake in the fork.
+It is the next step only if page faults from the page cache show up in the time to desktop.
 
 Windows helps both: its zero-page thread zeroes freed memory in the background, so most of an
-idle guest's free memory is zero pages, which copy mode stores and the memory server maps to
-the shared zero page.
+idle guest's free memory is zero pages, which copy mode stores privately in every clone and a
+mapped restore shares through the page cache.
 
 ## Getting the desktop to the page
 
@@ -270,24 +276,25 @@ protocol (FCVF frames of H.264 over a WebSocket, decoded with WebCodecs).
 
 | option | path | verdict |
 |---|---|---|
-| RDP with the H.264 graphics pipeline, bridged on the host | Windows encodes the session as H.264 (AVC420) itself; a FreeRDP client on the host receives it | **chosen** |
+| RDP with the graphics pipeline, bridged on the host | Windows encodes the session itself (H.264 for most of it); a FreeRDP client on the host decodes it into a desktop surface, which the bridge encodes as FCVF frames | **chosen** |
 | Apache Guacamole | guacd is an RDP client too, but it decodes and sends image updates (PNG, JPEG, WebP) in its own protocol to its own JavaScript client, through a servlet | rejected: an extra hop and image coding at a higher bitrate, and it replaces the page's frame path rather than feeding it |
 | a capture agent in the guest | needs a virtual monitor (an indirect display driver), Desktop Duplication and a software H.264 encoder inside Windows, competing with the desktop for its 2 vCPUs | rejected: RDP already renders a virtual display and encodes it in the guest, and is built in |
 
 The bridge, `fleet/windows/bridge` (stack PR 6), one per sandbox in a container on the host,
 in the sandbox's network namespace:
 
-- connects with FreeRDP 3 at 1280 x 720, the graphics pipeline with AVC420 only (no AVC444,
-  no progressive codec, no RemoteFX), no audio, no clipboard, no drives;
-- **passes Windows' H.264 through when it can**: an AVC420 surface command carries an H.264
-  access unit for the whole surface, which becomes an FCVF frame unchanged, so the bridge
-  adds no encode and no decode on the path to the viewer. Any other command (solid fills,
-  surface-to-surface copies, cache-to-surface, planar or ClearCodec tiles, which Windows uses
-  for some updates even with AVC420 negotiated) is applied to FreeRDP's decoded surface, and
-  from that frame until the next key frame the bridge encodes the decoded surface itself
-  (x264, zero latency preset, on the host's CPU) and asks Windows for a key frame by
-  refreshing the surface; the measurement section says how often each path runs;
-- serves the renderer's `/frames` WebSocket and `/health` (frames per second, which path,
+- connects with FreeRDP 3 at 1280 x 720 with the graphics pipeline and H.264 (FreeRDP built
+  with FFmpeg: Ubuntu's FreeRDP packages are built without H.264), no audio, no clipboard, no
+  drives;
+- **composites, then encodes**: FreeRDP decodes every graphics command into the retained
+  desktop surface, applying each H.264 update only inside its region rectangles as
+  MS-RDPEGFX requires, and the bridge encodes the surface with x264 (zero latency preset, on
+  the host's CPU; the host's GPUs are bound to vfio-pci for the wall) after each frame the
+  server ends. Windows' own H.264 cannot be passed through: its updates cover only the
+  changed regions (the region rectangles), the stream mixes in other codecs (ClearCodec,
+  the progressive codec, cache and surface copies), and AVC444 splits a frame into two
+  streams, while an FCVF frame is a whole picture the page decodes on its own;
+- serves the renderer's `/frames` WebSocket and `/health` (frames per second, encode time,
   frame age), and stamps each frame with its decode time on the host's clock, so the page's
   frame age works as for a phone;
 - reports the time to desktop: the first frame after a restore whose surface is the desktop
@@ -379,8 +386,9 @@ done when the screen changed.
 4. fcvm: the raw-VM mode (`vm run --guest windows`, firmware boot, TCP/RDP health, the
    namespace's generation and time line, snapshot create and run without fc-agent), with
    tests that fail first.
-5. Our Cloud Hypervisor fork: the external UFFD handshake and minor-mode guest memory, and
-   fcvm's server serving it; lands only if it measures faster than copy mode.
+5. Our Cloud Hypervisor fork: `memory_restore_mode=map` (the memory file mapped privately
+   over guest RAM), and fcvm restoring Cloud Hypervisor clones with it; lands only if it
+   measures faster than copy mode.
 6. Fleet: the bridge, the agent's Windows slots and gold flow, the coordinator's
    `state.windows` and intents, the page's `?mode=windows`.
 7. ejc3/aws: the host image with the Windows image's inputs and the bridge.
