@@ -474,10 +474,10 @@ pub(crate) struct Warmer {
 }
 
 impl Warmer {
-    pub(crate) fn new(snapshot_id: &str, image: File, mem_len: u64) -> Self {
+    pub(crate) fn new(snapshot_id: &str, image: Arc<File>, mem_len: u64) -> Self {
         Self {
             snapshot: snapshot_id.to_string(),
-            image: Arc::new(image),
+            image,
             mem_len,
             shared: Arc::new(Shared::default()),
         }
@@ -1146,7 +1146,7 @@ mod tests {
     /// A warmer over an empty scratch file. These tests pass their own `advise`, so the file
     /// is never read.
     fn scratch_warmer(mem_len: u64) -> Warmer {
-        let warmer = Warmer::new("test", tempfile::tempfile().unwrap(), mem_len);
+        let warmer = Warmer::new("test", Arc::new(tempfile::tempfile().unwrap()), mem_len);
         warmer.shared.unpaced.store(true, Ordering::Relaxed);
         warmer
     }
@@ -1535,7 +1535,7 @@ mod tests {
 
         let image = image_on_disk(len);
         let mmap = cold_mapping(&image, len, &recorded);
-        let warmer = Warmer::new("test", image, len);
+        let warmer = Warmer::new("test", Arc::new(image), len);
         warmer.shared.unpaced.store(true, Ordering::Relaxed);
 
         let set = set_of(len, &recorded);
