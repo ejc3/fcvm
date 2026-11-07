@@ -187,6 +187,7 @@ up)
     --filters Name=instance-type,Values=$TYPE --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sed "s/^$REGION//" | sort | paste -sd' ')}
   [ -n "$AZS" ] || die "no zone in $REGION offers $TYPE"
   ami=$(host_ami); [ -n "$ami" ] || die "the release names no available host image in $REGION (its copy may still be pending); GPUBOX_AMI=<ami> picks one"
+  image_in_region "$ami" || exit 1
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
@@ -210,8 +211,8 @@ up)
         break 2
       fi
       grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' "$errf" \
-        || { cat "$errf" >&2; rm -f "$errf"; ga_staging || die "run-instances failed"
-             admit_abandon; die "run-instances failed; the admission lock is kept until stale in case it launched"; }
+        || { cat "$errf" >&2; rm -f "$errf"; ga_staging || die "run-instances failed in $REGION"
+             admit_abandon; die "run-instances failed in $REGION; the admission lock is kept until stale in case it launched"; }
       say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' "$errf" | head -1)"
       id=""
     done

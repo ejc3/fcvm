@@ -29,6 +29,17 @@ if ga_staging; then
 else
   ADMISSION_TAG='{Key=fcvm-admission,Value=outside-staging}'
 fi
+# image_in_region AMI: succeed when AMI is an available image in REGION, else say so, naming
+# the region. An image id names one image in one region, and RunInstances given an id from
+# another region says only "The image id '[ami-...]' does not exist" (2026-11-07: a host bake
+# from a us-east-1 image under build-ami.sh's us-west-2 default). Checked before admission.
+image_in_region() {
+  local st
+  st=$(A ec2 describe-images --image-ids "$1" --query 'Images[0].State' --output text 2>/dev/null) || st=""
+  [ "$st" = available ] && return 0
+  say "$1 is not an available image in $REGION (${st:-not found there}): an image id names one region; launch in the image's region, or use its copy in $REGION"
+  return 1
+}
 WALL_RESERVE_spot=96
 WALL_RESERVE_ondemand=128
 QUOTA_CODE_spot=L-3819A6DF

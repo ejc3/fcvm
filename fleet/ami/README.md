@@ -100,7 +100,7 @@ fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, l
 | `fcvm-fleet-tile-x86_64-<commit>-<date>` (g4dn.xlarge) | `tile/build.sh` prep, image, bake (`units` and bake revise one launched with `BASE_AMI`) | nvidia-persistenced, the certificate from `fcvm-fleet/tls-wildcard`, the renderer on 127.0.0.1:8080 behind nginx on 443 (`fcvm-fleet-nginx.service`); none of them waits for cloud-init's network stage. `fcvm-fleet-prefetch.service` (wanted by `sysinit.target`, ordered after nothing) reads, 256 at a time, the pieces of root volume files that a first boot read (`/etc/fcvm-fleet/prefetch.list`, 2,825 pieces of 2,422 files, 421 MiB, of which 190 MiB are the NVIDIA modules), with the static `prefetch` binary built from `tile/prefetch.c`. The list is written by `tile/build.sh trace` (`tile/resident.py`: the page cache of a tile that served its first frame, mincore per file), run on a tile launched from the image being revised, and `bake` refuses an image without it |
 
 ```bash
-H=$(fleet/ami/build-ami.sh launch host)                  # BASE_AMI=<ami> revises an earlier image
+H=$(fleet/ami/build-ami.sh launch host)                  # BASE_AMI=<ami> revises an earlier image, in its own region (REGION=)
 fleet/ami/build-ami.sh push $H
 fleet/ami/build-ami.sh env $H FCVM_COMMIT=<commit>
 fleet/ami/build-ami.sh start $H host/build.sh prep && fleet/ami/build-ami.sh wait $H prep

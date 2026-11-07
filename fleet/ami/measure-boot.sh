@@ -34,6 +34,7 @@ esac
 mkt=on-demand vcpus=96; [ "$KIND" = tile ] && vcpus=4; [ ${#market[@]} -gt 0 ] && mkt=spot
 # shellcheck disable=SC2034  # read by g-admission.sh
 owner=ami-measure-$KIND GA_WHAT="$type to measure"
+image_in_region "$AMI" || exit 1
 admit_lock || { say "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"; exit 1; }
 trap admit_unlock EXIT
 room_for "$mkt" "$vcpus" || exit 1
@@ -56,7 +57,7 @@ for az in $AZS; do
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build},$ADMISSION_TAG]" \
     --query 'Instances[0].InstanceId' --output text 2>/tmp/measure-boot.err.$$) && break
   grep -q -E 'InsufficientInstanceCapacity|capacity' /tmp/measure-boot.err.$$ ||
-    { cat /tmp/measure-boot.err.$$ >&2; admit_abandon; say "run-instances failed; the admission lock is kept until stale in case it launched"; exit 1; }
+    { cat /tmp/measure-boot.err.$$ >&2; admit_abandon; say "run-instances failed in $REGION; the admission lock is kept until stale in case it launched"; exit 1; }
   echo "no $type capacity in ${REGION}${az}"
 done
 rm -f /tmp/measure-boot.err.$$
