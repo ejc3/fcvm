@@ -161,6 +161,11 @@ pub struct ResetAll {
     pub sandboxes: usize,
 }
 
+/// A sandbox's name across connections and coordinator restarts: its host and its index there.
+pub fn key(host: &str, index: u32) -> String {
+    format!("{host}/{index}")
+}
+
 /// How long an action stays in the assignment (an agent that reconnects within it still
 /// carries it out).
 pub const ACTION_KEEP_MS: u64 = 30_000;

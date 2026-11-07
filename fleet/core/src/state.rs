@@ -693,6 +693,11 @@ pub struct Fleet {
     pub last_windows_reset_all_at: BTreeMap<String, u64>,
     #[serde(default)]
     pub last_reset_all: Option<crate::windows::ResetAll>,
+    /// Sandboxes that were lent when their host left or the coordinator restarted, by
+    /// `windows::key` (host and index), with the borrow's session: the host may still run the
+    /// borrower's desktop, so the sandbox is reset on its first report.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub windows_to_reset: BTreeMap<String, String>,
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
@@ -770,6 +775,7 @@ impl State {
                 last_windows_reset_at: BTreeMap::new(),
                 last_windows_reset_all_at: BTreeMap::new(),
                 last_reset_all: None,
+                windows_to_reset: BTreeMap::new(),
                 potato: Default::default(),
                 expected_hosts: None,
             },
@@ -790,7 +796,9 @@ impl State {
         f.hosts.clear();
         f.slots.clear();
         f.phones.clear();
-        f.windows.clear();
+        // A lent sandbox's claim goes with the process; its host may come back running the
+        // borrower's desktop, so it is reset then, and the cooldown runs from now.
+        crate::apply::forget_windows(f, |_| true, now_ms);
         f.ec2.clear();
         f.n = 0;
         f.fcvm_dark.clear();

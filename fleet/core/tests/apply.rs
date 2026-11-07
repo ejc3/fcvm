@@ -1370,3 +1370,52 @@ fn the_potato_ladder_and_records_survive_a_coordinator_restart() {
     let r = state.fleet.potato.round.as_ref().expect("a round");
     assert_eq!((r.id, r.size), (2, 4));
 }
+
+/// A coordinator that restarts while a sandbox is lent loses the claim with its process; the
+/// host that comes back is still running the borrower's desktop. That sandbox is reset before
+/// anyone can borrow it, and the borrower's cooldown runs from the restart.
+#[test]
+fn a_coordinator_restart_resets_a_lent_sandbox_and_keeps_the_cooldown() {
+    let host = |at: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "hello",
+            "host": "h1", "arch": "x86_64", "gpus": [], "capacity": 0, "windows": 2,
+            "windows_actions": ["notepad"]}})
+    };
+    let running = |at: u64, generation: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": "win-2", "phase": "running", "generation": generation, "timings": {}}})
+    };
+    let cfg = config_with(serde_json::json!({}));
+    let s = events(serde_json::json!([
+        host(1000),
+        running(2000, 1),
+        {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 3000, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+         "name": "claim_windows", "args": {"slot": "win-2"}}
+    ]))
+    .iter()
+    .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(s.receipts["c1"].outcome, fleet_core::Outcome::Committed);
+    let s = s.resumed(cfg, 5000);
+    let s = events(serde_json::json!([
+        host(6000),
+        running(6500, 1),
+        {"type": "viewer_joined", "at": 6600, "viewer": "v-1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 7000, "viewer": "v-1", "client": "198.51.100.20", "id": "c2",
+         "name": "claim_windows", "args": {}}
+    ]))
+    .iter()
+    .fold(s, apply);
+    let a = &host_assignments(&s)["h1"];
+    let w2 = a.iter().find(|a| a.id == "win-2").unwrap();
+    assert_eq!(w2.generation, 2, "the lent desktop is reset");
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(
+        v["windows"]["tiles"][1]["last_relaunch"]["by"],
+        "return:windows-claim-1"
+    );
+    assert_eq!(
+        s.receipts["c2"].reason.as_deref(),
+        Some("your last sandbox was returned 2 s ago; borrow again in 58 s")
+    );
+}

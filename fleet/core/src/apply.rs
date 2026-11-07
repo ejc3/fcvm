@@ -464,7 +464,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
             f.phones.retain(|_, s| s.host.as_deref() != Some(host));
-            f.windows.retain(|_, s| s.host.as_deref() != Some(host));
+            forget_windows(f, |s| s.host.as_deref() == Some(host.as_str()), at);
             // A host the coordinator scaled away is not a reclaimed one.
             if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
                 f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
@@ -846,15 +846,23 @@ fn intent_effect(
         {
             Err("the GPUs are asleep".into())
         }
-        Intent::WindowsReset { slot } => windows_reset(state, c, slot.as_deref()),
-        Intent::ClaimWindows { slot } => claim_windows(state, c, slot.as_deref()),
+        Intent::WindowsReset { slot } => {
+            expire_windows(&mut state.fleet, at);
+            windows_reset(state, c, slot.as_deref())
+        }
+        Intent::ClaimWindows { slot } => {
+            expire_windows(&mut state.fleet, at);
+            claim_windows(state, c, slot.as_deref())
+        }
         Intent::ReleaseWindows { claim } => {
+            expire_windows(&mut state.fleet, at);
             let n = own_windows(&state.fleet, c.viewer).ok_or("this viewer holds no sandbox")?;
             check_windows_claim(&state.fleet, n, claim.as_deref())?;
             release_windows(&mut state.fleet, n, at);
             Ok("release sandbox".into())
         }
         Intent::WindowsAction { claim, action } => {
+            expire_windows(&mut state.fleet, at);
             windows_action(state, c, claim.as_deref(), *action)
         }
         Intent::ClaimGpu => claim(state, c),
@@ -1291,15 +1299,7 @@ fn tick(state: &mut State, at: u64) {
         }
     }
     // Borrowed sandboxes come back; actions the agents have had time to carry out are dropped.
-    let expired: Vec<u32> = f
-        .windows
-        .iter()
-        .filter(|(_, s)| windows_claim(s).is_some_and(|c| at >= c.expires_at))
-        .map(|(n, _)| *n)
-        .collect();
-    for n in expired {
-        release_windows(f, n, at);
-    }
+    expire_windows(f, at);
     for s in f.windows.values_mut() {
         if let Some(w) = s.windows.as_mut() {
             w.actions.retain(|a| {
@@ -2277,19 +2277,64 @@ fn observe_windows(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
     if r.generation > slot.generation {
         slot.generation = r.generation;
     }
+    // The host came back running a desktop that was lent: reset it before anyone borrows it.
+    let key = windows_index(slot).map(|i| crate::windows::key(host, i));
+    if let Some(session) = key.and_then(|k| f.windows_to_reset.remove(&k)) {
+        bump(slot, &format!("return:{session}"), at);
+    }
     let timed = slot
         .last_relaunch
         .as_ref()
         .is_some_and(|rl| rl.first_frame_at.is_some());
+    let clicked = slot.last_relaunch.is_some();
     note_report(slot, r, at);
     if !note_running(slot, r, at) || timed {
         return;
     }
-    if let (Some(rl), Some(desktop)) = (slot.last_relaunch.as_mut(), r.desktop_at) {
-        if rl.generation == r.generation && rl.first_frame_at == Some(at) {
-            rl.first_frame_at = Some(desktop.clamp(rl.clicked_at.min(at), at));
+    let (Some(rl), Some(desktop)) = (slot.last_relaunch.as_mut(), r.desktop_at) else {
+        return;
+    };
+    if rl.generation != r.generation || rl.first_frame_at != Some(at) {
+        return;
+    }
+    let desktop = desktop.min(at);
+    if clicked {
+        rl.first_frame_at = Some(desktop.max(rl.clicked_at.min(at)));
+    } else {
+        // Nobody clicked (a launch at the host's start): the launch began `total_ms` before
+        // its desktop, both on the host's clock, however late the report is read.
+        let took = r.timings.get("total_ms").copied().unwrap_or(0);
+        rl.clicked_at = desktop.saturating_sub(took);
+        rl.first_frame_at = Some(desktop);
+    }
+}
+
+/// End every borrow whose time is up at `at`. A tick does it, and so does every Windows
+/// intent before it is judged, so a borrow ends at its deadline and not at the next tick.
+fn expire_windows(f: &mut Fleet, at: u64) {
+    let expired: Vec<u32> = f
+        .windows
+        .iter()
+        .filter(|(_, s)| windows_claim(s).is_some_and(|c| at >= c.expires_at))
+        .map(|(n, _)| *n)
+        .collect();
+    for n in expired {
+        release_windows(f, n, at);
+    }
+}
+
+/// Remove the sandboxes `gone` picks. A lent one's borrow ends here (its client's cooldown
+/// starts), and it is marked to be reset when its host reports it again: the agent keeps
+/// its VMs running across a lost connection, and a coordinator restart does not stop them.
+pub fn forget_windows(f: &mut Fleet, gone: impl Fn(&Slot) -> bool, at: u64) {
+    for s in f.windows.values().filter(|s| gone(s)) {
+        if let (Some(c), Some(host), Some(i)) = (windows_claim(s), &s.host, windows_index(s)) {
+            f.last_windows_claim_end.insert(c.client.clone(), at);
+            f.windows_to_reset
+                .insert(crate::windows::key(host, i), c.session.clone());
         }
     }
+    f.windows.retain(|_, s| !gone(s));
 }
 
 fn own_windows(f: &Fleet, viewer: &str) -> Option<u32> {
