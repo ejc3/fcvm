@@ -266,7 +266,7 @@ list)
   for r in $REGIONS; do
     aws --region "$r" ec2 describe-instances --filters Name=tag:Purpose,Values=$PURPOSE Name=instance-state-name,Values=pending,running,stopping,shutting-down \
       --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Owner']|[0].Value,Tags[?Key=='LeaseUntil']|[0].Value,Tags[?Key=='Market']|[0].Value,LaunchTime]" --output text \
-      | awk -v r="$r" 'NF {$1 = $1 OFS r; print}' OFS='\t'
+      | awk -F '\t' -v r="$r" 'NF {$1 = $1 OFS r; print}' OFS='\t'
   done
   ;;
 *) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 2 ;;

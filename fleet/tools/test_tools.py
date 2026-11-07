@@ -213,7 +213,7 @@ case "$args" in
     if [ "$region" != "${FAKE_BOX_REGION:-us-east-1}" ]; then
       case "$args" in *"--instance-ids "*) echo "An error occurred (InvalidInstanceID.NotFound)" >&2; exit 254 ;; esac
     else
-      case "$args" in *"--instance-ids "*) echo fcvm-fleet-gpubox ;; *) printf 'i-fakebox\trunning\tsomeone\t2026-11-07T12:00:00Z\tspot\t2026-11-07T08:00:00+00:00\n' ;; esac
+      case "$args" in *"--instance-ids "*) echo fcvm-fleet-gpubox ;; *) printf 'i-fakebox\trunning\tsome one\t2026-11-07T12:00:00Z\tspot\t2026-11-07T08:00:00+00:00\n' ;; esac
     fi ;;
   *" ec2 describe-instance-type-offerings "*) printf '%s\n' ${FAKE_OFFER_AZS:-us-west-2a us-west-2c} ;;
   *" ec2 describe-instances "*)
@@ -482,8 +482,9 @@ class GpuboxWallReserve(unittest.TestCase):
         for home in ("us-west-2", "us-east-1"):
             r, _, _ = self.gpubox("list", FAKE_BOX_REGION=home, GPUBOX_REGION=None)
             self.assertEqual(r.returncode, 0, r.stderr)
-            rows = [line.split() for line in r.stdout.splitlines()]
-            self.assertEqual([(row[0], row[1]) for row in rows], [("i-fakebox", home)], r.stdout)
+            rows = [line.split("\t") for line in r.stdout.splitlines()]
+            self.assertEqual(rows, [["i-fakebox", home, "running", "some one", "2026-11-07T12:00:00Z", "spot",
+                                     "2026-11-07T08:00:00+00:00"]], r.stdout)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
