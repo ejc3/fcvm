@@ -951,6 +951,10 @@ pub struct RunArgs {
     /// address (config.network.loopback_ip in `fcvm ls --json`) when there is none.
     /// Bridged networking always listens on the VM's veth address and rejects an
     /// IPv6 HOSTIP.
+    /// A TCP mapping ending in /loopback (8080:80/loopback, 127.0.0.1:8080:80/tcp/loopback)
+    /// reaches its guest service as a loopback client, 127.0.0.1, for a service that
+    /// trusts loopback clients. Rootless and routed only, on a host loopback address or
+    /// none, since every client of the mapping gets that trust.
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 
@@ -1404,7 +1408,7 @@ pub struct SnapshotRunArgs {
     pub vsock_dir: Option<String>,
 
     /// Publish the clone's ports on these host addresses and ports instead of the
-    /// snapshot's. Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or
+    /// snapshot's. Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO][/loopback], comma-separated or
     /// repeated, as for `podman run --publish`. Each GUESTPORT/PROTO must be one the
     /// snapshot published. Bridged networking listens on the clone's veth address
     /// whatever HOSTIP says. Without this flag the clone inherits the snapshot's

@@ -2489,12 +2489,14 @@ mod tests {
                     host_port: 8080,
                     guest_port: 80,
                     proto: Protocol::Tcp,
+                    loopback_client: false,
                 },
                 PortMapping {
                     host_ip: Some("127.0.0.9".into()),
                     host_port: 5300,
                     guest_port: 53,
                     proto: Protocol::Udp,
+                    loopback_client: false,
                 },
             ],
         )
@@ -4239,6 +4241,7 @@ mod tests {
                 host_port: port,
                 guest_port: 80,
                 proto: Protocol::Tcp,
+                loopback_client: false,
             }],
         );
         // Left unreaped, so its PID cannot be reused while the check runs.

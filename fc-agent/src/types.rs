@@ -31,6 +31,10 @@ pub struct Plan {
     /// `network::publish_to_loopback`.
     #[serde(default)]
     pub published_guest_ports: Vec<String>,
+    /// Published guest TCP ports whose clients reach the guest's service as a loopback
+    /// client, 127.0.0.1 (`--publish .../loopback`) — see `network::publish_as_loopback_client`.
+    #[serde(default)]
+    pub loopback_client_guest_ports: Vec<String>,
     #[serde(default)]
     pub privileged: bool,
     #[serde(default)]

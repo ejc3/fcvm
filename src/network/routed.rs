@@ -1895,6 +1895,7 @@ mod tests {
                     host_port: 8080,
                     guest_port: 80,
                     proto: Protocol::Tcp,
+                    loopback_client: false,
                 })
                 .collect();
             RoutedNetwork::new("vm-test".into(), "tap-test".into(), mappings).needs_loopback_ip()
@@ -2135,6 +2136,7 @@ mod tests {
             host_port: 0,
             guest_port: 80,
             proto: Protocol::Tcp,
+            loopback_client: false,
         };
         let mappings = vec![mapping(Some("127.0.0.1")), mapping(None)];
         let mut net = RoutedNetwork::new("vm-test".into(), "tap-test".into(), mappings.clone());
@@ -2171,6 +2173,7 @@ mod tests {
                 host_port: taken.port(),
                 guest_port: 80,
                 proto: Protocol::Tcp,
+                loopback_client: false,
             }],
         )
         // A documentation prefix: what a late bind creates is routed nowhere.

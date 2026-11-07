@@ -1036,6 +1036,7 @@ mod tests {
                 host_port: 8080,
                 guest_port: 80,
                 proto: crate::network::Protocol::Tcp,
+                loopback_client: false,
             }],
         );
         let result = network.setup().await;

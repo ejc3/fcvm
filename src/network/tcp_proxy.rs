@@ -1133,6 +1133,7 @@ mod tests {
             host_port,
             guest_port: 80,
             proto: super::super::types::Protocol::Tcp,
+            loopback_client: false,
         }
     }
 
@@ -1838,6 +1839,7 @@ mod tests {
             guest_port: 9999,
             host_ip: None,
             proto: super::super::types::Protocol::Tcp,
+            loopback_client: false,
         };
 
         let mappings = [mapping];
