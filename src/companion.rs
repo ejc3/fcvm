@@ -98,11 +98,16 @@ pub fn death_message(
 struct Capture {
     tail: StderrTail,
     reader: Option<JoinHandle<()>>,
+    /// A run loop is waiting on this companion's exit to report it
+    /// ([`registered_exit`]), so [`register`] does not prune it.
+    claimed: bool,
 }
 
 /// Captures of companions that are handed around as a bare [`Child`] (the
 /// namespace holder), by pid. A process's pid is unique while it is unreaped,
 /// and an entry is removed when its death is reported or its owner reaps it.
+/// One whose owner reaped it without saying so (a failed setup) is pruned by the
+/// next [`register`]: its reader has reached EOF and its pid is gone.
 fn captures() -> &'static Mutex<HashMap<u32, Capture>> {
     static CAPTURES: OnceLock<Mutex<HashMap<u32, Capture>>> = OnceLock::new();
     CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -119,12 +124,30 @@ pub fn register(child: &mut Child, log: impl Fn(&str) + Send + 'static) {
         .take()
         .map(|stderr| capture(stderr, tail.clone(), log));
     if let Ok(mut captures) = captures().lock() {
-        if let Some(old) = captures.insert(pid, Capture { tail, reader }) {
+        captures.retain(|pid, capture| !abandoned(*pid, capture));
+        let capture = Capture {
+            tail,
+            reader,
+            claimed: false,
+        };
+        if let Some(old) = captures.insert(pid, capture) {
             if let Some(reader) = old.reader {
                 reader.abort();
             }
         }
     }
+}
+
+/// Whether nobody can report `capture` any more: no run loop claimed it, its reader
+/// is done, and its process has been reaped (a reaped pid has no /proc entry; an
+/// unreaped one, zombie included, does).
+fn abandoned(pid: u32, capture: &Capture) -> bool {
+    !capture.claimed
+        && capture
+            .reader
+            .as_ref()
+            .is_none_or(|reader| reader.is_finished())
+        && !std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// What the registered companion `pid` has printed so far.
@@ -155,14 +178,51 @@ async fn take_tail(pid: u32) -> StderrTail {
     capture.tail
 }
 
-/// Wait until the registered companion `child` exits, and describe it. A
-/// `None` child never resolves, so the caller can select on this unconditionally.
-pub async fn registered_death(name: &str, child: &mut Option<Child>) -> String {
+/// Wait until the registered companion `child` exits. A `None` child never resolves,
+/// so the caller can select on this unconditionally. Cancel-safe: it only waits, and
+/// the pid is read before the wait, which reaps the child only when it returns. The
+/// caller describes the exit with [`describe_registered`] once its arm has won, so
+/// draining stderr is never cut short by another arm.
+pub async fn registered_exit(
+    child: &mut Option<Child>,
+) -> (Option<u32>, std::io::Result<ExitStatus>) {
     let Some(child) = child.as_mut() else {
         return std::future::pending().await;
     };
     let pid = child.id();
-    match child.wait().await {
+    if let Some(pid) = pid {
+        if let Some(capture) = captures()
+            .lock()
+            .ok()
+            .as_mut()
+            .and_then(|c| c.get_mut(&pid))
+        {
+            capture.claimed = true;
+        }
+    }
+    (pid, child.wait().await)
+}
+
+/// The registered companion `child` if it has already exited, without waiting.
+pub fn registered_exit_now(
+    child: &mut Option<Child>,
+) -> Option<(Option<u32>, std::io::Result<ExitStatus>)> {
+    let child = child.as_mut()?;
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(status)) => Some((pid, Ok(status))),
+        Ok(None) => None,
+        Err(error) => Some((pid, Err(error))),
+    }
+}
+
+/// Describe the exit [`registered_exit`] returned, with what the companion printed.
+pub async fn describe_registered(
+    name: &str,
+    pid: Option<u32>,
+    status: std::io::Result<ExitStatus>,
+) -> String {
+    match status {
         Ok(status) => {
             let tail = match pid {
                 Some(pid) => take_tail(pid).await,
@@ -170,7 +230,25 @@ pub async fn registered_death(name: &str, child: &mut Option<Child>) -> String {
             };
             death_message(name, pid, &status, &tail)
         }
-        Err(error) => format!("{name} could not be watched: {error}"),
+        Err(error) => {
+            if let Some(pid) = pid {
+                forget(pid);
+            }
+            format!("{name} could not be watched: {error}")
+        }
+    }
+}
+
+/// The report of a network helper's death (pasta), naming the namespace holder
+/// first when it has died too. pasta exits when the holder of the namespace it
+/// serves dies, so the holder's exit is the cause and pasta's the consequence.
+pub async fn network_death_report(network_message: String, holder: &mut Option<Child>) -> String {
+    match registered_exit_now(holder) {
+        Some((pid, status)) => {
+            let holder_message = describe_registered("namespace holder", pid, status).await;
+            format!("{holder_message}; then {network_message}")
+        }
+        None => network_message,
     }
 }
 
@@ -246,7 +324,8 @@ mod tests {
         let pid = child.id().unwrap();
         register(&mut child, |_| {});
         let mut child = Some(child);
-        let message = registered_death("namespace holder", &mut child).await;
+        let (exited_pid, status) = registered_exit(&mut child).await;
+        let message = describe_registered("namespace holder", exited_pid, status).await;
         assert!(
             message.starts_with(&format!(
                 "namespace holder (pid {pid}) exited: exit status: 3"
@@ -258,5 +337,153 @@ mod tests {
             "{message}"
         );
         assert!(captures().lock().unwrap().get(&pid).is_none());
+    }
+
+    /// #852 review: a run loop whose other arm wakes while the death watcher drains
+    /// stderr must still report the companion's pid and last words. Against the
+    /// earlier registered_death, which drained inside the arm, the same loop lost both.
+    #[tokio::test]
+    async fn an_interrupted_watcher_still_reports_the_pid_and_stderr() {
+        // The grandchild keeps the stderr pipe open for 600 ms after the child exits.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "echo 'last words' >&2; (sleep 0.6) & exit 4"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        register(&mut child, |_| {});
+        let mut child = Some(child);
+        let message = loop {
+            tokio::select! {
+                (exited_pid, status) = registered_exit(&mut child) => {
+                    break describe_registered("namespace holder", exited_pid, status).await;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+            }
+        };
+        assert!(
+            message.starts_with(&format!(
+                "namespace holder (pid {pid}) exited: exit status: 4"
+            )),
+            "{message}"
+        );
+        assert!(message.ends_with("last words"), "{message}");
+    }
+
+    /// #852 review: a holder whose owner reaped it without forgetting it (a failed
+    /// setup) does not stay in the registry once another companion registers.
+    #[tokio::test]
+    async fn a_reaped_unreported_companion_is_pruned_at_the_next_registration() {
+        let spawn = || {
+            tokio::process::Command::new("sh")
+                .args(["-c", "echo gone >&2"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let first_pid = first.id().unwrap();
+        register(&mut first, |_| {});
+        first.wait().await.unwrap();
+        // Its reader reaches EOF once the pipe closes.
+        for _ in 0..200 {
+            let done = captures()
+                .lock()
+                .unwrap()
+                .get(&first_pid)
+                .is_some_and(|c| c.reader.as_ref().is_none_or(|r| r.is_finished()));
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut second = spawn();
+        let second_pid = second.id().unwrap();
+        register(&mut second, |_| {});
+        assert!(
+            captures().lock().unwrap().get(&first_pid).is_none(),
+            "the reaped companion's capture is still registered"
+        );
+        second.wait().await.unwrap();
+        forget(second_pid);
+    }
+
+    /// #852 review: pasta exits when the namespace holder dies, so a network helper's
+    /// death is reported with the holder first when the holder has died too.
+    #[tokio::test]
+    async fn a_network_helper_death_names_a_dead_holder_first() {
+        let mut holder = tokio::process::Command::new("sh")
+            .args(["-c", "echo 'holder last words' >&2; kill -KILL $$"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = holder.id().unwrap();
+        register(&mut holder, |_| {});
+        // Wait for the holder's death without reaping it, as pasta's exit follows it.
+        while !std::path::Path::new(&format!("/proc/{pid}/stat")).exists()
+            || !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_default()
+                .contains(") Z ")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut holder = Some(holder);
+        let message = network_death_report(
+            "pasta (pid 1) exited: exit status: 1".to_string(),
+            &mut holder,
+        )
+        .await;
+        assert!(
+            message.starts_with(&format!(
+                "namespace holder (pid {pid}) exited: signal: 9 (SIGKILL)"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; then pasta (pid 1) exited: exit status: 1"),
+            "{message}"
+        );
+        let mut alive = Some(
+            tokio::process::Command::new("sleep")
+                .arg("5")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            network_death_report("pasta exited".to_string(), &mut alive).await,
+            "pasta exited"
+        );
+    }
+
+    /// #852 review: both run loops report a network helper's death through
+    /// network_death_report, so a holder that died first is named first.
+    #[test]
+    fn both_run_loops_name_a_dead_holder_before_pasta() {
+        for (file, source) in [
+            (
+                "src/commands/podman/mod.rs",
+                include_str!("commands/podman/mod.rs"),
+            ),
+            (
+                "src/commands/snapshot.rs",
+                include_str!("commands/snapshot.rs"),
+            ),
+        ] {
+            let arm = source
+                .find(".companion_exited() =>")
+                .unwrap_or_else(|| panic!("{file} no longer waits on the network's helper"));
+            let body = &source[arm..arm + 600];
+            assert!(
+                body.contains("network_death_report("),
+                "{file} reports a network helper's death without checking the holder first"
+            );
+        }
     }
 }
