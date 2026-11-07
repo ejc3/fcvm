@@ -146,7 +146,7 @@ async fn test_serial_console_after_restore() -> Result<()> {
         .lines()
         .filter(|line| {
             // Lines from Firecracker's serial console containing fc-agent output
-            line.contains("firecracker") && line.contains("[fc-agent]")
+            is_console_line(line) && line.contains("[fc-agent]")
         })
         .collect();
     println!(
@@ -271,7 +271,7 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
     .context("spawning the source VM")?;
 
     let on_console =
-        |marker: String| move |line: &str| line.contains("firecracker:") && line.contains(&marker);
+        |marker: String| move |line: &str| is_console_line(line) && line.contains(&marker);
     let outcome = async {
         common::poll_health_by_pid(pid, 300).await?;
         common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --prepare-snapshot-network"])
@@ -320,7 +320,7 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
             common::poll_health_by_pid(clone_pid, 120).await?;
             anyhow::Ok(
                 wait_for_log_line(&clone_log, Duration::from_secs(30), |l| {
-                    l.contains("firecracker:") && l.contains("[fc-agent] handling restore")
+                    is_console_line(l) && l.contains("[fc-agent] handling restore")
                 })
                 .await,
             )
@@ -354,4 +354,10 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
         clone_log.display()
     );
     Ok(())
+}
+
+/// Whether a line of fcvm's log is a guest console line: fc-agent's lines are logged under
+/// `fcvm::console` (#1104), every other console line under the VMM's own `firecracker` target.
+fn is_console_line(line: &str) -> bool {
+    line.contains("fcvm::console:") || line.contains("firecracker:")
 }
