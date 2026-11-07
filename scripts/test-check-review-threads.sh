@@ -551,6 +551,25 @@ run_case "a human posting the summary body is claimable, not coverage" \
 run_case "an unlisted bot posting the summary body is claimable, not coverage" \
   "$(wrap8 "$SUITE" "$(cmt some-other-bot Bot 2026-01-02T00:20:00Z "$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
   1 "carry no disposition" "UNREVIEWED HEAD"
+# Codex's summary since 2026-11: the same table inside a <details> block whose <summary>
+# names it, after a codex-review-state HTML comment. Body copied from #1584, whose only
+# Codex result was this comment: the gate read it as no review of the head.
+codex_summary_details() { jq -n --arg rows "$1" --arg st "${2:-✅ Completed}" '"<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"deadbeef\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"}} -->\n\n<details>\n<summary><strong>Codex Review Summary</strong>: \($st)</summary>\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n\($rows)\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>\n\n</details>"'; }
+run_case "the live #1584 shape: a summary in a details block, Completed at the head, covers it" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_details "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  0 "HEAD COVERED"
+run_case "a details-block summary needs no disposition" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_details "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" 2026-01-02T01:00:05Z)")" \
+  0 "CLEAR"
+run_case "a details-block summary with a row still in progress is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_details "$(sum_row 'In progress' 2026-01-02T01:00:00.123456Z deadbee)" '⏳ In progress')" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "a details-block summary naming an older commit is not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_details "$(sum_row Completed 2026-01-02T01:00:00.123456Z abc123def4)")" 2026-01-02T01:00:05Z),$ANSWER")" \
+  1 "UNREVIEWED HEAD"
+run_case "text after a details-block summary is a finding, not coverage" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(jq -n --argjson b "$(codex_summary_details "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")" '$b + "\n\nP1: this drops the last row"')" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
 # The legacy comment may still appear, and both shapes are Codex verdicts: a summary that
 # binds nothing does not take away what the legacy verdict covers.
 run_case "the legacy verdict still covers beside a summary that binds nothing" \

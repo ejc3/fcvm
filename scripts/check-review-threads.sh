@@ -956,16 +956,26 @@ def summary_lines:
   | if $s == null then null
     else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
              | map(select(length > 0))) end;
+# The summary lines after its heading: "## Codex Review Summary" (to 2026-11), or the same
+# table inside a <details> block whose <summary> names it and that closes last (#1584).
+def codex_summary_table:
+  summary_lines as $l
+  | if $l == null then null
+    elif ($l | length) >= 1 and $l[0] == "## Codex Review Summary" then $l[1:]
+    elif ($l | length) >= 3 and $l[0] == "<details>"
+         and ($l[1] | test("^<summary><strong>Codex Review Summary</strong>: [^<>]*</summary>$"))
+         and $l[-1] == "</details>" then $l[2:-1]
+    else null end;
 def is_codex_summary:
   (((. // "") | sub("^[[:space:]]+"; "")) | startswith(codex_summary_marker))
-  and (summary_lines as $l
-       | ($l | length) >= 5
-       and ($l[0] == "## Codex Review Summary")
-       and ($l[1] == "This comment shows the latest Codex review activity on this pull request.")
-       and ($l[2] == "| Review | Status | Commit | Review trigger |")
-       and (($l[3] | summary_cells) as $sep
+  and (codex_summary_table as $l
+       | $l != null
+       and ($l | length) >= 4
+       and ($l[0] == "This comment shows the latest Codex review activity on this pull request.")
+       and ($l[1] == "| Review | Status | Commit | Review trigger |")
+       and (($l[2] | summary_cells) as $sep
             | ($sep | length) == 4 and ($sep | all(.[]; test("^:?-{3,}:?$"))))
-       and ($l[4:] | all(.[]; startswith("|") and endswith("|"))));
+       and ($l[3:] | all(.[]; startswith("|") and endswith("|"))));
 def summary_rows:
   [ (. // "") | split("\n")[] | gsub("^[[:space:]]+|[[:space:]]+$"; "")
     | select(startswith("|")) | summary_cells ]
