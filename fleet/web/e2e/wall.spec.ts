@@ -3,7 +3,7 @@ import { seconds, thousands, utcDate } from "../core/format.ts";
 import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
-import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
+import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -158,6 +158,7 @@ test("a capture while a tile fades back in says so, not that it shows the pictur
 
 test("no seam: pixels on both sides of every boundary match the picture at the drawn t", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
+  await holdSeamCamera(page);
   const r = await seamReport(page);
   console.log(`seams: T=${r.T} samples=${r.samples} worst tile ${Math.max(...Object.values(r.perTile)).toFixed(2)} worst boundary ${Math.max(...r.boundaries.map((b) => b.err)).toFixed(2)}`);
   // Smooth sample pairs only: 100 to 175 at 1024x640, more on larger screens, fewer where the camera holds on detail.
@@ -169,6 +170,7 @@ test("no seam: pixels on both sides of every boundary match the picture at the d
 
 test("the seam check catches a renderer that draws another t than it stamps", async ({ page }) => {
   await openWall(page, 15);
+  await holdSeamCamera(page);
   await setSkew("slot-2", 0.6);
   try {
     // How much a 0.6 s skew changes the smooth pixels at fcvm:2's edges rises
@@ -873,6 +875,7 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.shownMode)).toBe("aggregated");
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBe(3);
   await page.waitForTimeout(1000);
+  await holdSeamCamera(page);
   const r = await seamReport(page);
   console.log(`aggregated seams: T=${r.T} samples=${r.samples} worst tile ${Math.max(...Object.values(r.perTile)).toFixed(2)} worst boundary ${Math.max(...r.boundaries.map((b) => b.err)).toFixed(2)}`);
   for (const [id, sh] of Object.entries(r.shown)) if (sh !== "dark") expect(sh, id).toBe(`sync@${r.T}`);
