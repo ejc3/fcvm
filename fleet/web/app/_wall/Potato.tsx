@@ -55,9 +55,9 @@ function ActionButton({ b, name, onClick }: { b: PotatoButton; name: string; onC
   );
 }
 
-export function Potato({ coordUrl }: { coordUrl: string }) {
+export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: string | null }) {
   // No frame streams: the game is drawn from the snapshot alone.
-  const client = useMemo(() => new WallClient(coordUrl, () => []), [coordUrl]);
+  const client = useMemo(() => new WallClient(coordUrl, () => [], directUrl), [coordUrl, directUrl]);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const [now, setNow] = useState(0);
   const [stage, setStage] = useState<Box | null>(null);

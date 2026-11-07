@@ -205,8 +205,8 @@ function PanelView({
   );
 }
 
-export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
-  const client = useMemo(() => new WallClient(coordUrl, (st) => st.phones?.tiles ?? []), [coordUrl]);
+export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: string | null; mediaUrl: string }) {
+  const client = useMemo(() => new WallClient(coordUrl, (st) => st.phones?.tiles ?? [], directUrl), [coordUrl, directUrl]);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
