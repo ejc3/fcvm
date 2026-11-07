@@ -597,6 +597,16 @@ pub fn mount_extra_disks(
     Ok(mounted_paths)
 }
 
+/// Set this guest's NFSv4 client identity (the uuid in its co_ownerid) to a new one,
+/// for the NFS clients created after it.
+pub fn fresh_nfs_client_identity() -> Result<()> {
+    let uuid =
+        std::fs::read_to_string("/proc/sys/kernel/random/uuid").context("reading a new uuid")?;
+    std::fs::write("/sys/fs/nfs/net/nfs_client/identifier", uuid.trim())
+        .context("writing /sys/fs/nfs/net/nfs_client/identifier")?;
+    Ok(())
+}
+
 /// Mount NFS shares from host. Returns list of mounted paths. On a boot each share goes
 /// into `record` once it is mounted. A restore remounts the shares with no record: it
 /// reproduces the mounts the boot's check passed.
@@ -625,11 +635,20 @@ pub fn mount_nfs_shares(
         let mut mount_cmd = std::process::Command::new("mount");
         mount_cmd.arg("-t").arg("nfs");
 
-        let opts = if share.read_only {
-            "ro,nfsvers=4,nolock"
+        // NFSv4.0, not 4.1 or 4.2: a 4.1 session does not survive a restore. Requests in
+        // flight at the snapshot hold slots of the snapshot's session, and the client's
+        // recovery on the restored connection (BIND_CONN_TO_SESSION) waits for every slot
+        // to drain, so a file held open across the snapshot stayed in D state for good
+        // (gym_pairs_21, gym_pairs_25: the state manager stuck in nfs4_drain_slot_tbl).
+        // 4.0 has no sessions; the same holds recover within seconds of the restore.
+        let mut opts = if share.read_only {
+            "ro,nfsvers=4.0,nolock".to_string()
         } else {
-            "rw,nfsvers=4,nolock"
+            "rw,nfsvers=4.0,nolock".to_string()
         };
+        if let Some(port) = share.port {
+            opts.push_str(&format!(",port={port}"));
+        }
         mount_cmd.arg("-o").arg(opts);
         mount_cmd.arg(&nfs_source).arg(&share.mount_path);
 
@@ -658,6 +677,182 @@ pub fn mount_nfs_shares(
     }
 
     Ok(mounted_paths)
+}
+
+/// The mount namespaces other than fc-agent's own that hold an NFS mount at one of
+/// `paths`, each as its namespace (opened while a process in it was found, so the
+/// namespace outlives that process) and the paths to rebind there. The container's
+/// namespace is one: podman bound each share into it when the container started. A
+/// path under another of `paths` is left out, because the rebind of the outer share
+/// copies the mounts under it ([`rebind_into_namespace`]), when that namespace has the
+/// outer share at all. Reads each process's
+/// mountinfo, which names mounts without touching the filesystems in them.
+pub fn nfs_mounts_in_other_namespaces(
+    paths: &[String],
+) -> Result<Vec<(std::fs::File, Vec<String>)>> {
+    use std::os::unix::fs::MetadataExt;
+    let own = std::fs::metadata("/proc/self/ns/mnt")
+        .context("reading fc-agent's mount namespace")?
+        .ino();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(own);
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").context("listing /proc")? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // The namespace this descriptor holds is the one whose mounts are read only if
+        // the process was in it before and after the read: a process that exits or
+        // changes namespace in between is skipped, and its namespace stays unseen, so
+        // another process in it can still be found.
+        let ns_now = || {
+            std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
+                .ok()
+                .map(|m| m.ino())
+        };
+        let Ok(ns) = std::fs::File::open(format!("/proc/{pid}/ns/mnt")) else {
+            continue;
+        };
+        let Ok(ns_ino) = ns.metadata().map(|m| m.ino()) else {
+            continue;
+        };
+        if seen.contains(&ns_ino) || ns_now() != Some(ns_ino) {
+            continue;
+        }
+        let Ok(mountinfo) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
+            continue;
+        };
+        if ns_now() != Some(ns_ino) {
+            continue;
+        }
+        seen.insert(ns_ino);
+        let here = outermost_nfs_mounts(&mountinfo, paths);
+        if !here.is_empty() {
+            found.push((ns, here));
+        }
+    }
+    Ok(found)
+}
+
+/// The `paths` with an NFS mount in `mountinfo`, less those under another of them that
+/// has one there too (the rebind of the outer one copies them).
+fn outermost_nfs_mounts(mountinfo: &str, paths: &[String]) -> Vec<String> {
+    let mounted: Vec<&String> = paths
+        .iter()
+        .filter(|path| nfs_mounted_at(mountinfo, path))
+        .collect();
+    mounted
+        .iter()
+        .filter(|path| !mounted.iter().any(|outer| is_under(path, outer)))
+        .map(|path| path.to_string())
+        .collect()
+}
+
+/// Whether `path` is strictly below `parent`.
+fn is_under(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/') || parent.ends_with('/') && !rest.is_empty())
+}
+
+/// Whether `mountinfo` (proc_pid_mountinfo(5)) has an NFS mount at `path`. The mount
+/// point field escapes spaces, tabs, newlines and backslashes as octal.
+fn nfs_mounted_at(mountinfo: &str, path: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        let mut fields = line.split(' ');
+        let mount_point = fields.nth(4).map(unescape_mount_field);
+        let fstype = line
+            .split(" - ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next());
+        mount_point.as_deref() == Some(path) && matches!(fstype, Some("nfs" | "nfs4"))
+    })
+}
+
+/// Replace the copy of the NFS mount at `path` that the mount namespace of `pid` holds
+/// with a copy of fc-agent's own mount there. A restore remounts its shares under a
+/// new NFS client (`restore::nfs_remounts`), but the container bound the snapshot's
+/// mounts when it started, and those still use the snapshot's client, under the
+/// identity every twin clone shares. The copy is cloned from fc-agent's mount
+/// (open_tree) and attached beneath the old one at the same path (move_mount with
+/// MOVE_MOUNT_BENEATH), and then the old one is detached, so a process in the
+/// container resolving the path always finds a share there: detaching first left the
+/// bare directory for a moment, and a program run from the share in that moment
+/// failed with ENOENT. It runs on a thread of its own that enters that namespace and
+/// ends with it.
+pub fn rebind_into_namespace(ns: &std::fs::File, path: &str) -> Result<()> {
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    const MOVE_MOUNT_BENEATH: libc::c_uint = 0x200;
+    let c_path = std::ffi::CString::new(path).context("NFS share path")?;
+    // SAFETY: c_path is a valid NUL-terminated string; the syscall returns a new fd or -1.
+    let tree = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            // Recursive: the shares mounted under this one come with it.
+            (OPEN_TREE_CLONE | AT_RECURSIVE | libc::O_CLOEXEC as libc::c_uint) as libc::c_ulong,
+        )
+    };
+    if tree < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("open_tree {path}"));
+    }
+    // SAFETY: the syscall returned a new descriptor this function now owns.
+    let tree =
+        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(tree as i32) };
+    let ns = ns
+        .try_clone()
+        .context("duplicating the mount namespace descriptor")?;
+    let path = path.to_string();
+    thread::spawn(move || -> Result<()> {
+        use std::os::fd::AsRawFd;
+        // A thread that shares fc-agent's filesystem context cannot enter another
+        // mount namespace (setns(2)), so it takes its own first.
+        // SAFETY: plain syscalls on this thread's own context and on owned descriptors.
+        unsafe {
+            if libc::unshare(libc::CLONE_FS) != 0 {
+                return Err(std::io::Error::last_os_error()).context("unshare(CLONE_FS)");
+            }
+            if libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNS) != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("entering the container's mount namespace");
+            }
+        }
+        let c_path = std::ffi::CString::new(path.as_str()).context("NFS share path")?;
+        let empty = c"";
+        // SAFETY: tree is an open_tree descriptor; both strings are NUL-terminated.
+        let moved = unsafe {
+            libc::syscall(
+                libc::SYS_move_mount,
+                tree.as_raw_fd(),
+                empty.as_ptr(),
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_BENEATH) as libc::c_ulong,
+            )
+        };
+        if moved != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("attaching the remounted share at {path} in the container's namespace")
+            });
+        }
+        // The old copy may be held open; detaching it leaves those holders their files.
+        // SAFETY: c_path is a valid NUL-terminated string.
+        if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("detaching the snapshot's mount at {path} in the container's namespace")
+            });
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("the thread that rebinds the NFS share panicked"))?
 }
 
 /// Unmount a list of paths with lazy unmount.
@@ -729,6 +924,49 @@ pub fn unmount_disks(paths: &[String]) {
 mod tests {
     use super::*;
 
+    /// #1009: the container's copy of a share is found by its mount point and NFS type,
+    /// and nothing else at that path or of that type matches.
+    #[test]
+    fn an_nfs_mount_is_found_by_its_mount_point_and_type() {
+        let mountinfo = "\
+612 590 0:58 / /mydata rw,relatime shared:1 - nfs4 10.0.0.1:/srv rw,vers=4.2
+613 590 0:59 / /mydatum rw,relatime - nfs4 10.0.0.1:/srv rw,vers=4.2
+614 590 0:60 / /other rw,relatime - ext4 /dev/vdb rw
+615 590 0:61 / /plain rw,relatime - tmpfs tmpfs rw
+";
+        assert!(nfs_mounted_at(mountinfo, "/mydata"));
+        assert!(!nfs_mounted_at(mountinfo, "/myda"));
+        assert!(!nfs_mounted_at(mountinfo, "/other"));
+        assert!(!nfs_mounted_at(mountinfo, "/plain"));
+        assert!(!nfs_mounted_at("", "/mydata"));
+        // The mount point field escapes a space as \040.
+        let spaced = "620 590 0:62 / /data\\040files rw - nfs4 10.0.0.1:/srv rw\n";
+        assert!(nfs_mounted_at(spaced, "/data files"));
+        assert!(!nfs_mounted_at(spaced, "/data\\040files"));
+    }
+
+    /// A share under another share is rebound with it (open_tree is recursive), so only
+    /// the outer one is listed for a namespace.
+    #[test]
+    fn a_nested_share_is_left_to_its_outer_share() {
+        assert!(is_under("/data/inner", "/data"));
+        assert!(is_under("/data/inner", "/data/"));
+        assert!(!is_under("/database", "/data"));
+        assert!(!is_under("/data", "/data"));
+        let paths = vec!["/data".to_string(), "/data/inner".to_string()];
+        let both = "1 0 0:1 / /data rw - nfs4 h:/a rw\n2 1 0:2 / /data/inner rw - nfs4 h:/b rw\n";
+        assert_eq!(
+            outermost_nfs_mounts(both, &paths),
+            vec!["/data".to_string()]
+        );
+        // A namespace that has only the inner share still gets it rebound.
+        let inner = "2 1 0:2 / /data/inner rw - nfs4 h:/b rw\n";
+        assert_eq!(
+            outermost_nfs_mounts(inner, &paths),
+            vec!["/data/inner".to_string()]
+        );
+    }
+
     /// fc-agent has one block-device wait, so a change to it (a longer timeout, say) reaches
     /// every device it waits for: the overlay image, pmem and the extra disks (#1087).
     #[test]
@@ -748,6 +986,7 @@ mod tests {
                 host_path: "/export".to_string(),
                 mount_path: mount_path.to_string(),
                 read_only: false,
+                port: None,
             },
             mount_id: 77,
         }

@@ -125,7 +125,10 @@ ifeq ($(FCVM_NO_SNAPSHOT),)
 CI_NESTED_FILTER := -E '$(CI_ROOT_BASE) & not test(=test_nested_l2_with_large_files)'
 else
 # SnapshotDisabled mode: keep test_nested_l2_with_large_files (the FUSE-integrity guard runs here).
-CI_NESTED_FILTER := -E '$(CI_ROOT_BASE)'
+# Drop the fuzz gym's per-PR scenarios: they take every snapshot they test explicitly, and
+# FCVM_NO_SNAPSHOT only turns off the startup snapshot cache, so this lane would rerun the
+# same scenarios (the CacheHit origin turns the cache back on for itself).
+CI_NESTED_FILTER := -E '$(CI_ROOT_BASE) & not test(/^gym_(hugepage_)?pairs_/)'
 endif
 endif
 endif
@@ -683,6 +686,13 @@ SEEDS ?= 1
 OPS ?= 10
 fuzz: show-notes check-disk setup-fcvm
 	FCVM_FUZZ_SEEDS=$(SEEDS) FCVM_FUZZ_OPS=$(OPS) $(MAKE) _test-root FILTER=fuzz_lifecycle_chaos
+
+# Fuzz gym (tests/test_fuzz_gym.rs, #1009): the valid crossings of how a VM is created,
+# restored and used, FCVM_GYM_PARALLEL at a time; FCVM_GYM_SHARD=i/n runs every n-th, and
+# FCVM_GYM_SAMPLES adds seeded random repeats. The per-PR suite runs its all-pairs
+# covering set (gym_pairs_NN, gym_hugepage_pairs_NN) with the rest of test-root.
+fuzz-gym: show-notes check-disk setup-fcvm setup-hugepages setup-cloud-hypervisor
+	$(MAKE) _test-root IGNORED=1 FILTER="-E 'test(=gym_full_cross_product)'"
 
 # Race gym (docs/race-gym.md): concurrent fcvm actors parked at named failpoints and
 # released in enumerated orders. Rootless, so it runs as the invoking user.

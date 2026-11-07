@@ -1015,6 +1015,22 @@ fn validate_free_page_reporting(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `--nfs` without bridged networking. The share is exported to the guest's IP.
+/// A rootless guest reaches the host through pasta, so the host's nfsd sees the mount
+/// come from pasta's host-side address and refuses it ("access denied by server"); a
+/// routed guest's IPv4 stays inside its namespace, and its mount of the gateway is
+/// refused ("Connection refused"). Both failed only after the VM booted. Found by the
+/// fuzz gym (#1009).
+fn validate_nfs_network(args: &RunArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.nfs.is_empty() || matches!(args.network, NetworkMode::Bridged),
+        "--nfs needs --network bridged: a rootless VM reaches the host through pasta, so the \
+         host's NFS server sees its mount come from pasta, not from the address the share is \
+         exported to, and a routed VM's IPv4 does not leave its namespace"
+    );
+    Ok(())
+}
+
 /// `--gpu` devices are attached when fcvm restores the pre-start snapshot, which is
 /// taken without them. A run that never restores that snapshot would run without them.
 fn validate_gpu_run(args: &RunArgs, lifecycle: &PodmanLifecycle, no_snapshot: bool) -> Result<()> {
@@ -1585,6 +1601,7 @@ async fn prepare_vm_for_lifecycle(
     }
     validate_balloon_target(args.balloon, args.mem)?;
     validate_free_page_reporting(&args)?;
+    validate_nfs_network(&args)?;
     // Refuse a bad --pmem before the snapshot cache is looked up, so a cache hit
     // and a cold boot refuse it the same way.
     if !args.pmem.is_empty()
@@ -5368,6 +5385,38 @@ mod tests {
         assert!(
             switch_checked < looked_up,
             "prepare_vm_for_lifecycle looks the snapshot cache up before it checks --free-page-reporting"
+        );
+    }
+
+    /// A rootless or routed `--nfs` run is refused before it boots, by name (#1009: they
+    /// booted and then failed to mount).
+    #[test]
+    fn nfs_without_bridged_networking_is_refused_before_boot() {
+        let mut args = test_args();
+        args.nfs = vec!["/srv:/mnt".to_string()];
+        args.network = NetworkMode::Rootless;
+        let error = validate_nfs_network(&args).expect_err("rootless --nfs");
+        assert!(
+            error.to_string().contains("--nfs needs --network bridged"),
+            "{error}"
+        );
+        args.network = NetworkMode::Routed;
+        validate_nfs_network(&args).expect_err("routed --nfs");
+        args.network = NetworkMode::Bridged;
+        validate_nfs_network(&args).expect("bridged --nfs");
+        args.network = NetworkMode::Rootless;
+        args.nfs.clear();
+        validate_nfs_network(&args).expect("rootless without --nfs");
+        let prepare = include_str!("mod.rs");
+        let checked = prepare
+            .find("validate_nfs_network(&args)?;")
+            .expect("never checked");
+        let looked_up = prepare
+            .find("check_podman_snapshot(")
+            .expect("no cache lookup");
+        assert!(
+            checked < looked_up,
+            "--nfs is checked after the snapshot cache lookup"
         );
     }
 

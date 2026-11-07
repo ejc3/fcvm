@@ -501,8 +501,14 @@ patches_dir = "kernel/patches-x86"  # FUSE remap_file_range patch for reflink su
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
-# No special firecracker fork needed for x86 (standard firecracker supports Intel VT-x/AMD-V)
-# No special boot_args needed for x86
+# The default fork plus the vCPU's nested virtualization state in snapshots
+# (ejc3/firecracker#23, on the default branch's pinned commit). Without it a
+# restored L1 comes back outside VMX operation and its L2 never starts, which
+# kept the x86_64 L2 tests off the SnapshotEnabled runners (#664).
+# No special boot_args needed for x86.
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state"
+firecracker_commit = "ddc1969f8dba126a1c771aa7be9d4ec09ffc177c"
 
 # Host kernel configuration for x86 nested profile
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,

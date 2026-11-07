@@ -91,6 +91,10 @@ max-threads = 8
 [test-groups.nested-tests]
 max-threads = 1
 
+# Fuzz gym per-PR scenarios: each holds up to three VMs and a memory server at once.
+[test-groups.gym-tests]
+max-threads = 12
+
 # VM tests run at full parallelism (num-cpus)
 [test-groups.vm-tests]
 max-threads = "num-cpus"
@@ -107,6 +111,28 @@ max-threads = "num-cpus"
 [[profile.default.overrides]]
 filter = "package(fcvm) & (binary(test_race_gym) | test(/lifecycle_interleave_gym_/))"
 slow-timeout = { period = "14400s", terminate-after = 1 }
+retries = 0
+
+# Fuzz gym (tests/test_fuzz_gym.rs, #1009). The nightly cross product is one test that
+# runs a seventh of the 2376 valid scenarios each night (make fuzz-gym), 8 at a time.
+# Each per-PR scenario boots two to five VMs in sequence and takes one to four snapshots.
+# A retry would rerun the scenario and could turn a caught crossing green, so none.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(=gym_full_cross_product)"
+slow-timeout = { period = "21600s", terminate-after = 1 }
+retries = 0
+
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/^gym_pairs_/)"
+test-group = "gym-tests"
+slow-timeout = { period = "900s", terminate-after = 1 }
+retries = 0
+
+# The hugepage scenarios share the host's hugepage pool with the other hugepage tests.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/^gym_hugepage_pairs_/)"
+test-group = "hugepage-tests"
+slow-timeout = { period = "900s", terminate-after = 1 }
 retries = 0
 
 # Seeded lifecycle chaos fuzz (make fuzz, tests/test_fuzz_chaos.rs): ONE test
