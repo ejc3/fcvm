@@ -85,6 +85,8 @@ export interface SeamReport {
   /** Mean absolute difference across each internal boundary, against the pattern's own, over `n` smooth pairs. */
   boundaries: { a: string; b: string; err: number; n: number }[];
   samples: number;
+  /** Every tile drawn live (not dark) with a box: the tiles the seams are between. */
+  tiles: string[];
 }
 
 /**
@@ -226,7 +228,7 @@ export async function seamReport(page: Page): Promise<SeamReport> {
     const [a, b] = k.split("|") as [string, string];
     return { a, b, err: s.s / s.n, n: s.n };
   });
-  return { T: res.T, shown: res.shown, perTile, boundaries, samples };
+  return { T: res.T, shown: res.shown, perTile, boundaries, samples, tiles: live.map((t) => t.id) };
 }
 
 /**
