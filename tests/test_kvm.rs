@@ -650,6 +650,48 @@ except OSError as e:
     }
 }
 
+/// `localhost/nested-test` as a docker-archive at
+/// `/mnt/fcvm-btrfs/image-cache/{digest}.oci.tar`, the path the nested levels
+/// `podman load` from. The tests used to find this file only when an earlier
+/// launch of the image had left it in the image cache, and a fresh store has
+/// none: every L3 and L4 test then failed in L1 with "stat
+/// /mnt/image-cache/<digest>.oci.tar: no such file or directory" (#660). It is
+/// exported by image ID, under a unique temporary name, and renamed into place.
+async fn nested_test_archive(digest_stripped: &str) -> Result<String> {
+    let path = format!("/mnt/fcvm-btrfs/image-cache/{digest_stripped}.oci.tar");
+    if std::path::Path::new(&path).exists() {
+        return Ok(path);
+    }
+    let id_output = tokio::process::Command::new("podman")
+        .args(["inspect", "localhost/nested-test", "--format", "{{.Id}}"])
+        .output()
+        .await
+        .context("getting the nested-test image ID")?;
+    let image_id = String::from_utf8_lossy(&id_output.stdout)
+        .trim()
+        .to_string();
+    if image_id.is_empty() {
+        bail!(
+            "no image ID for localhost/nested-test: {}",
+            String::from_utf8_lossy(&id_output.stderr)
+        );
+    }
+    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache").await?;
+    let temp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+    fcvm::commands::podman::export_image_archive(
+        &image_id,
+        "localhost/nested-test",
+        std::path::Path::new(&temp),
+        None,
+    )
+    .await
+    .context("exporting localhost/nested-test for the nested levels")?;
+    tokio::fs::rename(&temp, &path)
+        .await
+        .with_context(|| format!("publishing {path}"))?;
+    Ok(path)
+}
+
 /// Run an nested chain test with configurable depth.
 ///
 /// This function attempts to run VMs nested N levels deep:
@@ -782,7 +824,7 @@ except OSError as e:
     }
     // Strip sha256: prefix to match fcvm's cache path format
     let digest_stripped = image_digest.trim_start_matches("sha256:");
-    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let image_cache_path = nested_test_archive(digest_stripped).await?;
     println!("[Setup] Image digest: {}", image_digest);
     println!("[Setup] Cache path: {}", image_cache_path);
 
@@ -1000,14 +1042,11 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L3 network: measures throughput degradation through triple NAT chain
+/// Test L3 network: measures throughput degradation through triple NAT chain.
 ///
-/// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
-/// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
-/// container startup to exceed the 10-minute test timeout.
-/// disk-dir and NFS may work better at L3.
+/// 732 and 734 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI: Makefile CI_ROOT_BASE runs only the kept nested tests.
 #[tokio::test]
-#[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1018,9 +1057,11 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
     .await
 }
 
-/// Test L3 network with NFS (may be faster than FUSE)
+/// Test L3 network with the image cache over NFS.
+///
+/// 732 and 741 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI.
 #[tokio::test]
-#[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1031,14 +1072,12 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L1→L2→L3: 3 levels of nesting
+/// Test L1→L2→L3: 3 levels of nesting.
 ///
-/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
-/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
-/// initialization alone takes 10+ minutes. Need to implement request pipelining
-/// or async PassthroughFs before this test can complete in reasonable time.
+/// 669 and 681 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660); about 9 of those minutes are L3 booting through the three-hop FUSE
+/// chain. Not in CI.
 #[tokio::test]
-#[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1441,17 +1480,20 @@ async fn run_nested_n_levels(
     // This avoids mounting the entire image-cache which could be large
     let image_dir = format!("/mnt/fcvm-btrfs/nested-test/{}", digest_stripped);
     let image_archive = format!("{}/{}.oci.tar", image_dir, digest_stripped);
-    let src_archive = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let src_archive = nested_test_archive(digest_stripped).await?;
 
     // Create directory and reflink-copy the archive (fast CoW copy on btrfs)
-    tokio::fs::create_dir_all(&image_dir).await.ok();
+    tokio::fs::create_dir_all(&image_dir).await?;
     if !tokio::fs::try_exists(&image_archive).await.unwrap_or(false) {
         println!("Copying OCI archive to dedicated directory...");
-        tokio::process::Command::new("cp")
+        let copied = tokio::process::Command::new("cp")
             .args(["--reflink=auto", &src_archive, &image_archive])
             .status()
             .await
             .context("copying OCI archive")?;
+        if !copied.success() {
+            bail!("copying {src_archive} to {image_archive}: {copied}");
+        }
     }
 
     // Both methods mount the same directory, just via different mechanisms
@@ -1633,6 +1675,18 @@ async fn run_nested_n_levels(
         ""
     };
 
+    // L1 reads the archive through the mount under test (FUSE or NFS). It starts
+    // its L2 with only `--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs`, so L2 and deeper
+    // read the same file through that map; /mnt/image-cache does not exist there
+    // (#660: every L3 and L4 run failed in L2 with "stat /mnt/image-cache/...").
+    let level_image_cache = |level: usize| {
+        if level == 1 {
+            image_cache_guest_path.clone()
+        } else {
+            image_dir.clone()
+        }
+    };
+
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
@@ -1695,7 +1749,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1758,7 +1812,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1819,7 +1873,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1874,10 +1928,11 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     let image_cache_args = image_cache_mount_args.join(" ");
     // `timeout` bounds the L1 VM's lifetime: when nextest kills a timed-out
     // test, this spawned pipeline would otherwise survive as an orphan and
-    // collide with the retry. 840s < the 900s nextest budget so the VM dies
-    // (and cleans up) before the test harness gives up.
+    // collide with the retry. 1140 s < the nested group's 1200 s nextest budget
+    // so the VM dies (and cleans up) before the test harness gives up. The L3
+    // tests complete in 669 to 741 s (#660), so 840 s left them 13% headroom.
     let fcvm_cmd = format!(
-        "timeout -k 10 840 sudo ./target/release/fcvm podman run \
+        "timeout -k 10 1140 sudo ./target/release/fcvm podman run \
          --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
@@ -1997,11 +2052,9 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
 /// Measures how long it takes to import the nested container image
 /// inside a VM when the image archive is accessed over FUSE-over-vsock.
 ///
-/// Disabled: takes 389s in CI due to NV2 nested virtualization overhead (75x
-/// slower than L1). FUSE throughput itself is fine (181-224 MB/s on L1).
-/// The bottleneck is podman load's gzip decompression + overlay writes running
-/// under double Stage 2 translation with a single vCPU.
-#[ignore = "podman load over FUSE in nested VM: slow + NV2-flaky; run manually — tracked in #630-B"]
+/// It took 389 s in CI before the #630 fixes. On a c8g.metal-48xl with the
+/// 6.18.60 host and guest kernels the whole test took 15 to 28 s in four runs
+/// (#660). Not in CI.
 #[tokio::test]
 async fn test_podman_load_over_fuse() -> Result<()> {
     println!("\nPodman Load Over FUSE Performance Test");
@@ -2032,12 +2085,8 @@ async fn test_podman_load_over_fuse() -> Result<()> {
     }
 
     let digest_stripped = digest.trim_start_matches("sha256:");
-    let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let archive_path = nested_test_archive(digest_stripped).await?;
     println!("   Digest: sha256:{}...", &digest_stripped[..12]);
-
-    if !std::path::Path::new(&archive_path).exists() {
-        bail!("OCI archive not found at {}", archive_path);
-    }
 
     // Get archive size
     let metadata = std::fs::metadata(&archive_path)?;
