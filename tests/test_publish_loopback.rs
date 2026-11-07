@@ -256,6 +256,94 @@ fn run_publish_loopback_case(network: &str) -> Result<()> {
     result
 }
 
+/// A `/loopback` mapping reaches its guest service as a loopback client, and a plain
+/// one does not (#1034). Two nginx servers on guest 127.0.0.1 answer with the client
+/// address they see.
+fn run_loopback_client_case(network: &str) -> Result<()> {
+    println!("\nloopback client case: {network}");
+    const AS_LOOPBACK: u16 = 9232;
+    const PLAIN: u16 = 9233;
+    let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("publoopclient-{network}-{}", std::process::id());
+    let loopback_host_port = common::find_available_high_port()?;
+    let mut plain_host_port = common::find_available_high_port()?;
+    while plain_host_port == loopback_host_port {
+        plain_host_port = common::find_available_high_port()?;
+    }
+    let guest_cmd = format!(
+        "set -e\n\
+         printf 'server {{ listen 127.0.0.1:{AS_LOOPBACK}; location / {{ return 200 \"client=$remote_addr\"; }} }}\\n\
+         server {{ listen 127.0.0.1:{PLAIN}; location / {{ return 200 \"client=$remote_addr\"; }} }}\\n' \
+         > /etc/nginx/conf.d/default.conf\n\
+         exec nginx -g 'daemon off;'\n"
+    );
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        network,
+        "--publish",
+        &format!("{loopback_host_port}:{AS_LOOPBACK}/loopback"),
+        "--publish",
+        &format!("{plain_host_port}:{PLAIN}"),
+        common::TEST_IMAGE,
+        "sh",
+        "-c",
+        &guest_cmd,
+    ]);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut fcvm = cmd.spawn().context("spawning fcvm")?;
+    let pid = fcvm.id();
+
+    let result = (|| -> Result<()> {
+        let ip = wait_healthy_publish_ip(&fcvm_path, pid)?;
+        let fetch = |port: u16| -> Result<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let out = Command::new("curl")
+                    .args(["-sS", "--max-time", "5", &format!("http://{ip}:{port}/")])
+                    .output()
+                    .context("curl the published port")?;
+                let body = String::from_utf8_lossy(&out.stdout).to_string();
+                if body.starts_with("client=") || std::time::Instant::now() >= deadline {
+                    return Ok(body);
+                }
+                std::thread::sleep(common::POLL_INTERVAL);
+            }
+        };
+        let as_loopback = fetch(loopback_host_port)?;
+        let plain = fetch(plain_host_port)?;
+        anyhow::ensure!(
+            as_loopback == "client=127.0.0.1",
+            "a /loopback mapping must reach its service as 127.0.0.1; it saw {as_loopback:?}"
+        );
+        anyhow::ensure!(
+            plain.starts_with("client=") && plain != "client=127.0.0.1",
+            "a plain mapping keeps its client's address (the fixture would pass for the wrong \
+             reason otherwise); it saw {plain:?}"
+        );
+        Ok(())
+    })();
+
+    fcvm::utils::graceful_kill(pid, 2000);
+    let _ = fcvm.wait();
+    result
+}
+
+#[test]
+fn test_publish_loopback_client_rootless() -> Result<()> {
+    run_loopback_client_case("rootless")
+}
+
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_publish_loopback_client_routed() -> Result<()> {
+    run_loopback_client_case("routed")
+}
+
 /// Rootless uses pasta's published-port path and is available without host root.
 #[test]
 fn test_publish_reaches_loopback_and_stays_contained_rootless() -> Result<()> {

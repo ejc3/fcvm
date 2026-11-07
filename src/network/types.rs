@@ -57,6 +57,12 @@ pub struct PortMapping {
     pub host_port: u16,
     pub guest_port: u16,
     pub proto: Protocol,
+    /// The guest's service sees this mapping's clients as a loopback client, 127.0.0.1
+    /// (`/loopback`, #1034). Only on a host loopback address, in rootless and routed
+    /// networking: whoever reaches the mapping gets the guest's loopback trust.
+    /// Written only when set, so configs without it keep their snapshot keys.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback_client: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -72,6 +78,9 @@ pub enum Protocol {
 pub struct GuestPort {
     pub port: u16,
     pub proto: Protocol,
+    /// The guest was set up to present this port's clients as loopback clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback_client: bool,
 }
 
 impl GuestPort {
@@ -82,6 +91,7 @@ impl GuestPort {
             .map(|m| Self {
                 port: m.guest_port,
                 proto: m.proto,
+                loopback_client: m.loopback_client,
             })
             .collect();
         ports.into_iter().collect()
@@ -90,9 +100,17 @@ impl GuestPort {
 
 impl std::fmt::Display for GuestPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.port, self.proto)
+        write!(f, "{}/{}", self.port, self.proto)?;
+        if self.loopback_client {
+            write!(f, "/{LOOPBACK_CLIENT}")?;
+        }
+        Ok(())
     }
 }
+
+/// The `--publish` option word that makes a mapping's clients loopback clients in the
+/// guest (`127.0.0.1:8080:80/tcp/loopback`).
+pub const LOOPBACK_CLIENT: &str = "loopback";
 
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,7 +129,11 @@ impl std::fmt::Display for PortMapping {
             Some(ip) => write!(f, "{ip}:")?,
             None => {}
         }
-        write!(f, "{}:{}/{}", self.host_port, self.guest_port, self.proto)
+        write!(f, "{}:{}/{}", self.host_port, self.guest_port, self.proto)?;
+        if self.loopback_client {
+            write!(f, "/{LOOPBACK_CLIENT}")?;
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +256,7 @@ impl PortMapping {
         mappings: &[Self],
         mode: crate::firecracker::FcNetworkMode,
     ) -> anyhow::Result<()> {
+        Self::require_loopback_client_rules(mappings, mode)?;
         let collide = |earlier: &Self, mapping: &Self| !Self::can_both_bind(earlier, mapping, mode);
         if let Some((earlier, mapping)) = Self::first_on_one_socket(mappings, collide) {
             let reason = Self::collision(earlier, mapping, mode).unwrap_or_default();
@@ -283,15 +306,35 @@ impl PortMapping {
             anyhow::bail!("invalid port mapping {s}: {GRAMMAR}");
         };
 
-        // Protocol suffix on the guest port; TCP when there is none.
-        let (guest_port_str, proto) = match guest_port_str.split_once('/') {
-            None => (guest_port_str, Protocol::Tcp),
-            Some((port, "tcp")) => (port, Protocol::Tcp),
-            Some((port, "udp")) => (port, Protocol::Udp),
-            Some((_, other)) => {
+        // Protocol and option words after the guest port: `/tcp`, `/udp`, `/loopback`
+        // (TCP), `/tcp/loopback`. TCP when there are none.
+        let mut words = guest_port_str.split('/');
+        let guest_port_str = words.next().unwrap_or_default();
+        let words: Vec<&str> = words.collect();
+        let (proto, loopback_client) = match words.as_slice() {
+            [] | ["tcp"] => (Protocol::Tcp, false),
+            ["udp"] => (Protocol::Udp, false),
+            [LOOPBACK_CLIENT] | ["tcp", LOOPBACK_CLIENT] => (Protocol::Tcp, true),
+            ["udp", LOOPBACK_CLIENT] => anyhow::bail!(
+                "invalid port mapping {s}: /{LOOPBACK_CLIENT} is for TCP mappings only"
+            ),
+            [other] | [other, ..] => {
                 anyhow::bail!("invalid port mapping {s}: invalid protocol {other}")
             }
         };
+        if loopback_client {
+            let on_loopback = host_ip.as_deref().is_none_or(|ip| {
+                ip.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            });
+            if !on_loopback {
+                anyhow::bail!(
+                    "invalid port mapping {s}: a /{LOOPBACK_CLIENT} mapping gives its clients \
+                     the guest's loopback trust, so it listens on a host loopback address \
+                     only (127.0.0.0/8, [::1], or none for the VM's own loopback address)"
+                );
+            }
+        }
 
         let host_port = host_port_str.parse().map_err(|_| {
             anyhow::anyhow!("invalid port mapping {s}: invalid host port {host_port_str}")
@@ -305,7 +348,36 @@ impl PortMapping {
             host_port,
             guest_port,
             proto,
+            loopback_client,
         })
+    }
+
+    /// Refuse what a network mode cannot do with `/loopback` mappings: bridged networking
+    /// listens on the VM's veth address, not a loopback one, and one guest port is
+    /// either a loopback-client port or not, since the guest's rule for it applies to
+    /// every client that reaches it.
+    pub fn require_loopback_client_rules(
+        mappings: &[Self],
+        mode: crate::firecracker::FcNetworkMode,
+    ) -> anyhow::Result<()> {
+        for mapping in mappings.iter().filter(|m| m.loopback_client) {
+            if mode == crate::firecracker::FcNetworkMode::Bridged {
+                anyhow::bail!(
+                    "port mapping {mapping}: bridged networking listens on the VM's veth \
+                     address, so it cannot publish a /{LOOPBACK_CLIENT} mapping; use rootless \
+                     or routed networking"
+                );
+            }
+            if let Some(plain) = mappings.iter().find(|m| {
+                !m.loopback_client && m.guest_port == mapping.guest_port && m.proto == mapping.proto
+            }) {
+                anyhow::bail!(
+                    "port mappings {mapping} and {plain} publish one guest port both as a \
+                     /{LOOPBACK_CLIENT} port and as a plain one"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +459,7 @@ mod tests {
                 host_port,
                 guest_port,
                 proto,
+                loopback_client: false,
             };
             assert_eq!(parsed, expected, "{spec}");
         }
@@ -543,6 +616,82 @@ mod tests {
             "{error}"
         );
         PortMapping::require_bindable(&mappings[..3], Routed).unwrap();
+    }
+
+    /// `/loopback` marks a TCP mapping whose clients reach the guest's service as
+    /// loopback clients (#1034), and is written back the way it parses.
+    #[test]
+    fn a_loopback_client_mapping_parses_and_is_written_back() {
+        for (spec, host_ip, written) in [
+            ("8097:80/loopback", None, "8097:80/tcp/loopback"),
+            (
+                "127.0.0.1:8097:80/tcp/loopback",
+                Some("127.0.0.1"),
+                "127.0.0.1:8097:80/tcp/loopback",
+            ),
+            (
+                "[::1]:8097:80/loopback",
+                Some("::1"),
+                "[::1]:8097:80/tcp/loopback",
+            ),
+        ] {
+            let mapping = PortMapping::parse(spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert!(mapping.loopback_client, "{spec}");
+            assert_eq!(mapping.proto, Protocol::Tcp, "{spec}");
+            assert_eq!(mapping.host_ip.as_deref(), host_ip, "{spec}");
+            assert_eq!(mapping.to_string(), written, "{spec}");
+            assert_eq!(PortMapping::parse(written).unwrap(), mapping, "{spec}");
+        }
+        assert!(!PortMapping::parse("8097:80").unwrap().loopback_client);
+        // A plain mapping serializes as it did before the field existed.
+        let json = serde_json::to_string(&PortMapping::parse("8097:80").unwrap()).unwrap();
+        assert!(!json.contains("loopback_client"), "{json}");
+    }
+
+    /// The guest's loopback trust goes no further than the host's: `/loopback` is refused
+    /// on a non-loopback host address, for UDP, in bridged networking, and beside a
+    /// plain mapping of the same guest port.
+    #[test]
+    fn a_loopback_client_mapping_is_refused_where_it_would_widen_trust() {
+        for spec in [
+            "0.0.0.0:8097:80/loopback",
+            "[::]:8097:80/loopback",
+            "192.0.2.1:8097:80/tcp/loopback",
+            "8097:80/udp/loopback",
+            "8097:80/loopback/tcp",
+        ] {
+            let error = PortMapping::parse(spec).expect_err(spec).to_string();
+            assert!(error.contains(spec), "{spec}: {error}");
+        }
+        let mappings = |specs: &[&str]| -> Vec<PortMapping> {
+            specs
+                .iter()
+                .map(|s| PortMapping::parse(s).unwrap())
+                .collect()
+        };
+        use crate::firecracker::FcNetworkMode;
+        let error =
+            PortMapping::require_bindable(&mappings(&["8097:80/loopback"]), FcNetworkMode::Bridged)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("bridged"), "{error}");
+        let error = PortMapping::require_bindable(
+            &mappings(&["8097:80/loopback", "127.0.0.1:8098:80"]),
+            FcNetworkMode::Rootless,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("8097:80/tcp/loopback") && error.contains("8098:80/tcp"),
+            "{error}"
+        );
+        for mode in [FcNetworkMode::Rootless, FcNetworkMode::Routed] {
+            PortMapping::require_bindable(
+                &mappings(&["8097:80/loopback", "[::1]:8098:80/loopback"]),
+                mode,
+            )
+            .unwrap();
+        }
     }
 
     /// Every rejection names the spec it rejected, so one bad entry in a

@@ -1632,6 +1632,7 @@ fn clone_port_mappings(
         let guest_port = crate::network::GuestPort {
             port: mapping.guest_port,
             proto: mapping.proto,
+            loopback_client: mapping.loopback_client,
         };
         let needs_no_setup = cold_boot || mapping.proto == crate::network::Protocol::Udp;
         if !needs_no_setup && !guest_ports.contains(&guest_port) {
@@ -6483,6 +6484,22 @@ mod tests {
             published(&["9090:81", "8080:80/udp"])
         );
         assert!(clone_port_mappings(&snapshot, &requested(&["9090:81"]), false).is_err());
+    }
+
+    /// A memory clone keeps how its guest set a port up: a loopback-client port stays
+    /// one, on any loopback host address, and a plain port stays plain (#1034).
+    #[test]
+    fn a_memory_clone_keeps_a_ports_loopback_client_setup() {
+        let snapshot = publishing(&["8097:80/loopback", "8443:443"]);
+        assert_eq!(
+            clone_port_mappings(&snapshot, &requested(&["[::1]:9097:80/loopback"]), false).unwrap(),
+            published(&["[::1]:9097:80/loopback"])
+        );
+        let error = clone_port_mappings(&snapshot, &requested(&["9097:80"]), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("80/tcp/loopback"), "{error}");
+        assert!(clone_port_mappings(&snapshot, &requested(&["9443:443/loopback"]), false).is_err());
     }
 
     /// `--publish none` publishes nothing, whatever the snapshot published, and is

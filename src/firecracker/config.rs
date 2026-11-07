@@ -487,9 +487,11 @@ impl FirecrackerConfig {
                 host_port: 0,
                 guest_port: m.guest_port,
                 proto: m.proto,
+                // The guest sets a loopback-client port up differently.
+                loopback_client: m.loopback_client,
             })
             .collect();
-        guest.sort_by_key(|m| (m.guest_port, m.proto.to_string()));
+        guest.sort_by_key(|m| (m.guest_port, m.proto.to_string(), m.loopback_client));
         guest.dedup();
         keyed.port_mappings = guest;
         std::borrow::Cow::Owned(keyed)
@@ -607,6 +609,16 @@ impl FirecrackerConfig {
             .map(|mapping| mapping.guest_port.to_string())
             .collect::<Vec<_>>();
 
+        let loopback_client_guest_ports = self
+            .port_mappings
+            .iter()
+            .filter(|mapping| mapping.loopback_client)
+            .map(|mapping| mapping.guest_port)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>();
+
         let mut document = serde_json::json!({
             "latest": {
                 "container-plan": {
@@ -636,6 +648,9 @@ impl FirecrackerConfig {
                     // 127.0.0.1:9222 regardless, so without this the only way in was a
                     // userspace relay inside the guest.
                     "published_guest_ports": published_guest_ports,
+                    // Of those, the ports whose clients reach the service as loopback
+                    // clients: fc-agent also SNATs them to 127.0.0.1 (#1034).
+                    "loopback_client_guest_ports": loopback_client_guest_ports,
                     "egress_proxy": matches!(self.network_mode, NetworkMode::Rootless),
                     "interactive": self.interactive,
                     "tty": self.tty,
@@ -728,6 +743,28 @@ mod tests {
     }
 
     /// Helper to create a default test config with optional overrides
+    fn test_mmds_runtime() -> MmdsRuntime {
+        MmdsRuntime {
+            volumes: vec![],
+            extra_disks: vec![],
+            nfs_mounts: vec![],
+            pmem_mounts: vec![],
+            image_device: None,
+            gpu_driver_device: None,
+            await_gpu_restore: false,
+            http_proxy: None,
+            https_proxy: None,
+            no_proxy: None,
+            subuid_start: None,
+            subuid_count: None,
+            subgid_start: None,
+            subgid_count: None,
+            host_clock: std::time::Duration::ZERO,
+            transparent_hugepage: None,
+            ntp_servers: vec![],
+        }
+    }
+
     fn test_config() -> FirecrackerConfig {
         FirecrackerConfig {
             boot_source: BootSource {
@@ -1266,6 +1303,7 @@ mod tests {
             host_port: 8080,
             guest_port: 80,
             proto: crate::network::types::Protocol::Tcp,
+            loopback_client: false,
         }];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
         let mut config3 = config2.clone();
@@ -1281,6 +1319,42 @@ mod tests {
     /// A fleet host publishes each slot's renderer on its own host ports, and every slot
     /// cold-booted and kept its own snapshot (2026-10-27: eight snapshot keys for eight
     /// slots of one image on one host).
+    /// A loopback-client port is set up differently in the guest, so it is its own key,
+    /// and the boot plan lists it for fc-agent's SNAT (#1034).
+    #[test]
+    fn a_loopback_client_port_is_keyed_and_in_the_boot_plan() {
+        let with = |specs: &[&str]| {
+            let mut config = test_config();
+            config.port_mappings = specs
+                .iter()
+                .map(|s| crate::network::PortMapping::parse(s).unwrap())
+                .collect();
+            config
+        };
+        let plain = with(&["8097:80"]);
+        let loopback = with(&["8097:80/loopback"]);
+        assert_ne!(plain.snapshot_key(), loopback.snapshot_key());
+        assert_eq!(
+            loopback.snapshot_key(),
+            with(&["[::1]:9000:80/tcp/loopback"]).snapshot_key(),
+            "the host side of a loopback-client mapping is not keyed either"
+        );
+        let plan = loopback.to_mmds_json(test_mmds_runtime());
+        assert_eq!(
+            plan.pointer("/latest/container-plan/loopback_client_guest_ports"),
+            Some(&serde_json::json!(["80"]))
+        );
+        assert_eq!(
+            plan.pointer("/latest/container-plan/published_guest_ports"),
+            Some(&serde_json::json!(["80"]))
+        );
+        let plan = plain.to_mmds_json(test_mmds_runtime());
+        assert_eq!(
+            plan.pointer("/latest/container-plan/loopback_client_guest_ports"),
+            Some(&serde_json::json!([]))
+        );
+    }
+
     #[test]
     fn the_snapshot_key_holds_only_the_guest_side_of_a_published_port() {
         use crate::network::types::Protocol;
@@ -1289,6 +1363,7 @@ mod tests {
             host_port,
             guest_port,
             proto: Protocol::Tcp,
+            loopback_client: false,
         };
         let mut slot1 = test_config();
         slot1.port_mappings = vec![
@@ -1313,24 +1388,28 @@ mod tests {
                 host_port: 8080,
                 guest_port: 80,
                 proto: crate::network::types::Protocol::Tcp,
+                loopback_client: false,
             },
             crate::network::PortMapping {
                 host_ip: None,
                 host_port: 8081,
                 guest_port: 80,
                 proto: crate::network::types::Protocol::Tcp,
+                loopback_client: false,
             },
             crate::network::PortMapping {
                 host_ip: None,
                 host_port: 8082,
                 guest_port: 80,
                 proto: crate::network::types::Protocol::Udp,
+                loopback_client: false,
             },
             crate::network::PortMapping {
                 host_ip: None,
                 host_port: 8083,
                 guest_port: 81,
                 proto: crate::network::types::Protocol::Tcp,
+                loopback_client: false,
             },
         ];
         let plan = config.to_mmds_json(MmdsRuntime {

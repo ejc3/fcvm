@@ -106,6 +106,7 @@ pub async fn run() -> Result<()> {
     network::pin_namespace_neighbour().await;
 
     network::publish_to_loopback(&plan.published_guest_ports);
+    network::publish_as_loopback_client(&plan.loopback_client_guest_ports);
 
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);

@@ -1776,6 +1776,62 @@ pub fn publish_to_loopback(ports: &[String]) {
     }
 }
 
+/// Make the published guest ports in `ports` reach their service as a loopback client.
+///
+/// `publish_to_loopback` DNATs a published port to 127.0.0.1 and keeps the client's
+/// address, which is the host side's relay (10.0.2.1 in routed mode), so a service that
+/// trusts loopback clients (one that serves `Host: localhost` only to them) refuses it
+/// (#1034). For a port published with `/loopback`, a SNAT in the nat table's INPUT
+/// chain rewrites the source of those DNAT'd connections to 127.0.0.1 too. fcvm allows
+/// `/loopback` only on a host loopback address, in rootless and routed networking,
+/// where every IPv4 connection that reaches eth0 comes from fcvm's namespace, so the
+/// guest's loopback trust goes no further than the host's. The reply's addresses are
+/// restored by conntrack.
+///
+/// A failure is logged and the port keeps working with the relay's address as client.
+pub fn publish_as_loopback_client(ports: &[String]) {
+    for port in wanted_ports(ports) {
+        match run_iptables(&loopback_client_snat_args("-A", port)) {
+            Ok(()) => eprintln!(
+                "[fc-agent] published port {port} reaches its service as a loopback client"
+            ),
+            Err(e) => eprintln!(
+                "[fc-agent] WARNING: SNAT for loopback-client port {port} failed: {e}. Its \
+                 clients reach the service with the relay's address."
+            ),
+        }
+    }
+}
+
+/// `iptables -w -t nat <op> INPUT -i eth0 -p tcp -d 127.0.0.1 --dport P -j SNAT
+/// --to-source 127.0.0.1`: the connections `loopback_dnat_args` rewrote, arriving from
+/// the host side, take loopback as their source as well.
+fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
+    [
+        "-w",
+        "-t",
+        "nat",
+        op,
+        "INPUT",
+        "-i",
+        "eth0",
+        "-p",
+        "tcp",
+        "-d",
+        "127.0.0.1",
+        "--dport",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([port.to_string()])
+    .chain(
+        ["-j", "SNAT", "--to-source", "127.0.0.1"]
+            .iter()
+            .map(|s| s.to_string()),
+    )
+    .collect()
+}
+
 /// Parse the published-port list and retain only ports that are safe to expose.
 ///
 /// Keeping this selection separate from iptables installation makes the egress
@@ -2088,6 +2144,16 @@ mod loopback_publish_tests {
         assert!(
             !args.contains("--to-source") && !args.contains("SNAT"),
             "{args}"
+        );
+    }
+
+    /// A loopback-client port's SNAT matches only the DNAT'd connections from eth0, and
+    /// rewrites their source to loopback (#1034).
+    #[test]
+    fn loopback_client_snat_rewrites_the_source_of_dnatd_connections_from_eth0() {
+        assert_eq!(
+            loopback_client_snat_args("-A", 8097).join(" "),
+            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1"
         );
     }
 

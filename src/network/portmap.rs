@@ -508,6 +508,7 @@ mod tests {
             host_port: 8080,
             guest_port: 80,
             proto: Protocol::Tcp,
+            loopback_client: false,
         }
     }
 
@@ -571,6 +572,7 @@ mod tests {
             host_port: 8080,
             guest_port: 80,
             proto: Protocol::Tcp,
+            loopback_client: false,
         }];
 
         // Setup
