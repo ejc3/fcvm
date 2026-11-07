@@ -2487,71 +2487,102 @@ fn every_shipped_guest_kernel_applies_the_virtio_ring_shutdown_fix() {
     );
 }
 
-/// The pinned release lets a page fault nested in an NMI take the reason flags of an async page fault
-/// that was delivered just before the NMI, and the guest then panics with "Host injected async #PF in
+/// Before 6.18.59 a page fault nested in an NMI could take the reason flags of an async page fault
+/// that was delivered just before the NMI, and the guest then panicked with "Host injected async #PF in
 /// interrupt disabled region". perf sampling with user call chains triggers it in a restored guest,
-/// where reading memory the host has not yet paged in takes async page faults. The patch consults the
-/// flags only for faults from user mode, the only mode the host delivers async page faults to. Every
-/// x86_64 guest kernel has to carry it, and the arm64 kernels must not, so their release identities
-/// and the snapshots keyed on them stay valid. `test_async_pf_inside_nmi_does_not_panic_a_restored_guest`
+/// where reading memory the host has not yet paged in takes async page faults. fcvm carried a fix as
+/// kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch
+/// until upstream took it as 81d99abe2bd8 ("x86/kvm: Don't consume async #PF flags on a kernel #PF in
+/// NMI context"), which 6.18.59 carries. So every x86_64 guest kernel has to pin 6.18.59 or later, and
+/// none may carry the old patch, which no longer applies. `test_async_pf_inside_nmi_does_not_panic_a_restored_guest`
 /// in test_snapshot_clone.rs exercises the fix at runtime.
 #[test]
-fn only_the_x86_guest_kernels_apply_the_async_pf_nmi_fix() {
-    // The patch's code change, not its comment: an edit that drops or moves the early return fails here.
-    const FIX: &str = "+\tif (!user_mode(regs)) {\n+\t\tif (likely(in_nmi() || !kvm_apf_reason_pending()))\n+\t\t\treturn false;";
-    let applies = shipped_guest_kernels_applying(FIX);
-    assert_eq!(
-        applies.len(),
-        6,
-        "expected default, nested and btrfs tables for both arches"
+fn every_x86_guest_kernel_pins_a_release_with_the_async_pf_nmi_fix() {
+    // The old patch's code change: a patch carrying it again would no longer apply to the pin.
+    const OLD_FIX: &str =
+        "+\tif (!user_mode(regs)) {\n+\t\tif (likely(in_nmi() || !kvm_apf_reason_pending()))";
+    let config = rootfs_config();
+    let root = repo_root();
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    for (profile_name, arch, profile) in source_built_tables(&config) {
+        if arch != "amd64" || profile_name.starts_with("mountinfo-") {
+            continue;
+        }
+        checked += 1;
+        let version = config["kernel_profiles"][&profile_name][&arch]["kernel_version"]
+            .as_str()
+            .unwrap();
+        let release = version
+            .strip_prefix("6.18.")
+            .and_then(|release| release.parse::<u32>().ok());
+        if release.is_none_or(|release| release < 59) {
+            wrong.push(format!(
+                "{profile_name}.{arch} pins {version}, before 6.18.59"
+            ));
+        }
+        if let Some(dir) = vm_kernel_patches_dir(&profile) {
+            for patch in applied_patches(&root, dir) {
+                if std::fs::read_to_string(&patch).is_ok_and(|text| text.contains(OLD_FIX)) {
+                    wrong.push(format!("{profile_name}.{arch} carries {}", patch.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 5,
+        "expected the default, gpu, phone, nested and btrfs x86_64 tables, saw {checked}"
     );
-    let wrong: Vec<_> = applies
-        .iter()
-        .filter(|(table, applied)| *applied != table.ends_with(".amd64"))
-        .map(|(table, applied)| format!("{table} applies={applied}"))
-        .collect();
     assert!(
         wrong.is_empty(),
-        "the async #PF / NMI fix must be applied by exactly the x86_64 guest kernels: {wrong:?}"
+        "the async #PF / NMI fix must come from the pinned release: {wrong:?}"
     );
 }
 
-/// 6.18.50 and 7.0.14 call rcu_barrier() in br_multicast_dev_del(), which runs under RTNL from
-/// a bridge's uninit, so a namespace teardown that removes many bridges holds RTNL for one
-/// rcu_barrier per bridge and every namespace creation on the host waits behind it (#1563: 1.5 s
-/// with 100 rootless clones torn down on a fleet host, 4 to 6 s on a CI runner). Linux removed the
-/// barrier in 25ae123db10b. Each host kernel fcvm builds applies it, as a host patch, not a
-/// `.vm.patch` the host build leaves out.
+/// Before 6.18.60 (and in 7.0.14) br_multicast_dev_del() calls rcu_barrier(), and it runs under
+/// RTNL from a bridge's uninit, so a namespace teardown that removes many bridges holds RTNL for
+/// one rcu_barrier per bridge and every namespace creation on the host waits behind it (#1563:
+/// 1.5 s with 100 rootless clones torn down on a fleet host, 4 to 6 s on a CI runner). Linux
+/// removed the barrier in 25ae123db10b, which 6.18.60 carries as 39679927fa7a. fcvm carried it as a
+/// host patch until the pin reached 6.18.60, so every host kernel fcvm builds has to pin 6.18.60 or
+/// later, and none may carry the old patch, which no longer applies.
 #[test]
-fn every_host_kernel_applies_the_bridge_rcu_barrier_removal() {
-    const FIX: &str = " \tcancel_work_sync(&br->mcast_gc_work);\n-\n-\trcu_barrier();\n }";
+fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
+    const OLD_FIX: &str = " \tcancel_work_sync(&br->mcast_gc_work);\n-\n-\trcu_barrier();\n }";
     let root = repo_root();
     let config = rootfs_config();
     let mut checked = Vec::new();
+    let mut wrong = Vec::new();
     for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
         for (arch, table) in arches.as_table().unwrap() {
-            let Some(dir) = table
-                .get("host_kernel")
-                .and_then(|host| host.get("patches_dir"))
-                .and_then(|dir| dir.as_str())
-            else {
+            let Some(host) = table.get("host_kernel") else {
                 continue;
             };
-            let applies = applied_patches(&root, dir).iter().any(|patch| {
-                !patch.to_string_lossy().ends_with(".vm.patch")
-                    && std::fs::read_to_string(patch).is_ok_and(|text| text.contains(FIX))
-            });
-            checked.push((format!("{profile_name}.{arch}"), applies));
+            let name = format!("{profile_name}.{arch}");
+            let version = host["kernel_version"].as_str().unwrap();
+            let release = version
+                .strip_prefix("6.18.")
+                .and_then(|release| release.parse::<u32>().ok());
+            if release.is_none_or(|release| release < 60) {
+                wrong.push(format!("{name} pins {version}, before 6.18.60"));
+            }
+            if let Some(dir) = host.get("patches_dir").and_then(|dir| dir.as_str()) {
+                for patch in applied_patches(&root, dir) {
+                    if std::fs::read_to_string(&patch).is_ok_and(|text| text.contains(OLD_FIX)) {
+                        wrong.push(format!("{name} carries {}", patch.display()));
+                    }
+                }
+            }
+            checked.push(name);
         }
     }
     assert!(
         checked.len() >= 2,
         "expected a host kernel for both arches, found {checked:?}"
     );
-    let missing: Vec<_> = checked.iter().filter(|(_, applies)| !applies).collect();
     assert!(
-        missing.is_empty(),
-        "these host kernels do not apply the bridge rcu_barrier removal: {missing:?}"
+        wrong.is_empty(),
+        "the bridge rcu_barrier removal must come from the pinned host release: {wrong:?}"
     );
 }
 

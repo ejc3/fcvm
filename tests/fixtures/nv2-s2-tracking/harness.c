@@ -96,6 +96,8 @@ static void counted_free(const void *p)
 #define kmalloc(size, gfp) counted_alloc(size)
 #define kzalloc(size, gfp) counted_alloc(size)
 #define kvcalloc(n, size, gfp) counted_alloc((n) * (size))
+#define kvmalloc_objs(type, n, gfp) ((type *)counted_alloc(sizeof(type) * (n)))
+#define kvzalloc_objs(obj, n, gfp) ((__typeof__(obj) *)counted_alloc(sizeof(obj) * (n)))
 #define kfree(p) counted_free(p)
 #define alloc_percpu(type) ((type *)counted_alloc(sizeof(type)))
 #define free_percpu(p) counted_free(p)
@@ -217,6 +219,7 @@ static void read_unlock(rwlock_t *l)
 }
 
 #define lockdep_assert_held_write(l) assert((l)->writers == 1)
+#define lockdep_assert_held(l) ((void)(l))
 #define lockdep_assert_held_read(l) assert((l)->readers > 0)
 #define spin_lock_init(l) ((l)->held = 0)
 
@@ -230,6 +233,16 @@ static struct harness_guard_spinlock harness_lock_spinlock(spinlock_t *l)
 static void harness_unlock_spinlock(struct harness_guard_spinlock *g)
 {
 	g->l->held = 0;
+}
+struct harness_guard_write_lock { rwlock_t *l; };
+static struct harness_guard_write_lock harness_lock_write_lock(rwlock_t *l)
+{
+	write_lock(l);
+	return (struct harness_guard_write_lock){ l };
+}
+static void harness_unlock_write_lock(struct harness_guard_write_lock *g)
+{
+	write_unlock(g->l);
 }
 #define HARNESS_CAT2(a, b) a##b
 #define HARNESS_CAT(a, b) HARNESS_CAT2(a, b)
@@ -257,16 +270,17 @@ struct kvm_s2_mmu {
 	bool nested_stage2_enabled;
 	bool pending_unmap;
 	struct rb_root_cached guest_s2_mappings;
+	u16 s2_mmu_idx;
 	atomic_t refcnt;
 };
 struct kvm_arch {
 	struct kvm_s2_mmu mmu;
 	unsigned long vcpu_features[1];
-	struct kvm_s2_mmu *nested_mmus;
+	struct kvm_s2_mmu **nested_mmus;
 	size_t nested_mmus_size;
 	int nested_mmus_next;
 	spinlock_t guest_s2_tracking_lock;
-	atomic_t vncr_map_count;
+	int config_lock;
 };
 struct kvm {
 	struct kvm_arch arch;
@@ -333,38 +347,31 @@ static void kvm_invalidate_vncr_ipa(struct kvm *kvm, u64 start, u64 end)
 }
 
 /* The forced interleaving for teardown_race: the unmapping thread drops the
- * mmu_lock to reschedule, kvm_arch_flush_shadow_all() runs on a second thread
- * until it has freed nested_mmus, and the unmapping thread resumes there. */
-static int race_state; /* 0 off, 1 armed, 2 waiting for the array free */
-static void *race_array;
-static sem_t go_flush, array_freed, unmapper_done;
+ * mmu_lock to reschedule, kvm_arch_flush_shadow_all() runs to completion on a
+ * second thread, freeing every shadow stage-2 page table and the canonical
+ * MMU, and the unmapping thread resumes after it. */
+static int race_state; /* 0 off, 1 armed, 2 flushed */
+static sem_t go_flush, flushed;
 
 static int cond_resched_rwlock_write(rwlock_t *l)
 {
 	write_unlock(l);
 	if (race_state == 1) {
-		race_state = 2;
 		sem_post(&go_flush);
-		sem_wait(&array_freed);
+		sem_wait(&flushed);
+		race_state = 2;
 	}
 	write_lock(l);
 	return 1;
 }
 
-static void kvfree(const void *p)
-{
-	counted_free(p);
-	if (race_state == 2 && p == race_array) {
-		race_state = 3;
-		sem_post(&array_freed);
-		sem_wait(&unmapper_done);
-	}
-}
+#define kvfree(p) counted_free(p)
 
 /* The functions under test, declared here because extracted.c holds them in
  * source order and some call ones defined later or in the other file. */
 struct kvm_guest_s2_mapping;
-void kvm_init_nested(struct kvm *kvm);
+int kvm_init_nested(struct kvm *kvm);
+void kvm_destroy_nested(struct kvm *kvm);
 int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu);
 void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu);
 int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long type);
@@ -394,7 +401,7 @@ static struct kvm *make_vm(int nr_vcpus)
 
 	assert(kvm);
 	rwlock_init(&kvm->mmu_lock);
-	kvm_init_nested(kvm);
+	assert(kvm_init_nested(kvm) == 0);
 	assert(kvm_init_stage2_mmu(kvm, &kvm->arch.mmu, IA_BITS) == 0);
 	for (int i = 0; i < nr_vcpus; i++) {
 		kvm->online_vcpus = i + 1;
@@ -403,13 +410,14 @@ static struct kvm *make_vm(int nr_vcpus)
 	}
 	/* As get_s2_mmu_nested() leaves an MMU it handed to a vcpu. */
 	for (size_t i = 0; i < kvm->arch.nested_mmus_size; i++)
-		kvm->arch.nested_mmus[i].tlb_vttbr = (i + 1) << 48;
+		kvm->arch.nested_mmus[i]->tlb_vttbr = (i + 1) << 48;
 	return kvm;
 }
 
 static void destroy_vm(struct kvm *kvm, int nr_vcpus)
 {
 	kvm_arch_flush_shadow_all(kvm);
+	kvm_destroy_nested(kvm);
 	for (int i = 0; i < nr_vcpus; i++)
 		free_page(vcpus[i].arch.ctxt.vncr_array);
 	free(kvm);
@@ -425,10 +433,10 @@ static void record(struct kvm *kvm, int mmu_idx, gpa_t cipa, gpa_t nipa, size_t 
 
 	/* user_mem_abort() records under kvm_fault_lock(), the read side. */
 	read_lock(&kvm->mmu_lock);
-	kvm_record_guest_s2_mapping(&kvm->arch.nested_mmus[mmu_idx], cipa, nipa, size, m);
+	kvm_record_guest_s2_mapping(kvm->arch.nested_mmus[mmu_idx], cipa, nipa, size, m);
 	read_unlock(&kvm->mmu_lock);
 #else
-	/* Linux 6.18.50 keeps no record of a shadow mapping. */
+	/* Linux 6.18.60 keeps no record of a shadow mapping. */
 	(void)kvm; (void)mmu_idx; (void)cipa; (void)nipa; (void)size;
 #endif
 }
@@ -438,7 +446,7 @@ static int mmu_of(struct kvm *kvm, struct kvm_pgtable *pgt)
 	if (pgt == kvm->arch.mmu.pgt)
 		return -1;
 	for (size_t i = 0; i < kvm->arch.nested_mmus_size; i++)
-		if (kvm->arch.nested_mmus[i].pgt == pgt)
+		if (kvm->arch.nested_mmus[i]->pgt == pgt)
 			return (int)i;
 	return -2;
 }
@@ -552,7 +560,7 @@ static void scenario_memslot(void)
 static void scenario_tlbi_removal(void)
 {
 	struct kvm *kvm = make_vm(1);
-	struct kvm_s2_mmu *mmu1 = &kvm->arch.nested_mmus[1];
+	struct kvm_s2_mmu *mmu1 = kvm->arch.nested_mmus[1];
 
 	record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
 	write_lock(&kvm->mmu_lock);
@@ -581,7 +589,7 @@ static void scenario_tlbi_removal(void)
 static void scenario_tlbi_refault(void)
 {
 	struct kvm *kvm = make_vm(1);
-	struct kvm_s2_mmu *mmu1 = &kvm->arch.nested_mmus[1];
+	struct kvm_s2_mmu *mmu1 = kvm->arch.nested_mmus[1];
 
 	record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
 	for (int i = 0; i < 100; i++) {
@@ -599,23 +607,28 @@ static void scenario_tlbi_refault(void)
 	check_teardown("tlbi_refault");
 }
 
-/* kvm_vcpu_init_nested() moves nested_mmus when a vcpu is added. A record
- * made before the move still names its MMU afterwards. */
+/* kvm_vcpu_init_nested() adds a pair of MMUs when a vcpu is added. A record
+ * made before that still names its MMU, and one made after it names the new
+ * MMU, by the index each MMU was given. */
 static void scenario_grow(void)
 {
 	struct kvm *kvm = make_vm(1);
-	struct kvm_s2_mmu *before = kvm->arch.nested_mmus;
 
 	record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
 	kvm->online_vcpus = 2;
 	vcpus[1] = (struct kvm_vcpu){ .kvm = kvm };
 	assert(kvm_vcpu_init_nested(&vcpus[1]) == 0);
-	assert(kvm->arch.nested_mmus != before && kvm->arch.nested_mmus_size == 4);
+	assert(kvm->arch.nested_mmus_size == 4);
+	kvm->arch.nested_mmus[3]->tlb_vttbr = 4UL << 48;
+	record(kvm, 3, A_CIPA, A_NIPA, SZ_4K);
 
-	invalidate_and_expect("block B after the array moved", kvm, B_CIPA, SZ_4K,
+	invalidate_and_expect("block B after the vcpu was added", kvm, B_CIPA, SZ_4K,
 			      (struct expect[]){ { 1, B_NIPA, SZ_2M } }, 1);
-	CHECK(tree_count(&kvm->arch.nested_mmus[1].guest_s2_mappings) == 0,
-	      "the record was not removed from nested MMU 1's tree after the move");
+	invalidate_and_expect("page A on the new MMU", kvm, A_CIPA, SZ_4K,
+			      (struct expect[]){ { 3, A_NIPA, SZ_4K } }, 1);
+	CHECK(tree_count(&kvm->arch.nested_mmus[1]->guest_s2_mappings) == 0 &&
+	      tree_count(&kvm->arch.nested_mmus[3]->guest_s2_mappings) == 0,
+	      "a record was not removed from its nested MMU's tree after the vcpu was added");
 	destroy_vm(kvm, 2);
 	check_teardown("grow");
 }
@@ -624,11 +637,13 @@ static void *flush_thread(void *kvm)
 {
 	sem_wait(&go_flush);
 	kvm_arch_flush_shadow_all(kvm);
+	sem_post(&flushed);
 	return NULL;
 }
 
 /* kvm_arch_flush_shadow_all() runs while an invalidation has dropped the
- * mmu_lock to reschedule, and frees nested_mmus before the unmap resumes. */
+ * mmu_lock to reschedule, and frees the shadow page tables and the canonical
+ * MMU before the unmap resumes. */
 static void scenario_teardown_race(void)
 {
 	struct kvm *kvm = make_vm(1);
@@ -637,19 +652,17 @@ static void scenario_teardown_race(void)
 	record(kvm, 0, A_CIPA, A_NIPA, SZ_4K);
 	record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
 	sem_init(&go_flush, 0, 0);
-	sem_init(&array_freed, 0, 0);
-	sem_init(&unmapper_done, 0, 0);
-	race_array = kvm->arch.nested_mmus;
+	sem_init(&flushed, 0, 0);
 	race_state = 1;
 	pthread_create(&flusher, NULL, flush_thread, kvm);
 
 	write_lock(&kvm->mmu_lock);
 	kvm_nested_unmap_cipa_range(kvm, A_CIPA, B_CIPA + SZ_2M - A_CIPA, true);
 	write_unlock(&kvm->mmu_lock);
-	CHECK(race_state == 3, "the unmap never rescheduled, so the race did not run");
-	sem_post(&unmapper_done);
+	CHECK(race_state == 2, "the unmap never rescheduled, so the race did not run");
 	pthread_join(flusher, NULL);
 
+	kvm_destroy_nested(kvm);
 	free_page(vcpus[0].arch.ctxt.vncr_array);
 	free(kvm);
 	check_teardown("teardown_race");
