@@ -395,6 +395,9 @@ pub struct SnapshotCreate {
     pub mem_file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_type: Option<String>, // "Full" or "Diff"
+    /// EXPERIMENT: false asks Firecracker not to fsync the snapshot files
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_snapshot_files: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

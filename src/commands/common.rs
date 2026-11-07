@@ -1205,7 +1205,9 @@ fn punch_in_place_diff_with(
             start = end;
         }
     }
-    file.sync_all().context("flushing the in-place diff")?;
+    if std::env::var_os("FCVM_EXP_NO_SYNC").is_none() {
+        file.sync_all().context("flushing the in-place diff")?;
+    }
     Ok(stats)
 }
 
@@ -5979,6 +5981,7 @@ pub async fn create_snapshot_core(
                     snapshot_type: Some(snapshot_type.to_string()),
                     snapshot_path: temp_vmstate_path.display().to_string(),
                     mem_file_path: temp_memory_path.display().to_string(),
+                    sync_snapshot_files: std::env::var_os("FCVM_EXP_NO_SYNC").map(|_| false),
                 })
                 .await
                 .context("creating Firecracker snapshot")
@@ -6045,6 +6048,8 @@ pub async fn create_snapshot_core(
                                 snapshot_type: Some("Full".to_string()),
                                 snapshot_path: temp_vmstate_path.display().to_string(),
                                 mem_file_path: full_memory_path.display().to_string(),
+                                sync_snapshot_files: std::env::var_os("FCVM_EXP_NO_SYNC")
+                                    .map(|_| false),
                             })
                             .await
                     }
