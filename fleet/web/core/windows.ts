@@ -111,14 +111,19 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
   let cols = inp.narrow ? (inp.panel ? Math.min(4, n) : Math.min(2, n)) : rectCols;
   // Beside the open panel the room is narrow: take the columns that make the desktops largest.
   if (inp.panel && !inp.narrow) cols = largest(cols);
+  // A wide screen keeps the snapshot's rows; a phone whose cells are under a full caption's
+  // width takes the columns that make the desktops largest. Above the open panel (compact from
+  // the start) it keeps rows of at least four, so a short room gets one long row rather than
+  // rows of no height.
+  let pick = false;
   if (!compact && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
     compact = true;
     capH = WINDOWS_CAPTION_H_COMPACT;
+    pick = inp.narrow;
+  } else if (compact && inp.narrow && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
+    pick = true;
   }
-  // A wide screen keeps the snapshot's rows; a phone whose cells are under a full caption's
-  // width takes the columns that make the desktops largest. Above the open panel it keeps rows
-  // of at least four, so a short room gets one long row rather than rows of no height.
-  if (inp.narrow && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) cols = largest(cols, inp.panel ? cols : 1);
+  if (pick) cols = largest(cols, inp.panel ? cols : 1);
   const cellW = cellFor(cols);
   const cellH = snap(cellW / aspect, dpr);
   const top = area.y;

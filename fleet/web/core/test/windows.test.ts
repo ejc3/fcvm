@@ -493,6 +493,14 @@ describe("captions", () => {
     expect(wide.every((b) => !b.compact)).toBe(true);
   });
 
+  it("a phone whose captions go compact still takes the columns that make the desktops largest", () => {
+    const w = windowsOf(3);
+    const L = layoutWindows({ area: { x: 0, y: 0, w: 684, h: 420 }, tiles: w.tiles, imageAspect: 16 / 3, narrow: true, panel: false, dpr: 2 });
+    expect(L.every((b) => b.compact)).toBe(true);
+    expect(new Set(L.map((b) => b.box.y)).size).toBe(1);
+    expect(L[0]!.box.w).toBe(220);
+  });
+
   it("with the panel open on a short phone, eight desktops still get room: the columns that make them largest", () => {
     const w = windowsOf(8);
     const short = { x: 8, y: 150, w: 304, h: 205 };
