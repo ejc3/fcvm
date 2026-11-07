@@ -3,7 +3,8 @@
 # (scripts/phone/aosp.sh) mounted at $AOSP_TOOLS: Gradle compiles the code against their
 # android.jar, d8 dexes it with Kotlin's standard library, aapt2 links the manifest, resources
 # and shaders against android.jar, then zipalign and apksigner. Nothing it runs or packages is
-# from the Android SDK. Prints the APK's path.
+# from the Android SDK. Prints the APK's path, in app/build/apk.<random>/, which no other run
+# writes.
 #
 # The signing key is GRADLE_USER_HOME's android/debug.keystore (made here on first use, with
 # the debug key's usual names), so rebuilds on one host sign alike and install over each other.
@@ -14,13 +15,15 @@ for f in "$JAR" "$T/bin/aapt2" "$T/bin/zipalign" "$T/framework/d8.jar" "$T/frame
   [ -e "$f" ] || { echo "build-apk.sh: $f is missing (scripts/phone/aosp.sh fetches the tools)" >&2; exit 2; }
 done
 cd "$(dirname "$0")"
-# one build at a time in this checkout: each deletes and writes app/build/apk
+# One Gradle build at a time in this checkout (they share app/build/dex-inputs); each run's
+# APK and its intermediates go to a directory of its own, so a concurrent run (another
+# `make apk`, scripts/phone/app.sh) never deletes or replaces this one's, whoever copies it.
 mkdir -p app/build
 exec 9> app/build/.apk.lock
 flock 9
 gradle --console=plain -q -PandroidJar="$JAR" :app:dexInputs >&2
-B=app/build/apk
-rm -rf "$B" && mkdir -p "$B/dex"
+B=$(mktemp -d app/build/apk.XXXXXX)
+mkdir -p "$B/dex"
 java -cp "$T/framework/d8.jar" com.android.tools.r8.D8 --release --min-api 30 --lib "$JAR" --output "$B/dex" \
   app/build/dex-inputs/*.jar >&2
 "$T/bin/aapt2" compile --dir app/src/main/res -o "$B/res.zip"

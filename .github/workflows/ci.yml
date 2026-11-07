@@ -286,6 +286,7 @@ jobs:
           bash scripts/phone/test-gpu-hook.sh
           bash scripts/phone/test-seam.sh
           bash scripts/phone/test-app-sh.sh
+          bash fleet/phone-app/test-build-apk.sh
 
   # Plans which self-hosted jobs this run needs.
   #

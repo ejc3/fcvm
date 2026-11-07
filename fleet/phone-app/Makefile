@@ -23,9 +23,8 @@ test: image
 apk: image
 	@test -n "$(AOSP_TOOLS)" && test -f "$(AOSP_TOOLS)/android.jar" || { echo "usage: make apk AOSP_TOOLS=<scripts/phone/aosp.sh --root-path>/tools" >&2; exit 2; }
 	@mkdir -p "$(GRADLE_HOME)"
-	@$(PODMAN) run --rm -v "$(CURDIR):/src" -v "$(GRADLE_HOME):/gradle-home" -v "$(AOSP_TOOLS):/aosp-tools:ro" -e AOSP_TOOLS=/aosp-tools $(IMAGE) \
-	  /src/build-apk.sh > /dev/null
-	@echo "$(CURDIR)/app/build/apk/robotpark.apk"
+	@out=$$($(PODMAN) run --rm -v "$(CURDIR):/src" -v "$(GRADLE_HOME):/gradle-home" -v "$(AOSP_TOOLS):/aosp-tools:ro" -e AOSP_TOOLS=/aosp-tools $(IMAGE) \
+	  /src/build-apk.sh) && echo "$(CURDIR)/$${out#/src/}"
 
 # Regenerates gradle/verification-metadata.xml from what both builds resolve; run it with an
 # empty GRADLE_HOME, since artifacts already in the cache are not all recorded.

@@ -462,7 +462,9 @@ boot)
   [ -n "$tls" ] || { echo "no libnvidia-tls among the GPU driver's libraries"; exit 1; }
   # -qmp: QEMU's monitor on the container's loopback, for run.sh's check that a GPU release
   # refuses while a guest memory dump runs (serve's phones have none). It must come last.
-  LD_PRELOAD=$tls setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
+  # FCVM_DUMP_RESUME_DELAY_MS (test only, the emulator fork's): a detached dump waits that
+  # long between ending and starting the guest again, so run.sh can put a release there.
+  FCVM_DUMP_RESUME_DELAY_MS=${PHONE_DUMP_RESUME_DELAY_MS:-5000} LD_PRELOAD=$tls setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
     -no-snapshot-load -feature -Uwb -verbose -qemu -qmp "tcp:127.0.0.1:${PHONE_QMP_PORT:-4444},server=on,wait=off" \
     > "$RUN/emulator.log" 2>&1 < /dev/null &
   echo $! > "$RUN/emulator.pid"

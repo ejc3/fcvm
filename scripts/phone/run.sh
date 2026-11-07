@@ -184,8 +184,9 @@ dump_status() { qmp '{"execute":"query-dump"}' | jq -r '.return.status // empty'
 # reads nothing until /tmp/dump.go exists, so it is still running for both refusals, and once
 # let go it must complete: the emulator's dump failed on every phone, into a FIFO or a file,
 # until it left out the address space device's user-backed area ("failed to save memory: Bad
-# address"). Then the phone still holds its GPU and the app draws. A dump that never ends
-# leaves the guest paused, so the run ends there.
+# address"). A release right after the dump completes leaves the guest paused (see below),
+# and after a retake the phone holds its GPU and the app draws. A dump that never ends leaves
+# the guest paused, so the run ends there.
 release_during_dump() {
   local r out st i rc
   X sh -c 'rm -f /tmp/dump.fifo /tmp/dump.go && mkfifo /tmp/dump.fifo && { setsid sh -c "exec 3< /tmp/dump.fifo; i=0; while [ ! -e /tmp/dump.go ] && [ \$i -lt 1800 ]; do sleep 0.1; i=\$((i + 1)); done; cat <&3 > /dev/null" > /dev/null 2>&1 < /dev/null & }' \
@@ -222,6 +223,19 @@ release_during_dump() {
     exit 1
   fi
   [ "$st" = completed ] && ok "the dump completed" || bad "the dump did not complete: '$st'"
+  # The dump's end and the guest's restart are one step: phone.sh boot widens the gap
+  # between them to 5 s (FCVM_DUMP_RESUME_DELAY_MS), and a release right after the dump
+  # reads complete must leave the guest paused. Ending first and restarting later, the dump
+  # started the released guest again 5 s after the release.
+  if out=$(X /usr/local/bin/gpu-hook release 2>&1); then
+    sleep 7
+    st=$(qmp '{"execute":"query-status"}' | jq -r '.return.status // empty' 2> /dev/null || true)
+    [ "$st" = paused ] && ok "a release right after the dump ends leaves the guest paused" \
+      || bad "a release right after the dump ended: the guest is '$st' 7 s later, its GPU released"
+    out=$(X /usr/local/bin/gpu-hook retake 2>&1) || bad "the retake after the dump failed: $out"
+  else
+    bad "a release right after the dump ended failed: $out"
+  fi
   st=$(X sh -c '/android/platform-tools/adb emu gpu status | head -1' 2>&1 | tr -d '\r' || true)
   if [ "$st" = held ]; then
     ok "after the dump the phone holds its GPU"
