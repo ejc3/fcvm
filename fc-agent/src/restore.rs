@@ -689,7 +689,7 @@ pub async fn handle_clone_restore(
     let reconcile_after_hook = || {
         let mut carried = carried_listeners.lock().unwrap();
         if let Some(carried) = carried.as_mut() {
-            if !carried.plan.translate.is_empty() {
+            if carried.keeps_watching() {
                 crate::retired_address::reconcile(carried)
                     .context("keeping listeners on a retired IPv6 address reachable")?;
             }

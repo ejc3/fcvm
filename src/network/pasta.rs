@@ -1384,8 +1384,22 @@ impl PastaNetwork {
                     None => self.loopback_ip.as_deref().unwrap_or("127.0.0.1"),
                 };
 
-                // pasta spec: "bind_addr/host_port:guest_port"
-                let spec = format!("{}/{}:{}", bind_addr, mapping.host_port, mapping.guest_port);
+                // pasta spec: "bind_addr/host_port:guest_port". An IPv6 mapping names
+                // the guest's address as its target ("…:fd00::100/guest_port"): pasta
+                // splices a connection from a loopback client into the namespace and
+                // connects to the guest from there, which works over IPv4 (the bridge
+                // holds 10.0.2.1/24) and not over IPv6, where the namespace has no
+                // address and the connection was reset. A rule with a target address is
+                // never spliced, so the connection reaches the guest over pasta's link,
+                // from the IPv6 gateway (pasta maps the host's loopback to it).
+                let spec = if bind_addr.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!(
+                        "{}/{}:{}/{}",
+                        bind_addr, mapping.host_port, self.guest_ipv6, mapping.guest_port
+                    )
+                } else {
+                    format!("{}/{}:{}", bind_addr, mapping.host_port, mapping.guest_port)
+                };
 
                 match mapping.proto {
                     Protocol::Tcp => tcp_specs.push(spec),
@@ -2514,6 +2528,47 @@ mod tests {
         );
         assert!(
             contains_run(&args, &["-u", "127.0.0.9/5300:53"]),
+            "{args:?}"
+        );
+    }
+
+    /// An IPv6 mapping names the guest's IPv6 address as its target, so pasta does not
+    /// splice a loopback client's connection into the namespace, which has no IPv6
+    /// address to connect from: that connection was reset.
+    #[test]
+    fn pasta_args_send_ipv6_mappings_to_the_guests_address() {
+        let network = PastaNetwork::new(
+            "args-ports-v6".into(),
+            "tap0".into(),
+            vec![
+                PortMapping {
+                    host_ip: Some("::1".into()),
+                    host_port: 8080,
+                    guest_port: 80,
+                    proto: Protocol::Tcp,
+                    loopback_client: false,
+                },
+                PortMapping {
+                    host_ip: Some("::".into()),
+                    host_port: 5300,
+                    guest_port: 53,
+                    proto: Protocol::Udp,
+                    loopback_client: false,
+                },
+            ],
+        );
+        let args = arg_strings(&network.build_pasta_args(
+            Path::new("/run/pasta-args-ports-v6.pid"),
+            9,
+            None,
+            false,
+        ));
+        assert!(
+            contains_run(&args, &["-t", "::1/8080:fd00::100/80"]),
+            "{args:?}"
+        );
+        assert!(
+            contains_run(&args, &["-u", "::/5300:fd00::100/53"]),
             "{args:?}"
         );
     }

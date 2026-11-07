@@ -199,6 +199,14 @@ fn test_port_forward_rootless() -> Result<()> {
     // Use dynamic port to avoid conflicts with system services
     let host_port = common::find_available_high_port().context("finding available port")?;
     let publish_arg = format!("{}:80", host_port);
+    // A mapping on the host's ::1 as well. pasta splices a connection from a loopback
+    // client into the VM's namespace and connects to the guest's IPv6 address from
+    // there, so the namespace needs an IPv6 address on the guest's link.
+    let ipv6_port = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .and_then(|l| l.local_addr())
+        .context("finding a free port on ::1")?
+        .port();
+    let publish_ipv6 = format!("[::1]:{ipv6_port}:80");
 
     // Start VM with rootless networking and port forwarding
     // Rootless uses unique loopback IPs (127.x.y.z) per VM
@@ -213,6 +221,8 @@ fn test_port_forward_rootless() -> Result<()> {
         "rootless",
         "--publish",
         &publish_arg,
+        "--publish",
+        &publish_ipv6,
         "--health-check",
         "http://localhost/",
         common::TEST_IMAGE,
@@ -300,6 +310,22 @@ fn test_port_forward_rootless() -> Result<()> {
         println!("Loopback access: FAIL");
     }
 
+    let ipv6 = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code} %{errormsg}",
+            &format!("http://[::1]:{ipv6_port}/"),
+        ])
+        .output()
+        .context("curl to ::1")?;
+    let ipv6_answer = String::from_utf8_lossy(&ipv6.stdout).to_string();
+    println!("::1 access: {ipv6_answer}");
+
     // Cleanup
     println!("Cleaning up...");
     let _ = Command::new("kill")
@@ -313,6 +339,10 @@ fn test_port_forward_rootless() -> Result<()> {
     assert!(
         loopback_works,
         "Rootless port forwarding via loopback IP should work"
+    );
+    assert!(
+        ipv6_answer.starts_with("200"),
+        "a mapping on the host's ::1 answers {ipv6_answer:?}"
     );
 
     println!("test_port_forward_rootless PASSED");

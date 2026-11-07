@@ -13,6 +13,10 @@ use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
 /// Wait, up to two minutes, until the log at `path` contains `marker`.
+/// What a clone logs once its host has opened the published UDP ports
+/// (`NetworkManager::open_restore_udp_gate`), after the restore ACK.
+const GATE_OPENED: &str = "opened the published UDP ports after the restore ACK";
+
 async fn wait_for_log(path: &std::path::Path, marker: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -252,6 +256,8 @@ async fn closed_until_the_restore_ack(network: &str) -> Result<()> {
             sent += 1;
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        // The clone logs the ACK before it opens the gate, so wait for the opening.
+        wait_for_log(&clone_log, GATE_OPENED).await?;
         let open = egress_filters(&namespace).await?;
         anyhow::ensure!(
             !open.contains("dst_port 5000"),
@@ -456,4 +462,36 @@ async fn test_restored_routed_clone_takes_no_datagram_before_its_udp_rule() -> R
     let _ = std::fs::remove_file(&go_file);
     common::kill_process(clone_pid).await;
     result
+}
+
+/// The rootless and bridged tests check the host's filters only once the clone has
+/// logged that it opened them: it logs the ACK first, so a check right after the ACK
+/// could find the gate still closed in a restore that is working.
+#[test]
+fn the_gate_is_checked_after_the_host_opened_it() {
+    let source = include_str!("test_restore_udp_gate.rs");
+    let start = source
+        .find("async fn closed_until_the_restore_ack(")
+        .expect("the rootless and bridged case is gone");
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").expect("the case's end")];
+    let opened = body
+        .find("wait_for_log(&clone_log, GATE_OPENED)")
+        .expect("the case no longer waits for the gate to open");
+    let checked = body
+        .find("let open = egress_filters(")
+        .expect("the case no longer checks the filters after the ACK");
+    assert!(
+        opened < checked,
+        "the filters are checked before the clone logged the gate open"
+    );
+    for (file, source) in [
+        ("pasta.rs", include_str!("../src/network/pasta.rs")),
+        ("bridged.rs", include_str!("../src/network/bridged.rs")),
+    ] {
+        assert!(
+            source.contains(&format!("{GATE_OPENED:?}")),
+            "{file} no longer logs {GATE_OPENED:?}"
+        );
+    }
 }
