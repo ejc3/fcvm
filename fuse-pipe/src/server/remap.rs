@@ -160,8 +160,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 let path = Self::format_path(&parent_path, &name_str);
                 let mut stable_ino = Self::path_hash(&path);
 
-                // Handle conflicts (true hash collision or rename-then-recreate)
-                if self.stable_to_inner.contains_key(&stable_ino) {
+                // Handle conflicts (true hash collision or rename-then-recreate). An inode
+                // gone at a restore stays reserved: the guest may still hold it, and a
+                // new file at its old path is another file.
+                let taken = |ino: &u64| {
+                    self.stable_to_inner.contains_key(ino) || self.gone.contains_key(ino)
+                };
+                if taken(&stable_ino) {
                     debug!(
                         stable_ino,
                         path = %path,
@@ -170,7 +175,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
                     let mut found = false;
                     for i in 1u64..10000 {
                         let alt = stable_ino.wrapping_add(i);
-                        if alt >= 2 && !self.stable_to_inner.contains_key(&alt) {
+                        if alt >= 2 && !taken(&alt) {
                             stable_ino = alt;
                             found = true;
                             break;
@@ -1396,6 +1401,12 @@ mod tests {
             gid,
         };
         assert_eq!(again.fs.gone_path(moved).as_deref(), Some("moved"));
+        // The guest looks the new file up: it gets an inode of its own.
+        assert_ne!(
+            again.lookup("moved"),
+            moved,
+            "the new file took the gone inode"
+        );
         let opened = again.call(VolumeRequest::Open {
             ino: moved,
             flags: libc::O_RDONLY as u32,

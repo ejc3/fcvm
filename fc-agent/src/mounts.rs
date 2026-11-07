@@ -684,21 +684,16 @@ pub fn mount_nfs_shares(
 /// namespace outlives that process) and the paths to rebind there. The container's
 /// namespace is one: podman bound each share into it when the container started. A
 /// path under another of `paths` is left out, because the rebind of the outer share
-/// copies the mounts under it ([`rebind_into_namespace`]). Reads each process's
+/// copies the mounts under it ([`rebind_into_namespace`]), when that namespace has the
+/// outer share at all. Reads each process's
 /// mountinfo, which names mounts without touching the filesystems in them.
 pub fn nfs_mounts_in_other_namespaces(
     paths: &[String],
 ) -> Result<Vec<(std::fs::File, Vec<String>)>> {
-    let own =
-        std::fs::read_link("/proc/self/ns/mnt").context("reading fc-agent's mount namespace")?;
-    let outermost: Vec<&String> = paths
-        .iter()
-        .filter(|path| {
-            !paths
-                .iter()
-                .any(|other| other != *path && is_under(path, other))
-        })
-        .collect();
+    use std::os::unix::fs::MetadataExt;
+    let own = std::fs::metadata("/proc/self/ns/mnt")
+        .context("reading fc-agent's mount namespace")?
+        .ino();
     let mut seen = std::collections::HashSet::new();
     seen.insert(own);
     let mut found = Vec::new();
@@ -711,31 +706,51 @@ pub fn nfs_mounts_in_other_namespaces(
         else {
             continue;
         };
-        // A process that exits between these reads has no namespace to fix through it;
-        // its namespace stays unseen, so another process in it can still be found.
+        // The namespace this descriptor holds is the one whose mounts are read only if
+        // the process was in it before and after the read: a process that exits or
+        // changes namespace in between is skipped, and its namespace stays unseen, so
+        // another process in it can still be found.
+        let ns_now = || {
+            std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
+                .ok()
+                .map(|m| m.ino())
+        };
         let Ok(ns) = std::fs::File::open(format!("/proc/{pid}/ns/mnt")) else {
             continue;
         };
-        let Ok(ns_id) = std::fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
+        let Ok(ns_ino) = ns.metadata().map(|m| m.ino()) else {
             continue;
         };
-        if seen.contains(&ns_id) {
+        if seen.contains(&ns_ino) || ns_now() != Some(ns_ino) {
             continue;
         }
         let Ok(mountinfo) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
             continue;
         };
-        seen.insert(ns_id);
-        let here: Vec<String> = outermost
-            .iter()
-            .filter(|path| nfs_mounted_at(&mountinfo, path))
-            .map(|path| path.to_string())
-            .collect();
+        if ns_now() != Some(ns_ino) {
+            continue;
+        }
+        seen.insert(ns_ino);
+        let here = outermost_nfs_mounts(&mountinfo, paths);
         if !here.is_empty() {
             found.push((ns, here));
         }
     }
     Ok(found)
+}
+
+/// The `paths` with an NFS mount in `mountinfo`, less those under another of them that
+/// has one there too (the rebind of the outer one copies them).
+fn outermost_nfs_mounts(mountinfo: &str, paths: &[String]) -> Vec<String> {
+    let mounted: Vec<&String> = paths
+        .iter()
+        .filter(|path| nfs_mounted_at(mountinfo, path))
+        .collect();
+    mounted
+        .iter()
+        .filter(|path| !mounted.iter().any(|outer| is_under(path, outer)))
+        .map(|path| path.to_string())
+        .collect()
 }
 
 /// Whether `path` is strictly below `parent`.
@@ -938,6 +953,18 @@ mod tests {
         assert!(is_under("/data/inner", "/data/"));
         assert!(!is_under("/database", "/data"));
         assert!(!is_under("/data", "/data"));
+        let paths = vec!["/data".to_string(), "/data/inner".to_string()];
+        let both = "1 0 0:1 / /data rw - nfs4 h:/a rw\n2 1 0:2 / /data/inner rw - nfs4 h:/b rw\n";
+        assert_eq!(
+            outermost_nfs_mounts(both, &paths),
+            vec!["/data".to_string()]
+        );
+        // A namespace that has only the inner share still gets it rebound.
+        let inner = "2 1 0:2 / /data/inner rw - nfs4 h:/b rw\n";
+        assert_eq!(
+            outermost_nfs_mounts(inner, &paths),
+            vec!["/data/inner".to_string()]
+        );
     }
 
     /// fc-agent has one block-device wait, so a change to it (a longer timeout, say) reaches

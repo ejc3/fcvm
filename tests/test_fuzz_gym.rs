@@ -878,7 +878,9 @@ async fn holds_keep_working(
             // A hold that may answer with an error (CorrectOrError, after a restore) can
             // take its whole timeout per check (a notify on NFS waits 5 s for an event
             // that does not come), so one check past the mark is enough of it.
-            let needed = if expect == Expect::CorrectOrError {
+            let needed = if count == 0 {
+                0
+            } else if expect == Expect::CorrectOrError {
                 1
             } else {
                 count
@@ -898,7 +900,7 @@ async fn holds_keep_working(
                 &[
                     "sh",
                     "-c",
-                    "cat /proc/fs/nfsfs/servers /proc/fs/nfsfs/volumes 2>/dev/null; \
+                    "cat /proc/fs/nfsfs/servers /proc/fs/nfsfs/volumes 2>/dev/null; ss -tn 2>/dev/null; grep -h nfs /proc/self/mountinfo; \
                      for p in $(pgrep gymhold); do \
                        echo \"== $p $(cut -d' ' -f3 /proc/$p/stat)\"; cat /proc/$p/stack; done",
                 ],
@@ -1464,10 +1466,22 @@ async fn scenario_body(
     } else {
         active.to_vec()
     };
+    // No check failed during the changes (count 0 only judges what is logged)...
     holds_keep_working(
         clone,
         &final_holds,
         &before_afters,
+        0,
+        "the clone during the post-restore changes",
+        true,
+    )
+    .await?;
+    // ...and every hold still makes progress after them.
+    let at = log_marks(clone, active).await?;
+    holds_keep_working(
+        clone,
+        &final_holds,
+        &at,
         5,
         "the clone after the post-restore changes",
         true,
@@ -1480,7 +1494,7 @@ async fn scenario_body(
 /// snapshot hold the snapshot's open files under the one NFSv4 client identity they
 /// both inherited, and the server keeps one copy of that client's open and lock state:
 /// whichever clone it does not follow gets an error on those files (EBADF on a write),
-/// never another file's data.
+/// never another file's data (#1737).
 fn twin_holds(s: &Scenario, active: &[Hold]) -> Vec<Hold> {
     active
         .iter()
