@@ -3159,6 +3159,25 @@ still load):
     first run fails too: a miss there tears its cold-booted VM down and
     restores its own snapshot with the caller's target. `--no-snapshot` runs
     it.
+- **Health check on a snapshot cache hit**: `--health-check` is host-side only
+  (fc-agent never sees it) and decides when a VM is Healthy, which is when its
+  startup snapshot is taken. So the startup snapshot's name holds it
+  (`FirecrackerConfig::startup_snapshot_base_key`, the whole config) and the
+  pre-start key does not (`snapshot_key`): a `podman run` and a `podman prepare`,
+  or two runs, that differ only in the URL share the pre-start snapshot and the
+  image import it holds (#953). A cache hit monitors the restoring run's own URL
+  and `--health-check-timeout`, not those the snapshot recorded, which may be
+  another run's; a command-line `fcvm snapshot run` monitors the recorded ones.
+  Without a URL the startup base key equals the pre-start key, and with one it is
+  the key both snapshots had before, so no existing directory changed name: a
+  pre-start snapshot made with a URL is no longer looked up, one made without a
+  URL is now also restored by runs with one, and every startup snapshot and
+  prepared content key keeps its name. `podman prepare` restores a pre-start
+  snapshot it finds, waits for Healthy, and installs its startup snapshot at its
+  target as a cold prepare does; `prepare --force` cold-boots, because it is for
+  content that changed under an unchanged key, which the pre-start snapshot holds
+  too. `test_prepare_and_run_share_the_pre_start_snapshot_across_health_checks`
+  covers a prepare and a run restoring a run's pre-start snapshot.
 - **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
   rejects sources with extra disks, and reboot-in-place is disabled for restored
   clones that have them (a relaunch would silently drop the data disks).

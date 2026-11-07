@@ -998,6 +998,186 @@ async fn test_balloon_target_honored_on_snapshot_cache_hit() -> Result<()> {
     result
 }
 
+/// `podman run` and `podman prepare` of one image and VM shape share the pre-start
+/// snapshot when they differ only in `--health-check` (#953). The URL decides when a VM is
+/// Healthy, which is when its startup snapshot is taken, and the pre-start snapshot is
+/// taken before the container starts.
+///
+/// Run 1 has no `--health-check`; it cold-boots and leaves the pre-start snapshot. The
+/// prepare asks for `http://localhost/` and has to restore from that snapshot (its log
+/// names the pre-start hit, and the snapshot it installs carries run 1's vsock lineage,
+/// which a cold boot does not), print its JSON record and nothing else on stdout, and
+/// record its own health check in what it installs. Run 3 asks for the same URL as the
+/// prepare; the prepare installed under its tag, not under the content key, so run 3
+/// restores the pre-start snapshot too, and has to monitor its own URL rather than the
+/// none that snapshot recorded. With the URL in the pre-start key the prepare and run 3
+/// cold-booted and imported the image again.
+#[tokio::test]
+async fn test_prepare_and_run_share_the_pre_start_snapshot_across_health_checks() -> Result<()> {
+    const URL: &str = "http://localhost/";
+    let (creator_name, prepare_name, tag, _) = common::unique_names("health-share");
+    let hit_name = format!("{creator_name}-hit");
+    // The same unique --env everywhere: nothing but --health-check differs, and run 1
+    // starts from a cold cache whatever earlier runs left there.
+    let env_unique = format!("HEALTHSHARE_ID={creator_name}");
+    let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+
+    let mut cleanup_pids = Vec::new();
+    let mut cleanup_keys: Vec<String> = vec![tag.clone()];
+    let result: Result<()> = async {
+        let (_creator, creator_pid, _creator_log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &creator_name,
+                    "--network",
+                    "rootless",
+                    "--env",
+                    &env_unique,
+                    "nginx:alpine",
+                ],
+                &[],
+            )
+            .await
+            .context("spawning run 1")?;
+        cleanup_pids.push(creator_pid);
+        common::poll_health_by_pid(creator_pid, 300).await?;
+        let base_key = recorded_pre_start_key(&states.load_state_by_pid(creator_pid).await?)?;
+        cleanup_keys.push(base_key.clone());
+        let lineage = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&base_key)
+            .await?
+            .original_vsock_vm_id
+            .context("the pre-start snapshot recorded no vsock lineage")?;
+        common::kill_process(creator_pid).await;
+
+        // The prepare, run to its end with stdout kept apart from the log.
+        let log_dir = std::path::Path::new("/tmp/fcvm-test-logs");
+        std::fs::create_dir_all(log_dir)?;
+        let prepare_log = log_dir.join(format!("{prepare_name}.log"));
+        let mut cmd = tokio::process::Command::new(common::find_fcvm_binary()?);
+        cmd.args([
+            "podman",
+            "prepare",
+            "--name",
+            &prepare_name,
+            "--tag",
+            &tag,
+            "--network",
+            "rootless",
+            "--env",
+            &env_unique,
+            "--health-check",
+            URL,
+            "--ready-timeout",
+            "300",
+            "nginx:alpine",
+        ])
+        .env("RUST_LOG", "debug")
+        .env_remove("FCVM_NO_SNAPSHOT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::fs::File::create(&prepare_log)?);
+        common::set_test_pdeathsig(&mut cmd);
+        // `output()` would pipe stderr too, over the log file set above.
+        let prepare = cmd.spawn().context("spawning the prepare")?;
+        let output = tokio::time::timeout(Duration::from_secs(600), prepare.wait_with_output())
+            .await
+            .context("the prepare did not end within 600 s")??;
+        let stdout = String::from_utf8(output.stdout)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "the prepare failed ({}); stdout {stdout:?}, log {}",
+            output.status,
+            prepare_log.display()
+        );
+        let choice = common::cache_choice(&prepare_log);
+        anyhow::ensure!(
+            choice == Some(("pre-start snapshot", base_key.clone())),
+            "the prepare differs from run 1 in --health-check alone and must restore run 1's \
+             pre-start snapshot {base_key}; it chose {choice:?} (log {})",
+            prepare_log.display()
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        anyhow::ensure!(
+            lines.len() == 1,
+            "a prepare's stdout is its one JSON record, got {stdout:?}"
+        );
+        let record: serde_json::Value = serde_json::from_str(lines[0])
+            .with_context(|| format!("the prepare's stdout is not JSON: {stdout:?}"))?;
+        anyhow::ensure!(
+            record["status"] == "prepared" && record["snapshot_key"] == tag.as_str(),
+            "unexpected prepare record {record}"
+        );
+        let content_key = record["content_key"]
+            .as_str()
+            .context("the prepare record has no content_key")?
+            .to_string();
+        // Run 3's startup snapshot is made under this key.
+        cleanup_keys.push(content_key.clone());
+        let prepared = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&tag)
+            .await?;
+        anyhow::ensure!(
+            prepared.original_vsock_vm_id.as_deref() == Some(lineage.as_str()),
+            "the prepared snapshot's lineage is {:?}, not run 1's {lineage}: it did not \
+             start from run 1's pre-start snapshot",
+            prepared.original_vsock_vm_id
+        );
+        anyhow::ensure!(
+            prepared.metadata.health_check_url.as_deref() == Some(URL),
+            "the prepared snapshot records health check {:?}, not the prepare's {URL}",
+            prepared.metadata.health_check_url
+        );
+
+        // Run 3: the prepare's URL, as a plain run.
+        let (_hit, hit_pid, hit_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &hit_name,
+                "--network",
+                "rootless",
+                "--env",
+                &env_unique,
+                "--health-check",
+                URL,
+                "nginx:alpine",
+            ],
+            &[],
+        )
+        .await
+        .context("spawning run 3")?;
+        cleanup_pids.push(hit_pid);
+        common::poll_health_by_pid(hit_pid, 300).await?;
+        let choice = common::cache_choice(&hit_log);
+        anyhow::ensure!(
+            choice == Some(("pre-start snapshot", base_key.clone())),
+            "run 3 differs from run 1 in --health-check alone and must restore run 1's \
+             pre-start snapshot {base_key}; it chose {choice:?}"
+        );
+        let state = states.load_state_by_pid(hit_pid).await?;
+        anyhow::ensure!(
+            state.config.health_check_url.as_deref() == Some(URL),
+            "run 3 monitors {:?}, not its own --health-check {URL}",
+            state.config.health_check_url
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in cleanup_pids.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    for key in &cleanup_keys {
+        let _ = common::delete_snapshot(key).await;
+    }
+    result
+}
+
 /// Which cached snapshot one `podman run` chose, from the line it logs when it
 /// decides.
 #[cfg(feature = "privileged-tests")]
@@ -1385,7 +1565,7 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
         // Run 1: cold boot; the explicit HTTP health check arms the startup
         // snapshot, which is created (as a diff on the pre-start snapshot)
         // once the VM reports healthy.
-        let (_creator_child, creator_pid, _creator_log) =
+        let (_creator_child, creator_pid, creator_log) =
             common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
                 &[
                     "podman",
@@ -1409,24 +1589,13 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
 
         let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
         let creator_state = states.load_state_by_pid(creator_pid).await?;
-        // The recorded key is the STARTUP snapshot once it exists (health only
-        // recovers after the startup-snapshot pause cycle, and the recording
-        // follows creation), but tolerate reading the pre-start base if the
-        // state was observed before the recording landed.
-        let recorded_key = creator_state
-            .config
-            .snapshot_name
-            .clone()
-            .context("cache-creator VM recorded no snapshot key")?;
-        let startup_key = if recorded_key.ends_with("-startup") {
-            recorded_key.clone()
-        } else {
-            format!("{}-startup", recorded_key)
-        };
-        let base_key = startup_key
-            .strip_suffix("-startup")
-            .expect("startup key always carries the suffix")
-            .to_string();
+        // Both names from the line the run logged when it chose how to start: the
+        // startup snapshot's base holds the --health-check URL and the pre-start key
+        // does not (#953).
+        let (_, base_key) = common::cache_choice(&creator_log)
+            .context("the cache-creator VM's log does not say how it started")?;
+        let startup_key = common::startup_choice_key(&creator_log)
+            .context("the cache-creator VM's log names no startup snapshot")?;
         cleanup_keys.push(base_key);
         cleanup_keys.push(startup_key.clone());
         let creator_source = creator_state
@@ -1556,7 +1725,7 @@ async fn test_vsock_dir_survives_the_snapshot_lifecycle() -> Result<()> {
     let mut cleanup_pid = None;
     let mut cleanup_keys: Vec<String> = Vec::new();
     let result: Result<()> = async {
-        let (_child, pid, _log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        let (_child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
             &[
                 "podman",
                 "run",
@@ -1581,11 +1750,10 @@ async fn test_vsock_dir_survives_the_snapshot_lifecycle() -> Result<()> {
 
         let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
         let state = states.load_state_by_pid(pid).await?;
-        if let Some(recorded) = state.config.snapshot_name.clone() {
-            let trimmed = recorded.trim_end_matches("-startup").to_string();
-            cleanup_keys.push(format!("{}-startup", trimmed));
-            cleanup_keys.push(trimmed);
-        }
+        // The startup snapshot's base holds the --health-check URL and the pre-start
+        // key does not (#953), so both names come from the run's log.
+        cleanup_keys.extend(common::cache_choice(&log).map(|(_, key)| key));
+        cleanup_keys.extend(common::startup_choice_key(&log));
         assert_eq!(
             state.config.vsock_socket_path.as_deref(),
             Some(expected_listener.as_path()),
@@ -7189,6 +7357,7 @@ async fn a_startup_snapshot_another_vm_installed_is_not_the_sources_diff_parent(
     )
     .await?;
     let mut key: Option<String> = None;
+    let mut startup_key: Option<String> = None;
 
     let outcome = async {
         // B: cold boot, its own pre-start snapshot, then held before the startup create.
@@ -7214,7 +7383,10 @@ async fn a_startup_snapshot_another_vm_installed_is_not_the_sources_diff_parent(
             common::cache_choice(&b_log).context("B's log does not say how it started")?;
         key = Some(pre_start.clone());
         anyhow::ensure!(how == "cold boot", "control: B started from a {how}");
-        let startup = format!("{pre_start}-startup");
+        // Its base holds the --health-check URL, which the pre-start key does not (#953).
+        let startup =
+            common::startup_choice_key(&b_log).context("B's log names no startup snapshot")?;
+        startup_key = Some(startup.clone());
 
         // A: restores B's pre-start snapshot and installs the startup snapshot.
         let a_args = run_args(&a_name);
@@ -7280,9 +7452,8 @@ async fn a_startup_snapshot_another_vm_installed_is_not_the_sources_diff_parent(
     let _ = b.wait().await;
     let _ = std::fs::remove_file(&gate);
     let _ = common::delete_snapshot(&snap_tag).await;
-    if let Some(key) = key {
-        let _ = common::delete_snapshot(&format!("{key}-startup")).await;
-        let _ = common::delete_snapshot(&key).await;
+    for name in startup_key.into_iter().chain(key) {
+        let _ = common::delete_snapshot(&name).await;
     }
     outcome
 }

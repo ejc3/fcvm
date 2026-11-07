@@ -1352,6 +1352,14 @@ pub struct SnapshotServeArgs {
     pub no_swap: bool,
 }
 
+/// The health check a restored clone monitors: `podman run --health-check` (None: the
+/// container's start, or its image's healthcheck) and `--health-check-timeout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreHealthCheck {
+    pub url: Option<String>,
+    pub timeout_secs: u64,
+}
+
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
     /// Serve process PID to clone from (UFFD mode - lazy on-demand paging)
@@ -1449,6 +1457,19 @@ pub struct SnapshotRunArgs {
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
+    /// The health check the clone monitors (internal use only). Passed from podman run
+    /// and prepare on a snapshot cache hit, because the URL is not in the pre-start key
+    /// and the timeout is in no key, so the snapshot's recorded check may be another
+    /// run's. None: the snapshot's recorded check.
+    #[arg(skip)]
+    pub health_check: Option<RestoreHealthCheck>,
+
+    /// Install a `podman prepare` startup snapshot from this restore (internal use only).
+    /// The clone is the prepare's disposable VM: it waits for Healthy, installs the
+    /// snapshot at the prepare's target with the VM left paused, and is torn down.
+    #[arg(skip)]
+    pub prepare: Option<crate::commands::podman::PreparedRestore>,
+
     /// Base snapshot key for startup snapshot creation (internal use only).
     /// When set, a startup snapshot will be created after the VM becomes healthy.
     /// Its name is made from this key and `balloon`.

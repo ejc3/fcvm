@@ -635,8 +635,32 @@ async fn settled_nonce_count(file: &Path, nonce: &str) -> usize {
 
 /// Best-effort removal of snapshot cache entries this test created (unique keys
 /// per run, so nothing else can be restoring them). Also removes `.creating`
-/// temp dirs left by an interrupted create.
+/// temp dirs left by an interrupted create. A startup snapshot of a run with
+/// `--health-check` is not named `<pre-start key>-startup` (its name holds the URL
+/// and the pre-start key does not), so the snapshots recorded as a key's diff
+/// parent or diff child go too.
 async fn cleanup_snapshot_keys(keys: &[Option<String>]) {
+    let manager = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+    let mut related = Vec::new();
+    for key in keys.iter().flatten() {
+        if let Ok(config) = manager.load_snapshot(key).await {
+            related.extend(config.parent_snapshot);
+        }
+    }
+    for name in manager.list_snapshots().await.unwrap_or_default() {
+        if let Ok(config) = manager.load_snapshot(&name).await {
+            if keys
+                .iter()
+                .flatten()
+                .any(|key| config.parent_snapshot.as_ref() == Some(key))
+            {
+                related.push(name);
+            }
+        }
+    }
+    for name in &related {
+        let _ = common::delete_snapshot(name).await;
+    }
     for key in keys.iter().flatten() {
         let _ = common::delete_snapshot(key).await;
         let _ = common::delete_snapshot(&format!("{}-startup", key)).await;
