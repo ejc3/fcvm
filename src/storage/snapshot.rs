@@ -221,9 +221,15 @@ pub struct SnapshotMetadata {
     #[serde(default)]
     pub restore_hook: Option<String>,
     /// The source VM's `--dns`, which names the guest's resolver whatever host runs
-    /// it. Without one, a restore gives the guest the restoring host's resolvers.
-    #[serde(default)]
-    pub dns_override: Option<String>,
+    /// it: `Some(None)` when it had none, and a restore gives the guest the restoring
+    /// host's resolvers. `None` is a snapshot made before this was recorded; read it
+    /// through [`SnapshotMetadata::source_dns_override`].
+    #[serde(
+        default,
+        deserialize_with = "crate::state::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dns_override: Option<Option<String>>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -329,6 +335,18 @@ fn is_zero(value: &usize) -> bool {
 }
 
 impl SnapshotMetadata {
+    /// The source VM's `--dns`.
+    ///
+    /// A snapshot made before `dns_override` was recorded names its resolver only in
+    /// `network_config.dns_server`, which then held the source's --dns when it had
+    /// one, and every restore kept that resolver. Such a snapshot keeps it still.
+    pub fn source_dns_override(&self) -> Option<&str> {
+        match &self.dns_override {
+            Some(recorded) => recorded.as_deref(),
+            None => self.network_config.dns_server.as_deref(),
+        }
+    }
+
     /// The balloon device a cold boot from this snapshot attaches, or None when the
     /// source had no device: the recorded target and free page reporting switch.
     pub fn balloon_device(&self) -> Option<crate::firecracker::BalloonDevice> {

@@ -2656,9 +2656,9 @@ async fn cmd_snapshot_run_inner(
     // another host's network may not reach.
     let resolvers = restore_resolvers(
         network_mode,
-        snapshot_config.metadata.dns_override.as_deref(),
+        snapshot_config.metadata.source_dns_override(),
         super::podman::GuestBootInputs::resolve(
-            snapshot_config.metadata.dns_override.as_deref(),
+            snapshot_config.metadata.source_dns_override(),
             &runtime_config,
         )
         .for_launch(network_mode, &[]),
@@ -2772,7 +2772,12 @@ async fn cmd_snapshot_run_inner(
     );
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // The source's --dns goes with the guest, so a snapshot of this clone keeps it.
-    vm_state.config.dns_override = snapshot_config.metadata.dns_override.clone();
+    vm_state.config.dns_override = Some(
+        snapshot_config
+            .metadata
+            .source_dns_override()
+            .map(str::to_string),
+    );
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
@@ -4391,7 +4396,7 @@ fn run_args_from_snapshot_metadata(
         // The source's --dns, which names the guest's resolver on any host.
         // Without one the cold boot gives the guest this host's resolvers, as
         // a restore does (`RestoreIdentity::dns`).
-        dns: meta.dns_override.clone(),
+        dns: meta.source_dns_override().map(str::to_string),
         name,
         cpu,
         mem,
@@ -5163,7 +5168,7 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
-            dns_override: None,
+            dns_override: Some(None),
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],
@@ -5261,7 +5266,7 @@ mod tests {
             )
         };
         assert_eq!(synth(&meta_dns).dns, None);
-        meta_dns.dns_override = Some("192.0.2.53".to_string());
+        meta_dns.dns_override = Some(Some("192.0.2.53".to_string()));
         assert_eq!(synth(&meta_dns).dns.as_deref(), Some("192.0.2.53"));
 
         // The clone's own port mappings come back out of the specs written here,
@@ -5973,6 +5978,44 @@ mod tests {
         let routed = restore_resolvers(FcNetworkMode::Routed, None, v4_only);
         assert_eq!(routed.mode_server, None);
         assert_eq!(routed.guest_dns(FcNetworkMode::Routed), None);
+    }
+
+    /// A snapshot made before `dns_override` was recorded names its resolver only in
+    /// `network_config.dns_server`, which held the source's --dns when it had one (a
+    /// rootless golden made with `--dns 10.0.2.2` among them). It keeps that
+    /// resolver, as every restore did before, so its pasta still turns off the DNS
+    /// special case and its guest's resolv.conf is left alone. A snapshot that
+    /// records the field, null included, is read as recorded.
+    #[test]
+    fn a_snapshot_made_before_dns_override_was_recorded_keeps_its_resolver() {
+        let mut fixture = metadata_fixture();
+        fixture.network_mode = FcNetworkMode::Rootless;
+        fixture.network_config.dns_server = Some("10.0.2.2".to_string());
+        let mut document = serde_json::to_value(&fixture).unwrap();
+        let read = |document: &serde_json::Value| -> crate::storage::SnapshotMetadata {
+            serde_json::from_value(document.clone()).unwrap()
+        };
+
+        document.as_object_mut().unwrap().remove("dns_override");
+        let legacy = read(&document);
+        assert_eq!(legacy.source_dns_override(), Some("10.0.2.2"));
+        let resolvers = restore_resolvers(
+            FcNetworkMode::Rootless,
+            legacy.source_dns_override(),
+            crate::commands::podman::GuestBootInputs::default(),
+        );
+        assert_eq!(resolvers.mode_server.as_deref(), Some("10.0.2.2"));
+
+        document["dns_override"] = serde_json::Value::Null;
+        assert_eq!(read(&document).source_dns_override(), None);
+        document["dns_override"] = serde_json::json!("192.0.2.53");
+        assert_eq!(read(&document).source_dns_override(), Some("192.0.2.53"));
+
+        // Written back, a recorded none stays recorded.
+        fixture.dns_override = Some(None);
+        let written = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(written["dns_override"], serde_json::Value::Null);
+        assert_eq!(read(&written).dns_override, Some(None));
     }
 
     fn snapshot_runtime_args_without_overrides() -> SnapshotRunArgs {
