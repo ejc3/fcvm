@@ -3076,6 +3076,36 @@ branch = "agent/nv2"
         assert!(error.to_string().contains("commit"), "{error}");
     }
 
+    /// The guest image starts none of Ubuntu's periodic maintenance jobs: every clone of a
+    /// snapshot fires them at the same wall-clock time, and fwupd-refresh's fwupd ran 256
+    /// MiB potato guests out of memory. The setup script removes each timer's enablement.
+    ///
+    /// RED BEFORE THE FIX: the image kept the cloud image's timers, fwupd-refresh.timer
+    /// among them.
+    #[test]
+    fn the_guest_image_starts_no_maintenance_timers() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let script = generate_setup_script(&plan);
+        for timer in [
+            "fwupd-refresh.timer",
+            "apt-daily.timer",
+            "apt-daily-upgrade.timer",
+            "motd-news.timer",
+            "man-db.timer",
+        ] {
+            assert!(
+                plan.services.disable.iter().any(|s| s == timer),
+                "{timer} is not in [services] disable"
+            );
+            assert!(
+                script.contains(&format!(
+                    "find /etc/systemd/system -name '{timer}' -type l -delete"
+                )),
+                "the setup script does not remove {timer}'s enablement"
+            );
+        }
+    }
+
     /// A profile on the PCI transport keeps the guest's NIC named eth0: virtio-net is a
     /// PCI device there and udev would rename it, and fc-agent and fcvm configure eth0
     /// (a routed guest restored on the gpu profile came up with no global IPv6 at all).
