@@ -80,8 +80,9 @@ fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, l
   nightly dogfood use us-west-2, where the image factory builds every host image (ejc3/aws
   `fcvm-fleet-ami-pipeline.tf`; the release's ids in both regions are in SSM
   `/fcvm-fleet/ami-release-copies`, us-east-1). `up` launches the release's host image for its
-  region from that record, or, where the record names none, the newest validated host image
-  there; never a candidate the factory has built but not released.
+  region from that record (in us-east-1 also from the release itself), and refuses when neither
+  names an available image there: it never picks an image by name or tag, which could be a
+  candidate the factory has not released. `GPUBOX_AMI` names an image explicitly.
 - Spot first in every AZ of the region that offers g4dn.metal (us-west-2: a, b, c), then on
   demand. Quota per region: G spot 192 vCPU (two g4dn.metal at once), G on demand 384 vCPU
   (four). Only in us-east-1 does `up` go through the wall's reserve and admission lock

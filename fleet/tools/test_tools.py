@@ -244,6 +244,8 @@ case "$args" in
   *" ssm get-parameter "*"/fcvm-fleet/ami-release-copies"*)
     [ -n "${FAKE_RELEASE_RECORD:-}" ] || { echo "An error occurred (ParameterNotFound)" >&2; exit 254; }
     echo "$FAKE_RELEASE_RECORD" ;;
+  *" ssm get-parameter "*"/fcvm-fleet/ami-release "*)
+    echo "${FAKE_RELEASE:-{\"host_amis\": {\"us-east-1\": {\"x86_64\": \"ami-00000000000000ea1\"}}}}" ;;
   *" ssm get-parameter "*) echo ami-ubuntu ;;
   *" ec2 wait "*) : ;;
   *" ssm describe-instance-information "*) echo Online ;;
@@ -274,6 +276,10 @@ esac
 """
 
 
+# The publisher's record of the live release's images in each region (SSM /fcvm-fleet/ami-release-copies).
+RELEASE_RECORD = '{"images": {"us-east-1": {"host": "ami-00000000000000ea1"}, "us-west-2": {"host": "ami-00000000000000eb2"}}}'
+
+
 def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00", type="g4dn.metal", cpu="48\\t2"):
     """The fake's rows for n instances: launch time, id, purpose, type, cores, threads."""
     return "".join(f"{at}\\ti-{type}-{k}\\t{purpose}\\t{type}\\t{cpu}\\n" for k in range(n))
@@ -293,7 +299,8 @@ class GpuboxWallReserve(unittest.TestCase):
         env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
                    FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
                    FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
-                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **{"GPUBOX_REGION": "us-east-1", "REGION": "us-east-1", "GPUBOX_AZS": "a", "AZS": "a", **extra})
+                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **{"GPUBOX_REGION": "us-east-1", "REGION": "us-east-1", "GPUBOX_AZS": "a", "AZS": "a",
+                      "FAKE_RELEASE_RECORD": RELEASE_RECORD, **extra})
         env = {k: v for k, v in env.items() if v is not None}
         cmd = cmd or ["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"]
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
@@ -504,7 +511,7 @@ class GpuboxWallReserve(unittest.TestCase):
                 # STS is global, the asset bucket's S3 has its own region (us-east-2), and the release
                 # record is one parameter in us-east-1.
                 regional = [c for c in r.calls if not c.startswith("sts ") and " s3 " not in f" {c} " and " s3api " not in f" {c} "
-                            and not c.startswith("--region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-release-copies ")]
+                            and not c.startswith("--region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-release")]
                 self.assertTrue(any(" run-instances " in c for c in regional))
                 for call in regional:
                     self.assertTrue(call.startswith(f"--region {region} "), call)
@@ -580,11 +587,18 @@ class GpuboxWallReserve(unittest.TestCase):
                 r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION=region, FAKE_RELEASE_RECORD=record)
                 self.assertEqual(len(launches), 1, r.stderr)
                 self.assertIn(f"--image-id {want} ", launches[0])
-        # No record (or its image not available yet): the newest validated image, never a candidate.
-        for extra in ({}, {"FAKE_RELEASE_RECORD": record, "FAKE_IMAGE_STATE": "pending"}):
-            r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION="us-west-2", **extra)
-            self.assertEqual(len(launches), 1, r.stderr)
-            self.assertIn("--image-id ami-fake ", launches[0])
+        # No record: the release itself, which names us-east-1 only. Never the newest image by name
+        # or tag, which can be a candidate or a validated image whose publication failed.
+        r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION="us-east-1", FAKE_RELEASE_RECORD=None)
+        self.assertEqual(len(launches), 1, r.stderr)
+        self.assertIn("--image-id ami-00000000000000ea1 ", launches[0])
+        for extra in ({"FAKE_RELEASE_RECORD": None}, {"FAKE_RELEASE_RECORD": record, "FAKE_IMAGE_STATE": "pending"}):
+            with self.subTest(extra=sorted(extra)):
+                r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION="us-west-2", **extra)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(launches, [], r.stderr)
+                self.assertIn("names no available host image", r.stderr)
+                self.assertFalse(any(" describe-images " in c and "--image-ids" not in c for c in r.calls), r.calls)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile

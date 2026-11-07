@@ -68,22 +68,21 @@ fi
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=fcvm-fleet-assets-$ACCOUNT
 
-# The newest fleet host AMI unless GPUBOX_AMI names one.
-# The live release's host image in REGION, from the publisher's record of every region's ids
-# (SSM /fcvm-fleet/ami-release-copies, us-east-1), unless GPUBOX_AMI names one. A region the
-# record does not cover yet gets the newest validated host image there, never an unreleased
-# factory candidate.
+# The live release's host image in REGION, unless GPUBOX_AMI names one: the publisher's record of
+# the release's ids in every region (SSM /fcvm-fleet/ami-release-copies), else the release itself
+# (/fcvm-fleet/ami-release, which names us-east-1), both in us-east-1. Nothing else: a validated
+# image is not necessarily released (a publication can fail after tagging it), and a factory
+# candidate never is. Prints nothing when neither names an available image there.
 host_ami() {
-  local rec id
+  local id q
   [ -n "${GPUBOX_AMI:-}" ] && { echo "$GPUBOX_AMI"; return; }
-  rec=$(aws --region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-release-copies --query Parameter.Value --output text 2>/dev/null || true)
-  id=$(jq -r --arg r "$REGION" '.images[$r].host // empty' <<<"$rec" 2>/dev/null || true)
-  if [[ "$id" =~ ^ami-[0-9a-f]{17}$ ]] && [ "$(A ec2 describe-images --image-ids "$id" --query 'Images[0].State' --output text 2>/dev/null)" = available ]; then
-    echo "$id"; return
-  fi
-  say "the release record names no available host image in $REGION; using the newest validated one"
-  A ec2 describe-images --owners self --filters Name=name,Values='fcvm-fleet-host-x86_64-*' Name=state,Values=available Name=tag:FleetImageValidated,Values=true \
-    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+  for q in "/fcvm-fleet/ami-release-copies .images[\$r].host" "/fcvm-fleet/ami-release .host_amis[\$r].x86_64"; do
+    id=$(aws --region us-east-1 ssm get-parameter --name "${q%% *}" --query Parameter.Value --output text 2>/dev/null \
+      | jq -r --arg r "$REGION" "${q#* } // empty" 2>/dev/null || true)
+    if [[ "$id" =~ ^ami-[0-9a-f]{17}$ ]] && [ "$(A ec2 describe-images --image-ids "$id" --query 'Images[0].State' --output text 2>/dev/null || true)" = available ]; then
+      echo "$id"; return
+    fi
+  done
 }
 
 # Refuse anything that is not a gpubox: the fleet's hosts and tiles carry other Purpose tags.
@@ -187,7 +186,7 @@ up)
   AZS=${GPUBOX_AZS:-$(A ec2 describe-instance-type-offerings --location-type availability-zone \
     --filters Name=instance-type,Values=$TYPE --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sed "s/^$REGION//" | sort | paste -sd' ')}
   [ -n "$AZS" ] || die "no zone in $REGION offers $TYPE"
-  ami=$(host_ami); [ -n "$ami" ] && [ "$ami" != None ] || die "no fleet host AMI in $REGION (ejc3/aws copies each published one there; is the copy still pending?)"
+  ami=$(host_ami); [ -n "$ami" ] || die "the release names no available host image in $REGION (its copy may still be pending); GPUBOX_AMI=<ami> picks one"
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
