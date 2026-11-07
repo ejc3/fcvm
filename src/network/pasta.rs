@@ -1212,9 +1212,15 @@ impl PastaNetwork {
     /// On IPv6-only hosts, traffic must go through a proxy.
     /// Returns the proxy URL with IPv6 address resolved from hostname.
     fn detect_http_proxy(names: [&str; 4]) -> Option<String> {
-        let proxy_url = names
-            .into_iter()
-            .find_map(|name| std::env::var(name).ok())?;
+        Self::detect_http_proxy_in(names, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::detect_http_proxy`] over `var`, the environment's lookup.
+    fn detect_http_proxy_in(
+        names: [&str; 4],
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        let proxy_url = names.into_iter().find_map(var)?;
 
         if let Some(rest) = proxy_url.strip_prefix("http://") {
             let host_port = rest.trim_end_matches('/');
@@ -2363,29 +2369,36 @@ impl NetworkManager for PastaNetwork {
 #[cfg(test)]
 mod tests {
     /// A rootless guest is given the host's HTTP and HTTPS proxies each for its own
-    /// scheme (#1464). nextest runs each test in its own process, so the environment
-    /// is this test's own.
+    /// scheme (#1464). The variables are a map, not the process environment, which a
+    /// test must not change while sibling threads read it.
     #[test]
     fn the_host_proxy_is_read_per_scheme() {
         use super::PastaNetwork;
         const HTTP: [&str; 4] = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"];
         const HTTPS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
-        for name in HTTP {
-            std::env::remove_var(name);
-        }
-        assert_eq!(PastaNetwork::detect_http_proxy(HTTP), None);
-        std::env::set_var("HTTPS_PROXY", "http://192.0.2.9:3129");
+        let env = |vars: &[(&str, &str)]| {
+            let vars: std::collections::HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |name: &str| vars.get(name).cloned()
+        };
+        assert_eq!(PastaNetwork::detect_http_proxy_in(HTTP, env(&[])), None);
+        let https_only = env(&[("HTTPS_PROXY", "http://192.0.2.9:3129")]);
         assert_eq!(
-            PastaNetwork::detect_http_proxy(HTTP).as_deref(),
+            PastaNetwork::detect_http_proxy_in(HTTP, https_only).as_deref(),
             Some("http://192.0.2.9:3129")
         );
-        std::env::set_var("HTTP_PROXY", "http://192.0.2.8:3128");
+        let both = [
+            ("HTTPS_PROXY", "http://192.0.2.9:3129"),
+            ("HTTP_PROXY", "http://192.0.2.8:3128"),
+        ];
         assert_eq!(
-            PastaNetwork::detect_http_proxy(HTTP).as_deref(),
+            PastaNetwork::detect_http_proxy_in(HTTP, env(&both)).as_deref(),
             Some("http://192.0.2.8:3128")
         );
         assert_eq!(
-            PastaNetwork::detect_http_proxy(HTTPS).as_deref(),
+            PastaNetwork::detect_http_proxy_in(HTTPS, env(&both)).as_deref(),
             Some("http://192.0.2.9:3129")
         );
     }
