@@ -2704,7 +2704,12 @@ fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
         inspect.status,
         stderr.trim()
     );
-    if stderr.contains("no such container") || stderr.contains("no container with name or ID") {
+    // Three spellings of "fcvm-container does not exist": podman's for an untyped
+    // inspect ("no such object"), and the two its container lookups give.
+    if stderr.contains("no such container")
+        || stderr.contains("no container with name or ID")
+        || stderr.contains("no such object")
+    {
         HookEligibility::Skip(detail)
     } else {
         HookEligibility::Fail(detail)
@@ -5353,6 +5358,20 @@ mod tests {
             HookEligibility::Skip(
                 "podman inspect exited exit status: 125: Error: no container with name or ID \
                  \"fcvm-container\" found"
+                    .to_string()
+            )
+        );
+        // `podman inspect` without a type names a missing container this way. A
+        // restore of a pre-start snapshot, whose container does not exist yet, read
+        // it and failed closed.
+        assert_eq!(
+            hook_eligibility(&output(
+                125,
+                "",
+                "Error: no such object: \"fcvm-container\""
+            )),
+            HookEligibility::Skip(
+                "podman inspect exited exit status: 125: Error: no such object: \"fcvm-container\""
                     .to_string()
             )
         );
