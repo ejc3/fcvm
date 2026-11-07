@@ -4745,6 +4745,7 @@ pub fn build_snapshot_config(
             username: vm_state.config.username.clone(),
             user: vm_state.config.user.clone(),
             port_mappings: vm_state.config.port_mappings.clone(),
+            published_guest_ports: Some(vm_state.config.guest_ports()),
             forward_localhost: vm_state.config.forward_localhost.clone(),
             network_mode: vm_state.config.network_mode,
             ipv6_prefix: vm_state.config.ipv6_prefix.clone(),

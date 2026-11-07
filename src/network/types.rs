@@ -48,11 +48,39 @@ pub struct PortMapping {
     pub proto: Protocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
     Udp,
+}
+
+/// A guest port and protocol a VM's guest was set up to publish: the guest side of a
+/// mapping, apart from the host address and port a VM listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct GuestPort {
+    pub port: u16,
+    pub proto: Protocol,
+}
+
+impl GuestPort {
+    /// The distinct guest ports of `mappings`, sorted.
+    pub fn of(mappings: &[PortMapping]) -> Vec<Self> {
+        let ports: std::collections::BTreeSet<Self> = mappings
+            .iter()
+            .map(|m| Self {
+                port: m.guest_port,
+                proto: m.proto,
+            })
+            .collect();
+        ports.into_iter().collect()
+    }
+}
+
+impl std::fmt::Display for GuestPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.port, self.proto)
+    }
 }
 
 impl std::fmt::Display for Protocol {

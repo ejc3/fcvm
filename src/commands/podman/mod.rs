@@ -2097,6 +2097,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.published_guest_ports = Some(crate::network::GuestPort::of(&port_mappings));
     vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
     vm_state.config.hypervisor = args.hypervisor.into();

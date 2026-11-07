@@ -266,6 +266,13 @@ pub struct SnapshotMetadata {
     /// Published port mappings inherited by clones
     #[serde(default)]
     pub port_mappings: Vec<crate::network::PortMapping>,
+    /// The guest ports the guest was set up to publish when it booted (fc-agent DNATs
+    /// each TCP one to its loopback). `port_mappings` are the host listeners, and a
+    /// clone restored from memory keeps its snapshot's guest set whatever it publishes
+    /// on the host. None when written before this field existed: `guest_ports()` then
+    /// reads the set from `port_mappings`.
+    #[serde(default)]
+    pub published_guest_ports: Option<Vec<crate::network::GuestPort>>,
     /// Guest localhost ports forwarded to the host's loopback (--forward-localhost),
     /// inherited by clones so routed mode re-establishes the host-side relay on restore
     #[serde(default)]
@@ -398,6 +405,14 @@ impl SnapshotMetadata {
     pub fn source_dns_override(&self) -> Option<&str> {
         self.known_dns_override()
             .unwrap_or(self.network_config.dns_server.as_deref())
+    }
+
+    /// The guest ports this snapshot's guest was set up to publish: the recorded set, or the guest
+    /// side of `port_mappings` when none is recorded.
+    pub fn guest_ports(&self) -> Vec<crate::network::GuestPort> {
+        self.published_guest_ports
+            .clone()
+            .unwrap_or_else(|| crate::network::GuestPort::of(&self.port_mappings))
     }
 
     /// The balloon device a cold boot from this snapshot attaches, or None when the
@@ -933,6 +948,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                published_guest_ports: None,
                 forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
@@ -1142,6 +1158,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                published_guest_ports: None,
                 forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
@@ -1234,6 +1251,7 @@ mod tests {
                     username: None,
                     user: None,
                     port_mappings: vec![],
+                    published_guest_ports: None,
                     forward_localhost: vec![],
                     network_mode: Default::default(),
                     ipv6_prefix: None,
@@ -1313,6 +1331,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                published_guest_ports: None,
                 forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
@@ -1517,6 +1536,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                published_guest_ports: None,
                 forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
@@ -1711,6 +1731,7 @@ mod tests {
             username: None,
             user: None,
             port_mappings: vec![],
+            published_guest_ports: None,
             forward_localhost: vec![],
             network_mode: Default::default(),
             ipv6_prefix: Some("2600:1f1c:494:201".to_string()),
