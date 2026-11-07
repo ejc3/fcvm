@@ -932,7 +932,11 @@ pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
 
 /// Start a fresh chronyd once the restore has stepped the clock. Its first
 /// measurements are all taken against the stepped clock.
-pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd) {
+///
+/// The lines it logs name the restore's epoch: a snapshot taken while this task still
+/// waits for sources carries the task into every clone, where it finishes and logs for the
+/// restore that started it, not for the clone's own.
+pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd, epoch: String) {
     let RetiredChronyd(lifecycle) = retired;
     if !*lifecycle {
         eprintln!(
@@ -945,10 +949,12 @@ pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd) {
     }
     drop(lifecycle);
     match wait_for_chrony_sources().await {
-        Ok(count) => {
-            eprintln!("[fc-agent] chronyd restarted after restore with {count} NTP source(s)")
+        Ok(count) => eprintln!(
+            "[fc-agent] chronyd restarted after restore (epoch={epoch}) with {count} NTP source(s)"
+        ),
+        Err(e) => {
+            eprintln!("[fc-agent] ERROR: chronyd is not usable after restore (epoch={epoch}): {e}")
         }
-        Err(e) => eprintln!("[fc-agent] ERROR: chronyd is not usable after restore: {e}"),
     }
 }
 
