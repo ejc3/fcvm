@@ -537,6 +537,21 @@ class GpuboxWallReserve(unittest.TestCase):
             self.assertEqual(rows, [["i-fakebox", home, "running", "some one", "2026-11-07T12:00:00Z", "spot",
                                      "2026-11-07T08:00:00+00:00"]], r.stdout)
 
+    def test_launch_errors_go_to_a_file_mktemp_made(self):
+        # A PID-named file in /tmp can be pre-created or a symlink planted there by another user.
+        src = open(os.path.join(HERE, "gpubox.sh")).read()
+        self.assertNotRegex(src, r"/tmp/[A-Za-z0-9._-]*\$\$")
+        r, launches, _ = self.up(od_in_use=boxes(3))
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+
+    def test_nightly_dogfood_pins_gpuboxes_to_us_west_2_and_downs_them_there(self):
+        # A session that inherits GPUBOX_REGION=us-east-1 would take the staging quota.
+        run = open(os.path.join(HERE, "..", "..", ".claude", "skills", "nightly-dogfood", "run.sh")).read()
+        pin = run.find("export GPUBOX_REGION=us-west-2")
+        self.assertGreater(pin, 0, "run.sh does not pin the gpubox region")
+        self.assertLess(pin, run.index('claude -p "/nightly-dogfood"'), "the pin comes after the session starts")
+        self.assertIn('bash fleet/tools/gpubox.sh down "$a" ${b:+"$b"}', run)
+
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
         s3 = tempfile.mkdtemp()

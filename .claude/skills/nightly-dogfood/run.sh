@@ -41,6 +41,8 @@ fi
 cd "$wt" || fail "cd"
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && [ -z "$(git status --porcelain)" ] || fail "$wt is not a clean origin/main"
 export DOGFOOD_RUN_DIR=$out
+# gpuboxes stay off the staging fleet's region and quota (us-east-1), whatever the caller's environment says.
+export GPUBOX_REGION=us-west-2
 : >"$out/machines"
 log "start $(git rev-parse --short HEAD)"
 timeout -k 5m 6h claude -p "/nightly-dogfood" --permission-mode bypassPermissions \

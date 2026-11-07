@@ -182,6 +182,7 @@ up)
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
+  errf=$(mktemp)
   adm=""
   if [ "$staging" = 1 ]; then
     admit_lock || die "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"
@@ -201,17 +202,17 @@ up)
           --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
           --user-data "$ud" \
           --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=gpubox-$owner},{Key=Purpose,Value=$PURPOSE},{Key=Owner,Value=$owner},{Key=LeaseUntil,Value=${lease/ /T}Z},{Key=Market,Value=$market}$adm]" \
-          --query 'Instances[0].InstanceId' --output text 2>/tmp/gpubox.err.$$); then
+          --query 'Instances[0].InstanceId' --output text 2>"$errf"); then
         break 2
       fi
-      grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' /tmp/gpubox.err.$$ \
-        || { cat /tmp/gpubox.err.$$ >&2; rm -f /tmp/gpubox.err.$$; [ "$staging" = 0 ] && die "run-instances failed"
+      grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' "$errf" \
+        || { cat "$errf" >&2; rm -f "$errf"; [ "$staging" = 0 ] && die "run-instances failed"
              admit_abandon; die "run-instances failed; the admission lock is kept until stale in case it launched"; }
-      say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' /tmp/gpubox.err.$$ | head -1)"
+      say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' "$errf" | head -1)"
       id=""
     done
   done
-  rm -f /tmp/gpubox.err.$$
+  rm -f "$errf"
   if [ "$staging" = 1 ]; then
     [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
     ledger_add "$id" "$market" 96 || { A ec2 terminate-instances --instance-ids "$id" >/dev/null || admit_abandon; die "$id's admission could not be recorded: terminated it, or kept the lock until stale if that failed"; }

@@ -32,8 +32,10 @@ under "For you" in the report.
 - **Machines.** Measure only on a pbox or gpubox you launched, never on this shared box. Carry each instance id, act
   only on your own, and take each one down as soon as its results are copied back. The moment you launch one, append
   a line to `$DOGFOOD_RUN_DIR/machines`: `pbox <slot> <instance id>`, or `gpubox <instance id> <region>` for a box
-  from `fleet/tools/gpubox.sh` (the two words `up` prints). gpubox boxes go to us-west-2, the default; never set
-  `GPUBOX_REGION=us-east-1`, which is the staging fleet's region and quota. Launch no other kind of instance. run.sh takes down whatever is listed and still running when the session ends, so a timeout
+  from `fleet/tools/gpubox.sh` (the two words `up` prints). run.sh sets `GPUBOX_REGION=us-west-2`; never change it to
+  us-east-1, the staging fleet's region and quota. A GPU check counts only on the live host image: compare the image
+  `up` launched with `images.us-west-2.host` in SSM `/fcvm-fleet/ami-release-copies` (us-east-1), and if they differ
+  (the release's copy still pending) record the GPU checks as not checked. Launch no other kind of instance. run.sh takes down whatever is listed and still running when the session ends, so a timeout
   cannot leave a box billing. Never touch the fleet's own hosts:
   file an ejc3/aws issue instead.
 - **Staging** (behind Cloudflare Access) deploys ship without asking. A public, ungated launch needs the owner.
