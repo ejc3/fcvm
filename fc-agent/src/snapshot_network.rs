@@ -2145,6 +2145,9 @@ async fn restore_boundary_with<
     // to reinstalling them: a malformed or tampered image cannot publish
     // early, and a transient probe failure must never become a dead clone the
     // spawn-free path would have restored.
+    // failpoint: hold before the gate is read, so a test can tamper with the restored gate
+    // and drive the reinstall below in a real guest (#806).
+    failpoint::hit_async("restore.pre_gate_verify").await;
     let verify_started = std::time::Instant::now();
     let verified_armed = match gate.is_closed().await {
         Ok(verdict) => verdict,
