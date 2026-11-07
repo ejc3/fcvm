@@ -4,7 +4,6 @@
 //! - A snapshot's source agrees with the host's clock once `snapshot create` returns
 //! - A clone agrees with the host's clock after a restore that stalls in the guest
 //! - exact restore cleanup re-establishes gateway and container connectivity
-//! - --no-swap creates dedicated cgroup with memory.swap.max=0
 //! - --no-dirty-tracking passes track_dirty_pages=false
 
 #![cfg(feature = "integration-slow")]
@@ -511,84 +510,6 @@ async fn test_restore_network_cleanup_reestablishes_gateway() -> Result<()> {
         "nginx should respond after restore"
     );
     println!("  ✓ Container nginx responding after restore");
-
-    // Cleanup
-    common::kill_process(clone_pid).await;
-    fixture.cleanup().await;
-    Ok(())
-}
-
-/// --no-swap should create a dedicated cgroup under /sys/fs/cgroup/fcvm.slice/
-/// with memory.swap.max=0 for the Firecracker process.
-#[cfg(feature = "privileged-tests")]
-#[tokio::test]
-async fn test_no_swap_creates_cgroup() -> Result<()> {
-    let fixture = common::SnapshotFixture::new("noswap", "bridged").await?;
-
-    // Clone WITH --no-swap
-    let (_, clone_name, _, _) = common::unique_names("noswap-c");
-    println!("  Spawning clone with --no-swap...");
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "snapshot",
-            "run",
-            "--pid",
-            &fixture.serve_pid.to_string(),
-            "--name",
-            &clone_name,
-            "--no-swap",
-        ],
-        &clone_name,
-    )
-    .await?;
-    common::poll_health_by_pid(clone_pid, 120).await?;
-    println!("  ✓ Clone healthy with --no-swap (PID: {})", clone_pid);
-
-    // Find the Firecracker process (child of the clone fcvm process)
-    let fc_pid_out = tokio::process::Command::new("pgrep")
-        .args([
-            "-f",
-            "firecracker.*api-sock",
-            "--parent",
-            &clone_pid.to_string(),
-        ])
-        .output()
-        .await?;
-    let fc_pid_str = String::from_utf8_lossy(&fc_pid_out.stdout);
-    let fc_pid: u32 = fc_pid_str
-        .trim()
-        .lines()
-        .next()
-        .context("no firecracker child found")?
-        .parse()
-        .context("parse fc pid")?;
-    println!("  Firecracker PID: {}", fc_pid);
-
-    // Check that Firecracker is in a fcvm.slice cgroup with swap disabled
-    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", fc_pid))
-        .context("reading firecracker cgroup")?;
-    let cgroup_path = cgroup
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .context("no cgroup v2 entry")?;
-    println!("  Firecracker cgroup: {}", cgroup_path);
-
-    assert!(
-        cgroup_path.contains("fcvm.slice"),
-        "Firecracker should be in fcvm.slice, got: {}",
-        cgroup_path
-    );
-
-    let swap_max =
-        std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.swap.max", cgroup_path))
-            .context("reading memory.swap.max")?;
-    assert_eq!(
-        swap_max.trim(),
-        "0",
-        "memory.swap.max should be 0, got: {}",
-        swap_max.trim()
-    );
-    println!("  ✓ Firecracker in fcvm.slice with memory.swap.max=0");
 
     // Cleanup
     common::kill_process(clone_pid).await;

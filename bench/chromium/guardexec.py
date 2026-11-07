@@ -64,7 +64,9 @@ def main() -> int:
                 f"parent changed before exec: expected {args.expected_parent}, "
                 f"found {os.getppid()}"
             )
-        os.execvpe(command[0], command, os.environ)
+        # fcvm moves itself into a cgroup of its own unless told to stay; the command
+        # stays in the cgroup this wrapper put it in, which is the one the run accounts.
+        os.execvpe(command[0], command, dict(os.environ, FCVM_CGROUP_PARENT="none"))
     except (OSError, RuntimeError) as error:
         print(f"guardexec: {type(error).__name__}: {error}", file=sys.stderr)
         return 125

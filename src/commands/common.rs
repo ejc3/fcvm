@@ -1425,60 +1425,6 @@ fn merge_with(
     Ok(stats)
 }
 
-/// Disable swap for a process by moving it to a dedicated cgroup with
-/// memory.swap.max=0.
-///
-/// VM anon pages are expensive to swap out and fault back in (random I/O, blocks
-/// guest threads). File cache pages (e.g. memory.bin) are cheap to re-fault
-/// (sequential btrfs reads with zstd decompression). With default swappiness=60,
-/// the kernel prefers swapping VM anon pages over evicting file cache, which
-/// causes severe I/O pressure and degraded VM performance.
-///
-/// Creates `/sys/fs/cgroup/fcvm.slice/fcvm-{pid}.scope` — a dedicated cgroup
-/// under the root slice where the memory controller is always available. This
-/// avoids the cgroup v2 "no internal processes" constraint that prevents creating
-/// child cgroups under session scopes.
-pub fn disable_cgroup_swap(pid: u32) {
-    // Create fcvm.slice if it doesn't exist (first VM on this host)
-    let slice_path = "/sys/fs/cgroup/fcvm.slice";
-    if let Err(e) = std::fs::create_dir_all(slice_path) {
-        warn!(pid, path = slice_path, error = %e, "failed to create fcvm.slice");
-        return;
-    }
-
-    // Enable memory controller on fcvm.slice so child cgroups get memory.*
-    let subtree_path = format!("{}/cgroup.subtree_control", slice_path);
-    if let Err(e) = std::fs::write(&subtree_path, "+memory") {
-        warn!(pid, path = %subtree_path, error = %e, "failed to enable memory controller");
-        return;
-    }
-
-    // Create a scope for this specific Firecracker process
-    let scope_path = format!("{}/fcvm-{}.scope", slice_path, pid);
-    if let Err(e) = std::fs::create_dir_all(&scope_path) {
-        warn!(pid, path = %scope_path, error = %e, "failed to create cgroup scope");
-        return;
-    }
-
-    // Set memory.swap.max=0 BEFORE moving the process in
-    let swap_max_path = format!("{}/memory.swap.max", scope_path);
-    if let Err(e) = std::fs::write(&swap_max_path, "0") {
-        warn!(pid, path = %swap_max_path, error = %e, "failed to set memory.swap.max=0");
-        return;
-    }
-
-    // Move the process into the scope
-    let procs_path = format!("{}/cgroup.procs", scope_path);
-    match std::fs::write(&procs_path, pid.to_string()) {
-        Ok(()) => {
-            info!(pid, cgroup = %scope_path, "moved to dedicated cgroup with swap disabled");
-        }
-        Err(e) => {
-            warn!(pid, path = %procs_path, error = %e, "failed to move process to cgroup");
-        }
-    }
-}
-
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///

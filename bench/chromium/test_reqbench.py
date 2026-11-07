@@ -1616,8 +1616,10 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
 
 
 class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
-    """`--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope, out of
-    the backend cgroup reqscale's guard placed the clone in.
+    """`--no-swap` moved Firecracker into /fcvm.slice/fcvm-<pid>.scope, out of
+    the backend cgroup reqscale's guard placed the clone in. fcvm now refuses it
+    without a cgroup of the VM's own, which a guarded clone and an unprivileged
+    one do not get.
 
     RED BEFORE THE FIX: every clone a scale run started passed `--no-swap`. In
     one run at 8 vCPUs all 7,560 clones logged the move, and reqscale's
@@ -1625,7 +1627,7 @@ class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
     cgroup ...: /fcvm.slice/fcvm-<pid>.scope") whose sample came after it.
     """
 
-    def argv(self, **extra):
+    def argv(self, euid=0, **extra):
         from unittest import mock
         seen = []
 
@@ -1639,7 +1641,8 @@ class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
                 snapshot_tag="", serve_pid=1, rust_log="off", timeout=1.0,
                 teardown_timeout=1.0, cdp_port=1, state_dir=d, data_root=d, ws_url="",
                 run_id="t", **extra)
-            with mock.patch.object(reqbench, "spawn_clone_process", spawn):
+            with mock.patch.object(reqbench, "spawn_clone_process", spawn), \
+                    mock.patch.object(reqbench.os, "geteuid", return_value=euid):
                 try:
                     reqbench.run_cdp_request(args, 0, fast=True)
                 except RuntimeError:
@@ -1656,6 +1659,11 @@ class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
         argv = self.argv()
         self.assertEqual(argv[0], "/bin/false")
         self.assertIn("--no-swap", argv)
+
+    def test_an_unprivileged_serial_clone_does_not_ask_for_no_swap(self):
+        argv = self.argv(euid=1000)
+        self.assertEqual(argv[0], "/bin/false")
+        self.assertNotIn("--no-swap", argv)
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):

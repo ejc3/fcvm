@@ -930,7 +930,7 @@ fn snapshot_restore_args(
         name: Some(args.name.clone()),
         exec: None,
         no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
-        no_swap: false,
+        no_swap: args.no_swap,
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
         map: Vec::new(),
@@ -3677,6 +3677,7 @@ mod tests {
             image_disk_override: None,
             pmem_devices: vec![],
             resolved_extra_disks: None,
+            no_swap: false,
         }
     }
 
