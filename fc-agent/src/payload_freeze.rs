@@ -50,8 +50,15 @@
 //!    removes the record when none is left. A cgroup whose thaw failed stays recorded, and
 //!    the watchdog tries it again on its next look past the deadline.
 //!
-//! A thaw with no record does nothing, so cleaning up twice is safe, and a container is never
-//! thawed by a boundary that did not freeze it.
+//! A thaw with no record does nothing, so cleaning up twice is safe. A cgroup whose freeze
+//! write failed is dropped from the record, so a pause someone makes later is not undone.
+//!
+//! One case is left by the order of the record and the freeze, and it is the lesser one. A
+//! prepare killed after writing the record and before freezing a cgroup leaves that cgroup
+//! recorded and running; if someone pauses it (`podman pause`, which does not take this
+//! lock) before the cleanup, the cleanup resumes it. Freezing before recording instead
+//! leaves a frozen container that nothing will ever thaw. fcvm itself never pauses a
+//! container.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -250,9 +257,32 @@ pub(crate) fn freeze_in(env: &Env) -> Vec<PathBuf> {
         );
         return Vec::new();
     }
+    let mut failed = Vec::new();
     for cgroup in &ours {
         if write_freeze(cgroup, "1") {
             (env.froze)(cgroup);
+        } else {
+            failed.push(cgroup.clone());
+        }
+    }
+    if !failed.is_empty() {
+        // Not frozen by this boundary, so not its to thaw: a pause someone makes later stays.
+        ours.retain(|cgroup| !failed.contains(cgroup));
+        let narrowed = Record {
+            id: record.id,
+            cgroups: ours.clone(),
+        };
+        let written = if ours.is_empty() {
+            std::fs::remove_file(env.record)
+        } else {
+            narrowed.write(env.record)
+        };
+        if let Err(error) = written {
+            eprintln!(
+                "[fc-agent] WARNING: dropping the cgroups that did not freeze from {} failed: \
+                 {error}",
+                env.record.display()
+            );
         }
     }
     drop(held);
@@ -575,6 +605,25 @@ mod tests {
         std::fs::write(&freeze, "1").unwrap();
         assert_eq!(tree.watchdog(DEADLINE_LOOKS), 1);
         after(&tree, &running, &paused);
+    }
+
+    /// A cgroup whose freeze write failed is not the boundary's: when someone pauses it
+    /// afterwards, the boundary's thaw leaves it paused.
+    #[test]
+    fn a_failed_freeze_is_not_recorded() {
+        let tree = Tree::new();
+        let running = tree.cgroup("libpod-payload-a", false);
+        let stuck = tree.cgroup("libpod-payload-b", false);
+        let freeze = stuck.join("cgroup.freeze");
+        std::fs::remove_file(&freeze).unwrap();
+        std::fs::create_dir(&freeze).unwrap();
+        // The directory still reads as not frozen, so the freeze selects it, and its write fails.
+        tree.run(freeze_in);
+        // Someone pauses it.
+        std::fs::remove_dir(&freeze).unwrap();
+        std::fs::write(&freeze, "1").unwrap();
+        assert_eq!(tree.run(thaw_in), 1);
+        after(&tree, &running, &stuck);
     }
 
     #[test]
