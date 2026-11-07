@@ -1680,10 +1680,30 @@ def summarize_memory_fits(cells, seed, bootstrap_resamples=MEMORY_BOOTSTRAP_RESA
             )
         observed = {}
         maximum_observed_ratio = 1.0
+        # The observed totals are compared over one process set in both
+        # bases. A clone maps the memory server's memfd, which the cgroup basis
+        # charges to the serve's cgroup (the serve filled it) and PSS charges
+        # to the clones that map it (the serve maps little of it). Clone-only
+        # totals therefore differ by the memfd pages the clones map, which at
+        # small N, with little private memory, exceeds 2x on its own (campaign
+        # 9182bb98 m8, N=2: cgroup 416.6 MiB, PSS 863.2 MiB, beside a serve of
+        # 838 MiB cgroup and 17 MiB PSS). The clones and the serve together
+        # hold the same pages in both bases, so their sum is what a broken
+        # basis would still put apart.
+        arrangement = side == "fcvm-clone"
+        if arrangement and any("serve_cgroup_mib" not in values or "serve_pss_mib" not in values
+                               for _rep, _n, values in rows):
+            raise RuntimeError(f"{side} has no serve observations to reconcile its bases over")
+
+        def total(value, basis):
+            if not arrangement:
+                return value[basis]
+            return value[basis] + value["serve_cgroup_mib" if basis == "cgroup_mib" else "serve_pss_mib"]
+
         for n in sorted({n for _rep, n, _values in rows}):
             at = [values for _rep, m, values in rows if m == n]
             estimates = {
-                basis: statistics.median(value[basis] for value in at)
+                basis: statistics.median(total(value, basis) for value in at)
                 for basis in MEMORY_BASES
             }
             if any(not math.isfinite(value) or value <= 0
@@ -1712,7 +1732,8 @@ def summarize_memory_fits(cells, seed, bootstrap_resamples=MEMORY_BOOTSTRAP_RESA
         fit["cross_basis_reconciliation"] = {
             "status": "accepted",
             "scope": (
-                "clone-incremental cell costs; shared snapshot serve excluded"
+                "observed totals of the clones and the shared snapshot serve; "
+                "marginal fits clone-incremental"
                 if side == "fcvm-clone"
                 else "container arrangement cell costs"
             ),
