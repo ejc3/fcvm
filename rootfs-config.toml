@@ -78,6 +78,8 @@ commit = "3057dcb77d2d3b2791fc0729ae1d1cf4cf401588"
 # Pinned to a fork branch carrying the aarch64 SVE register save/restore fix
 # (upstream CH PR #8268), which landed after the v52.0 release and is in no tagged
 # release yet. Required for CH snapshot/restore on SVE-capable hosts (Graviton3+).
+# The branch also carries memory_restore_mode=map (ejc3/cloud-hypervisor#1), which fcvm's
+# Cloud Hypervisor restores use: the snapshot's memory file mapped instead of copied.
 [cloud_hypervisor]
 repo = "ejc3/cloud-hypervisor"
 branch = "fcvm-v52-sve-fix"

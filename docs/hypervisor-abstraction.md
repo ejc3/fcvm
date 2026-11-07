@@ -47,6 +47,7 @@ Full table + citations in #632.
 | vsock host↔guest (`CONNECT`) | ✅ | ✅ same design (live parity unverified) | single `GuestChannel` (UdsConnect) expected |
 | full snapshot + restore-into-fresh-process | ✅ | ✅ | trait |
 | UFFD lazy restore | ✅ | ✅ (`memory_restore_mode=ondemand`, v52) | trait |
+| file-backed lazy restore, pages shared across clones | ✅ File backend | ✅ `memory_restore_mode=map` (our fork, ejc3/cloud-hypervisor#1), what fcvm uses | `file_backed_cow_restore` |
 | **cross-clone memory sharing** | ✅ **measured**: `File` backend mmaps `memory.bin` MAP_PRIVATE; 3× 1GiB clones ≈ 230MiB total PSS, with dirty tracking on OR off. UFFD path is **lazy population, not sharing** (UFFDIO_COPY makes per-VM copies) | ⏳ unblocked, density unmeasured: CH `ondemand` is in-process UFFD (per-VM pages), so density must come from page-cache sharing of a `MAP_PRIVATE` snapshot file — measurable now that snapshot create works (post-#8268) | split caps: `file_backed_cow_restore` / `external_uffd_lazy_restore` / `internal_uffd_lazy_restore` |
 | diff / incremental snapshots | ✅ | ❌ | cap `diff_snapshots` (FC-only; CH takes full) |
 | drive retarget on restore (`patch_drive`) | ✅ | ❌ | use **bind-mount redirect** (already VMM-agnostic) everywhere |
