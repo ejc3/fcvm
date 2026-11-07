@@ -75,7 +75,14 @@ fi
 # have the room too. Bounded, so a loop chain cannot spin.
 dir=$anc
 for _ in 1 2 3 4 5 6 7 8; do
-  source_dev=$(findmnt --noheadings --nofsroot --output SOURCE --target "$dir" 2>/dev/null | head -n 1 || true)
+  # A lookup that fails says nothing about whether the device is a loop, so it
+  # fails the check rather than passing it as "not loop-backed".
+  if ! source_dev=$(findmnt --noheadings --nofsroot --output SOURCE --target "$dir" 2>/dev/null) \
+    || ! source_dev=$(printf '%s\n' "$source_dev" | head -n 1) || [[ -z "$source_dev" ]]; then
+    echo "check-host-kernel-build: could not tell which device holds ${dir} (findmnt --target ${dir}), so whether ${build_dir} is loop-backed, and how much room the disk behind it has, is unknown." >&2
+    echo "  Install util-linux's findmnt, or set FCVM_HOST_KERNEL_BUILD_DIR to a directory findmnt can resolve." >&2
+    exit 2
+  fi
   [[ "$source_dev" == /dev/loop* ]] || break
   backing=$(losetup --list --noheadings --output BACK-FILE "$source_dev" 2>/dev/null | head -n 1 || true)
   backing=${backing%% (deleted)}

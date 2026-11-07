@@ -155,13 +155,6 @@ async fn fetch_verified_archive(
     dest: &Path,
     retry_delay: std::time::Duration,
 ) -> Result<()> {
-    if urls.is_empty() || sha256.is_empty() {
-        bail!(
-            "the [pasta] section of the rootfs config names no source archive \
-             (archive_sha256, archives): it was written by an older fcvm. Regenerate \
-             it with `fcvm setup --generate-config --force`"
-        );
-    }
     let mut failures = Vec::new();
     for url in urls {
         let mut delay = retry_delay;
@@ -360,23 +353,6 @@ mod tests {
             !dest.exists(),
             "a rejected download was left at {}",
             dest.display()
-        );
-    }
-
-    /// A config from before [pasta] named its archives loads with none; building
-    /// pasta from it must say how to get a config that does, not that no source
-    /// answered.
-    #[tokio::test]
-    async fn a_config_without_archive_sources_says_to_regenerate_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let err =
-            fetch_verified_archive(&[], "", &dir.path().join("dest"), std::time::Duration::ZERO)
-                .await
-                .expect_err("no sources to fetch from");
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("fcvm setup --generate-config --force"),
-            "{text}"
         );
     }
 
