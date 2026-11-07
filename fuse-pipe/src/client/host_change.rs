@@ -80,6 +80,8 @@ struct Job {
     /// Inodes whose attributes alone the kernel must drop (a restore).
     attrs: Vec<u64>,
     reply: Option<Box<dyn FnOnce() + Send>>,
+    /// Told when the job is done.
+    done: Option<crossbeam_channel::Sender<()>>,
 }
 
 /// The client's record of regular files and the thread that sends invalidations.
@@ -125,6 +127,9 @@ impl HostChanges {
                     if let Some(reply) = job.reply {
                         reply();
                     }
+                    if let Some(done) = job.done {
+                        let _ = done.send(());
+                    }
                 }
             })
             .map_err(|e| {
@@ -160,24 +165,22 @@ impl HostChanges {
     /// refresh that follows finds the new ctime and drops the pages ([`refreshed`]).
     ///
     /// [`refreshed`]: Self::refreshed
-    fn expire_attributes(&self) -> usize {
+    fn expire_attributes(&self) -> Option<(usize, crossbeam_channel::Receiver<()>)> {
         let attrs: Vec<u64> = self.files.iter().map(|entry| *entry.key()).collect();
-        let Some(jobs) = &self.jobs else {
-            return 0;
-        };
+        let jobs = self.jobs.as_ref()?;
         if attrs.is_empty() {
-            return 0;
+            return None;
         }
         let count = attrs.len();
+        let (done, finished) = crossbeam_channel::bounded(1);
         let job = Job {
             inodes: Vec::new(),
             attrs,
             reply: None,
+            done: Some(done),
         };
-        if jobs.send(job).is_err() {
-            return 0;
-        }
-        count
+        jobs.send(job).ok()?;
+        Some((count, finished))
     }
 
     /// The slot the mount fills with the session's notifier.
@@ -239,6 +242,7 @@ impl HostChanges {
             inodes: vec![ino],
             attrs: Vec::new(),
             reply: None,
+            done: None,
         };
         if jobs.send(job).is_err() {
             self.queued.fetch_sub(1, Ordering::AcqRel);
@@ -319,6 +323,7 @@ impl HostChanges {
             inodes: Vec::new(),
             attrs: Vec::new(),
             reply: Some(Box::new(reply)),
+            done: None,
         };
         let job = match &self.jobs {
             Some(jobs) => match jobs.send(job) {
@@ -364,16 +369,36 @@ static LIVE: std::sync::Mutex<Vec<std::sync::Weak<HostChanges>>> =
 
 /// After a restore from a snapshot: make the kernel drop the attributes it holds for every
 /// regular file of every fuse-pipe mount in this process, so the next access refreshes
-/// them and a file the host rewrote since the snapshot is read afresh. Returns the number
-/// of files. fc-agent calls it while it handles a restore.
-pub fn expire_cached_attributes() -> usize {
+/// them and a file the host rewrote since the snapshot is read afresh. Blocks until each
+/// mount's invalidation thread has sent them, or `timeout` passes, so nothing the caller
+/// starts afterwards reads through the old attributes. Returns the number of files sent.
+/// fc-agent calls it while it handles a restore, before the restore hook and publication.
+pub fn expire_cached_attributes(timeout: std::time::Duration) -> usize {
     let live: Vec<Arc<HostChanges>> = LIVE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter_map(std::sync::Weak::upgrade)
         .collect();
-    live.iter().map(|changes| changes.expire_attributes()).sum()
+    let pending: Vec<_> = live
+        .iter()
+        .filter_map(|changes| changes.expire_attributes())
+        .collect();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut sent = 0;
+    for (count, finished) in pending {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if finished.recv_timeout(left).is_ok() {
+            sent += count;
+        } else {
+            tracing::warn!(
+                target: "fuse-pipe::client",
+                files = count,
+                "a mount's invalidation thread did not drop its files' attributes in time"
+            );
+        }
+    }
+    sent
 }
 
 /// Test only: the inodes whose attributes were dropped with no session to tell.
@@ -611,15 +636,17 @@ mod tests {
         let mut dir = attr(INO + 1, 4096, 100, 100);
         dir.mode = libc::S_IFDIR | 0o755;
         assert!(!c.refreshed(INO + 1, &dir, c.now(), true));
-        assert!(super::expire_cached_attributes() >= 1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !ATTRS_SENT.lock().unwrap().contains(&INO) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the restore dropped no attributes of the tracked file"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Hold this mount's invalidation thread for a moment inside an earlier reply, so the
+        // sweep is still queued when the call returns unless it waits for it.
+        assert!(c.refreshed(INO, &attr(INO, 64, 100, 101), c.now(), false));
+        c.reply_after(vec![INO], || {
+            std::thread::sleep(std::time::Duration::from_millis(300))
+        });
+        assert!(super::expire_cached_attributes(std::time::Duration::from_secs(10)) >= 1);
+        assert!(
+            ATTRS_SENT.lock().unwrap().contains(&INO),
+            "the restore returned before the tracked file's attributes were dropped"
+        );
         assert!(
             !ATTRS_SENT.lock().unwrap().contains(&(INO + 1)),
             "directories are not tracked"

@@ -2641,6 +2641,32 @@ impl FaultWorkers {
     }
 }
 
+/// What a clone's fault workers did, read after they were joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredWorkers {
+    count: usize,
+    handed: u64,
+    answered: u64,
+    holes: u64,
+    stale: u64,
+}
+
+impl FaultWorkers {
+    /// Stop and join the workers (`Drop`), then read their counters.
+    fn retire(self) -> RetiredWorkers {
+        let (count, handed, stale) = (self.handles.len(), self.handed, self.stale);
+        let (answered, holes) = (Arc::clone(&self.answered), Arc::clone(&self.holes));
+        drop(self);
+        RetiredWorkers {
+            count,
+            handed,
+            answered: answered.load(Ordering::Relaxed),
+            holes: holes.load(Ordering::Relaxed),
+            stale,
+        }
+    }
+}
+
 impl Drop for FaultWorkers {
     /// Stop the workers, close the queue and join them. A worker finishes the fault it
     /// holds, if any: one source read and one fill, which with the clone gone fails at once.
@@ -2712,9 +2738,16 @@ impl FaultWorker {
             };
             let reply = match filled {
                 None => Some(WorkerReturn::Stale(job)),
-                Some(Ok((FaultOutcome::Resolved | FaultOutcome::AlreadyPresent, refused))) => {
+                Some(Ok((
+                    outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent),
+                    refused,
+                ))) => {
                     answered.fetch_add(1, Ordering::Relaxed);
-                    if matches!(job.answer, WorkerAnswer::Hole(_)) {
+                    // Counted as the handler counts its own: only a fill that installed the
+                    // page. One another populator got to first installed nothing.
+                    if matches!(job.answer, WorkerAnswer::Hole(_))
+                        && matches!(outcome, FaultOutcome::Resolved)
+                    {
                         holes.fetch_add(1, Ordering::Relaxed);
                     }
                     if refused {
@@ -3009,14 +3042,14 @@ struct VmState {
 }
 
 impl VmState {
-    /// Faults answered from a hole in the memory file, by the handler and by the fault
-    /// workers: the `hole_zero_filled` field of the exit line.
-    fn hole_zero_filled_total(&self) -> u64 {
-        self.hole_zero_filled
-            + self
-                .fault_workers
-                .as_ref()
-                .map_or(0, |workers| workers.holes.load(Ordering::Relaxed))
+    /// Stop and join the fault workers, and add the holes they filled to
+    /// `hole_zero_filled`, so the exit line counts the handler's and the workers' fills. The
+    /// join comes first: a worker can fill a page, wake the guest and only then count it,
+    /// and the clone can exit in between.
+    fn retire_fault_workers(&mut self) -> Option<RetiredWorkers> {
+        let retired = self.fault_workers.take()?.retire();
+        self.hole_zero_filled += retired.holes;
+        Some(retired)
     }
 
     /// Count a fault answered with zeros, under its reason, when this handler's ioctl
@@ -4725,7 +4758,8 @@ async fn serve_faults(
     }
 }
 
-fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
+fn log_clone_finished(ctx: &VmContext<'_>, state: &mut VmState, reason: &str) {
+    let retired = state.retire_fault_workers();
     let elapsed = state.started.elapsed();
     let rate = if elapsed.as_secs_f64() > 0.0 {
         state.fault_count as f64 / elapsed.as_secs_f64()
@@ -4747,14 +4781,14 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             "fault-around populated pages beyond the demanded ones"
         );
     }
-    if let Some(workers) = state.fault_workers.as_ref().filter(|w| w.handed > 0) {
+    if let Some(workers) = retired.filter(|w| w.handed > 0) {
         info!(
             target: "uffd",
             vm_id = %ctx.vm_id,
-            fault_workers = workers.handles.len(),
+            fault_workers = workers.count,
             handed = workers.handed,
-            answered = workers.answered.load(Ordering::Relaxed),
-            holes = workers.holes.load(Ordering::Relaxed),
+            answered = workers.answered,
+            holes = workers.holes,
             stale = workers.stale,
             "faults answered by the fault workers"
         );
@@ -4775,7 +4809,7 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
         target: "uffd",
         vm_id = %ctx.vm_id,
         fault_count = state.fault_count,
-        hole_zero_filled = state.hole_zero_filled_total(),
+        hole_zero_filled = state.hole_zero_filled,
         elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
         pages_per_sec = format!("{:.0}", rate),
         reason,
@@ -10314,17 +10348,33 @@ mod tests {
             .expect("a copy-mode clone has fault workers")
             .holes
             .store(3, Ordering::Relaxed);
-        assert_eq!(state.hole_zero_filled_total(), 5);
-        state.fault_workers = None;
-        assert_eq!(state.hole_zero_filled_total(), 2);
+        let retired = state
+            .retire_fault_workers()
+            .expect("the workers were running");
+        assert_eq!(retired.holes, 3);
+        assert_eq!(state.hole_zero_filled, 5);
+        assert!(state.fault_workers.is_none(), "the workers are joined");
+        assert_eq!(state.retire_fault_workers(), None);
         let source = include_str!("server.rs");
-        let exit = &source[..source
+        let log = &source[source.find(concat!("fn log_clone_", "finished(")).unwrap()..];
+        let retire = log
+            .find("state.retire_fault_workers()")
+            .expect("the exit retires the workers");
+        let exit = log
             .find(concat!("        reason,\n        \"VM ", "exited\""))
-            .unwrap()];
-        let exit = &exit[exit.rfind("info!(").unwrap()..];
+            .unwrap();
         assert!(
-            exit.contains("hole_zero_filled = state.hole_zero_filled_total(),"),
-            "the exit line counts the handler's holes alone"
+            retire < exit,
+            "the exit line is logged before the workers are joined"
+        );
+        assert!(log[..exit].contains("hole_zero_filled = state.hole_zero_filled,"));
+        // A worker counts a hole only when its fill installed the page.
+        let worker = &source[source.find(concat!("impl Fault", "Worker {")).unwrap()..];
+        let counted = &worker[..worker.find("holes.fetch_add(1").unwrap()];
+        let condition = &counted[counted.rfind("if matches!(job.answer").unwrap()..];
+        assert!(
+            condition.contains("matches!(outcome, FaultOutcome::Resolved)"),
+            "a worker counts a hole another populator filled"
         );
     }
 
