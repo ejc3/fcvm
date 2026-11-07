@@ -888,6 +888,24 @@ mod tests {
         );
     }
 
+    /// fc-agent's FATAL and WARNING lines reach a log filtered to fcvm's own targets, once, at
+    /// WARN under fcvm::guest (#1080).
+    #[test]
+    fn cloud_hypervisor_console_logs_fc_agent_alerts_under_fcvm() {
+        use crate::utils::log_capture::logged;
+        let fatal = "[fc-agent] FATAL: clone restore failed closed (epoch=e): boom";
+        for filter in ["warn", "fcvm=info"] {
+            let log = logged(filter, || super::log_console_line(fatal));
+            assert_eq!(
+                log.matches("FATAL: clone restore").count(),
+                1,
+                "{filter}: {log:?}"
+            );
+        }
+        let console_target = logged("cloud-hypervisor=trace", || super::log_console_line(fatal));
+        assert!(!console_target.contains("FATAL"), "{console_target:?}");
+    }
+
     use super::*;
 
     /// A reboot relaunch finishes the old guest's console tail before it starts the new Cloud
