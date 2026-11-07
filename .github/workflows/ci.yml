@@ -562,7 +562,11 @@ jobs:
     name: Host-${{ matrix.arch }}
     needs: [changes, skip-check]
     if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
-    runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
+    # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
+    # attempt of a job that a spot reclaim killed is retried where no reclaim can end
+    # it again (#834).
+    runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
     # Longest of the last 6 successful runs: 12 min. GitHub's default is SIX HOURS, which is
     # how a wedged runner held a job all day on 2026-08-06 (one job stuck >5h) while the
     # AWS-side lease logic kept renewing its lease because GitHub still reported it busy.
@@ -835,7 +839,11 @@ jobs:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
     needs: [changes, skip-check]
     if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
-    runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
+    # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
+    # attempt of a job that a spot reclaim killed is retried where no reclaim can end
+    # it again (#834).
+    runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
     # Longest of the last 6 successful runs: 43 min (arm64 SnapshotEnabled, which runs the
     # whole suite twice, plus the nested + btrfs kernel builds). ~3x headroom.
     # See the Host job comment for why the 6h default is not acceptable here.
@@ -1126,7 +1134,11 @@ jobs:
     name: Container-${{ matrix.arch }}
     needs: [changes, skip-check]
     if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
-    runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
+    # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
+    # attempt of a job that a spot reclaim killed is retried where no reclaim can end
+    # it again (#834).
+    runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
     # Longest of the last 6 successful runs: 21 min. ~3x headroom.
     # See the Host job comment for why the 6h default is not acceptable here.
     timeout-minutes: 60

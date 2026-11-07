@@ -2883,3 +2883,31 @@ fn workflow_downloads_fail_on_http_errors() {
         missing.join("\n")
     );
 }
+
+/// #834: spot reclaims end self-hosted jobs mid-run, and the automatic rerun of
+/// such a job could land on spot capacity and die the same way. Once the fleet
+/// serves the `on-demand` label (ejc3/aws #802) and the repository variable
+/// ON_DEMAND_RERUNS is `true`, every self-hosted job asks for it on a rerun, and
+/// the first attempt keeps the plain labels any host can take.
+#[test]
+fn every_self_hosted_ci_job_asks_for_an_on_demand_host_on_a_rerun() {
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci["jobs"].as_mapping().expect("ci.yml has jobs");
+    let wanted = "${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && \
+                  format('[\"self-hosted\",\"Linux\",\"{0}\",\"on-demand\"]', matrix.arch) || \
+                  format('[\"self-hosted\",\"Linux\",\"{0}\"]', matrix.arch)) }}";
+    let mut self_hosted = 0;
+    for (name, job) in jobs {
+        let runs_on = format!("{:?}", job.get("runs-on"));
+        if !runs_on.contains("self-hosted") {
+            continue;
+        }
+        self_hosted += 1;
+        assert_eq!(
+            job["runs-on"].as_str(),
+            Some(wanted),
+            "ci.yml job {name:?} runs on {runs_on}"
+        );
+    }
+    assert_eq!(self_hosted, 3, "expected the three self-hosted matrix jobs");
+}
