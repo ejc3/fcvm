@@ -48,14 +48,21 @@ pub fn can_own_subvolume_snapshot_of(base_dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// A base disk with at most this many extents is reflinked into a clone rather than given
-/// to it as a subvolume snapshot. A subvolume snapshot commits a btrfs transaction, and
-/// holds its parent directory's lock until the commit ends: with four restores and four
-/// snapshots at once on a fleet host it took 193 ms at the median and 1.8 s at p99, against
+/// Files with at most this many extents in all are reflinked rather than taken as a
+/// subvolume snapshot: a clone's disks, and a diff snapshot's memory file and disks. A
+/// subvolume snapshot commits a btrfs transaction, and holds its parent directory's lock
+/// until the commit ends, so concurrent snapshots and restores queue on each other's
+/// commits; a file written in a subvolume made in the running transaction also commits it
+/// when it is fsynced. With four restores and four snapshots at once on a fleet host a
+/// clone's disk took 193 ms at the median and 1.8 s at p99 as a subvolume snapshot, against
 /// 17 ms and 192 ms for a reflink of a 684-extent disk (interleaved A/B, 120 restores per
-/// arm). A reflink costs one extent reference per extent, about 12 to 25 us each (a
-/// 860,177-extent disk took 9 to 11 s), so at this limit it stays near 100 ms.
-pub const REFLINK_MAX_EXTENTS: u64 = 4096;
+/// arm). Staging the next generation of a 256 MiB memory file of about 10,000 extents five
+/// times a second over 96 snapshots, then writing 2,000 pages into it and fsyncing it, took
+/// 378 ms at the median and 8.5 s at p99 with a subvolume snapshot, against 141 ms and
+/// 1.4 s with a reflink into a plain directory (450 of each, the second of two interleaved
+/// pairs). A reflink costs one extent reference per extent, about 5 to 25 us each (a
+/// 860,177-extent disk took 9 to 11 s), so at this limit it stays under about 0.8 s.
+pub const REFLINK_MAX_EXTENTS: u64 = 32768;
 
 /// `FCVM_REFLINK_MAX_EXTENTS` replaces [`REFLINK_MAX_EXTENTS`] when it holds a number. `0`
 /// gives every disk that has an extent the subvolume snapshot, which is how the tests of
@@ -73,6 +80,30 @@ fn reflink_max_extents(value: Option<&str>) -> u64 {
 /// to snapshot as a subvolume, at a limit of `limit` extents.
 fn reflink_is_cheaper(extents: Option<u64>, limit: u64) -> bool {
     matches!(extents, Some(n) if n <= limit)
+}
+
+/// Whether `files` (with at most [`REFLINK_MAX_EXTENTS`] extents in all, or the limit in
+/// [`REFLINK_MAX_EXTENTS_ENV`]) are cheaper to reflink than to take as a subvolume snapshot.
+/// False when they cannot be counted.
+pub fn files_are_cheaper_to_reflink(files: &[PathBuf]) -> bool {
+    let limit = reflink_max_extents(std::env::var(REFLINK_MAX_EXTENTS_ENV).ok().as_deref());
+    reflink_is_cheaper(
+        crate::storage::extents::extents_in_files_up_to(files, limit).ok(),
+        limit,
+    )
+}
+
+/// Create a directory for files reflinked into it: an ordinary directory when `few_extents`
+/// (a later copy reflinks them again, and a file fsynced in it commits nothing), else a
+/// subvolume where the store allows ([`create_dir_or_subvolume`]), which a later copy takes
+/// whole as a subvolume snapshot.
+pub async fn create_dir_for_reflinks(path: &Path, few_extents: bool) -> Result<()> {
+    if !few_extents {
+        return create_dir_or_subvolume(path).await;
+    }
+    fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 /// The extents a clone of `base_dir`'s disks would reflink: every file in it, the root disk

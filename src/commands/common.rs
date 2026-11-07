@@ -4526,6 +4526,24 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the VM's disks (`disk_path` and the extra disks) have few enough extents that the
+/// snapshot's disk directory is an ordinary one: its clones reflink them again, and a
+/// subvolume would commit a transaction for every snapshot of a clone that has one.
+async fn disks_are_cheaper_to_reflink(
+    disk_path: &Path,
+    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
+) -> Result<bool> {
+    let mut files = vec![disk_path.to_path_buf()];
+    files.extend(snapshot_config.metadata.extra_disks.iter().map(|d| {
+        paths::vm_runtime_dir(&snapshot_config.vm_id)
+            .join("disks")
+            .join(&d.filename)
+    }));
+    tokio::task::spawn_blocking(move || crate::storage::disk::files_are_cheaper_to_reflink(&files))
+        .await
+        .context("extent count task panicked")
+}
+
 /// Reflink the rootfs + any extra disks into the temp snapshot dir (instant btrfs CoW).
 /// Shared by the Firecracker and Cloud Hypervisor snapshot-create paths; the caller must
 /// have the VM paused so the disk image matches the captured memory.
@@ -4557,7 +4575,8 @@ async fn reflink_disks_to_snapshot(
             }
         }
     }
-    crate::storage::disk::create_dir_or_subvolume(&disk_dir)
+    let few_extents = disks_are_cheaper_to_reflink(disk_path, snapshot_config).await?;
+    crate::storage::disk::create_dir_for_reflinks(&disk_dir, few_extents)
         .await
         .context("creating the snapshot's disk directory")?;
     reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
@@ -5757,19 +5776,30 @@ pub async fn create_snapshot_core(
     // transaction commit. Any other snapshot directory is created as a subvolume where the
     // store allows, so that the snapshots taken after it can be staged that way. A parent
     // memory file of another length cannot take the diff in place, so it is not staged.
+    // A parent memory file of few extents is reflinked into an ordinary directory instead
+    // (`files_are_cheaper_to_reflink`): the subvolume snapshot commits a transaction, and
+    // concurrent snapshots queue on each other's commits.
     let parent_fits = base_memory_source
         .as_ref()
         .and_then(|base| std::fs::metadata(base).ok())
         .is_some_and(|meta| meta.len() == memory_bytes);
+    let parent_few_extents = match base_memory_source.clone() {
+        Some(base) if has_base => tokio::task::spawn_blocking(move || {
+            crate::storage::disk::files_are_cheaper_to_reflink(&[base])
+        })
+        .await
+        .context("extent count task panicked")?,
+        _ => false,
+    };
     let staged = match parent_snapshot_dir {
-        Some(parent_dir) if has_base && parent_fits => {
+        Some(parent_dir) if has_base && parent_fits && !parent_few_extents => {
             crate::storage::disk::stage_from_parent_subvolume(parent_dir, &temp_snapshot_dir)
                 .await?
         }
         _ => false,
     };
     if !staged {
-        crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+        crate::storage::disk::create_dir_for_reflinks(&temp_snapshot_dir, parent_few_extents)
             .await
             .context("creating temp snapshot directory")?;
     }
