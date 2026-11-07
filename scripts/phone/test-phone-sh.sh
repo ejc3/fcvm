@@ -344,7 +344,7 @@ case "\$*" in
     [ "\$cut" = never ] || echo "\$c" > "$B/top"
     if [ -n "\$cut" ]; then printf 'Starting: Intent { cmp=%s }\r\n' "\$c"; exit 255; fi
     printf 'Status: ok\r\nTotalTime: 123\r\n' ;;
-  "shell dumpsys activity activities") [ -s "$B/top" ] && printf '  topResumedActivity=ActivityRecord{44375846 u0 %s t9}\r\n' "\$(cat "$B/top")" ;;
+  "shell dumpsys activity activities") [ -e "$B/slow" ] && sleep 1; [ -s "$B/top" ] && printf '  topResumedActivity=ActivityRecord{44375846 u0 %s t9}\r\n' "\$(cat "$B/top")" ;;
 esac
 exit 0
 STUB
@@ -388,10 +388,21 @@ bact open_browser && [ "$(cat "$B/front")" = browser ] && grep -q "shown_ms=[0-9
   && ok "open_browser whose am output ends after Starting goes by the browser in front" \
   || bad "open_browser with am's output cut: $(cat "$dir/act.err" "$B/out")"
 echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo never > "$B/cut"
-if FRONT_WAIT_S=1 bact open_browser; then bad "open_browser succeeded with Robot Park in front"
+if FRONT_WAIT_MS=1000 bact open_browser; then bad "open_browser succeeded with Robot Park in front"
 elif [ "$(grep -c "shell am start -W -n org.cromite.cromite" "$B/adb.log")" = 2 ] && grep -q "did not come to the front (dev.fcvm.robotpark/.MainActivity is)" "$dir/act.err"; then
   ok "open_browser fails, naming what is in front, when the browser never comes to the front after a second start"
 else bad "open_browser with the browser never in front: $(cat "$dir/act.err" "$B/adb.log")"; fi
+# another of the browser's activities in front is not the tab open_browser asked for
+echo org.cromite.cromite/org.chromium.chrome.browser.settings.SettingsActivity > "$B/top"; echo never > "$B/cut"
+if FRONT_WAIT_MS=1000 bact open_browser; then bad "open_browser succeeded with the browser's settings in front"
+else ok "open_browser fails when another of the browser's activities is in front"; fi
+# with a slow activity manager (each dumpsys 1 s) two tries still end within the wait asked
+# for, so they fit in a take-over action's 20 s, rather than after a count of polls
+echo dev.fcvm.robotpark/.MainActivity > "$B/top"; touch "$B/slow"; t0=$(date +%s%3N)
+FRONT_WAIT_MS=1000 bact open_browser || true; t=$(( $(date +%s%3N) - t0 ))
+rm -f "$B/slow"
+[ "$t" -lt 8000 ] && ok "two starts with a slow activity manager end within their deadline ($t ms)" \
+  || bad "open_browser with a slow activity manager took $t ms"
 rm -f "$B/cut"; echo browser > "$B/front"; echo org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity > "$B/top"
 bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"
 adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}

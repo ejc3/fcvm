@@ -73,20 +73,30 @@ resumed_activity() {
   "$ADB" shell dumpsys activity activities 2> /dev/null | tr -d '\r' \
     | sed -n 's/.*topResumedActivity=ActivityRecord{[^ ]* [^ ]* \([^ }]*\).*/\1/p' | head -1
 }
-# `am start -W ARGS...` for an activity of package PKG, judged by the activity manager's top
-# resumed activity afterwards, not by am's output: in a clone restored from a snapshot, am's
-# output can end after its Starting line, with no Status line, while the activity does come to
-# the front (#1691). Waits FRONT_WAIT_S seconds (10) for PKG on top, then starts it once more
-# (an activity already on top takes the intent again). Prints am's output and FrontTime, the
-# milliseconds from the start to PKG on top; fails at once on am's Error line.
-am_front() { # pkg am-args...
-  local pkg=$1 out t0 _try; shift
+# `am start -W ARGS...`, judged by the activity manager's top resumed activity afterwards, not
+# by am's output: in a clone restored from a snapshot, am's output can end after its Starting
+# line, with no Status line (#1691). The activity wanted is the -n component exactly, else any
+# activity of the package an implicit start names last. Waits FRONT_WAIT_MS (4000) for it on
+# top, then starts it once more (an activity already on top takes the intent again), so two
+# tries fit in a take-over action's 20 s (src/fleet/agent/slot.rs). Prints am's output and
+# FrontTime, the milliseconds from the start to the activity on top; fails at once on am's
+# Error line.
+am_front() { # am-args...
+  local want out t0 top deadline _try
+  want=$(sed -n 's/.*-n \([^ ]*\).*/\1/p' <<< "$*")
+  [ -n "$want" ] || want="${*: -1}/"
   t0=$(ms)
   for _try in 1 2; do
     out=$("$ADB" shell am start -W "$@" 2>&1 | tr -d '\r') || true
     grep -q '^Error' <<< "$out" && break
-    for _ in $(seq 1 $(( ${FRONT_WAIT_S:-10} * 5 ))); do
-      [[ "$(resumed_activity)" == "$pkg/"* ]] && { printf '%s\nFrontTime: %s\n' "$out" "$(( $(ms) - t0 ))"; return 0; }
+    deadline=$(( $(ms) + ${FRONT_WAIT_MS:-4000} ))
+    while :; do
+      top=$(resumed_activity)
+      if [[ "$want" == */ && "$top" == "$want"* ]] || [ "$top" = "$want" ]; then
+        printf '%s\nFrontTime: %s\n' "$out" "$(( $(ms) - t0 ))"
+        return 0
+      fi
+      [ "$(ms)" -lt "$deadline" ] || break
       sleep 0.2
     done
   done
@@ -166,7 +176,7 @@ start_app() {
   # the app hides the system bars; without this Android covers the scene with a one-time hint
   "$ADB" shell settings put secure immersive_mode_confirmations confirmed > /dev/null 2>&1 || true
   "$ADB" logcat -c > /dev/null 2>&1 || true
-  out=$(am_front dev.fcvm.robotpark -n dev.fcvm.robotpark/.MainActivity) \
+  out=$(am_front -n dev.fcvm.robotpark/.MainActivity) \
     || { echo "am start: Robot Park is not in front ($(resumed_activity)): $(grep -m2 -E 'Error|Status|Starting' <<< "$out" | tr '\n' ' ')"; return 1; }
   "$ADB" forward tcp:"$CTL_PORT" localabstract:dev.fcvm.robotpark > /dev/null || { echo "adb forward failed"; return 1; }
   for _ in $(seq 1 100); do
@@ -228,7 +238,7 @@ open_page() {
     http_get "$DEVTOOLS_PORT" "/json/close/$id" > /dev/null 2>&1 || true
   done
   "$ADB" shell am force-stop "$BROWSER_PKG" > /dev/null 2>&1 || true
-  out=$(am_front "$BROWSER_PKG" -a android.intent.action.VIEW -d "$BROWSER_URL" "$BROWSER_PKG") \
+  out=$(am_front -a android.intent.action.VIEW -d "$BROWSER_URL" "$BROWSER_PKG") \
     || { echo "am start of the browser: it is not in front ($(resumed_activity)): $(grep -m2 -E 'Error|Status|Starting' <<< "$out" | tr '\n' ' ')"; return 1; }
   echo browser > "$RUN/front"
   shown_ms "$out" > "$RUN/shown"
@@ -402,7 +412,7 @@ action)
   front() { cat "$RUN/front" 2> /dev/null || echo app; }
   to_app() {
     [ "$(front)" = browser ] || return 0
-    am_front dev.fcvm.robotpark -n dev.fcvm.robotpark/.MainActivity > /dev/null \
+    am_front -n dev.fcvm.robotpark/.MainActivity > /dev/null \
       || { echo "phone.sh: Robot Park did not come to the front ($(resumed_activity) is)" >&2; exit 1; }
     echo app > "$RUN/front"
     if mirror_open; then restart_app; fi
@@ -444,7 +454,7 @@ action)
       # while it shows. The activity is named, not launched as from the home screen: a launch
       # from the home screen after a while away (and a clone's clock has moved on) opens a new
       # tab page instead of the tab.
-      out=$(am_front "$BROWSER_PKG" -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity") \
+      out=$(am_front -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity") \
         || { echo "phone.sh: the browser did not come to the front ($(resumed_activity) is): $out" >&2; exit 1; }
       echo browser > "$RUN/front"
       shown_ms "$out" > "$RUN/shown"
