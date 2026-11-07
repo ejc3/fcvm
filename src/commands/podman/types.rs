@@ -437,6 +437,11 @@ fn check_mount_order(mount_points: &[(String, String)]) -> Result<()> {
     let is_map = |argument: &str| argument.starts_with("--map ");
     for (earlier_at, (earlier, earlier_path)) in mount_points.iter().enumerate() {
         for (later, later_path) in &mount_points[earlier_at + 1..] {
+            // Where a `..` leads depends on symlinks in the guest, so such a pair is left to
+            // fc-agent's check at boot (`MountRecord::check_none_covered`).
+            if has_parent_component(earlier_path) || has_parent_component(later_path) {
+                continue;
+            }
             let (earlier_guest, later_guest) = (Path::new(earlier_path), Path::new(later_path));
             if earlier_guest == later_guest {
                 bail!(
@@ -764,6 +769,11 @@ mod tests {
             [
                 mount_point("--map /c:/data", "/data"),
                 mount_point("--disk /d.raw:/database", "/database"),
+            ],
+            // Where `..` leads is the guest's to resolve; fc-agent checks it at boot.
+            [
+                mount_point("--map /c:/mnt/outer/../conf", "/mnt/outer/../conf"),
+                mount_point("--disk /d.raw:/mnt/outer", "/mnt/outer"),
             ],
         ];
         for mount_points in accepted {
