@@ -278,11 +278,17 @@ pub struct FleetCoordArgs {
     pub camera_seed: u64,
 
     /// Key per-client limits by the CF-Connecting-IP header (set by Cloudflare in front of
-    /// the coordinator), or by x-fleet-viewer-ip on a request Access admitted with a service
-    /// token (the staging page's Worker forwarding a viewer); without this flag, by the
-    /// connection's peer address
+    /// the coordinator); without this flag, by the connection's peer address
     #[arg(long)]
     pub trust_cf_connecting_ip: bool,
+
+    /// Key a request Cloudflare Access admitted with a service token by its x-fleet-viewer-ip
+    /// header: the staging page's Worker forwards every viewer with one token. Only behind a
+    /// tunnel whose connector requires Access (access.required), which verifies the
+    /// Cf-Access-Jwt-Assertion this reads; anywhere a request can arrive without that check, a
+    /// caller could choose the address it is limited by
+    #[arg(long)]
+    pub access_viewer_address: bool,
 
     /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
     /// intent. Without it no verification is asked for (local runs).

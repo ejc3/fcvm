@@ -29,6 +29,7 @@ struct Opts {
     checker: Arc<dyn TextChecker>,
     verifier: Arc<dyn Verifier>,
     trust_cf: bool,
+    access_viewer: bool,
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
@@ -48,6 +49,7 @@ impl Default for Opts {
             checker: allow_all(),
             verifier: Arc::new(turnstile::Off),
             trust_cf: true,
+            access_viewer: false,
             ec2_local: None,
             dns: None,
             site_key: None,
@@ -77,6 +79,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         allowed_origins: vec!["https://wall.example".into()],
         verifier: o.verifier,
         trust_cf_connecting_ip: o.trust_cf,
+        access_viewer_address: o.access_viewer,
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
@@ -639,19 +642,26 @@ fn access_jwt(claims: Value) -> String {
 
 /// Through the staging page's Worker every viewer arrives with the Worker's
 /// `CF-Connecting-IP`; the viewer's own address is in `x-fleet-viewer-ip`, which counts only
-/// on a request Access admitted with a service token.
+/// with `--access-viewer-address` and only on a request Access admitted with a service token.
+/// Without the switch (a coordinator no connector verifies Access for), a forged service-token
+/// payload must not let a caller choose its address.
 #[tokio::test]
 async fn a_forwarded_viewer_address_counts_only_with_a_service_token() {
     let worker = "2001:db8::103";
     let service =
         access_jwt(json!({"type": "app", "common_name": "example-client.access", "email": ""}));
     let person = access_jwt(json!({"type": "app", "email": "viewer@example.test"}));
-    for (jwt, separate) in [
-        (Some(service.as_str()), true),
-        (Some(person.as_str()), false),
-        (None, false),
+    for (access_viewer, jwt, separate) in [
+        (true, Some(service.as_str()), true),
+        (true, Some(person.as_str()), false),
+        (true, None, false),
+        (false, Some(service.as_str()), false),
     ] {
-        let c = coordinator_with(Opts::default()).await;
+        let c = coordinator_with(Opts {
+            access_viewer,
+            ..Opts::default()
+        })
+        .await;
         let headers = |viewer: &'static str| {
             let mut h = vec![("cf-connecting-ip", worker), ("x-fleet-viewer-ip", viewer)];
             if let Some(j) = jwt {
@@ -673,7 +683,7 @@ async fn a_forwarded_viewer_address_counts_only_with_a_service_token() {
         } else {
             assert_eq!(
                 r["reason"], "one word per 5 s per client",
-                "jwt {jwt:?}: the header must not count: {r}"
+                "switch {access_viewer}, jwt {jwt:?}: the header must not count: {r}"
             );
         }
     }
@@ -1267,6 +1277,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
@@ -3024,6 +3035,7 @@ async fn page_url(handle: &Handle) -> String {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),

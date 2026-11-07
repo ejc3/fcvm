@@ -185,12 +185,14 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
-(only behind Cloudflare, which sets it), else the peer address. With that flag, a request
-that Cloudflare Access admitted with a service token (its `Cf-Access-Jwt-Assertion` names a
-`common_name` and no `email`) is counted by its `x-fleet-viewer-ip` header instead: the
-staging page's Worker forwards every viewer's `/live` with one service token, and its
-subrequests all arrive with the Worker's own `CF-Connecting-IP`. Reconnecting does not
-reset a limit.
+(only behind Cloudflare, which sets it), else the peer address. With
+`--access-viewer-address`, a request that Cloudflare Access admitted with a service token
+(its `Cf-Access-Jwt-Assertion` names a `common_name` and no `email`) is counted by its
+`x-fleet-viewer-ip` header instead: the staging page's Worker forwards every viewer's `/live`
+with one service token, and its subrequests all arrive with the Worker's own
+`CF-Connecting-IP`. The coordinator does not verify that JWT itself, so the switch belongs
+only behind a tunnel connector that requires Access (`access.required`), which does.
+Reconnecting does not reset a limit.
 
 **Races.** A race relaunches every tile at once and times both halves by the
 coordinator's clock. The owner sets the cadence (`--race-every <secs>`); `race.next_race_at`
@@ -564,7 +566,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
                   [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
-                 [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
+                 [--trust-cf-connecting-ip] [--access-viewer-address] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
