@@ -460,6 +460,30 @@ pub(crate) async fn stop_ns_helper(helper: &mut Option<NsHelper>) {
     }
 }
 
+/// `path` as an absolute path to an existing file, a relative one taken from `cwd` and
+/// symlinks resolved. A raw VM records its firmware in its state and in its snapshots, and a
+/// clone boots it again after a guest restart from wherever that clone was started, so a
+/// relative path would name another file there, or none.
+fn existing_file(path: &Path, cwd: &Path, flag: &str) -> Result<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = std::fs::canonicalize(&joined)
+        .with_context(|| format!("{flag} {}: no such file", path.display()))?;
+    anyhow::ensure!(resolved.is_file(), "{flag} {}: not a file", path.display());
+    Ok(resolved)
+}
+
+/// Make `vm run`'s firmware and disk absolute, from `cwd`, before anything records or uses
+/// them.
+fn resolve_vm_run_paths(args: &mut VmRunArgs, cwd: &Path) -> Result<()> {
+    args.firmware = existing_file(&args.firmware, cwd, "--firmware")?;
+    args.disk = existing_file(&args.disk, cwd, "--disk")?;
+    Ok(())
+}
+
 /// Refuse a `vm run` fcvm cannot boot, before anything is allocated.
 fn check_vm_run_args(args: &VmRunArgs, host_arch: &str) -> Result<()> {
     anyhow::ensure!(
@@ -493,7 +517,9 @@ fn check_vm_run_args(args: &VmRunArgs, host_arch: &str) -> Result<()> {
 
 /// `fcvm vm run`: boot a raw VM, supervise it until its VMM exits or a signal arrives, then
 /// tear it down.
-async fn cmd_vm_run(args: VmRunArgs) -> Result<()> {
+async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    resolve_vm_run_paths(&mut args, &cwd)?;
     check_vm_run_args(&args, std::env::consts::ARCH)?;
     validate_vm_name(&args.name).context("invalid VM name")?;
     let ch_bin = crate::commands::common::find_cloud_hypervisor()?;
@@ -1029,6 +1055,64 @@ mod tests {
         let mut missing = args(&[]);
         missing.disk = dir.path().join("absent.raw");
         assert!(refused(&missing, "x86_64").contains("--disk"));
+    }
+
+    /// `vm run`'s firmware and disk are made absolute from the directory it runs in before
+    /// anything records them, so a clone booting the firmware again from another directory
+    /// finds the same file; a missing one is refused.
+    #[test]
+    fn vm_run_records_absolute_firmware_and_disk_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("fw")).unwrap();
+        std::fs::write(dir.path().join("fw/CLOUDHV.fd"), b"fw").unwrap();
+        std::fs::write(dir.path().join("win.raw"), b"disk").unwrap();
+        let mut args = run_args(&[
+            "vm",
+            "run",
+            "--name",
+            "w0",
+            "--firmware",
+            "fw/../fw/CLOUDHV.fd",
+            "--disk",
+            "win.raw",
+            "--guest",
+            "windows",
+        ]);
+        resolve_vm_run_paths(&mut args, dir.path()).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(args.firmware, root.join("fw/CLOUDHV.fd"));
+        assert_eq!(args.disk, root.join("win.raw"));
+        assert!(args.firmware.is_absolute() && args.disk.is_absolute());
+
+        let mut missing = run_args(&[
+            "vm",
+            "run",
+            "--name",
+            "w0",
+            "--firmware",
+            "absent.fd",
+            "--disk",
+            "win.raw",
+            "--guest",
+            "windows",
+        ]);
+        let error = format!(
+            "{:#}",
+            resolve_vm_run_paths(&mut missing, dir.path()).unwrap_err()
+        );
+        assert!(error.contains("--firmware absent.fd"), "{error}");
+
+        let source = include_str!("vm.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let run = &code[code.find("async fn cmd_vm_run(").unwrap()..];
+        let resolved = run.find("resolve_vm_run_paths(&mut args, &cwd)?").unwrap();
+        let recorded = run
+            .find("vm_state.config.firmware = Some(args.firmware.clone())")
+            .unwrap();
+        assert!(
+            resolved < recorded,
+            "vm run records the firmware before resolving it"
+        );
     }
 
     /// Connect to the clock line at `addr`, read its line, and answer with `reply` (none
