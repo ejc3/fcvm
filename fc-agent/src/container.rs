@@ -240,7 +240,7 @@ pub fn mount_overlay_image(
     let mount_path = IMAGE_STORE_PATH;
     std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
 
-    wait_for_device(device)?;
+    crate::mounts::wait_for_device(device)?;
 
     let device_path = if store_user.is_some() {
         std::fs::create_dir_all(IMAGE_STORE_RAW_PATH)
@@ -387,24 +387,6 @@ fn mount_succeeded(output: &std::process::Output) -> Result<()> {
 }
 
 /// Wait for a block device to appear (up to 5 seconds).
-fn wait_for_device(device: &str) -> Result<()> {
-    let device_path = std::path::Path::new(device);
-    for attempt in 1..=10 {
-        if device_path.exists() {
-            return Ok(());
-        }
-        if attempt == 10 {
-            anyhow::bail!("Device {} not found after 10 attempts", device);
-        }
-        eprintln!(
-            "[fc-agent] waiting for device {} (attempt {}/10)",
-            device, attempt
-        );
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    Ok(())
-}
-
 /// Get storage.conf path, runroot, and graphroot for the given user.
 fn storage_paths(username: Option<&str>) -> (String, String, String) {
     if let Some(name) = username {

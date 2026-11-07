@@ -173,8 +173,19 @@ pub async fn sync_clock_from_host() -> Result<()> {
         "[fc-agent] host clock round trips {round_trips:?}; stepping to the {:?} one",
         reading.round_trip
     );
-    set_system_clock(&reading.host_time_ns, reading.read.elapsed());
+    let since = since_stamp(&reading, std::time::Instant::now());
+    set_system_clock(&reading.host_time_ns, since);
     Ok(())
+}
+
+/// How long before the step the host's clock read its stamp, taking the stamp to be at the
+/// middle of the round trip. The host stamps right after it accepts the connection, so the
+/// stamp lies between the guest's connect and the end of its read. Counting from the end of
+/// the read put the guest behind by any stall during the read, and counting from the connect
+/// would put it ahead by any delay before the accept; the middle is off by at most half the
+/// round trip either way (#1358).
+fn since_stamp(reading: &HostClockReading, now: std::time::Instant) -> std::time::Duration {
+    now.saturating_duration_since(reading.read) + reading.round_trip / 2
 }
 
 /// Set the system clock to the host's clock. Shared by both transports.
@@ -334,6 +345,27 @@ mod clock_tests {
             body.contains("set_system_clock(&reading.host_time_ns")
                 && !body.contains("advance_system_clock("),
             "the boot clock step must go both ways: {body}"
+        );
+        assert!(
+            body.contains("since_stamp(&reading,"),
+            "the boot clock step counts from the middle of the round trip: {body}"
+        );
+    }
+
+    /// The stamp is taken to be at the middle of the round trip: a reading whose read ended
+    /// 30 ms ago with a 100 ms round trip was stamped 80 ms ago, not 30 ms (the end of the read)
+    /// and not 130 ms (the connect).
+    #[test]
+    fn the_stamp_is_taken_at_the_middle_of_the_round_trip() {
+        let read = std::time::Instant::now();
+        let reading = HostClockReading {
+            host_time_ns: "1".to_string(),
+            read,
+            round_trip: std::time::Duration::from_millis(100),
+        };
+        assert_eq!(
+            since_stamp(&reading, read + std::time::Duration::from_millis(30)),
+            std::time::Duration::from_millis(80)
         );
     }
 

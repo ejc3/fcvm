@@ -14,8 +14,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::net::TcpListener;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,19 +65,11 @@ async fn egress_stress_impl(
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
-    // Allocate a unique port for this test (parallel test isolation)
-    let http_server_port = find_free_port()?;
-
     // Step 0: Start local HTTP server
-    println!(
-        "Step 0: Starting local HTTP server on port {}...",
-        http_server_port
-    );
-    let http_server = start_http_server(http_server_port).await?;
-    println!(
-        "  ✓ HTTP server started (PID: {})",
-        http_server.id().unwrap_or(0)
-    );
+    println!("Step 0: Starting local HTTP server...");
+    let http_server = start_http_server(network).await?;
+    let http_server_port = http_server.port;
+    println!("  ✓ HTTP server started on port {}", http_server_port);
 
     // Determine the URL that VMs will use to test egress.
     // Routed mode uses IPv6 — each clone has a unique IPv6, so return routing
@@ -158,7 +148,7 @@ async fn egress_stress_impl(
             stderr.lines().next().unwrap_or("")
         );
         common::kill_process(baseline_pid).await;
-        stop_http_server(http_server).await;
+        http_server.stop().await;
         anyhow::bail!("Baseline egress verification failed");
     }
     println!("  ✓ Baseline egress works");
@@ -181,7 +171,7 @@ async fn egress_stress_impl(
 
     if !output.status.success() {
         common::kill_process(baseline_pid).await;
-        stop_http_server(http_server).await;
+        http_server.stop().await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Snapshot creation failed: {}", stderr);
     }
@@ -277,7 +267,7 @@ async fn egress_stress_impl(
             common::kill_process(*pid).await;
         }
         common::kill_process(serve_pid).await;
-        stop_http_server(http_server).await;
+        http_server.stop().await;
         anyhow::bail!("No clones became healthy");
     }
 
@@ -393,7 +383,7 @@ async fn egress_stress_impl(
     }
     common::kill_process(serve_pid).await;
     println!("  Killed memory server");
-    stop_http_server(http_server).await;
+    http_server.stop().await;
     println!("  Stopped HTTP server");
 
     // Report results
@@ -414,61 +404,56 @@ async fn egress_stress_impl(
     }
 }
 
-/// Find a free port for the HTTP server (parallel test isolation)
-fn find_free_port() -> Result<u16> {
-    // Bind to [::]:0 for dual-stack port allocation
-    let listener = TcpListener::bind("[::]:0").context("binding to find free port")?;
-    let port = listener.local_addr()?.port();
-    // Drop the listener - there's a tiny race window but it's acceptable for tests
-    drop(listener);
-    Ok(port)
+/// The host HTTP server the clones fetch from: in this test process, on a port the kernel picks,
+/// on `0.0.0.0` for the IPv4 modes and `[::]` for routed mode, whose clones reach the host over
+/// IPv6. One socket on `[::]` would not serve both on a host with `net.ipv6.bindv6only=1`.
+///
+/// It used to be `python3 -m http.server` as a child process, stopped by one `kill()` after the
+/// assertions. A failed run returned before that and left the server listening, and where
+/// `python3` is a launcher the kill reached the launcher only (#1065). A server in this process
+/// stops when the test returns, however it returns.
+async fn start_http_server(network: &str) -> Result<common::LocalTestServer> {
+    let address = if network == "routed" { "::" } else { "0.0.0.0" };
+    common::LocalTestServer::start_on_available_port(address)
+        .await
+        .with_context(|| format!("starting the host HTTP server on {address}"))
 }
 
-/// Start a simple HTTP server using Python (dual-stack: IPv4 + IPv6)
-async fn start_http_server(port: u16) -> Result<tokio::process::Child> {
-    // Bind on :: for dual-stack (IPv4 via ::ffff: mapping + native IPv6)
-    let child = tokio::process::Command::new("python3")
-        .args(["-m", "http.server", &port.to_string(), "--bind", "::"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("starting Python HTTP server")?;
+/// The server stops when the test that started it returns before its cleanup. What is watched
+/// is its listening socket, not its port, which another test can take at once
+/// (`host_http_server_stops_when_its_test_returns_early` in test_rootless_ipv6.rs).
+#[tokio::test]
+async fn stress_http_server_stops_when_its_test_returns_early() -> Result<()> {
+    type Listener = std::sync::Weak<tokio::net::TcpListener>;
 
-    // Wait for server to start with retries (container environments may be slower)
-    for attempt in 1..=10 {
-        tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
-
-        let check = tokio::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &format!("http://[::1]:{}/", port),
-            ])
-            .output()
-            .await?;
-
-        if String::from_utf8_lossy(&check.stdout).trim() == "200" {
-            return Ok(child);
-        }
-
-        if attempt == 10 {
-            anyhow::bail!(
-                "HTTP server not responding on port {} after {} attempts",
-                port,
-                attempt
-            );
-        }
+    async fn fails_before_cleanup(seen: &mut Option<Listener>) -> Result<()> {
+        let server = start_http_server("rootless").await?;
+        *seen = Some(server.listener());
+        anyhow::ensure!(
+            seen.as_ref().is_some_and(|l| l.strong_count() > 0),
+            "the server's socket is not open while its test runs"
+        );
+        anyhow::bail!("a step failed before the cleanup");
     }
 
-    Ok(child)
-}
-
-/// Stop the HTTP server
-async fn stop_http_server(mut server: tokio::process::Child) {
-    let _ = server.kill().await;
+    let mut seen = None;
+    let error = fails_before_cleanup(&mut seen)
+        .await
+        .expect_err("the stand-in body returns an error");
+    anyhow::ensure!(
+        error.to_string() == "a step failed before the cleanup",
+        "{error:#}"
+    );
+    let listener = seen.context("the stand-in body did not start its server")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listener.strong_count() > 0 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the server's listening socket is still open 5s after its test returned"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
 }
 
 // get_host_primary_ip() is now in common::get_host_primary_ip()

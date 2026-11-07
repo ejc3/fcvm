@@ -3094,6 +3094,100 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
 /// of hanging the command until its caller runs out of wall clock.
 const PREPARE_HEALTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The disposable source stopped before its container became healthy: its VM exited, or its
+/// health monitor ended (it ends when it sees the container stopped). A type of its own, so
+/// [`run_prepare_loop`] can add the container's exit code to these outcomes and to no other.
+#[derive(Debug)]
+enum PrepareSourceStopped {
+    VmExited(std::process::ExitStatus),
+    MonitorStopped,
+}
+
+impl std::fmt::Display for PrepareSourceStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VmExited(status) => write!(
+                f,
+                "disposable prepare VM exited before the container became healthy: {status}"
+            ),
+            Self::MonitorStopped => {
+                write!(f, "health monitor stopped before prepare snapshot creation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrepareSourceStopped {}
+
+/// How many of the container's last output lines a failed `podman prepare` puts in its error.
+const PREPARE_ERROR_TAIL_LINES: usize = 20;
+
+/// How much of the end of the saved container log is read for those lines.
+const PREPARE_ERROR_TAIL_BYTES: u64 = 16 << 10;
+
+/// A failed prepare's error followed by the end of the container's output, and where the output
+/// fcvm kept is: `podman prepare` forwards none of it, and teardown copies it to `saved` and the
+/// lines before its last rotation to `rotated` (`common::save_vm_logs`). An error that named
+/// neither left the caller to guess the VM id.
+///
+/// The copies are in /tmp, where another local user can put something at those names before
+/// teardown writes them, so a path is read only when it is a regular file, opened without
+/// following a symlink or waiting on a FIFO.
+fn with_container_output(
+    error: anyhow::Error,
+    saved: &std::path::Path,
+    rotated: &std::path::Path,
+) -> anyhow::Error {
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::OpenOptionsExt;
+    let open_regular = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()
+            .filter(|file| file.metadata().is_ok_and(|m| m.is_file()))
+    };
+    let Some(mut file) = open_regular(saved) else {
+        return error;
+    };
+    let kept = if open_regular(rotated).is_some() {
+        format!(
+            "{}, and the lines before them in {}",
+            saved.display(),
+            rotated.display()
+        )
+    } else {
+        saved.display().to_string()
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(PREPARE_ERROR_TAIL_BYTES);
+    let mut bytes = Vec::new();
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err()
+    {
+        return error;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<std::borrow::Cow<'_, str>> = text.lines().map(Into::into).collect();
+    if start > 0 {
+        // The read began inside a line: mark the line as cut rather than drop it, so a last
+        // line longer than the read is still shown.
+        if let Some(first) = lines.first_mut() {
+            *first = format!("[...]{first}").into();
+        }
+    }
+    let tail = &lines[lines.len().saturating_sub(PREPARE_ERROR_TAIL_LINES)..];
+    if tail.is_empty() {
+        anyhow::anyhow!("{error:#}\nthe container printed nothing (its output file is {kept})")
+    } else {
+        anyhow::anyhow!(
+            "{error:#}\nthe container's last {} lines of output (the output fcvm kept is in {kept}):\n{}",
+            tail.len(),
+            tail.join("\n")
+        )
+    }
+}
+
 /// Resolve why the wait for the disposable source's first Healthy transition ended.
 ///
 /// Split out of [`run_prepare_loop`] so every outcome is exercised without a VM: the
@@ -3113,7 +3207,7 @@ where
         }
         status = vm_exited => {
             let status = status.context("waiting for disposable prepare VM")?;
-            bail!("disposable prepare VM exited before the container became healthy: {status}")
+            Err(PrepareSourceStopped::VmExited(status).into())
         }
         _ = tokio::time::sleep(budget) => {
             bail!(
@@ -3123,7 +3217,7 @@ where
             )
         }
         startup_ack = startup_rx => {
-            startup_ack.context("health monitor stopped before prepare snapshot creation")
+            startup_ack.map_err(|_| PrepareSourceStopped::MonitorStopped.into())
         }
     }
 }
@@ -3147,7 +3241,18 @@ async fn run_prepare_loop(
         PodmanLifecycle::Prepare(options) => options.ready_timeout,
         PodmanLifecycle::Run => PREPARE_HEALTH_BUDGET,
     };
-    let startup_ack = await_prepare_healthy(startup_rx, cancel, budget, vm_exited).await?;
+    let startup_ack = match await_prepare_healthy(startup_rx, cancel, budget, vm_exited).await {
+        Ok(startup_ack) => startup_ack,
+        // The container's exit is why its source stopped: say what it exited with.
+        Err(error) if error.downcast_ref::<PrepareSourceStopped>().is_some() => {
+            let code = read_container_exit_code(&ctx.container_exit_seen, &ctx.data_dir).await;
+            return Err(match code {
+                Some(code) => error.context(format!("the container exited with code {code}")),
+                None => error.context("the container reported no exit code"),
+            });
+        }
+        Err(error) => return Err(error),
+    };
 
     // The container is healthy, so the guest's agent is up. A cold boot with
     // --free-page-reporting is checked before the snapshot below is taken.
@@ -3445,6 +3550,15 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             unreachable!("prepare lifecycle never runs a cached snapshot")
         }
         VmPreparation::Active(mut ctx) => {
+            // Teardown copies the container's output here (`common::save_vm_logs`); a failed
+            // prepare's error ends with its last lines and names the file.
+            let saved_output = ctx.container_log.as_ref().map(|_| {
+                let tmp = std::path::Path::new("/tmp");
+                (
+                    super::common::saved_log_path(tmp, "container", &ctx.vm_id),
+                    super::common::saved_log_path(tmp, "container.1", &ctx.vm_id),
+                )
+            });
             let operation = async {
                 if cancel.is_cancelled() {
                     bail!("interrupted during disposable VM setup");
@@ -3456,6 +3570,12 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             .await;
 
             let cleanup = cleanup_vm_context_verified(*ctx).await;
+            let operation = match (operation, saved_output) {
+                (Err(error), Some((saved, rotated))) => {
+                    Err(with_container_output(error, &saved, &rotated))
+                }
+                (operation, _) => operation,
+            };
             let prepared = finish_prepare(operation, cleanup)?;
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -5226,6 +5346,140 @@ mod tests {
             )),
             "{message}"
         );
+    }
+
+    /// A failed prepare's error ends with the container's last lines of output and names the
+    /// file holding all of it: `podman prepare` forwards none of the output, and an error that
+    /// said only that the VM exited left the caller to find the file by the VM's id (#1027).
+    #[test]
+    fn a_failed_prepare_names_the_container_output_and_ends_with_its_last_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("fcvm-container-vm-x.log");
+        let rotated = dir.path().join("fcvm-container.1-vm-x.log");
+        let lines: Vec<String> = (0..30).map(|n| format!("stdout: line {n}")).collect();
+        std::fs::write(&saved, lines.join("\n") + "\n").unwrap();
+        let error = with_container_output(anyhow::anyhow!("the VM exited"), &saved, &rotated);
+        let message = format!("{error:#}");
+        assert!(message.starts_with("the VM exited\n"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "the container's last {PREPARE_ERROR_TAIL_LINES} lines of output (the output fcvm kept is in {}):",
+                saved.display()
+            )),
+            "{message}"
+        );
+        assert!(message.ends_with("stdout: line 29"), "{message}");
+        assert!(message.contains("stdout: line 10\n"), "{message}");
+        assert!(!message.contains("stdout: line 9\n"), "{message}");
+
+        // Output that rotated: the earlier lines' copy is named too.
+        std::fs::write(&rotated, "stdout: line -1\n").unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &saved, &rotated)
+        );
+        assert!(
+            message.contains(&format!(
+                "{}, and the lines before them in {}",
+                saved.display(),
+                rotated.display()
+            )),
+            "{message}"
+        );
+        std::fs::remove_file(&rotated).unwrap();
+
+        std::fs::write(&saved, "").unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &saved, &rotated)
+        );
+        assert!(
+            message.contains("the container printed nothing"),
+            "{message}"
+        );
+
+        // A last line longer than the bytes read is shown cut, not taken for no output.
+        let long = "y".repeat(2 * PREPARE_ERROR_TAIL_BYTES as usize);
+        std::fs::write(&saved, format!("stdout: {long}\n")).unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &saved, &rotated)
+        );
+        assert!(
+            message.contains("the container's last 1 lines of output")
+                && message.contains("[...]yyy"),
+            "{}",
+            &message[..200]
+        );
+
+        let gone = dir.path().join("missing.log");
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &gone, &rotated)
+        );
+        assert_eq!(message, "x", "a file teardown did not write is not named");
+
+        // Something another user left at the name is not read: a FIFO would block the open,
+        // a symlink would be followed.
+        let fifo = dir.path().join("fifo.log");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &fifo, &rotated)
+        );
+        assert_eq!(message, "x", "a FIFO is not read");
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(&saved, &link).unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &link, &rotated)
+        );
+        assert_eq!(message, "x", "a symlink is not followed");
+    }
+
+    /// The outcomes in which the source stopped (its VM exited, or its health monitor ended on
+    /// seeing the container stopped) carry their own type, so the prepare loop adds the
+    /// container's exit code to them and to nothing else. A container that exits ends the
+    /// monitor first: the prepare sanity test saw that outcome, not the VM exit.
+    #[tokio::test(start_paused = true)]
+    async fn the_outcomes_where_the_source_stopped_are_told_apart() {
+        use std::os::unix::process::ExitStatusExt;
+        let stopped =
+            |error: &anyhow::Error| error.downcast_ref::<PrepareSourceStopped>().is_some();
+
+        let (_startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let vm_exited = await_prepare_healthy(
+            startup_rx,
+            &CancellationToken::new(),
+            PREPARE_HEALTH_BUDGET,
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+        )
+        .await
+        .expect_err("the VM exited");
+        assert!(stopped(&vm_exited), "{vm_exited:#}");
+
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        drop(startup_tx);
+        let monitor_ended = await_prepare_healthy(
+            startup_rx,
+            &CancellationToken::new(),
+            PREPARE_HEALTH_BUDGET,
+            std::future::pending::<Result<std::process::ExitStatus>>(),
+        )
+        .await
+        .expect_err("the monitor ended");
+        assert!(stopped(&monitor_ended), "{monitor_ended:#}");
+
+        let (_startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let timed_out = await_prepare_healthy(
+            startup_rx,
+            &CancellationToken::new(),
+            PREPARE_HEALTH_BUDGET,
+            std::future::pending::<Result<std::process::ExitStatus>>(),
+        )
+        .await
+        .expect_err("the budget ran out");
+        assert!(!stopped(&timed_out), "{timed_out:#}");
     }
 
     #[tokio::test(start_paused = true)]

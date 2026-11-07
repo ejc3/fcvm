@@ -829,8 +829,9 @@ async fn check_health_once(
                 }
                 Some(url_str) => {
                     // HTTP health check
-                    let url = url::Url::parse(url_str)
-                        .with_context(|| format!("parsing health check URL: {}", url_str))?;
+                    // A snapshot made before the scheme was checked at parse time can
+                    // still carry an https URL; it fails here with the same message.
+                    let url = parse_health_check_url(url_str)?;
                     let (port, health_path) = probe_port_and_path(&url);
                     let net = &state.config.network;
 
@@ -1248,13 +1249,26 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// The port and the path, query included, that a health check URL asks for.
-///
-/// The probe is plain HTTP in every mode, so the URL's scheme only picks the port when the
-/// URL names none. A fragment is not part of a request.
+/// Parse a `--health-check` URL. The probe is plain HTTP in every network mode, so a URL with
+/// any other scheme is refused: `https://host/health` was probed as plain HTTP on port 443,
+/// which a TLS server answers with an error, and the VM read unhealthy with nothing naming the
+/// cause (#958).
+pub fn parse_health_check_url(text: &str) -> Result<url::Url> {
+    let url = url::Url::parse(text).with_context(|| format!("parsing health check URL: {text}"))?;
+    anyhow::ensure!(
+        url.scheme() == "http",
+        "health check URL {text}: the probe is plain HTTP, so the URL must start with http://, \
+         not {}://",
+        url.scheme()
+    );
+    Ok(url)
+}
+
+/// The port and the path, query included, that a health check URL asks for: the URL's port,
+/// or HTTP's 80. A fragment is not part of a request.
 fn probe_port_and_path(url: &url::Url) -> (u16, &str) {
     (
-        url.port_or_known_default().unwrap_or(80),
+        url.port().unwrap_or(80),
         &url[url::Position::BeforePath..url::Position::AfterQuery],
     )
 }
@@ -1655,31 +1669,44 @@ mod tests {
         );
     }
 
-    /// The probe asks for what the health check URL asks for: its port, or the scheme's
-    /// default when it names none, and its path with the query. A fragment never reaches a
-    /// server.
+    /// The probe asks for what the health check URL asks for: its port, or HTTP's 80 when it
+    /// names none, and its path with the query. A fragment never reaches a server.
     #[test]
-    fn bridged_probe_url_keeps_the_query_and_the_schemes_default_port() {
+    fn bridged_probe_url_keeps_the_query_and_the_default_port() {
         let net = crate::network::NetworkConfig {
             host_ip: Some("10.73.23.93".to_string()),
             ..Default::default()
         };
         let probed: Vec<String> = [
             "http://localhost:8080/ready?full=1&source=fcvm",
-            "https://myapp.example.com/status",
+            "http://myapp.example.com/status",
             "http://localhost/health?x=1#top",
         ]
         .iter()
-        .map(|text| bridged_probe_url(&net, &url::Url::parse(text).unwrap()).unwrap())
+        .map(|text| bridged_probe_url(&net, &parse_health_check_url(text).unwrap()).unwrap())
         .collect();
         assert_eq!(
             probed,
             [
                 "http://10.73.23.94:8080/ready?full=1&source=fcvm",
-                "http://10.73.23.94:443/status",
+                "http://10.73.23.94:80/status",
                 "http://10.73.23.94:80/health?x=1",
             ]
         );
+    }
+
+    /// A URL the plain-HTTP probe cannot honour is refused with a message that says so, also
+    /// when it reaches the monitor from a snapshot made before the check at parse time.
+    #[test]
+    fn a_health_check_url_that_is_not_http_is_refused() {
+        for text in ["https://myapp.example.com/status", "ftp://host/x"] {
+            let message = format!("{:#}", parse_health_check_url(text).unwrap_err());
+            assert!(
+                message.contains("plain HTTP") && message.contains(text),
+                "{message}"
+            );
+        }
+        assert!(parse_health_check_url("http://localhost:8080/").is_ok());
     }
 
     const PROXY_PROBE_CHILD: &str = "FCVM_TEST_HEALTH_PROXY_PROBE_CHILD";

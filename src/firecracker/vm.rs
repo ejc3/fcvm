@@ -670,23 +670,17 @@ impl Drop for VmManager {
 }
 
 /// Log one line Firecracker printed: from its stderr, or from its stdout, which is the guest's
-/// serial console. A guest kernel crash headline goes to WARN under `fcvm::guest`
-/// (`log_kernel_crash_headline`); fc-agent's lines and container output to INFO (WARN from
-/// stderr); everything else to DEBUG.
+/// serial console. A console line fcvm keeps above DEBUG goes under fcvm's own targets
+/// (`log_console_line_under_fcvm`); a stderr line naming fc-agent to WARN; everything else to
+/// DEBUG under `firecracker`.
 fn log_firecracker_line(clean: &str, is_stderr: bool) {
-    if !is_stderr && crate::utils::log_kernel_crash_headline(clean) {
-        return;
-    }
-    let is_important = crate::utils::console_line_is_important(clean);
     if is_stderr {
-        if is_important {
+        if crate::utils::console_line_is_important(clean) {
             warn!(target: "firecracker", "{}", clean);
         } else {
             debug!(target: "firecracker", "{}", clean);
         }
-    } else if is_important {
-        info!(target: "firecracker", "{}", clean);
-    } else {
+    } else if !crate::utils::log_console_line_under_fcvm(clean) {
         debug!(target: "firecracker", "{}", clean);
     }
 }
@@ -1027,6 +1021,40 @@ mod tests {
         );
         assert!(refused.contains("FCVM_FIRECRACKER_LOG_LEVEL"), "{refused}");
         assert!(seen.is_none(), "Firecracker must not be spawned: {seen:?}");
+    }
+
+    /// fc-agent's console lines reach a log filtered to fcvm's own targets (RUST_LOG=fcvm=info),
+    /// and its errors fcvm's default log ("warn"). They were logged under `firecracker`, outside
+    /// `fcvm`, so both filters dropped them (#1104). Kernel messages and vitals samples stay
+    /// out of RUST_LOG=fcvm=debug, which job logs use.
+    #[test]
+    fn agent_console_lines_are_logged_under_fcvm() {
+        use crate::utils::log_capture::logged;
+        let agent = "[fc-agent] run_agent starting";
+        let error = "[fc-agent] Error: mounting FUSE volumes: Read-only file system (os error 30)";
+        let kernel = "[    1.234567] virtio_net virtio1 eth0: link up";
+        let vitals = "[fcvm-vitals] MemFree: 646880 kB";
+        let all = || {
+            for line in [agent, error, kernel, vitals] {
+                super::log_firecracker_line(line, false);
+            }
+        };
+        let info = logged("fcvm=info", all);
+        assert_eq!(info.matches("run_agent starting").count(), 1, "{info:?}");
+        assert_eq!(info.matches("mounting FUSE volumes").count(), 1, "{info:?}");
+        let default = logged("warn", all);
+        assert!(default.contains("mounting FUSE volumes"), "{default:?}");
+        assert!(!default.contains("run_agent starting"), "{default:?}");
+        let debug = logged("fcvm=debug", all);
+        assert!(
+            !debug.contains("virtio_net") && !debug.contains("MemFree"),
+            "a kernel message or a vitals sample under fcvm: {debug:?}"
+        );
+        let console = logged("firecracker=debug", all);
+        assert!(
+            console.contains("virtio_net") && console.contains("MemFree"),
+            "{console:?}"
+        );
     }
 
     /// A guest kernel's panic line reaches fcvm's default log (RUST_LOG unset is "warn") and a

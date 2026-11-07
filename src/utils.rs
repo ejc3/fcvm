@@ -446,6 +446,46 @@ fn printk_timestamps(line: &str) -> Vec<(usize, usize)> {
     found
 }
 
+/// Target of the guest console lines fcvm logs at INFO and WARN: fc-agent's
+/// lines. It is under `fcvm`, so a log filtered to fcvm's own targets
+/// (RUST_LOG=fcvm=info) keeps them. The other console lines stay at DEBUG under
+/// the VMM's target (`firecracker`, `cloud-hypervisor`), outside `fcvm`, so
+/// RUST_LOG=fcvm=debug does not add every kernel message and every 10 s
+/// `[fcvm-vitals]` sample of every VM to a job log (#1104).
+pub const CONSOLE_TARGET: &str = "fcvm::console";
+
+/// Whether an agent line reports an error: fc-agent's fatal block (`FATAL ERROR`,
+/// and `Error:` from its `fatal_error_line`) and its `ERROR:` lines. These are
+/// WARN, so fcvm's default filter (`warn`) shows why a guest failed.
+fn console_line_is_an_agent_error(clean: &str) -> bool {
+    clean.find("[fc-agent] ").is_some_and(|at| {
+        let message = &clean[at + "[fc-agent] ".len()..];
+        ["FATAL ERROR", "ERROR", "Error: "]
+            .iter()
+            .any(|word| message.starts_with(word))
+    })
+}
+
+/// Log a guest console line under fcvm's own targets when it is one fcvm keeps
+/// above DEBUG, and say whether it was: a kernel crash headline at WARN under
+/// `fcvm::guest`, an agent error at WARN and the agent's other lines at INFO
+/// under [`CONSOLE_TARGET`]. A line this returns false for is the caller's to
+/// log at DEBUG under the VMM's own target.
+pub fn log_console_line_under_fcvm(clean: &str) -> bool {
+    if log_kernel_crash_headline(clean) {
+        return true;
+    }
+    if !console_line_is_important(clean) {
+        return false;
+    }
+    if console_line_is_an_agent_error(clean) {
+        tracing::warn!(target: "fcvm::console", "{}", clean);
+    } else {
+        tracing::info!(target: "fcvm::console", "{}", clean);
+    }
+    true
+}
+
 /// Log `clean` at WARN under `fcvm::guest` when it is a guest kernel crash
 /// headline, and say whether it was. The console's own targets (`firecracker`,
 /// `cloud-hypervisor`) are outside `fcvm`, so a log filtered to fcvm's targets
