@@ -8371,6 +8371,18 @@ mod tests {
             .spawn()
             .unwrap();
         let expected = std::fs::canonicalize(which::which("sleep").unwrap()).unwrap();
+        // spawn() can return while /proc/<pid>/exe still names this test binary:
+        // under the full suite on a loaded host the read below saw it on both tries.
+        // The VMM a snapshot records has been running for seconds, so wait for the exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_link(format!("/proc/{}/exe", process.id()))
+            .ok()
+            .as_deref()
+            != Some(expected.as_path())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let config = build_snapshot_config(
             &state,
             "key",

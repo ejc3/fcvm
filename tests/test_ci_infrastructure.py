@@ -589,7 +589,8 @@ class StrayVmGuardTests(unittest.TestCase):
             [["kill", "-9", "--", "100"], ["kill", "-9", "--", "200"]],
         )
         self.assertIn(
-            "killed 2 process group(s), still live after SIGKILL and 0s: 1", result.stdout
+            "killed 2 process group(s) and 0 started after the kill, still live after SIGKILL and 0s: 1",
+            result.stdout,
         )
         self.assertIn("Unkillable microVMs", result.stdout)
         after_report = log_dir / "stray-vm-threads-post-after.tsv"
@@ -608,18 +609,47 @@ class StrayVmGuardTests(unittest.TestCase):
             "300 301 250 S tokio-rt-worker\n"
         )
         result, _log_dir, _ps_calls, sudo_calls, _elapsed = self.run_guard(
-            before, ps_output_after=after, dry_run=False, outer_timeout=20
+            before,
+            ps_output_after=after,
+            ps_output_later="250 250 1 S cargo-nextest\n",
+            dry_run=False,
+            outer_timeout=20,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Unkillable microVMs", result.stdout)
-        self.assertIn("still live after SIGKILL and 0s: 0", result.stdout)
+        self.assertIn(
+            "killed 1 process group(s) and 1 started after the kill, still live after SIGKILL and 0s: 0",
+            result.stdout,
+        )
         self.assertIn("started after the kill", result.stdout)
         self.assertIn("tgid 300: parent 250 (cargo-nextest)", result.stdout)
         commands = [shlex.split(line) for line in sudo_calls.splitlines()]
         self.assertCountEqual(
             commands, [["kill", "-9", "--", "100"], ["kill", "-9", "--", "300"]]
         )
+
+    def test_a_group_started_after_the_kill_that_does_not_die_is_unkillable(self) -> None:
+        """A late group is killed like the others and then checked like them: one
+        that is still alive after its SIGKILL is a survivor, whatever started it."""
+        before = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        late = "300 300 1 S firecracker\n300 301 1 D fc_vcpu 0\n"
+        result, _log_dir, _ps_calls, sudo_calls, _elapsed = self.run_guard(
+            before,
+            ps_output_after=late,
+            ps_output_later=late,
+            dry_run=False,
+            outer_timeout=20,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Unkillable microVMs", result.stdout)
+        self.assertIn(
+            "killed 1 process group(s) and 1 started after the kill, still live after SIGKILL and 0s: 1",
+            result.stdout,
+        )
+        commands = [shlex.split(line) for line in sudo_calls.splitlines()]
+        self.assertIn(["kill", "-9", "--", "300"], commands)
 
     def test_a_group_that_finishes_exiting_within_the_grace_is_not_unkillable(self) -> None:
         """A killed firecracker's last thread unmaps the guest's memory before the
@@ -640,7 +670,10 @@ class StrayVmGuardTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Unkillable microVMs", result.stdout)
-        self.assertIn("still live after SIGKILL and 10s: 0", result.stdout)
+        self.assertIn(
+            "killed 1 process group(s) and 0 started after the kill, still live after SIGKILL and 10s: 0",
+            result.stdout,
+        )
 
     def test_evidence_is_captured_per_tid_before_the_kill_and_for_survivors(self) -> None:
         """The August 2026 wedge was diagnosed by hand from /proc stacks that were
