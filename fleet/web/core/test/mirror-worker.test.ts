@@ -309,6 +309,11 @@ describe("the mirror worker", () => {
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(after), { timeout: 2000 });
     expect(last()!.posts).toBe(16);
     expect(last()!.stamp).toBeNull();
+    // a held frame: the stamp's top bit says the app drew its held layout; k is the rest
+    stampRow = (0x8000_0000 | 61_000) >>> 0;
+    ws.message(await msg(posts(15)));
+    await settle();
+    await vi.waitFor(() => expect(last()?.stamp?.k).toBe(61_000), { timeout: 2000 });
     stampRow = null;
     z.close();
   });

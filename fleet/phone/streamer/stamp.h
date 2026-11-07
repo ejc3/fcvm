@@ -9,6 +9,10 @@
 #define STAMP_ROWS 8
 #define STAMP_CELLS 32
 #define STAMP_FPS 60
+// The stamp's top bit: the app drew the frame in its held layout (a viewer holds the phone):
+// the whole screen, its bars lifted above the band, so the band shows below them. The frame
+// number is the other 31 bits.
+#define STAMP_HELD_BIT 0x80000000u
 
 // Reads the stamp of a top-down RGBA screen (`stride` bytes a row): the middle row of the
 // bottom band, the middle pixel of each cell. True and *k set when every cell is clean

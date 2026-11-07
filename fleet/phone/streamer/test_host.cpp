@@ -122,6 +122,34 @@ int main() {
     j = Json::parse(phone_header_json(s, "avc1.64001f", 30, "std", 600000));
     CHECK(j.at("layout_generation").type == Json::Null && j.at("phone").at("picture").str == "screen", "screen header");
   }
+  {  // a held frame (the stamp's held bit): the whole screen with the band cropped, timed by its
+     // stamp, and never placed as a scene frame, whether or not the streamer's scene says held
+    for (const char* body : {"{\"epoch_unix_ms\":1000,\"rect\":{\"x\":0.25,\"y\":0,\"w\":0.25,\"h\":1},"
+                             "\"image_aspect\":2.25,\"layout_generation\":3}",
+                             "{\"epoch_unix_ms\":1000,\"rect\":{\"x\":0.25,\"y\":0,\"w\":0.25,\"h\":1},"
+                             "\"image_aspect\":2.25,\"layout_generation\":3,\"mirror_viewer\":\"v\"}"}) {
+      PhoneScene sc = parsed(body);
+      double now = 1000 + 60000.0;  // t = 60 s
+      PhoneFrame f = phone_frame(true, 3600u | STAMP_HELD_BIT, now, sc);
+      CHECK(f.kind == PhonePicture::Held && f.k == 3600, "held bit: kind %d k %u", (int)f.kind, f.k);
+      PhoneGeo g = phone_frame_geometry(f, W, H, sc);
+      CHECK(!g.scene && g.crop_bottom == 8 && g.full_w == 720 && g.full_h == 1280 && g.x0 == 0 && g.y0 == 0 &&
+                g.layout_generation == -1,
+            "held geo scene %d crop %d full %dx%d at %d,%d", g.scene, g.crop_bottom, g.full_w, g.full_h, g.x0, g.y0);
+      Json j = Json::parse(phone_header_json(g, "avc1.64001f", 30, "std", 600000));
+      CHECK(j.at("phone").at("picture").str == "screen" && j.at("crop").at("bottom").num == 8, "held header");
+      FrameGate gate(30);
+      double t = 0;
+      CHECK(gate.admit_frame(f, now, sc, &t) && t == 60.0 && gate.held == 1 && gate.scene == 0 && gate.screen == 0,
+            "a held frame is admitted as held at its stamp's t: t %.3f held %llu", t, (unsigned long long)gate.held);
+      // odd frame numbers are not dropped for a held frame (a scene frame's 1/30 s grid)
+      CHECK(gate.admit_frame(phone_frame(true, 3603u | STAMP_HELD_BIT, now + 50, sc), now + 50, sc, &t) && t == 3603.0 / 60,
+            "a held odd frame: t %.3f", t);
+      CHECK(phone_frame(true, 3600u, now, sc).kind == PhonePicture::Scene, "without the bit, a scene frame");
+      CHECK(phone_frame(true, 9u | STAMP_HELD_BIT, now, sc).kind == PhonePicture::Screen, "an implausible held stamp");
+      CHECK(phone_frame(false, 3600u | STAMP_HELD_BIT, now, sc).kind == PhonePicture::Screen, "no stamp");
+    }
+  }
   {  // a re-tile: a frame the app drew before rect_from_frame is placed by previous_rect
     PhoneScene sc = parsed("{\"epoch_unix_ms\":1000,\"rect\":{\"x\":0.5,\"y\":0,\"w\":0.5,\"h\":1},\"image_aspect\":1.125,"
                            "\"layout_generation\":4,\"rect_from_frame\":300,\"previous_rect\":{\"x\":0,\"y\":0,\"w\":0.5,\"h\":1}}");
