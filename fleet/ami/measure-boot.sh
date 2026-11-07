@@ -12,10 +12,10 @@
 # The instance is terminated at the end. Fleet-account credentials in the environment.
 set -euo pipefail
 KIND=$1; AMI=$2
-REGION=${REGION:-us-east-1}
+REGION=${REGION:-us-west-2}   # off the staging fleet's region and quota (us-east-1)
 A() { aws --region "$REGION" "$@"; }
 now_ms() { date +%s%3N; }
-# The instance is a G instance in the wall's host region: it goes through the wall's reserve.
+# The instance is a G instance: in the wall's host region (us-east-1) it goes through the wall's reserve.
 say() { echo "measure-boot: $*" >&2; }
 now() { date +%s; }
 BUCKET=fcvm-fleet-assets-$(aws sts get-caller-identity --query Account --output text)
@@ -40,7 +40,10 @@ room_for "$mkt" "$vcpus" || exit 1
 # Like the coordinator, an AZ that has no capacity is skipped; the time spent on refusals
 # is reported apart (capacity wait) and the clock starts at the request that was accepted.
 tw=$(now_ms); id=""
-for az in ${AZS:-a b c d f}; do
+# Zones: AZS, or those of the region that offer the type, in order.
+[ -n "${AZS:-}" ] || AZS=$(A ec2 describe-instance-type-offerings --location-type availability-zone \
+  --filters Name=instance-type,Values=$type --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sed "s/^$REGION//" | sort | paste -sd' ')
+for az in $AZS; do
   subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
   t0=$(now_ms)
   admit_held || { say "the admission lock was broken, or held too long to launch under it; nothing launched"; exit 1; }

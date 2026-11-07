@@ -16,10 +16,10 @@
 #   build-ami.sh put-url <key>              presigned PUT URL for s3://<assets>/<key> (6 h)
 #   build-ami.sh get-url <key>              presigned GET URL for s3://<assets>/<key> (6 h)
 #
-# Environment: REGION (default us-east-1), SUBNET (default: the fleet subnet in us-east-1a),
+# Environment: REGION (default us-west-2), SUBNET (default: the fleet subnet in <REGION>a),
 # BASE_AMI (launch from an earlier fleet AMI instead of Ubuntu 24.04, to revise it).
 set -euo pipefail
-REGION=${REGION:-us-east-1}
+REGION=${REGION:-us-west-2}   # off the staging fleet's region and quota (us-east-1)
 HERE=$(cd "$(dirname "$0")" && pwd)
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=fcvm-fleet-assets-$ACCOUNT
@@ -28,7 +28,7 @@ S3REGION=${S3REGION:-us-east-2}   # the asset bucket is in the home region
 S3() { aws --region "$S3REGION" "$@"; }
 say() { echo "build-ami: $*" >&2; }
 now() { date +%s; }
-# A builder is a G instance in the wall's host region: it goes through the wall's reserve.
+# A builder is a G instance: in the wall's host region (us-east-1) it goes through the wall's reserve.
 # shellcheck source=../tools/g-admission.sh
 . "$HERE/../tools/g-admission.sh"
 

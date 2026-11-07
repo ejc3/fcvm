@@ -1,8 +1,9 @@
 # fleet/ami
 
-The fleet's two machine images, built in the fcvm-fleet account (us-east-1) by
-`build-ami.sh` and copied to us-west-2 when published, and `fleet/tools/gpubox.sh`, which
-leases a GPU host for one agent's work.
+The fleet's two machine images, built in the fcvm-fleet account in us-west-2 (the factory, and
+`build-ami.sh` by default) and copied to us-east-1, the staging fleet's region, when published,
+and `fleet/tools/gpubox.sh`, which leases a GPU host for one agent's work. Every G instance that
+is not the staging fleet's own runs in us-west-2, off staging's quota.
 
 ## Continuous image factory
 
@@ -76,14 +77,16 @@ fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, l
   the instance shut itself down (`Client.InstanceInitiatedShutdown`).
 - Region: us-west-2 unless `GPUBOX_REGION` says otherwise. The staging fleet runs in
   us-east-1, and a box there takes the quota its GPU host and tiles need, so agents and the
-  nightly dogfood use us-west-2, which holds a copy of every published host image (ejc3/aws
-  `fcvm-fleet-ami-release.tf`; the region-by-region ids are in SSM
-  `/fcvm-fleet/ami-release-copies`, us-east-1). `up` picks the newest available host image in
-  its region, so a release whose copy is still pending launches the previous one there.
+  nightly dogfood use us-west-2, where the image factory builds every host image (ejc3/aws
+  `fcvm-fleet-ami-pipeline.tf`; the release's ids in both regions are in SSM
+  `/fcvm-fleet/ami-release-copies`, us-east-1). `up` launches the release's host image for its
+  region from that record, or, where the record names none, the newest validated host image
+  there; never a candidate the factory has built but not released.
 - Spot first in every AZ of the region that offers g4dn.metal (us-west-2: a, b, c), then on
   demand. Quota per region: G spot 192 vCPU (two g4dn.metal at once), G on demand 384 vCPU
   (four). Only in us-east-1 does `up` go through the wall's reserve and admission lock
-  (`fleet/tools/g-admission.sh`); us-west-2 has no fleet host to leave room for.
+  (`fleet/tools/g-admission.sh`, which `build-ami.sh` and `measure-boot.sh` source too); us-west-2
+  has no fleet host to leave room for.
 - It acts only on instances tagged `Purpose=fcvm-fleet-gpubox`; the fleet's hosts, groups
   and services are never touched. The fcvm in the AMI is the commit in its name; build your
   own commit on the box (`/home/ubuntu/fcvm`, `make build`) when you need another.

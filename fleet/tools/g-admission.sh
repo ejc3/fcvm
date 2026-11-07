@@ -17,7 +17,18 @@
 # third gpubox launched by a checkout without the reserve, in the second the wall woke, left
 # the staging smoke with no fcvm tile. A check that cannot read the quota, the usage, the lock
 # or the ledger refuses.
-ADMISSION_TAG='{Key=fcvm-admission,Value=wall-reserve}'
+#
+# Only the staging region (us-east-1, the wall's host region) has a reserve. A launch anywhere
+# else (agents' gpuboxes, the image factory's builders, boot measurements: us-west-2) takes no
+# lock, writes no ledger entry and is tagged fcvm-admission=outside-staging; ejc3/aws denies an
+# untagged G launch only in us-east-1. The caller sets REGION before sourcing this file.
+GA_STAGING_REGION=us-east-1
+ga_staging() { [ "${REGION:?g-admission.sh needs REGION}" = "$GA_STAGING_REGION" ]; }
+if ga_staging; then
+  ADMISSION_TAG='{Key=fcvm-admission,Value=wall-reserve}'
+else
+  ADMISSION_TAG='{Key=fcvm-admission,Value=outside-staging}'
+fi
 WALL_RESERVE_spot=96
 WALL_RESERVE_ondemand=128
 QUOTA_CODE_spot=L-3819A6DF
@@ -52,6 +63,7 @@ quota_of() {
 reserve_of() { if [ "$1" = spot ]; then echo $WALL_RESERVE_spot; else echo $WALL_RESERVE_ondemand; fi; }
 # room_for MARKET VCPUS: 0 when that many fit and still leave the wall's reserve.
 room_for() {
+  ga_staging || return 0
   local quota usage ledger used reserve
   reserve=$(reserve_of "$1")
   quota=$(quota_of "$1") && usage=$(g_usage "$1") && ledger=$(ledger_recent) \
@@ -76,6 +88,7 @@ ADMIT_ETAG=""
 ADMIT_AT=0
 S3A() { aws --region "$S3REGION" "$@"; }
 admit_lock() {
+  ga_staging || return 0
   local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) f held etag at
   f=$(mktemp)
   while :; do
@@ -102,6 +115,7 @@ admit_lock() {
 # Whether the lock is still the one this `up` took, and young enough that nobody can break it
 # as stale before the launch is in the ledger (half of ADMIT_STALE_S, about 150 s of margin).
 admit_held() {
+  ga_staging || return 0
   local e
   [ $(( $(now) - ADMIT_AT )) -lt $(( ADMIT_STALE_S / 2 )) ] || return 1
   e=$(S3A s3api head-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --query ETag --output text 2>/dev/null) || return 1
@@ -128,6 +142,7 @@ ledger_recent() {
   rm -f "$f" "$f.err"
 }
 ledger_add() { # id market vcpus
+  ga_staging || return 0
   local recent
   recent=$(ledger_recent) || return 1
   { [ -z "$recent" ] || echo "$recent"; echo "$(now) $1 $2 $3"; } | S3A s3 cp --only-show-errors - "s3://$BUCKET/$ADMIT_LEDGER"

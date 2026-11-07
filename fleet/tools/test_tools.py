@@ -4,6 +4,7 @@ No GPU, coordinator or image library: fake servers on loopback ports the kernel 
 
     make -C fleet/tools test
 """
+import json
 import os
 import socket
 import subprocess
@@ -202,7 +203,8 @@ echo "$*" | tr '\n' ' ' >> "$FAKE_LOG"; echo >> "$FAKE_LOG"
 args=" $* "
 case "$args" in
   *" sts get-caller-identity "*) echo 123456789012 ;;
-  *" ec2 describe-images "*) echo ami-fake ;;
+  *" ec2 describe-images "*"--image-ids "*) echo "${FAKE_IMAGE_STATE:-available}" ;;
+  *" ec2 describe-images "*) case "$args" in *tag:FleetImageValidated,Values=true*) echo ami-fake ;; *) echo ami-unvalidated ;; esac ;;
   *" ec2 describe-security-groups "*) echo sg-fake ;;
   *" ec2 describe-subnets "*) [ -z "${FAKE_SLOW_SUBNETS:-}" ] || sleep 3; echo subnet-fake ;;
   *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
@@ -239,6 +241,9 @@ case "$args" in
       case "$args" in *" ${t%:*} "*)
         case "$args" in *"InstanceTypes[].["*) printf '%s\t%s\n' "${t%:*}" "${t#*:}" ;; *) echo "${t#*:}" ;; esac ;; esac
     done ;;
+  *" ssm get-parameter "*"/fcvm-fleet/ami-release-copies"*)
+    [ -n "${FAKE_RELEASE_RECORD:-}" ] || { echo "An error occurred (ParameterNotFound)" >&2; exit 254; }
+    echo "$FAKE_RELEASE_RECORD" ;;
   *" ssm get-parameter "*) echo ami-ubuntu ;;
   *" ec2 wait "*) : ;;
   *" ssm describe-instance-information "*) echo Online ;;
@@ -288,7 +293,7 @@ class GpuboxWallReserve(unittest.TestCase):
         env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
                    FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
                    FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
-                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **{"GPUBOX_REGION": "us-east-1", "GPUBOX_AZS": "a", **extra})
+                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **{"GPUBOX_REGION": "us-east-1", "REGION": "us-east-1", "GPUBOX_AZS": "a", "AZS": "a", **extra})
         env = {k: v for k, v in env.items() if v is not None}
         cmd = cmd or ["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"]
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
@@ -421,8 +426,7 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertIn("admit_held", src)
                 self.assertIn("ledger_add ", src)
                 self.assertIn("admit_abandon", src)
-                # gpubox.sh adds it only in the staging region, the one that has the reserve.
-                self.assertRegex(src, r'\$ADMISSION_TAG\]|adm=",\$ADMISSION_TAG"')
+                self.assertIn("$ADMISSION_TAG]", src)
 
     def test_usage_counts_each_type_s_default_vcpus(self):
         # The quota charges a type's default vCPUs whatever the CPU options: one g4dn.metal and
@@ -486,7 +490,7 @@ class GpuboxWallReserve(unittest.TestCase):
         r, launches, _ = self.up(spot_in_use=boxes(2), od_in_use=boxes(4), GPUBOX_REGION="us-west-2")
         self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
         self.assertEqual(r.stdout.split(), ["i-fakebox", "us-west-2"])
-        self.assertNotIn("fcvm-admission", launches[0], "a launch outside the staging region skipped the reserve")
+        self.assertIn("{Key=fcvm-admission,Value=outside-staging}", launches[0])
         for call in r.calls:
             self.assertNotIn("service-quotas", call)
             self.assertNotIn("gpubox/admission.lock", call)
@@ -497,8 +501,10 @@ class GpuboxWallReserve(unittest.TestCase):
             with self.subTest(region=region):
                 r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION=region)
                 self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
-                # STS is global and the asset bucket's S3 has its own region (us-east-2).
-                regional = [c for c in r.calls if not c.startswith("sts ") and " s3 " not in f" {c} " and " s3api " not in f" {c} "]
+                # STS is global, the asset bucket's S3 has its own region (us-east-2), and the release
+                # record is one parameter in us-east-1.
+                regional = [c for c in r.calls if not c.startswith("sts ") and " s3 " not in f" {c} " and " s3api " not in f" {c} "
+                            and not c.startswith("--region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-release-copies ")]
                 self.assertTrue(any(" run-instances " in c for c in regional))
                 for call in regional:
                     self.assertTrue(call.startswith(f"--region {region} "), call)
@@ -551,6 +557,34 @@ class GpuboxWallReserve(unittest.TestCase):
         self.assertGreater(pin, 0, "run.sh does not pin the gpubox region")
         self.assertLess(pin, run.index('claude -p "/nightly-dogfood"'), "the pin comes after the session starts")
         self.assertIn('bash fleet/tools/gpubox.sh down "$a" ${b:+"$b"}', run)
+
+    def test_ami_launchers_in_us_west_2_never_consult_the_staging_reserve(self):
+        # The image factory's and the boot measurements' G instances run in us-west-2 by default.
+        for cmd, word in ((["bash", os.path.join(HERE, "..", "ami", "build-ami.sh"), "launch", "host"], "build"),
+                          (["bash", os.path.join(HERE, "..", "ami", "measure-boot.sh"), "host", "ami-x"], "measure")):
+            with self.subTest(launcher=word):
+                r, launches, _ = self.up(od_in_use=boxes(4), spot_in_use=boxes(2), cmd=cmd, REGION=None, AZS=None,
+                                         FAKE_OFFER_AZS="us-west-2a", FAKE_USAGE_FAIL="1")
+                self.assertEqual(len(launches), 1, r.stderr)
+                self.assertTrue(launches[0].startswith("--region us-west-2 "), launches[0])
+                self.assertIn("{Key=fcvm-admission,Value=outside-staging}", launches[0])
+                for call in r.calls:
+                    self.assertNotIn("service-quotas", call)
+                    self.assertNotIn("gpubox/admission.lock", call)
+                    self.assertNotIn("gpubox/admitted", call)
+
+    def test_up_launches_the_live_releases_image_in_its_region(self):
+        record = json.dumps({"images": {"us-east-1": {"host": "ami-" + "1" * 17}, "us-west-2": {"host": "ami-" + "2" * 17}}})
+        for region, want in (("us-west-2", "ami-" + "2" * 17), ("us-east-1", "ami-" + "1" * 17)):
+            with self.subTest(region=region):
+                r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION=region, FAKE_RELEASE_RECORD=record)
+                self.assertEqual(len(launches), 1, r.stderr)
+                self.assertIn(f"--image-id {want} ", launches[0])
+        # No record (or its image not available yet): the newest validated image, never a candidate.
+        for extra in ({}, {"FAKE_RELEASE_RECORD": record, "FAKE_IMAGE_STATE": "pending"}):
+            r, launches, _ = self.up(od_in_use=boxes(3), GPUBOX_REGION="us-west-2", **extra)
+            self.assertEqual(len(launches), 1, r.stderr)
+            self.assertIn("--image-id ami-fake ", launches[0])
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
