@@ -6,9 +6,9 @@ import { Potato } from "./_wall/Potato.tsx";
 import { Wall } from "./_wall/Wall.tsx";
 
 // The coordinator's /live URL is read per request, so one build serves any fleet. With the
-// coordinator's Access service token set on the Worker, the page tries the coordinator's own
-// host first (directUrl: the browser may hold an Access session there, and it is the faster
-// path) and then its own origin, which the Worker forwards (core/live-proxy.ts, worker.ts).
+// coordinator's Access service token set on the Worker, the page tries FLEET_DIRECT_COORD_URL
+// first (directUrl: a hostname in the page's own Access application, the faster path) and
+// then its own origin, which the Worker forwards (core/live-proxy.ts, worker.ts).
 export const dynamic = "force-dynamic";
 
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {

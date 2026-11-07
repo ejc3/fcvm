@@ -96,8 +96,9 @@ to the page only gets Access's login redirect on its `/live` upgrade to the coor
 With the Worker secrets `FLEET_ACCESS_CLIENT_ID` and `FLEET_ACCESS_CLIENT_SECRET` (a service
 token the coordinator's application admits; the deploy uploads them from its environment) the
 Worker (`worker.ts`) forwards `/live` and `/poster.jpg`, and nothing else, to
-`FLEET_COORD_URL`'s host (`core/live-proxy.ts`). The page then tries the coordinator's own
-host first, which is the faster path when the browser holds an Access session there, and its
+`FLEET_COORD_URL`'s host (`core/live-proxy.ts`). The page then tries `FLEET_DIRECT_COORD_URL`
+first, the coordinator's `/live` on a hostname in the page's own Access application, whose
+eager redirect cookie gives the browser a session there at sign-in (the faster path), and its
 own origin next: a socket that fails before opening, or has not opened within
 `LIVE_OPEN_DEADLINE_MS`, moves on at once, and a reconnect goes back to the URL that worked
 (`core/net.ts`, `afterLiveFailure`). The poster always comes from the page's origin.
