@@ -34,6 +34,12 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+# This runs as root from corpus_extra's sealed runtime bundle, whose files and
+# directory are mode 0555 and checked at the campaign's end. Root writes past
+# 0555, so importing phase_supervisor would leave a __pycache__ directory in
+# the bundle and fail that check ("runtime directory './__pycache__' has mode
+# 0755"); sudo drops PYTHONDONTWRITEBYTECODE from the environment.
+sys.dont_write_bytecode = True
 
 import phase_supervisor  # noqa: E402
 
