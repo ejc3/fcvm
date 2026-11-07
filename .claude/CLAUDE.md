@@ -2824,7 +2824,15 @@ fcvm snapshot run --pid <serve_pid> --name clone1
     sends the job back to the handler, which decides it again as it does a parked fault's
     retry, and every REMOVE of a read is recorded before any fault of that read is
     answered. Faults on pages the balloon gave back, parked faults, fault-around (which
-    turns the workers off) and minor mode stay on the handler. Measured on a 32 GiB,
+    turns the workers off), minor mode and every fault while working-set replay runs stay
+    on the handler (#1694): replay copies from the handler's task between drains, so a fault
+    answered there goes ahead of it, while one handed to a worker waited behind the replay
+    workers' copies and reads. Measured in one session against handing them over, on the
+    same 32 GiB guest: under page cache pressure with reads limited to 200 MiB/s, healthy in
+    7.5 to 8.0 s against 91.8 s; with 16 processes allocating 1 GiB each during replay, 8.4 to
+    8.5 s against 9.8 to 10.0 s; with no recorded set (no replay) unchanged, 12.6 to 13.2 s
+    against 12.6 to 12.9 s. Sending only faults on uncached sources to the workers during
+    replay won the allocation case (8.4 to 8.5 s) but not the pressure case (91.8 s). Measured on a 32 GiB,
     32-vCPU guest whose first heavy allocation after a restore reclaimed its page cache
     (6.5 M faults, memory file evicted, 1 ms read latency): 21.0 to 21.5 s with one event
     per read and no workers, 12.7 to 13.1 s with 8 to 32 workers; the same work run again
