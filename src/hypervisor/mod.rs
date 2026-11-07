@@ -55,6 +55,14 @@ pub enum Backend {
     CloudHypervisor,
 }
 
+impl Backend {
+    /// For `#[serde(skip_serializing_if)]` on fields whose Firecracker value existed
+    /// before the field did.
+    pub fn is_firecracker(&self) -> bool {
+        *self == Backend::Firecracker
+    }
+}
+
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

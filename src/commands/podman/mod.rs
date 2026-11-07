@@ -38,7 +38,7 @@ pub(crate) use listeners::{
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
-    CreateSnapshotParams, ExistingGeneration, SnapshotInstall,
+    CreateSnapshotParams, ExistingGeneration, SnapshotInstall, SnapshotVmm,
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
@@ -379,10 +379,6 @@ fn snapshot_cache_opt_out(args: &RunArgs, env_no_snapshot: bool) -> bool {
         // the base image's disk, not the captured one, and a restore cannot make the two
         // agree.
         || args.rootfs_override.is_some()
-        // Cloud Hypervisor supports explicit `snapshot create`/`run` (P2), but the
-        // automatic pre-start snapshot cache for `podman run` is not wired up for CH yet
-        // (a follow-on) — so never enter the snapshot-cache / restore path for it here.
-        || args.hypervisor == crate::cli::args::Hypervisor::CloudHypervisor
         || env_no_snapshot
 }
 
@@ -2907,13 +2903,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    let fc_backend = ctx
-                        .vm_manager
-                        .as_any()
-                        .downcast_ref::<FirecrackerBackend>()
-                        .context("snapshot creation requires the Firecracker backend")?;
                     let snap = CreateSnapshotParams::cache_entry(
-                        fc_backend,
+                        SnapshotVmm::of(ctx.vm_manager.as_ref())?,
                         key,
                         // Taken before the workload starts and shared between targets.
                         BalloonRequirement::Any,
@@ -3074,13 +3065,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // The diff parent is resolved inside create_podman_snapshot under
                         // the per-VM snapshot lock (re-read from the state file), so a
                         // concurrent `fcvm snapshot create` cannot leave us with a stale base.
-                        let fc_backend = ctx
-                            .vm_manager
-                            .as_any()
-                            .downcast_ref::<FirecrackerBackend>()
-                            .context("snapshot creation requires the Firecracker backend")?;
                         let snap = CreateSnapshotParams::cache_entry(
-                            fc_backend,
+                            SnapshotVmm::of(ctx.vm_manager.as_ref())?,
                             &startup_key,
                             BalloonRequirement::StartedAt(ctx.args.balloon),
                             &ctx.vm_state,
@@ -3344,7 +3330,7 @@ async fn run_prepare_loop(
         .downcast_ref::<FirecrackerBackend>()
         .context("podman prepare requires the Firecracker backend")?;
     let snap = CreateSnapshotParams {
-        vm_manager: fc_backend,
+        vm_manager: SnapshotVmm::Firecracker(fc_backend),
         snapshot_key: &target.name,
         content_key: &target.content_key,
         snapshot_type: target.snapshot_type,
@@ -5342,9 +5328,10 @@ mod tests {
         args.rootfs_override = Some(std::path::PathBuf::from("disk-only.raw"));
         assert!(snapshot_cache_opt_out(&args, false));
 
+        // A Cloud Hypervisor run uses the cache like a Firecracker one (#806).
         let mut args = baseline();
         args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor;
-        assert!(snapshot_cache_opt_out(&args, false));
+        assert!(!snapshot_cache_opt_out(&args, false));
 
         assert!(snapshot_cache_opt_out(&baseline(), true));
     }

@@ -85,12 +85,37 @@ pub(super) fn balloon_text(target: Option<u32>) -> String {
     }
 }
 
+/// The VM a cache snapshot is taken of. A Firecracker VM is driven through its backend's
+/// client; a Cloud Hypervisor VM through its own API client at the VM's socket, which
+/// the creator opens from the VM's state.
+#[derive(Clone, Copy)]
+pub enum SnapshotVmm<'a> {
+    Firecracker(&'a FirecrackerBackend),
+    CloudHypervisor,
+}
+
+impl<'a> SnapshotVmm<'a> {
+    /// The running VM behind the hypervisor trait.
+    pub fn of(vm: &'a dyn crate::hypervisor::Hypervisor) -> Result<Self> {
+        match vm.backend() {
+            crate::hypervisor::Backend::Firecracker => Ok(Self::Firecracker(
+                vm.as_any()
+                    .downcast_ref::<FirecrackerBackend>()
+                    .context("a Firecracker VM's backend is not FirecrackerBackend")?,
+            )),
+            crate::hypervisor::Backend::CloudHypervisor => Ok(Self::CloudHypervisor),
+        }
+    }
+}
+
 /// Parameters for cache snapshot creation.
 ///
 /// Uses VmState as the single source of truth for snapshot metadata,
 /// ensuring fields like `original_vsock_vm_id` are always preserved correctly.
 pub struct CreateSnapshotParams<'a> {
-    pub vm_manager: &'a FirecrackerBackend,
+    /// The running VM: Firecracker, or Cloud Hypervisor for a pre-start or startup
+    /// snapshot of a `podman run --hypervisor cloud-hypervisor`.
+    pub vm_manager: SnapshotVmm<'a>,
     /// Directory name the generation is installed under, and its `config.name`.
     pub snapshot_key: &'a str,
     /// Content-addressed key whose content this generation holds. Equals `snapshot_key`
@@ -114,7 +139,7 @@ impl CreateSnapshotParams<'_> {
     /// is the key, the entry is prunable cache, and another process winning the race is
     /// a reusable result.
     pub fn cache_entry<'a>(
-        vm_manager: &'a FirecrackerBackend,
+        vm_manager: SnapshotVmm<'a>,
         snapshot_key: &'a str,
         balloon: BalloonRequirement,
         vm_state: &'a VmState,
@@ -265,8 +290,18 @@ pub async fn create_podman_snapshot(
 
     info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
 
-    // Get Firecracker client
-    let client = vm_manager.client().context("VM not started")?;
+    // The Firecracker client, for a Firecracker VM. A Cloud Hypervisor VM is driven by
+    // its own API client at the same socket path when it is saved, below.
+    let client = match vm_manager {
+        SnapshotVmm::Firecracker(backend) => Some(backend.client().context("VM not started")?),
+        SnapshotVmm::CloudHypervisor => {
+            anyhow::ensure!(
+                source_disposition == crate::commands::common::SnapshotSourceDisposition::Resume,
+                "a Cloud Hypervisor snapshot always resumes its source VM"
+            );
+            None
+        }
+    };
 
     // A startup snapshot is named for the balloon target its workload initialized
     // under. `fcvm balloon` can change the target while the workload initializes,
@@ -276,7 +311,8 @@ pub async fn create_podman_snapshot(
     // per-VM snapshot lock, which a set takes too, so the target cannot change
     // between here and the save. It runs before the pause, so a VM whose snapshot
     // is not taken is not disturbed.
-    if let BalloonRequirement::StartedAt(started_at) = *balloon {
+    // `fcvm balloon` refuses a Cloud Hypervisor VM, so its target is the one it started with.
+    if let (BalloonRequirement::StartedAt(started_at), Some(client)) = (*balloon, client) {
         let now = client
             .balloon_target_mib()
             .await
@@ -337,6 +373,23 @@ pub async fn create_podman_snapshot(
     let parent_dir = parent_snapshot_key
         .as_deref()
         .map(|key| paths::snapshot_dir().join(key));
+    let Some(client) = client else {
+        // Cloud Hypervisor: always a full snapshot, and the source resumes.
+        let ch_client = crate::hypervisor::cloud_hypervisor::api::ChClient::new(
+            paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
+        );
+        crate::commands::common::create_snapshot_ch(
+            &ch_client,
+            snapshot_config,
+            disk_path,
+            &vsock_socket_path,
+            Some(&extra_files),
+        )
+        .await?;
+        drop(_vm_lock);
+        drop(_generation_locks);
+        return Ok(SnapshotInstall::Created);
+    };
     let published_memory = crate::commands::common::create_snapshot_core(
         client,
         snapshot_config,
@@ -498,6 +551,7 @@ pub(super) fn build_firecracker_config(
         fuse_trace_rate: boot_inputs.fuse_trace_rate,
         fuse_max_write: boot_inputs.fuse_max_write,
         no_writeback_cache: boot_inputs.no_writeback_cache,
+        hypervisor: args.hypervisor.into(),
     }
 }
 
