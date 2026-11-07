@@ -3164,12 +3164,23 @@ async fn cmd_snapshot_run_inner(
     // (with a possibly non-privileged port → insecure); other modes connect
     // with the guest IP like a baseline VM.
     vm_state.config.nfs_shares = snapshot_config.metadata.nfs_shares.clone();
+    let mut nfs_host_ip = None;
     if !vm_state.config.nfs_shares.is_empty() {
         let bridged_veth_ip = setup
             .network_mut()
             .as_any()
             .downcast_ref::<BridgedNetwork>()
             .and_then(|net| net.veth_inner_ip().map(str::to_string));
+        // The guest remounts its shares at this clone's own host address, not the
+        // snapshot's gateway. The kernel reuses an NFS client for a mount whose server
+        // address matches one it holds, and a share the restored workload still holds
+        // open keeps the snapshot's client alive under the snapshot's identity, which
+        // every twin clone shares: the server let one twin mount and hung the other
+        // (#1009). A new address makes a new client, which takes the clone's own
+        // identity (`fresh_nfs_client_identity` in fc-agent).
+        if bridged_veth_ip.is_some() {
+            nfs_host_ip = network_config.host_ip.clone();
+        }
         let (client_spec, insecure) = match (bridged_veth_ip, network_config.guest_ip.clone()) {
             (Some(ip), _) => (ip, true),
             (None, Some(ip)) => (ip, false),
@@ -3522,6 +3533,9 @@ async fn cmd_snapshot_run_inner(
     if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
         restore_latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
     }
+    if let Some(ref ip) = nfs_host_ip {
+        restore_latest["nfs-host-ip"] = serde_json::Value::String(ip.clone());
+    }
     // The command the guest runs in the container before this clone is published
     // (`--on-restore`, recorded in the snapshot's metadata). Carried here, per
     // restore, so it is no part of the snapshot's cache key.
@@ -3578,6 +3592,7 @@ async fn cmd_snapshot_run_inner(
         network_config: &network_config,
         restore_epoch: &restore_epoch,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
+        nfs_host_ip: nfs_host_ip.clone(),
         track_dirty_pages: needs_dirty_tracking,
         firecracker_choice,
         balloon_target_mib: args.balloon,
