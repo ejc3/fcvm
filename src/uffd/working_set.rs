@@ -270,7 +270,14 @@ impl PageSet {
     /// Sets built for different image sizes merge over their overlap; the caller validates
     /// sizes, this just refuses to read or write out of bounds.
     pub fn union_from(&mut self, other: &PageSet) -> u64 {
+        self.merge_from(other).0
+    }
+
+    /// [`PageSet::union_from`], also saying whether the set changed: a granule was added or a
+    /// first-touch time became earlier.
+    pub fn merge_from(&mut self, other: &PageSet) -> (u64, bool) {
         let mut added = 0u64;
+        let mut times_changed = false;
         let common = self.words.len().min(other.words.len());
         for i in 0..common {
             let before = self.words[i];
@@ -285,18 +292,20 @@ impl PageSet {
                     else {
                         continue;
                     };
-                    self.first[granule] = if before & (1u64 << (granule % 64)) == 0 {
+                    let merged = if before & (1u64 << (granule % 64)) == 0 {
                         *time
                     } else {
                         earlier(*mine, *time)
                     };
+                    times_changed |= merged != *mine;
+                    self.first[granule] = merged;
                 }
             }
             let after = before | theirs;
             added += (after & !before).count_ones() as u64;
             self.words[i] = after;
         }
-        added
+        (added, added > 0 || times_changed)
     }
 
     /// The set split by first-touch tier: one bitmap per tier, earliest first, each holding the
@@ -744,7 +753,7 @@ pub struct WorkingSetStore {
     lock_path: PathBuf,
     key: ImageKey,
     mem_len: u64,
-    known: Mutex<PageSet>,
+    known: Arc<Mutex<PageSet>>,
     /// `known` split by first-touch tier, for replay. Splitting a large set scans every
     /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
     /// and on a thread of its own after the set changes, never on a clone's fault path.
@@ -760,6 +769,8 @@ struct OrderedTiers {
     /// The version `tiers` was split from.
     split_from: u64,
     tiers: Option<Arc<Vec<PageSet>>>,
+    /// A splitting thread runs. It splits again when the union changed while it worked.
+    splitting: bool,
 }
 
 impl WorkingSetStore {
@@ -857,8 +868,9 @@ impl WorkingSetStore {
                 version: 0,
                 split_from: 0,
                 tiers: Some(Arc::new(known.by_first_touch())),
+                splitting: false,
             })),
-            known: Mutex::new(known),
+            known: Arc::new(Mutex::new(known)),
         })
     }
 
@@ -922,27 +934,40 @@ impl WorkingSetStore {
         tiers
     }
 
-    /// Split the union again on a thread of its own after it changed. A split that a later
-    /// change made stale is dropped.
-    fn resplit_after_change(&self, known: &PageSet) {
-        let version = {
+    /// Split the union again after it changed, on one thread at a time: a change that arrives
+    /// while a split runs makes that thread split again when it finishes, so a burst of
+    /// changes costs one thread and at most one stale split. The thread copies the union
+    /// itself, after the caller has released it.
+    fn resplit_after_change(&self) {
+        {
             let mut ordered = self.ordered.lock().expect("working set order mutex");
             ordered.version += 1;
-            ordered.version
-        };
-        let set = known.clone();
+            if ordered.splitting {
+                return;
+            }
+            ordered.splitting = true;
+        }
+        let known = self.known.clone();
         let ordered = self.ordered.clone();
         let spawned = std::thread::Builder::new()
             .name("fcvm-ws-order".into())
-            .spawn(move || {
+            .spawn(move || loop {
+                let version = ordered.lock().expect("working set order mutex").version;
+                let set = known.lock().expect("working set mutex").clone();
                 let tiers = Arc::new(set.by_first_touch());
                 let mut ordered = ordered.lock().expect("working set order mutex");
                 if ordered.version == version {
                     ordered.split_from = version;
                     ordered.tiers = Some(tiers);
+                    ordered.splitting = false;
+                    return;
                 }
             });
         if let Err(error) = spawned {
+            self.ordered
+                .lock()
+                .expect("working set order mutex")
+                .splitting = false;
             debug!(target: "uffd", %error, "the working-set order split runs on the next clone instead");
         }
     }
@@ -954,9 +979,14 @@ impl WorkingSetStore {
 
     /// Add one clone's observations to the in-process union without touching the filesystem.
     fn remember(&self, observed: &PageSet) -> u64 {
-        let mut known = self.known.lock().expect("working set mutex");
-        let added = known.union_from(observed);
-        self.resplit_after_change(&known);
+        let (added, changed) = self
+            .known
+            .lock()
+            .expect("working set mutex")
+            .merge_from(observed);
+        if changed {
+            self.resplit_after_change();
+        }
         added
     }
 
@@ -1052,8 +1082,11 @@ impl WorkingSetStore {
         let added = merged.union_from(observed);
         let total = merged.len();
         // The union holds everything on disk, so it differs from the file only when it gained
-        // granules or an earlier first-touch time.
-        let changed = on_disk.as_ref() != Some(&merged);
+        // granules or an earlier first-touch time. With no file, only a non-empty union is new.
+        let changed = match on_disk.as_ref() {
+            Some(disk) => disk != &merged,
+            None => !merged.is_empty(),
+        };
 
         // Publish ONLY if the path still names the image we served. A snapshot tag may have
         // been recreated before this merge acquired its shared generation lease: we keep
@@ -1076,10 +1109,13 @@ impl WorkingSetStore {
 
         // Preserve everything learned even when publication fails: the current serve process
         // can still prefetch it, and a later successful merge will retry the disk union.
-        {
-            let mut known = self.known.lock().expect("working set mutex");
-            known.union_from(&merged);
-            self.resplit_after_change(&known);
+        let (_, known_changed) = self
+            .known
+            .lock()
+            .expect("working set mutex")
+            .merge_from(&merged);
+        if known_changed {
+            self.resplit_after_change();
         }
 
         result?;
@@ -1630,6 +1666,46 @@ mod tests {
             runs,
             vec![100, 0],
             "the new split holds the change, earliest first"
+        );
+    }
+
+    #[test]
+    fn a_clone_that_changes_nothing_keeps_the_store_split() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("tiers-unchanged", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut clone1 = store.recorder();
+        clone1.insert_range_at(0, GRANULE, 600);
+        store.merge_and_persist(&clone1).unwrap();
+        let version = store.ordered.lock().unwrap().version;
+        // The same page at a later time, and nothing at all: neither changes the union.
+        let mut later = store.recorder();
+        later.insert_range_at(0, GRANULE, 900);
+        store.remember(&later);
+        store.remember(&store.recorder());
+        store.merge_and_persist(&later).unwrap();
+        assert_eq!(
+            store.ordered.lock().unwrap().version,
+            version,
+            "a merge that changed nothing made the store split the union again"
+        );
+        // An earlier time is a change.
+        let mut earlier = store.recorder();
+        earlier.insert_range_at(0, GRANULE, 3);
+        store.remember(&earlier);
+        assert_ne!(store.ordered.lock().unwrap().version, version);
+    }
+
+    #[test]
+    fn an_empty_recording_writes_no_sidecar() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("empty-recording", mem_len);
+        let store = open_store(&image, mem_len);
+        let outcome = store.merge_and_persist(&store.recorder()).unwrap();
+        assert!(!outcome.persisted, "an empty recording was published");
+        assert!(
+            !WorkingSetStore::path_for(&image).exists(),
+            "an empty recording wrote a sidecar"
         );
     }
 
