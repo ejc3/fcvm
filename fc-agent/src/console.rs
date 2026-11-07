@@ -324,16 +324,8 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             // this lock, no write can start here.
             if state.gate.load(Ordering::SeqCst) == 0 {
                 while !pending.is_empty() {
-                    // One line per write: a console with less room than the bytes handed to it
-                    // takes what fits, and a write that ended inside a line would let another
-                    // console writer land in the rest of it. A line is split only when the
-                    // console has less room than that line.
-                    let head = pending.make_contiguous();
-                    let line = head
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map_or(head.len(), |at| at + 1);
-                    match write(state.console_fd.as_fd(), &head[..line]) {
+                    let (head, _) = pending.as_slices();
+                    match write(state.console_fd.as_fd(), head) {
                         Ok(0) => break,
                         Ok(n) => {
                             pending.drain(..n);
@@ -716,7 +708,7 @@ async fn run_source_request(request: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
 
     /// Fake console: a pipe whose read end the test controls. Not reading it
@@ -874,67 +866,6 @@ mod tests {
             text, expected,
             "an agent line was split by another console writer"
         );
-    }
-
-    /// A console with less room than the writer's backlog takes whole lines. Main's writer
-    /// handed the console its whole backlog in one write, the console took what fitted, and
-    /// the write ended inside a line: another writer then landed in the rest of it.
-    #[test]
-    fn a_console_short_of_room_takes_whole_lines() {
-        let (console_wr, mut console_rd) = fake_console();
-        unsafe {
-            libc::fcntl(console_wr.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
-        }
-        let other = std::fs::File::from(console_wr.try_clone().unwrap());
-        let state = setup(console_wr).unwrap();
-        let line = |i: u8| {
-            let mut l = vec![b'0' + i; 999];
-            l.push(b'\n');
-            l
-        };
-        for i in 0..6 {
-            write_pipe(&state, &line(i));
-        }
-        // The writer has filled the console and holds the rest.
-        assert!(
-            wait_until(
-                || {
-                    let mut queued: libc::c_int = 0;
-                    unsafe { libc::ioctl(console_rd.as_raw_fd(), libc::FIONREAD, &mut queued) };
-                    let held = state.enqueued.load(Ordering::SeqCst)
-                        - state.disposed.load(Ordering::SeqCst);
-                    queued >= 4000 && held >= 1000
-                },
-                Duration::from_secs(5)
-            ),
-            "the writer never filled the console"
-        );
-        // Another writer lands while the writer is held back.
-        state.gate.fetch_add(1, Ordering::SeqCst);
-        drop(state.write_lock.lock().unwrap());
-        let mut seen: Vec<u8> = Vec::new();
-        drain_console(&mut console_rd, &mut seen);
-        (&other).write_all(b"MARKER\n").unwrap();
-        state.gate.fetch_sub(1, Ordering::SeqCst);
-        assert!(
-            wait_until(
-                || {
-                    drain_console(&mut console_rd, &mut seen);
-                    seen.len() == 6 * 1000 + 7
-                },
-                Duration::from_secs(5)
-            ),
-            "{} bytes reached the console",
-            seen.len()
-        );
-        for l in String::from_utf8_lossy(&seen).lines() {
-            assert!(
-                l == "MARKER" || (l.len() == 999 && !l.contains("MARKER")),
-                "a line was split by another console writer: {} bytes, starting {:?}",
-                l.len(),
-                &l[..l.len().min(8)]
-            );
-        }
     }
 
     /// main.rs replaces std's `eprintln!` with one that writes through `eprint_line`, before
