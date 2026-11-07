@@ -1097,6 +1097,8 @@ async fn test_failed_prepare_from_a_pre_start_snapshot_keeps_the_container_outpu
         !status.success(),
         "a prepare whose container exits 1 must fail, got {status}"
     );
+    // The prepare's output reaches the log through copy tasks that can outlive it.
+    common::wait_for_log_eof(&log, Duration::from_secs(10)).await?;
     let choice = common::cache_choice(&log);
     // The run's snapshot is named for this test's unique command; remove it either way.
     if let Some((_, key)) = &choice {
