@@ -57,7 +57,7 @@ pub struct Listener {
 }
 
 /// What a restore does with the retired addresses.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Retired addresses a listener uses, to be held on `lo`, deprecated.
     pub keep: Vec<Ipv6Addr>,
@@ -154,10 +154,20 @@ pub fn plan(
     retired.sort_unstable();
     retired.dedup();
 
+    // A port something listens on at the clone's own address, or on `::`, is that
+    // listener's: a service the restore hook or a later restart bound again there is
+    // reached directly, and its old listener on the retired address is not.
+    let served_here = |l: &Listener| {
+        listeners.iter().any(|other| {
+            other.proto == l.proto
+                && other.port == l.port
+                && (other.address == current || other.address.is_unspecified())
+        })
+    };
     let mut using: Vec<Listener> = listeners
         .iter()
         .copied()
-        .filter(|l| retired.contains(&l.address))
+        .filter(|l| retired.contains(&l.address) && !served_here(l))
         .collect();
     using.sort_unstable();
 
@@ -234,7 +244,7 @@ fn run_checked(program: &str, args: &[&str], input: Option<&str>) -> Result<()> 
 
 /// Apply `plan`: hold the kept addresses on `lo`, translate the clone's address to
 /// them, remove what no listener uses.
-fn apply(plan: &Plan, current: Ipv6Addr, on_lo: &[Ipv6Addr]) -> Result<()> {
+fn apply(plan: &Plan, current: Ipv6Addr, on_lo: &[Ipv6Addr], had_rules: bool) -> Result<()> {
     for address in &plan.keep {
         if !on_lo.contains(address) {
             let address = format!("{address}/128");
@@ -254,6 +264,14 @@ fn apply(plan: &Plan, current: Ipv6Addr, on_lo: &[Ipv6Addr]) -> Result<()> {
                 None,
             )?;
         }
+    }
+    if plan.translate.is_empty() && had_rules {
+        // The chain stays hooked and empty.
+        run_checked(
+            "ip6tables-restore",
+            &["-w", "--noflush"],
+            Some(&chain_rules(plan, current)),
+        )?;
     }
     if !plan.translate.is_empty() {
         run_checked(
@@ -294,8 +312,68 @@ pub fn carry_listeners(retired_now: Option<Ipv6Addr>, current: Ipv6Addr) -> Resu
     let mut listeners = parse_sockets(&read("/proc/net/tcp6")?, Proto::Tcp);
     listeners.extend(parse_sockets(&read("/proc/net/udp6")?, Proto::Udp));
     let plan = plan(retired_now, &on_lo, &listeners, current);
-    apply(&plan, current, &on_lo)?;
+    apply(&plan, current, &on_lo, false)?;
     Ok(plan)
+}
+
+/// Plan again from the listeners as they are now and apply what changed, after
+/// `previous`: a retired listener that closed, or a service now listening on the
+/// clone's own address, loses its translation, and an address no listener uses any
+/// more leaves `lo`. Reads three `/proc` files and starts no process when nothing
+/// changed.
+pub fn reconcile(current: Ipv6Addr, previous: &Plan) -> Result<Plan> {
+    let read =
+        |path: &str| std::fs::read_to_string(path).with_context(|| format!("reading {path}"));
+    let on_lo = parse_retired_on_lo(&read("/proc/net/if_inet6")?);
+    let mut listeners = parse_sockets(&read("/proc/net/tcp6")?, Proto::Tcp);
+    listeners.extend(parse_sockets(&read("/proc/net/udp6")?, Proto::Udp));
+    let next = plan(None, &on_lo, &listeners, current);
+    if next.translate != previous.translate || !next.remove.is_empty() {
+        apply(&next, current, &on_lo, !previous.translate.is_empty())?;
+    }
+    Ok(next)
+}
+
+/// How often a clone with translations looks again at its listeners.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The restore whose translations the running watch keeps; a later restore ends it.
+static WATCH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Keep `plan`'s translations in step with the listeners after the restore published:
+/// every second while any remain, reconcile. A service that closes its listener on the
+/// retired address and binds the clone's own loses the translation within a second.
+/// Ends when no translation remains or a later restore starts its own.
+pub fn watch(current: Ipv6Addr, plan: Plan) {
+    use std::sync::atomic::Ordering;
+    let generation = WATCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    if plan.translate.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut plan = plan;
+        while !plan.translate.is_empty() {
+            tokio::time::sleep(WATCH_EVERY).await;
+            if WATCH_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let previous = std::mem::take(&mut plan);
+            plan = match tokio::task::spawn_blocking(move || {
+                reconcile(current, &previous).map_err(|e| (e, previous))
+            })
+            .await
+            {
+                Ok(Ok(next)) => next,
+                Ok(Err((error, previous))) => {
+                    eprintln!(
+                        "[fc-agent] WARNING: keeping retired IPv6 listeners reachable: {error:#}"
+                    );
+                    previous
+                }
+                Err(_) => return,
+            };
+        }
+    });
 }
 
 #[cfg(test)]
@@ -419,6 +497,29 @@ fe800000000000000000000000000001 01 40 20 a0 lo
             Plan::default()
         );
         assert_eq!(plan(None, &[], &listeners, addr(NEW)), Plan::default());
+    }
+
+    /// A port a listener serves at the clone's own address or on `::` is not
+    /// translated: a service the restore hook or a restart bound there again is reached
+    /// directly, not sent to its old listener on the retired address.
+    #[test]
+    fn a_port_served_at_the_new_address_is_not_translated() {
+        for here in [NEW, "::"] {
+            let listeners = [
+                listener(Proto::Tcp, OLD, 8081),
+                listener(Proto::Tcp, here, 8081),
+            ];
+            let plan = plan(Some(addr(OLD)), &[], &listeners, addr(NEW));
+            assert!(plan.translate.is_empty(), "{here}: {plan:?}");
+            assert!(plan.keep.is_empty(), "{here}: {plan:?}");
+        }
+        // Another port of the same service is still carried.
+        let listeners = [
+            listener(Proto::Tcp, OLD, 8081),
+            listener(Proto::Tcp, NEW, 9000),
+        ];
+        let plan = plan(Some(addr(OLD)), &[], &listeners, addr(NEW));
+        assert_eq!(plan.translate, vec![(Proto::Tcp, 8081, addr(OLD))]);
     }
 
     /// A clone of a clone: the first snapshot's address is already on lo, and the
