@@ -3,9 +3,11 @@
 //! A restored clone's memory is paged in on demand, and every fault is answered in the order
 //! it arrived. A container that runs on every vCPU right after the restore puts its faults
 //! ahead of fc-agent's, so fc-agent's restore waits behind the workload's page-in. Measured on
-//! a 128 GiB, 32 vCPU guest whose 28 workers touch 40 GiB, with the memory file read at
-//! 400 MB/s and the warm-up paced: restores 2 to 4 acknowledged in 3.4 to 4.6 s with the
-//! container running and 2.2 to 2.6 s with it frozen until fc-agent's restore was done.
+//! a c8gd.metal-48xl: a 128 GiB, 32 vCPU guest whose 28 workers touch 40 GiB, 4 restores per
+//! round from a copy-mode memory server, the page cache dropped before each restore and the
+//! memory file read at 400 MB/s. Restores 2 to 4 acknowledged in 1.60 to 2.54 s with the
+//! container frozen (3 rounds) and in 2.31 to 6.34 s with it running (3 rounds), with 0 soft
+//! lockups in all 28 restores of the session.
 //!
 //! # Ownership
 //!
