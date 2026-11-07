@@ -42,6 +42,7 @@ async fn test_state_persistence() {
                 dns_server: None,
                 guest_ipv6: None,
                 host_ipv6: None,
+                guest_ipv6_local_only: false,
                 dns_search: None,
                 http_proxy: None,
                 https_proxy: None,

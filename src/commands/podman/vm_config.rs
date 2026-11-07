@@ -249,7 +249,7 @@ pub(crate) fn build_runtime_boot_args(
     }
 
     // IPv6 configuration via kernel cmdline (for rootless networking)
-    // Format: ipv6=<client>|<gateway> - parsed by fc-agent to configure eth0
+    // Format: ipv6=<client>|<gateway>[|local] - parsed by fc-agent to configure eth0
     // Uses | as delimiter since : is part of IPv6 addresses
     if let (Some(guest_ipv6), Some(host_ipv6)) =
         (&network_config.guest_ipv6, &network_config.host_ipv6)
@@ -258,6 +258,10 @@ pub(crate) fn build_runtime_boot_args(
             boot_args.push(' ');
         }
         boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
+        // fc-agent installs no default route: the gateway is all the guest reaches.
+        if network_config.guest_ipv6_local_only {
+            boot_args.push_str("|local");
+        }
     }
 
     // Pass DNS servers to guest for resolv.conf configuration: the mode's

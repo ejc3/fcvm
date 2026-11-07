@@ -137,17 +137,11 @@ async fn test_forward_localhost() -> Result<()> {
 /// A host service listening on ::1 alone (as a local test database can) is reached
 /// through --forward-localhost in rootless mode: pasta maps the guest's IPv4 gateway to
 /// the host's 127.0.0.1 and its IPv6 gateway to the host's ::1, and the guest's relay
-/// tries the second when the first refuses.
+/// tries the second when the first refuses. On a host without a global IPv6 address
+/// (the CI container) pasta runs IPv6 in local mode, so the guest still has its IPv6
+/// gateway (#1026).
 #[tokio::test]
 async fn test_forward_localhost_reaches_a_host_service_on_ipv6_loopback_only() -> Result<()> {
-    // The guest reaches the host's ::1 only through pasta's IPv6 gateway, and pasta gives a
-    // guest IPv6 only when the host has a global IPv6 address. The CI container has none, so
-    // pasta runs --ipv4-only there and the guest has no route to ::1 to test; every host
-    // job runs this test.
-    if common::is_in_container() {
-        println!("SKIP: the container has no global IPv6, so pasta gives the guest none");
-        return Ok(());
-    }
     run_forward_localhost_case_to(
         std::net::Ipv6Addr::LOCALHOST.into(),
         &[],

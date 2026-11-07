@@ -743,6 +743,7 @@ impl NetworkManager for BridgedNetwork {
             dns_server,
             guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
             host_ipv6: None,
+            guest_ipv6_local_only: false,
             dns_search: None,
             http_proxy: proxies.http_url,
             https_proxy: proxies.https_url,
