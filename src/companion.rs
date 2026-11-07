@@ -190,17 +190,21 @@ pub async fn registered_exit(
         return std::future::pending().await;
     };
     let pid = child.id();
-    if let Some(pid) = pid {
-        if let Some(capture) = captures()
-            .lock()
-            .ok()
-            .as_mut()
-            .and_then(|c| c.get_mut(&pid))
-        {
-            capture.claimed = true;
-        }
-    }
+    claim(pid);
     (pid, child.wait().await)
+}
+
+/// Mark the capture of `pid` as one a run loop will report, so [`register`] keeps it.
+fn claim(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    if let Some(capture) = captures()
+        .lock()
+        .ok()
+        .as_mut()
+        .and_then(|c| c.get_mut(&pid))
+    {
+        capture.claimed = true;
+    }
 }
 
 /// The registered companion `child` if it has already exited, without waiting.
@@ -209,6 +213,8 @@ pub fn registered_exit_now(
 ) -> Option<(Option<u32>, std::io::Result<ExitStatus>)> {
     let child = child.as_mut()?;
     let pid = child.id();
+    // Claimed before the reap, so no registration prunes it before it is described.
+    claim(pid);
     match child.try_wait() {
         Ok(Some(status)) => Some((pid, Ok(status))),
         Ok(None) => None,
@@ -344,9 +350,27 @@ mod tests {
     /// earlier registered_death, which drained inside the arm, the same loop lost both.
     #[tokio::test]
     async fn an_interrupted_watcher_still_reports_the_pid_and_stderr() {
-        // The grandchild keeps the stderr pipe open for 600 ms after the child exits.
+        // A grandchild holds the stderr pipe open, blocked on a fifo, until the test
+        // releases it. The release waits for the child to be reaped (its /proc entry
+        // gone: the watcher has seen the exit) and then for two wins of the timer arm
+        // after that, which would cancel a drain running inside the watcher's arm. A
+        // watcher that reports from the winning arm stops the timer, so the release
+        // also comes 300 ms after the reap.
+        let dir = std::env::temp_dir().join(format!("companion-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("release");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let script = format!(
+            "echo 'last words' >&2; (read _ < {}) & exit 4",
+            fifo.display()
+        );
         let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "echo 'last words' >&2; (sleep 0.6) & exit 4"])
+            .args(["-c", &script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -354,15 +378,40 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         register(&mut child, |_| {});
+        let timer_wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releaser = {
+            let fifo = fifo.clone();
+            let timer_wins = timer_wins.clone();
+            tokio::spawn(async move {
+                while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let at_reap = timer_wins.load(std::sync::atomic::Ordering::SeqCst);
+                let reaped = std::time::Instant::now();
+                while timer_wins.load(std::sync::atomic::Ordering::SeqCst) < at_reap + 2
+                    && reaped.elapsed() < Duration::from_millis(300)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::task::spawn_blocking(move || std::fs::write(fifo, "go\n"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            })
+        };
         let mut child = Some(child);
         let message = loop {
             tokio::select! {
                 (exited_pid, status) = registered_exit(&mut child) => {
                     break describe_registered("namespace holder", exited_pid, status).await;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    timer_wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         };
+        releaser.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             message.starts_with(&format!(
                 "namespace holder (pid {pid}) exited: exit status: 4"
@@ -485,5 +534,52 @@ mod tests {
                 "{file} reports a network helper's death without checking the holder first"
             );
         }
+    }
+
+    /// #852 review round 2: a holder found dead by network_death_report (pasta's arm
+    /// won first) keeps its capture through a registration that lands between the
+    /// reap and the report.
+    #[tokio::test]
+    async fn a_holder_reaped_for_the_network_report_keeps_its_stderr() {
+        let mut holder = tokio::process::Command::new("sh")
+            .args(["-c", "echo 'holder words' >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = holder.id().unwrap();
+        register(&mut holder, |_| {});
+        // Dead and its pipe at EOF, still unreaped.
+        for _ in 0..500 {
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_default()
+                .contains(") Z ");
+            let eof = captures()
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .is_some_and(|c| c.reader.as_ref().is_none_or(|r| r.is_finished()));
+            if zombie && eof {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut holder = Some(holder);
+        let (exited_pid, status) = registered_exit_now(&mut holder).expect("the holder is dead");
+        // Another VM's holder registers before this report is written.
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let other_pid = other.id().unwrap();
+        register(&mut other, |_| {});
+        let message = describe_registered("namespace holder", exited_pid, status).await;
+        assert!(message.ends_with("holder words"), "{message}");
+        forget(other_pid);
     }
 }
