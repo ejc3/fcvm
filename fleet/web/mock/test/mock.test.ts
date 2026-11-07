@@ -499,6 +499,29 @@ describe("mock race, second design review", () => {
     c.ws.close();
   });
 
+  it("camera_stop flies to a stop once, and asked again where it holds, keeps the camera and the hold", async () => {
+    type Key = { t: number; x: number; y: number; zoom: number };
+    const keys = () => JSON.stringify(coord.patternScene().camera);
+    const last = () => coord.patternScene().camera.at(-1) as unknown as Key;
+    // With a word sent, "words" flies to the latest word, not to the stop's fallback (0, 0).
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `cs-${Date.now()}`, name: "word", args: { text: "drift" } }));
+    await c.next((m) => m["type"] === "receipt");
+    c.ws.close();
+    for (const stop of ["planet", "words"]) {
+      await admin("/mock/schedule", { camera_stop: stop });
+      await sleep(700);
+      await admin("/mock/schedule", { hold_in_ms: 1000 });
+      const held = keys();
+      await admin("/mock/schedule", { camera_stop: stop });
+      expect(keys(), `${stop}: the camera holds where it was`).toBe(held);
+      // The hold is the full one again, not the second it had left (seamReport draws for longer).
+      expect(coord.fleetState().nudges.next_hold_at, stop).toBeGreaterThan(Date.now() + 500_000);
+    }
+    expect(last()).not.toMatchObject({ x: 0, y: 0 });
+    await admin("/mock/schedule", { hold_in_ms: 600_000 });
+  });
+
   it("lends a wall GPU: the tile is borrowed and sits out races, the claim streams, then the tile restores", async () => {
     const c = await live();
     const other = await live();

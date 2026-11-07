@@ -96,7 +96,7 @@ const RACES_KEPT = 20;
 /** Why a late viewer's claim_gpu or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
 const LATE_CLAIM = "direct streams are full, so this page watches the broadcast";
 
-const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
+export const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
   { id: "planet", label: "the ringed planet", x: 0.35, y: -0.05, zoom: 1.6 },
   { id: "nebula", label: "the nebula", x: -0.6, y: 0.15, zoom: 1.0 },
   { id: "stars", label: "the star field", x: 1.2, y: -0.4, zoom: 0.7 },
@@ -1003,17 +1003,22 @@ export class MockCoordinator {
     return best;
   }
 
+  /** Where the camera holds for a stop: the viewers' words stop is the latest word. */
+  private stopPose(target: (typeof NUDGE_TARGETS)[number]): { x: number; y: number; zoom: number } {
+    const words = target.id === "words" && this.words.length > 0 ? this.words[this.words.length - 1]!.pos : null;
+    return { x: words?.x ?? target.x, y: words?.y ?? target.y, zoom: target.zoom };
+  }
+
   /** The camera leaves for the leading stop. */
   private nextStop(now: number): void {
     const best = this.leadingStop();
     const target = NUDGE_TARGETS.find((x) => x.id === best)!;
     const t = sceneT(this.opts.epochUnixMs, now);
     const here = cameraAt(this.camera, t);
-    const words = target.id === "words" && this.words.length > 0 ? this.words[this.words.length - 1]!.pos : null;
     this.camera = [
       ...this.camera.filter((k) => k.t < t && k.t >= t - 30).slice(-2),
       { t, x: here["x"] ?? 0, y: here["y"] ?? 0, zoom: here["zoom"] ?? 1 },
-      { t: t + this.opts.travelSecs, x: words?.x ?? target.x, y: words?.y ?? target.y, zoom: target.zoom },
+      { t: t + this.opts.travelSecs, ...this.stopPose(target) },
     ];
     this.nudge = { holding: best, nextHoldAt: now + (this.opts.holdSecs + this.opts.travelSecs) * 1000, openedAt: now, votes: new Map() };
     this.markDirty();
@@ -1636,6 +1641,23 @@ export class MockCoordinator {
           if (typeof b["capacity_wait_ms"] === "number") this.forcedWaitMs = b["capacity_wait_ms"];
           if (typeof b["hold_in_ms"] === "number") this.nudge.nextHoldAt = this.now() + b["hold_in_ms"];
           if (typeof b["gpu_scrub"] === "boolean") this.gpuScrub = b["gpu_scrub"];
+          // The directed camera leaves for this stop now, as if it had every vote (tests that
+          // measure pixels hold it on the stop they were measured at). When it holds there
+          // already it stays, and its hold starts again.
+          if (typeof b["camera_stop"] === "string") {
+            const stop = NUDGE_TARGETS.find((x) => x.id === b["camera_stop"]);
+            if (!stop) throw new Error(`no stop ${b["camera_stop"]}`);
+            const last = this.camera[this.camera.length - 1]!;
+            const pose = this.stopPose(stop);
+            const atRest = last.t <= this.sceneNow() && last.x === pose.x && last.y === pose.y && last.zoom === pose.zoom;
+            if (!atRest) {
+              this.nudge.votes = new Map([["mock-admin", stop.id]]);
+              this.nextStop(this.now());
+            } else {
+              // Holding there already: a full hold from now, so it does not leave mid-measurement.
+              this.nudge.nextHoldAt = this.now() + this.opts.holdSecs * 1000;
+            }
+          }
           // The director sets the time of day per hold; tests set it here.
           if (typeof b["time_of_day"] === "number") this.timeOfDay = b["time_of_day"];
           this.markDirty();

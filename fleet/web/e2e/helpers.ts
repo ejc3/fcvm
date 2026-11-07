@@ -1,5 +1,7 @@
 import { expect, type Page } from "@playwright/test";
 import { frameCtx, expectedRgb, type PatternScene } from "../mock/pattern.ts";
+import { SEAM_STOP, seamPoints, smoothAt } from "../mock/seam-pairs.ts";
+import { cameraAt } from "../core/scene.ts";
 import type { CaptureResult } from "../app/_wall/worker-msgs.ts";
 
 export const COORD = `http://localhost:${process.env.FLEET_E2E_COORD_PORT}`;
@@ -102,21 +104,26 @@ export async function settledCapture(page: Page, points: { x: number; y: number 
   }
 }
 
+export { SEAM_MIN_PAIRS } from "../mock/seam-pairs.ts";
+
 /**
- * Sample pairs placed along each boundary (a pair: a point 3 px before it and 2 px after it).
- * Only pairs where the picture is smooth count, and with 12 a boundary was often left with 1
- * to 3 of them, so its mean error was one or two pixels' compression noise: on 30 runs of the
- * aggregated check, 26 had a boundary with fewer than 4, and CI failed one at 3.35 (#1348).
- * With 64, over 60 runs of this and the direct check, the fewest was 5 and the worst boundary
- * 1.59 (2.31 with 12, on 30 runs of the aggregated check alone).
+ * Move the directed camera to the stop the seam check is measured at (SEAM_STOP), and wait until
+ * the page draws past its arrival. The check's smooth pairs depend on the picture: at the star
+ * field, where an earlier test leaves the camera, 70 of 2801 draws judge no boundary of the
+ * bottom-left tile (mock/seam-pairs.ts).
  */
-const SEAM_PAIRS = 64;
-/** A boundary's error is a mean over at least this many smooth pairs. */
-export const SEAM_MIN_PAIRS = 4;
+export async function holdSeamCamera(page: Page): Promise<void> {
+  await admin("/mock/schedule", { camera_stop: SEAM_STOP.id });
+  const arrive = (await mockState()).pattern.camera.at(-1)!.t;
+  await expect
+    .poll(async () => page.evaluate(async () => (await window.__fleet!.client.capture([])).T ?? 0), { timeout: 20_000, intervals: [250] })
+    .toBeGreaterThan(arrive + 0.5);
+}
 
 /**
  * Read back pixels on both sides of every boundary between two drawn tiles, in
- * one draw, and compare them with the pattern at that draw's t.
+ * one draw, and compare them with the pattern at that draw's t. The camera must be
+ * held on SEAM_STOP (holdSeamCamera).
  */
 export async function seamReport(page: Page): Promise<SeamReport> {
   const v = await page.evaluate(() => {
@@ -124,43 +131,14 @@ export async function seamReport(page: Page): Promise<SeamReport> {
     return { image: view.layout!.image, tiles: view.tiles.map((t) => ({ id: t.id, box: t.box!, dark: t.dark })) };
   });
   const live = v.tiles.filter((t) => !t.dark && t.box);
-  type P = { x: number; y: number; tile: string; pair: string };
-  const pts: P[] = [];
-  const near = (a: number, b: number) => Math.abs(a - b) < 0.75;
-  for (const a of live) {
-    for (const b of live) {
-      if (a.id >= b.id) continue;
-      // A left of B or B left of A: a vertical boundary.
-      for (const [l, r] of [[a, b], [b, a]] as const) {
-        if (near(l.box.x + l.box.w, r.box.x)) {
-          const y0 = Math.max(l.box.y, r.box.y);
-          const y1 = Math.min(l.box.y + l.box.h, r.box.y + r.box.h);
-          if (y1 - y0 < 8) continue;
-          for (let k = 1; k <= SEAM_PAIRS; k++) {
-            const y = Math.floor(y0 + ((y1 - y0) * k) / (SEAM_PAIRS + 1)) + 0.5;
-            const x = r.box.x;
-            const pair = `${l.id}|${r.id}`;
-            pts.push({ x: x - 3 + 0.5, y, tile: l.id, pair }, { x: x + 2 + 0.5, y, tile: r.id, pair });
-          }
-        }
-      }
-      for (const [t, u] of [[a, b], [b, a]] as const) {
-        if (near(t.box.y + t.box.h, u.box.y)) {
-          const x0 = Math.max(t.box.x, u.box.x);
-          const x1 = Math.min(t.box.x + t.box.w, u.box.x + u.box.w);
-          if (x1 - x0 < 8) continue;
-          for (let k = 1; k <= SEAM_PAIRS; k++) {
-            const x = Math.floor(x0 + ((x1 - x0) * k) / (SEAM_PAIRS + 1)) + 0.5;
-            const y = u.box.y;
-            const pair = `${t.id}|${u.id}`;
-            pts.push({ x, y: y - 3 + 0.5, tile: t.id, pair }, { x, y: y + 2 + 0.5, tile: u.id, pair });
-          }
-        }
-      }
-    }
-  }
+  const pts = seamPoints(live);
   const res = await settledCapture(page, pts.map(({ x, y }) => ({ x, y })));
-  const f = frameCtx(res.T!, (await mockState()).pattern);
+  const pattern = (await mockState()).pattern;
+  const cam = cameraAt(pattern.camera, res.T!);
+  if (cam["x"] !== SEAM_STOP.x || cam["y"] !== SEAM_STOP.y || cam["zoom"] !== SEAM_STOP.zoom) {
+    throw new Error(`seamReport: the camera at t ${res.T} is ${JSON.stringify(cam)}, not the ${SEAM_STOP.id} stop the check is measured at; holdSeamCamera first`);
+  }
+  const f = frameCtx(res.T!, pattern);
   const uv = (x: number, y: number) => ({ u: (x - v.image.x) / v.image.w, v: (y - v.image.y) / v.image.h });
   // Smooth sample pairs: expected and observed colour on each side.
   type Sample = { tile: string; pair: string; e: [number, number, number]; o: [number, number, number] };
@@ -169,16 +147,7 @@ export async function seamReport(page: Page): Promise<SeamReport> {
     const p = [pts[i]!, pts[i + 1]!];
     // Skip pairs where the picture itself changes fast (text, rings, stars):
     // compression and scaling error there says nothing about seams.
-    const smooth = p.every((q) => {
-      const c = uv(q.x, q.y);
-      const e0 = expectedRgb(c.u, c.v, f);
-      // Within 4 px, which covers 4:2:0 chroma and the scaling filter's reach.
-      return [[-2, 0], [2, 0], [0, -2], [0, 2], [-4, 0], [4, 0], [0, -4], [0, 4], [-3, -3], [3, 3], [-3, 3], [3, -3]].every(([dx, dy]) => {
-        const n = uv(q.x + dx!, q.y + dy!);
-        const e1 = expectedRgb(n.u, n.v, f);
-        return Math.max(...e0.map((x, k) => Math.abs(x - e1[k]!))) <= 6;
-      });
-    });
+    const smooth = p.every((q) => smoothAt(v.image, f, q.x, q.y));
     if (!smooth) continue;
     const mk = (k: number): Sample => {
       const c = uv(p[k]!.x, p[k]!.y);

@@ -676,9 +676,18 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
         if file_type.is_dir() {
             synced.extend(sync_generation(&path)?);
         } else if file_type.is_file() {
-            std::fs::File::open(&path)
-                .with_context(|| format!("opening prepared artifact {}", path.display()))?
-                .sync_all()
+            // A file renamed away between the listing and the open is not this generation's
+            // to sync: a working-set writer publishes `memory.bin.working-set` from a
+            // temporary beside it, under the sidecar lock and not this one, so a recording
+            // or a serve of the same snapshot can rename one away mid-scan.
+            #[cfg(test)]
+            sync_hooks::before_open(&path);
+            let file = match std::fs::File::open(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                opened => opened
+                    .with_context(|| format!("opening prepared artifact {}", path.display()))?,
+            };
+            file.sync_all()
                 .with_context(|| format!("syncing prepared artifact {}", path.display()))?;
             synced.push(path);
         }
@@ -689,6 +698,31 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
         .with_context(|| format!("syncing prepared generation {}", dir.display()))?;
     synced.push(dir.to_path_buf());
     Ok(synced)
+}
+
+/// A test's hook into `sync_generation` between listing an entry and opening it, where a
+/// working-set writer can rename its temporary away.
+#[cfg(test)]
+mod sync_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(&std::path::Path)>;
+
+    thread_local! {
+        static BEFORE_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set_before_open(hook: Option<Hook>) {
+        BEFORE_OPEN.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(super) fn before_open(path: &std::path::Path) {
+        BEFORE_OPEN.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
 }
 
 /// Verify the generation installed at `target.name`.
@@ -3917,13 +3951,18 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let cancel = lifecycle_gate.cancellation_token();
     spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
+    let record = !args.no_record_working_set;
+    let ready_timeout = std::time::Duration::from_secs(args.ready_timeout);
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
-        ready_timeout: std::time::Duration::from_secs(args.ready_timeout),
+        ready_timeout,
     });
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
+            if record {
+                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+            }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
         VmPreparation::RunCompleted => {
@@ -3957,9 +3996,152 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
                 (operation, _) => operation,
             };
             let prepared = finish_prepare(operation, cleanup)?;
+            if record {
+                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+            }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
     }
+}
+
+/// Record a working set for a prepared snapshot that has none (#955 part 3).
+///
+/// The recorded set exists only once a clone has run, so the first restore of a fresh
+/// snapshot replayed nothing: measured on a 128 GiB guest, it reached healthy in 2m29s and
+/// the next five, each replaying a set, in 1m14s to 1m42s. A prepare builds its snapshot
+/// ahead of time and can afford the recording itself: it restores the snapshot once with
+/// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
+/// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
+/// A recording that fails is logged and the prepare still succeeds: the set is a hint.
+async fn record_working_set(
+    snapshot_key: &str,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) {
+    let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
+    if recorded_pages(&snapshot_dir) > 0 {
+        info!(
+            snapshot_key,
+            "the prepared snapshot already has a recorded working set"
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    match recording_restore(snapshot_key, timeout, cancel).await {
+        Ok(()) if recorded_pages(&snapshot_dir) > 0 => info!(
+            snapshot_key,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "recorded a working set for the prepared snapshot"
+        ),
+        Ok(()) => warn!(
+            snapshot_key,
+            "the recording restore ran but wrote no working set; the first restore will \
+             fault its pages in on demand"
+        ),
+        Err(error) => warn!(
+            snapshot_key,
+            error = %format!("{error:#}"),
+            "could not record a working set for the prepared snapshot; the first restore \
+             will fault its pages in on demand"
+        ),
+    }
+}
+
+/// The `fcvm snapshot run` that records a prepared snapshot's working set: this binary,
+/// stdout discarded so the prepare's own JSON record stays alone on it, killed when this
+/// process exits or `timeout` passes.
+async fn recording_restore(
+    snapshot_key: &str,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("locating the fcvm binary")?;
+    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
+    run_recording(&mut command, timeout, cancel).await
+}
+
+/// Pages of the working set a serve of this snapshot would replay: 0 when there is no
+/// sidecar, or one the store does not accept (another image's, a corrupt one) or that holds
+/// nothing. A file existing is not enough: a copied snapshot keeps a sidecar its image no
+/// longer matches, and skipping on it left the first restore with nothing to replay.
+fn recorded_pages(snapshot_dir: &std::path::Path) -> u64 {
+    super::snapshot::open_snapshot_working_set(snapshot_dir)
+        .map(|(store, _)| store.to_prefetch().len())
+        .unwrap_or(0)
+}
+
+/// The recording clone's VM name: `record-<this pid>`. Not built from the snapshot key, which
+/// may hold a dot or run past the 63 characters a VM name allows (a startup key with a host
+/// address is 57 characters).
+fn recording_vm_name() -> String {
+    format!("record-{}", std::process::id())
+}
+
+/// Run the recording restore to its end, or stop it when `timeout` passes or the prepare is
+/// cancelled: SIGTERM, so the clone tears down, then SIGKILL after 10 s.
+async fn run_recording(
+    command: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut child = command.spawn().context("spawning the recording restore")?;
+    let why = tokio::select! {
+        status = child.wait() => {
+            let status = status.context("waiting for the recording restore")?;
+            anyhow::ensure!(status.success(), "the recording restore exited with {status}");
+            return Ok(());
+        }
+        _ = tokio::time::sleep(timeout) => format!("did not finish within {timeout:?}"),
+        _ = cancel.cancelled() => "was interrupted with the prepare".to_string(),
+    };
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(2) on the child this function spawned and has not reaped.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    bail!("the recording restore {why}")
+}
+
+fn recording_restore_command(
+    exe: &std::path::Path,
+    snapshot_key: &str,
+    name: &str,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .args([
+            "snapshot",
+            "run",
+            "--snapshot",
+            snapshot_key,
+            "--name",
+            name,
+        ])
+        .args(["--exec", "true"])
+        .env("FCVM_FORCE_UFFD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // SAFETY: getpid() before the fork; in the child only async-signal-safe calls (prctl,
+    // getppid) run before exec.
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+    command
 }
 
 /// The IPv6 prefix a run gives its VM: the run's own for routed networking, and none for
@@ -3998,6 +4180,158 @@ mod tests {
             format!("{error:#}").contains("missing exact configured Firecracker artifact"),
             "{error:#}"
         );
+    }
+
+    /// The recording restore is `snapshot run --snapshot <key> --exec true` of this binary
+    /// through a memory server, with its stdout discarded, and a prepare runs it before it
+    /// publishes, on a cache hit and after a cold or restored boot alike, unless told not
+    /// to (#955).
+    #[test]
+    fn a_prepare_records_its_snapshots_working_set_before_it_publishes() {
+        let command = recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap");
+        let std = command.as_std();
+        let args: Vec<_> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "snapshot",
+                "run",
+                "--snapshot",
+                "snap",
+                "--name",
+                "record-1-snap",
+                "--exec",
+                "true"
+            ]
+        );
+        assert!(std
+            .get_envs()
+            .any(|(k, v)| k == "FCVM_FORCE_UFFD" && v == Some(std::ffi::OsStr::new("1"))));
+
+        let source = include_str!("mod.rs");
+        let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert_eq!(
+            prepare
+                .matches("record_working_set(&prepared.output.snapshot_key")
+                .count(),
+            2,
+            "both ways a prepare ends record before they publish"
+        );
+        for branch in prepare.split("record_working_set(&prepared").skip(1) {
+            assert!(
+                branch.contains("publish_prepared_snapshot_gated"),
+                "the record comes before the publish"
+            );
+        }
+        assert!(prepare.contains("let record = !args.no_record_working_set;"));
+    }
+
+    /// The recording clone's name is a valid VM name whatever the snapshot key. Built from
+    /// the key, as it was, a dotted tag or a startup key with a host address (57 characters)
+    /// made an invalid name, and the recording failed before it restored anything.
+    #[test]
+    fn the_recording_clone_has_a_valid_name_for_any_snapshot_key() {
+        let long_key = format!("{}-host{:032x}-startup", "abc123def456", u128::MAX);
+        assert!(crate::state::validate_vm_name(&format!("record-1-{long_key}")).is_err());
+        assert!(crate::state::validate_vm_name("record-1-my.tag").is_err());
+        crate::state::validate_vm_name(&recording_vm_name()).expect("a valid VM name");
+        let source = include_str!("mod.rs");
+        let restore = &source[source.find("async fn recording_restore(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(restore.contains("&recording_vm_name()"));
+    }
+
+    /// A prepare cancelled while its recording restore runs stops that restore and returns,
+    /// instead of waiting out the ready timeout. Before, the wait observed only the timeout.
+    #[tokio::test]
+    async fn a_cancelled_prepare_stops_its_recording_restore() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").kill_on_drop(true);
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancelling.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = run_recording(&mut command, std::time::Duration::from_secs(20), &cancel)
+            .await
+            .expect_err("a cancelled recording is an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the cancelled recording ran for {:?}",
+            started.elapsed()
+        );
+        assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+    }
+
+    /// A prepare records unless the snapshot already has a working set the store accepts and
+    /// that holds pages. An empty or unusable sidecar does not count: before, the file merely
+    /// existing skipped the recording.
+    #[test]
+    fn a_sidecar_that_holds_nothing_does_not_skip_the_recording() {
+        // The snapshot sits in a child directory: its generation lock is created beside it,
+        // and a lock beside the temporary directory itself would outlive the test.
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        assert_eq!(recorded_pages(&snapshot), 0, "no snapshot at all");
+        std::fs::write(snapshot.join("memory.bin"), vec![0u8; 64 * 4096]).unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            crate::uffd::WorkingSetStore::path_for(&snapshot.join("memory.bin")),
+            b"not a working set",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_pages(&snapshot),
+            0,
+            "a corrupt sidecar counted as recorded"
+        );
+        let source = include_str!("mod.rs");
+        let record = &source[source.find("async fn record_working_set(").unwrap()..];
+        let record = &record[..record.find("\n}\n").unwrap()];
+        assert!(!record.contains("sidecar.exists()"));
+    }
+
+    /// The durability scan skips a file renamed away between its listing and its open, as a
+    /// working-set writer's temporary is, instead of failing the prepare.
+    #[test]
+    fn a_file_renamed_away_mid_scan_does_not_fail_the_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = dir.path().join("generation");
+        std::fs::create_dir_all(generation.join("disk")).unwrap();
+        std::fs::write(generation.join("kept"), b"1").unwrap();
+        std::fs::write(generation.join("disk").join("disk.raw"), b"2").unwrap();
+        std::fs::write(generation.join("memory.bin.working-set.tmp"), b"3").unwrap();
+        let away = dir.path().join("published");
+        let renamed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = renamed.clone();
+        sync_hooks::set_before_open(Some(Box::new(move |path: &std::path::Path| {
+            if path.ends_with("memory.bin.working-set.tmp") {
+                std::fs::rename(path, &away).unwrap();
+                seen.set(true);
+            }
+        })));
+        let synced = sync_generation(&generation);
+        sync_hooks::set_before_open(None);
+        assert!(renamed.get(), "the hook never ran on the temporary");
+        let synced = synced.expect("a file renamed away mid-scan failed the sync");
+        for kept in [
+            generation.join("kept"),
+            generation.join("disk").join("disk.raw"),
+            generation.join("disk"),
+            generation.clone(),
+        ] {
+            assert!(synced.contains(&kept), "{} was not synced", kept.display());
+        }
+        assert!(!synced
+            .iter()
+            .any(|p| p.ends_with("memory.bin.working-set.tmp")));
     }
 
     fn test_args() -> RunArgs {

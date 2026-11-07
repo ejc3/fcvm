@@ -1093,6 +1093,17 @@ async fn test_prepare_and_run_share_the_pre_start_snapshot_across_health_checks(
             output.status,
             prepare_log.display()
         );
+        // The prepare recorded a working set for what it installed, so the first restore
+        // of it replays one (#955).
+        let sidecar = fcvm::uffd::WorkingSetStore::path_for(
+            &fcvm::paths::snapshot_dir().join(&tag).join("memory.bin"),
+        );
+        anyhow::ensure!(
+            std::fs::metadata(&sidecar).is_ok_and(|m| m.len() > 72),
+            "the prepare left no recorded working set at {} (log {})",
+            sidecar.display(),
+            prepare_log.display()
+        );
         let choice = common::cache_choice(&prepare_log);
         anyhow::ensure!(
             choice == Some(("pre-start snapshot", base_key.clone())),

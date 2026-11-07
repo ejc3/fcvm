@@ -63,10 +63,52 @@ use tracing::{debug, info, warn};
 /// number of bits and a set recorded by a 4 KiB clone is directly usable by a 2 MiB one.
 pub const GRANULE: u64 = 4096;
 
-/// `magic || version || granule || mem_len || granules || image_key`.
+/// `magic || version || granule || mem_len || granules || image_key`, then the bitmap's u64
+/// words, then one little-endian [`FirstTouch`] for each granule in the set, in ascending
+/// granule order.
 const HEADER_LEN: usize = 8 + 8 + 8 + 8 + 8 + 32;
 const MAGIC: &[u8; 8] = b"FCVMWSET";
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
+
+/// When a granule was first touched: tenths of a second after the handshake of the clone that
+/// touched it, plus one, saturating at `u16::MAX`. 0 means no time is known. Merging two
+/// observations keeps the earlier time, so a set converges on the time the guest first needs
+/// each page, whichever clone saw it first.
+pub type FirstTouch = u16;
+
+/// The [`FirstTouch`] of a fault `elapsed` after its clone's handshake.
+pub fn first_touch_stamp(elapsed: std::time::Duration) -> FirstTouch {
+    (elapsed.as_millis() / 100 + 1).min(u128::from(FirstTouch::MAX)) as FirstTouch
+}
+
+/// Upper bounds, in tenths of a second after the handshake, of the first-touch tiers replay
+/// works through in order: the first half second, then each tier twice as long as the one
+/// before. A granule with no known time goes in the tier after the last bound. Tiers keep
+/// replay an ordered pass over bitmaps rather than a sort of millions of runs.
+const TIER_BOUNDS: [FirstTouch; 10] = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560];
+
+/// Number of first-touch tiers, the last holding granules touched after the last bound or at
+/// an unknown time.
+pub const TIERS: usize = TIER_BOUNDS.len() + 1;
+
+/// The tier of a granule first touched at `stamp`.
+fn tier_of(stamp: FirstTouch) -> usize {
+    if stamp == 0 {
+        return TIERS - 1;
+    }
+    TIER_BOUNDS
+        .iter()
+        .position(|bound| stamp <= *bound)
+        .unwrap_or(TIERS - 1)
+}
+
+/// The earlier of two first-touch times, where 0 is unknown and loses to any known time.
+fn earlier(a: FirstTouch, b: FirstTouch) -> FirstTouch {
+    match (a, b) {
+        (0, other) | (other, 0) => other,
+        (a, b) => a.min(b),
+    }
+}
 
 /// Refuse to even allocate a bitmap for an implausible memory file (1 TiB of 4 KiB granules
 /// is a 32 MiB bitmap). Guards against a corrupt header turning into a huge allocation.
@@ -122,15 +164,19 @@ pub struct Run {
     pub len: u64,
 }
 
-/// A set of snapshot pages, as a bitmap over [`GRANULE`]-sized granules of the memory file.
+/// A set of snapshot pages, as a bitmap over [`GRANULE`]-sized granules of the memory file,
+/// with the time each granule was first touched.
 ///
 /// A bitmap rather than a list of offsets because it dedupes for free (the same page faults
 /// more than once across a clone's life), costs a fixed 32 KiB per GiB of guest memory, and
-/// makes merging two clones' observations a word-wise OR.
+/// makes merging two clones' observations a word-wise OR. The first-touch times cost 512 KiB
+/// per GiB, and merge by keeping the earlier time.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PageSet {
     granules: u64,
     words: Vec<u64>,
+    /// One [`FirstTouch`] per granule; meaningful only where the bit is set.
+    first: Vec<FirstTouch>,
 }
 
 /// Print the runs, not 32 KiB of hex: a failing assertion should say WHICH pages differ.
@@ -153,6 +199,7 @@ impl PageSet {
         Self {
             granules,
             words: vec![0; (granules as usize).div_ceil(64)],
+            first: vec![0; granules as usize],
         }
     }
 
@@ -176,13 +223,37 @@ impl PageSet {
     /// fault path, where a mapping that runs past the end of a truncated memory file is
     /// already handled (zero-filled) and must not become an error here.
     pub fn insert_range(&mut self, offset: u64, len: u64) {
+        self.insert_range_at(offset, len, 0);
+    }
+
+    /// Mark `[offset, offset + len)` as touched at `stamp` (see [`FirstTouch`]). A granule that
+    /// already has an earlier time keeps it.
+    pub fn insert_range_at(&mut self, offset: u64, len: u64, stamp: FirstTouch) {
         let first = offset / GRANULE;
         let last = offset.saturating_add(len.max(1) - 1) / GRANULE;
         for granule in first..=last.min(self.granules.saturating_sub(1)) {
             if granule >= self.granules {
                 break;
             }
-            self.words[(granule / 64) as usize] |= 1u64 << (granule % 64);
+            let bit = 1u64 << (granule % 64);
+            let word = &mut self.words[(granule / 64) as usize];
+            let time = &mut self.first[granule as usize];
+            *time = if *word & bit == 0 {
+                stamp
+            } else {
+                earlier(*time, stamp)
+            };
+            *word |= bit;
+        }
+    }
+
+    /// The first-touch time of a granule in the set (0 when unknown or absent).
+    #[cfg(test)]
+    pub(crate) fn first_touch(&self, granule: u64) -> FirstTouch {
+        if self.contains(granule) {
+            self.first[granule as usize]
+        } else {
+            0
         }
     }
 
@@ -199,15 +270,66 @@ impl PageSet {
     /// Sets built for different image sizes merge over their overlap; the caller validates
     /// sizes, this just refuses to read or write out of bounds.
     pub fn union_from(&mut self, other: &PageSet) -> u64 {
+        self.union_changes(other).0
+    }
+
+    /// [`union_from`](Self::union_from), also saying whether any granule already in the set
+    /// took an earlier first-touch time: `(added, made_earlier)`.
+    fn union_changes(&mut self, other: &PageSet) -> (u64, bool) {
         let mut added = 0u64;
+        let mut made_earlier = false;
         let common = self.words.len().min(other.words.len());
         for i in 0..common {
             let before = self.words[i];
-            let after = before | other.words[i];
+            let theirs = other.words[i];
+            if theirs != 0 {
+                let mut bits = theirs;
+                while bits != 0 {
+                    let granule = i * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (Some(mine), Some(time)) =
+                        (self.first.get(granule), other.first.get(granule))
+                    else {
+                        continue;
+                    };
+                    self.first[granule] = if before & (1u64 << (granule % 64)) == 0 {
+                        *time
+                    } else {
+                        let kept = earlier(*mine, *time);
+                        made_earlier |= kept != *mine;
+                        kept
+                    };
+                }
+            }
+            let after = before | theirs;
             added += (after & !before).count_ones() as u64;
             self.words[i] = after;
         }
-        added
+        (added, made_earlier)
+    }
+
+    /// The set split by first-touch tier: one bitmap per tier, earliest first, each holding the
+    /// granules first touched in that tier's interval (the last also those with no known time).
+    /// Replay and the page cache warm-up walk the tiers in order, so the pages a clone needs
+    /// first are mapped first. Costs one bitmap per tier, which the image size fixes.
+    pub fn by_first_touch(&self) -> Vec<PageSet> {
+        let mut tiers: Vec<PageSet> = (0..TIERS)
+            .map(|_| PageSet {
+                granules: self.granules,
+                words: vec![0; self.words.len()],
+                first: Vec::new(),
+            })
+            .collect();
+        for (i, word) in self.words.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let granule = i * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let tier = tier_of(self.first.get(granule).copied().unwrap_or(0));
+                tiers[tier].words[i] |= 1u64 << (granule % 64);
+            }
+        }
+        tiers
     }
 
     /// Coalesce the set into as few contiguous runs as possible.
@@ -264,6 +386,14 @@ impl PageSet {
         for word in &self.words {
             buf.extend_from_slice(&word.to_le_bytes());
         }
+        for (i, word) in self.words.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let granule = i * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                buf.extend_from_slice(&self.first[granule].to_le_bytes());
+            }
+        }
         buf
     }
 
@@ -306,6 +436,7 @@ impl PageSet {
         let mut set = Self {
             granules,
             words: Vec::with_capacity(words),
+            first: vec![0; granules as usize],
         };
         for i in 0..words {
             let off = HEADER_LEN + i * 8;
@@ -317,6 +448,24 @@ impl PageSet {
             let tail = &mut set.words[words - 1];
             *tail &= u64::MAX >> (64 - granules % 64);
         }
+        let members = set.len() as usize;
+        let times_at = HEADER_LEN + words * 8;
+        if buf.len() < times_at + members * 2 {
+            return reject("truncated first-touch times");
+        }
+        if buf.len() > times_at + members * 2 {
+            return reject("bytes after the first-touch times");
+        }
+        let mut next = times_at;
+        for (i, word) in set.words.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let granule = i * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                set.first[granule] = u16::from_le_bytes([buf[next], buf[next + 1]]);
+                next += 2;
+            }
+        }
         Some(set)
     }
 }
@@ -325,15 +474,6 @@ impl PageSet {
 pub struct RunIter<'a> {
     set: &'a PageSet,
     cursor: u64,
-}
-
-#[cfg(test)]
-impl RunIter<'_> {
-    /// How far into the set this iterator has read, in bytes. It is what lets a test pin that a
-    /// consumer of the runs reads the recording no further than it has to.
-    pub(crate) fn position(&self) -> u64 {
-        self.cursor * GRANULE
-    }
 }
 
 impl Iterator for RunIter<'_> {
@@ -347,6 +487,63 @@ impl Iterator for RunIter<'_> {
             offset: start * GRANULE,
             len: (end - start) * GRANULE,
         })
+    }
+}
+
+/// The runs of a [`PageSet`] in first-touch order: every run of the earliest tier in
+/// ascending offset, then every run of the next tier, and so on (see
+/// [`PageSet::by_first_touch`]). Runs of different tiers are never joined, so a run is
+/// contiguous within its tier.
+pub struct OrderedRuns {
+    tiers: Arc<Vec<PageSet>>,
+    tier: usize,
+    cursor: u64,
+}
+
+impl OrderedRuns {
+    pub fn new(set: &PageSet) -> Self {
+        Self::from_tiers(Arc::new(set.by_first_touch()))
+    }
+
+    /// The runs of a set already split by [`PageSet::by_first_touch`].
+    pub fn from_tiers(tiers: Arc<Vec<PageSet>>) -> Self {
+        Self {
+            tiers,
+            tier: 0,
+            cursor: 0,
+        }
+    }
+
+    /// The tier of the run [`next`](Iterator::next) returned last.
+    pub fn tier(&self) -> usize {
+        self.tier
+    }
+
+    /// How far into its current tier this iterator has read, in bytes.
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> u64 {
+        self.cursor * GRANULE
+    }
+}
+
+impl Iterator for OrderedRuns {
+    type Item = Run;
+
+    fn next(&mut self) -> Option<Run> {
+        loop {
+            let set = self.tiers.get(self.tier)?;
+            let Some(start) = set.next_set(self.cursor) else {
+                self.tier += 1;
+                self.cursor = 0;
+                continue;
+            };
+            let end = set.next_clear(start);
+            self.cursor = end;
+            return Some(Run {
+                offset: start * GRANULE,
+                len: (end - start) * GRANULE,
+            });
+        }
     }
 }
 
@@ -557,6 +754,21 @@ pub struct WorkingSetStore {
     key: ImageKey,
     mem_len: u64,
     known: Mutex<PageSet>,
+    /// `known` split by first-touch tier, for replay. Splitting a large set scans every
+    /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
+    /// and on a thread of its own after the set changes, never on a clone's fault path.
+    ordered: Arc<Mutex<OrderedTiers>>,
+}
+
+/// A cached [`PageSet::by_first_touch`] of the store's union, and which change of the union
+/// it was split from.
+#[derive(Default)]
+struct OrderedTiers {
+    /// Bumped by every change of the union.
+    version: u64,
+    /// The version `tiers` was split from.
+    split_from: u64,
+    tiers: Option<Arc<Vec<PageSet>>>,
 }
 
 impl WorkingSetStore {
@@ -650,6 +862,11 @@ impl WorkingSetStore {
             lock_path,
             key,
             mem_len,
+            ordered: Arc::new(Mutex::new(OrderedTiers {
+                version: 0,
+                split_from: 0,
+                tiers: Some(Arc::new(known.by_first_touch())),
+            })),
             known: Mutex::new(known),
         })
     }
@@ -697,6 +914,48 @@ impl WorkingSetStore {
         self.known.lock().expect("working set mutex").clone()
     }
 
+    /// The set to prefetch for a clone starting now, split by first-touch tier. The split is the
+    /// cached one when it is current, which is the usual case: it was made when the set loaded
+    /// or after its last change. Otherwise it is made here.
+    pub fn to_prefetch_ordered(&self) -> Arc<Vec<PageSet>> {
+        let known = self.known.lock().expect("working set mutex");
+        let mut ordered = self.ordered.lock().expect("working set order mutex");
+        if ordered.split_from == ordered.version {
+            if let Some(tiers) = &ordered.tiers {
+                return tiers.clone();
+            }
+        }
+        let tiers = Arc::new(known.by_first_touch());
+        ordered.split_from = ordered.version;
+        ordered.tiers = Some(tiers.clone());
+        tiers
+    }
+
+    /// Split the union again on a thread of its own after it changed. A split that a later
+    /// change made stale is dropped.
+    fn resplit_after_change(&self, known: &PageSet) {
+        let version = {
+            let mut ordered = self.ordered.lock().expect("working set order mutex");
+            ordered.version += 1;
+            ordered.version
+        };
+        let set = known.clone();
+        let ordered = self.ordered.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fcvm-ws-order".into())
+            .spawn(move || {
+                let tiers = Arc::new(set.by_first_touch());
+                let mut ordered = ordered.lock().expect("working set order mutex");
+                if ordered.version == version {
+                    ordered.split_from = version;
+                    ordered.tiers = Some(tiers);
+                }
+            });
+        if let Err(error) = spawned {
+            debug!(target: "uffd", %error, "the working-set order split runs on the next clone instead");
+        }
+    }
+
     /// An empty set sized for this image, for a clone to record into.
     pub fn recorder(&self) -> PageSet {
         PageSet::empty(self.mem_len)
@@ -704,10 +963,14 @@ impl WorkingSetStore {
 
     /// Add one clone's observations to the in-process union without touching the filesystem.
     fn remember(&self, observed: &PageSet) -> u64 {
-        self.known
-            .lock()
-            .expect("working set mutex")
-            .union_from(observed)
+        let mut known = self.known.lock().expect("working set mutex");
+        let (added, made_earlier) = known.union_changes(observed);
+        // An unchanged union keeps its split: a new one would put the next clone's split back
+        // on its fault path until the thread finished.
+        if added > 0 || made_earlier {
+            self.resplit_after_change(&known);
+        }
+        added
     }
 
     /// Merge one clone's observations into the union and persist it if it grew.
@@ -796,12 +1059,14 @@ impl WorkingSetStore {
 
         // Re-read under the lock: another serve process may have recorded since we loaded.
         let on_disk = read_set(&self.path, &self.key, self.mem_len);
-        let disk_len = on_disk.as_ref().map_or(0, PageSet::len);
-        if let Some(disk) = on_disk {
-            merged.union_from(&disk);
+        if let Some(disk) = on_disk.as_ref() {
+            merged.union_from(disk);
         }
         let added = merged.union_from(observed);
         let total = merged.len();
+        // The union holds everything on disk, so it differs from the file only when it gained
+        // granules or an earlier first-touch time.
+        let changed = on_disk.as_ref() != Some(&merged);
 
         // Publish ONLY if the path still names the image we served. A snapshot tag may have
         // been recreated before this merge acquired its shared generation lease: we keep
@@ -809,7 +1074,7 @@ impl WorkingSetStore {
         // image. The lease prevents any further replacement through the rename below; this
         // identity check rejects a replacement that already completed.
         let superseded = !self.image_is_still_ours();
-        let persisted = total > disk_len && !superseded;
+        let persisted = changed && !superseded;
         let result = if persisted {
             write_set(&self.path, &merged, &self.key, self.mem_len)
         } else {
@@ -824,10 +1089,13 @@ impl WorkingSetStore {
 
         // Preserve everything learned even when publication fails: the current serve process
         // can still prefetch it, and a later successful merge will retry the disk union.
-        self.known
-            .lock()
-            .expect("working set mutex")
-            .union_from(&merged);
+        {
+            let mut known = self.known.lock().expect("working set mutex");
+            let (added, made_earlier) = known.union_changes(&merged);
+            if added > 0 || made_earlier {
+                self.resplit_after_change(&known);
+            }
+        }
 
         result?;
         Ok(Some(MergeOutcome {
@@ -893,7 +1161,10 @@ pub fn hint_covers_most_of_the_image(hint_bytes: u64, mem_len: u64) -> bool {
 fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
     let granules = mem_len.div_ceil(GRANULE);
     let bitmap_bytes = granules.div_ceil(64).saturating_mul(8);
-    let max_len = (HEADER_LEN as u64).saturating_add(bitmap_bytes);
+    let times_bytes = granules.saturating_mul(std::mem::size_of::<FirstTouch>() as u64);
+    let max_len = (HEADER_LEN as u64)
+        .saturating_add(bitmap_bytes)
+        .saturating_add(times_bytes);
     let mut buf = Vec::new();
     match File::open(path).and_then(|f| f.take(max_len.saturating_add(1)).read_to_end(&mut buf)) {
         Ok(_) => {}
@@ -1121,6 +1392,70 @@ mod tests {
     }
 
     #[test]
+    fn first_touch_times_merge_to_the_earlier_known_time() {
+        let mem_len = 64 * GRANULE;
+        let mut a = PageSet::empty(mem_len);
+        a.insert_range_at(0, GRANULE, 30);
+        a.insert_range_at(GRANULE, GRANULE, 0);
+        a.insert_range_at(2 * GRANULE, GRANULE, 7);
+        a.insert_range_at(2 * GRANULE, GRANULE, 12);
+        let mut b = PageSet::empty(mem_len);
+        b.insert_range_at(0, GRANULE, 5);
+        b.insert_range_at(GRANULE, GRANULE, 40);
+        b.insert_range_at(3 * GRANULE, GRANULE, 9);
+        assert_eq!(a.union_from(&b), 1);
+        assert_eq!(
+            (0..4).map(|g| a.first_touch(g)).collect::<Vec<_>>(),
+            vec![5, 40, 7, 9],
+            "a merge keeps the earlier known time, and a known time beats an unknown one"
+        );
+    }
+
+    #[test]
+    fn first_touch_times_round_trip_through_the_file() {
+        let image = fake_image("times", 1024 * GRANULE);
+        let key = image_key(&image);
+        let mem_len = 1024 * GRANULE;
+        let mut set = PageSet::empty(mem_len);
+        set.insert_range_at(0, GRANULE, 3);
+        set.insert_range_at(700 * GRANULE, 2 * GRANULE, 900);
+        set.insert_range_at(1000 * GRANULE, GRANULE, 0);
+        let encoded = set.encode(&key, mem_len);
+        assert_eq!(encoded.len(), HEADER_LEN + 16 * 8 + 4 * 2);
+        let decoded = PageSet::decode(&encoded, &key, mem_len).expect("must decode");
+        assert_eq!(decoded, set);
+        assert_eq!(decoded.first_touch(701), 900);
+        let mut longer = encoded.clone();
+        longer.push(0);
+        assert!(PageSet::decode(&longer, &key, mem_len).is_none());
+        assert!(PageSet::decode(&encoded[..encoded.len() - 1], &key, mem_len).is_none());
+    }
+
+    #[test]
+    fn ordered_runs_come_earliest_tier_first() {
+        let mem_len = 256 * GRANULE;
+        let mut set = PageSet::empty(mem_len);
+        // High offsets touched first, low offsets late or at an unknown time.
+        set.insert_range_at(0, 4 * GRANULE, 0);
+        set.insert_range_at(10 * GRANULE, 2 * GRANULE, 600);
+        set.insert_range_at(200 * GRANULE, 3 * GRANULE, 2);
+        set.insert_range_at(203 * GRANULE, GRANULE, 15);
+        let runs: Vec<(u64, u64)> = OrderedRuns::new(&set)
+            .map(|r| (r.offset / GRANULE, r.len / GRANULE))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![(200, 3), (203, 1), (10, 2), (0, 4)],
+            "runs must come first-touch tier by tier, and a tier boundary splits a run"
+        );
+        assert_eq!(
+            runs.iter().map(|(_, n)| n).sum::<u64>(),
+            set.len(),
+            "every granule once"
+        );
+    }
+
+    #[test]
     fn decode_rejects_a_set_recorded_for_a_different_image() {
         let mem_len = 64 * GRANULE;
         let image = fake_image("key-a", mem_len);
@@ -1200,6 +1535,8 @@ mod tests {
         let mut encoded = PageSet::empty(mem_len).encode(&key, mem_len);
         let last_word = encoded.len() - 8;
         encoded[last_word..].copy_from_slice(&u64::MAX.to_le_bytes());
+        // The 36 granules left after masking each carry an (unknown) first-touch time.
+        encoded.extend(std::iter::repeat_n(0u8, (100 - 64) * 2));
 
         let decoded = PageSet::decode(&encoded, &key, mem_len).unwrap();
         let end = decoded.runs().map(|r| r.offset + r.len).max().unwrap_or(0);
@@ -1241,6 +1578,96 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    #[test]
+    fn store_persists_a_union_that_only_gained_an_earlier_time() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("earlier", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut clone1 = store.recorder();
+        clone1.insert_range_at(0, GRANULE, 300);
+        assert!(store.merge_and_persist(&clone1).unwrap().persisted);
+        let mut clone2 = store.recorder();
+        clone2.insert_range_at(0, GRANULE, 4);
+        let outcome = store.merge_and_persist(&clone2).unwrap();
+        assert_eq!((outcome.total, outcome.added), (1, 0));
+        assert!(
+            outcome.persisted,
+            "an earlier first-touch time with no new granule was not written"
+        );
+        let reopened = open_store(&image, mem_len);
+        assert_eq!(reopened.to_prefetch().first_touch(0), 4);
+        let mut clone3 = store.recorder();
+        clone3.insert_range_at(0, GRANULE, 50);
+        assert!(
+            !store.merge_and_persist(&clone3).unwrap().persisted,
+            "a later time changes nothing, so nothing is written"
+        );
+    }
+
+    /// A clone takes the tier split the store made when it loaded the set, not one made on its
+    /// fault path, and a change of the union is split again on another thread.
+    #[test]
+    fn the_store_keeps_its_tier_split_off_the_fault_path() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("tiers", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut clone1 = store.recorder();
+        clone1.insert_range_at(0, GRANULE, 600);
+        store.merge_and_persist(&clone1).unwrap();
+        let reopened = open_store(&image, mem_len);
+        {
+            // The split exists before any clone asks for it: made when the set loaded.
+            let ordered = reopened.ordered.lock().unwrap();
+            assert!(
+                ordered.tiers.is_some() && ordered.split_from == ordered.version,
+                "loading the set did not split it"
+            );
+        }
+        let first = reopened.to_prefetch_ordered();
+        assert!(
+            Arc::ptr_eq(&first, &reopened.to_prefetch_ordered()),
+            "a clone split the set itself instead of taking the store's split"
+        );
+        let mut clone2 = reopened.recorder();
+        clone2.insert_range_at(100 * GRANULE, GRANULE, 1);
+        reopened.remember(&clone2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ordered = reopened.ordered.lock().unwrap();
+            if ordered.split_from == ordered.version {
+                break;
+            }
+            drop(ordered);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the union was not split again"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let runs: Vec<u64> = OrderedRuns::from_tiers(reopened.to_prefetch_ordered())
+            .map(|run| run.offset / GRANULE)
+            .collect();
+        assert_eq!(
+            runs,
+            vec![100, 0],
+            "the new split holds the change, earliest first"
+        );
+
+        // A clone that adds nothing and moves no time earlier leaves the split as it is.
+        let version = reopened.ordered.lock().unwrap().version;
+        let split = reopened.to_prefetch_ordered();
+        let mut same = reopened.recorder();
+        same.insert_range_at(100 * GRANULE, GRANULE, 9);
+        reopened.remember(&same);
+        reopened.remember(&reopened.recorder());
+        assert_eq!(
+            reopened.ordered.lock().unwrap().version,
+            version,
+            "an unchanged union invalidated the split"
+        );
+        assert!(Arc::ptr_eq(&split, &reopened.to_prefetch_ordered()));
     }
 
     #[test]

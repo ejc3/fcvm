@@ -25,6 +25,7 @@ export interface ProxyEnv {
   FLEET_COORD_URL?: string;
   FLEET_ACCESS_CLIENT_ID?: string;
   FLEET_ACCESS_CLIENT_SECRET?: string;
+  FLEET_DIRECT_COORD_URL?: string;
 }
 
 /** The forwarding the Worker does, or null when it has no service token or no coordinator. */
@@ -78,11 +79,16 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
 }
 
 /**
- * The /live URL the page tries before its own origin: the coordinator's host, when the
- * Worker forwards (the browser may hold an Access session there too), else null.
+ * The /live URL the page tries before its own origin, when the Worker forwards: the
+ * coordinator's socket on a hostname in the page's own Access application
+ * (FLEET_DIRECT_COORD_URL; ejc3/aws fcvm-dev.tf, fleet-api-direct-stage), whose eager
+ * redirect cookie gives the browser a session there at sign-in. Unset, the page has only
+ * its own origin.
  */
 export function pageDirectLiveUrl(env: ProxyEnv): string | null {
-  return liveProxy(env) === null ? null : (env.FLEET_COORD_URL as string);
+  const direct = typeof env.FLEET_DIRECT_COORD_URL === "string" ? env.FLEET_DIRECT_COORD_URL.trim() : "";
+  if (liveProxy(env) === null || !/^wss?:\/\/[^/?#]+\/live$/i.test(direct)) return null;
+  return direct;
 }
 
 /**

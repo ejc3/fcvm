@@ -191,6 +191,11 @@ same reference and use `--force`. Without `--tag` the snapshot is installed unde
 content key as cache, which `snapshots prune` reclaims; with `--tag` it is a user
 snapshot that survives a prune.
 
+Before it prints its record, `prepare` restores a snapshot that has no recorded working
+set once through a memory server and tears the clone down, which records the pages a
+restore touches. The first restore that follows replays them instead of faulting each one
+in. `--no-record-working-set` skips that restore.
+
 A `prepare` whose image import is already in the cache, from a `podman run` of the same
 image and VM shape, restores that pre-start snapshot instead of booting cold, then waits
 for healthy as a cold `prepare` does. `--health-check` is not part of that snapshot's

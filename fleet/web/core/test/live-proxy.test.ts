@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { forwardedRequest, isProxiedPath, liveProxy, pageLiveUrl, VIEWER_ADDRESS_HEADER } from "../live-proxy.ts";
+import { forwardedRequest, isProxiedPath, liveProxy, pageDirectLiveUrl, pageLiveUrl, VIEWER_ADDRESS_HEADER } from "../live-proxy.ts";
 
 const env = { FLEET_COORD_URL: "wss://coord.example.test/live", FLEET_ACCESS_CLIENT_ID: "id-1", FLEET_ACCESS_CLIENT_SECRET: "secret-1" };
 
@@ -72,5 +72,23 @@ describe("pageLiveUrl", () => {
     expect(pageLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL }, "stage.example.test", "https")).toBe(env.FLEET_COORD_URL);
     expect(pageLiveUrl(env, null, "https")).toBe(env.FLEET_COORD_URL);
     expect(pageLiveUrl({}, "stage.example.test", "https")).toBe("");
+  });
+});
+
+describe("pageDirectLiveUrl", () => {
+  const direct = "wss://direct.example.test/live";
+  it("is FLEET_DIRECT_COORD_URL when the Worker forwards", () => {
+    expect(pageDirectLiveUrl({ ...env, FLEET_DIRECT_COORD_URL: direct })).toBe(direct);
+  });
+
+  it("is never the coordinator's API host, which has no browser session", () => {
+    expect(pageDirectLiveUrl(env)).toBeNull();
+  });
+
+  it("is null without the Worker token or with a URL that is not a /live socket", () => {
+    expect(pageDirectLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL, FLEET_DIRECT_COORD_URL: direct })).toBeNull();
+    for (const bad of ["", "https://direct.example.test/live", "wss://direct.example.test/agent", "wss://direct.example.test/live?x=1"]) {
+      expect(pageDirectLiveUrl({ ...env, FLEET_DIRECT_COORD_URL: bad })).toBeNull();
+    }
   });
 });

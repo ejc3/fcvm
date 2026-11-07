@@ -2825,7 +2825,15 @@ fcvm snapshot run --pid <serve_pid> --name clone1
     sends the job back to the handler, which decides it again as it does a parked fault's
     retry, and every REMOVE of a read is recorded before any fault of that read is
     answered. Faults on pages the balloon gave back, parked faults, fault-around (which
-    turns the workers off) and minor mode stay on the handler. Measured on a 32 GiB,
+    turns the workers off), minor mode and every fault while working-set replay runs stay
+    on the handler (#1694): replay copies from the handler's task between drains, so a fault
+    answered there goes ahead of it, while one handed to a worker waited behind the replay
+    workers' copies and reads. Measured in one session against handing them over, on the
+    same 32 GiB guest: under page cache pressure with reads limited to 200 MiB/s, healthy in
+    7.5 to 8.0 s against 91.8 s; with 16 processes allocating 1 GiB each during replay, 8.4 to
+    8.5 s against 9.8 to 10.0 s; with no recorded set (no replay) unchanged, 12.6 to 13.2 s
+    against 12.6 to 12.9 s. Sending only faults on uncached sources to the workers during
+    replay won the allocation case (8.4 to 8.5 s) but not the pressure case (91.8 s). Measured on a 32 GiB,
     32-vCPU guest whose first heavy allocation after a restore reclaimed its page cache
     (6.5 M faults, memory file evicted, 1 ms read latency): 21.0 to 21.5 s with one event
     per read and no workers, 12.7 to 13.1 s with 8 to 32 workers; the same work run again
@@ -2891,11 +2899,23 @@ separately.
   remains available for the next request. A stopping server waits up to 10 s for publications
   already scheduled, after its last clone has gone: without the wait a serve stopped right
   after its clone exited published nothing, and four restores of a 128 GiB guest in a row
-  replayed no set. Publication also takes the
+  replayed no set. `podman prepare` records a set for a snapshot that has none: it restores
+  the snapshot once with `snapshot run --exec true` through a memory server and tears the
+  clone down (`--no-record-working-set` skips it), so the first restore after a prepare
+  replays a set (#955). Publication also takes the
   snapshot generation lock shared from the final image-identity check through the atomic
   rename. Snapshot replacement takes that lock exclusively, so it either finishes before the
   check (the old clone declines to publish) or waits until an active publication completes; it
   cannot land in between.
+- **First-touch order**: each recorded granule also keeps when it was first touched, in tenths
+  of a second after its clone's handshake (`FirstTouch`, 2 bytes per granule; the sidecar is
+  format version 2, and a version 1 file is dropped and re-recorded). Merging keeps the earlier
+  time, so the set converges on when the guest first needs each page, and a merge that only
+  makes a time earlier is published like one that adds granules. Replay and the warm-up walk the
+  set in 11 tiers (the first half second, then doubling: 1 s, 2 s, 4 s and so on, the last also
+  holding granules with no known time), ascending offset within a tier (`OrderedRuns`), so the
+  pages the restore path and the first requests touch are mapped first rather than wherever
+  their offset falls in a replay of tens of GiB.
 - **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
   chunks. Replay starts during the snapshot load, when Firecracker hands the server its
