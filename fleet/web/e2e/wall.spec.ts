@@ -32,6 +32,8 @@ test.describe.configure({ mode: "serial" });
 
 test("the mosaic draws every GPU live, 15 tiles at one common t, each side as wide as its GPUs", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
+  // WebKit's frame canvas is in memory: its GPU canvas in a worker aborts in Skia (#1523).
+  expect(await page.evaluate(() => window.__fleet!.client.cpuCanvas)).toBe(test.info().project.name === "webkit");
   const v = await view(page);
   expect(v.tiles).toHaveLength(15);
   expect(v.tiles.filter((t) => t.box !== null)).toHaveLength(15);

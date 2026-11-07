@@ -74,7 +74,15 @@ export default defineConfig({
       grep: /@engines/,
       testIgnore: /(screenshots|phones|potato|mirror)\.spec\.ts/,
       dependencies: ["chromium"],
-      use: { ...devices["Desktop Safari"], viewport, deviceScaleFactor: 1 },
+      use: {
+        ...devices["Desktop Safari"],
+        viewport,
+        deviceScaleFactor: 1,
+        // The frame canvas in memory (app/_wall/wall-client.ts cpuCanvasAsked): on a GPU canvas
+        // drawn in a worker this WebKit build aborts in Skia's GPU flush, 4 of 10 standalone runs
+        // that restyle the canvas while the worker draws, and 0 of 10 with the canvas in memory (#1523).
+        storageState: { cookies: [], origins: [{ origin: `http://localhost:${PORTS.web}`, localStorage: [{ name: "fleet-wall.canvas", value: "cpu" }] }] },
+      },
     },
     // Last, because it writes words and lights into the shared scene.
     {
