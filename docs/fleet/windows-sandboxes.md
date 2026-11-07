@@ -74,8 +74,9 @@ evaluation period. The design holds to that so a public launch stays possible, a
 below is enforced by code with a test, not by convention:
 
 - **No accounts and no persistence.** A viewer signs in to nothing. The desktop is the session
-  of a standard local user (`sandbox`), not an administrator, and nobody types its password. Every borrowed sandbox is discarded when
-  the borrow ends (restored from the snapshot), so nothing a viewer did survives them.
+  of a standard local user (`sandbox`), not an administrator, and nobody types its password.
+  Every borrowed sandbox is discarded when the borrow ends (restored from the snapshot), so
+  nothing a viewer did survives them.
 - **A hard session limit.** A borrow lasts `windows_claim_secs` (120 s by default, the
   phones' value), and the coordinator ends it then whatever the viewer does.
 - **No file transfer in or out, and no egress.** The bridge negotiates no clipboard, drive,
@@ -144,9 +145,11 @@ QEMU builds the image and nothing else: an unattended install needs the installe
 be debuggable, and Cloud Hypervisor has none. `fleet/windows/build-image.sh` (stack PR 3)
 installs from the ISO into a 40 GiB raw disk under QEMU (q35, OVMF, the target disk on
 virtio-blk so the installed system boots with `viostor`, the two ISOs and a config ISO on
-SATA), with `autounattend.xml` generated from a template in the repository and an
-administrator password generated on the builder, kept beside the image (mode 0600) and never
-written to the repository or a log. Setup injects every virtio-win driver offline, and a
+SATA), with `autounattend.xml` generated from a template in the repository, and two passwords
+generated on the builder (the administrator's, which nothing uses after the build, and the
+standard user `sandbox`'s, which the bridge logs on with), kept beside the image (mode 0600)
+and never written to the repository or a log. `sandbox` is a member of Remote Desktop Users
+and of no administrative group. Setup injects every virtio-win driver offline, and a
 `SetupComplete.cmd` script configures:
 
 - Remote Desktop on, Network Level Authentication off (the port is reachable only from the
@@ -227,7 +230,7 @@ fcvm vm run --name win-1 --firmware <CLOUDHV.fd> --disk <image.raw> --cpu 2 --me
 ### Per-clone identity
 
 Every clone of one snapshot has the snapshot's machine SID, computer name (`SANDBOX`),
-administrator password, Remote Desktop certificate and private key, and network address.
+passwords, Remote Desktop certificate and private key, and network address.
 That is acceptable for disposable sandboxes and is stated here so nobody builds on it:
 
 - no sandbox joins a domain or talks to another sandbox (each is alone in a namespace with no
@@ -245,7 +248,7 @@ place is a second agent step at restore, after the clock, not a different snapsh
 The gold flow, run by the agent once per host and image (stack PR 6):
 
 1. Cold boot the image in a raw VM. Health answers when Remote Desktop listens.
-2. The bridge logs on as the administrator at the sandbox's size (1280 x 720) and waits for
+2. The bridge logs on as `sandbox` at the sandbox's size (1280 x 720) and waits for
    the desktop. The first logon creates the profile and runs first-logon tasks.
 3. It waits until the desktop is idle: the VM's vCPU threads under 2% of a core for 10 s in a
    row, read from `/proc` on the host.
