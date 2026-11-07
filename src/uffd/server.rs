@@ -73,6 +73,12 @@ const READ_BATCH: usize = 64;
 /// How long a connecting VMM has to complete the UFFD handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a stopping server waits for its working-set writer. A publication writes one
+/// bitmap of 32 KiB per GiB of guest memory (4 MiB for 128 GiB) and renames it into place;
+/// the bound is for a filesystem that has stopped answering, which must not hold the server
+/// past it.
+const WORKING_SET_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long the handler keeps retrying parked faults without sleeping, after a fault is parked
 /// and after every REMOVE event it reads.
 ///
@@ -1547,6 +1553,29 @@ impl UffdServer {
             match result {
                 Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
                 Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
+            }
+        }
+        // Every handler has scheduled its clone's faults by now. Give the writer a bounded
+        // time to publish them before the process exits with them only in memory.
+        if let Some(persistence) = self.working_set_persistence.clone() {
+            let started = std::time::Instant::now();
+            let drained =
+                tokio::task::spawn_blocking(move || persistence.drain(WORKING_SET_DRAIN_TIMEOUT))
+                    .await
+                    .unwrap_or(false);
+            if drained {
+                debug!(
+                    target: "uffd",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "working-set publications finished before shutdown"
+                );
+            } else {
+                warn!(
+                    target: "uffd",
+                    timeout_secs = WORKING_SET_DRAIN_TIMEOUT.as_secs(),
+                    "the working-set writer was still busy at shutdown; this server's \
+                     recording stays unpublished"
+                );
             }
         }
 
