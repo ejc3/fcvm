@@ -81,7 +81,8 @@ class SetupLog(unittest.TestCase):
 class Build(unittest.TestCase):
     def test_setup_complete_never_reboots_the_machine_itself(self):
         setup = read(HERE, "fcvm-setup.ps1")
-        body = setup.split("@'")[0]  # SetupComplete's own steps, before the finish script
+        # SetupComplete's own steps: the script without the finish script it writes out
+        body = re.sub(r"@'.*?'@", "", setup, flags=re.S)
         self.assertNotRegex(body, r"(?m)^\s*(shutdown|Restart-Computer)\b")
         self.assertIn("New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)", setup)
 
