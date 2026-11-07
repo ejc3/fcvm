@@ -2932,8 +2932,8 @@ separately.
   `elapsed_ms`, or, for a fresh snapshot, that no working set is recorded yet. Minor mode
   reads the whole image into its memfd at startup, so it has nothing to warm, and
   `--uffd-prefetch off` starts no warm-up. Known limits, with numbers, are in the module doc:
-  the warm-up is not paced, so on a cold cache another running clone's major fault waits
-  behind its readahead, it can outrun replay when free page cache is smaller than the
+  the warm-up keeps at most 8 MiB of readahead outstanding (`IN_FLIGHT_BYTES`), so on a cold
+  cache another running clone's major fault waits behind at most that much, it can outrun replay when free page cache is smaller than the
   recorded set, and a minor-mode server starting on the same image drops what it loaded.
 - **Idle snapshots leave the page cache when a server starts** (`src/uffd/release.rs`, #1066):
   a server that starts asks the kernel to drop the memory file of every other snapshot that

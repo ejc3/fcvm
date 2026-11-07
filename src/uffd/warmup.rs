@@ -68,8 +68,9 @@
 //!
 //! # Known limits
 //!
-//! * **It is not paced.** On a cold cache the thread keeps the device queue full for its
-//!   whole run, so another running clone's major fault on an uncached page waits behind
+//! * **It is paced to [`IN_FLIGHT_BYTES`].** Unpaced, it queued a whole recorded set, and
+//!   every demand fault on a page it had not reached read behind all of it (#986, #1069).
+//!   Within the window a running clone's major fault on an uncached page still waits behind
 //!   readahead. A microbenchmark (6 GiB file on btrfs over a virtio disk, `nr_requests` 256,
 //!   scheduler `none`) measured a cold single-page fault at a median of 125 us alone and
 //!   1,193 us while back-to-back 128 KiB requests ran, with the p90 going from 141 us to
@@ -104,6 +105,103 @@ use super::working_set::{PageSet, Run, GRANULE};
 /// size is only truncated on a host that lowered them, and it is a whole number of 4, 16 or
 /// 64 KiB pages.
 const REQUEST_BYTES: u64 = 128 * 1024;
+
+/// How many requested bytes may be read ahead and not yet in the page cache.
+///
+/// A demand fault on a page the warm-up has not reached reads behind every queued readahead
+/// request, so an unpaced warm-up that queued a whole recorded set made each such fault wait
+/// for all of it (#986, #1069). Measured in one session on a c8g.metal-48xl: a 128 GiB, 32
+/// vCPU guest whose 28 workers touch 40 GiB, restored four times from a 46 GiB recorded set
+/// with the memory file read at 400 MB/s (cgroup io.max) after the page cache was dropped.
+/// The guest acknowledgement of restores 2 to 4, and the soft lockups the guest logged:
+///
+/// | warm-up | acknowledgement (s) | soft lockups |
+/// |---|---|---|
+/// | unpaced (two series) | 89, 121, 121 and 98, 132, 132 | 28 to 30, and 3, per restore |
+/// | none | 100, 118, 108 | 0 |
+/// | 32 MiB in flight | 10.2, 8.9, 9.1 | 0 |
+/// | 8 MiB in flight | 4.6, 3.4, 3.5 | 0 |
+/// | 2 MiB in flight | 5.3, 4.8, 4.7 | 0 |
+///
+/// A first restore, with no recorded set, acknowledged in 1.8 to 3.5 s. Paced at 8 MiB the
+/// warm-up read 9.1 to 10.4 M pages in 95 to 98 s, the device's rate, so pacing cost it no
+/// throughput.
+const IN_FLIGHT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How long one request may stay not resident before the pacer stops waiting for it: a page
+/// the kernel read and evicted again would otherwise hold the warm-up for ever.
+const RESIDENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Keeps at most [`IN_FLIGHT_BYTES`] of the warm-up's requests outstanding: before the next
+/// request is issued, the oldest outstanding ones are retired once `resident` reports them
+/// in the page cache, or once they have been outstanding [`RESIDENT_WITHIN`].
+struct Pacer<R: FnMut(Request) -> bool> {
+    in_flight: std::collections::VecDeque<(Request, Instant)>,
+    bytes: u64,
+    window: u64,
+    resident: R,
+}
+
+impl<R: FnMut(Request) -> bool> Pacer<R> {
+    fn new(window: u64, resident: R) -> Self {
+        Self {
+            in_flight: std::collections::VecDeque::new(),
+            bytes: 0,
+            window,
+            resident,
+        }
+    }
+
+    /// Wait until `next` fits the window, or `stop` is set. Returns false on a stop.
+    fn wait_for_room(&mut self, next: Request, stop: &AtomicBool) -> bool {
+        while self.bytes + next.len > self.window && !self.in_flight.is_empty() {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            let (oldest, issued) = self.in_flight[0];
+            if (self.resident)(oldest) || issued.elapsed() >= RESIDENT_WITHIN {
+                self.in_flight.pop_front();
+                self.bytes -= oldest.len;
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        true
+    }
+
+    fn issued(&mut self, request: Request) {
+        self.in_flight.push_back((request, Instant::now()));
+        self.bytes += request.len;
+    }
+}
+
+/// Whether every page of `request` is in `image`'s page cache, asked of `mincore` on a
+/// mapping of the file. `mincore` does not touch the pages, so a truncated image cannot
+/// fault here either.
+fn resident(map: &memmap2::Mmap, request: Request) -> bool {
+    let page = host_page_size();
+    let (Ok(start), Ok(len)) = (
+        usize::try_from(request.offset),
+        usize::try_from(request.len),
+    ) else {
+        return true;
+    };
+    if start.saturating_add(len) > map.len() {
+        return true;
+    }
+    let pages = len.div_ceil(page as usize);
+    let mut vec = vec![0u8; pages];
+    // SAFETY: the range lies inside `map`, which stays mapped for the call, and `vec` has a
+    // byte for each page of it.
+    let rc = unsafe {
+        libc::mincore(
+            map.as_ptr().add(start) as *mut libc::c_void,
+            len,
+            vec.as_mut_ptr().cast(),
+        )
+    };
+    rc != 0 || vec.iter().all(|byte| byte & 1 == 1)
+}
 
 /// One `WILLNEED` request: `len` bytes of the memory image at `offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,8 +429,22 @@ impl Warmer {
         recorded: impl FnOnce() -> PageSet + Send + 'static,
     ) -> bool {
         let image = Arc::clone(&self.image);
+        let stop = Arc::clone(&self.shared);
+        // The pacer's view of the page cache. A mapping that cannot be made leaves the
+        // warm-up unpaced, as it was before the pacer.
+        // SAFETY: the mapping is only passed to mincore, which never reads the pages, so a
+        // file another process truncates cannot fault through it.
+        let map = unsafe { memmap2::Mmap::map(&*image) }.ok();
+        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| {
+            map.as_ref().is_none_or(|map| resident(map, request))
+        });
         self.warm_if_idle_with(trigger, recorded, move |request| {
-            request_read(&image, request)
+            if !pacer.wait_for_room(request, &stop.stop) {
+                return Ok(());
+            }
+            request_read(&image, request)?;
+            pacer.issued(request);
+            Ok(())
         })
     }
 
@@ -648,6 +760,78 @@ mod tests {
 
     const G: u64 = GRANULE;
     const PAGE: u64 = 4096;
+
+    /// The warm-up the server starts goes through the pacer: each request waits for room in
+    /// the window before it is issued, and is counted once issued. Unpaced, the warm-up
+    /// queued a whole recorded set (#986, #1069).
+    #[test]
+    fn the_server_s_warm_up_is_paced() {
+        let source = include_str!("warmup.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let start = code
+            .find("pub(crate) fn warm_if_idle(")
+            .expect("no warm_if_idle");
+        let body = &code[start..start + code[start..].find("\n    }\n").unwrap()];
+        let wait = body
+            .find("pacer.wait_for_room(request")
+            .expect("the warm-up does not wait for room in the window");
+        let read = body
+            .find("request_read(&image, request)")
+            .expect("the warm-up issues no request");
+        let issued = body
+            .find("pacer.issued(request)")
+            .expect("the warm-up does not count what it issued");
+        assert!(wait < read && read < issued, "{body}");
+        assert!(
+            source.contains("Pacer::new(IN_FLIGHT_BYTES,"),
+            "the pacer's window is not IN_FLIGHT_BYTES"
+        );
+    }
+
+    /// The pacer never lets more than its window of requests be outstanding: with the
+    /// device reading nothing, the next request waits; once the oldest is resident, it is
+    /// retired and the next one goes out. Unpaced, the warm-up queued every request at once
+    /// (#986, #1069).
+    #[test]
+    fn the_pacer_keeps_at_most_its_window_outstanding() {
+        let resident_upto = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = std::sync::Arc::clone(&resident_upto);
+        let mut pacer = Pacer::new(4 * REQUEST_BYTES, move |request: Request| {
+            request.offset + request.len <= seen.load(Ordering::Relaxed)
+        });
+        let stop = AtomicBool::new(false);
+        let request = |i: u64| Request {
+            offset: i * REQUEST_BYTES,
+            len: REQUEST_BYTES,
+        };
+        for i in 0..4 {
+            assert!(pacer.wait_for_room(request(i), &stop));
+            pacer.issued(request(i));
+        }
+        assert_eq!(pacer.bytes, 4 * REQUEST_BYTES);
+
+        // Nothing is resident: the fifth request waits until the device reads the first.
+        let reader = {
+            let resident_upto = std::sync::Arc::clone(&resident_upto);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                resident_upto.store(REQUEST_BYTES, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        assert!(pacer.wait_for_room(request(4), &stop));
+        assert!(
+            started.elapsed() >= Duration::from_millis(90),
+            "the fifth request went out while four were outstanding"
+        );
+        pacer.issued(request(4));
+        assert_eq!(pacer.bytes, 4 * REQUEST_BYTES);
+        reader.join().unwrap();
+
+        // A stop ends the wait.
+        stop.store(true, Ordering::Relaxed);
+        assert!(!pacer.wait_for_room(request(5), &stop));
+    }
 
     fn set_of(mem_len: u64, runs: &[(u64, u64)]) -> PageSet {
         let mut set = PageSet::empty(mem_len);
