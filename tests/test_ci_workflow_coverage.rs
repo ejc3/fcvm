@@ -2948,3 +2948,34 @@ fn kernel_workflows_set_up_btrfs_with_the_make_target() {
         "found {setups} btrfs setup steps in kernels.yml"
     );
 }
+
+/// The host jobs put the VMM logs teardown keeps in /tmp into their test-log artifact, before
+/// the upload, so a guest that hung leaves its VMM's side too (a Cloud Hypervisor clone whose
+/// second CPU never ran after a restore had only the guest's console). The container job's
+/// VMs keep theirs inside the container.
+#[test]
+fn host_jobs_upload_the_vmm_logs_teardown_keeps() {
+    let ci = parse_workflow("ci.yml");
+    for job in ["host", "host-root"] {
+        let steps = ci["jobs"][job]["steps"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("ci.yml job {job} has no steps"));
+        let position = |name: &str| {
+            steps
+                .iter()
+                .position(|step| step.get("name").and_then(Value::as_str) == Some(name))
+        };
+        let upload = position("Upload test logs")
+            .unwrap_or_else(|| panic!("job {job} uploads no test logs"));
+        let save = position("Save VMM logs")
+            .unwrap_or_else(|| panic!("job {job} does not save the VMM logs"));
+        assert!(save < upload, "job {job} saves the VMM logs after uploading");
+        let step = &steps[save];
+        assert_eq!(step.get("if").and_then(Value::as_str), Some("always()"), "job {job}");
+        let run = step.get("run").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            run.contains("fcvm-firecracker-*.log") && run.contains("/tmp/fcvm-test-logs/"),
+            "job {job} copies no VMM log into the artifact: {run}"
+        );
+    }
+}
