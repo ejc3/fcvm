@@ -93,6 +93,38 @@ const QUIESCE_PHASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CONSOLE: OnceLock<Arc<ConsoleShared>> = OnceLock::new();
 
+/// fc-agent's `eprintln!`: the line in one write. Panics if the write fails, as std's does.
+pub fn eprint_line(args: std::fmt::Arguments<'_>) {
+    if let Err(e) = write_line(&mut std::io::stderr().lock(), args) {
+        panic!("failed printing to stderr: {e}");
+    }
+}
+
+/// Write one line, `args` and its newline, with a single `write_all`. Backs fc-agent's own
+/// `eprintln!` (main.rs), which replaces std's.
+///
+/// std's macro writes a line in pieces, one write per literal and per argument and one for
+/// the newline, and the writer thread reads the pipe as the pieces arrive, so a line could
+/// reach the console in pieces. Any other console writer (the kernel, a process writing
+/// `/dev/ttyS0`) could then land inside it: the serial console test once read
+/// `[fc-agent] exec server: accepted connection on vsock port 4998<marker>`, where the exec
+/// that wrote the marker raced the line that logged its accept. A pipe write of up to
+/// `PIPE_BUF` (4096) bytes is atomic, so a line that size or smaller now leaves the pipe
+/// in one read.
+pub fn write_line(
+    out: &mut impl std::io::Write,
+    args: std::fmt::Arguments<'_>,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let mut line = String::with_capacity(128);
+    // Formatting into a String fails only if a Display impl reports an error, as for std's
+    // macros, which then panic.
+    line.write_fmt(args)
+        .expect("a Display implementation returned an error unexpectedly");
+    line.push('\n');
+    out.write_all(line.as_bytes())
+}
+
 /// Shared state between the writer thread and quiesce callers.
 pub struct ConsoleShared {
     console_fd: OwnedFd,
@@ -752,6 +784,108 @@ mod tests {
         assert!(
             wait_until(|| state.flushed(), Duration::from_secs(5)),
             "writer must account every relayed byte as disposed"
+        );
+    }
+
+    /// Writes each piece it is handed into the agent's pipe, waits until the console holds
+    /// it, and after the first piece writes a marker straight to the console, as an exec
+    /// writing `/dev/ttyS0` would. A line that arrives in pieces then has the marker inside.
+    struct RacedPipe<'a> {
+        state: &'a Arc<ConsoleShared>,
+        console_rd: &'a mut std::fs::File,
+        other: &'a std::fs::File,
+        seen: &'a mut Vec<u8>,
+        sent: usize,
+        raced: bool,
+    }
+
+    impl std::io::Write for RacedPipe<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            write_pipe(self.state, buf);
+            self.sent += buf.len();
+            let sent = self.sent;
+            assert!(
+                wait_until(
+                    || {
+                        drain_console(self.console_rd, self.seen);
+                        self.seen.len() >= sent
+                    },
+                    Duration::from_secs(5)
+                ),
+                "the writer did not forward {sent} bytes"
+            );
+            if !self.raced {
+                self.raced = true;
+                let mut other = self.other;
+                other.write_all(b"MARKER\n")?;
+                self.sent += b"MARKER\n".len();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An agent line reaches the console whole when another console writer races it. With
+    /// std's `writeln!` the line is three writes and the marker lands after the first, which
+    /// is what the serial console test once read.
+    #[test]
+    fn a_line_reaches_the_console_whole_with_another_writer_racing_it() {
+        let (console_wr, mut console_rd) = fake_console();
+        let other = std::fs::File::from(console_wr.try_clone().unwrap());
+        let state = setup(console_wr).unwrap();
+        let mut seen: Vec<u8> = Vec::new();
+        let port = 4998;
+        {
+            let mut raced = RacedPipe {
+                state: &state,
+                console_rd: &mut console_rd,
+                other: &other,
+                seen: &mut seen,
+                sent: 0,
+                raced: false,
+            };
+            write_line(
+                &mut raced,
+                format_args!("[fc-agent] exec server: accepted connection on vsock port {port}"),
+            )
+            .unwrap();
+        }
+        // The marker went straight to the console after the last write.
+        let expected = "[fc-agent] exec server: accepted connection on vsock port 4998\nMARKER\n";
+        wait_until(
+            || {
+                drain_console(&mut console_rd, &mut seen);
+                seen.len() >= expected.len()
+            },
+            Duration::from_secs(5),
+        );
+        let text = String::from_utf8_lossy(&seen);
+        assert_eq!(
+            text, expected,
+            "an agent line was split by another console writer"
+        );
+    }
+
+    /// main.rs replaces std's `eprintln!` with one that writes through `eprint_line`, before
+    /// any module, so every module's `eprintln!` is the one-write one.
+    #[test]
+    fn fc_agent_replaces_eprintln_before_its_modules() {
+        let main = include_str!("main.rs");
+        let defined = main
+            .find("macro_rules! eprintln {")
+            .expect("main.rs no longer defines fc-agent's eprintln!");
+        let first_module = main.find("\nmod ").expect("main.rs declares no module");
+        assert!(
+            defined < first_module,
+            "eprintln! is defined after a module"
+        );
+        let body = &main[defined..first_module];
+        assert_eq!(
+            body.matches("$crate::console::eprint_line(format_args!(")
+                .count(),
+            2
         );
     }
 

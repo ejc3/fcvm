@@ -1,3 +1,15 @@
+// fc-agent's own `eprintln!`: each line is one write, so a line reaches the console whole
+// (see `console::write_line`). Defined before every module so it replaces std's throughout
+// the crate. fc-agent prints nothing to stdout.
+macro_rules! eprintln {
+    () => {
+        $crate::console::eprint_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::console::eprint_line(format_args!($($arg)*))
+    };
+}
+
 mod agent;
 mod bootplan;
 mod console;
