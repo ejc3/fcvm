@@ -233,7 +233,8 @@ pub(crate) fn freeze_in(env: &Env) -> Vec<PathBuf> {
     // A record still here belongs to a boundary nothing thawed: its cgroups are ours.
     let previous = Record::read(env.record);
     let previous_id = previous.as_ref().map(|record| record.id);
-    let mut ours = previous.map(|record| record.cgroups).unwrap_or_default();
+    let inherited = previous.map(|record| record.cgroups).unwrap_or_default();
+    let mut ours = inherited.clone();
     for cgroup in payload_cgroups(env.parent) {
         if !ours.contains(&cgroup) && !freeze_requested(&cgroup) {
             ours.push(cgroup);
@@ -261,7 +262,8 @@ pub(crate) fn freeze_in(env: &Env) -> Vec<PathBuf> {
     for cgroup in &ours {
         if write_freeze(cgroup, "1") {
             (env.froze)(cgroup);
-        } else {
+        } else if !inherited.contains(cgroup) {
+            // An inherited cgroup was frozen by the boundary before, so it stays ours.
             failed.push(cgroup.clone());
         }
     }
@@ -624,6 +626,24 @@ mod tests {
         std::fs::write(&freeze, "1").unwrap();
         assert_eq!(tree.run(thaw_in), 1);
         after(&tree, &running, &stuck);
+    }
+
+    /// A retried snapshot whose freeze write fails on a cgroup the first freeze froze keeps
+    /// it recorded, so the retry's resume thaws it once the write works.
+    #[test]
+    fn a_retry_keeps_an_inherited_cgroup_whose_write_failed() {
+        let tree = Tree::new();
+        let running = tree.cgroup("libpod-payload-a", false);
+        let paused = tree.cgroup("libpod-payload-p", true);
+        tree.run(freeze_in);
+        let freeze = running.join("cgroup.freeze");
+        std::fs::remove_file(&freeze).unwrap();
+        std::fs::create_dir(&freeze).unwrap();
+        tree.run(freeze_in);
+        std::fs::remove_dir(&freeze).unwrap();
+        std::fs::write(&freeze, "1").unwrap();
+        assert_eq!(tree.run(thaw_in), 1);
+        after(&tree, &running, &paused);
     }
 
     #[test]
