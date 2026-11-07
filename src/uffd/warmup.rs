@@ -1208,10 +1208,16 @@ mod tests {
         let resident = &code[start..start + code[start..].find("\n}\n").unwrap()];
         assert!(resident.contains("libc::RWF_NOWAIT"), "{resident}");
         assert!(!resident.contains("mincore("), "{resident}");
+        let squeezed: String = resident.split_whitespace().collect();
+        let fallback = squeezed
+            .find("Some(libc::EOPNOTSUPP)=>map")
+            .expect("no fallback for a filesystem that refuses RWF_NOWAIT");
+        let mapped = squeezed
+            .find("mapped_resident(map,request)")
+            .expect("the fallback does not ask the mapping");
+        let other = squeezed.find("_=>true").expect("no default arm");
         assert!(
-            resident.contains(
-                "Some(libc::EOPNOTSUPP) => map.is_none_or(|map| mapped_resident(map, request)),"
-            ),
+            fallback < mapped && mapped < other,
             "mincore is asked for anything but a filesystem that refuses RWF_NOWAIT: {resident}"
         );
     }
