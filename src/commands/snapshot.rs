@@ -1782,6 +1782,7 @@ fn release_idle_snapshot_memory(serving: &str) {
 
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
+    crate::cgroup::require_swap_disabled(args.no_swap)?;
     validate_snapshot_name(&args.snapshot_name)?;
     info!(
         "Starting memory server for snapshot: {}",
@@ -2213,6 +2214,7 @@ fn volume_state_from_snapshot(
 ///
 /// This is public so podman.rs can call it directly for cache hits.
 pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
+    crate::cgroup::require_swap_disabled(args.no_swap)?;
     cmd_snapshot_run_attempt(args).await.result
 }
 
