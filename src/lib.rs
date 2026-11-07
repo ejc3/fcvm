@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod commands;
+pub mod companion;
 pub mod firecracker;
 pub mod fleet;
 pub mod gpu;

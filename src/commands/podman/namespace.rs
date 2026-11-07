@@ -25,9 +25,6 @@ pub(super) async fn setup_rootless_namespace(
     let (mut child, mut holder_pid) =
         crate::commands::common::spawn_namespace_holder(&holder_cmd).await?;
 
-    // Take stderr pipe for diagnostics if holder dies during nsenter
-    let mut holder_stderr = child.stderr.take();
-
     // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
     // This is also inside retry logic - if holder dies during nsenter, retry everything
     let setup_script = pasta_net.build_setup_script();
@@ -132,23 +129,9 @@ pub(super) async fn setup_rootless_namespace(
                 "network setup succeeded after retry"
             );
         } else {
-            // If holder died, try to capture its stderr for more context
+            // If holder died, its stderr (captured since spawn) says why
             let holder_stderr_content = if !holder_alive {
-                if let Some(ref mut pipe) = holder_stderr {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = String::new();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        pipe.read_to_string(&mut buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => buf,
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                }
+                crate::companion::tail_of(holder_pid).lines().join("\n")
             } else {
                 String::new()
             };
