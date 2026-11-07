@@ -82,81 +82,6 @@ use nix::unistd::{read, write};
 /// are counted and summarized rather than silent.
 const PENDING_CAP: usize = 1024 * 1024;
 
-/// How long the writer holds the unfinished last line back, waiting for its newline,
-/// before it writes it anyway. `eprintln!` writes a line in pieces (each literal and each
-/// argument, then the newline), and the writer reads the pipe as the pieces arrive, so
-/// without the hold a line reached the console in pieces. Any other console writer (the
-/// kernel, a process writing `/dev/ttyS0`) could then land inside it: the serial console
-/// test once read `[fc-agent] exec server: accepted connection on vsock port 4998<marker>`,
-/// where the exec that wrote the marker raced the line that logged its accept.
-const PARTIAL_LINE_HOLD: Duration = Duration::from_millis(100);
-
-/// An unfinished line this long is written without waiting for its newline: the hold is
-/// for a line still being written, not for output that has none.
-const PARTIAL_LINE_CAP: usize = 4096;
-
-/// How much of `pending` to write now: through its last newline, or all of it once the
-/// unfinished tail has waited [`PARTIAL_LINE_HOLD`] (`tail_since`) or reached
-/// [`PARTIAL_LINE_CAP`] bytes.
-fn writable_len(pending: &[u8], tail_since: Option<Instant>, now: Instant) -> usize {
-    let whole = pending
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |at| at + 1);
-    let tail = pending.len() - whole;
-    let held_long_enough =
-        tail_since.is_some_and(|since| now.saturating_duration_since(since) >= PARTIAL_LINE_HOLD);
-    if tail >= PARTIAL_LINE_CAP || held_long_enough {
-        pending.len()
-    } else {
-        whole
-    }
-}
-
-/// Follow the unfinished line at the end of `pending` and return when it began to wait for
-/// its newline. A line is known by where it starts, counted in bytes ever appended at the back
-/// of `pending` (`appended`), so a new unfinished line gets a fresh wait even when no newline
-/// was read since the last one ended, and a line inserted at the front (the recovery summary)
-/// does not restart the wait of the line it is inserted before.
-fn track_tail(
-    pending: &[u8],
-    appended: u64,
-    tail: &mut Option<(u64, Instant)>,
-    now: Instant,
-) -> Option<Instant> {
-    let whole = pending
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |at| at + 1);
-    let unfinished = (pending.len() - whole) as u64;
-    if unfinished == 0 {
-        *tail = None;
-        return None;
-    }
-    let start = appended - unfinished;
-    match *tail {
-        Some((at, since)) if at == start => Some(since),
-        _ => {
-            *tail = Some((start, now));
-            Some(now)
-        }
-    }
-}
-
-/// How long the writer's poll may wait, in ms: until the held line's wait ends when that is
-/// what it waits for, else the regular tick. While gated nothing can be written, so the end of
-/// a hold is no reason to wake.
-fn poll_tick(tail_since: Option<Instant>, want_write: bool, gated: bool, now: Instant) -> u16 {
-    match tail_since {
-        Some(since) if !want_write && !gated => {
-            let left = PARTIAL_LINE_HOLD.saturating_sub(now.saturating_duration_since(since));
-            // At least 1 ms, so a hold that just ended does not poll with no wait.
-            (left.as_millis() as u16).clamp(1, POLL_TICK_MS)
-        }
-        _ => POLL_TICK_MS,
-    }
-}
-
 /// Writer thread poll tick. Bounds how quickly the writer notices a gate
 /// transition; pipe data wakes it immediately via POLLIN.
 const POLL_TICK_MS: u16 = 100;
@@ -167,6 +92,38 @@ const POLL_TICK_MS: u16 = 100;
 const QUIESCE_PHASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CONSOLE: OnceLock<Arc<ConsoleShared>> = OnceLock::new();
+
+/// fc-agent's `eprintln!`: the line in one write. Panics if the write fails, as std's does.
+pub fn eprint_line(args: std::fmt::Arguments<'_>) {
+    if let Err(e) = write_line(&mut std::io::stderr().lock(), args) {
+        panic!("failed printing to stderr: {e}");
+    }
+}
+
+/// Write one line, `args` and its newline, with a single `write_all`. Backs fc-agent's own
+/// `eprintln!` (main.rs), which replaces std's.
+///
+/// std's macro writes a line in pieces, one write per literal and per argument and one for
+/// the newline, and the writer thread reads the pipe as the pieces arrive, so a line could
+/// reach the console in pieces. Any other console writer (the kernel, a process writing
+/// `/dev/ttyS0`) could then land inside it: the serial console test once read
+/// `[fc-agent] exec server: accepted connection on vsock port 4998<marker>`, where the exec
+/// that wrote the marker raced the line that logged its accept. A pipe write of up to
+/// `PIPE_BUF` (4096) bytes is atomic, so a line that size or smaller now leaves the pipe
+/// in one read.
+pub fn write_line(
+    out: &mut impl std::io::Write,
+    args: std::fmt::Arguments<'_>,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let mut line = String::with_capacity(128);
+    // Formatting into a String fails only if a Display impl reports an error, as for std's
+    // macros, which then panic.
+    line.write_fmt(args)
+        .expect("a Display implementation returned an error unexpectedly");
+    line.push('\n');
+    out.write_all(line.as_bytes())
+}
 
 /// Shared state between the writer thread and quiesce callers.
 pub struct ConsoleShared {
@@ -309,28 +266,18 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
 fn writer_loop(state: Arc<ConsoleShared>) {
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut buf = [0u8; 8192];
-    // Bytes ever appended at the back of `pending`, and the unfinished line at its end:
-    // where it starts in those terms and when it began to wait (see `track_tail`).
-    let mut appended: u64 = 0;
-    let mut tail: Option<(u64, Instant)> = None;
 
     loop {
         // Poll: always watch the pipe; watch the console for writability only
         // when there is something to flush and the gate is open.
-        // A held unfinished line is not something to write yet: waiting on POLLOUT for it
-        // would spin, so the poll waits for the pipe or the end of the hold instead.
-        let now = Instant::now();
-        let gated = state.gate.load(Ordering::SeqCst) != 0;
-        let tail_since = tail.map(|(_, since)| since);
-        let want_write = !gated && writable_len(pending.make_contiguous(), tail_since, now) > 0;
-        let tick = poll_tick(tail_since, want_write, gated, now);
+        let want_write = !pending.is_empty() && state.gate.load(Ordering::SeqCst) == 0;
         {
             let mut fds = [
                 PollFd::new(state.pipe_rd.as_fd(), PollFlags::POLLIN),
                 PollFd::new(state.console_fd.as_fd(), PollFlags::POLLOUT),
             ];
             let nfds = if want_write { 2 } else { 1 };
-            match poll(&mut fds[..nfds], PollTimeout::from(tick)) {
+            match poll(&mut fds[..nfds], PollTimeout::from(POLL_TICK_MS)) {
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(_) => {
@@ -352,7 +299,6 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                     let room = PENDING_CAP.saturating_sub(pending.len());
                     let keep = n.min(room);
                     pending.extend(&buf[..keep]);
-                    appended += keep as u64;
                     if keep < n {
                         let over = (n - keep) as u64;
                         // Dropped bytes are disposed: the enqueued/disposed
@@ -370,28 +316,18 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             }
         }
 
-        let tail_since = track_tail(
-            pending.make_contiguous(),
-            appended,
-            &mut tail,
-            Instant::now(),
-        );
-
         // 2) Flush pending to the console — never while gated, never blocking.
-        // Whole lines only, each write one contiguous run (see PARTIAL_LINE_HOLD).
         let mut wrote_any = false;
         if !pending.is_empty() {
             let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             // Checked under the lock: after quiesce() sets the gate and cycles
             // this lock, no write can start here.
             if state.gate.load(Ordering::SeqCst) == 0 {
-                let mut left = writable_len(pending.make_contiguous(), tail_since, Instant::now());
-                while left > 0 {
-                    let head = &pending.make_contiguous()[..left];
+                while !pending.is_empty() {
+                    let (head, _) = pending.as_slices();
                     match write(state.console_fd.as_fd(), head) {
                         Ok(0) => break,
                         Ok(n) => {
-                            left -= n;
                             pending.drain(..n);
                             state.disposed.fetch_add(n as u64, Ordering::SeqCst);
                             wrote_any = true;
@@ -414,11 +350,9 @@ fn writer_loop(state: Arc<ConsoleShared>) {
         }
 
         // 3) Console proven alive again after drops: emit ONE summary line.
-        // Only after a fully successful flush (wrote_any, and nothing left that may be
-        // written now) so a dead console can't loop summary → drop → summary. An unfinished
-        // line held back may remain; the summary goes in front of it, so it is neither held
-        // behind that line nor joined to it.
-        if wrote_any && writable_len(pending.make_contiguous(), tail_since, Instant::now()) == 0 {
+        // Only after a fully successful flush (wrote_any && empty) so a dead
+        // console can't loop summary → drop → summary.
+        if wrote_any && pending.is_empty() {
             let dropped = state.dropped.swap(0, Ordering::SeqCst);
             if dropped > 0 {
                 let line = format!(
@@ -430,9 +364,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                 state
                     .enqueued
                     .fetch_add(line.len() as u64, Ordering::SeqCst);
-                for &b in line.as_bytes().iter().rev() {
-                    pending.push_front(b);
-                }
+                pending.extend(line.as_bytes());
             }
         }
     }
@@ -855,145 +787,142 @@ mod tests {
         );
     }
 
-    /// A line written in pieces reaches the console whole, so another console writer
-    /// cannot land inside it. The serial console test once read
-    /// `...accepted connection on vsock port 4998<marker>`: the writer had forwarded the
-    /// line without its newline, and the marker the exec wrote to `/dev/ttyS0` landed
-    /// before the newline did.
+    /// A writer that records every write it is handed.
+    struct Writes(Vec<Vec<u8>>);
+
+    impl std::io::Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line with arguments is one write. std's `writeln!`, the path its `eprintln!` takes,
+    /// is several: the reason fc-agent replaces the macros.
     #[test]
-    fn a_line_written_in_pieces_reaches_the_console_whole() {
+    fn a_line_is_one_write() {
+        let port = 4998;
+        let mut ours = Writes(Vec::new());
+        write_line(
+            &mut ours,
+            format_args!("[fc-agent] exec server: accepted connection on vsock port {port}"),
+        )
+        .unwrap();
+        assert_eq!(
+            ours.0,
+            vec![b"[fc-agent] exec server: accepted connection on vsock port 4998\n".to_vec()]
+        );
+        let mut std_path = Writes(Vec::new());
+        writeln!(
+            std_path,
+            "[fc-agent] exec server: accepted connection on vsock port {port}"
+        )
+        .unwrap();
+        assert!(std_path.0.len() > 1, "{:?}", std_path.0);
+    }
+
+    /// Writes each piece it is handed into the agent's pipe, waits until the console holds
+    /// it, and after the first piece writes a marker straight to the console, as an exec
+    /// writing `/dev/ttyS0` would. A line that arrives in pieces then has the marker inside.
+    struct RacedPipe<'a> {
+        state: &'a Arc<ConsoleShared>,
+        console_rd: &'a mut std::fs::File,
+        other: &'a std::fs::File,
+        seen: &'a mut Vec<u8>,
+        sent: usize,
+        raced: bool,
+    }
+
+    impl std::io::Write for RacedPipe<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            write_pipe(self.state, buf);
+            self.sent += buf.len();
+            let sent = self.sent;
+            assert!(
+                wait_until(
+                    || {
+                        drain_console(self.console_rd, self.seen);
+                        self.seen.len() >= sent
+                    },
+                    Duration::from_secs(5)
+                ),
+                "the writer did not forward {sent} bytes"
+            );
+            if !self.raced {
+                self.raced = true;
+                let mut other = self.other;
+                other.write_all(b"MARKER\n")?;
+                self.sent += b"MARKER\n".len();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An agent line reaches the console whole when another console writer races it. With
+    /// std's `writeln!` the line is three writes and the marker lands after the first, which
+    /// is what the serial console test once read.
+    #[test]
+    fn a_line_reaches_the_console_whole_with_another_writer_racing_it() {
         let (console_wr, mut console_rd) = fake_console();
-        // Another writer to the same console, as `echo ... > /dev/ttyS0` is.
         let other = std::fs::File::from(console_wr.try_clone().unwrap());
         let state = setup(console_wr).unwrap();
         let mut seen: Vec<u8> = Vec::new();
-
-        write_pipe(
-            &state,
-            b"[fc-agent] exec server: accepted connection on vsock port ",
-        );
-        write_pipe(&state, b"4998");
-        // Well inside the hold, and far longer than the writer takes to forward bytes.
-        std::thread::sleep(Duration::from_millis(30));
-        (&other).write_all(b"UART-TEST-MARKER\n").unwrap();
-        write_pipe(&state, b"\n");
-        assert!(
-            wait_until(
-                || {
-                    drain_console(&mut console_rd, &mut seen);
-                    seen.iter().filter(|&&b| b == b'\n').count() == 2
-                },
-                Duration::from_secs(5)
-            ),
-            "both lines reach the console, got {:?}",
-            String::from_utf8_lossy(&seen)
-        );
-        let text = String::from_utf8_lossy(&seen);
-        assert!(
-            text.lines()
-                .any(|l| l == "[fc-agent] exec server: accepted connection on vsock port 4998"),
-            "the agent's line was split by another console writer: {text:?}"
-        );
-        assert!(text.lines().any(|l| l == "UART-TEST-MARKER"), "{text:?}");
-
-        // Output with no newline still reaches the console once the hold ends.
-        let before = seen.len();
-        write_pipe(&state, b"prompt> ");
-        assert!(
-            wait_until(
-                || {
-                    drain_console(&mut console_rd, &mut seen);
-                    seen[before..] == *b"prompt> "
-                },
-                Duration::from_secs(5)
-            ),
-            "an unfinished line is written after the hold, got {:?}",
-            String::from_utf8_lossy(&seen[before..])
-        );
-        assert!(wait_until(|| state.flushed(), Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn writable_len_holds_only_an_unfinished_line_within_its_hold() {
-        let now = Instant::now();
-        assert_eq!(writable_len(b"", None, now), 0);
-        assert_eq!(writable_len(b"a\nb\n", None, now), 4);
-        assert_eq!(writable_len(b"a\nbc", Some(now), now), 2);
-        assert_eq!(
-            writable_len(b"a\nbc", Some(now - PARTIAL_LINE_HOLD), now),
-            4
-        );
-        let long = vec![b'x'; PARTIAL_LINE_CAP];
-        assert_eq!(writable_len(&long, Some(now), now), PARTIAL_LINE_CAP);
-    }
-
-    /// An unfinished line is known by where it starts: one that grows keeps its wait, a new
-    /// one after a line ended gets a fresh wait even when no newline was read in between,
-    /// and the recovery summary inserted in front does not restart the wait behind it.
-    #[test]
-    fn an_unfinished_line_keeps_its_own_wait() {
-        let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(500);
-        let mut tail = None;
-        assert_eq!(track_tail(b"", 0, &mut tail, t0), None);
-        assert_eq!(track_tail(b"old", 3, &mut tail, t0), Some(t0));
-        assert_eq!(
-            track_tail(b"oldmore", 7, &mut tail, t1),
-            Some(t0),
-            "the same line grew"
-        );
-        assert_eq!(
-            track_tail(b"summary\noldmore", 7, &mut tail, t1),
-            Some(t0),
-            "a line inserted in front"
-        );
-        // "oldmore" was written once its wait ended, the summary went in front of nothing,
-        // and the next read brought a fragment with no newline.
-        assert_eq!(
-            track_tail(b"summary\nfrag", 11, &mut tail, t1),
-            Some(t1),
-            "a new fragment inherited the wait of the line before it"
-        );
-        assert_eq!(track_tail(b"frag\n", 12, &mut tail, t1), None);
-    }
-
-    #[test]
-    fn a_gated_writer_does_not_wake_for_the_end_of_a_hold() {
-        let now = Instant::now();
-        let ended = now - PARTIAL_LINE_HOLD;
-        assert_eq!(poll_tick(Some(ended), false, true, now), POLL_TICK_MS);
-        assert_eq!(poll_tick(Some(ended), false, false, now), 1);
-        assert_eq!(poll_tick(Some(now), false, false, now), 100);
-        assert_eq!(poll_tick(None, true, false, now), POLL_TICK_MS);
-    }
-
-    /// The recovery summary is not held behind an unfinished line: output that always ends
-    /// with a fresh unfinished line keeps `pending` from ever being empty.
-    #[test]
-    fn the_recovery_summary_is_not_held_behind_an_unfinished_line() {
-        let (console_wr, mut console_rd) = fake_console();
-        let state = setup(console_wr).unwrap();
-        state.dropped.store(4, Ordering::SeqCst);
-        let mut seen: Vec<u8> = Vec::new();
-        write_pipe(&state, b"start");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut found = false;
-        while Instant::now() < deadline && !found {
-            // Each write ends the line before it and starts a new one, well inside the hold.
-            write_pipe(&state, b"\nnext");
-            std::thread::sleep(Duration::from_millis(20));
-            drain_console(&mut console_rd, &mut seen);
-            found = String::from_utf8_lossy(&seen)
-                .contains("dropped 4 bytes of log output while the console was stalled");
+        let port = 4998;
+        {
+            let mut raced = RacedPipe {
+                state: &state,
+                console_rd: &mut console_rd,
+                other: &other,
+                seen: &mut seen,
+                sent: 0,
+                raced: false,
+            };
+            write_line(
+                &mut raced,
+                format_args!("[fc-agent] exec server: accepted connection on vsock port {port}"),
+            )
+            .unwrap();
         }
-        let text = String::from_utf8_lossy(&seen);
-        assert!(
-            found,
-            "no recovery summary while lines kept flowing: {text:?}"
+        // The marker went straight to the console after the last write.
+        let expected = "[fc-agent] exec server: accepted connection on vsock port 4998\nMARKER\n";
+        wait_until(
+            || {
+                drain_console(&mut console_rd, &mut seen);
+                seen.len() >= expected.len()
+            },
+            Duration::from_secs(5),
         );
+        let text = String::from_utf8_lossy(&seen);
+        assert_eq!(
+            text, expected,
+            "an agent line was split by another console writer"
+        );
+    }
+
+    /// main.rs replaces std's `eprintln!` with one that writes through `eprint_line`, before
+    /// any module, so every module's `eprintln!` is the one-write one.
+    #[test]
+    fn fc_agent_replaces_eprintln_before_its_modules() {
+        let main = include_str!("main.rs");
+        let defined = main
+            .find("macro_rules! eprintln {")
+            .expect("main.rs no longer defines fc-agent's eprintln!");
+        let first_module = main.find("\nmod ").expect("main.rs declares no module");
         assert!(
-            text.lines().all(|l| !l.contains("next[fc-agent]")),
-            "the summary was joined to an unfinished line: {text:?}"
+            defined < first_module,
+            "eprintln! is defined after a module"
+        );
+        let body = &main[defined..first_module];
+        assert_eq!(
+            body.matches("$crate::console::eprint_line(format_args!(")
+                .count(),
+            2
         );
     }
 
