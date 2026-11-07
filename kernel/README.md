@@ -52,6 +52,18 @@ async page fault for every page it touches that the host has not paged in yet,
 so perf sampling with call chains in a clone hits it within seconds. The nested
 link is a `.vm.patch` so the x86 host kernel does not apply it.
 
+The nested profiles' `kernel/patches-arm64` and `kernel/patches-x86` also feed
+the host kernels (`make install-host-kernel`), minus the `.vm.patch` files. Both
+carry Linux commit 25ae123db10b (6.18 stable 39679927fa7a, first in 6.18.60),
+which removes an `rcu_barrier()` from `br_multicast_dev_del()`. Each fcvm VM has
+a bridge in its own network namespace, and the kernel tears dying namespaces
+down in batches under one RTNL hold, so the barrier ran once per bridge inside
+that hold: with 100 VMs stopping together on 6.18.50, `cleanup_net` held RTNL
+for 1.9 s and a namespace creation waited up to 1.86 s; with the patch no hold
+passed 50 ms and the longest creation took 180 ms (#1563).
+`every_host_kernel_applies_the_bridge_rcu_barrier_removal` fails if a host
+kernel's patch set loses it.
+
 The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
 x86_64): the default patches, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
