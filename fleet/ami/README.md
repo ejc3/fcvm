@@ -1,7 +1,9 @@
 # fleet/ami
 
-The fleet's two machine images, built in the fcvm-fleet account (us-east-1) by
-`build-ami.sh`, and `fleet/tools/gpubox.sh`, which leases a GPU host for one agent's work.
+The fleet's two machine images, built in the fcvm-fleet account in us-west-2 (the factory, and
+`build-ami.sh` by default) and copied to us-east-1, the staging fleet's region, when published,
+and `fleet/tools/gpubox.sh`, which leases a GPU host for one agent's work. Every G instance that
+is not the staging fleet's own runs in us-west-2, off staging's quota.
 
 ## Continuous image factory
 
@@ -55,14 +57,14 @@ profile set up, the renderer image warmed in the store. Ready about 165 s after 
 then restores to the renderer's first frame in about 9 s.
 
 ```bash
-id=$(fleet/tools/gpubox.sh up --hours 4 --owner my-task | cut -d' ' -f1)   # prints "<id> us-east-1"
+id=$(fleet/tools/gpubox.sh up --hours 4 --owner my-task | cut -d' ' -f1)   # prints "<id> us-west-2"
 fleet/tools/gpubox.sh run $id 'cat /run/fcvm-fleet/gpus'                   # as root
 fleet/tools/gpubox.sh run $id -u 'cd /tmp && fcvm podman run --kernel-profile gpu --gpu 0000:18:00.0 ...'   # as ubuntu
 fleet/tools/gpubox.sh copy ./work.tgz $id:/tmp/work.tgz
 fleet/tools/gpubox.sh copy $id:/tmp/results.json ./results.json
 fleet/tools/gpubox.sh extend $id 2      # lease ends 2 h from now
-fleet/tools/gpubox.sh down $id
-fleet/tools/gpubox.sh list              # every gpubox, owner, lease end
+fleet/tools/gpubox.sh down $id us-west-2   # the region is optional; without it both regions are searched
+fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, lease end
 ```
 
 - It assumes `fcvm-fleet-terraform` (the role named in SSM `/infra/fcvm-fleet`) from a dev box whose instance role may assume it; nothing else to set up.
@@ -73,8 +75,19 @@ fleet/tools/gpubox.sh list              # every gpubox, owner, lease end
 - The lease is enforced on the box: a systemd timer powers it off at the lease end (default
   4 h, at most 24), and powering off terminates it. Tested by moving a lease end 90 s ahead:
   the instance shut itself down (`Client.InstanceInitiatedShutdown`).
-- Spot first in every us-east-1 AZ, then on demand. Quota, shared with the fleet's own spot
-  host: G spot 192 vCPU (two g4dn.metal at once), G on demand 384 vCPU (four).
+- Region: us-west-2 unless `GPUBOX_REGION` says otherwise. The staging fleet runs in
+  us-east-1, and a box there takes the quota its GPU host and tiles need, so agents and the
+  nightly dogfood use us-west-2, where the image factory builds every host image (ejc3/aws
+  `fcvm-fleet-ami-pipeline.tf`; the release's ids in both regions are in SSM
+  `/fcvm-fleet/ami-release-copies`, us-east-1). `up` launches the release's host image for its
+  region from that record (in us-east-1 also from the release itself), and refuses when neither
+  names an available image there: it never picks an image by name or tag, which could be a
+  candidate the factory has not released. `GPUBOX_AMI` names an image explicitly.
+- Spot first in every AZ of the region that offers g4dn.metal (us-west-2: a, b, c), then on
+  demand. Quota per region: G spot 192 vCPU (two g4dn.metal at once), G on demand 384 vCPU
+  (four). Only in us-east-1 does `up` go through the wall's reserve and admission lock
+  (`fleet/tools/g-admission.sh`, which `build-ami.sh` and `measure-boot.sh` source too); us-west-2
+  has no fleet host to leave room for.
 - It acts only on instances tagged `Purpose=fcvm-fleet-gpubox`; the fleet's hosts, groups
   and services are never touched. The fcvm in the AMI is the commit in its name; build your
   own commit on the box (`/home/ubuntu/fcvm`, `make build`) when you need another.

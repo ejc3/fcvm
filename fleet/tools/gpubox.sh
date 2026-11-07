@@ -12,8 +12,16 @@
 #   gpubox.sh copy <id>:<remote> <local>   copy a file off the box (through the asset bucket)
 #   gpubox.sh copy <local> <id>:<remote>   copy a file onto the box
 #   gpubox.sh extend <id> <hours>  move the lease end to <hours> from now
-#   gpubox.sh down <id>            terminate exactly that instance
-#   gpubox.sh list                 every gpubox, with owner, lease end and state
+#   gpubox.sh down <id> [<region>] terminate exactly that instance
+#   gpubox.sh list                 every gpubox in every gpubox region: id, region, state,
+#                                  owner, lease end, market, launch time
+#
+# Region: GPUBOX_REGION, default us-west-2, where agents' boxes live so they never take the
+# staging fleet's quota (the fleet runs in us-east-1). `up` launches from the newest host AMI in
+# that region (the image factory builds in us-west-2 and copies each release to us-east-1, ejc3/aws
+# fcvm-fleet-ami-pipeline.tf). The other commands find the
+# box by id in us-west-2 or us-east-1 (GPUBOX_REGIONS); `down` also takes the region `up`
+# printed, and then looks only there.
 #
 # Access is SSM Run Command only: the fleet's security group admits TCP 443 and nothing
 # else, and stays that way. Output of one `run` is cut by SSM at 24,000 characters; write
@@ -26,15 +34,16 @@
 #
 # Credentials: assumes fcvm-fleet-terraform (named in SSM /infra/fcvm-fleet, us-west-1) unless
 # the environment already holds that role's credentials (or GPUBOX_USE_ENV=1 says to use them).
-# Quota (us-east-1, 2026-10-23): G spot 192 vCPU, two g4dn.metal at once, shared with the
-# fleet's own spot host; G on demand 384 vCPU, four, shared with the wall's host, its
-# on-demand tiles and the AMI builders. `up` leaves room for the wall (room_for).
+# Quota (2026-11-07): G spot 192 vCPU and G on demand 384 in us-west-2 and in us-east-1, two
+# and four g4dn.metal. In us-east-1, the staging region, they are shared with the wall's host and
+# its on-demand tiles, and `up` there goes through the wall's reserve (g-admission.sh). In
+# us-west-2 the image factory's builders share them, and there is no reserve.
 set -euo pipefail
-REGION=us-east-1
+REGION=${GPUBOX_REGION:-us-west-2}
+REGIONS=${GPUBOX_REGIONS:-us-west-2 us-east-1}
 S3REGION=us-east-2
 PURPOSE=fcvm-fleet-gpubox
 TYPE=g4dn.metal
-AZS=${GPUBOX_AZS:-a b c d f}
 
 say() { echo "gpubox: $*" >&2; }
 die() { say "$*"; exit 1; }
@@ -59,19 +68,36 @@ fi
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=fcvm-fleet-assets-$ACCOUNT
 
-# The newest fleet host AMI unless GPUBOX_AMI names one.
+# The live release's host image in REGION, unless GPUBOX_AMI names one: the publisher's record of
+# the release's ids in every region (SSM /fcvm-fleet/ami-release-copies), else the release itself
+# (/fcvm-fleet/ami-release, which names us-east-1), both in us-east-1. Nothing else: a validated
+# image is not necessarily released (a publication can fail after tagging it), and a factory
+# candidate never is. Prints nothing when neither names an available image there.
 host_ami() {
+  local id q
   [ -n "${GPUBOX_AMI:-}" ] && { echo "$GPUBOX_AMI"; return; }
-  A ec2 describe-images --owners self --filters Name=name,Values='fcvm-fleet-host-x86_64-*' Name=state,Values=available \
-    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+  for q in "/fcvm-fleet/ami-release-copies .images[\$r].host" "/fcvm-fleet/ami-release .host_amis[\$r].x86_64"; do
+    id=$(aws --region us-east-1 ssm get-parameter --name "${q%% *}" --query Parameter.Value --output text 2>/dev/null \
+      | jq -r --arg r "$REGION" "${q#* } // empty" 2>/dev/null || true)
+    if [[ "$id" =~ ^ami-[0-9a-f]{17}$ ]] && [ "$(A ec2 describe-images --image-ids "$id" --query 'Images[0].State' --output text 2>/dev/null || true)" = available ]; then
+      echo "$id"; return
+    fi
+  done
 }
 
 # Refuse anything that is not a gpubox: the fleet's hosts and tiles carry other Purpose tags.
+# check_box ID [REGION]: find the box in REGION, or else in the first of REGIONS that has it,
+# and act in that region from then on.
 check_box() {
-  local purpose
-  purpose=$(A ec2 describe-instances --instance-ids "$1" --query "Reservations[0].Instances[0].Tags[?Key=='Purpose']|[0].Value" --output text 2>/dev/null) \
-    || die "no instance $1 in $REGION"
-  [ "$purpose" = "$PURPOSE" ] || die "$1 is not a gpubox (Purpose=$purpose); refusing"
+  local purpose r where=${2:-$REGIONS}
+  for r in $where; do
+    purpose=$(aws --region "$r" ec2 describe-instances --instance-ids "$1" --query "Reservations[0].Instances[0].Tags[?Key=='Purpose']|[0].Value" --output text 2>/dev/null) \
+      || continue
+    [ "$purpose" = "$PURPOSE" ] || die "$1 is not a gpubox (Purpose=$purpose); refusing"
+    REGION=$r
+    return 0
+  done
+  die "no instance $1 in $where"
 }
 
 ssm() { # id, command: print output, return the command's exit status
@@ -136,7 +162,8 @@ systemctl enable --now gpubox-lease.timer
 EOF
 }
 
-# Admission through the wall's reserve: fleet/tools/g-admission.sh.
+# Admission through the wall's reserve: fleet/tools/g-admission.sh, which applies it only in the
+# staging region (us-east-1); a box elsewhere takes no lock and writes no ledger entry.
 # shellcheck disable=SC2034  # read by g-admission.sh
 GA_WHAT=$TYPE
 # shellcheck source=g-admission.sh
@@ -155,10 +182,15 @@ up)
   done
   [[ "$hours" =~ ^[0-9]+$ ]] && [ "$hours" -ge 1 ] && [ "$hours" -le 24 ] || die "--hours must be 1 to 24"
   lease=$(date -u -d "+$hours hours" '+%Y-%m-%d %H:%M:%S')
-  ami=$(host_ami); [ "$ami" != None ] || die "no fleet host AMI in $REGION"
+  # Zones: GPUBOX_AZS, or those of the region that offer g4dn.metal, in order.
+  AZS=${GPUBOX_AZS:-$(A ec2 describe-instance-type-offerings --location-type availability-zone \
+    --filters Name=instance-type,Values=$TYPE --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sed "s/^$REGION//" | sort | paste -sd' ')}
+  [ -n "$AZS" ] || die "no zone in $REGION offers $TYPE"
+  ami=$(host_ami); [ -n "$ami" ] || die "the release names no available host image in $REGION (its copy may still be pending); GPUBOX_AMI=<ami> picks one"
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
+  errf=$(mktemp)
   admit_lock || die "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"
   trap admit_unlock EXIT
   for market in spot on-demand; do
@@ -174,17 +206,18 @@ up)
           --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
           --user-data "$ud" \
           --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=gpubox-$owner},{Key=Purpose,Value=$PURPOSE},{Key=Owner,Value=$owner},{Key=LeaseUntil,Value=${lease/ /T}Z},{Key=Market,Value=$market},$ADMISSION_TAG]" \
-          --query 'Instances[0].InstanceId' --output text 2>/tmp/gpubox.err.$$); then
+          --query 'Instances[0].InstanceId' --output text 2>"$errf"); then
         break 2
       fi
-      grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' /tmp/gpubox.err.$$ \
-        || { cat /tmp/gpubox.err.$$ >&2; rm -f /tmp/gpubox.err.$$; admit_abandon; die "run-instances failed; the admission lock is kept until stale in case it launched"; }
-      say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' /tmp/gpubox.err.$$ | head -1)"
+      grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' "$errf" \
+        || { cat "$errf" >&2; rm -f "$errf"; ga_staging || die "run-instances failed"
+             admit_abandon; die "run-instances failed; the admission lock is kept until stale in case it launched"; }
+      say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' "$errf" | head -1)"
       id=""
     done
   done
-  rm -f /tmp/gpubox.err.$$
-  [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
+  rm -f "$errf"
+  [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand$(ga_staging && echo ", that leaves the wall's host its room")"
   ledger_add "$id" "$market" 96 || { A ec2 terminate-instances --instance-ids "$id" >/dev/null || admit_abandon; die "$id's admission could not be recorded: terminated it, or kept the lock until stale if that failed"; }
   admit_unlock; trap - EXIT
   say "launched $id ($market, ${REGION}${az}, $ami), lease until $lease UTC"
@@ -228,12 +261,15 @@ extend)
   say "lease until $lease UTC"
   ;;
 down)
-  id=$2; check_box "$id"
+  id=$2; check_box "$id" "${3:-}"
   A ec2 terminate-instances --instance-ids "$id" --query 'TerminatingInstances[0].CurrentState.Name' --output text >&2
   ;;
 list)
-  A ec2 describe-instances --filters Name=tag:Purpose,Values=$PURPOSE Name=instance-state-name,Values=pending,running,stopping,shutting-down \
-    --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Owner']|[0].Value,Tags[?Key=='LeaseUntil']|[0].Value,Tags[?Key=='Market']|[0].Value,LaunchTime]" --output text
+  for r in $REGIONS; do
+    aws --region "$r" ec2 describe-instances --filters Name=tag:Purpose,Values=$PURPOSE Name=instance-state-name,Values=pending,running,stopping,shutting-down \
+      --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Owner']|[0].Value,Tags[?Key=='LeaseUntil']|[0].Value,Tags[?Key=='Market']|[0].Value,LaunchTime]" --output text \
+      | awk -F '\t' -v r="$r" 'NF {$1 = $1 OFS r; print}' OFS='\t'
+  done
   ;;
-*) sed -n 2,33p "$0"; exit 2 ;;
+*) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 2 ;;
 esac

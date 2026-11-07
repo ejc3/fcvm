@@ -6,7 +6,7 @@
 # Both hours fire so that 03:30 Pacific is met in summer and winter time; the other one exits here. DOGFOOD_NOW=1 runs
 # it at any hour. One run at a time (a lock). The session works in its own worktree, reset to origin/main, and writes
 # to /mnt/fcvm-btrfs/fcvm-dogfood/<Pacific date>/<UTC start time>/: session.jsonl (the transcript), session.err,
-# run.log and machines (one line per instance the session launched: `pbox <slot> <instance id>` or `gpubox <instance id>`).
+# run.log and machines (one line per instance the session launched: `pbox <slot> <instance id>` or `gpubox <instance id> <region>`).
 # Whatever is listed there and still running when the session ends is taken down here, so a timeout cannot leave a box
 # billing.
 set -u
@@ -41,6 +41,8 @@ fi
 cd "$wt" || fail "cd"
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && [ -z "$(git status --porcelain)" ] || fail "$wt is not a clean origin/main"
 export DOGFOOD_RUN_DIR=$out
+# gpuboxes stay off the staging fleet's region and quota (us-east-1), whatever the caller's environment says.
+export GPUBOX_REGION=us-west-2
 : >"$out/machines"
 log "start $(git rev-parse --short HEAD)"
 timeout -k 5m 6h claude -p "/nightly-dogfood" --permission-mode bypassPermissions \
@@ -52,8 +54,9 @@ while read -r kind a b; do
   case $kind in
     # `--instance` makes pbox act only while the slot still holds that instance.
     pbox) pbox down "$a" --instance "$b" >>"$out/run.log" 2>&1 && log "pbox down $a ($b)" || log "pbox down $a ($b) refused or failed" ;;
-    # gpubox.sh assumes the fleet account's role itself, so the id is handed to it rather than to a bare aws call.
-    gpubox) bash fleet/tools/gpubox.sh down "$a" >>"$out/run.log" 2>&1 && log "gpubox down $a" || log "gpubox down $a failed" ;;
+    # gpubox.sh assumes the fleet account's role itself, so the id and its region are handed to it rather than to a bare
+    # aws call. A line without a region makes it look for the id in every gpubox region.
+    gpubox) bash fleet/tools/gpubox.sh down "$a" ${b:+"$b"} >>"$out/run.log" 2>&1 && log "gpubox down $a ${b:-}" || log "gpubox down $a ${b:-} failed" ;;
   esac
 done <"$out/machines"
 exit $status
