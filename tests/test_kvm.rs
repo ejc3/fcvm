@@ -1042,14 +1042,11 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L3 network: measures throughput degradation through triple NAT chain
+/// Test L3 network: measures throughput degradation through triple NAT chain.
 ///
-/// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
-/// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
-/// container startup to exceed the 10-minute test timeout.
-/// disk-dir and NFS may work better at L3.
+/// 732 and 734 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI: Makefile CI_ROOT_BASE runs only the kept nested tests.
 #[tokio::test]
-#[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1060,9 +1057,11 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
     .await
 }
 
-/// Test L3 network with NFS (may be faster than FUSE)
+/// Test L3 network with the image cache over NFS.
+///
+/// 732 and 741 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI.
 #[tokio::test]
-#[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1073,14 +1072,12 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L1→L2→L3: 3 levels of nesting
+/// Test L1→L2→L3: 3 levels of nesting.
 ///
-/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
-/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
-/// initialization alone takes 10+ minutes. Need to implement request pipelining
-/// or async PassthroughFs before this test can complete in reasonable time.
+/// 669 and 681 s on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660); about 9 of those minutes are L3 booting through the three-hop FUSE
+/// chain. Not in CI.
 #[tokio::test]
-#[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1931,10 +1928,11 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     let image_cache_args = image_cache_mount_args.join(" ");
     // `timeout` bounds the L1 VM's lifetime: when nextest kills a timed-out
     // test, this spawned pipeline would otherwise survive as an orphan and
-    // collide with the retry. 840s < the 900s nextest budget so the VM dies
-    // (and cleans up) before the test harness gives up.
+    // collide with the retry. 1140 s < the nested group's 1200 s nextest budget
+    // so the VM dies (and cleans up) before the test harness gives up. The L3
+    // tests complete in 669 to 741 s (#660), so 840 s left them 13% headroom.
     let fcvm_cmd = format!(
-        "timeout -k 10 840 sudo ./target/release/fcvm podman run \
+        "timeout -k 10 1140 sudo ./target/release/fcvm podman run \
          --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
@@ -2054,11 +2052,9 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
 /// Measures how long it takes to import the nested container image
 /// inside a VM when the image archive is accessed over FUSE-over-vsock.
 ///
-/// Disabled: takes 389s in CI due to NV2 nested virtualization overhead (75x
-/// slower than L1). FUSE throughput itself is fine (181-224 MB/s on L1).
-/// The bottleneck is podman load's gzip decompression + overlay writes running
-/// under double Stage 2 translation with a single vCPU.
-#[ignore = "podman load over FUSE in nested VM: slow + NV2-flaky; run manually — tracked in #630-B"]
+/// It took 389 s in CI before the #630 fixes. On a c8g.metal-48xl with the
+/// 6.18.60 host and guest kernels the whole test took 15 to 28 s in four runs
+/// (#660). Not in CI.
 #[tokio::test]
 async fn test_podman_load_over_fuse() -> Result<()> {
     println!("\nPodman Load Over FUSE Performance Test");
