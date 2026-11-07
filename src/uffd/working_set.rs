@@ -276,6 +276,16 @@ impl PageSet {
             && self.words[(granule / 64) as usize] & (1u64 << (granule % 64)) != 0
     }
 
+    /// Whether every granule of `self` is in `other`, first-touch times aside.
+    pub fn is_subset_of(&self, other: &PageSet) -> bool {
+        self.granules == other.granules
+            && self
+                .words
+                .iter()
+                .zip(&other.words)
+                .all(|(mine, theirs)| mine & !theirs == 0)
+    }
+
     /// OR `other` into `self`, returning how many granules were newly added.
     ///
     /// Sets built for different image sizes merge over their overlap; the caller validates
@@ -634,7 +644,14 @@ impl WorkingSetPersistence {
         let (requests, receiver) = sync_channel(1);
         let worker_store = Arc::clone(&store);
         let builder = match builds {
-            PackBuilds::On { reclaim_dir } => PackBuilder::new(Arc::clone(&store), reclaim_dir),
+            PackBuilds::On { reclaim_dir } => {
+                PackBuilder::new(Arc::clone(&store), reclaim_dir, None)
+            }
+            #[cfg(test)]
+            PackBuilds::Hooked {
+                reclaim_dir,
+                frame_hook,
+            } => PackBuilder::new(Arc::clone(&store), Some(reclaim_dir), Some(frame_hook)),
             PackBuilds::Off => None,
         };
         let worker = std::thread::Builder::new()
@@ -733,6 +750,12 @@ pub(crate) enum PackBuilds {
     /// the real data directory or build after they return.
     #[cfg_attr(not(test), allow(dead_code))]
     Off,
+    /// Test only: [`PackBuilds::On`] with `frame_hook` called before each frame a build reads.
+    #[cfg(test)]
+    Hooked {
+        reclaim_dir: PathBuf,
+        frame_hook: FrameHook,
+    },
 }
 
 /// Threads a pack build reads and compresses on. A build runs in the background after a clone
@@ -742,9 +765,9 @@ pub(crate) const PACK_BUILD_THREADS: usize = 4;
 /// The thread that builds a served snapshot's pack after its sidecar is published.
 ///
 /// Detached, like the persistence worker. It holds one pending set: a request made while a
-/// build runs replaces the pending one and cancels the running build at its next frame,
-/// because a pack is installed only beside the set it holds and the sidecar holds the newer
-/// set by then. A build that fails logs a warning, and replay reads the memory file.
+/// build runs replaces the pending one, and the running build finishes and installs (a pack
+/// of a smaller set is still used for the runs it holds), after which the latest pending set
+/// is built. A build that fails logs a warning, and replay reads the memory file.
 struct PackBuilder {
     shared: Arc<PackRequests>,
 }
@@ -764,12 +787,16 @@ struct PendingPack {
 }
 
 impl PackBuilder {
-    fn new(store: Arc<WorkingSetStore>, reclaim_dir: Option<PathBuf>) -> Option<Self> {
+    fn new(
+        store: Arc<WorkingSetStore>,
+        reclaim_dir: Option<PathBuf>,
+        frame_hook: Option<FrameHook>,
+    ) -> Option<Self> {
         let shared = Arc::new(PackRequests::default());
         let worker_shared = Arc::clone(&shared);
         let spawned = std::thread::Builder::new()
             .name("fcvm-ws-pack".to_string())
-            .spawn(move || pack_builder(store, worker_shared, reclaim_dir));
+            .spawn(move || pack_builder(store, worker_shared, reclaim_dir, frame_hook));
         match spawned {
             Ok(worker) => {
                 drop(worker);
@@ -797,10 +824,14 @@ impl Drop for PackBuilder {
     }
 }
 
+/// Called before each frame a build reads: a test's way to pause a build. `None` in a serve.
+type FrameHook = Arc<dyn Fn() + Send + Sync>;
+
 fn pack_builder(
     store: Arc<WorkingSetStore>,
     requests: Arc<PackRequests>,
     reclaim_dir: Option<PathBuf>,
+    frame_hook: Option<FrameHook>,
 ) {
     loop {
         let set = {
@@ -820,20 +851,14 @@ fn pack_builder(
             None => crate::reclaim::owner_dir(),
         };
         let started = std::time::Instant::now();
-        let cancel = || {
-            requests
-                .pending
-                .lock()
-                .is_ok_and(|pending| pending.set.is_some())
+        let at_each_frame = || {
+            if let Some(hook) = &frame_hook {
+                hook();
+            }
+            false
         };
-        let built = dir.and_then(|dir| store.build_pack(&set, &dir, PACK_BUILD_THREADS, &cancel));
-        if built
-            .as_ref()
-            .is_err_and(|error| error.is::<pack::Cancelled>())
-        {
-            debug!(target: "uffd", "a newer working set replaced the one being packed");
-            continue;
-        }
+        let built =
+            dir.and_then(|dir| store.build_pack(&set, &dir, PACK_BUILD_THREADS, &at_each_frame));
         log_pack_build(&store.pack_path(), &built, started.elapsed());
         if matches!(built, Ok(PackBuild::Installed(_))) {
             store.load_pack();
@@ -899,8 +924,9 @@ pub struct WorkingSetStore {
     /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
     /// and on a thread of its own after the set changes, never on a clone's fault path.
     ordered: Arc<Mutex<OrderedTiers>>,
-    /// The pack opened last ([`WorkingSetStore::load_pack`]), for clones to replay from while
-    /// its digest is the union's.
+    /// The pack opened last ([`WorkingSetStore::load_pack`]), for clones to replay from. Any
+    /// pack of this image serves: replay copies the runs it holds and reads the memory file for
+    /// the rest.
     pack: Mutex<Option<Arc<Pack>>>,
     /// Held while a pack is opened, so two loads do not both read its tables.
     pack_load: Mutex<()>,
@@ -922,8 +948,8 @@ pub enum PackBuild {
     /// The memory image or snapshot generation is no longer the one this store describes, so
     /// nothing was installed.
     Superseded,
-    /// The sidecar holds another set by now, so the pack was not installed: a pack beside it
-    /// must be that set's.
+    /// The sidecar no longer holds every run of the set the pack was built from (it was
+    /// rewritten with another set), so the pack was not installed.
     SetChanged,
 }
 
@@ -1362,40 +1388,38 @@ impl WorkingSetStore {
         self.pack_allowed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// The pack of `ordered`, if one is loaded, without waiting: what a clone's replay asks
-    /// on its fault path. [`WorkingSetStore::load_pack`] loads one.
-    pub fn pack_for(&self, ordered: &Ordered) -> Option<Arc<Pack>> {
+    /// The loaded pack, without waiting: what a clone's replay asks on its fault path.
+    /// [`WorkingSetStore::load_pack`] loads one.
+    pub fn pack_for(&self) -> Option<Arc<Pack>> {
         if !self.pack_allowed() {
             return None;
         }
-        let pack = self.pack.lock().expect("working set pack mutex");
-        pack.as_ref()
-            .filter(|pack| pack.digest() == &ordered.digest)
-            .cloned()
+        self.pack.lock().expect("working set pack mutex").clone()
     }
 
-    /// The pack of the current union, opened now if it is not loaded yet: for the page cache
-    /// warm-up and a build that just installed one, on threads of their own. `None` when there
-    /// is no pack of this set for this image.
+    /// This image's pack, opened now if it is not loaded or a newer one was installed since:
+    /// for the page cache warm-up and a build that just installed one, on threads of their own.
+    /// `None` when there is no pack of this image.
     pub fn load_pack(&self) -> Option<Arc<Pack>> {
         if !self.pack_allowed() {
             return None;
         }
-        let ordered = self.to_prefetch_ordered();
-        if let Some(pack) = self.pack_for(&ordered) {
-            return Some(pack);
-        }
         let _loading = self.pack_load.lock().expect("working set pack load mutex");
-        if let Some(pack) = self.pack_for(&ordered) {
-            return Some(pack);
+        // A pack installed since, by this serve's builder or another serve's, is a new inode.
+        let on_disk = std::fs::metadata(self.pack_path())
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()));
+        if let Some(pack) = self.pack_for() {
+            let loaded = pack
+                .file()
+                .metadata()
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()));
+            if loaded.is_some() && loaded == on_disk {
+                return Some(pack);
+            }
         }
-        let opened = Pack::open(
-            &self.pack_path(),
-            &self.key,
-            &ordered.digest,
-            self.mem_len,
-            pack::runs_of(OrderedRuns::from_tiers(ordered.tiers.clone()), self.mem_len),
-        );
+        let opened = Pack::open(&self.pack_path(), &self.key, self.mem_len);
         match opened {
             Ok(Some(pack)) => {
                 let pack = Arc::new(pack);
@@ -1414,8 +1438,7 @@ impl WorkingSetStore {
                     target: "uffd",
                     path = %self.pack_path().display(),
                     error = %format!("{error:#}"),
-                    "ignoring a working-set pack that does not hold the recorded set; replay \
-                     reads the memory file"
+                    "ignoring a damaged working-set pack; replay reads the memory file"
                 );
                 None
             }
@@ -1442,17 +1465,12 @@ impl WorkingSetStore {
         }
         let ordered = Ordered::of(set);
         let out = self.pack_path();
-        // Already built only if the pack opens as this set's, tables and all: a pack whose
-        // header names the set but whose tables are damaged is rebuilt.
-        let built = Pack::open(
-            &out,
-            &self.key,
-            &ordered.digest,
-            self.mem_len,
-            pack::runs_of(OrderedRuns::from_tiers(ordered.tiers.clone()), self.mem_len),
-        );
-        if matches!(built, Ok(Some(_))) {
-            return Ok(PackBuild::AlreadyBuilt);
+        // Already built only if the pack opens, tables and all, and was built from this set:
+        // a damaged pack, or one of a smaller set, is rebuilt.
+        if let Ok(Some(built)) = Pack::open(&out, &self.key, self.mem_len) {
+            if built.digest() == &ordered.digest {
+                return Ok(PackBuild::AlreadyBuilt);
+            }
         }
         let mem = File::open(&self.mem_path)
             .with_context(|| format!("opening {}", self.mem_path.display()))?;
@@ -1475,12 +1493,12 @@ impl WorkingSetStore {
             reclaim_dir,
             cancel,
         )?;
-        self.install_pack(temp, stats, set, &ordered.digest)
+        self.install_pack(temp, stats, set)
     }
 
-    /// Rename `temp`, the pack of `set` (whose order digest is `digest`), into place, under
-    /// the snapshot's shared generation lock and the sidecar's lock, and only if the image and
-    /// generation are still this store's and the sidecar holds `set`. Returns
+    /// Rename `temp`, the pack of `set`, into place, under the snapshot's shared generation
+    /// lock and the sidecar's lock, and only if the image and generation are still this
+    /// store's and every granule of `set` is in the sidecar's set (it may have grown since). Returns
     /// [`PackBuild::Installed`] with `stats` once the pack is in place; otherwise dropping
     /// `temp` removes it.
     ///
@@ -1489,13 +1507,12 @@ impl WorkingSetStore {
     /// ([`WorkingSetStore::merge_and_persist`]): checking first and locking later would let a
     /// replacement land between the two, and the new image would get the old image's bytes.
     /// The sidecar lock orders the install against a publication of another set, so a pack
-    /// is installed only beside the set it holds.
+    /// is installed only beside a set that holds all of its runs.
     fn install_pack(
         &self,
         temp: pack::PackTemp,
         stats: pack::BuildStats,
         set: &PageSet,
-        digest: &[u8; 32],
     ) -> Result<PackBuild> {
         let generation_file = File::options()
             .create(true)
@@ -1527,10 +1544,7 @@ impl WorkingSetStore {
             PackBuild::Superseded
         } else {
             let on_disk = read_set(&self.path, &self.key, self.mem_len);
-            let holds_set = match &on_disk {
-                Some(disk) => disk == set || &disk.order_digest() == digest,
-                None => false,
-            };
+            let holds_set = on_disk.as_ref().is_some_and(|disk| set.is_subset_of(disk));
             if holds_set {
                 temp.install(&self.pack_path())?;
                 PackBuild::Installed(stats)
@@ -2628,7 +2642,7 @@ mod tests {
         persistence.schedule("vm-pack", recorded_set(&store));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while store.pack_for(&store.to_prefetch_ordered()).is_none() {
+        while store.pack_for().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no pack of the published set was built within 30 s"
@@ -2786,12 +2800,79 @@ mod tests {
         assert_eq!(temporaries(&image), Vec::<String>::new());
     }
 
-    /// A pack is installed only beside the set it holds: a sidecar that took another set while
-    /// the pack was built keeps no pack of the old set.
+    /// A pack is installed only beside a set that holds all its runs: a sidecar rewritten
+    /// with another set while the pack was built gets no pack of the old one.
     #[test]
     fn a_pack_is_not_installed_beside_another_set() {
         let mem_len = 2048 * GRANULE;
         let image = patterned_image("pack-set-changed", mem_len);
+        let (_root, dir) = reclaim_dir();
+        let store = open_store(&image, mem_len);
+        let observed = recorded_set(&store);
+        store.merge_and_persist(&observed).unwrap();
+        let other = open_store(&image, mem_len);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let cancel = || {
+            if !published.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut another = other.recorder();
+                another.insert_range_at(1800 * GRANULE, 10 * GRANULE, 1);
+                WorkingSetStore::seed_held_generation(
+                    &image,
+                    mem_len,
+                    &generation_config_for(&image),
+                    &another,
+                )
+                .unwrap();
+            }
+            false
+        };
+        assert_eq!(
+            store.build_pack(&observed, &dir, 1, &cancel).unwrap(),
+            PackBuild::SetChanged
+        );
+        assert!(!pack::path_for(&image).exists());
+        assert_eq!(temporaries(&image), Vec::<String>::new());
+    }
+
+    /// The set the pack on disk beside `image` was built from, by its order digest.
+    fn pack_built_from(image: &Path) -> Option<[u8; 32]> {
+        let bytes = std::fs::read(pack::path_for(image)).ok()?;
+        bytes.get(56..88)?.try_into().ok()
+    }
+
+    /// A set that grew since its pack was built still replays from that pack: the pack holds
+    /// the bytes of the runs it was built from, and replay reads the memory file for the rest.
+    #[test]
+    fn a_pack_of_a_smaller_set_is_used_after_the_set_grows() {
+        let mem_len = 2048 * GRANULE;
+        let image = patterned_image("pack-grown", mem_len);
+        let (_root, dir) = reclaim_dir();
+        let store = open_store(&image, mem_len);
+        let observed = recorded_set(&store);
+        store.merge_and_persist(&observed).unwrap();
+        assert!(matches!(
+            store.build_pack(&observed, &dir, 2, &|| false).unwrap(),
+            PackBuild::Installed(_)
+        ));
+        let mut more = store.recorder();
+        more.insert_range_at(1800 * GRANULE, 10 * GRANULE, 1);
+        assert!(store.merge_and_persist(&more).unwrap().persisted);
+
+        let grown = open_store(&image, mem_len);
+        bind(&grown, &image);
+        assert_ne!(grown.to_prefetch(), observed, "the set grew");
+        assert!(
+            grown.load_pack().is_some(),
+            "the pack of the smaller set is not used once the set grew"
+        );
+    }
+
+    /// A pack is installed beside a sidecar that grew while it was built: every run it holds
+    /// is still a recorded run.
+    #[test]
+    fn a_pack_is_installed_beside_a_set_that_grew_while_it_was_built() {
+        let mem_len = 2048 * GRANULE;
+        let image = patterned_image("pack-set-grew", mem_len);
         let (_root, dir) = reclaim_dir();
         let store = open_store(&image, mem_len);
         let observed = recorded_set(&store);
@@ -2806,11 +2887,114 @@ mod tests {
             }
             false
         };
-        assert_eq!(
+        assert!(matches!(
             store.build_pack(&observed, &dir, 1, &cancel).unwrap(),
-            PackBuild::SetChanged
-        );
+            PackBuild::Installed(_)
+        ));
+        assert_eq!(pack_built_from(&image), Some(observed.order_digest()));
+    }
+
+    /// A serve of a snapshot that has a recorded set and no pack builds one on its first
+    /// publication, although that publication changes nothing: this is how an inherited set,
+    /// or one recorded before packs existed, gets its pack.
+    #[test]
+    fn a_serve_of_a_set_with_no_pack_builds_one() {
+        let mem_len = 2048 * GRANULE;
+        let image = patterned_image("pack-first-serve", mem_len);
+        let recorded = {
+            let store = open_store(&image, mem_len);
+            let observed = recorded_set(&store);
+            store.merge_and_persist(&observed).unwrap();
+            observed
+        };
         assert!(!pack::path_for(&image).exists());
-        assert_eq!(temporaries(&image), Vec::<String>::new());
+        let store = Arc::new(open_store(&image, mem_len));
+        let (_root, dir) = reclaim_dir();
+        let persistence = WorkingSetPersistence::with_pack_builds(
+            Arc::clone(&store),
+            PackBuilds::On {
+                reclaim_dir: Some(dir),
+            },
+        )
+        .unwrap();
+        // A clone that faulted only pages already recorded: the sidecar does not change.
+        let mut clone = store.recorder();
+        clone.insert_range_at(0, GRANULE, 3);
+        persistence.schedule("vm-first", clone);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while pack_built_from(&image) != Some(recorded.order_digest()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first serve of a set with no pack built none within 30 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A set that grows while its pack is built does not cancel that build: the build
+    /// finishes and installs, and the grown set is built after it.
+    #[test]
+    fn a_grown_set_is_built_after_the_running_build_and_does_not_cancel_it() {
+        let mem_len = 2048 * GRANULE;
+        let image = patterned_image("pack-coalesce", mem_len);
+        let store = Arc::new(open_store(&image, mem_len));
+        let (_root, dir) = reclaim_dir();
+        // The first build pauses at its first frame, the second at its first frame too.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let hook: FrameHook = Arc::new(move || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                paused_tx.send(()).ok();
+                go_rx.lock().unwrap().recv().ok();
+            }
+        });
+        let persistence = WorkingSetPersistence::with_pack_builds(
+            Arc::clone(&store),
+            PackBuilds::Hooked {
+                reclaim_dir: dir,
+                frame_hook: hook,
+            },
+        )
+        .unwrap();
+        let first = recorded_set(&store);
+        persistence.schedule("vm-1", first.clone());
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first build never started");
+
+        let mut more = store.recorder();
+        more.insert_range_at(1800 * GRANULE, 10 * GRANULE, 1);
+        persistence.schedule("vm-2", more);
+        let grown = store.to_prefetch();
+        assert_ne!(grown, first);
+        // Let the sidecar of the grown set be published while the first build waits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while open_store(&image, mem_len).to_prefetch() != grown {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the grown set was not published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        go_tx.send(()).unwrap();
+
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the grown set was never built");
+        assert_eq!(
+            pack_built_from(&image),
+            Some(first.order_digest()),
+            "the first build was not installed before the grown set's build began"
+        );
+        go_tx.send(()).unwrap();
+        while pack_built_from(&image) != Some(grown.order_digest()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the grown set's pack was not installed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

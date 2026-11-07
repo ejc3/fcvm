@@ -2715,9 +2715,10 @@ async fn replay_then_serve(
 ) -> Result<()> {
     if let Some(store) = working_set {
         let recorded = store.to_prefetch_ordered();
-        // The pack of this set, if one is loaded: asked without waiting, because a clone's
+        // The snapshot's pack, if one is loaded: asked without waiting, because a clone's
         // replay must not wait on a pack's tables. The warm-up loads it when the serve starts.
-        let pack = store.pack_for(&recorded);
+        // A pack of a smaller set serves the runs it holds; the rest read the memory file.
+        let pack = store.pack_for();
         if recorded.tiers.iter().any(|tier| !tier.is_empty())
             && replay_working_set(ctx, async_uffd, recorded.tiers, pack, state).await?
                 == Replay::Exited
@@ -11202,8 +11203,9 @@ mod tests {
     /// Replay from a pack copies what replay from the memory file copies, page for page and
     /// byte for byte: the recorded runs in every tier, across frames, with a recorded page
     /// the balloon has given back stepped over and recorded holes mapped to zeros, both of
-    /// which the handler decides before a run reaches a worker. The pack's statistics show
-    /// the copies came out of its frames.
+    /// which the handler decides before a run reaches a worker. The pack was built before the
+    /// set grew, so it holds only part of what is replayed, and the rest is read from the
+    /// memory file. The pack's statistics show the copies came out of its frames.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replay_from_a_pack_copies_what_replay_from_the_memory_file_copies() {
         const PAGE: usize = 4096;
@@ -11219,20 +11221,16 @@ mod tests {
 
         let key = crate::uffd::working_set::ImageKey::of(&mem_path, &[1; 32]).unwrap();
         let reclaim = crate::reclaim::owner_dir_in(&dir.path().join("data")).unwrap();
-        crate::uffd::pack::build_for_test(&mem_path, &key, &recorded, &reclaim, 2);
+        // The pack holds the set before its last range was recorded.
+        let mut packed = PageSet::empty(mem_len);
+        packed.insert_range_at(0, (1500 * PAGE) as u64, 2);
+        packed.insert_range_at((2000 * PAGE) as u64, (900 * PAGE) as u64, 30);
+        crate::uffd::pack::build_for_test(&mem_path, &key, &packed, &reclaim, 2);
         let tiers = std::sync::Arc::new(recorded.by_first_touch());
-        let pack = crate::uffd::pack::Pack::open(
-            &crate::uffd::pack::path_for(&mem_path),
-            &key,
-            &recorded.order_digest(),
-            mem_len,
-            crate::uffd::pack::runs_of(
-                crate::uffd::working_set::OrderedRuns::from_tiers(tiers.clone()),
-                mem_len,
-            ),
-        )
-        .unwrap()
-        .expect("the pack of this set");
+        let pack =
+            crate::uffd::pack::Pack::open(&crate::uffd::pack::path_for(&mem_path), &key, mem_len)
+                .unwrap()
+                .expect("the pack of this image");
         assert!(pack.frames().len() >= 3, "{} frames", pack.frames().len());
         let pack = Arc::new(pack);
 

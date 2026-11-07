@@ -16,7 +16,8 @@
 //! All integers little-endian.
 //!
 //! - Header ([`HEADER_LEN`] bytes): magic `FCVMWPAK`, version, the memory file's length, its
-//!   [`ImageKey`], the set's [`PageSet::order_digest`], the number of runs, the number of frames.
+//!   [`ImageKey`], the [`PageSet::order_digest`] of the set it was built from, a SHA-256 of the
+//!   two tables below, the number of runs, the number of frames.
 //! - The runs, in stream order: `(file_offset: u64, len: u64)` each.
 //! - The frames: `(compressed_len: u64, raw_len: u64)` each.
 //! - The frames' compressed bytes, back to back.
@@ -35,12 +36,16 @@
 //! # Trust
 //!
 //! A pack is a cache of bytes the memory file holds, so unlike the recorded set it is data, not
-//! a hint. It is opened only when its key and order digest match the image and the set being
-//! replayed and its run table is the set's runs in first-touch order, and each frame carries a
-//! zstd content checksum: a frame that does not decompress to the length its table says makes
-//! the rest of the replay read the memory file ([`PackStream`]).
+//! a hint. It is opened only when its key names the image being served, whatever set it was
+//! built from: replay copies from it the runs its own table holds and reads the memory file
+//! for the rest ([`PackStream`]), so a set that grew since keeps using it until a pack of the
+//! grown set replaces it. The tables carry a SHA-256 and are checked to hold disjoint runs
+//! inside the file, so a damaged table cannot put one run's bytes at another's offset, and
+//! each frame carries a zstd content checksum: a frame that does not decompress to the length
+//! its table says makes the rest of the replay read the memory file.
 
 use anyhow::{bail, ensure, Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -54,9 +59,11 @@ use super::working_set::PageSet;
 use super::working_set::{ImageKey, OrderedRuns, Run};
 
 const MAGIC: &[u8; 8] = b"FCVMWPAK";
-const VERSION: u64 = 1;
-/// magic, version, mem_len, key, order digest, runs, frames.
-pub const HEADER_LEN: usize = 8 + 8 + 8 + 32 + 32 + 8 + 8;
+const VERSION: u64 = 2;
+/// magic, version, mem_len, key, order digest, tables digest, runs, frames.
+pub const HEADER_LEN: usize = 8 + 8 + 8 + 32 + 32 + 32 + 8 + 8;
+/// Where the tables digest sits in the header.
+const TABLES_DIGEST_AT: usize = 88;
 /// Uncompressed bytes per frame.
 pub const FRAME_RAW: usize = 4 << 20;
 /// zstd level: level 1 decompresses as fast as any level and compresses fastest.
@@ -250,6 +257,8 @@ fn write_pack(
     out.write_all(&mem_len.to_le_bytes())?;
     out.write_all(key.as_bytes())?;
     out.write_all(digest)?;
+    // The tables digest is written once the frame table is known.
+    out.write_all(&[0u8; 32])?;
     out.write_all(&(runs.len() as u64).to_le_bytes())?;
     out.write_all(&frame_count.to_le_bytes())?;
     for run in runs {
@@ -363,13 +372,22 @@ fn write_pack(
         "wrote {written} of {frame_count} working-set frames"
     );
     let mut file = out.into_inner().map_err(|e| e.into_error())?;
-    file.seek(SeekFrom::Start(table_pos))?;
     let mut table = Vec::with_capacity(lengths.len() * 16);
     for (compressed_len, raw_len) in &lengths {
         table.extend_from_slice(&compressed_len.to_le_bytes());
         table.extend_from_slice(&raw_len.to_le_bytes());
     }
+    let mut tables = Sha256::new();
+    for run in runs {
+        tables.update(run.offset.to_le_bytes());
+        tables.update(run.len.to_le_bytes());
+    }
+    tables.update(&table);
+    let tables: [u8; 32] = tables.finalize().into();
+    file.seek(SeekFrom::Start(table_pos))?;
     file.write_all(&table)?;
+    file.seek(SeekFrom::Start(TABLES_DIGEST_AT as u64))?;
+    file.write_all(&tables)?;
     file.sync_all().context("syncing the working-set pack")?;
     Ok(BuildStats {
         runs: runs.len() as u64,
@@ -407,18 +425,12 @@ fn compress(
     compressor.compress(raw)
 }
 
-fn header_names(
-    header: &[u8; HEADER_LEN],
-    key: &ImageKey,
-    digest: &[u8; 32],
-    mem_len: u64,
-) -> bool {
+fn header_names(header: &[u8; HEADER_LEN], key: &ImageKey, mem_len: u64) -> bool {
     let u64_at = |off: usize| u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
     &header[0..8] == MAGIC
         && u64_at(8) == VERSION
         && u64_at(16) == mem_len
         && &header[24..56] == key.as_bytes()
-        && &header[56..88] == digest
 }
 
 /// Where a range of the memory file comes from, as [`Pack::pieces`] splits it.
@@ -434,9 +446,10 @@ pub enum Piece {
     File { file_offset: u64, len: u64 },
 }
 
-/// An opened pack whose key, order digest and run table match.
+/// An opened pack of the image its key names.
 pub struct Pack {
     file: File,
+    /// The order digest of the set it was built from.
     digest: [u8; 32],
     /// The runs, in stream order.
     runs: Vec<Run>,
@@ -448,31 +461,23 @@ pub struct Pack {
 }
 
 impl Pack {
-    /// Open the pack at `path` if it describes the image `key` names and the set whose order
-    /// digest is `digest` and whose runs, in stream order, are `expected` ([`runs_of`]).
-    /// `Ok(None)` when there is no pack or it describes something else; an error for a pack
-    /// that could not be read or whose tables are inconsistent.
-    pub fn open(
-        path: &Path,
-        key: &ImageKey,
-        digest: &[u8; 32],
-        mem_len: u64,
-        expected: impl Iterator<Item = Run>,
-    ) -> Result<Option<Self>> {
+    /// Open the pack at `path` if it holds bytes of the image `key` names, a memory file of
+    /// `mem_len` bytes. `Ok(None)` when there is no pack or it describes another image; an
+    /// error for a pack that could not be read or whose tables are damaged or inconsistent.
+    pub fn open(path: &Path, key: &ImageKey, mem_len: u64) -> Result<Option<Self>> {
         let file = match File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
         let mut header = [0u8; HEADER_LEN];
-        if file.read_exact_at(&mut header, 0).is_err()
-            || !header_names(&header, key, digest, mem_len)
-        {
+        if file.read_exact_at(&mut header, 0).is_err() || !header_names(&header, key, mem_len) {
             return Ok(None);
         }
         let u64_at = |off: usize| u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
-        let run_count = u64_at(88);
-        let frame_count = u64_at(96);
+        let digest: [u8; 32] = header[56..88].try_into().unwrap();
+        let run_count = u64_at(120);
+        let frame_count = u64_at(128);
         let file_len = file.metadata()?.len();
         let tables = run_count
             .checked_add(frame_count)
@@ -484,10 +489,15 @@ impl Pack {
         let (run_count, frame_count) = (run_count as usize, frame_count as usize);
         let mut buf = vec![0u8; tables as usize];
         file.read_exact_at(&mut buf, HEADER_LEN as u64)?;
+        let tables_digest: [u8; 32] = Sha256::digest(&buf).into();
+        ensure!(
+            tables_digest[..] == header[TABLES_DIGEST_AT..TABLES_DIGEST_AT + 32],
+            "{}: the tables do not match their digest",
+            path.display()
+        );
         let at = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         let mut runs = Vec::with_capacity(run_count);
         let mut starts = Vec::with_capacity(run_count);
-        let mut expected = expected;
         let mut stream = 0u64;
         for i in 0..run_count {
             let run = Run {
@@ -495,19 +505,18 @@ impl Pack {
                 len: at(i * 16 + 8),
             };
             ensure!(
-                expected.next() == Some(run),
-                "{}: run {i} is not the recorded set's",
+                run.len > 0
+                    && run
+                        .offset
+                        .checked_add(run.len)
+                        .is_some_and(|end| end <= mem_len),
+                "{}: run {i} lies outside the memory file",
                 path.display()
             );
             runs.push(run);
             starts.push(stream);
             stream += run.len;
         }
-        ensure!(
-            expected.next().is_none(),
-            "{}: the recorded set has runs the pack does not",
-            path.display()
-        );
         let bound = zstd::zstd_safe::compress_bound(FRAME_RAW) as u64;
         let mut frames = Vec::with_capacity(frame_count);
         let mut file_pos = HEADER_LEN as u64 + tables;
@@ -538,9 +547,18 @@ impl Pack {
         );
         let mut by_offset: Vec<u32> = (0..run_count as u32).collect();
         by_offset.sort_unstable_by_key(|&i| runs[i as usize].offset);
+        // `pieces` maps a file range through the runs in file order, so they must not overlap.
+        for pair in by_offset.windows(2) {
+            let (a, b) = (runs[pair[0] as usize], runs[pair[1] as usize]);
+            ensure!(
+                a.offset + a.len <= b.offset,
+                "{}: two runs overlap",
+                path.display()
+            );
+        }
         Ok(Some(Self {
             file,
-            digest: *digest,
+            digest,
             runs,
             starts,
             frames,
@@ -548,6 +566,7 @@ impl Pack {
         }))
     }
 
+    /// The [`PageSet::order_digest`] of the set the pack was built from.
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
     }
@@ -1072,14 +1091,8 @@ mod tests {
         crate::reclaim::owner_dir_in(&dir.join("data")).unwrap()
     }
 
-    fn open(path: &Path, key: &ImageKey, set: &PageSet, mem_len: u64) -> Result<Option<Pack>> {
-        Pack::open(
-            path,
-            key,
-            &set.order_digest(),
-            mem_len,
-            runs_of(OrderedRuns::new(set), mem_len),
-        )
+    fn open(path: &Path, key: &ImageKey, mem_len: u64) -> Result<Option<Pack>> {
+        Pack::open(path, key, mem_len)
     }
 
     /// Every recorded byte comes back out of the pack at the stream position its run maps to,
@@ -1097,7 +1110,7 @@ mod tests {
         let stats = build_for_test(&mem, &key, &set, &reclaim_dir(dir.path()), 3);
         assert_eq!(stats.raw_bytes, set.bytes());
         assert_eq!(stats.frames, set.bytes().div_ceil(FRAME_RAW as u64));
-        let pack = open(&path_for(&mem), &key, &set, mem_len).unwrap().unwrap();
+        let pack = open(&path_for(&mem), &key, mem_len).unwrap().unwrap();
         let mut stream = Vec::new();
         let mut scratch = Vec::new();
         for (index, frame) in pack.frames().iter().enumerate() {
@@ -1151,10 +1164,11 @@ mod tests {
         );
     }
 
-    /// A pack for another set order, another image, or a different length is not used, and a
-    /// frame whose bytes are damaged fails to decompress instead of returning them.
+    /// A pack of another image or a different length is not used, a pack of another set of
+    /// the same image is, and a frame whose bytes are damaged fails to decompress instead of
+    /// returning them.
     #[test]
-    fn a_pack_for_another_set_or_image_is_not_opened() {
+    fn a_pack_for_another_image_is_not_opened() {
         let dir = tempfile::tempdir().unwrap();
         let mem_len = 256 * GRANULE;
         let mem = image(dir.path(), mem_len);
@@ -1163,15 +1177,11 @@ mod tests {
         let key = key(&mem);
         let out = path_for(&mem);
         build_for_test(&mem, &key, &set, &reclaim_dir(dir.path()), 1);
-        assert!(open(&out, &key, &set, mem_len).unwrap().is_some());
-        let mut reordered = set.clone();
-        reordered.insert_range_at(0, GRANULE, 0);
-        reordered.insert_range_at(100 * GRANULE, GRANULE, 1);
-        assert!(open(&out, &key, &reordered, mem_len).unwrap().is_none());
+        assert!(open(&out, &key, mem_len).unwrap().is_some());
         let other = ImageKey::of(&mem, &[8u8; 32]).unwrap();
-        assert!(open(&out, &other, &set, mem_len).unwrap().is_none());
-        assert!(open(&out, &key, &set, mem_len + GRANULE).unwrap().is_none());
-        let pack = open(&out, &key, &set, mem_len).unwrap().unwrap();
+        assert!(open(&out, &other, mem_len).unwrap().is_none());
+        assert!(open(&out, &key, mem_len + GRANULE).unwrap().is_none());
+        let pack = open(&out, &key, mem_len).unwrap().unwrap();
         let frame = pack.frames()[0];
         let f = File::options().write(true).open(&out).unwrap();
         f.write_all_at(&[0xFF; 16], frame.file_pos + 4).unwrap();
@@ -1179,11 +1189,10 @@ mod tests {
         assert!(pack.decompress(0, &mut Vec::new(), &mut raw).is_err());
     }
 
-    /// The header's digest only says which set the pack claims to hold. A run table that
-    /// disagrees with that set (a damaged entry, a builder bug) would put one run's bytes at
-    /// another run's offset, so the table is checked against the set's own runs.
+    /// A damaged run table would put one run's bytes at another run's offset, so the tables
+    /// carry a digest and a pack whose tables do not match it is not opened.
     #[test]
-    fn a_pack_whose_run_table_is_not_the_sets_is_not_opened() {
+    fn a_pack_whose_run_table_is_damaged_is_not_opened() {
         let dir = tempfile::tempdir().unwrap();
         let mem_len = 256 * GRANULE;
         let mem = image(dir.path(), mem_len);
@@ -1193,13 +1202,14 @@ mod tests {
         let key = key(&mem);
         let out = path_for(&mem);
         build_for_test(&mem, &key, &set, &reclaim_dir(dir.path()), 1);
-        // Move the second run of the table by one granule; the digest still names the set.
+        // Move the second run of the table to another stretch of the file: still disjoint and
+        // inside the file, so only the tables digest can tell.
         let f = File::options().write(true).open(&out).unwrap();
-        f.write_all_at(&(GRANULE).to_le_bytes(), HEADER_LEN as u64 + 16)
+        f.write_all_at(&(40 * GRANULE).to_le_bytes(), HEADER_LEN as u64 + 16)
             .unwrap();
         assert!(
-            open(&out, &key, &set, mem_len).is_err(),
-            "a pack whose runs are not the set's was opened"
+            open(&out, &key, mem_len).is_err(),
+            "a pack whose run table was damaged was opened"
         );
     }
 
@@ -1245,7 +1255,7 @@ mod tests {
                 assert!(got == want, "bytes for {offset:#x}+{len:#x} differ");
             }
         };
-        let pack = Arc::new(open(&path_for(&mem), &key, &set, mem_len).unwrap().unwrap());
+        let pack = Arc::new(open(&path_for(&mem), &key, mem_len).unwrap().unwrap());
         assert_eq!(pack.frames().len(), 3);
         let stream = PackStream::new(Arc::clone(&pack), 2);
         check(&stream);
@@ -1392,7 +1402,7 @@ mod tests {
         set.insert_range_at(0, 3072 * GRANULE, 1);
         let key = key(&mem);
         build_for_test(&mem, &key, &set, &reclaim_dir(dir.path()), 2);
-        let pack = Arc::new(open(&path_for(&mem), &key, &set, mem_len).unwrap().unwrap());
+        let pack = Arc::new(open(&path_for(&mem), &key, mem_len).unwrap().unwrap());
         let stream = PackStream::new(pack, 1);
         let handles = stream.spawn_read_ahead(2);
         for handle in handles {
