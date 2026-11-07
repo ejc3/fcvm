@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { forwardedRequest, isProxiedPath, liveProxy, pageLiveUrl } from "../live-proxy.ts";
+import { accessRefused, accessTokenFrom, forwardedRequest, isProxiedPath, liveProxy, pageLiveUrl, tokenUsable, VIEWER_ADDRESS_HEADER } from "../live-proxy.ts";
 
 const env = { FLEET_COORD_URL: "wss://coord.example.test/live", FLEET_ACCESS_CLIENT_ID: "id-1", FLEET_ACCESS_CLIENT_SECRET: "secret-1" };
 
@@ -32,6 +32,7 @@ describe("forwardedRequest", () => {
     ["CF-Access-Client-Secret", "caller-secret"],
     ["Host", "stage.example.test"],
     ["x-real-ip", "198.51.100.9"],
+    [VIEWER_ADDRESS_HEADER, "198.51.100.66"],
     ["cf-connecting-ip", "203.0.113.7"],
   ];
   const { url, headers } = forwardedRequest(proxy, "/live", "?a=1", incoming);
@@ -52,9 +53,45 @@ describe("forwardedRequest", () => {
     expect(get("cf-access-client-secret")).toEqual(["secret-1"]);
   });
 
-  it("carries the viewer's address in x-real-ip, never a caller's", () => {
-    expect(get("x-real-ip")).toEqual(["203.0.113.7"]);
-    expect(forwardedRequest(proxy, "/live", "", [["x-real-ip", "198.51.100.9"]]).headers.filter(([k]) => k === "x-real-ip")).toEqual([]);
+  it("carries the viewer's address in its own header, never a caller's", () => {
+    expect(get(VIEWER_ADDRESS_HEADER)).toEqual(["203.0.113.7"]);
+    expect(get("x-real-ip")).toEqual([]);
+    expect(forwardedRequest(proxy, "/live", "", [[VIEWER_ADDRESS_HEADER, "198.51.100.9"]]).headers.filter(([k]) => k === VIEWER_ADDRESS_HEADER)).toEqual([]);
+  });
+
+  it("presents a kept Access token instead of the service token", () => {
+    const kept = forwardedRequest(proxy, "/live", "", incoming, "kept.jwt.value").headers;
+    const has = (n: string) => kept.filter(([k]) => k.toLowerCase() === n).map(([, v]) => v);
+    expect(has("cf-access-token")).toEqual(["kept.jwt.value"]);
+    expect(has("cf-access-client-id")).toEqual([]);
+    expect(has("cf-access-client-secret")).toEqual([]);
+    expect(get("cf-access-token")).toEqual([]);
+  });
+});
+
+describe("the kept Access token", () => {
+  const b64 = (s: string) => Buffer.from(s).toString("base64url");
+  const jwt = `${b64('{"alg":"RS256"}')}.${b64('{"exp":1900000000,"type":"app"}')}.c2ln`;
+
+  it("is read from the coordinator application's CF_Authorization cookie", () => {
+    expect(accessTokenFrom([`CF_Authorization=${jwt}; Path=/; Secure; HttpOnly`])).toEqual({ token: jwt, exp: 1900000000 });
+    expect(accessTokenFrom(["other=1", `CF_Authorization=${jwt}`])).toEqual({ token: jwt, exp: 1900000000 });
+    expect(accessTokenFrom(["CF_AppSession=abc; Path=/"])).toBeNull();
+    expect(accessTokenFrom(["CF_Authorization=not-a-jwt; Path=/"])).toBeNull();
+    expect(accessTokenFrom([`CF_Authorization=${b64("{}")}.${b64('{"type":"app"}')}.c2ln`])).toBeNull();
+    expect(accessTokenFrom([])).toBeNull();
+  });
+
+  it("is used until a minute before it expires", () => {
+    const t = { token: jwt, exp: 1900000000 };
+    expect(tokenUsable(t, 1900000000_000 - 61_000)).toBe(true);
+    expect(tokenUsable(t, 1900000000_000 - 59_000)).toBe(false);
+    expect(tokenUsable(null, 0)).toBe(false);
+  });
+
+  it("is dropped on a redirect, 401 or 403, never on a 101 or 200", () => {
+    for (const s of [301, 302, 307, 401, 403]) expect(accessRefused(s)).toBe(true);
+    for (const s of [101, 200, 404, 500]) expect(accessRefused(s)).toBe(false);
   });
 });
 

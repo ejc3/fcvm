@@ -29,6 +29,7 @@ struct Opts {
     checker: Arc<dyn TextChecker>,
     verifier: Arc<dyn Verifier>,
     trust_cf: bool,
+    access_viewer: bool,
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
@@ -48,6 +49,7 @@ impl Default for Opts {
             checker: allow_all(),
             verifier: Arc::new(turnstile::Off),
             trust_cf: true,
+            access_viewer: false,
             ec2_local: None,
             dns: None,
             site_key: None,
@@ -77,6 +79,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         allowed_origins: vec!["https://wall.example".into()],
         verifier: o.verifier,
         trust_cf_connecting_ip: o.trust_cf,
+        access_viewer_address: o.access_viewer,
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
@@ -184,10 +187,25 @@ impl Viewer {
     }
 
     async fn connect_raw(url: &str, ip: Option<&str>) -> Viewer {
+        let headers: Vec<(&str, &str)> =
+            ip.map(|ip| ("cf-connecting-ip", ip)).into_iter().collect();
+        Viewer::connect_with_headers(url, &headers).await
+    }
+
+    /// Connect sending these request headers, then the seat message.
+    async fn connect_seated_with_headers(url: &str, headers: &[(&str, &str)]) -> Viewer {
+        let mut v = Viewer::connect_with_headers(url, headers).await;
+        v.send(json!({"type": "seat", "ticket": null})).await;
+        v
+    }
+
+    async fn connect_with_headers(url: &str, headers: &[(&str, &str)]) -> Viewer {
         let mut req = url.into_client_request().unwrap();
-        if let Some(ip) = ip {
-            req.headers_mut()
-                .insert("cf-connecting-ip", ip.parse().unwrap());
+        for (name, value) in headers {
+            let name =
+                tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                    .unwrap();
+            req.headers_mut().insert(name, value.parse().unwrap());
         }
         let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         Viewer {
@@ -610,6 +628,65 @@ async fn limits_are_keyed_by_the_client_address() {
         b.receipt("w2").await["reason"],
         "one word per 5 s per client"
     );
+}
+
+/// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
+/// a placeholder.
+fn access_jwt(claims: Value) -> String {
+    format!(
+        "{}.{}.sig",
+        admission::b64url(br#"{"alg":"RS256"}"#),
+        admission::b64url(claims.to_string().as_bytes())
+    )
+}
+
+/// Through the staging page's Worker every viewer arrives with the Worker's
+/// `CF-Connecting-IP`; the viewer's own address is in `x-fleet-viewer-ip`, which counts only
+/// with `--access-viewer-address` and only on a request Access admitted with a service token.
+/// Without the switch (a coordinator no connector verifies Access for), a forged service-token
+/// payload must not let a caller choose its address.
+#[tokio::test]
+async fn a_forwarded_viewer_address_counts_only_with_a_service_token() {
+    let worker = "2001:db8::103";
+    let service =
+        access_jwt(json!({"type": "app", "common_name": "example-client.access", "email": ""}));
+    let person = access_jwt(json!({"type": "app", "email": "viewer@example.test"}));
+    for (access_viewer, jwt, separate) in [
+        (true, Some(service.as_str()), true),
+        (true, Some(person.as_str()), false),
+        (true, None, false),
+        (false, Some(service.as_str()), false),
+    ] {
+        let c = coordinator_with(Opts {
+            access_viewer,
+            ..Opts::default()
+        })
+        .await;
+        let headers = |viewer: &'static str| {
+            let mut h = vec![("cf-connecting-ip", worker), ("x-fleet-viewer-ip", viewer)];
+            if let Some(j) = jwt {
+                h.push(("cf-access-jwt-assertion", j));
+            }
+            h
+        };
+        let mut a = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.1")).await;
+        let mut b = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.2")).await;
+        a.intent("w1", "word", json!({"text": "one"})).await;
+        assert_eq!(a.receipt("w1").await["outcome"], "committed");
+        b.intent("w2", "word", json!({"text": "two"})).await;
+        let r = b.receipt("w2").await;
+        if separate {
+            assert_eq!(
+                r["outcome"], "committed",
+                "service token: each viewer has its own limit: {r}"
+            );
+        } else {
+            assert_eq!(
+                r["reason"], "one word per 5 s per client",
+                "switch {access_viewer}, jwt {jwt:?}: the header must not count: {r}"
+            );
+        }
+    }
 }
 
 /// With Turnstile on, a connection's intents are refused (and not recorded) until it has
@@ -1200,6 +1277,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
@@ -2961,6 +3039,7 @@ async fn page_url(handle: &Handle) -> String {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),

@@ -43,20 +43,29 @@ export function isProxiedPath(pathname: string): boolean {
 }
 
 /**
- * Request headers the Worker drops: the viewer's Access credentials for the page host (the
- * coordinator's application has its own, the service token), any service token a caller
- * sent, the hop's own Host, and x-real-ip, which is set from the viewer's address below.
+ * The viewer's address, for the coordinator's per-client limits. The Worker's subrequest
+ * reaches Cloudflare's front door as a request of its own, so the coordinator sees the
+ * Worker's address in CF-Connecting-IP for every viewer; it reads this header instead, and
+ * only on a request Access admitted with a service token (src/fleet/coord/live.rs).
  */
-const DROPPED = new Set(["cookie", "host", "cf-access-jwt-assertion", "cf-access-token", "cf-access-client-id", "cf-access-client-secret", "x-real-ip"]);
+export const VIEWER_ADDRESS_HEADER = "x-fleet-viewer-ip";
+
+/**
+ * Request headers the Worker drops: the viewer's Access credentials for the page host (the
+ * coordinator's application has its own, the service token), any Access token or service
+ * token a caller sent, the hop's own Host, and any viewer address a caller sent, which the
+ * Worker sets itself.
+ */
+const DROPPED = new Set(["cookie", "host", "cf-access-jwt-assertion", "cf-access-token", "cf-access-client-id", "cf-access-client-secret", "x-real-ip", VIEWER_ADDRESS_HEADER]);
 
 /**
  * The upstream URL and headers for a forwarded request. The rest of the headers pass
  * unchanged: Origin (the coordinator checks it against its allowed origins), Upgrade and the
- * Sec-WebSocket ones. x-real-ip carries the viewer's address: on a same-zone Worker
- * subrequest Cloudflare sets CF-Connecting-IP from it, and the coordinator keys its
- * per-client limits on CF-Connecting-IP.
+ * Sec-WebSocket ones. The viewer's CF-Connecting-IP goes in VIEWER_ADDRESS_HEADER. With
+ * `accessToken` (the coordinator application's JWT, which Access issued for the service
+ * token on an earlier request) the Worker presents that instead of the service token.
  */
-export function forwardedRequest(proxy: LiveProxy, path: string, search: string, headers: Iterable<[string, string]>): { url: string; headers: [string, string][] } {
+export function forwardedRequest(proxy: LiveProxy, path: string, search: string, headers: Iterable<[string, string]>, accessToken: string | null = null): { url: string; headers: [string, string][] } {
   const out: [string, string][] = [];
   let viewer: string | null = null;
   for (const [name, value] of headers) {
@@ -65,9 +74,66 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
     if (DROPPED.has(n)) continue;
     out.push([name, value]);
   }
-  if (viewer !== null) out.push(["x-real-ip", viewer]);
-  out.push(["cf-access-client-id", proxy.clientId], ["cf-access-client-secret", proxy.clientSecret]);
+  if (viewer !== null) out.push([VIEWER_ADDRESS_HEADER, viewer]);
+  if (accessToken !== null) out.push(["cf-access-token", accessToken]);
+  else out.push(["cf-access-client-id", proxy.clientId], ["cf-access-client-secret", proxy.clientSecret]);
   return { url: `${proxy.upstream}${path}${search}`, headers: out };
+}
+
+export interface AccessToken {
+  token: string;
+  /** Expiry, in seconds since the epoch, from the JWT's `exp`. */
+  exp: number;
+}
+
+/** The coordinator application's JWT from an upstream response's Set-Cookie lines, or null. */
+export function accessTokenFrom(setCookies: readonly string[]): AccessToken | null {
+  for (const line of setCookies) {
+    const m = /^\s*CF_Authorization=([A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+)\s*(;|$)/.exec(line);
+    if (!m) continue;
+    const payload = b64urlText(m[2]!);
+    if (payload === null) continue;
+    try {
+      const exp = (JSON.parse(payload) as { exp?: unknown }).exp;
+      if (typeof exp === "number" && Number.isFinite(exp)) return { token: m[1]!, exp };
+    } catch {
+      // Not a JWT payload: not a token to keep.
+    }
+  }
+  return null;
+}
+
+/** A kept token is used until a minute before it expires. */
+export function tokenUsable(t: AccessToken | null, nowMs: number): t is AccessToken {
+  return t !== null && t.exp * 1000 - 60_000 > nowMs;
+}
+
+/**
+ * Whether an upstream answer may be Access refusing a kept token: a redirect to its login, or
+ * 401/403. The coordinator's own 403 (a foreign Origin) also matches, which costs one retry
+ * with the service token and is then passed on.
+ */
+export function accessRefused(status: number): boolean {
+  return status === 401 || status === 403 || (status >= 300 && status < 400);
+}
+
+function b64urlText(s: string): string | null {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let bits = 0;
+  let acc = 0;
+  const bytes: number[] = [];
+  for (const c of s) {
+    const v = alphabet.indexOf(c);
+    if (v < 0) return null;
+    acc = ((acc << 6) | v) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((acc >> bits) & 0xff);
+    }
+  }
+  // Byte to character: the claim read here, exp, is ASCII, as JSON's syntax is.
+  return String.fromCharCode(...bytes);
 }
 
 /**

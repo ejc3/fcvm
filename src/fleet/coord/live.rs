@@ -47,6 +47,9 @@ pub struct LiveConfig {
     pub turnstile_site_key: Option<String>,
     /// Key clients by `CF-Connecting-IP` (only behind Cloudflare, which sets it).
     pub trust_cf_connecting_ip: bool,
+    /// Key a request Access admitted with a service token by [`VIEWER_ADDRESS_HEADER`]
+    /// (only behind a connector that requires and verifies Access).
+    pub access_viewer_address: bool,
     pub poster: Arc<Poster>,
     /// Who gets direct streams and who the broadcast, and their tokens.
     pub gate: Arc<Gate>,
@@ -154,19 +157,70 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
         .into_response()
 }
 
-/// The address the per-client limits use.
-pub fn client_address(headers: &HeaderMap, peer: SocketAddr, trust_cf: bool) -> String {
-    if trust_cf {
-        if let Some(ip) = headers
-            .get("cf-connecting-ip")
+/// The viewer's address as the staging page's Worker forwards it (fleet/web/worker.ts). A
+/// Worker's subrequest reaches Cloudflare's front door as a request of its own, so its
+/// `CF-Connecting-IP` is the Worker's address, the same for every viewer.
+pub const VIEWER_ADDRESS_HEADER: &str = "x-fleet-viewer-ip";
+
+/// The address the per-client limits use: `CF-Connecting-IP` behind Cloudflare (`trust_cf`),
+/// else the peer address. With `access_viewer`, a request Access admitted with a service token
+/// is keyed by [`VIEWER_ADDRESS_HEADER`] instead: only the fleet's own Worker and CI hold one,
+/// and a browser's Access JWT names a person, so a viewer cannot set the address it is limited
+/// by. That holds only where the connector verifies the JWT, hence the separate switch.
+pub fn client_address(
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    trust_cf: bool,
+    access_viewer: bool,
+) -> String {
+    let ip = |name: &str| {
+        headers
+            .get(name)
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
-        {
-            return ip.to_string();
+            .map(str::to_string)
+    };
+    if access_viewer && access_service_token(headers) {
+        if let Some(viewer) = ip(VIEWER_ADDRESS_HEADER) {
+            return viewer;
+        }
+    }
+    if trust_cf {
+        if let Some(cf) = ip("cf-connecting-ip") {
+            return cf;
         }
     }
     peer.ip().to_string()
+}
+
+/// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
+/// it forwards names one (`common_name`, the token's client id) and no person (`email`).
+/// The signature is not checked here, so this is trusted only with `--access-viewer-address`:
+/// staging's tunnel connector refuses a request whose token does not verify for the
+/// coordinator's applications (`access.required`, ejc3/aws fcvm-dev.tf).
+fn access_service_token(headers: &HeaderMap) -> bool {
+    let Some(jwt) = headers
+        .get("cf-access-jwt-assertion")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(payload) = jwt.split('.').nth(1) else {
+        return false;
+    };
+    let Some(claims) = super::admission::b64url_decode(payload)
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    else {
+        return false;
+    };
+    let named = |k: &str| {
+        claims
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+    };
+    named("common_name") && !named("email")
 }
 
 async fn live(
@@ -181,7 +235,12 @@ async fn live(
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    let client = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip);
+    let client = client_address(
+        &headers,
+        peer,
+        app.cfg.trust_cf_connecting_ip,
+        app.cfg.access_viewer_address,
+    );
     let page = Page {
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
     };

@@ -1373,6 +1373,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         allowed_origins: args.allowed_origins,
         verifier,
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
+        access_viewer_address: args.access_viewer_address,
         turnstile_site_key: args.turnstile_site_key,
         poster,
         gate: Arc::new(gate),
