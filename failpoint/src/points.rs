@@ -38,4 +38,5 @@ pub const GUEST_POINTS: &[&str] = &[
     "exec.post_ack_pre_go",
     "restore.post_epoch_read",
     "restore.pre_ack_connect",
+    "restore.pre_gate_verify",
 ];
