@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 fail=0
 no() { echo "FAIL: $*"; fail=1; }
-scripts=(fleet/ami/*.sh fleet/ami/common/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/tools/gpubox.sh fleet/tools/issue-cert.sh)
+scripts=(fleet/ami/*.sh fleet/ami/common/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/tools/gpubox.sh fleet/tools/g-admission.sh fleet/tools/issue-cert.sh)
 for f in "${scripts[@]}"; do bash -n "$f" || no "bash -n $f"; done
 if command -v shellcheck >/dev/null; then
   shellcheck -S warning "${scripts[@]}" || no "shellcheck -S warning"
