@@ -388,6 +388,75 @@ bool step_keys(const Step& s, std::vector<KeyEvent>* out) {
 
 const Step kCloseWindowStep = chord2(SC_LMENU, SC_F4);
 
+bool KeyQueue::submit(const std::vector<KeyEvent>& ev, uint64_t* ticket, std::string* err) {
+  if (status_ == QUEUED || status_ == SENDING) {
+    *err = "another key batch is still pending";
+    return false;
+  }
+  batch_ = ev;
+  err_.clear();
+  status_ = QUEUED;
+  *ticket = ++ticket_;
+  return true;
+}
+
+bool KeyQueue::take(std::vector<KeyEvent>* out) {
+  if (status_ != QUEUED) return false;
+  *out = std::move(batch_);
+  batch_.clear();
+  status_ = SENDING;
+  return true;
+}
+
+void KeyQueue::done(bool ok, const std::string& err) {
+  if (status_ != SENDING) return;
+  status_ = ok ? SENT : FAILED;
+  err_ = ok ? "" : err;
+}
+
+bool KeyQueue::cancel(uint64_t ticket) {
+  if (ticket != ticket_ || status_ != QUEUED) return false;
+  batch_.clear();
+  status_ = FAILED;
+  err_ = "dropped unsent";
+  return true;
+}
+
+void KeyQueue::fail(const std::string& why) {
+  if (status_ != QUEUED && status_ != SENDING) return;
+  batch_.clear();
+  status_ = FAILED;
+  err_ = why;
+}
+
+KeyQueue::Status KeyQueue::status(uint64_t ticket, std::string* err) const {
+  if (ticket != ticket_) {
+    *err = "superseded";
+    return FAILED;
+  }
+  *err = err_;
+  return status_;
+}
+
+bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err) {
+  for (size_t i = 0; i < ev.size(); i++)
+    if (!send(ev[i])) {
+      *err = "key event " + std::to_string(i + 1) + " of " + std::to_string(ev.size()) + " could not be sent";
+      return false;
+    }
+  return true;
+}
+
+// ---- the desktop size
+
+std::string desktop_size_violation(uint32_t w, uint32_t h) {
+  if (w >= RDP_MIN_SIDE && w <= RDP_MAX_WIDTH && h >= RDP_MIN_SIDE && h <= RDP_MAX_HEIGHT) return "";
+  char b[160];
+  snprintf(b, sizeof b, "the server's desktop size %u x %u is outside %d..%d x %d..%d", w, h, RDP_MIN_SIDE, RDP_MAX_WIDTH,
+           RDP_MIN_SIDE, RDP_MAX_HEIGHT);
+  return b;
+}
+
 // ---- POST /scene
 
 bool bridge_scene_parse(const std::string& body, BridgeScene* out, std::string* err) {
@@ -409,6 +478,11 @@ bool bridge_scene_parse(const std::string& body, BridgeScene* out, std::string* 
       return false;
     }
     s.epoch_unix_ms = j.at("epoch_unix_ms").number("epoch_unix_ms");
+    // the renderer's rule (scene.cpp); NaN and the infinities fail it too
+    if (!(fabs(s.epoch_unix_ms) <= 9.0e15) || s.epoch_unix_ms != floor(s.epoch_unix_ms)) {
+      *err = "epoch_unix_ms: an integer of at most 9e15 in magnitude expected";
+      return false;
+    }
     if (j.has("admit_keys") && j.at("admit_keys").type != Json::Null) {
       const auto& ks = j.at("admit_keys").array("admit_keys");
       if (ks.size() > 4) {
@@ -497,7 +571,12 @@ std::string bridge_header_json(int w, int h, const std::string& codec, int fps, 
 }
 
 long long frame_slot(double unix_ms, double epoch_unix_ms, int fps) {
-  return (long long)floor((unix_ms - epoch_unix_ms) * fps / 1000.0);
+  double s = floor((unix_ms - epoch_unix_ms) * fps / 1000.0);
+  if (s != s) return 0;  // NaN
+  // converted only once it fits: a double outside long long's range is undefined to convert
+  if (s >= (double)FRAME_SLOT_LIMIT) return FRAME_SLOT_LIMIT;
+  if (s <= -(double)FRAME_SLOT_LIMIT) return -FRAME_SLOT_LIMIT;
+  return (long long)s;
 }
 
 double frame_slot_t(double unix_ms, double epoch_unix_ms, int fps) {
@@ -558,6 +637,14 @@ std::string str_or_null(const std::string& s) { return s.empty() ? "null" : "\""
 }  // namespace
 
 std::string bridge_health_json(const BridgeHealth& h) {
+  // Built as a string: the streams, the codecs and the viewers grow with what peers do, so no
+  // fixed buffer bounds the document (a truncated one is not JSON).
+  auto f = [](const char* fmt, double v) {
+    char b[64];
+    snprintf(b, sizeof b, fmt, v);
+    return std::string(b);
+  };
+  auto u = [](uint64_t v) { return std::to_string(v); };
   std::string streams = "[";
   for (size_t i = 0; i < h.streams.size(); i++) {
     int q = h.streams[i].second;
@@ -568,22 +655,21 @@ std::string bridge_health_json(const BridgeHealth& h) {
   std::string heights = h.streams.empty() || !h.surface_h ? "[]" : "[" + std::to_string(h.surface_h) + "]";
   const WindowsTimes& t = h.times;
   bool ready = h.state == STATE_CONNECTED || h.state == STATE_DESKTOP;
-  char b[8192];
-  snprintf(b, sizeof b,
-           "{\"fps\":%.1f,\"heights\":%s,\"streams\":%s,\"gpu\":null,\"t\":%.6f,\"frame\":%u,"
-           "\"boot_id\":\"%s\",\"ready\":%s,%s\"startup_ms\":{\"first_frame_sent\":%s},"
-           "\"windows\":{\"state\":\"%s\",\"connects\":%llu,\"attempts\":%llu,"
-           "\"times_unix_ms\":{\"start\":%s,\"connect_started\":%s,\"tcp\":%s,\"rdp\":%s,\"first_frame\":%s,\"desktop\":%s},"
-           "\"desktop_by\":\"%s\",\"surface\":[%d,%d],\"fps\":%.1f,\"encode_ms_p50\":%s,\"encode_ms_p90\":%s,"
-           "\"frame_age_ms\":%s,\"last_error\":%s,\"h264\":%s,\"gfx_frames\":%llu,\"paint_frames\":%llu,"
-           "\"gfx_codecs\":%s}",
-           h.fps, heights.c_str(), streams.c_str(), h.t, h.frame, h.boot_id.c_str(), ready ? "true" : "false",
-           h.error.empty() ? "" : ("\"error\":\"" + json_escape(h.error.substr(0, 300)) + "\",").c_str(), num(h.first_frame_sent_ms).c_str(),
-           bridge_state_name(h.state), (unsigned long long)h.connects, (unsigned long long)h.attempts, num(t.start).c_str(),
-           num(t.connect_started).c_str(), num(t.tcp).c_str(), num(t.rdp).c_str(), num(t.first_frame).c_str(),
-           num(t.desktop).c_str(), h.desktop_by, h.surface_w, h.surface_h, h.fps, num(h.encode_p50, "%.2f").c_str(),
-           num(h.encode_p90, "%.2f").c_str(), num(h.frame_age_ms).c_str(), str_or_null(h.last_error).c_str(),
-           h.h264 ? "true" : "false", (unsigned long long)h.gfx_frames, (unsigned long long)h.paint_frames,
-           h.gfx_codecs.c_str());
-  return std::string(b) + ",\"viewers\":" + h.viewers + "}";
+  std::string o;
+  o += "{\"fps\":" + f("%.1f", h.fps) + ",\"heights\":" + heights + ",\"streams\":" + streams + ",\"gpu\":null,\"t\":" +
+       f("%.6f", h.t) + ",\"frame\":" + u(h.frame) + ",\"boot_id\":\"" + json_escape(h.boot_id) +
+       "\",\"ready\":" + (ready ? "true" : "false") + ",";
+  if (!h.error.empty()) o += "\"error\":\"" + json_escape(h.error.substr(0, 300)) + "\",";
+  o += "\"startup_ms\":{\"first_frame_sent\":" + num(h.first_frame_sent_ms) + "},";
+  o += "\"windows\":{\"state\":\"" + std::string(bridge_state_name(h.state)) + "\",\"connects\":" + u(h.connects) +
+       ",\"attempts\":" + u(h.attempts) + ",\"times_unix_ms\":{\"start\":" + num(t.start) +
+       ",\"connect_started\":" + num(t.connect_started) + ",\"tcp\":" + num(t.tcp) + ",\"rdp\":" + num(t.rdp) +
+       ",\"first_frame\":" + num(t.first_frame) + ",\"desktop\":" + num(t.desktop) + "},\"desktop_by\":\"" +
+       h.desktop_by + "\",\"surface\":[" + std::to_string(h.surface_w) + "," + std::to_string(h.surface_h) +
+       "],\"fps\":" + f("%.1f", h.fps) + ",\"encode_ms_p50\":" + num(h.encode_p50, "%.2f") +
+       ",\"encode_ms_p90\":" + num(h.encode_p90, "%.2f") + ",\"frame_age_ms\":" + num(h.frame_age_ms) +
+       ",\"last_error\":" + str_or_null(h.last_error) + ",\"h264\":" + (h.h264 ? "true" : "false") +
+       ",\"gfx_frames\":" + u(h.gfx_frames) + ",\"paint_frames\":" + u(h.paint_frames) + ",\"gfx_codecs\":" +
+       h.gfx_codecs + "}";
+  return o + ",\"viewers\":" + h.viewers + "}";
 }

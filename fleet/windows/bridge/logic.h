@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include <deque>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,6 +62,10 @@ class DesktopDetector {
   const Thumb& desktop_thumb() const { return desktop_; }
   const char* by() const { return ref_.empty() ? "settled" : "reference"; }
   bool has_reference() const { return !ref_.empty(); }
+  // A connection began or ended: a frame seen before it is no candidate, so a desktop only
+  // settles on frames of the connection it is shown on (time spent disconnected counts for
+  // nothing). Without a reference only; a found desktop stays found.
+  void reset_settle() { have_candidate_ = false; }
   const Thumb& reference() const { return ref_; }
 
  private:
@@ -161,6 +166,48 @@ extern const Step kCloseWindowStep;
 // A screen differs from another (STEP_WAIT_CHANGE) past this thumbnail RMSE.
 #define CHANGE_RMSE 0.02
 
+// The key queue between Bridge::play and the link's thread (RdpLink::send_keys and drain_keys,
+// which hold its mutex around every call). It holds one batch, a step's balanced presses and
+// releases, at a time: a second is refused while the first is queued or being sent. A waiter
+// that gives up cancels its batch, which drops it if the link's thread has not taken it yet, so
+// keys never go out after their action failed; a batch already taken is being sent and cannot
+// be split.
+class KeyQueue {
+ public:
+  enum Status { QUEUED, SENDING, SENT, FAILED };
+  // Queues ev under a new ticket; false with a message while another batch is pending.
+  bool submit(const std::vector<KeyEvent>& ev, uint64_t* ticket, std::string* err);
+  // The link's thread takes the queued batch (SENDING until done()); false when none is queued.
+  bool take(std::vector<KeyEvent>* out);
+  // The batch taken was sent (ok) or failed with err.
+  void done(bool ok, const std::string& err);
+  // The waiter of ticket gave up: true when its batch was still queued and is now dropped.
+  bool cancel(uint64_t ticket);
+  // The connection ended: a queued batch is dropped and fails with why.
+  void fail(const std::string& why);
+  // The state of ticket's batch, and the failure's message. A ticket that is not the latest
+  // batch's has failed.
+  Status status(uint64_t ticket, std::string* err) const;
+
+ private:
+  uint64_t ticket_ = 0;
+  Status status_ = SENT;
+  std::vector<KeyEvent> batch_;
+  std::string err_;
+};
+// Sends the events in order through send, stopping at the first it refuses; false with which.
+bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err);
+
+// ---- the desktop size
+
+// The desktop sizes the bridge takes: RDP_WIDTH and RDP_HEIGHT (main.cpp, both even) and any
+// size the server negotiates or resizes to, checked before FreeRDP's GDI allocates the surface.
+#define RDP_MIN_SIDE 200
+#define RDP_MAX_WIDTH 4096
+#define RDP_MAX_HEIGHT 2160
+// "" for a size within the bounds, else why it is refused.
+std::string desktop_size_violation(uint32_t w, uint32_t h);
+
 // ---- the channel check (docs/fleet/windows-sandboxes.md, "Edition and licensing")
 
 // What the connection was set up with, read from FreeRDP's settings after its channels
@@ -196,7 +243,8 @@ std::string settings_violation(const RdpSettingsView& v);
 
 // What the bridge reads of a scene: its clock (epoch_unix_ms, required) and the direct-stream
 // keys (admit_keys, at most 4, 64 hex digits each), checked as the phone streamer checks them;
-// the rest of the body is the wall's and is ignored.
+// the rest of the body is the wall's and is ignored. The epoch is an integer of at most 9e15 in
+// magnitude, the renderer's rule (scene.cpp), so the slot arithmetic stays in range.
 struct BridgeScene {
   double epoch_unix_ms = 0;
   std::vector<std::string> admit_keys;  // raw (admit.h)
@@ -212,6 +260,9 @@ uint32_t quality_rate_bps(int q, int w, int h, int fps);
 float quality_crf(int q);
 // The header that opens a stream: the whole desktop, an image of its own.
 std::string bridge_header_json(int w, int h, const std::string& codec, int fps, const char* q, uint32_t bitrate);
+// A slot's bound: frame_slot clamps to +-2^53, where a double still counts by one and the
+// encoder's slot + 1 cannot overflow.
+#define FRAME_SLOT_LIMIT (1LL << 53)
 // A frame's `t`: the 1/fps slot of its host time on the scene's clock (seconds since the last
 // scene's epoch_unix_ms; 0 before any scene), as the phone streamer stamps its screen frames.
 double frame_slot_t(double unix_ms, double epoch_unix_ms, int fps);

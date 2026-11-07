@@ -56,6 +56,8 @@ void Bridge::on_rdp(double ms) {
   connects_++;
   connected_ = true;
   last_error_.clear();
+  // a desktop settles on this connection's frames only
+  detector_.reset_settle();
   if (times_.rdp < 0) times_.rdp = ms;
   fprintf(stderr, "windows-bridge: connected to %s (connection %llu)\n", opt_.rdp.socket.c_str(), (unsigned long long)connects_);
 }
@@ -65,6 +67,8 @@ void Bridge::on_down(const std::string& why, bool fatal, bool was_connected) {
   connected_ = false;
   last_error_ = why;
   if (fatal) fatal_ = why;
+  // the surface stands still while disconnected because nothing arrives: that is no settle
+  detector_.reset_settle();
   // every attempt before the sandbox listens fails: log the first of a run and the changes
   static std::string logged;
   if (fatal || was_connected || why != logged) fprintf(stderr, "windows-bridge: %s\n", why.c_str());

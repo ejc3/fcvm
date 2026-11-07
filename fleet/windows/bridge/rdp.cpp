@@ -119,11 +119,18 @@ struct RdpLink::Hooks {
       gdi->primary->hdc->hwnd->invalid->null = TRUE;
     return TRUE;
   }
+  // gdi_resize frees and replaces the surface under the update lock, from whichever thread
+  // handles the resize (DesktopResize, or rdpgfx ResetGraphics through it). The buffer, its
+  // size and its stride are read, and copied by on_frame, under that lock. It is a recursive
+  // critical section, so the hold EndPaint already has nests. The sink takes only its own
+  // mutexes under it, and nothing that holds those takes this lock.
   static void emit(rdpContext* c, bool gfx) {
+    rdp_update_lock(c->update);
     rdpGdi* gdi = c->gdi;
-    if (!gdi || !gdi->primary_buffer) return;
-    link_of(c)->sink_->on_frame(gdi->primary_buffer, (int)gdi->width, (int)gdi->height, (size_t)gdi->stride, unix_ms_now(),
-                                gfx);
+    if (gdi && gdi->primary_buffer)
+      link_of(c)->sink_->on_frame(gdi->primary_buffer, (int)gdi->width, (int)gdi->height, (size_t)gdi->stride,
+                                  unix_ms_now(), gfx);
+    rdp_update_unlock(c->update);
   }
   static BOOL end_paint(rdpContext* c) {
     rdpGdi* gdi = c->gdi;
@@ -136,9 +143,19 @@ struct RdpLink::Hooks {
     emit(c, false);
     return TRUE;
   }
+  // The server resizes the desktop (a DesktopResize, or an rdpgfx ResetGraphics, which calls
+  // this and ignores what it returns): a size outside the bounds is never allocated, and the
+  // connection ends as failed.
   static BOOL desktop_resize(rdpContext* c) {
-    return gdi_resize(c->gdi, freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopWidth),
-                      freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopHeight));
+    UINT32 w = freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopWidth);
+    UINT32 h = freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopHeight);
+    std::string v = desktop_size_violation(w, h);
+    if (!v.empty()) {
+      link_of(c)->set_fatal(v);
+      freerdp_abort_connect_context(c);
+      return FALSE;
+    }
+    return gdi_resize(c->gdi, w, h);
   }
   static UINT gfx_end_frame(RdpgfxClientContext* gfx, const RDPGFX_END_FRAME_PDU* end) {
     rdpGdi* gdi = (rdpGdi*)gfx->custom;
@@ -178,9 +195,11 @@ struct RdpLink::Hooks {
     }
     freerdp_client_OnChannelDisconnectedEventHandler(ctx, e);
   }
+  // FreeRDP names the host from its settings, which a redirection or a gateway would change:
+  // the link connects to RDP_SOCKET whatever it names.
   static int tcp_connect(rdpContext* c, rdpSettings* s, const char* host, int port, DWORD timeout) {
     RdpLink* l = link_of(c);
-    int fd = ((pTCPConnect)l->tcp_connect_)(c, s, host, port, timeout);
+    int fd = ((pTCPConnect)l->tcp_connect_)(c, s, l->cfg_.socket.c_str(), port, timeout);
     if (fd >= 0) l->sink_->on_tcp(unix_ms_now());
     return fd;
   }
@@ -213,7 +232,7 @@ struct RdpLink::Hooks {
     }
     std::string v = settings_violation(settings_view(instance->context->settings));
     if (!v.empty()) {
-      link_of(instance->context)->fatal_ = "the connection's settings are refused: " + v;
+      link_of(instance->context)->set_fatal("the connection's settings are refused: " + v);
       return FALSE;
     }
     return freerdp_settings_set_bool(s, FreeRDP_SupportDynamicChannels, TRUE) &&
@@ -221,6 +240,13 @@ struct RdpLink::Hooks {
   }
   static BOOL post_connect(freerdp* instance) {
     rdpContext* c = instance->context;
+    // gdi_init allocates the surface at the negotiated size
+    std::string v = desktop_size_violation(freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopWidth),
+                                           freerdp_settings_get_uint32(c->settings, FreeRDP_DesktopHeight));
+    if (!v.empty()) {
+      link_of(c)->set_fatal(v);
+      return FALSE;
+    }
     if (!gdi_init(instance, PIXEL_FORMAT_BGRX32)) return FALSE;
     c->update->BeginPaint = begin_paint;
     c->update->EndPaint = end_paint;
@@ -249,11 +275,19 @@ struct RdpLink::Hooks {
                                           const char*, const char*, const char*, DWORD) {
     return 2;
   }
+  // A server redirection (MS-RDPBCGR 2.2.13) would send the link to another host with other
+  // credentials. FreeRDP has torn the connection down by the time it asks; refusing ends the
+  // attempt, and the link with it.
+  static BOOL refuse_redirect(freerdp* instance) {
+    link_of(instance->context)->set_fatal("the server asked to redirect the connection, which the bridge refuses");
+    return FALSE;
+  }
   static BOOL client_new(freerdp* instance, rdpContext*) {
     instance->PreConnect = pre_connect;
     instance->PostConnect = post_connect;
     instance->PostDisconnect = post_disconnect;
     instance->LoadChannels = load_channels;
+    instance->Redirect = refuse_redirect;
     instance->AuthenticateEx = authenticate;
     instance->VerifyCertificateEx = verify_certificate;
     instance->VerifyChangedCertificateEx = verify_changed_certificate;
@@ -296,10 +330,30 @@ bool configure(rdpSettings* s, const RdpConfig& cfg, const std::string& password
 }
 }  // namespace
 
+RdpLink::RdpLink(RdpConfig c, RdpSink* sink)
+    : cfg_(std::move(c)), sink_(sink), wake_(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {}
+
+RdpLink::~RdpLink() {
+  if (wake_) CloseHandle((HANDLE)wake_);
+}
+
+void RdpLink::set_fatal(const std::string& why) {
+  std::lock_guard<std::mutex> l(mu_);
+  if (fatal_.empty()) fatal_ = why;
+}
+
+std::string RdpLink::fatal_reason() {
+  std::lock_guard<std::mutex> l(mu_);
+  return fatal_;
+}
+
 std::string RdpLink::attempt(bool* reached, bool* fatal) {
   *reached = false;
   *fatal = false;
-  fatal_.clear();
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    fatal_.clear();
+  }
   gfx_end_frame_ = nullptr;
   gfx_surface_command_ = nullptr;
   std::string err;
@@ -340,8 +394,8 @@ std::string RdpLink::attempt(bool* reached, bool* fatal) {
   freerdp* instance = ctx->instance;
   if (!freerdp_connect(instance)) {
     UINT32 e = freerdp_get_last_error(ctx);
-    if (!fatal_.empty()) {
-      err = fatal_;
+    if (std::string f = fatal_reason(); !f.empty()) {
+      err = f;
       *fatal = true;
     } else {
       const char* s = freerdp_get_last_error_string(e);
@@ -383,6 +437,10 @@ std::string RdpLink::attempt(bool* reached, bool* fatal) {
     drain_keys(ctx);
     sink_->on_tick(unix_ms_now());
   }
+  if (std::string f = fatal_reason(); !f.empty()) {
+    err = f;
+    *fatal = true;
+  }
   connected_ = false;
   fail_keys("the connection ended");
   freerdp_disconnect(instance);
@@ -393,23 +451,26 @@ std::string RdpLink::attempt(bool* reached, bool* fatal) {
 
 void RdpLink::drain_keys(void* context) {
   rdpContext* ctx = (rdpContext*)context;
-  std::deque<KeyEvent> batch;
+  std::vector<KeyEvent> batch;
   {
     std::lock_guard<std::mutex> l(mu_);
-    batch.swap(keys_);
+    if (!keyq_.take(&batch)) return;
   }
-  for (const KeyEvent& k : batch) freerdp_input_send_keyboard_event_ex(ctx->input, k.down ? TRUE : FALSE, FALSE, k.scancode);
-  if (batch.empty()) return;
+  std::string err;
+  bool ok = send_key_batch(
+      batch,
+      [&](const KeyEvent& k) {
+        return freerdp_input_send_keyboard_event_ex(ctx->input, k.down ? TRUE : FALSE, FALSE, k.scancode) != FALSE;
+      },
+      &err);
   std::lock_guard<std::mutex> l(mu_);
-  sent_ += batch.size();
+  keyq_.done(ok, err);
   cv_.notify_all();
 }
 
-void RdpLink::fail_keys(const std::string&) {
+void RdpLink::fail_keys(const std::string& why) {
   std::lock_guard<std::mutex> l(mu_);
-  keys_.clear();
-  sent_ = queued_;
-  generation_++;
+  keyq_.fail(why);
   cv_.notify_all();
 }
 
@@ -419,18 +480,22 @@ bool RdpLink::send_keys(const std::vector<KeyEvent>& ev, std::string* err) {
     *err = "not connected to the sandbox";
     return false;
   }
-  uint64_t gen = generation_;
-  for (const KeyEvent& k : ev) keys_.push_back(k);
-  queued_ += ev.size();
-  uint64_t target = queued_;
+  uint64_t ticket = 0;
+  if (!keyq_.submit(ev, &ticket, err)) return false;
   if (wake_) SetEvent((HANDLE)wake_);
-  bool done = cv_.wait_for(l, std::chrono::seconds(5), [&] { return sent_ >= target || generation_ != gen; });
-  if (generation_ != gen) {
-    *err = "the connection ended before the keys were sent";
+  std::string why;
+  auto settled = [&] {
+    KeyQueue::Status st = keyq_.status(ticket, &why);
+    return st == KeyQueue::SENT || st == KeyQueue::FAILED;
+  };
+  if (!cv_.wait_for(l, std::chrono::seconds(5), settled)) {
+    // what the connection's thread has not taken is dropped here, never sent after the action failed
+    *err = keyq_.cancel(ticket) ? "the keys were not sent within 5 s and were dropped"
+                                : "the keys were not confirmed sent within 5 s";
     return false;
   }
-  if (!done) {
-    *err = "the keys were not sent within 5 s";
+  if (keyq_.status(ticket, &why) == KeyQueue::FAILED) {
+    *err = "the keys were not sent: " + why;
     return false;
   }
   return true;
@@ -447,7 +512,10 @@ void RdpLink::run() {
   // FreeRDP's warnings repeat on every attempt while the sandbox restores; WLOG_LEVEL (winpr's
   // own variable) still sets any level.
   if (!getenv("WLOG_LEVEL")) WLog_SetLogLevel(WLog_GetRoot(), WLOG_ERROR);
-  wake_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+  if (!wake_) {
+    sink_->on_down("CreateEvent failed", true, false);
+    return;
+  }
   Backoff backoff;
   while (!stop_) {
     bool reached = false, fatal = false;
@@ -467,7 +535,4 @@ void RdpLink::run() {
       l.lock();
     }
   }
-  std::lock_guard<std::mutex> l(mu_);
-  CloseHandle((HANDLE)wake_);
-  wake_ = nullptr;
 }

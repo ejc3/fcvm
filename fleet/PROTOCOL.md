@@ -2484,7 +2484,10 @@ before the channel transport loads, it checks its settings (`settings_violation`
 UDP, a gateway and FreeRDP's own reconnect are off, TLS and the graphics pipeline with H.264
 are on, no device is redirected, and the channels are only `rdpgfx`, `drdynvc` and `ainput`. A
 connection that fails the check is never made, and the bridge reports `failed` and stops
-connecting.
+connecting. It ends the connection and stops the same way when the server negotiates or resizes
+to a desktop outside 200..4096 x 200..2160 (checked before FreeRDP's GDI allocates the surface)
+and when the server redirects the connection; the socket connect goes to `RDP_SOCKET` whatever
+host FreeRDP's settings name.
 
 It connects at once and, when the connection cannot be made or drops, again after 100 ms,
 doubling to 2 s, for ever: it starts before the sandbox restores.
@@ -2496,15 +2499,19 @@ doubling to 2 s, for ever: it starts before the sandbox restores.
   `height`, `full_width` and `full_height` the same, `x0` and `y0` 0, no crop). `q` picks the
   quality as for the renderer. `admit` is checked as the renderer checks it.
 - `POST /scene`: needs the scene token when one is configured ("Access" under "Renderer").
-  The bridge reads `epoch_unix_ms` (required) and `admit_keys` (at most 4) as the phone
-  streamer does, and ignores the rest. `400` names a refused field.
+  The bridge reads `epoch_unix_ms` (required, an integer of at most 9e15 in magnitude, as the
+  renderer requires) and `admit_keys` (at most 4) as the phone streamer does, and ignores the
+  rest. `400` names a refused field.
 - `POST /budget`: accepted when well formed and ignored.
 - `POST /action` with `{"name": "<action>"}`: needs the scene token when one is configured,
   as `POST /scene` does. Runs one of the fixed input sequences below through FreeRDP's
   keyboard input and answers `200 {"ok":true,"action":..,"ms":..}` once the sequence has been
   sent. `400` for a name not in the table (the message lists the allowed names, and
   `actions` lists them as an array), `409` while another action runs, `503` with no
-  connection, `504` when a step that waits for the screen to change saw no change. Nothing a
+  connection or when a step's keys were not sent (a send failed, the connection ended, or they
+  were not sent within 5 s; keys not yet sent are then dropped, never sent later, and a new
+  step is refused while an earlier one is still being sent), `504` when a step that waits for
+  the screen to change saw no change. Nothing a
   caller sends reaches Windows: the name selects a sequence written in the source
   (`kActions`, `fleet/windows/bridge/logic.cpp`), other fields are ignored, and no free keys,
   text or clicks exist. An action never holds up frames.
@@ -2526,8 +2533,8 @@ doubling to 2 s, for ever: it starts before the sandbox restores.
 host; not a Windows measurement.)
 
 `state` is `connecting` (no connection), `connected` (connected, no desktop yet), `desktop` (the
-desktop has been seen) or `failed` (the settings check refused the connection; `error` says
-why). `connects` counts connections made and `attempts` attempts started. The times are on the
+desktop has been seen) or `failed` (the settings check, the desktop size or a redirection
+refused the connection; `error` says why). `connects` counts connections made and `attempts` attempts started. The times are on the
 host's clock, each the first since the process started: `start` the process, `connect_started`
 the start of the attempt that first reached the socket (the latest attempt before one did),
 `tcp` the socket connected (`rdp.sock` answers), `rdp` FreeRDP's post-connect (TLS, the
@@ -2546,7 +2553,8 @@ so a run shows whether Windows sent H.264.
 A frame is the desktop when its 160 x 90 downscale (each cell the mean of its area) is within
 an RMSE of 0.05 (channels on 0..1) of the reference picture `DESKTOP_REF` (binary PPM or PNG,
 any size, downscaled the same way). Without a reference (unset, missing or unreadable), the
-desktop is the first frame the surface then stays at for 2 s, where a change of at most 0.01
+desktop is the first frame the surface then stays at for 2 s on one connection (a disconnect
+or a reconnect starts the wait again), where a change of at most 0.01
 RMSE (the taskbar clock turning a minute) does not count and a picture of one flat colour
 (below 0.02 of luma spread) never counts; `desktop_by` is `settled`, and the bridge writes that
 frame's 160 x 90 thumbnail to `DESKTOP_REF_OUT` (binary PPM) when it is set. The gold flow makes

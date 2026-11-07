@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -41,7 +40,10 @@ class RdpSink {
 
 class RdpLink {
  public:
-  RdpLink(RdpConfig c, RdpSink* sink) : cfg_(std::move(c)), sink_(sink) {}
+  RdpLink(RdpConfig c, RdpSink* sink);
+  ~RdpLink();
+  RdpLink(const RdpLink&) = delete;
+  RdpLink& operator=(const RdpLink&) = delete;
   // Connects, serves the connection, and reconnects after 100 ms doubling to 2 s, until stop()
   // or a fatal error. Returns then, disconnected.
   void run();
@@ -50,8 +52,9 @@ class RdpLink {
   void stop();
   bool connected() const { return connected_.load(); }
   // Sends the events in order from the connection's thread and returns once they are sent;
-  // false when there is no connection or it ends first. Only Bridge::play calls it, with
-  // events from step_keys().
+  // false when there is no connection, another batch is pending, a send fails, the connection
+  // ends first, or 5 s pass (the batch is then dropped if the connection's thread has not
+  // taken it). Only Bridge::play calls it, with events from step_keys().
   bool send_keys(const std::vector<KeyEvent>& ev, std::string* err);
   // Whether this FreeRDP was built with H.264 for the graphics pipeline.
   static bool built_with_h264();
@@ -65,6 +68,10 @@ class RdpLink {
   std::string attempt(bool* reached, bool* fatal);
   void drain_keys(void* context);
   void fail_keys(const std::string& why);
+  // A refusal that retrying cannot help (the channel check, the desktop size, a redirection),
+  // from whichever FreeRDP thread finds it; attempt() ends the link with it.
+  void set_fatal(const std::string& why);
+  std::string fatal_reason();
 
   RdpConfig cfg_;
   RdpSink* sink_;
@@ -72,14 +79,14 @@ class RdpLink {
   std::atomic<bool> connected_{false};
   std::mutex mu_;
   std::condition_variable cv_;
-  void* wake_ = nullptr;  // winpr event: input queued or stop
-  // under mu_: queued key events; sent_ counts events sent, queued_ events ever queued
-  std::deque<KeyEvent> keys_;
-  uint64_t queued_ = 0, sent_ = 0;
-  uint64_t generation_ = 0;  // bumped when a connection ends: waiting senders give up
+  // winpr event: input queued or stop. Made in the constructor and closed in the destructor,
+  // so stop() and run() read it on any thread, in any order.
+  void* const wake_;
+  // under mu_
+  KeyQueue keyq_;
+  std::string fatal_;
   // per connection (its thread)
   void* gfx_end_frame_ = nullptr;   // the GDI's rdpgfx EndFrame, which the link wraps
   void* gfx_surface_command_ = nullptr;  // and its SurfaceCommand, to count codecs
   void* tcp_connect_ = nullptr;     // FreeRDP's own TCP connect, which the link wraps
-  std::string fatal_;               // set by the channel check
 };

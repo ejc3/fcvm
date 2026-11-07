@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -380,7 +381,7 @@ int main() {
       CHECK(count(*s, "freerdp_input_send_unicode") == 0 && count(*s, "freerdp_input_send_mouse") == 0 &&
                 count(*s, "send_extended_mouse") == 0 && count(*s, "freerdp_input_send_rel") == 0,
             "no unicode typing and no mouse");
-    CHECK(count(rdp, "keys_.push_back(") == 1 && count(function_body(rdp, "bool RdpLink::send_keys("), "keys_.push_back(") == 1,
+    CHECK(count(rdp, "keyq_.submit(") == 1 && count(function_body(rdp, "bool RdpLink::send_keys("), "keyq_.submit(ev,") == 1,
           "the queue is filled by send_keys only");
     std::string play = function_body(bridge, "int Bridge::play(");
     CHECK(count(bridge, "send_keys(") == 2 && count(play, "send_keys(") == 2, "send_keys is called from Bridge::play only");
@@ -469,8 +470,8 @@ int main() {
           "FreeRDP's settings-driven channel loader is never used");
     CHECK(count(load, "{RDPGFX_CHANNEL_NAME, AINPUT_CHANNEL_NAME}") == 1, "the dynamic channels are rdpgfx and ainput");
     std::string att = function_body(rdp, "std::string RdpLink::attempt(");
-    CHECK(count(att, "settings_violation(settings_view(ctx->settings))") == 1 && count(att, "*fatal = true;") == 2,
-          "and before connecting");
+    CHECK(count(att, "settings_violation(settings_view(ctx->settings))") == 1 && count(att, "*fatal = true;") == 3,
+          "and before connecting (the other two: a refusal found while connecting, or while connected)");
     CHECK(count(rdp, "instance->LoadChannels = load_channels;") == 1, "the link's channel loader is the one FreeRDP uses");
   }
 
@@ -557,6 +558,151 @@ int main() {
     CHECK(d.pct(0.5) == -1, "no samples");
     for (int i = 1; i <= 10; i++) d.add(i);
     CHECK(d.pct(0.5) == 6 && d.pct(0.9) == 9, "percentiles: %f %f", d.pct(0.5), d.pct(0.9));
+  }
+
+  // ---- review findings (PR #1732): each block fails without its fix
+  {  // 1: the surface is copied under the lock FreeRDP's gdi_resize takes before it frees it
+    std::string rdp = source_text("rdp.cpp");
+    std::string emit = function_body(rdp, "  static void emit(");
+    size_t lock = emit.find("rdp_update_lock(c->update);"), buf = emit.find("primary_buffer"),
+           frame = emit.find("on_frame("), unlock = emit.find("rdp_update_unlock(c->update);");
+    CHECK(lock != std::string::npos && buf != std::string::npos && frame != std::string::npos &&
+              unlock != std::string::npos && lock < buf && buf < frame && frame < unlock,
+          "emit reads the buffer, its size and stride and hands them to on_frame (which copies) under the update lock");
+    CHECK(count(rdp, "primary_buffer") == count(emit, "primary_buffer"), "and nothing else reads the buffer");
+  }
+  {  // 2: the desktop size is bounded before any GDI allocation
+    CHECK(desktop_size_violation(1280, 720) == "" && desktop_size_violation(4096, 2160) == "" &&
+              desktop_size_violation(200, 200) == "" && desktop_size_violation(1279, 719) == "",
+          "sizes within 200..4096 x 200..2160 pass");
+    const uint32_t bad[][2] = {{4097, 720}, {1280, 2161}, {0, 720}, {1280, 0}, {199, 720}, {65535, 65535}, {UINT32_MAX, 1}};
+    for (const auto& b : bad) CHECK(desktop_size_violation(b[0], b[1]) != "", "%u x %u is refused", b[0], b[1]);
+    CHECK(desktop_size_violation(8192, 8192) == "the server's desktop size 8192 x 8192 is outside 200..4096 x 200..2160",
+          "%s", desktop_size_violation(8192, 8192).c_str());
+    std::string rdp = source_text("rdp.cpp");
+    std::string pc = function_body(rdp, "  static BOOL post_connect("), dr = function_body(rdp, "  static BOOL desktop_resize(");
+    CHECK(pc.find("desktop_size_violation(") != std::string::npos && pc.find("desktop_size_violation(") < pc.find("gdi_init("),
+          "post_connect checks the negotiated size before gdi_init allocates");
+    CHECK(dr.find("desktop_size_violation(") != std::string::npos && dr.find("desktop_size_violation(") < dr.find("gdi_resize(") &&
+              count(dr, "freerdp_abort_connect_context(") == 1 && count(dr, "set_fatal(") == 1,
+          "a resize (DesktopResize, and rdpgfx ResetGraphics through it) is checked before gdi_resize and ends the "
+          "connection as failed");
+    std::string m = source_text("main.cpp");
+    CHECK(count(m, "o.rdp.width > RDP_MAX_WIDTH") == 1 && count(m, "o.rdp.height > RDP_MAX_HEIGHT") == 1,
+          "main.cpp holds RDP_WIDTH and RDP_HEIGHT to the same bounds");
+  }
+  {  // 3: no redirection, and the transport connects to RDP_SOCKET whatever host FreeRDP names
+    std::string rdp = source_text("rdp.cpp");
+    std::string redirect = function_body(rdp, "  static BOOL refuse_redirect(");
+    CHECK(count(rdp, "instance->Redirect = refuse_redirect;") == 1 && count(redirect, "return FALSE;") == 1 &&
+              count(redirect, "set_fatal(") == 1 && count(redirect, "return TRUE") == 0,
+          "a server redirection is refused, and the link stops (failed)");
+    std::string tcp = function_body(rdp, "  static int tcp_connect(");
+    CHECK(count(tcp, "l->cfg_.socket.c_str()") == 1 && tcp.find("(c, s, host,") == std::string::npos,
+          "the socket connect is always to the configured RDP_SOCKET");
+  }
+  {  // 4: one key batch at a time; a waiter that gives up drops what was not taken
+    KeyQueue q;
+    std::vector<KeyEvent> a = {{SC_LWIN, true}, {SC_LWIN, false}}, got;
+    uint64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
+    std::string err;
+    CHECK(q.submit(a, &t1, &err), "a batch is queued");
+    CHECK(!q.submit(a, &t2, &err) && err == "another key batch is still pending", "a second while one is queued: %s",
+          err.c_str());
+    CHECK(q.take(&got) && got == a && q.status(t1, &err) == KeyQueue::SENDING, "the sender takes it");
+    CHECK(!q.submit(a, &t2, &err), "or while it is being sent");
+    q.done(true, "");
+    CHECK(q.status(t1, &err) == KeyQueue::SENT, "sent");
+    CHECK(q.submit(a, &t2, &err) && t2 != t1, "a new batch once it is sent");
+    CHECK(q.cancel(t2) && q.status(t2, &err) == KeyQueue::FAILED, "a waiter that gives up drops its queued batch");
+    got.clear();
+    CHECK(!q.take(&got) && got.empty(), "and it is never sent");
+    CHECK(q.submit(a, &t3, &err) && q.take(&got), "the next batch is accepted once the dropped one is gone");
+    CHECK(!q.cancel(t3) && q.status(t3, &err) == KeyQueue::SENDING, "a batch being sent cannot be called back");
+    q.done(true, "");
+    CHECK(q.submit(a, &t4, &err), "queued");
+    q.fail("the connection ended");
+    CHECK(q.status(t4, &err) == KeyQueue::FAILED && err == "the connection ended" && !q.take(&got),
+          "a connection that ends drops the queued batch");
+    CHECK(q.submit(a, &t5, &err) && q.take(&got), "queued and taken");
+    q.done(false, "key event 1 of 2 could not be sent");
+    CHECK(q.status(t5, &err) == KeyQueue::FAILED && err == "key event 1 of 2 could not be sent", "a send that failed");
+    std::string rdp = source_text("rdp.cpp");
+    std::string sk = function_body(rdp, "bool RdpLink::send_keys(");
+    CHECK(count(sk, "keyq_.cancel(") == 1, "send_keys drops its batch when it gives up");
+  }
+  {  // 5: every send is checked; the first failure stops the batch and fails it
+    std::vector<KeyEvent> ev = {{SC_LCONTROL, true}, {SC_LSHIFT, true}, {SC_ESCAPE, true},
+                                {SC_ESCAPE, false}, {SC_LSHIFT, false}, {SC_LCONTROL, false}};
+    int calls = 0;
+    std::string err;
+    bool ok = send_key_batch(ev, [&](const KeyEvent&) { return ++calls != 3; }, &err);
+    CHECK(!ok && calls == 3 && err == "key event 3 of 6 could not be sent", "stops at the first failure: %d calls, %s", calls,
+          err.c_str());
+    calls = 0;
+    CHECK(send_key_batch(ev, [&](const KeyEvent&) { return ++calls > 0; }, &err) && calls == 6, "all sent");
+    std::string rdp = source_text("rdp.cpp");
+    std::string drain = function_body(rdp, "void RdpLink::drain_keys(");
+    CHECK(count(drain, "send_key_batch(") == 1 && count(drain, "keyq_.done(") == 1 &&
+              count(drain, "return freerdp_input_send_keyboard_event_ex(") == 1,
+          "drain_keys sends through send_key_batch with each call's result and reports it");
+  }
+  {  // 6: wake_ is made before any thread can use it and never reassigned
+    std::string h = source_text("rdp.h"), rdp = source_text("rdp.cpp");
+    CHECK(count(h, "void* const wake_;") == 1 && count(rdp, "wake_ =") == 0 && count(rdp, "wake_(CreateEvent(") == 1,
+          "the event is created in the constructor (stop() before run() is safe)");
+  }
+  {  // 7: a settle only counts on the connection it was seen on
+    DesktopDetector d{Thumb()};
+    d.frame(0, desktop_thumb());
+    d.tick(1000);
+    d.reset_settle();  // the connection drops
+    d.tick(3000);
+    CHECK(!d.found(), "time disconnected does not settle the desktop");
+    d.reset_settle();  // reconnected
+    d.frame(3000, desktop_thumb());
+    d.tick(4999);
+    CHECK(!d.found(), "a frame on the new connection starts a new 2 s");
+    d.tick(5000);
+    CHECK(d.found() && d.desktop_ms() == 3000, "and settles on it: %f", d.desktop_ms());
+    std::string b = source_text("bridge.cpp");
+    CHECK(count(function_body(b, "void Bridge::on_down("), "detector_.reset_settle();") == 1 &&
+              count(function_body(b, "void Bridge::on_rdp("), "detector_.reset_settle();") == 1,
+          "the bridge resets it when a connection ends and when one starts");
+  }
+  {  // 8: /health stays one JSON document whatever the number of streams
+    BridgeHealth h;
+    for (int i = 0; i < 3000; i++) h.streams.push_back({540, i % 3});
+    h.surface_h = 720;
+    h.error = std::string(1000, 'e');
+    h.last_error = std::string(1000, 'l');
+    h.state = STATE_FAILED;
+    bool parsed = false;
+    size_t n = 0;
+    try {
+      Json j = Json::parse(bridge_health_json(h));
+      parsed = true;
+      n = j.at("streams").arr.size();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "health: %s\n", e.what());
+    }
+    CHECK(parsed && n == 3000, "3000 streams: parsed %d, %zu listed", parsed, n);
+  }
+  {  // 9: the scene clock is bounded, and the slot conversion cannot overflow
+    BridgeScene s;
+    std::string err;
+    CHECK(!bridge_scene_parse("{\"epoch_unix_ms\":1e999}", &s, &err), "an infinite epoch is refused: %s", err.c_str());
+    for (const char* e : {"1e300", "-1e300", "9000000000000001", "-9000000000000001", "1.5"})
+      CHECK(!bridge_scene_parse(std::string("{\"epoch_unix_ms\":") + e + "}", &s, &err) &&
+                err == "epoch_unix_ms: an integer of at most 9e15 in magnitude expected",
+            "epoch %s is refused: %s", e, err.c_str());
+    CHECK(bridge_scene_parse("{\"epoch_unix_ms\":9000000000000000}", &s, &err) &&
+              bridge_scene_parse("{\"epoch_unix_ms\":1794079324214}", &s, &err) && s.epoch_unix_ms == 1794079324214.0,
+          "the renderer's range passes: %s", err.c_str());
+    CHECK(frame_slot(1.8e12, -1e300, 60) == FRAME_SLOT_LIMIT && frame_slot(1.8e12, 1e300, 60) == -FRAME_SLOT_LIMIT &&
+              frame_slot(NAN, 0, 30) == 0 && frame_slot(1.8e12, -INFINITY, 30) == FRAME_SLOT_LIMIT,
+          "out-of-range slots are clamped, not converted");
+    CHECK(frame_slot(2050, 1000, 30) == 31, "in range, unchanged");
   }
 
   // ---- reconnecting

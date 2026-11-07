@@ -73,9 +73,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "windows-bridge: RDP_SOCKET must be the absolute path of the sandbox's rdp.sock\n");
     return 2;
   }
-  if (o.rdp.width < 200 || o.rdp.width > 4096 || o.rdp.height < 200 || o.rdp.height > 2160 || (o.rdp.width & 1) ||
-      (o.rdp.height & 1)) {
-    fprintf(stderr, "windows-bridge: RDP_WIDTH 200..4096 and RDP_HEIGHT 200..2160, both even\n");
+  // the bounds rdp.cpp holds the server's size to (logic.h)
+  if (o.rdp.width < RDP_MIN_SIDE || o.rdp.width > RDP_MAX_WIDTH || o.rdp.height < RDP_MIN_SIDE ||
+      o.rdp.height > RDP_MAX_HEIGHT || (o.rdp.width & 1) || (o.rdp.height & 1)) {
+    fprintf(stderr, "windows-bridge: RDP_WIDTH %d..%d and RDP_HEIGHT %d..%d, both even\n", RDP_MIN_SIDE, RDP_MAX_WIDTH,
+            RDP_MIN_SIDE, RDP_MAX_HEIGHT);
     return 2;
   }
   if (o.fps < 1 || o.fps > 60) {
