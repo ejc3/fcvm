@@ -126,7 +126,18 @@ pub struct NfsMount {
     pub mount_path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// The server port the guest mounts at; None is NFS's own (2049). A restore
+    /// alternates it (`restore::nfs_remounts`).
+    #[serde(default)]
+    pub port: Option<u16>,
 }
+
+/// The second port a restored clone mounts its NFS shares at. The kernel reuses an NFS
+/// client for a server address and port it already holds, so a remount at the snapshot's
+/// own port would keep the snapshot's client and its identity; the restore alternates
+/// between 2049 and this one. Every clone namespace forwards both to the host's nfsd
+/// (`NFS_RESTORE_PORT` in src/network/veth.rs, which must match).
+pub const NFS_RESTORE_PORT: u16 = 20049;
 
 #[derive(Debug, Deserialize)]
 pub struct LatestMetadata {

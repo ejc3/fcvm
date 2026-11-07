@@ -1349,6 +1349,10 @@ mod tests {
             after_paren
         }
 
+        /// Functions that mount only in a restored clone, after the boot's check: the
+        /// restore reproduces mounts the check passed (restore.rs).
+        const RESTORE_ONLY: [&str; 1] = ["rebind_into_namespace"];
+        let mut restore_only = Vec::new();
         let mut mounting = Vec::new();
         // Each line that mounts with no record call after it in its function before the
         // next line that mounts, as "function at file:line".
@@ -1380,6 +1384,11 @@ mod tests {
                         let name = function.clone().unwrap_or_else(|| {
                             panic!("a mount outside any function in {}", path.display())
                         });
+                        // Restore-only: checked below, never reached from a boot.
+                        if RESTORE_ONLY.contains(&name.as_str()) {
+                            restore_only.push(name);
+                            continue;
+                        }
                         unrecorded.extend(awaiting.take());
                         // This FUSE mount blocks on the thread start_fuse_mount starts for
                         // as long as the volume is mounted, so mount_fuse_volumes records
@@ -1434,6 +1443,24 @@ mod tests {
             reached_by.map(|(function, _)| function),
             "the functions that mount changed: list each with the agent.rs call that reaches it"
         );
+
+        restore_only.sort();
+        restore_only.dedup();
+        assert_eq!(
+            restore_only, RESTORE_ONLY,
+            "a restore-only mount function is gone"
+        );
+        for function in RESTORE_ONLY {
+            let call = format!("mounts::{function}(");
+            assert!(
+                !without_tests(include_str!("agent.rs")).contains(&call),
+                "agent.rs calls the restore-only {function}"
+            );
+            assert!(
+                without_tests(include_str!("restore.rs")).contains(&call),
+                "restore.rs no longer calls {function}"
+            );
+        }
 
         let body = without_tests(include_str!("agent.rs"));
         let check = body

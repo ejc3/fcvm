@@ -4,6 +4,11 @@ use tracing::{debug, info, warn};
 
 use super::namespace::exec_in_namespace;
 
+/// The second NFS port a restored guest mounts its shares at, forwarded to the host's
+/// nfsd in every clone namespace. fc-agent's `types::NFS_RESTORE_PORT` must match
+/// (`nfs_restore_port_matches_fc_agent`).
+pub const NFS_RESTORE_PORT: u16 = 20049;
+
 /// In-Namespace NAT configuration for clone egress
 ///
 /// When clones are restored from a snapshot, they all have the same guest IP
@@ -793,6 +798,41 @@ pub async fn setup_in_namespace_nat(
     // route back over this clone's own /30. (Clones of one snapshot share
     // the guest IP; without the masquerade, replies would depend on the
     // shared guest-IP /32 host route, which only one clone can hold.)
+    //
+    // A restored guest remounts its NFS shares at the gateway's other NFS port
+    // (`NFS_RESTORE_PORT`), so that the remount gets an NFS client of its own; this
+    // namespace forwards that port to the host's nfsd too, ahead of the rule that keeps
+    // every other port as it is. A clone of a clone remounts back at 2049, so the
+    // snapshot's mounts reach the host at either port.
+    let nfs_restore_target = format!("{host_ip}:2049");
+    let nfs_restore_port = NFS_RESTORE_PORT.to_string();
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "iptables",
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-s",
+            &config.guest_ip,
+            "-d",
+            &config.gateway_ip,
+            "-p",
+            "tcp",
+            "--dport",
+            &nfs_restore_port,
+            "-j",
+            "DNAT",
+            "--to-destination",
+            &nfs_restore_target,
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to add the NFS restore port DNAT rule in namespace: {stderr}");
+    }
     for proto in ["tcp", "udp"] {
         let output = exec_in_namespace(
             ns_name,
@@ -1210,6 +1250,36 @@ mod parse_tests {
 #[cfg(feature = "privileged-tests")]
 mod tests {
     use super::*;
+
+    /// fc-agent remounts at the port this file forwards; the two must agree.
+    #[test]
+    fn nfs_restore_port_matches_fc_agent() {
+        let agent = include_str!("../../fc-agent/src/types.rs");
+        assert!(
+            agent.contains(&format!(
+                "pub const NFS_RESTORE_PORT: u16 = {NFS_RESTORE_PORT};"
+            )),
+            "fc-agent/src/types.rs NFS_RESTORE_PORT differs from src/network/veth.rs"
+        );
+    }
+
+    /// #1009: the clone namespace forwards the NFS restore port to the host's nfsd, and
+    /// does so ahead of the rule that keeps every other gateway port as it is.
+    #[test]
+    fn a_clone_namespace_forwards_the_nfs_restore_port_before_the_other_ports() {
+        let source = include_str!("veth.rs");
+        let body = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        let restore = body
+            .find("&nfs_restore_target,")
+            .expect("no DNAT rule for the NFS restore port");
+        let general = body
+            .find("failed to add {} gateway DNAT rule in namespace")
+            .expect("no gateway DNAT rule");
+        assert!(
+            restore < general,
+            "the NFS restore port rule must come first"
+        );
+    }
     use crate::network::namespace::{
         create_namespace, delete_namespace, exec_in_namespace, NamespaceCreation,
     };
