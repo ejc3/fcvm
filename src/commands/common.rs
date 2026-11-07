@@ -5709,8 +5709,10 @@ pub async fn create_snapshot_core(
     // The caller provides parent_snapshot_dir from VmState.config.snapshot_name,
     // which tracks the last snapshot created from (or restored into) this VM.
     // This is always the correct diff base.
+    // EXPERIMENT: FCVM_EXP_FORCE_FULL writes every snapshot as a Full one into a plain dir
+    let force_full = std::env::var_os("FCVM_EXP_FORCE_FULL").is_some();
     let (has_base, base_memory_source, diff_parent_name) =
-        if let Some(parent_dir) = parent_snapshot_dir {
+        if let Some(parent_dir) = parent_snapshot_dir.filter(|_| !force_full) {
             let parent_memory = parent_dir.join("memory.bin");
             if parent_memory.exists() {
                 let parent_name = parent_dir
@@ -5799,9 +5801,12 @@ pub async fn create_snapshot_core(
         _ => false,
     };
     if !staged {
-        crate::storage::disk::create_dir_for_reflinks(&temp_snapshot_dir, parent_few_extents)
-            .await
-            .context("creating temp snapshot directory")?;
+        crate::storage::disk::create_dir_for_reflinks(
+            &temp_snapshot_dir,
+            parent_few_extents || force_full,
+        )
+        .await
+        .context("creating temp snapshot directory")?;
     }
 
     // A diff snapshot is written in place when its memory file shares the parent's extents:
