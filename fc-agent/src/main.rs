@@ -13,6 +13,7 @@ mod netlink;
 mod network;
 mod nftables;
 mod output;
+mod payload_freeze;
 mod proxy;
 mod restore;
 mod retired_address;
@@ -75,14 +76,24 @@ async fn main() {
     let one_shot = std::env::args().nth(1);
     let one_shot_result = match one_shot.as_deref() {
         Some("--prepare-snapshot-network") => {
-            Some(snapshot_network::prepare_snapshot_network().await)
+            // The container is frozen first, so it opens no socket and faults no page
+            // while the boundary closes, and a restored clone starts with it frozen
+            // (payload_freeze). A failed prepare thaws it again: the host resumes the
+            // source on its own when the prepare fails.
+            payload_freeze::freeze();
+            let prepared = snapshot_network::prepare_snapshot_network().await;
+            if prepared.is_err() {
+                payload_freeze::thaw();
+            }
+            Some(prepared)
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
-            Some(
+            let resumed =
                 snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
-                    .await,
-            )
+                    .await;
+            payload_freeze::thaw();
+            Some(resumed)
         }
         _ => None,
     };
@@ -138,6 +149,10 @@ async fn main() {
 
     eprintln!("[fc-agent] starting");
 
+    // Thaws a snapshot boundary's container freeze whose deadline passed with no thaw: a
+    // resume that never reached the guest, an fcvm that died mid-snapshot (payload_freeze).
+    payload_freeze::spawn_watchdog();
+
     // Arm guest failpoints from the kernel cmdline: fcvm forwards the host env
     // FCVM_GUEST_FAILPOINT as `fcvm_failpoint=<spec>` (the fuse_trace_rate
     // pattern) because fc-agent cannot read host env. Guest specs take sleep and
@@ -189,6 +204,50 @@ fn fatal_error_line(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The container is frozen before the boundary's prepare and thawed when the prepare
+    /// fails and when the source resumes; a restored clone thaws it before publication
+    /// (payload_freeze). A freeze with no thaw on one of those paths would leave the
+    /// container stopped, so each is pinned.
+    #[test]
+    fn the_container_is_frozen_across_the_boundary_and_thawed_on_every_way_out() {
+        let main = include_str!("main.rs");
+        let main = &main[..main.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let squeezed: String = main.split_whitespace().collect();
+        let prepare = squeezed
+            .find("Some(\"--prepare-snapshot-network\")=>{")
+            .expect("no prepare one-shot");
+        let freeze = squeezed[prepare..]
+            .contains("payload_freeze::freeze();letprepared=snapshot_network::prepare_snapshot_network().await;ifprepared.is_err(){payload_freeze::thaw();}");
+        assert!(
+            freeze,
+            "the prepare does not freeze first and thaw on failure"
+        );
+        assert!(
+            squeezed.contains(".await;payload_freeze::thaw();Some(resumed)"),
+            "the source resume does not thaw"
+        );
+
+        let restore: String = crate::restore::handle_clone_restore_source()
+            .split_whitespace()
+            .collect();
+        let thaw = restore
+            .find("crate::payload_freeze::thaw();")
+            .expect("a clone never thaws");
+        let publish = restore
+            .find(".publish(restore_hook,")
+            .expect("no publication");
+        assert!(
+            thaw < publish,
+            "a clone thaws after publication, so its hook runs frozen"
+        );
+        // The long-running agent runs the deadline's watchdog; the one-shots do not.
+        let watchdog = squeezed
+            .find("payload_freeze::spawn_watchdog();")
+            .expect("the agent starts no freeze watchdog");
+        let agent = squeezed.find("agent::run()").expect("no agent run");
+        assert!(watchdog < agent && prepare < watchdog);
+    }
+
     use super::fatal_error_line;
     use anyhow::Context;
 
