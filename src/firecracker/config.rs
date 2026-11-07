@@ -230,6 +230,12 @@ pub struct FirecrackerConfig {
     /// are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub no_writeback_cache: bool,
+    /// The VMM that boots and snapshots the VM. A memory snapshot is in its VMM's own
+    /// format, so a Cloud Hypervisor run must never restore a Firecracker snapshot or the
+    /// reverse (#806). Firecracker, the default, is skip-serialized so existing keys are
+    /// unchanged.
+    #[serde(skip_serializing_if = "crate::hypervisor::Backend::is_firecracker")]
+    pub hypervisor: crate::hypervisor::Backend,
 }
 
 impl Default for FirecrackerConfig {
@@ -274,6 +280,7 @@ impl Default for FirecrackerConfig {
             fuse_trace_rate: None,
             fuse_max_write: None,
             no_writeback_cache: false,
+            hypervisor: crate::hypervisor::Backend::Firecracker,
         }
     }
 }
@@ -760,6 +767,20 @@ mod tests {
     #[test]
     fn test_snapshot_key_golden() {
         assert_eq!(test_config().snapshot_key(), "4278f265ad63");
+    }
+
+    /// A memory snapshot is in its VMM's own format, so a Cloud Hypervisor run and a
+    /// Firecracker run of the same command get different keys. Firecracker's key is the
+    /// one it had before the field (the golden key above).
+    #[test]
+    fn the_snapshot_key_names_the_hypervisor_when_it_is_not_firecracker() {
+        let firecracker = test_config();
+        let mut cloud_hypervisor = test_config();
+        cloud_hypervisor.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        assert_ne!(firecracker.snapshot_key(), cloud_hypervisor.snapshot_key());
+        assert!(!serde_json::to_string(&firecracker)
+            .unwrap()
+            .contains("hypervisor"));
     }
 
     /// The key hashes this JSON. A config with no balloon has no `balloon` member,

@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use super::podman::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
-    CreateSnapshotParams, SnapshotOutcome,
+    CreateSnapshotParams, SnapshotOutcome, SnapshotVmm,
 };
 use crate::cli::args::RunArgs;
 use crate::cli::{
@@ -4470,17 +4470,12 @@ async fn cmd_snapshot_run_inner(
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
                         let startup_key = startup_snapshot_key(base_key, args.balloon, args.host_ipv6);
 
-                        // Skip if startup snapshot already exists. The startup-snapshot cache
-                        // path is Firecracker-specific (diff snapshots via create_snapshot_core)
-                        // and only runs for the podman-cache restore (FC); a Cloud Hypervisor
-                        // clone forces no_snapshot, so the downcast never fails for it in
-                        // practice — and if a non-FC backend ever reaches here, skip gracefully.
+                        // Skip if startup snapshot already exists. Both backends take one
+                        // (`create_podman_snapshot`): a Cloud Hypervisor clone saves a full
+                        // snapshot, a Firecracker one a diff on the snapshot it came from.
                         if check_podman_snapshot(&startup_key).await.is_some() {
                             info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
-                        } else if let Some(fc_backend) = vm_manager
-                            .as_any()
-                            .downcast_ref::<crate::hypervisor::firecracker::FirecrackerBackend>()
-                        {
+                        } else {
                             info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
                             // Use select! so SIGTERM can abort startup snapshot immediately.
@@ -4490,7 +4485,7 @@ async fn cmd_snapshot_run_inner(
                             // the per-VM snapshot lock (re-read from the state file), so a
                             // concurrent `fcvm snapshot create` cannot leave us with a stale base.
                             let snap = CreateSnapshotParams::cache_entry(
-                                fc_backend,
+                                SnapshotVmm::of(vm_manager.as_ref())?,
                                 &startup_key,
                                 BalloonRequirement::StartedAt(args.balloon),
                                 &vm_state,
