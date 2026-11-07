@@ -446,7 +446,7 @@ pub async fn spawn_namespace_holder(
             });
         }
 
-        let child = cmd.spawn().with_context(|| {
+        let mut child = cmd.spawn().with_context(|| {
             format!(
                 "spawning namespace holder (attempt {}): {:?}",
                 attempt, holder_cmd
@@ -454,6 +454,12 @@ pub async fn spawn_namespace_holder(
         })?;
 
         let holder_pid = child.id().context("getting holder process PID")?;
+        // Its stderr from the first instant: a holder that dies later is
+        // reported with what it printed (#852).
+        crate::companion::register(
+            &mut child,
+            |line| tracing::warn!(target: "fcvm::holder", "{}", line),
+        );
         if attempt > 1 {
             info!(holder_pid, attempt, "namespace holder started (retry)");
         } else {
@@ -464,6 +470,7 @@ pub async fn spawn_namespace_holder(
         // Must happen before wait_for_namespace_ready which checks uid_map.
         if let Err(e) = setup_namespace_mappings(holder_pid).await {
             warn!(holder_pid, error = %e, "failed to set up namespace mappings");
+            crate::companion::forget(holder_pid);
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(holder_pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
@@ -484,6 +491,7 @@ pub async fn spawn_namespace_holder(
                 return Ok((child, holder_pid));
             }
             crate::utils::NamespaceReadyResult::HolderDied => {
+                crate::companion::forget(holder_pid);
                 if std::time::Instant::now() < deadline {
                     warn!(
                         holder_pid,
@@ -2386,11 +2394,15 @@ async fn cleanup_vm_inner(
     let vmm_reaped = vm_manager.reap();
     let holder_reaped = async {
         if let Some(ref mut holder) = holder_child {
+            let pid = holder.id();
             // Reap the zombie left by the SIGKILL above.
             holder
                 .wait()
                 .await
                 .context("waiting for namespace holder process")?;
+            if let Some(pid) = pid {
+                crate::companion::forget(pid);
+            }
         }
         Ok::<(), anyhow::Error>(())
     };

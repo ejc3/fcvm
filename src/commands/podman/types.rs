@@ -106,7 +106,7 @@ pub struct VmContext {
     /// teardown stops and joins it before copying the file out.
     pub container_log: Option<super::listeners::ContainerLogWriter>,
     /// Egress proxy task (rootless mode only); aborted during cleanup.
-    pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    pub egress_proxy_handle: Option<tokio::task::JoinHandle<Option<String>>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
     /// What this process knows the guest to be (see [`CacheVerdict`]). Written
     /// by the run loop BEFORE it resolves any cache oneshot; read by the
