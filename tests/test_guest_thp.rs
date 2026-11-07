@@ -102,10 +102,10 @@ async fn test_guest_thp_is_applied_at_boot_and_inherited_or_overridden_by_clones
 
 /// The mode is not in the snapshot cache key, so a run that gives none and restores
 /// the snapshot of one that gave `never` must not inherit it: it runs in the guest
-/// kernel's own mode, `always` in the default kernel profile
-/// (`CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y`), as its cold boot would. Without a
+/// kernel's own mode ([`KERNEL_DEFAULT_THP`]), as its cold boot would. Without a
 /// health-check URL the first run takes only the pre-start snapshot, which the second
-/// restores.
+/// restores. The test is about that snapshot, so both runs opt back in to snapshots,
+/// which the SnapshotDisabled CI lanes switch off with FCVM_NO_SNAPSHOT.
 #[tokio::test]
 async fn test_a_cache_hit_without_guest_thp_runs_in_the_kernel_mode() -> Result<()> {
     let nanos = std::time::SystemTime::now()
@@ -115,24 +115,25 @@ async fn test_a_cache_hit_without_guest_thp_runs_in_the_kernel_mode() -> Result<
     let cmd = format!("echo guest-thp-{nanos}; exec sleep 3600");
     let (miss_name, hit_name, _, _) = common::unique_names("guest-thp-hit");
 
-    let (mut miss, miss_pid, miss_log) = common::spawn_fcvm_with_log_path(
-        &[
-            "podman",
-            "run",
-            "--name",
-            &miss_name,
-            "--network",
-            "rootless",
-            "--guest-thp",
-            "never",
-            common::TEST_IMAGE,
-            "sh",
-            "-c",
-            &cmd,
-        ],
-        &miss_name,
-    )
-    .await?;
+    let (mut miss, miss_pid, miss_log) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &miss_name,
+                "--network",
+                "rootless",
+                "--guest-thp",
+                "never",
+                common::TEST_IMAGE,
+                "sh",
+                "-c",
+                &cmd,
+            ],
+            &[],
+        )
+        .await?;
     common::poll_health_by_pid(miss_pid, 180).await?;
     assert_eq!(guest_thp(miss_pid).await?, "never");
     wait_for_log(
@@ -144,7 +145,7 @@ async fn test_a_cache_hit_without_guest_thp_runs_in_the_kernel_mode() -> Result<
     common::kill_process(miss_pid).await;
     let _ = miss.wait().await;
 
-    let (mut hit, hit_pid, hit_log) = common::spawn_fcvm_with_log_path(
+    let (mut hit, hit_pid, hit_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -157,7 +158,7 @@ async fn test_a_cache_hit_without_guest_thp_runs_in_the_kernel_mode() -> Result<
             "-c",
             &cmd,
         ],
-        &hit_name,
+        &[],
     )
     .await?;
     common::poll_health_by_pid(hit_pid, 180).await?;
