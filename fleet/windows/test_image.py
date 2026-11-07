@@ -132,6 +132,11 @@ class AgentAddresses(unittest.TestCase):
         self.assertIn("ConnectAsync('10.0.2.1', 4600)", agent)
         self.assertIn('"ack $gen $([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())`n"', agent)
 
+    def test_the_agent_retries_the_network_until_the_neighbour_is_pinned(self):
+        agent = read(HERE, "fcvm-agent.ps1")
+        self.assertIn("do { Net; Start-Sleep -Seconds 1 } until (Get-NetNeighbor -IPAddress 10.0.2.1 | Where-Object State -eq 'Permanent')", agent)
+        self.assertNotRegex(agent, r"(?m)^Net$", "a single Net at start gives up when the NIC is not up yet")
+
     def test_the_agent_parses_only_a_whole_line_with_a_plausible_time(self):
         agent = read(HERE, "fcvm-agent.ps1")
         self.assertIn("$r.ReadLine()", agent)

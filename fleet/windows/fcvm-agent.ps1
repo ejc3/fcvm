@@ -23,7 +23,9 @@ function Net {
     New-NetNeighbor -InterfaceIndex $i -IPAddress 10.0.2.1 -LinkLayerAddress 02-fc-00-00-02-01 -State Permanent | Out-Null
   }
 }
-Net
+# The task starts at boot, possibly before the NIC is up: retry until the pinned neighbour
+# entry exists (it is set last, after the address).
+do { Net; Start-Sleep -Seconds 1 } until (Get-NetNeighbor -IPAddress 10.0.2.1 | Where-Object State -eq 'Permanent')
 $gen = $null
 $ascii = [Text.Encoding]::ASCII
 while ($true) {
