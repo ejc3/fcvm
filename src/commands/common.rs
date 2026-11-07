@@ -4680,14 +4680,33 @@ async fn reflink_disks_to_snapshot(
     disk_path: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     temp_snapshot_dir: &Path,
+    commit_free: bool,
 ) -> Result<()> {
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
+    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
+    // `commit_free` (--memory-dir): disks with few extents are reflinked into an ordinary
+    // directory, which commits no transaction, and a clone of the snapshot reflinks them
+    // again (REFLINK_MAX_EXTENTS) rather than snapshotting a subvolume.
+    let reflink_into_dir = commit_free && {
+        let mut files = vec![disk_path.to_path_buf()];
+        files.extend(
+            snapshot_config
+                .metadata
+                .extra_disks
+                .iter()
+                .map(|d| runtime_disks.join(&d.filename)),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::storage::disk::files_are_cheaper_to_reflink(&files)
+        })
+        .await
+        .context("extent count task panicked")?
+    };
     // A VM whose disk directory is a subvolume (a restored clone's is a snapshot of its snapshot's
     // disk/) has it snapshotted whole: one transaction commit, while the VM is paused, where a
     // reflink of the root disk costs one reference per extent.
-    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
     if let (Some(src), Some(root_name)) = (disk_path.parent(), disk_path.file_name()) {
-        if src == runtime_disks {
+        if src == runtime_disks && !reflink_into_dir {
             let keep: Vec<String> = snapshot_config
                 .metadata
                 .extra_disks
@@ -4704,9 +4723,15 @@ async fn reflink_disks_to_snapshot(
             }
         }
     }
-    crate::storage::disk::create_dir_or_subvolume(&disk_dir)
-        .await
-        .context("creating the snapshot's disk directory")?;
+    if reflink_into_dir {
+        tokio::fs::create_dir_all(&disk_dir)
+            .await
+            .context("creating the snapshot's disk directory")?;
+    } else {
+        crate::storage::disk::create_dir_or_subvolume(&disk_dir)
+            .await
+            .context("creating the snapshot's disk directory")?;
+    }
     reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
     for extra_disk in &snapshot_config.metadata.extra_disks {
         let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
@@ -5832,6 +5857,7 @@ impl SnapshotBoundaryTimes {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
@@ -5840,6 +5866,7 @@ pub async fn create_snapshot_core(
     parent_snapshot_dir: Option<&Path>,
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
+    memory_dir: Option<&Path>,
 ) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -5901,15 +5928,16 @@ pub async fn create_snapshot_core(
     // Check available disk space before attempting snapshot.
     // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
     {
+        // A memory file in --memory-dir takes its space there (a tmpfs's size limit).
+        let space_dir = memory_dir.unwrap_or(snapshot_dir);
         let required_bytes = snapshot_space_required(snapshot_config.metadata.memory_mib, has_base);
-        if let Some(available_bytes) = snapshot_space_available(snapshot_dir, required_bytes).await
-        {
+        if let Some(available_bytes) = snapshot_space_available(space_dir, required_bytes).await {
             if available_bytes < required_bytes {
                 return Err(SnapshotSpaceShortfall {
                     kind: if has_base { "diff" } else { "full" },
                     required_bytes,
                     available_bytes,
-                    path: snapshot_dir.to_path_buf(),
+                    path: space_dir.to_path_buf(),
                 }
                 .into());
             }
@@ -5944,10 +5972,19 @@ pub async fn create_snapshot_core(
         }
         _ => false,
     };
+    // A snapshot whose memory is in --memory-dir is a full one, and nothing is staged into
+    // its directory later, so an ordinary directory serves: a subvolume would only add the
+    // transaction commit a file fsynced in a new subvolume forces.
     if !staged {
-        crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
-            .await
-            .context("creating temp snapshot directory")?;
+        if memory_dir.is_some() {
+            tokio::fs::create_dir_all(&temp_snapshot_dir)
+                .await
+                .context("creating temp snapshot directory")?;
+        } else {
+            crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+                .await
+                .context("creating temp snapshot directory")?;
+        }
     }
 
     // A diff snapshot is written in place when its memory file shares the parent's extents:
@@ -5999,7 +6036,15 @@ pub async fn create_snapshot_core(
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
     if !has_base {
-        if let Err(e) = create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name) {
+        let created = match memory_dir {
+            Some(dir) => crate::storage::disk::create_linked_memory_file(dir, &temp_memory_path)
+                .map(|target| {
+                    info!(snapshot = %snapshot_config.name, memory_file = %target.display(),
+                        "writing the memory file outside the snapshot directory");
+                }),
+            None => create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name),
+        };
+        if let Err(e) = created {
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e);
         }
@@ -6229,9 +6274,14 @@ pub async fn create_snapshot_core(
     boundary.save_ms = boundary.lap(boundary_started);
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
-            .await
-            .context("copying disk during snapshot")
+        reflink_disks_to_snapshot(
+            disk_path,
+            &snapshot_config,
+            &temp_snapshot_dir,
+            memory_dir.is_some(),
+        )
+        .await
+        .context("copying disk during snapshot")
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
@@ -6704,7 +6754,7 @@ pub async fn create_snapshot_ch(
     // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (CH VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir, false)
             .await
             .context("copying disk during Cloud Hypervisor snapshot")
     } else {

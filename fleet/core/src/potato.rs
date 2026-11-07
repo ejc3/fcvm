@@ -1219,6 +1219,34 @@ mod tests {
         (g, cfg, proofs)
     }
 
+    /// A player in the ring that cannot wake (its sleep's memory file is gone: the host
+    /// rebooted, or the memory directory was cleared) drops the ball at once, naming the wake,
+    /// and the next round is scheduled; nothing waits for a catch that cannot come.
+    #[test]
+    fn a_player_that_cannot_wake_drops_the_ball_and_the_next_round_is_scheduled() {
+        let (mut g, cfg, _) = game(3);
+        let r = g.round.clone().expect("a round");
+        let failed = r.ring[1];
+        g.event(
+            "h",
+            &PotatoEvent {
+                at: 1200,
+                player: failed,
+                kind: PotatoKind::Failed {
+                    stage: "wake".into(),
+                    error: "the memory file of snapshot potato-1 is gone".into(),
+                },
+            },
+            1200,
+            &cfg,
+        );
+        let d = g.last_drop.as_ref().expect("a drop");
+        assert_eq!((d.reason.as_str(), d.player), ("wake_failed", Some(failed)));
+        assert!(g.round.is_none(), "the round ended");
+        assert_eq!(g.next_round_at, Some(1200 + cfg.restart_after_ms));
+        assert_eq!(g.players[&failed].phase, "failed");
+    }
+
     /// Player `p`'s catch of `seq` in `round`, stepped from its proof (or a wrong colour).
     fn catch(
         proofs: &mut [PotatoProof],
