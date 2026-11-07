@@ -1170,7 +1170,7 @@ python3 "$BENCH/serve_guardian.py" \
         # a supervisor killed after it armed completion leaves it to drain the
         # replay process set, restore dnsmasq and publish completion, so the
         # guardian releases the lease only after both (#895).
-        exec python3 "${supervisor%/*}/cleanup_owner.py" \
+        exec python3 -B "${supervisor%/*}/cleanup_owner.py" \
             --completion-path "$completion_path" \
             --completion-token "$completion_token" \
             --finalizer "$finalizer" --finalizer-timeout 60 -- \
