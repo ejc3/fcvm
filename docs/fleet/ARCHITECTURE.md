@@ -1875,6 +1875,20 @@ still on subvolumes, four wakes and four sleeps at once (`potatobench.py burst`)
 disk step took 17 ms p50 and 192 ms p99 as a reflink against 193 ms and 1.8 s as a subvolume
 snapshot, and fcvm now reflinks a clone's disk of at most 4096 extents.
 
+A soak of the coordinator and one host shaped like staging (96 players, two phones, the
+ladder from 2 to 96, 2026-11-07) put a number on the host's side. Sleeps finished at up to
+about 4 a second. Rings of 64 and 96 at holds near 250 ms ask for more (4.2 to 4.6 a
+second), so sleeps queue: in one 30-second stretch completions fell to 2.6 a second with 54
+sleeps running, the median sleep reached 9 to 10 s, and the ball dropped on a player still
+going to sleep. The coordinator's sleep lines put the time in the btrfs steps (`stage`, `disk`,
+`publish`) and in Firecracker's save, all waiting on transaction commits: bpftrace counted
+972 in 240 s, most taking 128 to 512 ms, 684 of them from subvolume snapshots and 287 from
+fsyncs of memory files in new subvolumes. Two changes did not move the tail and were not
+kept: reflinking a diff's memory file into an ordinary directory (a sleep's p99 9.6 s against
+10.9 s), and running at most 4 sleeps at once (p99 16.1 s against 9.1 s, the queue moved
+from btrfs into the agent). These runs predate the guest image without maintenance timers,
+whose fwupd OOMs stalled a few sleeps further.
+
 ### The starting pace
 
 Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth per lap
@@ -1908,7 +1922,11 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
   agent a desired round (number, ring, starting hold, shrink, floor, flight window), which
   the agent reconciles like a slot assignment. The ladder, each size's record and the
   overall records are in the state file; a round in progress is not, and a restarted
-  coordinator starts a new round at the size it was on.
+  coordinator starts a new round at the size it was on. Its log (target
+  `fcvm::fleet::potato`) holds a line for each round's start and end, with what ended it,
+  for each ball nobody caught, and for each sleep and wake when it ends (`potato player
+  slept`, `potato player woke`: the player, its start and end on the host's clock, its
+  duration and stages), so a round can be read without the host's logs.
 - **The page.** A view model in `fleet/web/core` from the `/live` snapshot's `potato`
   section, the mock coordinator's potato game, the ring, the ladder and the drop card,
   and Playwright tests on desktop and phone layouts.
