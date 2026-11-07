@@ -10,6 +10,7 @@ pub mod spot;
 pub mod tls;
 pub mod vm;
 pub mod webproxy;
+pub mod windows;
 
 use crate::cli::FleetAgentArgs;
 use crate::fleet::aggregate::{Layout, TileSpec};
@@ -45,6 +46,8 @@ pub struct Agent {
     pub boot: BTreeMap<String, u64>,
     /// Potato mode: the host's player VMs.
     pub potato: Option<potato::PotatoCfg>,
+    /// Windows mode: the host's Windows sandboxes.
+    pub windows: Option<windows::WindowsCfg>,
 }
 
 /// The host's aggregator.
@@ -279,7 +282,45 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     } else {
         None
     };
+    let windows = match &args.windows_image {
+        Some(dir) if args.windows > 0 => {
+            let manifest = windows::Manifest::read(dir)?;
+            for f in ["disk.raw", "CLOUDHV.fd", "sandbox-password"] {
+                anyhow::ensure!(
+                    dir.join(f).is_file(),
+                    "--windows-image {} has no {f}",
+                    dir.display()
+                );
+            }
+            anyhow::ensure!(
+                args.windows_idle_cpu > 0.0 && args.windows_idle_cpu < 1.0,
+                "--windows-idle-cpu {} is not a share of one core between 0 and 1",
+                args.windows_idle_cpu
+            );
+            Some(windows::WindowsCfg {
+                count: args.windows,
+                image_dir: dir.clone(),
+                manifest,
+                bridge_image: args.windows_bridge_image.clone(),
+                podman: args.windows_podman.clone(),
+                state_dir: args.windows_state_dir.clone(),
+                snapshot_dir: args.windows_snapshot_dir.clone(),
+                proc_root: "/proc".into(),
+                idle_cpu: args.windows_idle_cpu,
+                idle_for: Duration::from_secs(10),
+                gold_healthy_deadline: Duration::from_secs(600),
+                logon_deadline: Duration::from_secs(300),
+                idle_deadline: Duration::from_secs(300),
+                snapshot_deadline: Duration::from_secs(600),
+                start_timeout: Duration::from_secs(args.start_timeout_secs),
+                poll: Duration::from_millis(100),
+                tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
+            })
+        }
+        _ => None,
+    };
     let agent = Agent {
+        windows,
         potato,
         host,
         capacity: args.capacity.unwrap_or(gpus.len()),
@@ -424,6 +465,37 @@ where
         };
         ports.insert(g.sbdf.clone(), (port, addr, tls_port));
     }
+    // Windows sandboxes take the ports and addresses after every GPU's, by their index.
+    let mut places = Vec::new();
+    for k in 0..agent.windows.as_ref().map_or(0, |w| w.count) as usize {
+        let i = all.len() + k;
+        places.push(windows::Place {
+            port: u16::try_from(i)
+                .ok()
+                .and_then(|i| agent.base_port.checked_add(i))
+                .with_context(|| {
+                    format!(
+                        "--base-port {} leaves no port for sandbox {k}",
+                        agent.base_port
+                    )
+                })?,
+            ipv6: match &agent.cfg.ipv6_prefix {
+                Some(p) => Some(p.slot_address(i)?),
+                None => None,
+            },
+            tls_port: match agent.cfg.tls_publish_base {
+                Some(b) => Some(
+                    u16::try_from(i)
+                        .ok()
+                        .and_then(|i| b.checked_add(i))
+                        .with_context(|| {
+                            format!("--tls-publish-base {b} leaves no port for sandbox {k}")
+                        })?,
+                ),
+                None => None,
+            },
+        });
+    }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
     out.send(AgentMsg::Hello {
         host: agent.host.clone(),
@@ -435,6 +507,12 @@ where
         phones: agent.phones.clone(),
         phone_actions: vm::phone_actions(agent.cfg.phone.as_ref()),
         potato_players: agent.potato.as_ref().map_or(0, |p| p.players),
+        windows: agent.windows.as_ref().map_or(0, |w| w.count),
+        windows_actions: agent
+            .windows
+            .as_ref()
+            .map(|_| windows::actions())
+            .unwrap_or_default(),
     })
     .ok();
     let (potato_tx, potato_rx) = watch::channel(None);
@@ -464,6 +542,9 @@ where
     });
 
     let cfg = Arc::new(agent.cfg);
+    let mut sandboxes = agent.windows.map(|w| {
+        windows::Windows::start(Arc::new(w), cfg.clone(), places, out.clone(), http.clone())
+    });
     let (scene_tx, scene_rx) = watch::channel::<Option<SharedScene>>(None);
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetPlan>>(None);
     // The aggregator's layout follows the assignment and the scene.
@@ -517,6 +598,19 @@ where
                 region: r,
             } => {
                 region = r;
+                // The Windows sandboxes are the Windows mode's to run; they have no GPU.
+                let (sandbox_list, list): (Vec<AssignSlot>, Vec<AssignSlot>) =
+                    list.into_iter().partition(|a| a.windows.is_some());
+                match &mut sandboxes {
+                    Some(w) => w.assign(&sandbox_list),
+                    None if !sandbox_list.is_empty() => {
+                        tracing::warn!(
+                            sandboxes = sandbox_list.len(),
+                            "assigned Windows sandboxes, but this agent runs none (--windows)"
+                        )
+                    }
+                    None => {}
+                }
                 // The aggregator joins the wall's tiles; a phone's rect is of the phones' image.
                 placed = list
                     .iter()
@@ -596,6 +690,9 @@ where
     }
     for t in retired {
         let _ = t.await;
+    }
+    if let Some(w) = sandboxes {
+        w.stop().await;
     }
     drop(out);
     let _ = writer.await;
@@ -680,6 +777,7 @@ fn assign(
                 ipv4: None,
                 v4_port: None,
                 place: cfg.place.clone(),
+                desktop_at: None,
             }));
             continue;
         };

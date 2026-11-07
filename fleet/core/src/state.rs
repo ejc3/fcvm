@@ -90,6 +90,16 @@ pub struct Config {
     /// the phones' image is laid out in these.
     #[serde(default = "phone_aspect")]
     pub phone_aspect: f64,
+    /// Windows mode: a borrowed sandbox returns after this long, and the same client address
+    /// waits `windows_claim_cooldown_secs` after it to borrow again.
+    #[serde(default = "two_minutes")]
+    pub windows_claim_secs: u64,
+    #[serde(default = "one_minute")]
+    pub windows_claim_cooldown_secs: u64,
+    /// Sandboxes that may be lent at once. `None`: 2 or half the sandboxes (rounded up),
+    /// whichever is smaller.
+    #[serde(default)]
+    pub max_windows_lent: Option<usize>,
 }
 
 fn ten_minutes() -> u64 {
@@ -183,6 +193,12 @@ impl Config {
     pub fn phone_lend_cap(&self, n: usize) -> usize {
         self.max_phones_lent.unwrap_or_else(|| 2.min(n.div_ceil(2)))
     }
+
+    /// How many of `n` Windows sandboxes may be lent at once.
+    pub fn windows_lend_cap(&self, n: usize) -> usize {
+        self.max_windows_lent
+            .unwrap_or_else(|| 2.min(n.div_ceil(2)))
+    }
 }
 
 impl Default for Config {
@@ -216,6 +232,9 @@ impl Default for Config {
             phone_claim_cooldown_secs: 60,
             max_phones_lent: None,
             phone_aspect: phone_aspect(),
+            windows_claim_secs: 120,
+            windows_claim_cooldown_secs: 60,
+            max_windows_lent: None,
         }
     }
 }
@@ -256,6 +275,13 @@ pub struct Host {
     /// (`PhoneAction::offered`).
     #[serde(default)]
     pub phone_actions: Vec<String>,
+    /// The take-over actions its Windows sandboxes carry out, as its hello listed them
+    /// (`WindowsAction::offered`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows_actions: Vec<String>,
+    /// Its Windows image, as its agent last reported it (`AgentMsg::WindowsImage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image: Option<crate::windows::WindowsImage>,
 }
 
 /// What an agent (or the EC2 driver) last said about one slot.
@@ -366,6 +392,9 @@ pub struct Slot {
     /// A phone's own state (`Fleet::phones` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<crate::phone::PhoneSlot>,
+    /// A Windows sandbox's own state (`Fleet::windows` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<crate::windows::WindowsSlot>,
 }
 
 /// A viewer's own GPU: a standby slot restored for them with their own scene.
@@ -648,6 +677,22 @@ pub struct Fleet {
     pub phones_zoom: crate::phone::PhonesZoom,
     #[serde(default)]
     pub last_phones_zoom_at: BTreeMap<String, u64>,
+    /// Windows mode: the sandboxes (`win-<n>`), apart from the wall's slots and the phones.
+    #[serde(default)]
+    pub windows: BTreeMap<u32, Slot>,
+    #[serde(default)]
+    pub windows_claim_count: u64,
+    #[serde(default)]
+    pub last_windows_claim_end: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub windows_action_seq: u64,
+    /// Per client: its last reset of one sandbox, and of every sandbox.
+    #[serde(default)]
+    pub last_windows_reset_at: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub last_windows_reset_all_at: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub last_reset_all: Option<crate::windows::ResetAll>,
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
@@ -718,6 +763,13 @@ impl State {
                 phone_action_seq: 0,
                 phones_zoom: Default::default(),
                 last_phones_zoom_at: BTreeMap::new(),
+                windows: BTreeMap::new(),
+                windows_claim_count: 0,
+                last_windows_claim_end: BTreeMap::new(),
+                windows_action_seq: 0,
+                last_windows_reset_at: BTreeMap::new(),
+                last_windows_reset_all_at: BTreeMap::new(),
+                last_reset_all: None,
                 potato: Default::default(),
                 expected_hosts: None,
             },
@@ -738,6 +790,7 @@ impl State {
         f.hosts.clear();
         f.slots.clear();
         f.phones.clear();
+        f.windows.clear();
         f.ec2.clear();
         f.n = 0;
         f.fcvm_dark.clear();
@@ -859,6 +912,14 @@ pub fn phone_name(n: u32) -> String {
 
 pub fn phone_number(id: &str) -> Option<u32> {
     id.strip_prefix("phone-")?.parse().ok()
+}
+
+pub fn windows_name(n: u32) -> String {
+    format!("win-{n}")
+}
+
+pub fn windows_number(id: &str) -> Option<u32> {
+    id.strip_prefix("win-")?.parse().ok()
 }
 
 #[cfg(test)]

@@ -190,6 +190,10 @@ pub struct SlotReport {
     /// or an address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// Windows mode, with `running`: when the sandbox's desktop first showed (the bridge's
+    /// `times_unix_ms.desktop`), Unix ms on the host's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_at: Option<u64>,
 }
 
 /// The public label of where a slot runs: `EC2 in <region>`. The one place the wording is
@@ -283,7 +287,17 @@ pub enum AgentMsg {
         /// The most potato players the host runs (potato mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         potato_players: u32,
+        /// The Windows sandboxes the host runs (Windows mode); 0 runs none.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        windows: u32,
+        /// The take-over actions the host's sandboxes carry out (Windows mode); a sandbox
+        /// offers nothing else but `reset`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        windows_actions: Vec<String>,
     },
+    /// Windows mode: the host's Windows image, its age and the gold snapshot's state, sent
+    /// after the hello and whenever any of it changes.
+    WindowsImage(crate::windows::WindowsImage),
     /// Potato mode: something that happened to one of the host's players.
     Potato(crate::potato::PotatoEvent),
     Slot(SlotReport),
@@ -355,6 +369,24 @@ pub struct AssignSlot {
     /// phones' image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<AssignPhone>,
+    /// A Windows sandbox (Windows mode): the slot runs a clone of the host's gold snapshot
+    /// and its bridge; `sbdf` is empty and `rect` null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<AssignWindows>,
+}
+
+/// What a Windows sandbox's assignment adds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignWindows {
+    /// Its place among the host's sandboxes (0-based): its ports and address.
+    pub index: u32,
+    /// When the click that asked for this generation was made (the coordinator's clock), for
+    /// the agent's click-to-desktop time; absent for a launch nobody clicked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clicked_at: Option<u64>,
+    /// The take-over actions to carry out, each once by `seq`, oldest first.
+    #[serde(default)]
+    pub actions: Vec<crate::windows::WindowsActionReq>,
 }
 
 /// What a phone slot's assignment adds.
@@ -609,6 +641,7 @@ mod tests {
                 standby: false,
                 warm: false,
                 phone: None,
+                windows: None,
             }],
             region: None,
         };

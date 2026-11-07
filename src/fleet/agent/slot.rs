@@ -180,6 +180,7 @@ impl SlotCtx {
             ipv4: self.tls_port.and(self.cfg.public_ipv4.clone()),
             v4_port: self.cfg.public_ipv4.as_ref().and(self.tls_port),
             place: self.cfg.place.clone(),
+            desktop_at: None,
         }));
     }
 

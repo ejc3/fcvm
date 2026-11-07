@@ -653,6 +653,38 @@ pub struct FleetAgentArgs {
     /// (docs/fleet/ARCHITECTURE.md, "The browser")
     #[arg(long, requires = "phone_apk")]
     pub phone_browser_apk: Option<std::path::PathBuf>,
+
+    /// Windows mode: run N disposable Windows sandboxes on this x86_64 host, each a clone of
+    /// one gold snapshot of an idle logged-on desktop (docs/fleet/windows-sandboxes.md);
+    /// needs --windows-image
+    #[arg(long, default_value_t = 0, requires = "windows_image")]
+    pub windows: u32,
+
+    /// The Windows image directory fleet/windows/build-image.sh made (disk.raw, CLOUDHV.fd,
+    /// sandbox-password, manifest.json)
+    #[arg(long)]
+    pub windows_image: Option<std::path::PathBuf>,
+
+    /// The bridge container image (fleet/windows/bridge), one per sandbox on the host
+    #[arg(long, default_value = "localhost/fcvm-windows-bridge:fleet")]
+    pub windows_bridge_image: String,
+
+    /// Where the agent keeps each image's gold desktop reference
+    #[arg(long, default_value = "/mnt/fcvm-btrfs/windows-fleet")]
+    pub windows_state_dir: std::path::PathBuf,
+
+    /// fcvm's snapshot directory, where a gold snapshot made before is found
+    #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
+    pub windows_snapshot_dir: std::path::PathBuf,
+
+    /// The gold desktop is idle once its VM uses under this share of one core for 10 s in a
+    /// row (an idle disconnected desktop measured 0.12 to 0.13)
+    #[arg(long, default_value_t = 0.15)]
+    pub windows_idle_cpu: f64,
+
+    /// podman, which runs the bridges (tests)
+    #[arg(long, default_value = "podman", hide = true)]
+    pub windows_podman: std::path::PathBuf,
 }
 
 /// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and

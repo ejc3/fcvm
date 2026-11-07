@@ -755,6 +755,8 @@ async fn the_agent_socket_answers_pings() {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        windows: 0,
+        windows_actions: Vec::new(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -807,6 +809,8 @@ impl FakeAgent {
                 phones: vec![],
                 phone_actions: vec![],
                 potato_players: 0,
+                windows: 0,
+                windows_actions: Vec::new(),
             })
             .unwrap();
         FakeAgent {
@@ -847,6 +851,7 @@ impl FakeAgent {
                 ipv4: None,
                 v4_port: None,
                 place: None,
+                desktop_at: None,
             }))
             .unwrap();
     }
@@ -1912,6 +1917,7 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
         standby: false,
         warm: false,
         phone: None,
+        windows: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -2034,6 +2040,7 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         standby: false,
         warm: false,
         phone: None,
+        windows: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -2144,6 +2151,7 @@ async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance
         standby: false,
         warm: false,
         phone: None,
+        windows: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -3505,6 +3513,7 @@ async fn a_host_running_after_the_ec2_half_woke_the_fleet_records_its_boot() {
                     ipv4: None,
                     v4_port: None,
                     place: None,
+                    desktop_at: None,
                 },
             })
             .await;
@@ -6150,6 +6159,7 @@ async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
         standby: false,
         warm: false,
         phone: None,
+        windows: None,
     };
     let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
     let (_scene, scene_rx) = tokio::sync::watch::channel(None);
@@ -6373,6 +6383,11 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     // So is a borrowed phone.
     late.intent("phone", "claim_phone", json!({})).await;
     let r = late.receipt("phone").await;
+    assert_eq!(r["outcome"], "refused");
+    assert_eq!(r["reason"], live::LATE_CLAIM);
+    // And a borrowed Windows sandbox, which is shown from its direct stream too.
+    late.intent("sandbox", "claim_windows", json!({})).await;
+    let r = late.receipt("sandbox").await;
     assert_eq!(r["outcome"], "refused");
     assert_eq!(r["reason"], live::LATE_CLAIM);
     // No later admission ever gives it a token.
@@ -6647,6 +6662,7 @@ async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
                             ipv4: None,
                             v4_port: None,
                             place: None,
+                            desktop_at: None,
                         },
                     })
                     .await;

@@ -1,7 +1,7 @@
 //! What the coordinator sends out, derived from the state: the browser snapshot, each
 //! host's slot assignment, the EC2 driver's assignment and the shared scene.
 
-use crate::protocol::{AssignPhone, AssignSlot, SharedScene};
+use crate::protocol::{AssignPhone, AssignSlot, AssignWindows, SharedScene};
 use crate::scene::Scene;
 use crate::state::*;
 use crate::tiling::{Half, Rect};
@@ -403,6 +403,10 @@ pub struct View {
     /// includes a phone. Absent with no phones.
     #[serde(skip_serializing_if = "PhonesView::is_empty")]
     pub phones: PhonesView,
+    /// Windows mode (`?mode=windows`): the sandboxes and their own image. Absent with no
+    /// sandboxes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowsView>,
     /// Potato mode (`?mode=potato`): the ladder, the round and the players. Absent until a
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,6 +417,22 @@ impl PhonesView {
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }
+}
+
+/// The Windows sandboxes, laid out in their own image, row-major (`win:<k>`, 1-based).
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowsView {
+    /// What every tile and the take-over panel say about the edition and its use.
+    pub label: &'static str,
+    pub image_aspect: f64,
+    pub tiles: Vec<TileView>,
+    /// Sandboxes lent to viewers: at most `cap` at once.
+    pub borrow: BorrowView,
+    /// How long a borrowed sandbox stays with its viewer.
+    pub claim_secs: u64,
+    /// The Windows image of the first host (by name) that reported one.
+    pub image: Option<crate::windows::WindowsImage>,
+    pub last_reset_all: Option<crate::windows::ResetAll>,
 }
 
 /// The phones, laid out in their own image, row-major (`phone:<k>`, 1-based).
@@ -697,6 +717,7 @@ pub fn view(state: &State) -> View {
 
         actions: f.actions.iter().cloned().collect(),
         phones: phones_view(state),
+        windows: windows_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
     }
 }
@@ -772,6 +793,80 @@ fn phones_view(state: &State) -> PhonesView {
         zoomed_out: f.phones_zoom.out,
         zoom_at: f.phones_zoom.at,
     }
+}
+
+/// Each sandbox's place in the sandboxes' image, by sandbox number, and the image's aspect.
+pub fn windows_places(state: &State) -> (BTreeMap<u32, (usize, Rect)>, f64) {
+    let (rects, aspect) = crate::windows::layout(state.fleet.windows.len());
+    let places = state
+        .fleet
+        .windows
+        .keys()
+        .zip(rects)
+        .enumerate()
+        .map(|(i, (n, r))| (*n, (i, r)))
+        .collect();
+    (places, aspect)
+}
+
+fn windows_view(state: &State) -> Option<WindowsView> {
+    let f = &state.fleet;
+    if f.windows.is_empty() {
+        return None;
+    }
+    let (places, image_aspect) = windows_places(state);
+    let tiles = places
+        .iter()
+        .map(|(n, (i, rect))| {
+            let s = &f.windows[n];
+            let mut t = tile(state, format!("win:{}", i + 1), Half::Fcvm, *rect, Some(s));
+            t.borrowed = s
+                .windows
+                .as_ref()
+                .and_then(|w| w.claim.as_ref())
+                .map(|c| BorrowedView {
+                    session: c.session.clone(),
+                    viewer: c.viewer.clone(),
+                    since: c.claimed_at,
+                    until: c.expires_at,
+                });
+            t.actions = Some(
+                crate::apply::windows_offers(f, *n)
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect(),
+            );
+            t
+        })
+        .collect();
+    let lent: Vec<u64> = f
+        .windows
+        .values()
+        .filter_map(|s| s.windows.as_ref()?.claim.as_ref())
+        .map(|c| c.expires_at)
+        .collect();
+    let image = f
+        .hosts
+        .values()
+        .filter(|h| {
+            f.windows
+                .values()
+                .any(|s| s.host.as_deref() == Some(h.name.as_str()))
+        })
+        .find_map(|h| h.windows_image.clone());
+    Some(WindowsView {
+        label: crate::windows::LABEL,
+        image_aspect,
+        tiles,
+        borrow: BorrowView {
+            cap: state.config.windows_lend_cap(f.windows.len()),
+            lent: lent.len(),
+            next_return_at: lent.iter().copied().min(),
+        },
+        claim_secs: state.config.windows_claim_secs,
+        image,
+        last_reset_all: f.last_reset_all.clone(),
+    })
 }
 
 fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> Option<HalfScore> {
@@ -1003,6 +1098,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 standby: in_standby(state, s),
                 warm: is_warming(state, s),
                 phone: None,
+                windows: None,
             });
         }
     }
@@ -1053,6 +1149,43 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         })
                         .unwrap_or_default(),
                 }),
+                windows: None,
+            });
+        }
+    }
+    // The sandboxes: each carries out the actions of its current launch.
+    for (n, s) in &state.fleet.windows {
+        let (Some(host), Some(w)) = (&s.host, &s.windows) else {
+            continue;
+        };
+        if let Some(list) = out.get_mut(host) {
+            let offers = crate::apply::windows_offers(&state.fleet, *n);
+            list.push(AssignSlot {
+                id: s.id.clone(),
+                sbdf: String::new(),
+                generation: s.generation,
+                rect: None,
+                private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
+                standby: false,
+                warm: false,
+                phone: None,
+                windows: Some(AssignWindows {
+                    index: w.index,
+                    clicked_at: s
+                        .last_relaunch
+                        .as_ref()
+                        .filter(|r| r.generation == s.generation)
+                        .map(|r| r.clicked_at),
+                    actions: w
+                        .actions
+                        .iter()
+                        .filter(|a| a.generation == s.generation && offers.contains(&a.action))
+                        .cloned()
+                        .collect(),
+                }),
             });
         }
     }
@@ -1087,6 +1220,7 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             standby: false,
             warm: false,
             phone: None,
+            windows: None,
         })
         .collect()
 }

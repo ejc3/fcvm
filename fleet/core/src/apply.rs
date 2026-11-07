@@ -25,6 +25,9 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
     before.last_light_at = after.last_light_at.clone();
     before.last_relaunch_at = after.last_relaunch_at.clone();
     before.last_claim_end = after.last_claim_end.clone();
+    before.last_windows_reset_at = after.last_windows_reset_at.clone();
+    before.last_windows_reset_all_at = after.last_windows_reset_all_at.clone();
+    before.last_windows_claim_end = after.last_windows_claim_end.clone();
     before.history_ready_at = after.history_ready_at;
     before.budget.next_round_at = after.budget.next_round_at;
     before.budget.smoothed = after.budget.smoothed;
@@ -247,6 +250,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .values_mut()
                 .chain(f.ec2.values_mut())
                 .chain(f.phones.values_mut())
+                .chain(f.windows.values_mut())
                 .find(|s| s.id == *slot)
             {
                 // Only for the launch the slot is on: a slower write for an earlier launch
@@ -302,6 +306,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             for n in phones {
                 release_phone(&mut state.fleet, n, at);
             }
+            let sandboxes: Vec<u32> = state
+                .fleet
+                .windows
+                .iter()
+                .filter(|(_, s)| windows_claim(s).is_some_and(|c| c.viewer == *viewer))
+                .map(|(n, _)| *n)
+                .collect();
+            for n in sandboxes {
+                release_windows(&mut state.fleet, n, at);
+            }
             None
         }
         Event::Tick { .. } => {
@@ -328,6 +342,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     phones,
                     phone_actions,
                     potato_players,
+                    windows,
+                    windows_actions,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
@@ -336,11 +352,20 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                             .fleet
                             .potato
                             .agent_hello(host, *potato_players, at, &cfg);
+                        // A hello again on the same connection keeps the image it reported.
+                        let image = state
+                            .fleet
+                            .hosts
+                            .get(host)
+                            .and_then(|h| h.windows_image.clone());
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
                         if let Some(h) = state.fleet.hosts.get_mut(host) {
                             h.phone_actions = phone_actions.clone();
+                            h.windows_actions = windows_actions.clone();
+                            h.windows_image = image.filter(|_| *windows > 0);
                         }
                         phone_hello(&mut state.fleet, host, gpus, phones, at);
+                        windows_hello(&mut state.fleet, host, *windows, at);
                         let p = &mut state.fleet.power;
                         if wake_open(p) {
                             let woke = p.woke_at;
@@ -366,6 +391,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_slot(&mut state.fleet, Half::Fcvm, n, Some(host), r, at);
                     } else if let Some(n) = phone_number(&r.id) {
                         observe_phone(&mut state.fleet, n, host, r, at);
+                    } else if let Some(n) = windows_number(&r.id) {
+                        observe_windows(&mut state.fleet, n, host, r, at);
                     }
                 }
                 AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
@@ -422,6 +449,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     let cfg = state.config.potato.clone();
                     state.fleet.potato.event(host, e, at, &cfg);
                 }
+                AgentMsg::WindowsImage(image) => {
+                    if let Some(h) = state.fleet.hosts.get_mut(host) {
+                        h.windows_image = Some(image.clone());
+                    }
+                }
             }
             None
         }
@@ -432,6 +464,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
             f.phones.retain(|_, s| s.host.as_deref() != Some(host));
+            f.windows.retain(|_, s| s.host.as_deref() != Some(host));
             // A host the coordinator scaled away is not a reclaimed one.
             if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
                 f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
@@ -532,7 +565,8 @@ fn power_step(state: &mut State, at: u64) {
         f.power.idle_since.get_or_insert(at);
     }
     let claims = f.slots.values().any(|s| s.claim.is_some())
-        || f.phones.values().any(|s| phone_claim(s).is_some());
+        || f.phones.values().any(|s| phone_claim(s).is_some())
+        || f.windows.values().any(|s| windows_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
         // Connected pages do not wake it once the limit has run out: an arrival does.
@@ -807,8 +841,21 @@ fn intent_effect(
         }
         // Asleep with pages still connected (no new viewer for the limit), a claim would hold
         // a GPU the fleet is not running and keep nothing awake: refuse it, as restart_now.
-        Intent::ClaimGpu | Intent::ClaimPhone { .. } if state.fleet.power.state == "asleep" => {
+        Intent::ClaimGpu | Intent::ClaimPhone { .. } | Intent::ClaimWindows { .. }
+            if state.fleet.power.state == "asleep" =>
+        {
             Err("the GPUs are asleep".into())
+        }
+        Intent::WindowsReset { slot } => windows_reset(state, c, slot.as_deref()),
+        Intent::ClaimWindows { slot } => claim_windows(state, c, slot.as_deref()),
+        Intent::ReleaseWindows { claim } => {
+            let n = own_windows(&state.fleet, c.viewer).ok_or("this viewer holds no sandbox")?;
+            check_windows_claim(&state.fleet, n, claim.as_deref())?;
+            release_windows(&mut state.fleet, n, at);
+            Ok("release sandbox".into())
+        }
+        Intent::WindowsAction { claim, action } => {
+            windows_action(state, c, claim.as_deref(), *action)
         }
         Intent::ClaimGpu => claim(state, c),
         Intent::ClaimPhone { phone } => claim_phone(state, c, phone.as_deref()),
@@ -1243,6 +1290,23 @@ fn tick(state: &mut State, at: u64) {
             });
         }
     }
+    // Borrowed sandboxes come back; actions the agents have had time to carry out are dropped.
+    let expired: Vec<u32> = f
+        .windows
+        .iter()
+        .filter(|(_, s)| windows_claim(s).is_some_and(|c| at >= c.expires_at))
+        .map(|(n, _)| *n)
+        .collect();
+    for n in expired {
+        release_windows(f, n, at);
+    }
+    for s in f.windows.values_mut() {
+        if let Some(w) = s.windows.as_mut() {
+            w.actions.retain(|a| {
+                at < a.at + crate::windows::ACTION_KEEP_MS && a.generation == s.generation
+            });
+        }
+    }
     // A reclaimed host is listed for a minute after it is gone.
     let hosts = f.hosts.clone();
     f.reclaimed.retain(|h, (_, gone)| {
@@ -1261,6 +1325,18 @@ fn tick(state: &mut State, at: u64) {
     keep(
         &mut f.last_phone_claim_end,
         state.config.phone_claim_cooldown_secs * 1000,
+    );
+    keep(
+        &mut f.last_windows_reset_at,
+        state.config.relaunch_interval_ms,
+    );
+    keep(
+        &mut f.last_windows_reset_all_at,
+        crate::windows::RESET_ALL_INTERVAL_MS,
+    );
+    keep(
+        &mut f.last_windows_claim_end,
+        state.config.windows_claim_cooldown_secs * 1000,
     );
     // Restores per minute are kept for the last hour (this minute and the 59 before).
     let minute = at / 60_000;
@@ -1326,6 +1402,8 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             aggregate_v4_port: None,
             aggregate_published: None,
             phone_actions: Vec::new(),
+            windows_actions: Vec::new(),
+            windows_image: None,
         },
     );
     f.reclaimed.remove(host);
@@ -1352,6 +1430,7 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
         last_relaunch: None,
         claim: None,
         phone: None,
+        windows: None,
     }
 }
 
@@ -2139,4 +2218,311 @@ fn phones_zoom(state: &mut State, c: &Ctx, out: bool) -> Result<String, String> 
         z.keys.drain(..n - crate::phone::ZOOM_KEYS);
     }
     Ok(if out { "zoom out" } else { "zoom in" }.into())
+}
+
+// ---------------------------------------------------------------------------
+// Windows mode
+// ---------------------------------------------------------------------------
+
+fn windows_claim(s: &Slot) -> Option<&crate::windows::WindowsClaim> {
+    s.windows.as_ref().and_then(|w| w.claim.as_ref())
+}
+
+fn windows_index(s: &Slot) -> Option<u32> {
+    s.windows.as_ref().map(|w| w.index)
+}
+
+/// The sandboxes of a host's hello: one per index below `count`, the host's others removed.
+/// A sandbox keeps its name and launch across a hello that keeps its index.
+fn windows_hello(f: &mut Fleet, host: &str, count: u32, at: u64) {
+    f.windows.retain(|_, s| {
+        s.host.as_deref() != Some(host) || windows_index(s).is_some_and(|i| i < count)
+    });
+    for index in 0..count {
+        let exists = f
+            .windows
+            .values()
+            .any(|s| s.host.as_deref() == Some(host) && windows_index(s) == Some(index));
+        if exists {
+            continue;
+        }
+        let n = (1..).find(|n| !f.windows.contains_key(n)).unwrap();
+        let mut s = new_slot(
+            windows_name(n),
+            Half::Fcvm,
+            Some(host.to_string()),
+            None,
+            at,
+        );
+        s.windows = Some(crate::windows::WindowsSlot {
+            index,
+            ..Default::default()
+        });
+        f.windows.insert(n, s);
+    }
+}
+
+/// A sandbox's report. Its launch's first frame is the bridge's desktop time, on the host's
+/// clock, kept between the click and this read so a skewed clock cannot move it outside them.
+fn observe_windows(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
+    let Some(slot) = f.windows.get_mut(&n) else {
+        return;
+    };
+    if slot.host.as_deref() != Some(host) {
+        return;
+    }
+    if r.phase == "running" && slot.observed.phase != "running" {
+        count_restore(&mut f.counters, at);
+    }
+    if r.generation > slot.generation {
+        slot.generation = r.generation;
+    }
+    let timed = slot
+        .last_relaunch
+        .as_ref()
+        .is_some_and(|rl| rl.first_frame_at.is_some());
+    note_report(slot, r, at);
+    if !note_running(slot, r, at) || timed {
+        return;
+    }
+    if let (Some(rl), Some(desktop)) = (slot.last_relaunch.as_mut(), r.desktop_at) {
+        if rl.generation == r.generation && rl.first_frame_at == Some(at) {
+            rl.first_frame_at = Some(desktop.clamp(rl.clicked_at.min(at), at));
+        }
+    }
+}
+
+fn own_windows(f: &Fleet, viewer: &str) -> Option<u32> {
+    f.windows
+        .iter()
+        .find(|(_, s)| windows_claim(s).is_some_and(|c| c.viewer == viewer))
+        .map(|(n, _)| *n)
+}
+
+fn check_windows_claim(f: &Fleet, n: u32, claim: Option<&str>) -> Result<(), String> {
+    let session = &windows_claim(&f.windows[&n]).unwrap().session;
+    match claim {
+        Some(k) if k != session => Err(format!("{k:?} is not this viewer's sandbox")),
+        _ => Ok(()),
+    }
+}
+
+/// The sandbox named `id`.
+fn windows_slot(f: &Fleet, id: &str) -> Result<u32, String> {
+    windows_number(id)
+        .filter(|n| f.windows.contains_key(n))
+        .ok_or_else(|| format!("no sandbox {id:?}"))
+}
+
+/// Sandboxes a viewer may borrow: on a host that is not draining, running their current
+/// launch, not lent.
+fn windows_free(f: &Fleet, s: &Slot) -> Result<(), String> {
+    if windows_claim(s).is_some() {
+        return Err(format!("{} is lent to another viewer", s.id));
+    }
+    if host_draining(&f.hosts, s) {
+        return Err(format!("{} is leaving the fleet", s.id));
+    }
+    if s.observed.phase != "running" || s.observed.generation < s.generation {
+        return Err(format!("{} is not running", s.id));
+    }
+    Ok(())
+}
+
+/// Restore one sandbox, or every one, from the gold snapshot: its generation moves and the
+/// launch is timed from this click.
+fn windows_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<String, String> {
+    let at = c.at;
+    if state.fleet.power.state == "asleep" {
+        return Err("the hosts are asleep".into());
+    }
+    let f = &mut state.fleet;
+    match slot {
+        Some(id) => {
+            let n = windows_slot(f, id)?;
+            rate(
+                &f.last_windows_reset_at,
+                c.client,
+                at,
+                state.config.relaunch_interval_ms,
+                "reset",
+            )?;
+            let hosts = f.hosts.clone();
+            let s = f.windows.get_mut(&n).unwrap();
+            if windows_claim(s).is_some() {
+                return Err(format!("{} is lent to a viewer", s.id));
+            }
+            if host_draining(&hosts, s) {
+                return Err(format!("{} is on a draining host", s.id));
+            }
+            bump(s, &format!("viewer:{}", c.viewer), at);
+            f.last_windows_reset_at.insert(c.client.to_string(), at);
+            Ok(format!("reset {}", s.id))
+        }
+        None => {
+            rate(
+                &f.last_windows_reset_all_at,
+                c.client,
+                at,
+                crate::windows::RESET_ALL_INTERVAL_MS,
+                "reset all",
+            )?;
+            let hosts = f.hosts.clone();
+            let mut n = 0;
+            for s in f.windows.values_mut() {
+                if windows_claim(s).is_some() || host_draining(&hosts, s) {
+                    continue;
+                }
+                bump(s, "reset_all", at);
+                n += 1;
+            }
+            if n == 0 {
+                return Err("no sandbox can be reset now".into());
+            }
+            f.last_windows_reset_all_at.insert(c.client.to_string(), at);
+            f.last_reset_all = Some(crate::windows::ResetAll {
+                clicked_at: at,
+                by: format!("viewer:{}", c.viewer),
+                sandboxes: n,
+            });
+            Ok(format!("reset all {n} sandboxes"))
+        }
+    }
+}
+
+fn claim_windows(state: &mut State, c: &Ctx, want: Option<&str>) -> Result<String, String> {
+    let at = c.at;
+    let cfg = &state.config;
+    let f = &mut state.fleet;
+    if f.windows
+        .values()
+        .any(|s| windows_claim(s).is_some_and(|k| k.client == c.client))
+    {
+        return Err("one sandbox per client at a time".into());
+    }
+    if let Some(end) = f.last_windows_claim_end.get(c.client) {
+        let free_at = end + cfg.windows_claim_cooldown_secs * 1000;
+        if at < free_at {
+            return Err(format!(
+                "your last sandbox was returned {} s ago; borrow again in {} s",
+                (at - end) / 1000,
+                (free_at - at).div_ceil(1000)
+            ));
+        }
+    }
+    let lent: Vec<u64> = f
+        .windows
+        .values()
+        .filter_map(windows_claim)
+        .map(|k| k.expires_at)
+        .collect();
+    let cap = cfg.windows_lend_cap(f.windows.len());
+    if lent.len() >= cap {
+        let back = lent
+            .iter()
+            .min()
+            .map_or(0, |t| t.saturating_sub(at).div_ceil(1000));
+        return Err(format!(
+            "{} of {cap} sandboxes are already lent; the next comes back in {back} s",
+            lent.len()
+        ));
+    }
+    let n = match want {
+        Some(id) => {
+            let n = windows_slot(f, id)?;
+            windows_free(f, &f.windows[&n])?;
+            n
+        }
+        None => *f
+            .windows
+            .iter()
+            .find(|(_, s)| windows_free(f, s).is_ok())
+            .map(|(n, _)| n)
+            .ok_or("no sandbox can be lent now: none is running and free")?,
+    };
+    f.windows_claim_count += 1;
+    let session = format!("windows-claim-{}", f.windows_claim_count);
+    let slot = f.windows.get_mut(&n).unwrap();
+    slot.windows.get_or_insert_with(Default::default).claim = Some(crate::windows::WindowsClaim {
+        session: session.clone(),
+        viewer: c.viewer.to_string(),
+        client: c.client.to_string(),
+        claimed_at: at,
+        expires_at: at + cfg.windows_claim_secs * 1000,
+        last_action_at: None,
+    });
+    Ok(format!("{session} on {}", slot.id))
+}
+
+/// Give a sandbox back: it is restored from the gold snapshot, so nothing the viewer did
+/// survives them and the next viewer finds the idle desktop.
+fn release_windows(f: &mut Fleet, n: u32, at: u64) {
+    let Some(slot) = f.windows.get_mut(&n) else {
+        return;
+    };
+    let Some(claim) = slot.windows.as_mut().and_then(|w| w.claim.take()) else {
+        return;
+    };
+    bump(slot, &format!("return:{}", claim.session), at);
+    f.last_windows_claim_end.insert(claim.client, at);
+}
+
+/// The take-over actions sandbox `n` offers: those its host's hello listed, and `reset`.
+pub fn windows_offers(f: &Fleet, n: u32) -> Vec<crate::windows::WindowsAction> {
+    let listed = f
+        .windows
+        .get(&n)
+        .and_then(|s| s.host.as_ref())
+        .and_then(|h| f.hosts.get(h))
+        .map(|h| h.windows_actions.as_slice())
+        .unwrap_or_default();
+    crate::windows::WindowsAction::offered(listed)
+}
+
+fn windows_action(
+    state: &mut State,
+    c: &Ctx,
+    claim: Option<&str>,
+    action: crate::windows::WindowsAction,
+) -> Result<String, String> {
+    use crate::windows::WindowsAction;
+    let at = c.at;
+    let f = &mut state.fleet;
+    let n = own_windows(f, c.viewer)
+        .ok_or("sandbox actions need a sandbox of your own (claim_windows)")?;
+    check_windows_claim(f, n, claim)?;
+    // Only what the sandbox's host carries out: an agent skips the whole assignment line that
+    // names an action it does not know.
+    if !windows_offers(f, n).contains(&action) {
+        return Err(format!(
+            "{}'s host does not support {}",
+            f.windows[&n].id,
+            action.as_str()
+        ));
+    }
+    let slot = f.windows.get_mut(&n).unwrap();
+    let generation = slot.generation;
+    let w = slot.windows.as_mut().unwrap();
+    let k = w.claim.as_mut().unwrap();
+    if let Some(last) = k.last_action_at {
+        let next = last + crate::windows::ACTION_INTERVAL_MS;
+        if at < next {
+            return Err(format!("one action a second; wait {} ms", next - at));
+        }
+    }
+    k.last_action_at = Some(at);
+    let session = k.session.clone();
+    if action == WindowsAction::Reset {
+        // A reset restores the sandbox's VM, timed like any relaunch.
+        bump(slot, &format!("reset:{session}"), at);
+        return Ok(format!("reset {}", slot.id));
+    }
+    f.windows_action_seq += 1;
+    w.actions.push(crate::windows::WindowsActionReq {
+        seq: f.windows_action_seq,
+        action,
+        at,
+        generation,
+    });
+    Ok(format!("{} on {}", action.as_str(), slot.id))
 }

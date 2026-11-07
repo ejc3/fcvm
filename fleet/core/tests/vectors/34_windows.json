@@ -1,0 +1,1364 @@
+{
+  "config": {
+    "max_tiles": 2,
+    "max_windows_lent": 1,
+    "windows_claim_cooldown_secs": 60,
+    "windows_claim_secs": 30
+  },
+  "description": "Windows mode: an agent's sandboxes become win-<n>, laid out in their own 16:9 image and never on the wall. windows_reset restores one sandbox (rate limited per client) or every free one (once per 10 s per client); claim_windows borrows one (one per client, a cap, a cooldown); windows_action accepts only the enumerated actions from the holder, at most one a second, and hands them to the agent with the sandbox's assignment; reset, the end of a borrow and a viewer leaving each restore the sandbox, timed from the click to the bridge's desktop time, kept between the click and the report's read.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello",
+        "windows": 3,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1500,
+      "host": "h1",
+      "msg": {
+        "age_days": 12,
+        "build": "26100.1742",
+        "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+        "eval_expires": "2027-05-06T10:00:00+00:00",
+        "gold": "building",
+        "gold_error": null,
+        "id": "3f9c0a1b2c4d",
+        "installed_at": "2026-11-07T10:00:00Z",
+        "refused": null,
+        "type": "windows_image",
+        "warning": null
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 1990,
+        "frame_url": "ws://h1:20101/frames",
+        "generation": 1,
+        "id": "win-1",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 1990,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 1,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 1990,
+        "frame_url": "ws://h1:20103/frames",
+        "generation": 1,
+        "id": "win-3",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.20",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 3000,
+      "client": "198.51.100.20",
+      "id": "r1",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "win-3"
+      },
+      "at": 3500,
+      "client": "198.51.100.20",
+      "id": "r2",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 3600,
+      "client": "198.51.100.21",
+      "id": "r3",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "win-9"
+      },
+      "at": 3700,
+      "client": "198.51.100.21",
+      "id": "r4",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "all": true,
+        "slot": "win-3"
+      },
+      "at": 3800,
+      "client": "198.51.100.21",
+      "id": "r4b",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 4000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "restoring",
+        "timings": {},
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "connecting",
+        "timings": {},
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 7000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 6950,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 8000,
+      "client": "198.51.100.20",
+      "id": "c1",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "notepad"
+      },
+      "at": 9000,
+      "client": "198.51.100.20",
+      "id": "a1",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "cmd.exe /c calc"
+      },
+      "at": 9100,
+      "client": "198.51.100.20",
+      "id": "a2",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "notepad",
+        "text": "hello",
+        "x": 0.5
+      },
+      "at": 9200,
+      "client": "198.51.100.20",
+      "id": "a2b",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "about"
+      },
+      "at": 9500,
+      "client": "198.51.100.20",
+      "id": "a3",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "terminal"
+      },
+      "at": 10500,
+      "client": "198.51.100.20",
+      "id": "a4",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "notepad"
+      },
+      "at": 10600,
+      "client": "198.51.100.21",
+      "id": "a5",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 10700,
+      "client": "198.51.100.21",
+      "id": "c2",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 10800,
+      "client": "198.51.100.21",
+      "id": "r5",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "all": true
+      },
+      "at": 11000,
+      "client": "198.51.100.21",
+      "id": "r6",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "all": true
+      },
+      "at": 15000,
+      "client": "198.51.100.21",
+      "id": "r7",
+      "name": "windows_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "action": "reset",
+        "claim": "windows-claim-1"
+      },
+      "at": 16000,
+      "client": "198.51.100.20",
+      "id": "a6",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 17000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 10000,
+        "frame_url": "ws://h1:20103/frames",
+        "generation": 2,
+        "id": "win-3",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 40000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 41000,
+      "client": "198.51.100.20",
+      "id": "c3",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 41500,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 41400,
+        "frame_url": "ws://h1:20101/frames",
+        "generation": 2,
+        "id": "win-1",
+        "phase": "running",
+        "timings": {
+          "connect_ms": 900,
+          "desktop_ms": 120,
+          "first_frame_ms": 300,
+          "restore_ms": 2100,
+          "total_ms": 3500
+        },
+        "type": "slot",
+        "vm": "win-1"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 42000,
+      "client": "198.51.100.21",
+      "id": "c4",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 42100,
+      "client": "198.51.100.21",
+      "id": "c5",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 43000,
+      "type": "viewer_left",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 44000,
+      "client": "198.51.100.20",
+      "id": "x1",
+      "name": "release_windows",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 45000,
+      "host": "h1",
+      "msg": {
+        "age_days": 150,
+        "build": "26100.1742",
+        "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+        "eval_expires": "2027-05-06T10:00:00+00:00",
+        "gold": "ready",
+        "gold_error": null,
+        "id": "3f9c0a1b2c4d",
+        "installed_at": "2026-11-07T10:00:00Z",
+        "refused": null,
+        "type": "windows_image",
+        "warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 46000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 47000,
+      "host": "h1",
+      "type": "agent_gone"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/assign/h1/0/windows": null,
+        "/assign/h1/1/id": "win-1",
+        "/assign/h1/1/rect": null,
+        "/assign/h1/1/sbdf": "",
+        "/assign/h1/1/windows/actions": [],
+        "/assign/h1/1/windows/clicked_at": null,
+        "/assign/h1/1/windows/index": 0,
+        "/assign/h1/3/windows/index": 2,
+        "/view/tiles/0/slot": "slot-1",
+        "/view/tiles/1": null,
+        "/view/windows/borrow/cap": 1,
+        "/view/windows/image": null,
+        "/view/windows/image_aspect": 5.333333333333333,
+        "/view/windows/label": "Windows Server 2025 evaluation, for demonstration only",
+        "/view/windows/tiles/0/actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all",
+          "reset"
+        ],
+        "/view/windows/tiles/0/id": "win:1",
+        "/view/windows/tiles/0/slot": "win-1",
+        "/view/windows/tiles/1/rect": {
+          "h": 1.0,
+          "w": 0.3333333333333333,
+          "x": 0.3333333333333333,
+          "y": 0.0
+        },
+        "/view/windows/tiles/2/slot": "win-3",
+        "/view/windows/tiles/3": null
+      },
+      "note": "an agent's sandboxes become win-<n>, laid out in their own image, never on the wall"
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/view/windows/image/age_days": 12,
+        "/view/windows/image/edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+        "/view/windows/image/gold": "building"
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/windows/tiles/2/last_relaunch/by": "wake",
+        "/view/windows/tiles/2/last_relaunch/first_frame_at": 1990,
+        "/view/windows/tiles/2/last_relaunch/phases/connect_ms": 900,
+        "/view/windows/tiles/2/phase": "running"
+      },
+      "note": "a sandbox up at the start is timed from its own report; its first frame is the bridge's desktop time"
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/assign/h1/1/generation": 1,
+        "/assign/h1/2/generation": 2,
+        "/assign/h1/2/windows/clicked_at": 3000,
+        "/receipts/r1/outcome": "committed",
+        "/view/windows/tiles/1/last_relaunch/by": "viewer:v1",
+        "/view/windows/tiles/1/phase": "relaunching"
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/r2/reason": "one reset per 2 s per client"
+      }
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/receipts/r3/reason": "args must name a slot or say all"
+      }
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/receipts/r4/reason": "no sandbox \"win-9\""
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/r4b/reason": "args must name a slot or say all"
+      }
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/view/windows/tiles/1/phase": "restoring"
+      }
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/windows/tiles/1/phase": "connecting"
+      }
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/windows/tiles/1/last_relaunch/clicked_at": 3000,
+        "/view/windows/tiles/1/last_relaunch/first_frame_at": 6950,
+        "/view/windows/tiles/1/last_relaunch/phases/total_ms": 3500
+      }
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/receipts/c1/outcome": "committed",
+        "/view/windows/borrow/lent": 1,
+        "/view/windows/tiles/1/borrowed/session": "windows-claim-1",
+        "/view/windows/tiles/1/borrowed/until": 38000,
+        "/view/windows/tiles/1/frame_url": "ws://h1:20102/frames",
+        "/view/windows/tiles/1/phase": "running"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/assign/h1/1/windows/actions": [],
+        "/assign/h1/2/windows/actions/0/action": "notepad",
+        "/assign/h1/2/windows/actions/0/generation": 2,
+        "/assign/h1/2/windows/actions/0/seq": 1,
+        "/receipts/a1/outcome": "committed"
+      }
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/assign/h1/2/windows/actions/1": null,
+        "/receipts/a2/reason": "args.action must be one of start_menu, notepad, explorer, task_manager, about, terminal, close_all, reset"
+      },
+      "note": "no free-form input reaches a sandbox"
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/assign/h1/2/windows/actions/1": null,
+        "/receipts/a2b/reason": "args.text is not accepted"
+      },
+      "note": "no text or point rides along with an action"
+    },
+    {
+      "after": 19,
+      "checks": {
+        "/receipts/a3/reason": "one action a second; wait 500 ms"
+      }
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/receipts/a4/reason": "win-2's host does not support terminal"
+      }
+    },
+    {
+      "after": 21,
+      "checks": {
+        "/receipts/a5/reason": "sandbox actions need a sandbox of your own (claim_windows)"
+      }
+    },
+    {
+      "after": 22,
+      "checks": {
+        "/receipts/c2/reason": "1 of 1 sandboxes are already lent; the next comes back in 28 s"
+      }
+    },
+    {
+      "after": 23,
+      "checks": {
+        "/receipts/r5/reason": "win-2 is lent to a viewer"
+      }
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/assign/h1/1/generation": 2,
+        "/assign/h1/2/generation": 2,
+        "/assign/h1/2/windows/actions/0/action": "notepad",
+        "/assign/h1/3/generation": 2,
+        "/receipts/r6/outcome": "committed",
+        "/view/windows/last_reset_all": {
+          "by": "viewer:v2",
+          "clicked_at": 11000,
+          "sandboxes": 2
+        },
+        "/view/windows/tiles/0/last_relaunch/by": "reset_all"
+      },
+      "note": "reset all skips the lent sandbox"
+    },
+    {
+      "after": 25,
+      "checks": {
+        "/receipts/r7/reason": "one reset all per 10 s per client"
+      }
+    },
+    {
+      "after": 26,
+      "checks": {
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/2/windows/actions": [],
+        "/receipts/a6/outcome": "committed",
+        "/view/windows/tiles/1/borrowed/session": "windows-claim-1",
+        "/view/windows/tiles/1/last_relaunch/by": "reset:windows-claim-1"
+      },
+      "note": "the holder's reset restores the VM and keeps the borrow; the old launch's actions are dropped"
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/view/windows/tiles/2/last_relaunch/first_frame_at": 11000
+      },
+      "note": "a host clock behind the coordinator cannot put the desktop before the click"
+    },
+    {
+      "after": 28,
+      "checks": {
+        "/assign/h1/2/generation": 4,
+        "/view/windows/borrow/lent": 0,
+        "/view/windows/tiles/1/borrowed": null,
+        "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-1"
+      },
+      "note": "the borrow ends: the sandbox is restored for the next viewer"
+    },
+    {
+      "after": 29,
+      "checks": {
+        "/receipts/c3/reason": "your last sandbox was returned 1 s ago; borrow again in 59 s"
+      }
+    },
+    {
+      "after": 31,
+      "checks": {
+        "/receipts/c4/reason": "win-2 is not running"
+      }
+    },
+    {
+      "after": 32,
+      "checks": {
+        "/receipts/c5/outcome": "committed",
+        "/view/windows/tiles/0/borrowed/session": "windows-claim-2"
+      }
+    },
+    {
+      "after": 33,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/view/windows/tiles/0/borrowed": null,
+        "/view/windows/tiles/0/last_relaunch/by": "return:windows-claim-2"
+      },
+      "note": "a viewer that leaves gives its sandbox back"
+    },
+    {
+      "after": 34,
+      "checks": {
+        "/receipts/x1/reason": "this viewer holds no sandbox"
+      }
+    },
+    {
+      "after": 35,
+      "checks": {
+        "/view/windows/image/gold": "ready",
+        "/view/windows/image/warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media"
+      }
+    },
+    {
+      "after": 36,
+      "checks": {
+        "/assign/h1/3": null,
+        "/view/windows/image/warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media",
+        "/view/windows/image_aspect": 3.5555555555555554,
+        "/view/windows/tiles/1/slot": "win-2",
+        "/view/windows/tiles/2": null
+      },
+      "note": "a hello with fewer sandboxes drops the rest and keeps the image"
+    },
+    {
+      "after": 37,
+      "checks": {
+        "/view/windows": null
+      },
+      "note": "no sandboxes, no windows in the state"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 3000,
+        "id": "r1",
+        "name": "windows_reset",
+        "outcome": "committed",
+        "summary": "reset win-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "win-3"
+        },
+        "at": 3500,
+        "id": "r2",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "one reset per 2 s per client",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3600,
+        "id": "r3",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "args must name a slot or say all",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-9"
+        },
+        "at": 3700,
+        "id": "r4",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "no sandbox \"win-9\"",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "all": true,
+          "slot": "win-3"
+        },
+        "at": 3800,
+        "id": "r4b",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "args must name a slot or say all",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 8000,
+        "id": "c1",
+        "name": "claim_windows",
+        "outcome": "committed",
+        "summary": "windows-claim-1 on win-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "notepad"
+        },
+        "at": 9000,
+        "id": "a1",
+        "name": "windows_action",
+        "outcome": "committed",
+        "summary": "notepad on win-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "cmd.exe /c calc"
+        },
+        "at": 9100,
+        "id": "a2",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "args.action must be one of start_menu, notepad, explorer, task_manager, about, terminal, close_all, reset",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "notepad",
+          "text": "hello",
+          "x": 0.5
+        },
+        "at": 9200,
+        "id": "a2b",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "args.text is not accepted",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "about"
+        },
+        "at": 9500,
+        "id": "a3",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "one action a second; wait 500 ms",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "terminal"
+        },
+        "at": 10500,
+        "id": "a4",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "win-2's host does not support terminal",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "notepad"
+        },
+        "at": 10600,
+        "id": "a5",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "sandbox actions need a sandbox of your own (claim_windows)",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 10700,
+        "id": "c2",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "1 of 1 sandboxes are already lent; the next comes back in 28 s",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 10800,
+        "id": "r5",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "win-2 is lent to a viewer",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "all": true
+        },
+        "at": 11000,
+        "id": "r6",
+        "name": "windows_reset",
+        "outcome": "committed",
+        "summary": "reset all 2 sandboxes",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "all": true
+        },
+        "at": 15000,
+        "id": "r7",
+        "name": "windows_reset",
+        "outcome": "refused",
+        "summary": "one reset all per 10 s per client",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "action": "reset",
+          "claim": "windows-claim-1"
+        },
+        "at": 16000,
+        "id": "a6",
+        "name": "windows_action",
+        "outcome": "committed",
+        "summary": "reset win-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 41000,
+        "id": "c3",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "your last sandbox was returned 1 s ago; borrow again in 59 s",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 42000,
+        "id": "c4",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "win-2 is not running",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 42100,
+        "id": "c5",
+        "name": "claim_windows",
+        "outcome": "committed",
+        "summary": "windows-claim-2 on win-1",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 44000,
+        "id": "x1",
+        "name": "release_windows",
+        "outcome": "refused",
+        "summary": "this viewer holds no sandbox",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 4,
+      "restores_last_hour": 4,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [
+      {
+        "host": "h1",
+        "kind": "host_reclaimed",
+        "retiling": true,
+        "since": 47000
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 2500,
+        "last_wake": null,
+        "sleep_without_arrival_at": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 1455,
+      "from_t": 48.5,
+      "generation": 2
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 42000,
+      "holding": "ridges",
+      "holding_label": "Across the ridges",
+      "leading": "peak-close",
+      "next": null,
+      "next_hold_at": 44000,
+      "next_label": null,
+      "opened_at": 40000,
+      "targets": [
+        {
+          "arrive_at": 61000,
+          "id": "peak-close",
+          "label": "Circling the peak",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "peak-west",
+          "label": "The peak from the west",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -85.416255,
+            0.959022,
+            -97.319808
+          ],
+          "pos": [
+            -30.821399,
+            2.183617,
+            -71.591669
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -82.854021,
+            2.196468,
+            -107.041988
+          ],
+          "pos": [
+            -32.312498,
+            2.237366,
+            -71.390428
+          ],
+          "t": 31.0
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -78.550373,
+            2.464257,
+            -115.214027
+          ],
+          "pos": [
+            -33.503134,
+            2.327439,
+            -71.221981
+          ],
+          "t": 32.0
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -74.295133,
+            2.380238,
+            -120.639428
+          ],
+          "pos": [
+            -34.347855,
+            2.381619,
+            -71.066239
+          ],
+          "t": 33.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.3,
+            2.4,
+            -122.65
+          ],
+          "pos": [
+            -34.8,
+            2.4,
+            -70.9
+          ],
+          "t": 34.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.54,
+            2.4,
+            -122.47
+          ],
+          "pos": [
+            -35.04,
+            2.4,
+            -70.72
+          ],
+          "t": 35.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.78,
+            2.4,
+            -122.29
+          ],
+          "pos": [
+            -35.28,
+            2.4,
+            -70.54
+          ],
+          "t": 36.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.02,
+            2.4,
+            -122.11
+          ],
+          "pos": [
+            -35.52,
+            2.4,
+            -70.36
+          ],
+          "t": 37.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.26,
+            2.4,
+            -121.93
+          ],
+          "pos": [
+            -35.76,
+            2.4,
+            -70.18
+          ],
+          "t": 38.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.5,
+            2.4,
+            -121.75
+          ],
+          "pos": [
+            -36.0,
+            2.4,
+            -70.0
+          ],
+          "t": 39.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.74,
+            2.4,
+            -121.57
+          ],
+          "pos": [
+            -36.24,
+            2.4,
+            -69.82
+          ],
+          "t": 40.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.98,
+            2.4,
+            -121.39
+          ],
+          "pos": [
+            -36.48,
+            2.4,
+            -69.64
+          ],
+          "t": 41.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.22,
+            2.4,
+            -121.21
+          ],
+          "pos": [
+            -36.72,
+            2.4,
+            -69.46
+          ],
+          "t": 42.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.46,
+            2.4,
+            -121.03
+          ],
+          "pos": [
+            -36.96,
+            2.4,
+            -69.28
+          ],
+          "t": 43.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.7,
+            2.4,
+            -120.85
+          ],
+          "pos": [
+            -37.2,
+            2.4,
+            -69.1
+          ],
+          "t": 44.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.94,
+            2.4,
+            -120.67
+          ],
+          "pos": [
+            -37.44,
+            2.4,
+            -68.92
+          ],
+          "t": 45.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.735,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7122,
+          "t": 34.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 1,
+      "count": 1
+    }
+  }
+}

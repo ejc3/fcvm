@@ -26,6 +26,8 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             phones: vec![],
             phone_actions: vec![],
             potato_players: 0,
+            windows: 0,
+            windows_actions: Vec::new(),
         },
     }
 }
@@ -189,6 +191,7 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 ipv4: None,
                 v4_port: None,
                 place: None,
+                desktop_at: None,
             }),
         });
     }
@@ -311,6 +314,8 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             phones: vec![],
             phone_actions: vec![],
             potato_players: 0,
+            windows: 0,
+            windows_actions: Vec::new(),
         },
     }];
     later.push(running(240000, "h1", "slot-1"));
@@ -530,6 +535,8 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 phones: (6..8).map(gpu).collect(),
                 phone_actions: vec![],
                 potato_players: 0,
+                windows: 0,
+                windows_actions: Vec::new(),
             },
         },
     );

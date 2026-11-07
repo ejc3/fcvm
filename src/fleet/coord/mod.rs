@@ -655,6 +655,26 @@ impl Actor {
                     let round = self.state.fleet.potato.round.as_ref().map(|r| r.id);
                     potato_log::log_event(&host, round, e);
                 }
+                if let AgentMsg::WindowsImage(w) = &msg {
+                    let was = self
+                        .state
+                        .fleet
+                        .hosts
+                        .get(&host)
+                        .and_then(|h| h.windows_image.as_ref());
+                    let news = |k: fn(&fleet_core::windows::WindowsImage) -> &Option<String>| {
+                        k(w).as_ref()
+                            .filter(|v| was.and_then(|o| k(o).as_ref()) != Some(*v))
+                    };
+                    if let Some(why) = news(|w| &w.refused) {
+                        tracing::error!(%host, image = %w.id, refused = %why, "the host's Windows image is refused");
+                    } else if let Some(why) = news(|w| &w.warning) {
+                        tracing::warn!(%host, image = %w.id, warning = %why, "the host's Windows image is old");
+                    }
+                    if let Some(e) = news(|w| &w.gold_error) {
+                        tracing::error!(%host, image = %w.id, error = %e, "the host's gold snapshot failed");
+                    }
+                }
                 let quarantined = match &msg {
                     AgentMsg::Quarantine { sbdf, report, .. } => {
                         Some((sbdf.clone(), report.clone()))
