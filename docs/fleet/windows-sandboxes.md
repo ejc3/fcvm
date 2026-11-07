@@ -423,5 +423,92 @@ done when the screen changed.
 
 ## Measurements
 
-To be filled by stack PR 2 from one session on one host: cold boot to desktop, snapshot size,
-restore to first desktop frame for 1, 4 and 8 clones at once, and private memory per clone.
+The prototype, 2026-11-07, one session on one g4dn.metal launched for it (Xeon Platinum
+8259CL, 96 vCPUs, 384 GiB, the fleet host image; nothing else ran on it during a
+measurement). The guest: Windows Server 2025 Datacenter evaluation, build 26100.1742, 2 vCPUs
+and 4 GiB, installed by the prototype of `fleet/windows/build-image.sh`, logged on over RDP,
+the client disconnected, then snapshotted. The prototype's idle check (the Cloud Hypervisor
+process's CPU, not its vCPU threads, under 2% of a core for 10 s) never passed: the desktop
+stayed at 12 to 13% of a core, the checks gave up after 300 s and 120 s, and the snapshot was
+taken anyway. Cloud Hypervisor is fcvm's fork (`fcvm-v52-sve-fix`) for the cold boots and the
+ondemand run, and that fork with `memory_restore_mode=map` (ejc3/cloud-hypervisor#1) for the
+restore comparison, copy included (the patch leaves the copy path unchanged). The RDP client is FreeRDP 3.17.2 built with FFmpeg, AVC444
+graphics, in each VM's network namespace; the scripts are a prototype of the agent's flow
+(network namespaces made by hand, a socat line for the clock), not fcvm's raw-VM mode.
+
+Times are from launching `cloud-hypervisor` (boot or `--restore`) on the host's clock:
+"RDP answer" is the first X.224 connection confirm from the guest, polled every 50 ms;
+"first update" is the first H.264 graphics update the client received, the client being
+started at the RDP answer. It is not checked to be the whole desktop: a screenshot of every
+client 20 s later shows the desktop, and the bridge (stack PR 6) times the first frame that
+matches it. N clones were restored at once, each into its own namespace with
+its own reflinked disk; three rounds, the modes interleaved within each round.
+
+### Image, boot and snapshot
+
+| | |
+|---|---|
+| unattended install under QEMU (8 vCPUs, 8 GiB), to power off after the setup scripts | 713 s |
+| first boot under Cloud Hypervisor (new hardware), launch to RDP answer | 17.4 s |
+| cold boot of the installed image, launch to RDP answer | 8.2 to 10.2 s (4 boots) |
+| cold boot, launch to the desktop (logon of an existing profile, RMSE match at 160x90 against the restored desktop, polled every 100 ms) | 18.8 to 21.2 s (3 boots) |
+| snapshot: pause, then `vm.snapshot` | 10 ms, then 2.60 s |
+| memory file | 4.00 GiB, dense on disk; 1,801 MiB of it non-zero pages (56% of the pages are zero) |
+| disk at the snapshot | 9.6 GiB allocated of 40 GiB |
+| idle desktop, session disconnected | 12 to 13% of one host core per sandbox, steady; the cause is not yet attributed (the guest agent's polling is one candidate) |
+
+### Restore to the first graphics update
+
+Each cell is the range of the three rounds' medians over the N clones, then the slowest clone
+of any round; "first update" includes the RDP connection (below).
+
+| N at once | | copy | map, memory file reflinked | map, memory file linked |
+|---|---|---|---|---|
+| 1 | RDP answer | 2.80 to 3.35 s | 1.05 to 1.15 s | 0.074 to 0.076 s |
+| 1 | first update | 4.16 to 4.60 s | 3.16 to 3.77 s | **2.19 to 2.58 s** |
+| 4 | RDP answer | 3.30 to 3.38 s (max 3.58) | 1.67 to 1.74 s (max 1.78) | 0.39 to 0.43 s (max 0.73) |
+| 4 | first update | 5.14 to 5.33 s (max 5.48) | 4.10 to 4.42 s (max 4.81) | **2.62 to 2.75 s (max 3.31)** |
+| 8 | RDP answer | 6.65 to 6.80 s (max 7.01) | 2.48 to 2.71 s (max 2.92) | 0.85 to 0.89 s (max 1.69) |
+| 8 | first update | 8.67 to 8.77 s (max 9.67) | 5.20 to 5.37 s (max 5.98) | **2.95 to 3.00 s (max 3.72)** |
+
+- **copy** reads the whole memory file into each clone's anonymous memory before the guest
+  runs. It took 2.8 to 3.4 s to the RDP answer for one clone and 6.6 to 6.8 s for eight at
+  once.
+- **ondemand** (Cloud Hypervisor's own userfaultfd handler) was worse on one clone: 3.7 s to
+  the RDP answer and 11.0 s to the first update (one run), and it still ended with all 4 GiB
+  resident.
+- **map** with the memory file reflinked into each clone's directory (as fcvm's restore
+  prepares it today) answers RDP after 1.0 to 1.2 s for one clone and 2.5 to 2.7 s for eight:
+  a reflink is a new inode with an empty page cache, so every clone reads its pages from disk.
+- **map with the memory file linked** (one inode for every clone) answers RDP in 74 to 76 ms
+  for one clone: the guest resumes with nothing read, and its pages come from a warm page
+  cache. Eight at once answer in 0.85 to 0.89 s (median).
+
+Mapped and linked, most of the time to the first update is after the RDP answer: 2.1 to 2.5 s
+for one clone, against 1.2 to 1.5 s with copy, whose guest memory is all resident when the
+client connects. That interval holds the RDP connection (TCP, TLS, the capability exchange),
+Windows reconnecting the disconnected session, the first update, and the guest's page faults
+on pages it has not touched yet; the bridge times each of its own steps, so the next
+measurement separates them.
+
+### Memory per clone
+
+Read from `/proc/<cloud-hypervisor>/smaps_rollup` 20 s after each restore, with the desktop
+shown: the range over the three rounds of the mean per clone.
+
+| N at once | | copy | map, reflinked | map, linked |
+|---|---|---|---|---|
+| 1 | resident | 4,102 MiB | 1,663 to 1,690 MiB | 1,699 to 1,703 MiB |
+| 1 | proportional (PSS) | 4,101 MiB | 1,661 to 1,688 MiB | 1,697 to 1,702 MiB |
+| 4 | PSS | 4,098 MiB | 1,662 to 1,668 MiB | 970 to 979 MiB |
+| 8 | PSS | 4,097 MiB | 1,659 to 1,663 MiB | 837 to 845 MiB |
+| any | private dirty | 2,023 to 2,073 MiB (and all 4 GiB private) | 692 to 720 MiB | 708 to 733 MiB |
+
+A copy-restored clone holds the whole 4 GiB as its own anonymous memory. A mapped clone
+holds only what the guest has touched (1.7 GiB resident), and of that only what it wrote
+(about 0.7 GiB) is its own: with the
+memory file linked, the clean pages are shared, so eight clones cost 845 MiB each in PSS
+against 4,097 MiB with copy, and a ninth costs about 0.7 GiB plus whatever pages no earlier
+clone touched.
+
+The design's choice follows: map, with the memory file linked, is stack PR 5.
