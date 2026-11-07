@@ -45,7 +45,7 @@
   <project name="platform/external/perfetto" path="external/perfetto" revision="37518c39e3db120322359090db3d54f6ac100078"/>
   <project name="platform/external/pkg-config" path="third_party/pkg-config" revision="110660333d9126a57154408fff5f675867cfd1f7" clone-depth="1"/>
   <project name="platform/external/protobuf" path="external/protobuf" revision="623d88a75a0b17ad2cc4be8fa79c3b97e7384a40"/>
-  <project name="ejc3/platform_external_qemu" path="external/qemu" remote="github" revision="840751c76df22efdaa412fec225cafc447b549b4">
+  <project name="ejc3/platform_external_qemu" path="external/qemu" remote="github" revision="cdcddd4e5c3ff5d8c05e40ef3c7de0a516c1c942">
     <copyfile src="android/vscode/emu.code-workspace" dest="emu.code-workspace"/>
     <linkfile src="toplevel.MODULE.bazel" dest="MODULE.bazel"/>
     <linkfile src="toplevel.MODULE.bazel.lock" dest="MODULE.bazel.lock"/>

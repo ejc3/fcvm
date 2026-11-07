@@ -30,5 +30,6 @@ if [ ! -f "$APK" ]; then
   tmp=$(mktemp "$WORK/robotpark.XXXXXX")
   cp "$built" "$tmp"
   mv "$tmp" "$APK"
+  rm -rf "$(dirname "$built")"
 fi
 echo "$APK"

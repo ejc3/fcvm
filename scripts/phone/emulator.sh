@@ -68,10 +68,14 @@ for p in ET.parse(manifest).getroot().iter("project"):
 if bad:
     sys.exit("emulator.sh: checkouts differ from the manifest:\n  " + "\n  ".join(bad))
 PY
+# --ccache none: rebuild.sh compiles through the sccache of its prebuilts by default, whose
+# client talks to one server per user on a fixed port (127.0.0.1:4226, sccache 0.3.0 has
+# no other endpoint), so two builds at once shared one server, and the second's compiles
+# failed once the first was done with it ("sccache: error: failed to execute compile").
 echo "emulator.sh: building (log $LOG)" >&2
 (
   cd external/qemu
-  android/rebuild.sh --target linux --task-disable ctest --task-disable coveragereport \
+  android/rebuild.sh --target linux --ccache none --task-disable ctest --task-disable coveragereport \
     --task-disable packagesamples --task-disable zipintegrationtests --task-disable integrationtest
 ) >> "$LOG" 2>&1 || { tail -40 "$LOG" >&2; exit 1; }
 rm -rf "$OUT.tmp"
