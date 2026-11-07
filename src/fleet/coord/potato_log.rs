@@ -220,9 +220,7 @@ impl Marks {
 pub enum RoundNote {
     /// The round being played stopped with no drop: a viewer's restart, or a new agent
     /// connection for the host.
-    EndedWithoutDrop {
-        round: u64,
-    },
+    EndedWithoutDrop { round: u64 },
     Started {
         round: u64,
         size: u32,
