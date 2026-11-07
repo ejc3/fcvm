@@ -238,6 +238,50 @@ fn resident(
     }
 }
 
+/// The pacer's view of the page cache, made on the warm-up's own thread the first time it is
+/// asked: opening a file and mapping it read its metadata, which a stalled filesystem can
+/// hold, and the server admits clones on the thread that starts a warm-up.
+///
+/// The probes read through a descriptor of their own, advised `POSIX_FADV_RANDOM`: a
+/// `RWF_NOWAIT` read of a page the cache does not hold may start the kernel's readahead,
+/// and on a descriptor without readahead that reads only the probed request's own pages,
+/// which the warm-up has asked for already, and none of their neighbours. The server's
+/// descriptor keeps its readahead, which its fault path's reads use.
+struct Probe {
+    image: Arc<File>,
+    file: Option<Option<File>>,
+    map: Option<Option<memmap2::Mmap>>,
+    scratch: Vec<u8>,
+}
+
+/// The residency question the server's shared pacer asks.
+type ResidentProbe = Box<dyn FnMut(Request) -> bool + Send>;
+
+impl Probe {
+    fn new(image: Arc<File>) -> Self {
+        Self {
+            image,
+            file: None,
+            map: None,
+            scratch: Vec::new(),
+        }
+    }
+
+    fn resident(&mut self, request: Request) -> bool {
+        use std::os::fd::AsRawFd;
+        let image = &self.image;
+        let file = self.file.get_or_insert_with(|| {
+            let file = File::open(format!("/proc/self/fd/{}", image.as_raw_fd())).ok()?;
+            let _ = posix_fadvise(&file, 0, 0, PosixFadviseAdvice::POSIX_FADV_RANDOM);
+            Some(file)
+        });
+        match file {
+            Some(file) => resident(file, &mut self.map, request, &mut self.scratch),
+            None => resident(image, &mut self.map, request, &mut self.scratch),
+        }
+    }
+}
+
 /// Whether every page of `request` is resident by `mincore` on `map`, a mapping of the file.
 /// `mincore` does not touch the pages, so a truncated file cannot fault here either.
 fn mapped_resident(map: &memmap2::Mmap, request: Request) -> bool {
@@ -548,6 +592,11 @@ fn warm_paced(
             stats.requests += 1;
             match advise(request) {
                 Ok(()) => stats.bytes += request.len,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    stats.requests -= 1;
+                    stats.stopped_early = true;
+                    break 'runs;
+                }
                 Err(error) => {
                     if stats.failures == 0 {
                         warn!(
@@ -768,15 +817,22 @@ pub(crate) struct Warmer {
     image: Arc<File>,
     mem_len: u64,
     shared: Arc<Shared>,
+    /// One pacer for every warm-up of this server, so a warm-up that starts while the last
+    /// one's final window is still being read waits for it: a pacer per warm-up let two
+    /// windows be outstanding at once.
+    pacer: Arc<std::sync::Mutex<Pacer<ResidentProbe>>>,
 }
 
 impl Warmer {
     pub(crate) fn new(snapshot_id: &str, image: Arc<File>, mem_len: u64) -> Self {
+        let mut probe = Probe::new(Arc::clone(&image));
+        let resident: ResidentProbe = Box::new(move |request| probe.resident(request));
         Self {
             snapshot: snapshot_id.to_string(),
             image,
             mem_len,
             shared: Arc::new(Shared::default()),
+            pacer: Arc::new(std::sync::Mutex::new(Pacer::new(IN_FLIGHT_BYTES, resident))),
         }
     }
 
@@ -793,16 +849,12 @@ impl Warmer {
     ) -> bool {
         let image = Arc::clone(&self.image);
         let stop = Arc::clone(&self.shared);
-        let probe = Arc::clone(&self.image);
-        // Made on the warm-up's thread, only where the filesystem refuses RWF_NOWAIT.
-        let mut map = None;
-        let mut scratch = Vec::new();
-        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| {
-            resident(&probe, &mut map, request, &mut scratch)
-        });
+        let pacer = Arc::clone(&self.pacer);
         self.warm_if_idle_with(trigger, recorded, move |request| {
+            let mut pacer = pacer.lock().unwrap_or_else(|e| e.into_inner());
             if !pacer.wait_for_room(request, &stop.stop) {
-                return Ok(());
+                // Not asked for: the warm-up counts it as a stop, not as requested bytes.
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
             }
             request_read(&image, request)?;
             pacer.issued(request);
@@ -1174,6 +1226,47 @@ mod tests {
         );
     }
 
+    /// A request the pacer gave up on because the serve is stopping is a stop: nothing was
+    /// asked of the kernel, so it is neither requested bytes nor a refusal.
+    #[test]
+    fn a_request_the_pacer_stopped_counts_as_a_stop() {
+        let mem_len = 64 * G;
+        let set = set_of(mem_len, &[(0, 8 * G)]);
+        let stop = AtomicBool::new(false);
+        let stats = warm_paced(&set, mem_len, PAGE, &stop, &mut |_| Pace::Go, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        });
+        assert!(stats.stopped_early);
+        assert_eq!(stats.bytes, 0);
+        assert_eq!(stats.failures, 0);
+        assert_eq!(stats.requests, 0);
+    }
+
+    /// A probe of a cold request reads, at most, the request's own pages: its descriptor has
+    /// no readahead, so the pages after it stay cold. A probe on the server's descriptor
+    /// started the kernel's readahead past the request, reads the pacer never counted.
+    #[test]
+    fn a_probe_reads_no_page_past_its_request() {
+        use testing::{evict, image_on_disk, resident_pages, MIB};
+        let file = Arc::new(image_on_disk(4 * MIB));
+        // SAFETY: a private test file nothing else truncates.
+        let map = unsafe { memmap2::Mmap::map(&*file) }.unwrap();
+        evict(&file);
+        let request = Request {
+            offset: MIB,
+            len: 4 * PAGE,
+        };
+        let mut probe = Probe::new(Arc::clone(&file));
+        let _ = probe.resident(request);
+        // The kernel's read of what the probe asked for may still be in flight.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            resident_pages(&map, MIB + 4 * PAGE, MIB),
+            0,
+            "a probe read pages past its request"
+        );
+    }
+
     /// The warm-up the server starts goes through the pacer: each request waits for room in
     /// the window before it is issued, and is counted once issued. Unpaced, the warm-up
     /// queued a whole recorded set (#986, #1069).
@@ -1198,10 +1291,20 @@ mod tests {
         // The server admits clones on the thread that calls this, so nothing here may wait on
         // the filesystem: the fallback mapping is made on the warm-up's own thread.
         assert!(!body.contains("Mmap::map"), "{body}");
+        // One pacer for every warm-up of the server, so a new one waits for the last window.
         assert!(
-            body.contains("Pacer::new(IN_FLIGHT_BYTES,"),
+            !body.contains("Pacer::new("),
+            "a warm-up makes a pacer of its own: {body}"
+        );
+        assert!(body.contains("Arc::clone(&self.pacer)"), "{body}");
+        assert!(
+            code.contains("Pacer::new(IN_FLIGHT_BYTES, resident)"),
             "the pacer's window is not IN_FLIGHT_BYTES"
         );
+        // The probes read through a descriptor without readahead.
+        let start = code.find("impl Probe {").expect("no Probe");
+        let probe = &code[start..start + code[start..].find("\n}\n").unwrap()];
+        assert!(probe.contains("POSIX_FADV_RANDOM"), "{probe}");
         // Residency comes from reading the page cache, not from mincore, which reports every
         // page of a file the process may not write as resident.
         let start = code.find("fn resident(").expect("no resident");
