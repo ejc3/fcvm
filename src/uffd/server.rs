@@ -5282,7 +5282,11 @@ mod tests {
 
         let mut observed = store.recorder();
         observed.insert_range(0, 4096);
-        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let persistence = WorkingSetPersistence::with_pack_builds(
+            Arc::clone(&store),
+            crate::uffd::working_set::PackBuilds::Off,
+        )
+        .unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         // Capacity one is deliberate: on the RED path the receive times out while I/O is
         // parked, then cleanup releases the lease and joins the thread. Its late completion
@@ -5448,7 +5452,11 @@ mod tests {
                 recorder.insert_range_at(offset, 4096, stamp);
             }
         }
-        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let persistence = WorkingSetPersistence::with_pack_builds(
+            Arc::clone(&store),
+            crate::uffd::working_set::PackBuilds::Off,
+        )
+        .unwrap();
         persist_observed_working_set("vm-late", Some(persistence.clone()), late.recorded.take());
         assert!(
             store.to_prefetch().is_empty(),

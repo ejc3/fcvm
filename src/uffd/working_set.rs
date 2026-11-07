@@ -620,12 +620,26 @@ pub(crate) struct WorkingSetPersistence {
 }
 
 impl WorkingSetPersistence {
+    /// A persistence worker for `store`, which also builds the snapshot's pack after each
+    /// publication, with its temporaries recorded in this user's reclaim directory.
     pub(crate) fn new(store: Arc<WorkingSetStore>) -> Result<Self> {
+        Self::with_pack_builds(store, PackBuilds::On { reclaim_dir: None })
+    }
+
+    /// [`WorkingSetPersistence::new`] with pack builds as `builds` says.
+    pub(crate) fn with_pack_builds(
+        store: Arc<WorkingSetStore>,
+        builds: PackBuilds,
+    ) -> Result<Self> {
         let (requests, receiver) = sync_channel(1);
         let worker_store = Arc::clone(&store);
+        let builder = match builds {
+            PackBuilds::On { reclaim_dir } => PackBuilder::new(Arc::clone(&store), reclaim_dir),
+            PackBuilds::Off => None,
+        };
         let worker = std::thread::Builder::new()
             .name("fcvm-ws-write".to_string())
-            .spawn(move || persistence_worker(worker_store, receiver))
+            .spawn(move || persistence_worker(worker_store, receiver, builder))
             .context("spawning working-set persistence worker")?;
         // Deliberately detach: unlike Tokio's blocking pool, a stuck hint writer must not be
         // joined during runtime/process teardown.
@@ -662,19 +676,35 @@ impl WorkingSetPersistence {
     }
 }
 
-fn persistence_worker(store: Arc<WorkingSetStore>, receiver: Receiver<PersistRequest>) {
+fn persistence_worker(
+    store: Arc<WorkingSetStore>,
+    receiver: Receiver<PersistRequest>,
+    builder: Option<PackBuilder>,
+) {
+    // The first publication pass of a server asks for a pack even when the sidecar did not
+    // change, so a snapshot whose pack is missing or stale gets one; after that, only a
+    // changed sidecar does. The builder skips a set whose pack is already on disk.
+    let mut asked = false;
     while let Ok(request) = receiver.recv() {
         match store.try_persist_known() {
-            Ok(Some(outcome)) => info!(
-                target: "uffd",
-                vm_id = %request.vm_id,
-                faulted_pages = request.faulted_pages,
-                learned_pages = request.learned_pages,
-                known_pages = outcome.total,
-                persisted = outcome.persisted,
-                superseded = outcome.superseded,
-                "merged this clone's faults into the snapshot's working set"
-            ),
+            Ok(Some((outcome, set))) => {
+                info!(
+                    target: "uffd",
+                    vm_id = %request.vm_id,
+                    faulted_pages = request.faulted_pages,
+                    learned_pages = request.learned_pages,
+                    known_pages = outcome.total,
+                    persisted = outcome.persisted,
+                    superseded = outcome.superseded,
+                    "merged this clone's faults into the snapshot's working set"
+                );
+                if let Some(builder) = &builder {
+                    if !outcome.superseded && (outcome.persisted || !asked) {
+                        asked = true;
+                        builder.request(set);
+                    }
+                }
+            }
             Ok(None) => debug!(
                 target: "uffd",
                 vm_id = %request.vm_id,
@@ -694,8 +724,122 @@ fn persistence_worker(store: Arc<WorkingSetStore>, receiver: Receiver<PersistReq
     }
 }
 
-/// Threads a pack build reads and compresses on.
+/// Whether a persistence worker builds the snapshot's pack after it publishes.
+pub(crate) enum PackBuilds {
+    /// It does, with each temporary recorded in `reclaim_dir` (`None`:
+    /// [`crate::reclaim::owner_dir`]).
+    On { reclaim_dir: Option<PathBuf> },
+    /// It does not: for tests of persistence alone, which must not write reclaim records in
+    /// the real data directory or build after they return.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Off,
+}
+
+/// Threads a pack build reads and compresses on. A build runs in the background after a clone
+/// exits, and nothing waits for it.
 pub(crate) const PACK_BUILD_THREADS: usize = 4;
+
+/// The thread that builds a served snapshot's pack after its sidecar is published.
+///
+/// Detached, like the persistence worker. It holds one pending set: a request made while a
+/// build runs replaces the pending one and cancels the running build at its next frame,
+/// because a pack is installed only beside the set it holds and the sidecar holds the newer
+/// set by then. A build that fails logs a warning, and replay reads the memory file.
+struct PackBuilder {
+    shared: Arc<PackRequests>,
+}
+
+#[derive(Default)]
+struct PackRequests {
+    pending: Mutex<PendingPack>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PendingPack {
+    set: Option<PageSet>,
+    /// The persistence worker is gone: the builder finishes what is pending and exits, so it
+    /// keeps the store no longer than the serve does.
+    closed: bool,
+}
+
+impl PackBuilder {
+    fn new(store: Arc<WorkingSetStore>, reclaim_dir: Option<PathBuf>) -> Option<Self> {
+        let shared = Arc::new(PackRequests::default());
+        let worker_shared = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("fcvm-ws-pack".to_string())
+            .spawn(move || pack_builder(store, worker_shared, reclaim_dir));
+        match spawned {
+            Ok(worker) => {
+                drop(worker);
+                Some(Self { shared })
+            }
+            Err(error) => {
+                warn!(target: "uffd", %error, "could not start the working-set pack builder; replay reads the memory file");
+                None
+            }
+        }
+    }
+
+    fn request(&self, set: PageSet) {
+        self.shared.pending.lock().expect("pack request mutex").set = Some(set);
+        self.shared.wake.notify_one();
+    }
+}
+
+impl Drop for PackBuilder {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.shared.pending.lock() {
+            pending.closed = true;
+        }
+        self.shared.wake.notify_one();
+    }
+}
+
+fn pack_builder(
+    store: Arc<WorkingSetStore>,
+    requests: Arc<PackRequests>,
+    reclaim_dir: Option<PathBuf>,
+) {
+    loop {
+        let set = {
+            let mut pending = requests.pending.lock().expect("pack request mutex");
+            loop {
+                if let Some(set) = pending.set.take() {
+                    break set;
+                }
+                if pending.closed {
+                    return;
+                }
+                pending = requests.wake.wait(pending).expect("pack request mutex");
+            }
+        };
+        let dir = match &reclaim_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => crate::reclaim::owner_dir(),
+        };
+        let started = std::time::Instant::now();
+        let cancel = || {
+            requests
+                .pending
+                .lock()
+                .is_ok_and(|pending| pending.set.is_some())
+        };
+        let built = dir.and_then(|dir| store.build_pack(&set, &dir, PACK_BUILD_THREADS, &cancel));
+        if built
+            .as_ref()
+            .is_err_and(|error| error.is::<pack::Cancelled>())
+        {
+            debug!(target: "uffd", "a newer working set replaced the one being packed");
+            continue;
+        }
+        log_pack_build(&store.pack_path(), &built, started.elapsed());
+        if matches!(built, Ok(PackBuild::Installed(_))) {
+            store.load_pack();
+        }
+    }
+}
 
 /// The one line a pack build logs.
 pub(crate) fn log_pack_build(path: &Path, built: &Result<PackBuild>, took: std::time::Duration) {
@@ -1036,6 +1180,7 @@ impl WorkingSetStore {
     /// waiting on `flock` or doing filesystem I/O.
     pub fn merge_and_persist(&self, observed: &PageSet) -> Result<MergeOutcome> {
         self.merge_and_persist_inner(observed, false)?
+            .map(|(outcome, _)| outcome)
             .ok_or_else(|| anyhow::anyhow!("blocking working-set lock unexpectedly contended"))
     }
 
@@ -1044,7 +1189,10 @@ impl WorkingSetStore {
     /// Another persistence worker already owns that lock when this returns `None`. The
     /// observations remain in `known`; that worker's queued successor or a later clone will
     /// publish the union. Contention can therefore cost a cache update, never liveness.
-    fn try_persist_known(&self) -> Result<Option<MergeOutcome>> {
+    ///
+    /// With the outcome comes the union the sidecar now holds, or would hold had publication
+    /// not been superseded: the set a pack is built for.
+    fn try_persist_known(&self) -> Result<Option<(MergeOutcome, PageSet)>> {
         self.merge_and_persist_inner(&PageSet::empty(self.mem_len), true)
     }
 
@@ -1052,7 +1200,7 @@ impl WorkingSetStore {
         &self,
         observed: &PageSet,
         nonblocking_sidecar: bool,
-    ) -> Result<Option<MergeOutcome>> {
+    ) -> Result<Option<(MergeOutcome, PageSet)>> {
         let mut merged = self.known.lock().expect("working set mutex").clone();
 
         // Snapshot creators/deleters take this inode exclusively. Keep the shared lease from
@@ -1137,12 +1285,15 @@ impl WorkingSetStore {
         }
 
         result?;
-        Ok(Some(MergeOutcome {
-            total,
-            added,
-            persisted,
-            superseded,
-        }))
+        Ok(Some((
+            MergeOutcome {
+                total,
+                added,
+                persisted,
+                superseded,
+            },
+            merged,
+        )))
     }
 
     /// Whether the snapshot generation and memory image at our paths are still the ones this
@@ -2273,7 +2424,8 @@ mod tests {
         let outcome = store
             .try_persist_known()
             .unwrap()
-            .expect("the retry must acquire the released sidecar");
+            .expect("the retry must acquire the released sidecar")
+            .0;
         assert!(outcome.persisted);
         assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 2);
     }
@@ -2455,6 +2607,41 @@ mod tests {
         observed.insert_range_at(0, 600 * GRANULE, 3);
         observed.insert_range_at(1000 * GRANULE, 300 * GRANULE, 40);
         observed
+    }
+
+    /// Publishing a clone's working set is followed, in the background, by a pack of exactly
+    /// the published set, which a later serve of the snapshot opens.
+    #[test]
+    fn a_pack_is_built_after_the_working_set_is_published() {
+        let mem_len = 2048 * GRANULE;
+        let image = patterned_image("pack-after-publish", mem_len);
+        let store = Arc::new(open_store(&image, mem_len));
+        let (_root, dir) = reclaim_dir();
+        bind(&store, &image);
+        let persistence = WorkingSetPersistence::with_pack_builds(
+            Arc::clone(&store),
+            PackBuilds::On {
+                reclaim_dir: Some(dir),
+            },
+        )
+        .unwrap();
+        persistence.schedule("vm-pack", recorded_set(&store));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while store.pack_for(&store.to_prefetch_ordered()).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no pack of the published set was built within 30 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reopened = open_store(&image, mem_len);
+        bind(&reopened, &image);
+        assert!(
+            reopened.load_pack().is_some(),
+            "a serve of the snapshot does not open the pack beside the sidecar"
+        );
+        assert_eq!(temporaries(&image), Vec::<String>::new());
     }
 
     /// A pack holds one image's bytes. Neither a store of the image that replaced it nor a
