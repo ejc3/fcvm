@@ -28,7 +28,11 @@ pub const CLOCK_LINE_ADDR: &str = "10.0.2.1:4600";
 /// The guest's address inside its namespace, set statically by its agent.
 pub const RAW_GUEST_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 2, 100);
 
-/// The Unix socket in a raw VM's data directory that reaches its Remote Desktop port.
+/// The directory in a raw VM's data directory that holds its `rdp.sock`, mode 0700 so only
+/// the VM's owner can reach the socket whatever the umask.
+pub const RDP_SOCKET_DIR: &str = "rdp";
+
+/// The Unix socket that reaches a raw VM's Remote Desktop port, in [`RDP_SOCKET_DIR`].
 pub const RDP_SOCKET: &str = "rdp.sock";
 
 /// The file in a raw VM's data directory holding the guest agent's last acknowledgement:
@@ -60,7 +64,42 @@ const NS_HELPER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// A raw VM's `rdp.sock`.
 pub fn rdp_socket_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(RDP_SOCKET)
+    data_dir.join(RDP_SOCKET_DIR).join(RDP_SOCKET)
+}
+
+/// Bind the Unix socket at `path` so that only this user can connect, whatever the umask:
+/// its directory is created (or tightened) to 0700 and the socket set to 0600 before
+/// anything accepts on it. A stale socket at the path is replaced.
+pub fn bind_private_unix(path: &Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = path.parent().context("a socket path with no directory")?;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    // The mode a create asks for is masked by the umask, and an existing directory keeps its
+    // own: set it outright.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("making {} private", dir.display()))?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("making {} private", path.display()))?;
+    Ok(listener)
+}
+
+/// Whether a peer of the RDP relay may use it: only a process of the helper's own user,
+/// which is fcvm's (the health probe) and the bridge's. The relay forwards bytes to the
+/// guest's Remote Desktop without authenticating them, so the socket's mode is not the only
+/// check.
+pub fn rdp_peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid
 }
 
 /// A raw VM's acknowledgement file.
@@ -163,14 +202,30 @@ pub async fn serve_clock_line(
     }
 }
 
-/// Relay every connection to `listener` to `target`, both ways, each on its own task. Runs
-/// until the listener fails.
+/// Relay every connection to `listener` from a peer of uid `allowed_uid` (`SO_PEERCRED`) to
+/// `target`, both ways, each on its own task; close any other. Runs until the listener fails.
 pub async fn serve_rdp_relay(
     listener: tokio::net::UnixListener,
     target: std::net::SocketAddr,
+    allowed_uid: u32,
 ) -> Result<()> {
     loop {
         let (client, _) = listener.accept().await.context("accepting on rdp.sock")?;
+        match client.peer_cred() {
+            Ok(cred) if rdp_peer_allowed(cred.uid(), allowed_uid) => {}
+            Ok(cred) => {
+                eprintln!(
+                    "rdp relay: refusing a peer of uid {} (pid {:?})",
+                    cred.uid(),
+                    cred.pid()
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!("rdp relay: reading a peer's credentials: {error}");
+                continue;
+            }
+        }
         tokio::spawn(async move {
             let guest = tokio::time::timeout(
                 RDP_RELAY_CONNECT_TIMEOUT,
@@ -221,13 +276,7 @@ async fn relay_until_one_side_ends(
 /// `fcvm vm ns-helper`: bind `rdp.sock` and the clock line, say so on stdout, and serve both.
 async fn cmd_ns_helper(args: NsHelperArgs) -> Result<()> {
     use std::io::Write;
-    match std::fs::remove_file(&args.rdp_socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("removing {}", args.rdp_socket.display())),
-    }
-    let rdp = tokio::net::UnixListener::bind(&args.rdp_socket)
-        .with_context(|| format!("binding {}", args.rdp_socket.display()))?;
+    let rdp = bind_private_unix(&args.rdp_socket)?;
     let clock = tokio::net::TcpListener::bind(CLOCK_LINE_ADDR)
         .await
         .with_context(|| format!("binding the clock line on {CLOCK_LINE_ADDR}"))?;
@@ -249,7 +298,8 @@ async fn cmd_ns_helper(args: NsHelperArgs) -> Result<()> {
     drop(null);
     let target = std::net::SocketAddr::from((RAW_GUEST_IP, args.rdp_port));
     tokio::try_join!(
-        serve_rdp_relay(rdp, target),
+        // SAFETY: geteuid has no preconditions.
+        serve_rdp_relay(rdp, target, unsafe { libc::geteuid() }),
         serve_clock_line(clock, args.generation, args.ack_file),
     )?;
     Ok(())
@@ -931,8 +981,9 @@ mod tests {
         });
         let socket = rdp_socket_path(dir.path());
         let relay = tokio::spawn(serve_rdp_relay(
-            tokio::net::UnixListener::bind(&socket).unwrap(),
+            bind_private_unix(&socket).unwrap(),
             target,
+            unsafe { libc::geteuid() },
         ));
         let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
         client.write_all(b"hello").await.unwrap();
@@ -946,6 +997,78 @@ mod tests {
         .unwrap();
         assert_eq!(&reply, b"HELLO");
         echo.await.unwrap();
+        relay.abort();
+    }
+
+    /// rdp.sock is reachable by its owner only, whatever the umask: under a umask of 0 its
+    /// directory is 0700 and the socket 0600, and a directory that already existed with
+    /// wider permissions is tightened. The relay closes a peer whose uid is not the
+    /// helper's without connecting to the guest, and relays one whose uid is.
+    #[tokio::test]
+    async fn rdp_sock_is_private_and_serves_only_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // nextest runs each test in a process of its own, so the umask is this test's.
+        // SAFETY: umask has no preconditions.
+        unsafe { libc::umask(0) };
+        let dir = tempfile::tempdir().unwrap();
+        let socket = rdp_socket_path(dir.path());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let listener = bind_private_unix(&socket).unwrap();
+        assert_eq!(mode(socket.parent().unwrap()), 0o700);
+        assert_eq!(mode(&socket), 0o600);
+        drop(listener);
+        std::fs::set_permissions(
+            socket.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let listener = bind_private_unix(&socket).unwrap();
+        assert_eq!(
+            mode(socket.parent().unwrap()),
+            0o700,
+            "an existing directory is tightened"
+        );
+
+        let me = unsafe { libc::geteuid() };
+        assert!(rdp_peer_allowed(me, me));
+        assert!(!rdp_peer_allowed(me + 1, me));
+        assert!(!rdp_peer_allowed(65534, me));
+
+        // A relay that allows another uid treats this test as a stranger.
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = guest.local_addr().unwrap();
+        let relay = tokio::spawn(serve_rdp_relay(listener, target, me + 1));
+        let mut stranger = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stranger.read(&mut byte))
+                .await
+                .expect("the relay closes a stranger's connection");
+        assert!(matches!(read, Ok(0) | Err(_)), "a stranger got {read:?}");
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(300), guest.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the relay connected a stranger to the guest"
+        );
+        relay.abort();
+
+        // The owner is relayed.
+        let relay = tokio::spawn(serve_rdp_relay(
+            bind_private_unix(&socket).unwrap(),
+            target,
+            me,
+        ));
+        let mut owner = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        owner.write_all(b"x").await.unwrap();
+        let (mut guest_side, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), guest.accept())
+                .await
+                .expect("the owner is relayed")
+                .unwrap();
+        guest_side.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"x");
         relay.abort();
     }
 
@@ -978,8 +1101,9 @@ mod tests {
         });
         let socket = rdp_socket_path(dir.path());
         let relay = tokio::spawn(serve_rdp_relay(
-            tokio::net::UnixListener::bind(&socket).unwrap(),
+            bind_private_unix(&socket).unwrap(),
             target,
+            unsafe { libc::geteuid() },
         ));
         let baseline = open_sockets();
         let mut held = Vec::new();

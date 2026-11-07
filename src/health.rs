@@ -1627,7 +1627,8 @@ mod tests {
     fn fake_rdp_sock(dir: &std::path::Path, fake: FakeRdp) -> tokio::task::JoinHandle<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener =
-            tokio::net::UnixListener::bind(crate::commands::vm::rdp_socket_path(dir)).unwrap();
+            crate::commands::vm::bind_private_unix(&crate::commands::vm::rdp_socket_path(dir))
+                .unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; RDP_CONNECTION_REQUEST.len()];
