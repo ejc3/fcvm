@@ -121,7 +121,7 @@ function bodyOf(u: number, aspect: number): { pad: Pad; w: number; h: number; sw
 }
 
 /** The rows of a set of rectangles: each tile's row and its place in it, and the longest row. */
-function gridOf(tiles: readonly Tile[]): { rows: number; cols: number; at: Map<string, { row: number; col: number; len: number }> } {
+export function gridOf(tiles: readonly Tile[]): { rows: number; cols: number; at: Map<string, { row: number; col: number; len: number }> } {
   const ys: number[] = [];
   for (const t of [...tiles].sort((a, b) => a.rect.y - b.rect.y)) if (!ys.some((y) => Math.abs(y - t.rect.y) < SAME)) ys.push(t.rect.y);
   const rowOf = (t: Tile) => ys.findIndex((y) => Math.abs(y - t.rect.y) < SAME);
@@ -253,7 +253,7 @@ export function phoneName(t: { id: string }): string {
   return k === undefined ? t.id : `Phone ${k}`;
 }
 
-const tenths = (ms: number) => `${(Math.max(0, ms) / 1000).toFixed(1)} s`;
+export const tenths = (ms: number) => `${(Math.max(0, ms) / 1000).toFixed(1)} s`;
 
 /**
  * How a phone says it was restored: "Phone restored in 4.6 s" from the click to the app's first
@@ -309,7 +309,7 @@ export function phoneNotice(notices: readonly Notice[]): string | null {
 
 // ---- the draw plan -------------------------------------------------------------------
 
-function isLive(t: Tile): boolean {
+export function isLive(t: Tile): boolean {
   return t.phase === "running" && (t.frame_url !== null || t.frame_url_v4 !== null);
 }
 
@@ -323,34 +323,47 @@ export interface PhonesPlanInput {
   noVideo?: string | null;
 }
 
+export interface DirectPlanInput {
+  state: ClientState;
+  tiles: readonly Tile[];
+  /** The width over height of the tiles' image, for the cost of each stream. */
+  imageAspect: number;
+  /** Where each tile is drawn; a tile with no box streams nothing. */
+  boxes: ReadonlyMap<string, Box | null>;
+  dpr: number;
+  reducedMotion: boolean;
+  /** A tile whose video this viewer does not receive. */
+  noVideo?: string | null;
+}
+
 /**
- * What the frame drawer gets: one direct stream per phone placed, each filling its own box (the
- * plan has no image, so the drawer does not seat frames by the stream's grid), and a phone that
- * is not running drawn dark. A phone that is not placed (another is opened) streams nothing.
+ * What the frame drawer gets for tiles that are not part of the wall's picture (phones, Windows
+ * sandboxes): one direct stream per tile placed, each filling its own box (the plan has no image,
+ * so the drawer does not seat frames by the stream's grid), and a tile that is not running drawn
+ * dark. A tile that is not placed streams nothing.
  */
-export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
-  const { state: s, phones, layout, dpr } = inp;
-  const boxOf = new Map(layout.phones.map((p) => [p.id, p.box]));
+export function directPlan(inp: DirectPlanInput): DrawPlan {
+  const { state: s, dpr } = inp;
   const family = s.net.family;
-  // phone streams take the direct seat's token as the wall's do (the streamer checks it)
+  // these streams take the direct seat's token as the wall's do (the streamer checks it)
   const admit = s.admission?.direct?.value ?? null;
   // a viewer who came when every seat was held has no token, and the streamer refuses it
   const seated = s.admission?.locked !== true;
   let bps = 0;
   const direct: DrawSource[] = [];
-  for (const t of phones.tiles) {
+  for (const t of inp.tiles) {
     if (!seated) break;
-    const box = boxOf.get(t.id) ?? null;
+    const box = inp.boxes.get(t.id) ?? null;
     const base = streamUrl(t, family);
     if (box === null || base === null || !isLive(t) || t.id === inp.noVideo) continue;
     const height = streamHeightFor(box.h * dpr, box.w / box.h);
-    bps += streamBitrate(t.rect, phones.image_aspect, height);
+    bps += streamBitrate(t.rect, inp.imageAspect, height);
     direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height, "std"), baseUrl: base, height, box, admit });
   }
-  const tiles: DrawTile[] = phones.tiles.map((t) => ({
+  const tiles: DrawTile[] = inp.tiles.map((t) => ({
     id: t.id,
     half: t.half,
-    box: boxOf.get(t.id) ?? null,
+    box: inp.boxes.get(t.id) ?? null,
     dark: t.phase !== "running",
     outline: COLORS.fcvm.darkOutline,
     slowFade: false,
@@ -374,6 +387,19 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
     gen: 0,
     atT: 0,
   };
+}
+
+/** The phones' plan: one direct stream per phone placed. */
+export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
+  return directPlan({
+    state: inp.state,
+    tiles: inp.phones.tiles,
+    imageAspect: inp.phones.image_aspect,
+    boxes: new Map(inp.layout.phones.map((p) => [p.id, p.box])),
+    dpr: inp.dpr,
+    reducedMotion: inp.reducedMotion,
+    noVideo: inp.noVideo ?? null,
+  });
 }
 
 // ---- the view -----------------------------------------------------------------------
@@ -669,7 +695,7 @@ export interface PhonesView {
   sleep: SleepView | null;
 }
 
-const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
+export const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
   mode: "direct",
   direct: [],
   aggregated: [],

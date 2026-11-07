@@ -18,4 +18,5 @@ export * from "./broadcast.ts";
 export * from "./view.ts";
 export * from "./phones.ts";
 export * from "./potato.ts";
+export * from "./windows.ts";
 export * as fmt from "./format.ts";

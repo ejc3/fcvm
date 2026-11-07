@@ -388,6 +388,57 @@ export interface Phones {
   tiles: PhoneTile[];
 }
 
+/** A Windows sandbox: a Tile with the take-over actions it accepts (those its host carries out, and `reset`). */
+export interface WindowTile extends Tile {
+  actions: string[];
+}
+
+/** The gold snapshot every sandbox is cloned from. */
+export type WindowsGold = "building" | "ready" | "failed";
+
+/** The Windows image behind the sandboxes (PROTOCOL.md, "Windows mode": `image`). */
+export interface WindowsImage {
+  id: string;
+  edition: string;
+  build: string;
+  installed_at: string;
+  eval_expires: string;
+  /** Whole days since the installation. */
+  age_days: number;
+  /** From 150 days after the installation. */
+  warning: string | null;
+  /** Set once the agent refuses to start sandboxes from this image. */
+  refused: string | null;
+  gold: WindowsGold;
+  /** Why the gold snapshot failed. */
+  gold_error: string | null;
+}
+
+/** The last committed reset of every sandbox. */
+export interface WindowsResetAll {
+  clicked_at: number;
+  /** `viewer:<id>`, or whatever else the coordinator names. */
+  by: string;
+  sandboxes: number;
+}
+
+/**
+ * Windows mode (PROTOCOL.md, "Windows mode"): disposable Windows sandboxes laid out in an image
+ * of their own, never part of the wall. A sandbox is a Tile, with the borrow named in `borrowed`.
+ */
+export interface Windows {
+  /** The line every tile and the take-over panel show. */
+  label: string;
+  /** Width over height of the sandboxes' image: one row of up to four, then rows of equal length. */
+  image_aspect: number;
+  /** How long a borrow lasts, seconds. */
+  claim_secs: number;
+  borrow: Borrow;
+  image: WindowsImage | null;
+  last_reset_all: WindowsResetAll | null;
+  tiles: WindowTile[];
+}
+
 /**
  * Potato mode (PROTOCOL.md, "Potato mode"; fleet/core/src/potato.rs, `PotatoView`): a ladder of
  * rings of CPU-only player VMs passing a ball. Absent until a host has run players.
@@ -518,6 +569,8 @@ export interface FleetState {
   phones: Phones | null;
   /** Null until a host has run potato players. */
   potato: Potato | null;
+  /** Null when the fleet runs no Windows sandboxes. */
+  windows: Windows | null;
 }
 
 export interface SnapshotMsg {
@@ -623,7 +676,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart", "windows_reset", "claim_windows", "release_windows", "windows_action"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -829,6 +882,61 @@ function parsePhones(v: unknown): Phones | null {
     borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
     zoomed_out: v["zoomed_out"] === true,
     zoom_at: numOrNull(v, "zoom_at", w),
+    tiles,
+  };
+}
+
+const WINDOWS_GOLD: readonly WindowsGold[] = ["building", "ready", "failed"];
+
+function parseWindowsImage(v: unknown, where: string): WindowsImage | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  const gold = str(v, "gold", where);
+  const known = WINDOWS_GOLD.find((g) => g === gold);
+  if (known === undefined) throw new ProtocolError(`${where}.gold is ${gold}`);
+  return {
+    id: str(v, "id", where),
+    edition: str(v, "edition", where),
+    build: str(v, "build", where),
+    installed_at: str(v, "installed_at", where),
+    eval_expires: str(v, "eval_expires", where),
+    age_days: num(v, "age_days", where),
+    warning: strOrNull(v, "warning", where),
+    refused: strOrNull(v, "refused", where),
+    gold: known,
+    gold_error: strOrNull(v, "gold_error", where),
+  };
+}
+
+function parseWindowsResetAll(v: unknown, where: string): WindowsResetAll | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), sandboxes: num(v, "sandboxes", where) };
+}
+
+function parseWindows(v: unknown): Windows | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("windows is not an object");
+  const w = "windows";
+  const aspect = num(v, "image_aspect", w);
+  if (aspect <= 0) throw new ProtocolError("windows.image_aspect is not positive");
+  const b = obj(v, "borrow", w);
+  const tiles: WindowTile[] = arr(v, "tiles", w).map((t, i) => ({
+    ...parseTile(t, i),
+    actions: arr(t as Obj, "actions", `${w}.tiles[${i}]`).filter((x): x is string => typeof x === "string"),
+  }));
+  const ids = new Set<string>();
+  for (const t of tiles) {
+    if (ids.has(t.id)) throw new ProtocolError(`sandbox ${t.id} appears twice`);
+    ids.add(t.id);
+  }
+  return {
+    label: str(v, "label", w),
+    image_aspect: aspect,
+    claim_secs: num(v, "claim_secs", w),
+    borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
+    image: parseWindowsImage(v["image"], `${w}.image`),
+    last_reset_all: parseWindowsResetAll(v["last_reset_all"], `${w}.last_reset_all`),
     tiles,
   };
 }
@@ -1157,6 +1265,7 @@ function parseState(o: Obj): FleetState {
     }),
     phones: parsePhones(o["phones"]),
     potato: parsePotato(o["potato"]),
+    windows: parseWindows(o["windows"]),
   };
 }
 

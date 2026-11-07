@@ -64,6 +64,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     aggregates: [],
     phones: null,
     potato: null,
+    windows: null,
     ...over,
   };
 }

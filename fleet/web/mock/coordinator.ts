@@ -19,6 +19,7 @@ import type { PatternScene } from "./pattern.ts";
 import { mockLayout } from "./layout.ts";
 import { MockPhones, type MockPhonesOptions } from "./phones.ts";
 import { MockPotato, type MockPotatoOptions } from "./potato.ts";
+import { MockWindows, type MockWindowsOptions } from "./windows.ts";
 
 export interface CoordinatorOptions {
   port: number;
@@ -60,6 +61,8 @@ export interface CoordinatorOptions {
   phones?: MockPhonesOptions;
   /** A host running potato players (potato mode): none unless set. */
   potato?: MockPotatoOptions;
+  /** Windows sandboxes (windows mode): none unless set. */
+  windows?: MockWindowsOptions;
   /** Delay of the fake text check. */
   checkMs: number;
   epochUnixMs: number;
@@ -311,6 +314,7 @@ export class MockCoordinator {
   private recorded = new WeakSet<Race>();
   private phones: MockPhones | null = null;
   private potato: MockPotato | null = null;
+  private windows: MockWindows | null = null;
 
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
@@ -338,6 +342,19 @@ export class MockCoordinator {
     }
     if (opts.potato && opts.potato.players > 0) {
       this.potato = new MockPotato(opts.potato, { now: () => this.now(), later: (ms, fn) => this.later(ms, fn), markDirty: () => this.markDirty() });
+    }
+    if (opts.windows && opts.windows.count > 0) {
+      this.windows = new MockWindows(
+        opts.windows,
+        {
+          now: () => this.now(),
+          later: (ms, fn) => this.later(ms, fn),
+          markDirty: () => this.markDirty(),
+          scene: () => this.patternScene(),
+          renderers: opts.renderers,
+        },
+        start,
+      );
     }
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
     this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, openedAt: start, votes: new Map() };
@@ -516,6 +533,7 @@ export class MockCoordinator {
       })),
       ...(this.phones ? { phones: this.phones.state() } : {}),
       ...(this.potato ? { potato: this.potato.state() } : {}),
+      ...(this.windows ? { windows: this.windows.state() } : {}),
     };
   }
 
@@ -582,6 +600,7 @@ export class MockCoordinator {
       this.clients.delete(client);
       if (client.claim && client.claim.phase !== "ended") this.endClaim(client.claim, "The viewer left.");
       this.phones?.left(client.viewer);
+      this.windows?.left(client.viewer);
       this.markDirty();
     });
     ws.on("error", () => {});
@@ -631,7 +650,7 @@ export class MockCoordinator {
     // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
     // stream: the coordinator refuses both before anything else, a repeated intent id included
     // (its receipt is not looked up), and records nothing (src/fleet/coord/live.rs, LATE_CLAIM).
-    if (client.late && (name === "claim_gpu" || name === "claim_phone")) {
+    if (client.late && (name === "claim_gpu" || name === "claim_phone" || name === "claim_windows")) {
       this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
       return;
     }
@@ -812,7 +831,8 @@ export class MockCoordinator {
         const reply = { refuse: (r: string) => this.refuse(c, r), committed: (s: string) => this.committed(c, s) };
         const phone = this.phones?.apply<Receipt>(c.viewer, name, args, reply);
         const potato = phone ?? this.potato?.apply<Receipt>(c.viewer, name, reply);
-        return potato ?? this.refuse(c, `unknown intent "${name}"`);
+        const windows = potato ?? this.windows?.apply<Receipt>(c.viewer, name, args, reply);
+        return windows ?? this.refuse(c, `unknown intent "${name}"`);
       }
     }
   }
@@ -1535,6 +1555,10 @@ export class MockCoordinator {
       json(200, { actions: this.phones?.actions ?? [] });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/mock/windows-actions") {
+      json(200, { actions: this.windows?.actions ?? [], intents: this.windows?.intents ?? [] });
+      return;
+    }
     if (req.method !== "POST") {
       res.writeHead(404).end();
       return;
@@ -1546,6 +1570,16 @@ export class MockCoordinator {
           this.phones.reset({
             ...(typeof b["zoomed_out"] === "boolean" ? { zoomed_out: b["zoomed_out"] } : {}),
             ...(b["release_all"] === true ? { release_all: true } : {}),
+          });
+          return { ok: true };
+        });
+        return;
+      case "/mock/windows":
+        body((b) => {
+          if (!this.windows) throw new Error("the mock runs no Windows sandboxes (FLEET_MOCK_WINDOWS)");
+          this.windows.reset({
+            ...(b["release_all"] === true ? { release_all: true } : {}),
+            ...(typeof b["image_age_days"] === "number" ? { image_age_days: b["image_age_days"] } : {}),
           });
           return { ok: true };
         });
@@ -1570,6 +1604,13 @@ export class MockCoordinator {
             for (const [slot, offers] of Object.entries(b["phone_offers"] as Record<string, unknown>)) {
               if (!Array.isArray(offers) || offers.some((a) => typeof a !== "string")) throw new Error(`phone_offers.${slot} must be a list of action names`);
               this.phones.setOffers(slot, offers as string[]);
+            }
+          }
+          if (typeof b["windows_offers"] === "object" && b["windows_offers"] !== null) {
+            if (!this.windows) throw new Error("the mock runs no Windows sandboxes (FLEET_MOCK_WINDOWS)");
+            for (const [slot, offers] of Object.entries(b["windows_offers"] as Record<string, unknown>)) {
+              if (!Array.isArray(offers) || offers.some((a) => typeof a !== "string")) throw new Error(`windows_offers.${slot} must be a list of action names`);
+              this.windows.setOffers(slot, offers as string[]);
             }
           }
           if (typeof b["fail"] === "string") {
@@ -1710,6 +1751,7 @@ export class MockCoordinator {
     for (const r of this.tiles) if (r.timer) clearTimeout(r.timer);
     this.phones?.close();
     this.potato?.close();
+    this.windows?.close();
     for (const c of this.clients) c.ws.terminate();
     this.wss.close();
     await new Promise<void>((r) => this.server.close(() => r()));

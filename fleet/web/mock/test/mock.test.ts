@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
 import { MockCoordinator } from "../coordinator.ts";
+import { MockWindows } from "../windows.ts";
 import { gridIn, mockLayout } from "../layout.ts";
 import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
@@ -28,6 +29,7 @@ beforeAll(async () => {
     sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
     refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
     phones: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 150, zoomGapMs: 300 },
+    windows: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 300 },
   });
   await coord.listen();
 });
@@ -971,6 +973,327 @@ describe("mock phones", () => {
   });
 });
 
+describe("mock windows", () => {
+  type WindowsState = {
+    label: string;
+    image_aspect: number;
+    claim_secs: number;
+    borrow: { cap: number; lent: number; next_return_at: number | null };
+    image: { age_days: number; warning: string | null; refused: string | null; gold: string } | null;
+    last_reset_all: { clicked_at: number; by: string; sandboxes: number } | null;
+    tiles: { id: string; slot: string; phase: string; actions: string[]; rect: unknown; borrowed: { session: string; viewer: string } | null; last_relaunch: { by: string; clicked_at: number; first_frame_at: number | null } }[];
+  };
+  const winNow = () => (coord.fleetState() as unknown as { windows: WindowsState }).windows;
+  let seq = 0;
+  /** Send an intent and wait for its receipt. */
+  async function send(c: Awaited<ReturnType<typeof live>>, name: string, args: Record<string, unknown> = {}) {
+    const id = `win-${++seq}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name, args }));
+    return (await c.next((m) => m["type"] === "receipt" && m["id"] === id)) as { outcome: string; reason?: string };
+  }
+  const settle = async () => {
+    await admin("/mock/windows", { release_all: true });
+    await until(() => winNow().tiles.every((t) => t.phase === "running"));
+  };
+  const record = async () => (await (await fetch(`http://localhost:${coord.port}/mock/windows-actions`)).json()) as { actions: { action: string; sandbox: string; session: string }[]; intents: { name: string; outcome: string }[] };
+
+  it("lays the sandboxes out as one row of 16:9 desktops, with a stream each, apart from the wall and the phones", async () => {
+    await settle();
+    const w = winNow();
+    expect(w.label).toBe("Windows Server 2025 evaluation, for demonstration only");
+    expect(w.tiles.map((t) => [t.id, t.slot])).toEqual([["win:1", "win-1"], ["win:2", "win-2"], ["win:3", "win-3"]]);
+    expect(w.image_aspect).toBeCloseTo((3 * 16) / 9, 9);
+    expect(w.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
+    expect(w.tiles.every((t) => t.actions.join() === "start_menu,notepad,explorer,task_manager,about,terminal,close_all,reset")).toBe(true);
+    expect(w.image).toMatchObject({ age_days: 12, warning: null, refused: null, gold: "ready" });
+    const st = coord.fleetState();
+    expect(st.tiles.some((t) => t.id.startsWith("win"))).toBe(false);
+    expect((st as unknown as { phones: { tiles: { id: string }[] } }).phones.tiles.some((t) => t.id.startsWith("win"))).toBe(false);
+  });
+
+  it("serves a stream for each sandbox, in the sandboxes' own image", async () => {
+    await settle();
+    const w = winNow();
+    const urls = (coord.fleetState() as unknown as { windows: { tiles: { frame_url: string | null }[] } }).windows.tiles.map((t) => t.frame_url);
+    expect(urls.every((u) => typeof u === "string" && u.includes("win-"))).toBe(true);
+    const ws = new WebSocket(`${urls[1]}?h=180`);
+    const got = await new Promise<number>((res, rej) => {
+      const to = setTimeout(() => rej(new Error("no frame")), 8000);
+      ws.on("message", (d, bin) => {
+        if (!bin) return;
+        const p = parseFrame(new Uint8Array(d as Buffer));
+        if (p.ok) {
+          clearTimeout(to);
+          res(p.frame.frame);
+        }
+      });
+      ws.on("error", rej);
+    });
+    ws.close();
+    expect(got).toBeGreaterThanOrEqual(0);
+    expect(w.tiles).toHaveLength(3);
+  });
+
+  it("resets one sandbox: restoring, then connecting, then running with a new restore, timed from the click", async () => {
+    await settle();
+    const a = await live();
+    const before = winNow().tiles[1]!.last_relaunch.clicked_at;
+    expect(await send(a, "windows_reset", { slot: "win-2" })).toMatchObject({ outcome: "committed" });
+    const t = winNow().tiles[1]!;
+    expect(t).toMatchObject({ phase: "restoring", last_relaunch: { first_frame_at: null } });
+    expect(t.last_relaunch.by).toMatch(/^viewer:/);
+    expect(t.last_relaunch.clicked_at).toBeGreaterThan(before);
+    await until(() => winNow().tiles[1]!.phase === "connecting");
+    await until(() => winNow().tiles[1]!.phase === "running");
+    const done = winNow().tiles[1]!.last_relaunch;
+    expect(done.first_frame_at! - done.clicked_at).toBeGreaterThanOrEqual(250);
+    a.ws.close();
+  });
+
+  it("limits a client to one reset every 2 s, and refuses the unknown, the lent and badly named", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    expect(await send(a, "windows_reset", { slot: "win-1" })).toMatchObject({ outcome: "committed" });
+    expect(await send(a, "windows_reset", { slot: "win-3" })).toMatchObject({ outcome: "refused", reason: "one reset per 2 s per client" });
+    // another client is not held by the first one's interval
+    expect(await send(b, "windows_reset", { slot: "win-3" })).toMatchObject({ outcome: "committed" });
+    expect(await send(b, "windows_reset", {})).toMatchObject({ outcome: "refused", reason: "args must name a slot or say all" });
+    expect(await send(b, "windows_reset", { slot: "win-1", all: true })).toMatchObject({ outcome: "refused", reason: "args must name a slot or say all" });
+    await sleep(2050);
+    expect(await send(a, "windows_reset", { slot: "win-9" })).toMatchObject({ outcome: "refused", reason: 'no sandbox "win-9"' });
+    expect(await send(a, "claim_windows", { slot: "win-2" })).toMatchObject({ outcome: "committed" });
+    expect(await send(b, "windows_reset", { slot: "win-2" })).toMatchObject({ outcome: "refused", reason: "win-2 is lent to a viewer" });
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("resets every sandbox that is not lent, once per 10 s per client, and records the last reset all", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    await send(a, "claim_windows", { slot: "win-3" });
+    expect(winNow().last_reset_all).toBeNull();
+    expect(await send(b, "windows_reset", { all: true })).toMatchObject({ outcome: "committed" });
+    const w = winNow();
+    expect(w.last_reset_all).toMatchObject({ sandboxes: 2 });
+    expect(w.last_reset_all!.by).toMatch(/^viewer:/);
+    expect(w.tiles.map((t) => t.last_relaunch.by === "reset_all")).toEqual([true, true, false]);
+    expect(w.tiles[0]!.phase).toBe("restoring");
+    expect(w.tiles[2]!.phase).toBe("running");
+    expect(await send(b, "windows_reset", { all: true })).toMatchObject({ outcome: "refused", reason: "one reset all per 10 s per client" });
+    await until(() => winNow().tiles.every((t) => t.phase === "running"));
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("reset all from a third viewer resets only the sandboxes that are not lent", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    const c = await live();
+    await admin("/mock/windows", { release_all: true });
+    await send(a, "claim_windows", { slot: "win-1" });
+    await send(b, "claim_windows", { slot: "win-2" });
+    expect(await send(c, "windows_reset", { all: true })).toMatchObject({ outcome: "committed" });
+    expect(winNow().last_reset_all).toMatchObject({ sandboxes: 1 });
+    for (const x of [a, b, c]) x.ws.close();
+  });
+
+  it("refuses reset all when every sandbox is lent", () => {
+    const host = {
+      now: () => Date.now(),
+      later: (ms: number, fn: () => void) => setTimeout(fn, ms),
+      markDirty: () => 1,
+      scene: () => coord.patternScene(),
+      renderers: { setTile() {}, setAvailable() {}, frameUrl: () => "ws://example-host:1/frames/x", frameUrlV4: () => "ws://example-host-v4:1/frames/x" } as unknown as MockRenderers,
+    };
+    const only = new MockWindows({ count: 1, cap: 1, claimSecs: 5, cooldownSecs: 0, restoreMs: 50 }, host, Date.now());
+    const reply = {
+      refuse: (reason: string): { outcome: string; reason?: string } => ({ outcome: "refused", reason }),
+      committed: (summary: string): { outcome: string; reason?: string } => ({ outcome: "committed", reason: summary }),
+    };
+    try {
+      expect(only.apply("a", "claim_windows", {}, reply)).toMatchObject({ outcome: "committed" });
+      expect(only.apply("b", "windows_reset", { all: true }, reply)).toEqual({ outcome: "refused", reason: "no sandbox can be reset now" });
+      expect(only.apply("b", "windows_reset", { slot: "win-1" }, reply)).toEqual({ outcome: "refused", reason: "win-1 is lent to a viewer" });
+      expect(only.apply("b", "phone_action", {}, reply)).toBeUndefined();
+    } finally {
+      only.close();
+    }
+  });
+
+  it("lends a sandbox to one viewer at a time, up to the cap, with the coordinator's reasons", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    const c = await live();
+    expect(await send(a, "claim_windows", { slot: "win-2" })).toMatchObject({ outcome: "committed" });
+    const held = winNow().tiles[1]!.borrowed!;
+    expect(held.session).toMatch(/^windows-claim-\d+$/);
+    expect(winNow().borrow).toMatchObject({ cap: 2, lent: 1 });
+    expect(await send(a, "claim_windows")).toMatchObject({ outcome: "refused", reason: "one sandbox per client at a time" });
+    expect(await send(b, "claim_windows", { slot: "win-2" })).toMatchObject({ outcome: "refused", reason: "win-2 is lent to another viewer" });
+    expect(await send(b, "claim_windows", { slot: "win-9" })).toMatchObject({ outcome: "refused", reason: 'no sandbox "win-9"' });
+    expect(await send(b, "claim_windows", { slot: 7 })).toMatchObject({ outcome: "refused", reason: "args.slot must be a sandbox slot" });
+    // Without a name, the lowest-numbered free sandbox.
+    expect(await send(b, "claim_windows")).toMatchObject({ outcome: "committed" });
+    expect(winNow().tiles[0]!.borrowed).not.toBeNull();
+    expect(await send(c, "claim_windows")).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^2 of 2 sandboxes are already lent; the next comes back in \d+ s$/) });
+    for (const x of [a, b, c]) x.ws.close();
+  });
+
+  it("refuses a sandbox that is not running", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    await send(a, "windows_reset", { slot: "win-3" });
+    expect(await send(b, "claim_windows", { slot: "win-3" })).toMatchObject({ outcome: "refused", reason: "win-3 is not running" });
+    await until(() => winNow().tiles[2]!.phase === "running");
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("refuses claim_windows from a viewer admitted late, with the coordinator's reason, and records nothing", async () => {
+    await settle();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: true });
+    const late = await live();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: false });
+    try {
+      expect(await send(late, "claim_windows", { slot: "win-1" })).toMatchObject({ outcome: "refused", version: 0 });
+      expect(winNow().tiles.every((t) => t.borrowed === null)).toBe(true);
+    } finally {
+      late.ws.close();
+    }
+  });
+
+  it("takes only the fixed actions, from the holder, one a second, and nothing that carries a point, a key or text", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    expect(await send(a, "windows_action", { action: "notepad" })).toMatchObject({ outcome: "refused", reason: "sandbox actions need a sandbox of your own (claim_windows)" });
+    await send(a, "claim_windows", { slot: "win-1" });
+    const session = winNow().tiles[0]!.borrowed!.session;
+    const list = "start_menu, notepad, explorer, task_manager, about, terminal, close_all, reset";
+    for (const bad of [{ action: "adb shell rm -rf /" }, { action: "" }, { action: 5 }, {}, { action: "Notepad" }, { action: "tap" }]) {
+      expect(await send(a, "windows_action", { ...bad, claim: session })).toMatchObject({ outcome: "refused", reason: `args.action must be one of ${list}` });
+    }
+    for (const extra of [{ x: 0.5 }, { y: 0.5 }, { text: "calc" }]) {
+      const [k] = Object.keys(extra);
+      expect(await send(a, "windows_action", { action: "notepad", claim: session, ...extra })).toMatchObject({ outcome: "refused", reason: `args.${k} is not accepted` });
+    }
+    expect(await send(a, "windows_action", { action: "notepad", claim: "windows-claim-0" })).toMatchObject({ outcome: "refused", reason: '"windows-claim-0" is not this viewer\'s sandbox' });
+    expect(await send(b, "windows_action", { action: "notepad", claim: session })).toMatchObject({ outcome: "refused", reason: "sandbox actions need a sandbox of your own (claim_windows)" });
+    expect(await send(a, "windows_action", { action: "notepad", claim: session })).toMatchObject({ outcome: "committed" });
+    expect(await send(a, "windows_action", { action: "explorer", claim: session })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^one action a second; wait \d+ ms$/) });
+    await sleep(1050);
+    expect(await send(a, "windows_action", { action: "explorer" })).toMatchObject({ outcome: "committed" });
+    const r = await record();
+    expect(r.actions.map((x) => [x.action, x.sandbox, x.session])).toEqual([["notepad", "win-1", session], ["explorer", "win-1", session]]);
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("refuses an action the sandbox's host does not list, but always offers reset", async () => {
+    await settle();
+    // the mock does not lend its offers over HTTP; list them through the fault route
+    await admin("/mock/fault", { windows_offers: { "win-1": ["notepad"] } });
+    try {
+      expect(winNow().tiles[0]!.actions).toEqual(["notepad", "reset"]);
+      const a = await live();
+      await send(a, "claim_windows", { slot: "win-1" });
+      expect(await send(a, "windows_action", { action: "terminal" })).toMatchObject({ outcome: "refused", reason: "win-1's host does not support terminal" });
+      a.ws.close();
+    } finally {
+      await admin("/mock/windows", { release_all: true });
+    }
+  });
+
+  it("the reset action restores the held sandbox and keeps the borrow", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "claim_windows", { slot: "win-2" });
+    const session = winNow().tiles[1]!.borrowed!.session;
+    expect(await send(a, "windows_action", { action: "reset", claim: session })).toMatchObject({ outcome: "committed" });
+    expect(winNow().tiles[1]).toMatchObject({ phase: "restoring", last_relaunch: { by: `reset:${session}`, first_frame_at: null } });
+    expect(winNow().tiles[1]!.borrowed!.session).toBe(session);
+    // nothing but the reset reached the sandbox
+    expect((await record()).actions).toEqual([]);
+    await until(() => winNow().tiles[1]!.phase === "running");
+    a.ws.close();
+  });
+
+  it("takes a sandbox back, restored, when it is released, when the viewer leaves and when the time is up, and makes the viewer wait to borrow again", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "claim_windows", { slot: "win-1" });
+    const session = winNow().tiles[0]!.borrowed!.session;
+    expect(await send(a, "release_windows", { claim: "other" })).toMatchObject({ outcome: "refused", reason: '"other" is not this viewer\'s sandbox' });
+    expect(await send(a, "release_windows", { claim: session })).toMatchObject({ outcome: "committed" });
+    expect(winNow().tiles[0]).toMatchObject({ borrowed: null, last_relaunch: { by: `return:${session}` } });
+    expect(await send(a, "release_windows")).toMatchObject({ outcome: "refused", reason: "this viewer holds no sandbox" });
+    expect(await send(a, "claim_windows", { slot: "win-2" })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^your last sandbox was returned \d+ s ago; borrow again in \d+ s$/) });
+    await until(() => winNow().tiles[0]!.phase === "running");
+    // A viewer that leaves gives its sandbox back.
+    const b = await live();
+    await sleep(1100);
+    await send(b, "claim_windows", { slot: "win-2" });
+    const s2 = winNow().tiles[1]!.borrowed!.session;
+    b.ws.close();
+    await until(() => winNow().tiles[1]!.borrowed === null);
+    expect(winNow().tiles[1]!.last_relaunch.by).toBe(`return:${s2}`);
+    // The borrow ends after claimSecs (2 s here).
+    await until(() => winNow().tiles.every((t) => t.phase === "running"));
+    const c = await live();
+    await send(c, "claim_windows", { slot: "win-3" });
+    const s3 = winNow().tiles[2]!.borrowed!.session;
+    await until(() => winNow().tiles[2]!.borrowed === null, 4000);
+    expect(winNow().tiles[2]!.last_relaunch.by).toBe(`return:${s3}`);
+    c.ws.close();
+    a.ws.close();
+  });
+
+  it("an image from 150 days old warns and from 170 is refused", async () => {
+    try {
+      await admin("/mock/windows", { image_age_days: 151 });
+      expect(winNow().image).toMatchObject({ age_days: 151, refused: null, warning: expect.stringContaining("151 days old") });
+      await admin("/mock/windows", { image_age_days: 171 });
+      expect(winNow().image).toMatchObject({ age_days: 171, refused: expect.stringContaining("171 days old"), warning: expect.any(String) });
+    } finally {
+      await admin("/mock/windows", { image_age_days: 12 });
+    }
+    expect(winNow().image).toMatchObject({ warning: null, refused: null });
+  });
+
+  it("records every Windows intent it received, refused or not", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "windows_reset", { slot: "win-1" });
+    await send(a, "windows_reset", { slot: "win-1" });
+    expect((await record()).intents.map((i) => [i.name, i.outcome])).toEqual([["windows_reset", "committed"], ["windows_reset", "refused"]]);
+    a.ws.close();
+  });
+
+  it("a mock without sandboxes has no windows in its snapshot, and none of the four intents", async () => {
+    const r = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 1, maxHeight: 360, epochUnixMs: coord.patternScene().epoch_unix_ms, scene: () => other.patternScene() });
+    await r.listen();
+    const other: MockCoordinator = new MockCoordinator({
+      port: 0, fcvmGpus: 2, ec2Gpus: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+      raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
+      borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
+      sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
+      refusedWords: ["forbidden"], checkMs: 20, epochUnixMs: coord.patternScene().epoch_unix_ms, renderers: r,
+    });
+    try {
+      expect(Object.keys(other.fleetState())).not.toContain("windows");
+      expect(Object.keys(other.fleetState())).not.toContain("phones");
+    } finally {
+      await other.close();
+      await r.close();
+    }
+  });
+});
+
 describe("the mock speaks the coordinator's snapshot shapes", () => {
   // The coordinator's own states (#1146, core/test/fixtures/coordinator.json): every
   // field the mock sends must be one the coordinator sends, at the same path.
@@ -980,6 +1303,11 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
    * or with GPU readings), so listed by hand with the line that documents it.
    */
   const DOCUMENTED: Record<string, string> = {
+    "windows": 'PROTOCOL.md, "Windows mode": `state.windows`',
+    "actions[].args.slot": "windows_reset and claim_windows: the sandbox, in the activity log",
+    "actions[].args.all": "windows_reset: every sandbox, in the activity log",
+    "actions[].args.action": "windows_action: the fixed action, in the activity log",
+    "actions[].args.claim": "windows_action and release_windows: the borrow, in the activity log",
     "phones.tiles[].borrowed": '"borrowed": {"session", "viewer", "since", "until"}',
     "phones.tiles[].gpu_stats": "as a wall tile's",
     "phones.tiles[].last_relaunch.phases": "as a wall tile's",
