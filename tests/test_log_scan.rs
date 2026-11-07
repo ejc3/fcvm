@@ -2527,6 +2527,26 @@ fn review_gate_treats_a_coderabbit_walkthrough_with_additions_as_a_claim() {
             "the walkthrough with {case} is a claim.\n{out}"
         );
     }
+
+    // A recent-review block that counts findings posted does not say no findings in either
+    // layout, whatever else it holds. With the clean line beside the count this covered the head.
+    let body = text.replace(
+        "<!-- recent_review_start -->",
+        "<!-- recent_review_start -->\n**Actionable comments posted: 3**",
+    );
+    assert_ne!(body, text);
+    let (code, out) = run_gate_on_comment(
+        "cr-walkthrough-count",
+        "coderabbitai",
+        "Bot",
+        &serde_json::to_string(&body).unwrap(),
+        WALKTHROUGH_HEAD,
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("carry no disposition") && !out.contains("HEAD COVERED"),
+        "a findings count beside the clean line is a claim and covers nothing.\n{out}"
+    );
 }
 
 /// The clean walkthrough from any account but CodeRabbit's bot is an ordinary comment.
@@ -2549,6 +2569,165 @@ fn review_gate_treats_a_coderabbit_walkthrough_from_another_account_as_a_claim()
         assert!(
             out.contains("carry no disposition") && !out.contains("HEAD COVERED"),
             "{login} as {typename}: claimable, never coverage.\n{out}"
+        );
+    }
+}
+
+/// The head the status-block walkthrough fixture's review range ends at.
+const STATUS_WALKTHROUGH_HEAD: &str = "9c1d7e5a3b2f4e6d8a0c1b3d5f7e9a2c4b6d8e0f";
+
+/// CodeRabbit's summary comment after a review that found nothing, in the layout it posted
+/// on #1713 (2026-11-07): the no-findings line sits in a block of its own
+/// (`recent_review_status`), ahead of the walkthrough, and the recent-review block keeps the
+/// reviewed range. It needs no disposition and covers the head that range ends at.
+///
+/// Before this the gate looked for the line in the recent-review block only, so a clean
+/// review in this layout covered no head and its comment read as an unanswered finding.
+#[test]
+fn review_gate_reads_a_coderabbit_walkthrough_whose_clean_line_is_in_the_status_block() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-status-walkthrough",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-clean-walkthrough-status.md"),
+        STATUS_WALKTHROUGH_HEAD,
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a walkthrough reporting no actionable comments is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("HEAD COVERED"),
+        "a range that ends at the head covers it.\n{out}"
+    );
+
+    let (code, out) = run_gate_on_comment(
+        "cr-status-walkthrough-other-head",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-clean-walkthrough-status.md"),
+        "deadbeef",
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a range that ends elsewhere covers no head.\n{out}"
+    );
+}
+
+/// The status-block walkthrough with anything added, or without its clean line where that
+/// layout puts it, is a claim. Whether it still covers the head is decided separately, from
+/// the status block, the recent-review block and the reviewed range outside the free regions:
+/// text appended elsewhere or an unlisted line costs a disposition, and a status block that is
+/// not exactly the clean line, or a recent-review block that counts findings, covers nothing.
+///
+/// Before the layout was listed every case was already a claim. One of them covered the head:
+/// the clean line moved into the recent-review block under a status block that reports
+/// findings.
+#[test]
+fn review_gate_treats_a_status_block_walkthrough_with_additions_as_a_claim() {
+    require_jq();
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-clean-walkthrough-status.md"),
+    )
+    .unwrap();
+    let clean = "No actionable comments were generated in the recent review.";
+    let status_block = format!(
+        "<!-- recent_review_status_start -->\n\n{clean}\n\n<!-- recent_review_status_end -->\n"
+    );
+    assert!(
+        text.contains(&status_block),
+        "the fixture's status block changed shape"
+    );
+    // (what was changed, the body, whether the head is still covered)
+    let cases = [
+        (
+            "a finding appended",
+            format!("{text}\nP1: this drops the last row\n"),
+            true,
+        ),
+        (
+            "a Merge Risk of High",
+            text.replace("Minimal</strong> · up to", "High</strong> · up to"),
+            true,
+        ),
+        (
+            "an unlisted line in the recent-review block",
+            text.replace(
+                "- **Review profile**: CHILL",
+                "- **Review profile**: ASSERTIVE",
+            ),
+            true,
+        ),
+        (
+            "a finding inside the status block",
+            text.replace(
+                "<!-- recent_review_status_end -->",
+                "P1: this drops the last row\n<!-- recent_review_status_end -->",
+            ),
+            false,
+        ),
+        (
+            "findings in place of the clean line",
+            text.replace(clean, "Actionable comments posted: 1"),
+            false,
+        ),
+        (
+            "findings in the status block and the clean line in the recent-review block",
+            text.replace(clean, "Actionable comments posted: 1")
+                .replace(
+                    "<!-- recent_review_start -->",
+                    &format!("<!-- recent_review_start -->\n{clean}\n"),
+                ),
+            false,
+        ),
+        (
+            "a findings count in the recent-review block under a clean status block",
+            text.replace(
+                "<!-- recent_review_start -->",
+                "<!-- recent_review_start -->\n**Actionable comments posted: 2**",
+            ),
+            false,
+        ),
+        (
+            "an empty status block",
+            text.replace(&format!("{clean}\n"), ""),
+            false,
+        ),
+        (
+            "a second status block",
+            format!("{text}\n{status_block}"),
+            false,
+        ),
+        (
+            "its status block quoted in the walkthrough and absent outside it",
+            text.replace(&status_block, "").replace(
+                "<!-- walkthrough_start -->",
+                &format!("<!-- walkthrough_start -->\n```\n{status_block}```"),
+            ),
+            false,
+        ),
+    ];
+    for (case, body, covers) in cases {
+        assert_ne!(body, text, "{case}: the fixture edit did not apply");
+        let (code, out) = run_gate_on_comment(
+            "cr-status-walkthrough-claim",
+            "coderabbitai",
+            "Bot",
+            &serde_json::to_string(&body).unwrap(),
+            STATUS_WALKTHROUGH_HEAD,
+        );
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the walkthrough with {case} is a claim.\n{out}"
+        );
+        assert_eq!(
+            out.contains("HEAD COVERED"),
+            covers,
+            "the walkthrough with {case}: head covered must be {covers}.\n{out}"
         );
     }
 }

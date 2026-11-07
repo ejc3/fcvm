@@ -736,6 +736,7 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #                                                                 rendered, shape-checked
 #   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
 #   cr_stack      <!-- review_stack_entry_start --> .. _end       rendered, shape-checked
+#   cr_status     <!-- recent_review_status_start --> .. _end      rendered, shape-checked
 #   cr_recent     <!-- recent_review_start --> .. _end             rendered, shape-checked
 #   cr_finishing  <!-- finishing_touch_checkbox_start --> .. _end  rendered, shape-checked
 #   cr_walkthrough, cr_risk, cr_premerge                          FREE regions, see below
@@ -746,13 +747,17 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # being read: the walkthrough, the Merge Risk text and the pre-merge checks of CodeRabbit's
 # summary comment, which are the bot's prose about the change and cannot be shape-listed.
 # They are removed only inside is_cr_clean_walkthrough, which requires the summarize marker
-# and no other marker, each of the six blocks exactly once, the recent-review block saying
-# "No actionable comments were generated in the recent review." over a reviewed range, a
+# and no other marker, each of the six blocks exactly once, the line "No actionable comments
+# were generated in the recent review." where the comment's layout puts it (cr_no_findings:
+# alone in the status block when there is one, else in the recent-review block), a reviewed
+# range in the recent-review block, a
 # Merge Risk of Minimal, and every line outside the blocks to be a fold or that Merge Risk
 # line. Findings reach this gate as review threads and review bodies, which are judged on
 # their own; text added to the comment anywhere outside a free region is left over and makes
 # the comment claimable. The exemption grants no coverage: walkthrough_sha decides that.
-# Read off #1304 through #1386 (8 comments, all matched), 2026-10-27. The
+# Read off #1304 through #1386 (8 comments, all matched), 2026-10-27, and off #1713
+# (2026-11-07), whose layout has the status block, <br> lines inside the folds, an "Explain
+# Change" stack link, and fold titles without their emoji. The
 # "Review finished." reply was posted with <dl><dd> wrappers on #1392; is_verdict lists
 # both layouts, and the reply names no commit, so it covers nothing.
 #
@@ -794,7 +799,8 @@ def cr_tips_res:
   [ "^---$"
   , "^</?details>$"
   , "^</?(dl|dd)>$"
-  , "^<summary>(❤️ Share|<strong>❤️ Share</strong>)</summary>$"
+  , "^<br>$"
+  , "^<summary>(❤️ Share|<strong>❤️ Share</strong>|<strong>Share</strong>)</summary>$"
   , "^- \\[(X|Mastodon|Reddit|LinkedIn)\\]\\(https://[^)]*\\)$"
   , "^Thanks for using \\[CodeRabbit\\]\\(https://coderabbit\\.ai\\?utm_source=oss&utm_medium=github&utm_campaign=[^)]+\\)! It.s free for OSS, and your support helps us grow\\. If you like it, consider giving us a shout-out\\.$"
   , "^<sub>Comment `@coderabbitai help` to get the list of available commands\\.</sub>$"
@@ -817,18 +823,27 @@ def cr_icon_summary_re($icon; $name):
   "^<summary><strong><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)-dark\\.svg\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> \($name)</strong></summary>$";
 def cr_stack_res:
   [ "^<a href=\"https://app\\.coderabbit\\.ai/change-stack/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+\\?scope=[A-Za-z0-9_]+&amp;cs_source=review_comment\"><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui-dark\\.svg\\?v=3\"><source media=\"\\(prefers-color-scheme: light\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui\\.svg\\?v=3\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui\\.svg\\?v=3\" alt=\"Review in Change Stack →\" height=\"32\"></picture></a>$"
+  , "^<a href=\"https://app\\.coderabbit\\.ai/change-stack/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+\\?scope=[A-Za-z0-9_]+&amp;cs_source=review_comment\"><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change-dark\\.svg\"><source media=\"\\(prefers-color-scheme: light\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change\\.svg\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change\\.svg\" alt=\"Explain Change →\" height=\"32\"></picture></a>$"
+  ];
+# The block that holds the no-findings line in the layout CodeRabbit posted on #1713
+# (2026-11-07). Nothing else is listed: a count of findings there fails the shape.
+def cr_status_res:
+  [ "^No actionable comments were generated in the recent review\\.$"
   ];
 def cr_recent_res:
   [ "^No actionable comments were generated in the recent review\\.$"
   , "^</?details>$"
   , "^</?(dl|dd)>$"
+  , "^</?h6>$"
+  , "^<br>$"
   , "^<!-- review_info_content -->$"
-  , "^<summary><strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/info\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Recent review info</strong></summary>$"
+  , "^<summary><strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/info\\.svg\" width=\"(16\" height=\"16|12\" height=\"12)\" align=\"absmiddle\" alt=\"\"></picture> Recent review info</strong></summary>$"
   , cr_icon_summary_re("cog"; "Run configuration")
   , cr_icon_summary_re("git-commit-horizontal"; "Commits")
   , cr_icon_summary_re("file-plus-corner"; "Files selected for processing: [0-9]+")
   , cr_icon_summary_re("file-minus-corner"; "Files ignored due to path filters: [0-9]+")
   , cr_icon_summary_re("file-no-changes"; "Files with no reviewable changes: [0-9]+")
+  , cr_icon_summary_re("file-similar"; "Files skipped from review as they are similar to previous changes: [0-9]+")
   , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
   , "^\\* [A-Za-z0-9_./@+-]+$"
   , "^- \\*\\*(Source mode\\*\\*: Auto|(Repository|Branch|Commit)\\*\\*: Unavailable|File\\*\\*: No configuration file from this repository applied|(Layers|Configuration used)\\*\\*: defaults|Review profile\\*\\*: CHILL|Plan\\*\\*: (Advanced|Pro Plus|Team))$"
@@ -839,7 +854,8 @@ def cr_recent_res:
 def cr_finishing_res:
   [ "^</?details( open)?>$"
   , "^</?(dl|dd)>$"
-  , "^<summary><strong>(Finishing Touches(: 💡 [0-9]+)?|📝 Generate docstrings(: 💡)?|🧪 Generate unit tests \\(beta\\))</strong></summary>$"
+  , "^<br>$"
+  , "^<summary><strong>(Finishing Touches(: 💡 [0-9]+)?|(📝 )?Generate docstrings(: 💡)?|(🧪 )?Generate unit tests \\(beta\\))</strong></summary>$"
   , "^<!-- finishing_touch_suggestion:[a-z_]+ -->$"
   , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"(, \"radioGroupId\": \"[A-Za-z0-9_-]+\")?\\} --> (Commit to this branch|Create a new PR)$"
   ];
@@ -849,6 +865,7 @@ def cr_risk_summary_re: "^<summary><strong>Merge Risk:</strong> <strong><picture
 def cr_frame_res:
   [ "^</?details>$"
   , "^</?(dl|dd)>$"
+  , "^<br>$"
   , cr_risk_summary_re
   ];
 def accounted_regions:
@@ -860,6 +877,8 @@ def accounted_regions:
       re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
   , { name: "cr_stack", rendered: true, lines: cr_stack_res,
       re: "<!-- review_stack_entry_start -->(?<inner>(.|\n)*?)<!-- review_stack_entry_end -->" }
+  , { name: "cr_status", rendered: true, lines: cr_status_res,
+      re: "<!-- recent_review_status_start -->(?<inner>(.|\n)*?)<!-- recent_review_status_end -->" }
   , { name: "cr_recent", rendered: true, lines: cr_recent_res,
       re: "<!-- recent_review_start -->(?<inner>(.|\n)*?)<!-- recent_review_end -->" }
   , { name: "cr_finishing", rendered: true, lines: cr_finishing_res,
@@ -993,12 +1012,50 @@ def summary_rows:
 def cr_range_re: "Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and (?<sha>[0-9a-f]{40})\\.";
 def cr_marker_re: "<!-- This is an auto-generated comment: [^>]*-->";
 def cr_summarize_marker: "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->";
+# The summary comment without its free regions. Their text is the bot own description of
+# the change and is not read, so a block quoted there (a walkthrough of a diff that holds
+# these markers) is neither the status block nor the recent-review block.
+def cr_outside_free: strip_accounted(["cr_walkthrough", "cr_risk", "cr_premerge"]) // "";
+# The text inside the first block of an accounted region, read with the pattern the region
+# declares, so that what is shape-checked and what is read cannot drift apart. A name that
+# declares no pattern reads nothing.
+def region_inner($name):
+  ([accounted_regions[] | select(.name == $name) | .re] | first) as $re
+  | if $re == null then empty
+    else ([match($re) | .captures[] | select(.name == "inner") | .string] | first) // empty end;
+def cr_recent_block: cr_outside_free | region_inner("cr_recent");
+def cr_clean_line: "No actionable comments were generated in the recent review.";
+# The clean line as the recent-review block has held it: alone on its line, with the emoji
+# CodeRabbit appended to it at the time of #815.
+def cr_clean_line_re: "^No actionable comments were generated in the recent review\\.( 🎉)?$";
+def cr_findings_count_re: "Actionable comments posted: [0-9]+";
+def trimmed_lines: split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0));
+# Whether the summary comment says its last review found nothing. CodeRabbit has put that
+# line in two places: inside the recent-review block (#1304 on), and from #1713
+# (2026-11-07) in a recent_review_status block of its own, ahead of the walkthrough. A
+# comment that has the status block is judged by it, and the block must appear once and
+# hold that line and nothing else: the same line elsewhere does not outvote a status block
+# that reports findings or is empty. A comment without one must have the line in its
+# recent-review block. In both layouts there must be a recent-review block, and one that
+# counts findings posted never says no findings. Any other unlisted line there leaves the
+# comment claimable and costs a disposition, as it does everywhere else in the comment.
+def cr_no_findings:
+  cr_outside_free as $o
+  | [$o | region_inner("cr_recent")] as $recent
+  | ($recent | length) == 1
+    and ($recent[0] | test(cr_findings_count_re) | not)
+    and (if ($o | test("<!-- recent_review_status_(start|end) -->")) then
+           ([$o | scan("<!-- recent_review_status_start -->")] | length) == 1
+           and ([$o | scan("<!-- recent_review_status_end -->")] | length) == 1
+           and ([$o | region_inner("cr_status") | trimmed_lines] == [[cr_clean_line]])
+         else ($recent[0] | trimmed_lines | any(test(cr_clean_line_re)))
+         end);
 def walkthrough_sha:
   ([ (. // "")
      | select([scan(cr_marker_re)] == [cr_summarize_marker])
      | select(test("(?m)^>[[:space:]]*##") | not)
-     | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
-     | select(test("No actionable comments were generated in the recent review"))
+     | select(cr_no_findings)
+     | cr_recent_block
      | capture(cr_range_re) | .sha ] | first) // "";
 def codex_limit_line1: "You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).";
 def codex_limit_line2: "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).";
@@ -1102,13 +1159,13 @@ def is_cr_summary_notice:
                        | $rest != null and ($rest | test("[^[:space:]]") | not))));
 def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;
 # The CodeRabbit summary comment once its review has finished with nothing to report: the
-# summarize marker and no other marker, each of six regions exactly once, the recent-review
-# block saying no actionable comments were generated, and nothing left between the regions
+# summarize marker and no other marker, each of six regions exactly once, the line saying no
+# actionable comments were generated where cr_no_findings reads it, and nothing left between the regions
 # but folds and one Minimal Merge Risk line. The review stack link, the recent-review block, the
 # finishing touches and the tips and Autofix blocks are shape-checked. The walkthrough, the
 # risk text and the pre-merge checks are the bot own description of the change, listed
 # as free regions in accounted_regions: findings reach this gate as review threads and review
-# bodies, which are judged on their own, and the recent-review block above is where the bot
+# bodies, which are judged on their own, and the status or recent-review block is where the bot
 # says there are none. Anything appended or inserted outside those regions is left over and
 # makes the comment claimable. This exempts the comment from answers; it grants no coverage,
 # which walkthrough_sha decides.
@@ -1121,10 +1178,9 @@ def is_cr_clean_walkthrough:
     and all(cr_walkthrough_names[]; . as $n
             | ([$b | scan("<!-- \($n)_start -->")] | length) == 1
               and ([$b | scan("<!-- \($n)_end -->")] | length) == 1)
-    and (($b | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r)
-         | test("(?m)^No actionable comments were generated in the recent review\\.$")
-           and test(cr_range_re))
-    and (($b | strip_accounted(["cr_stack", "cr_recent", "cr_finishing", "cr_walkthrough", "cr_risk", "cr_premerge", "cr_tips", "cr_autopilot", "html_comment"])) as $rest
+    and ($b | cr_no_findings)
+    and ([$b | cr_recent_block | test(cr_range_re)] | any)
+    and (($b | strip_accounted(["cr_stack", "cr_status", "cr_recent", "cr_finishing", "cr_walkthrough", "cr_risk", "cr_premerge", "cr_tips", "cr_autopilot", "html_comment"])) as $rest
          | $rest != null
            and ($rest | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))
                 | all(.[]; . as $line | any(cr_frame_res[]; . as $re | $line | test($re)))
@@ -1615,10 +1671,11 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   #   - CodeRabbit's "Full review finished." reply names nothing, so it never covers a
   #     head on its own: it is a notice, exempt from dispositions and nothing more. What
   #     names the head is the walkthrough comment CodeRabbit edits in place. After a
-  #     review that finished with no comments it carries, between "<!-- recent_review_start -->"
-  #     and "<!-- recent_review_end -->", the line "No actionable comments were generated"
-  #     and the line "Reviewing files that changed from the base of the PR and between
-  #     <sha> and <sha>". The second sha is the last commit reviewed and must be the head,
+  #     review that finished with no comments it carries the line "No actionable comments
+  #     were generated" (alone in its recent_review_status block, or in older comments
+  #     between "<!-- recent_review_start -->" and "<!-- recent_review_end -->") and, in the
+  #     recent-review block, the line "Reviewing files that changed from the base of the PR
+  #     and between <sha> and <sha>". The second sha is the last commit reviewed and must be the head,
   #     and the comment's updatedAt must postdate the head's arrival. (A review that did
   #     produce comments leaves a review object on the head, which `reviewed` counts.)
   #     Only that block, in a comment carrying no notice, counts (walkthrough_sha): the

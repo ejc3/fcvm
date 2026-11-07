@@ -332,8 +332,11 @@ not, and as text a fraction sorts before the "Z" it replaces. A timestamp the ga
 cannot parse dates nothing, so it covers nothing and answers nothing. CodeRabbit's "Full
 review finished." reply names nothing and never covers on its own; what names the head
 is the walkthrough comment CodeRabbit edits in place, whose recent-review block says
-which commit range it reviewed. That block must say no actionable comments were
-generated, the comment must carry no CodeRabbit notice (failed, skipped, paused, rate
+which commit range it reviewed. The comment must say no actionable comments were
+generated (alone in its status block when it has one, otherwise in the recent-review block),
+the recent-review block must not count findings posted, both blocks are read outside the
+walkthrough, risk and pre-merge regions, it
+must carry no CodeRabbit notice (failed, skipped, paused, rate
 limited, in progress), the range must end at the head, and the edit must postdate the
 head's arrival at GitHub. Both of those signals live in a comment its bot edits in
 place, so the gate re-reads the PR comments after all its paging and blocks when one of
@@ -406,13 +409,15 @@ Three rules the gate enforces, each of them a hole it once had:
   pins it.
 - **CodeRabbit's finished-clean comment and its "Review finished." reply need no answer either.**
   The summary comment, once its review found nothing, is exempt when it has the review stack
-  link, the recent-review block saying "No actionable comments were generated in the recent
-  review.", a Minimal Merge Risk and nothing outside its blocks; the walkthrough, risk text and
+  link, the line "No actionable comments were generated in the recent review." (alone in its
+  status block when the comment has one, otherwise in the recent-review block), a Minimal
+  Merge Risk and nothing outside its blocks; the walkthrough, risk text and
   pre-merge checks are the bot's own prose and are the only unread regions
   (`is_cr_clean_walkthrough`). Text added anywhere else makes it claimable, and it covers a head
   only through the range rule above. The "Action performed" reply, in either layout, covers
-  nothing. Pinned by the `cr-clean-walkthrough.md` and `cr-review-finished-reply.md` fixtures in
-  `tests/fixtures/review-gate`, which both harnesses read. #1351, #1386 and #1392 were blocked on them.
+  nothing. Pinned by the `cr-clean-walkthrough.md`, `cr-clean-walkthrough-status.md` and
+  `cr-review-finished-reply.md` fixtures in `tests/fixtures/review-gate`, which both harnesses
+  read. #1351, #1386, #1392 and #1713 were blocked on them.
 - **The head commit must have been reviewed.** Answering every finding proves nothing if
   nobody reviewed the code you are merging. This gate shipped with five open findings that
   way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it
