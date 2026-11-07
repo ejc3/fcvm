@@ -771,10 +771,9 @@ async fn release_held_run(run: &str, pid: u32, set_mib: Option<u32>) -> Result<(
     // The release's own effect can start a snapshot under it: nginx starts, the run turns
     // healthy and takes its startup snapshot at once, and the pause resets vsock under this
     // exec if its answer has not arrived yet. fcvm exec then reports the session orphaned
-    // and does not resend (CI run 42393525591, run 3: orphaned 2.0 s after GO). That is how
-    // an exec whose effect starts a snapshot can end, so it is not a failure here: the
-    // health wait below says whether the release took effect. A run that declines the
-    // startup snapshot takes none, and its release must answer.
+    // and does not resend. That is how an exec whose effect starts a snapshot can end, so it
+    // is not a failure here: the health wait below says whether the release took effect. A
+    // run that declines the startup snapshot takes none, and its release must answer.
     //
     // The run that takes the snapshot keeps its exec open across it (`sleep`), so this path
     // runs every time instead of whenever the race lands.
