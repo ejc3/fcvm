@@ -48,7 +48,9 @@ case "$*" in
   "shell dumpsys SurfaceFlinger")
     [ -e "$D/go" ] && echo "SurfaceFlinger checked with the go file present" >> "$D/log"
     echo "GLES: Google (NVIDIA Corporation), Android Emulator OpenGL ES Translator (${FAKE_RENDERER:-Tesla T4/PCIe/SSE2}), OpenGL ES 3.1" ;;
-  "shell am start"*) if [ "${FAKE_AM:-ok}" = ok ]; then echo "Status: ok"; else echo "Error: Activity class does not exist."; fi ;;
+  # the started activity comes to the top (am's -n component, else the package last named)
+  "shell am start"*) if [ "${FAKE_AM:-ok}" = ok ]; then echo "Status: ok"; c=$(sed -n 's/.* -n \([^ ]*\).*/\1/p' <<< "$*"); echo "${c:-${*: -1}/.Main}" > "$D/top"; else echo "Error: Activity class does not exist."; fi ;;
+  "shell dumpsys activity activities") [ -s "$D/top" ] && echo "  topResumedActivity=ActivityRecord{1 u0 $(cat "$D/top") t9}" ;;
   "logcat -d -s ROBOTPARK:I") echo "I ROBOTPARK: renderer=Android Emulator OpenGL ES Translator (${FAKE_APP_RENDERER:-Tesla T4/PCIe/SSE2})" ;;
   "emu kill") kill "$(cat "$D/run/emulator.pid")" ;;
 esac
@@ -333,7 +335,16 @@ cat > "$B/adb" <<STUB
 echo "adb \$*" >> "$B/adb.log"
 case "\$*" in
   "shell pm path org.cromite.cromite") [ -e "$B/installed" ] && echo "package:/data/app/base.apk" ;;
-  "shell am start"*) printf 'Status: ok\r\nTotalTime: 123\r\n' ;;
+  # am start -W: the started activity comes to the top. With $B/cut, am's output ends after its
+  # Starting line (#1691): the activity still comes to the top when the file says "front", and
+  # not at all when it says "never".
+  "shell am start"*)
+    c=\$(sed -n 's/.* -n \([^ ]*\).*/\1/p' <<< "\$*"); [ -n "\$c" ] || c="\${@: -1}/.Main"
+    cut=\$(cat "$B/cut" 2> /dev/null)
+    [ "\$cut" = never ] || echo "\$c" > "$B/top"
+    if [ -n "\$cut" ]; then printf 'Starting: Intent { cmp=%s }\r\n' "\$c"; exit 255; fi
+    printf 'Status: ok\r\nTotalTime: 123\r\n' ;;
+  "shell dumpsys activity activities") [ -s "$B/top" ] && printf '  topResumedActivity=ActivityRecord{44375846 u0 %s t9}\r\n' "\$(cat "$B/top")" ;;
 esac
 exit 0
 STUB
@@ -369,6 +380,19 @@ bact open_browser || bad "open_browser failed: $(cat "$dir/act.err")"
 adb_has "shell am start -W -n org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity" && adb_has "shell input keycombination 113 46" \
   && ! adb_has "force-stop" && grep -q "shown_ms=123" "$B/out" && [ "$(cat "$B/front")" = browser ] \
   && ok "open_browser brings the loaded page to the front and reloads it" || bad "open_browser ran: $(cat "$B/adb.log" "$B/out")"
+# #1691: in a restored clone am's output ended after its Starting line, with no Status line,
+# and open_browser failed although the browser had come to the front. What is in front is the
+# activity manager's top resumed activity, not am's output.
+echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo front > "$B/cut"
+bact open_browser && [ "$(cat "$B/front")" = browser ] && grep -q "shown_ms=[0-9]" "$B/out" && adb_has "shell input keycombination 113 46" \
+  && ok "open_browser whose am output ends after Starting goes by the browser in front" \
+  || bad "open_browser with am's output cut: $(cat "$dir/act.err" "$B/out")"
+echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo never > "$B/cut"
+if FRONT_WAIT_S=1 bact open_browser; then bad "open_browser succeeded with Robot Park in front"
+elif [ "$(grep -c "shell am start -W -n org.cromite.cromite" "$B/adb.log")" = 2 ] && grep -q "did not come to the front (dev.fcvm.robotpark/.MainActivity is)" "$dir/act.err"; then
+  ok "open_browser fails, naming what is in front, when the browser never comes to the front after a second start"
+else bad "open_browser with the browser never in front: $(cat "$dir/act.err" "$B/adb.log")"; fi
+rm -f "$B/cut"; echo browser > "$B/front"; echo org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity > "$B/top"
 bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"
 adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}
 {"type":"action","name":"dance"}' ] && [ "$(cat "$B/front")" = app ] \

@@ -68,6 +68,33 @@ RUN=${PHONE_RUN:-/tmp}
 export PHONE_GO_FILE=${PHONE_GO_FILE:-/run/phone-verified}
 AVD=$ANDROID_AVD_HOME/phone.avd
 ms() { date +%s%3N; }
+# The activity in front as the activity manager has it (package/class), or nothing.
+resumed_activity() {
+  "$ADB" shell dumpsys activity activities 2> /dev/null | tr -d '\r' \
+    | sed -n 's/.*topResumedActivity=ActivityRecord{[^ ]* [^ ]* \([^ }]*\).*/\1/p' | head -1
+}
+# `am start -W ARGS...` for an activity of package PKG, judged by the activity manager's top
+# resumed activity afterwards, not by am's output: in a clone restored from a snapshot, am's
+# output can end after its Starting line, with no Status line, while the activity does come to
+# the front (#1691). Waits FRONT_WAIT_S seconds (10) for PKG on top, then starts it once more
+# (an activity already on top takes the intent again). Prints am's output and FrontTime, the
+# milliseconds from the start to PKG on top; fails at once on am's Error line.
+am_front() { # pkg am-args...
+  local pkg=$1 out t0 _try; shift
+  t0=$(ms)
+  for _try in 1 2; do
+    out=$("$ADB" shell am start -W "$@" 2>&1 | tr -d '\r') || true
+    grep -q '^Error' <<< "$out" && break
+    for _ in $(seq 1 $(( ${FRONT_WAIT_S:-10} * 5 ))); do
+      [[ "$(resumed_activity)" == "$pkg/"* ]] && { printf '%s\nFrontTime: %s\n' "$out" "$(( $(ms) - t0 ))"; return 0; }
+      sleep 0.2
+    done
+  done
+  printf '%s\n' "$out"
+  return 1
+}
+# How long the activity took to show: am's TotalTime, else the time to the front.
+shown_ms() { local t; t=$(sed -n 's/^TotalTime: *//p' <<< "$1"); [ -n "$t" ] || t=$(sed -n 's/^FrontTime: *//p' <<< "$1"); echo "${t:+shown_ms=$t}"; }
 . "$(dirname "$0")/phone-proc.sh"
 
 make_avd() {
@@ -139,8 +166,8 @@ start_app() {
   # the app hides the system bars; without this Android covers the scene with a one-time hint
   "$ADB" shell settings put secure immersive_mode_confirmations confirmed > /dev/null 2>&1 || true
   "$ADB" logcat -c > /dev/null 2>&1 || true
-  out=$("$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity 2>&1 | tr -d '\r') || true
-  grep -q '^Status: ok' <<< "$out" || { echo "am start: $(grep -m2 -E 'Error|Status' <<< "$out" | tr '\n' ' ')"; return 1; }
+  out=$(am_front dev.fcvm.robotpark -n dev.fcvm.robotpark/.MainActivity) \
+    || { echo "am start: Robot Park is not in front ($(resumed_activity)): $(grep -m2 -E 'Error|Status|Starting' <<< "$out" | tr '\n' ' ')"; return 1; }
   "$ADB" forward tcp:"$CTL_PORT" localabstract:dev.fcvm.robotpark > /dev/null || { echo "adb forward failed"; return 1; }
   for _ in $(seq 1 100); do
     line=$("$ADB" logcat -d -s ROBOTPARK:I 2>/dev/null | tr -d '\r' | grep -m1 -o 'renderer=.*' || true)
@@ -201,10 +228,10 @@ open_page() {
     http_get "$DEVTOOLS_PORT" "/json/close/$id" > /dev/null 2>&1 || true
   done
   "$ADB" shell am force-stop "$BROWSER_PKG" > /dev/null 2>&1 || true
-  out=$("$ADB" shell am start -W -a android.intent.action.VIEW -d "$BROWSER_URL" "$BROWSER_PKG" 2>&1 | tr -d '\r') || true
-  grep -q '^Status: ok' <<< "$out" || { echo "am start of the browser: $(grep -m2 -E 'Error|Status' <<< "$out" | tr '\n' ' ')"; return 1; }
+  out=$(am_front "$BROWSER_PKG" -a android.intent.action.VIEW -d "$BROWSER_URL" "$BROWSER_PKG") \
+    || { echo "am start of the browser: it is not in front ($(resumed_activity)): $(grep -m2 -E 'Error|Status|Starting' <<< "$out" | tr '\n' ' ')"; return 1; }
   echo browser > "$RUN/front"
-  sed -n 's/^TotalTime: */shown_ms=/p' <<< "$out" > "$RUN/shown"
+  shown_ms "$out" > "$RUN/shown"
 }
 # The streamer, restarted whenever it exits, unless the GPU hook holds it (while the phone's
 # GPU is released for a warm snapshot, nothing in the container may hold the GPU). The hold
@@ -375,8 +402,8 @@ action)
   front() { cat "$RUN/front" 2> /dev/null || echo app; }
   to_app() {
     [ "$(front)" = browser ] || return 0
-    "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity 2>&1 | tr -d '\r' | grep -q '^Status: ok' \
-      || { echo "phone.sh: Robot Park did not come to the front" >&2; exit 1; }
+    am_front dev.fcvm.robotpark -n dev.fcvm.robotpark/.MainActivity > /dev/null \
+      || { echo "phone.sh: Robot Park did not come to the front ($(resumed_activity) is)" >&2; exit 1; }
     echo app > "$RUN/front"
     if mirror_open; then restart_app; fi
   }
@@ -417,10 +444,10 @@ action)
       # while it shows. The activity is named, not launched as from the home screen: a launch
       # from the home screen after a while away (and a clone's clock has moved on) opens a new
       # tab page instead of the tab.
-      out=$("$ADB" shell am start -W -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity" 2>&1 | tr -d '\r')
-      grep -q '^Status: ok' <<< "$out" || { echo "phone.sh: the browser did not come to the front: $out" >&2; exit 1; }
+      out=$(am_front "$BROWSER_PKG" -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity") \
+        || { echo "phone.sh: the browser did not come to the front ($(resumed_activity) is): $out" >&2; exit 1; }
       echo browser > "$RUN/front"
-      sed -n 's/^TotalTime: */shown_ms=/p' <<< "$out" > "$RUN/shown"
+      shown_ms "$out" > "$RUN/shown"
       "$ADB" shell input keycombination 113 46 > /dev/null 2>&1 || { echo "phone.sh: the page was not reloaded" >&2; exit 1; }
     fi
     echo "ok open_browser $(cat "$RUN/shown" 2> /dev/null)"
