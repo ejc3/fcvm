@@ -2122,17 +2122,18 @@ impl RestoreResolvers {
 
 /// The resolvers the restore document gives the guest.
 ///
-/// A snapshot made before `dns_override` was recorded gives none, which leaves the
-/// guest's resolv.conf as it is, as every restore did when it was made: its
-/// recorded resolver may be the source's --dns or the one its host chose, and
-/// rewriting resolv.conf from it as an override would drop the search domains the
-/// guest booted with.
+/// A snapshot that cannot say what its source's --dns was (a bridged or routed one
+/// made before `dns_override` was recorded) gives none, which leaves the guest's
+/// resolv.conf as it is, as every restore did when it was made: its recorded
+/// resolver may be the source's --dns or the one its host chose, and rewriting
+/// resolv.conf from it as an override would drop the search domains the guest
+/// booted with.
 fn restore_document_dns(
     meta: &crate::storage::SnapshotMetadata,
     resolvers: &RestoreResolvers,
     mode: FcNetworkMode,
 ) -> Option<super::podman::GuestDns> {
-    meta.dns_override.as_ref()?;
+    meta.known_dns_override()?;
     resolvers.guest_dns(mode)
 }
 
@@ -2788,7 +2789,12 @@ async fn cmd_snapshot_run_inner(
     );
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // The source's --dns goes with the guest, so a snapshot of this clone keeps it.
-    vm_state.config.dns_override = snapshot_config.metadata.dns_override.clone();
+    // When the snapshot cannot say, neither does the clone, and its network reports
+    // the recorded resolver for a snapshot of it to fall back to.
+    vm_state.config.dns_override = snapshot_config
+        .metadata
+        .known_dns_override()
+        .map(|known| known.map(str::to_string));
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
@@ -6010,6 +6016,22 @@ mod tests {
         document.as_object_mut().unwrap().remove("dns_override");
         let legacy = read(&document);
         assert_eq!(legacy.source_dns_override(), Some("10.0.2.2"));
+        // A legacy rootless snapshot's recorded resolver is its --dns: pasta reports
+        // none of its own. A clone of it records that, so a snapshot of the clone,
+        // whose pasta reports no resolver either, keeps it.
+        assert_eq!(legacy.known_dns_override(), Some(Some("10.0.2.2")));
+        let code: String = {
+            let source = include_str!("snapshot.rs");
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        assert!(
+            code.contains(
+                "vm_state.config.dns_override=snapshot_config.metadata.known_dns_override()"
+            ),
+            "a clone no longer records what its snapshot knows of the source's --dns"
+        );
         let resolvers = restore_resolvers(
             FcNetworkMode::Rootless,
             legacy.source_dns_override(),
@@ -6030,6 +6052,8 @@ mod tests {
         };
         let mut bridged = legacy.clone();
         bridged.network_mode = FcNetworkMode::Bridged;
+        assert_eq!(bridged.known_dns_override(), None);
+        assert_eq!(bridged.source_dns_override(), Some("10.0.2.2"));
         let given = |meta: &crate::storage::SnapshotMetadata| {
             let resolvers = restore_resolvers(
                 FcNetworkMode::Bridged,

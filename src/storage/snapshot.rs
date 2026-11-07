@@ -335,16 +335,32 @@ fn is_zero(value: &usize) -> bool {
 }
 
 impl SnapshotMetadata {
-    /// The source VM's `--dns`.
+    /// The source VM's `--dns`, or `None` when this snapshot cannot say.
     ///
     /// A snapshot made before `dns_override` was recorded names its resolver only in
-    /// `network_config.dns_server`, which then held the source's --dns when it had
-    /// one, and every restore kept that resolver. Such a snapshot keeps it still.
-    pub fn source_dns_override(&self) -> Option<&str> {
+    /// `network_config.dns_server`. In rootless mode that field is set by --dns and
+    /// nothing else (pasta reports no resolver of its own), so it is the override. In
+    /// bridged and routed mode it may be --dns or the resolver the host chose.
+    pub fn known_dns_override(&self) -> Option<Option<&str>> {
         match &self.dns_override {
-            Some(recorded) => recorded.as_deref(),
-            None => self.network_config.dns_server.as_deref(),
+            Some(recorded) => Some(recorded.as_deref()),
+            None if matches!(
+                self.network_mode,
+                crate::firecracker::FcNetworkMode::Rootless
+            ) =>
+            {
+                Some(self.network_config.dns_server.as_deref())
+            }
+            None => None,
         }
+    }
+
+    /// The resolver a restore of this snapshot is given as its source's --dns. A
+    /// bridged or routed snapshot that cannot say keeps the resolver it recorded, as
+    /// every restore did when it was made.
+    pub fn source_dns_override(&self) -> Option<&str> {
+        self.known_dns_override()
+            .unwrap_or(self.network_config.dns_server.as_deref())
     }
 
     /// The balloon device a cold boot from this snapshot attaches, or None when the
