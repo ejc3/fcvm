@@ -1,6 +1,6 @@
-From d479daef94dba4a6adeaa6ab0db4394fddf43c01 Mon Sep 17 00:00:00 2001
+From 293925d98318bbee7c62404d96bad5af36a15b33 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 17:23:48 +0000
+Date: Fri, 6 Nov 2026 00:08:24 +0000
 Subject: [PATCH] KVM: arm64: nv: Unmap only the affected shadow stage-2 ranges
  on invalidation
 
@@ -34,16 +34,16 @@ refactor that 6.18 does not have:
   record is allocated after the page is faulted in and before
   kvm_fault_lock(), so an allocation failure releases the page and returns
   -ENOMEM.
-- 6.18 keeps kvm->arch.nested_mmus as an array of structures, which
-  kvm_vcpu_init_nested() reallocates as vcpus are added, so a record
-  cannot point at its nested MMU. It names the MMU by index in the low
-  bits of nested.start, as 2064f15b0848 does upstream.
-- 6.18's kvm_arch_flush_shadow_all() frees that array without the
-  mmu_lock and before it frees the canonical MMU, whose tree owns the
-  records (upstream moved these frees to VM destruction in e5843f4effaa).
-  It now drops every record under the mmu_lock first, so that a
+- A record names its nested MMU by index in the low bits of
+  nested.start, and each shadow MMU stores its own index in s2_mmu_idx,
+  as 2064f15b0848 does upstream. 6.18.56 brought the array of pointers
+  (e5843f4effaa and its stable dependency), so the index is assigned
+  where kvm_vcpu_init_nested() publishes a new pair of MMUs.
+- kvm_arch_flush_shadow_all() frees every shadow stage-2 page table and
+  the canonical MMU, whose tree owns the records, without dropping the
+  records. It now drops every record under the mmu_lock first, so that a
   kvm_nested_unmap_cipa_range() that dropped the lock to reschedule finds
-  no record naming the freed array when it resumes.
+  no record when it resumes.
 - kvm_record_guest_s2_mapping() does not insert a record identical to one
   already in the nested MMU's tree. An unmap that covers part of a shadow
   block (a guest TLBI of a subrange) removes the whole block but keeps its
@@ -51,14 +51,14 @@ refactor that 6.18 does not have:
   that block, without bound until an unmap covers all of it.
 - kmalloc() instead of kmalloc_obj().
 ---
- arch/arm64/include/asm/kvm_host.h   |  20 +++
+ arch/arm64/include/asm/kvm_host.h   |  23 ++++
  arch/arm64/include/asm/kvm_nested.h |   8 ++
  arch/arm64/kvm/mmu.c                |  90 ++++++++++++-
- arch/arm64/kvm/nested.c             | 198 ++++++++++++++++++++++++++++
- 4 files changed, 309 insertions(+), 7 deletions(-)
+ arch/arm64/kvm/nested.c             | 202 +++++++++++++++++++++++++++-
+ 4 files changed, 315 insertions(+), 8 deletions(-)
 
 diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
-index 7bee8a3..21a8ad4 100644
+index 419e37112..dd717600a 100644
 --- a/arch/arm64/include/asm/kvm_host.h
 +++ b/arch/arm64/include/asm/kvm_host.h
 @@ -14,6 +14,7 @@
@@ -86,17 +86,20 @@ index 7bee8a3..21a8ad4 100644
  struct kvm_s2_mmu {
  	struct kvm_vmid vmid;
  
-@@ -222,6 +233,9 @@ struct kvm_s2_mmu {
+@@ -222,6 +233,12 @@ struct kvm_s2_mmu {
  	 */
  	bool	pending_unmap;
  
 +	/* Guest s2 mapping records indexed in this MMU's IPA space. */
 +	struct rb_root_cached guest_s2_mappings;
 +
++	/* Index in kvm->arch.nested_mmus, only valid for a shadow S2 */
++	u16	s2_mmu_idx;
++
  	/*
  	 *  0: Nobody is currently using this, check vttbr for validity
  	 * >0: Somebody is actively using this.
-@@ -311,6 +325,12 @@ struct kvm_arch {
+@@ -311,6 +328,12 @@ struct kvm_arch {
  	size_t nested_mmus_size;
  	int nested_mmus_next;
  
@@ -110,10 +113,10 @@ index 7bee8a3..21a8ad4 100644
  	struct vgic_dist	vgic;
  
 diff --git a/arch/arm64/include/asm/kvm_nested.h b/arch/arm64/include/asm/kvm_nested.h
-index 6f768e3..2a7af76 100644
+index dda7fffe0..609d862d8 100644
 --- a/arch/arm64/include/asm/kvm_nested.h
 +++ b/arch/arm64/include/asm/kvm_nested.h
-@@ -76,6 +76,12 @@ extern void kvm_s2_mmu_iterate_by_vmid(struct kvm *kvm, u16 vmid,
+@@ -77,6 +77,12 @@ extern void kvm_s2_mmu_iterate_by_vmid(struct kvm *kvm, u16 vmid,
  				       const union tlbi_info *info,
  				       void (*)(struct kvm_s2_mmu *,
  						const union tlbi_info *));
@@ -126,7 +129,7 @@ index 6f768e3..2a7af76 100644
  extern void kvm_vcpu_load_hw_mmu(struct kvm_vcpu *vcpu);
  extern void kvm_vcpu_put_hw_mmu(struct kvm_vcpu *vcpu);
  
-@@ -131,6 +137,8 @@ extern int kvm_s2_handle_perm_fault(struct kvm_vcpu *vcpu,
+@@ -132,6 +138,8 @@ extern int kvm_s2_handle_perm_fault(struct kvm_vcpu *vcpu,
  				    struct kvm_s2_trans *trans);
  extern int kvm_inject_s2_fault(struct kvm_vcpu *vcpu, u64 esr_el2);
  extern void kvm_nested_s2_wp(struct kvm *kvm);
@@ -136,7 +139,7 @@ index 6f768e3..2a7af76 100644
  extern void kvm_nested_s2_flush(struct kvm *kvm);
  
 diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
-index b423769..7da6d61 100644
+index af50fed5b..cb5ea1c59 100644
 --- a/arch/arm64/kvm/mmu.c
 +++ b/arch/arm64/kvm/mmu.c
 @@ -7,6 +7,7 @@
@@ -147,7 +150,7 @@ index b423769..7da6d61 100644
  #include <linux/io.h>
  #include <linux/hugetlb.h>
  #include <linux/sched/signal.h>
-@@ -313,6 +314,19 @@ static void invalidate_icache_guest_page(void *va, size_t size)
+@@ -322,6 +323,19 @@ static void invalidate_icache_guest_page(void *va, size_t size)
   * we then fully enforce cacheability of RAM, no matter what the guest
   * does.
   */
@@ -167,7 +170,7 @@ index b423769..7da6d61 100644
  /**
   * __unmap_stage2_range -- Clear stage2 page table entries to unmap a range
   * @mmu:   The KVM stage-2 MMU pointer
-@@ -330,11 +344,17 @@ static void __unmap_stage2_range(struct kvm_s2_mmu *mmu, phys_addr_t start, u64
+@@ -339,11 +353,17 @@ static void __unmap_stage2_range(struct kvm_s2_mmu *mmu, phys_addr_t start, u64
  {
  	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
  	phys_addr_t end = start + size;
@@ -187,7 +190,7 @@ index b423769..7da6d61 100644
  }
  
  void kvm_stage2_unmap_range(struct kvm_s2_mmu *mmu, phys_addr_t start,
-@@ -974,6 +994,8 @@ int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long t
+@@ -983,6 +1003,8 @@ int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long t
  
  	mmu->pgd_phys = __pa(pgt->pgd);
  
@@ -196,7 +199,7 @@ index b423769..7da6d61 100644
  	if (kvm_is_nested_s2_mmu(kvm, mmu))
  		kvm_init_nested_s2_mmu(mmu);
  
-@@ -1066,6 +1088,7 @@ void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
+@@ -1075,6 +1097,7 @@ void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
  {
  	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
  	struct kvm_pgtable *pgt = NULL;
@@ -204,7 +207,7 @@ index b423769..7da6d61 100644
  
  	write_lock(&kvm->mmu_lock);
  	pgt = mmu->pgt;
-@@ -1078,12 +1101,22 @@ void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
+@@ -1087,12 +1110,22 @@ void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
  	if (kvm_is_nested_s2_mmu(kvm, mmu))
  		kvm_init_nested_s2_mmu(mmu);
  
@@ -227,7 +230,7 @@ index b423769..7da6d61 100644
  }
  
  static void hyp_mc_free_fn(void *addr, void *mc)
-@@ -1536,6 +1569,7 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1524,6 +1557,7 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_MEMABORT_FLAGS;
  	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_R;
  	struct kvm_pgtable *pgt = vcpu->arch.hw_mmu->pgt;
@@ -235,7 +238,7 @@ index b423769..7da6d61 100644
  	unsigned long mmu_seq;
  	struct page *page;
  	struct kvm *kvm = vcpu->kvm;
-@@ -1548,6 +1582,12 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1536,6 +1570,12 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	if (ret)
  		return ret;
  
@@ -248,7 +251,7 @@ index b423769..7da6d61 100644
  	if (nested)
  		gfn = kvm_s2_trans_output(nested) >> PAGE_SHIFT;
  	else
-@@ -1566,6 +1606,7 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1554,6 +1594,7 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	if (ret) {
  		kvm_prepare_memory_fault_exit(vcpu, fault_ipa, PAGE_SIZE,
  					      write_fault, exec_fault, false);
@@ -256,7 +259,7 @@ index b423769..7da6d61 100644
  		return ret;
  	}
  
-@@ -1591,10 +1632,21 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1579,10 +1620,21 @@ static int gmem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, fault_ipa, PAGE_SIZE,
  						 __pfn_to_phys(pfn), prot,
  						 memcache, flags);
@@ -278,7 +281,7 @@ index b423769..7da6d61 100644
  
  	if (writable && !ret)
  		mark_page_dirty_in_slot(kvm, memslot, gfn);
-@@ -1625,6 +1677,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1613,6 +1665,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	long vma_pagesize, fault_granule;
  	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_R;
  	struct kvm_pgtable *pgt;
@@ -286,7 +289,7 @@ index b423769..7da6d61 100644
  	struct page *page;
  	vm_flags_t vm_flags;
  	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_MEMABORT_FLAGS;
-@@ -1808,6 +1861,14 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1782,6 +1835,14 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  	if (nested)
  		adjust_nested_fault_perms(nested, &prot, &writable);
  
@@ -301,7 +304,7 @@ index b423769..7da6d61 100644
  	kvm_fault_lock(kvm);
  	pgt = vcpu->arch.hw_mmu->pgt;
  	if (mmu_invalidate_retry(kvm, mmu_seq)) {
-@@ -1875,11 +1936,24 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+@@ -1850,11 +1911,24 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
  		ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, fault_ipa, vma_pagesize,
  					     __pfn_to_phys(pfn), prot,
  					     memcache, flags);
@@ -326,7 +329,7 @@ index b423769..7da6d61 100644
  
  	/* Mark the page dirty only if the fault is handled successfully */
  	if (writable && !ret)
-@@ -2097,14 +2171,16 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
+@@ -2072,14 +2146,16 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
  
  bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
  {
@@ -347,7 +350,7 @@ index b423769..7da6d61 100644
  	return false;
  }
  
-@@ -2393,7 +2469,7 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+@@ -2368,7 +2444,7 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
  
  	write_lock(&kvm->mmu_lock);
  	kvm_stage2_unmap_range(&kvm->arch.mmu, gpa, size, true);
@@ -357,7 +360,7 @@ index b423769..7da6d61 100644
  }
  
 diff --git a/arch/arm64/kvm/nested.c b/arch/arm64/kvm/nested.c
-index 44bb2c9..dacf40b 100644
+index 92853a343..4850ee501 100644
 --- a/arch/arm64/kvm/nested.c
 +++ b/arch/arm64/kvm/nested.c
 @@ -5,6 +5,7 @@
@@ -368,22 +371,34 @@ index 44bb2c9..dacf40b 100644
  #include <linux/kvm.h>
  #include <linux/kvm_host.h>
  
-@@ -49,6 +50,7 @@ void kvm_init_nested(struct kvm *kvm)
- 	kvm->arch.nested_mmus = NULL;
+@@ -50,6 +51,7 @@ int kvm_init_nested(struct kvm *kvm)
+ 					      KVM_MAX_VCPUS * S2_MMU_PER_VCPU,
+ 					      GFP_KERNEL_ACCOUNT);
  	kvm->arch.nested_mmus_size = 0;
- 	atomic_set(&kvm->arch.vncr_map_count, 0);
 +	spin_lock_init(&kvm->arch.guest_s2_tracking_lock);
- }
  
- static int init_nested_s2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu)
-@@ -727,6 +729,132 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
+ 	return kvm->arch.nested_mmus ? 0 : -ENOMEM;
+ }
+@@ -124,8 +126,10 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
+ 
+ 		guard(write_lock)(&kvm->mmu_lock);
+ 
+-		for (i = 0; i < S2_MMU_PER_VCPU; i++)
++		for (i = 0; i < S2_MMU_PER_VCPU; i++) {
++			tmp[i].s2_mmu_idx = i + kvm->arch.nested_mmus_size;
+ 			kvm->arch.nested_mmus[i + kvm->arch.nested_mmus_size] = &tmp[i];
++		}
+ 
+ 		kvm->arch.nested_mmus_size += S2_MMU_PER_VCPU;
+ 	}
+@@ -745,6 +749,132 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
  	return s2_mmu;
  }
  
 +/*
 + * A record names its nested MMU by index into kvm->arch.nested_mmus, kept
-+ * in the low bits of nested.start (which is at least page aligned), and
-+ * not by pointer: kvm_vcpu_init_nested() moves the array when it grows.
++ * in the low bits of nested.start (which is at least page aligned), as
++ * upstream 2064f15b0848 does, so a record costs no pointer.
 + */
 +#define S2_MMU_IDX_MASK	GENMASK_ULL(11, 0)
 +
@@ -394,13 +409,13 @@ index 44bb2c9..dacf40b 100644
 +	BUILD_BUG_ON(KVM_MAX_VCPUS * S2_MMU_PER_VCPU > SZ_4K);
 +	BUILD_BUG_ON(PAGE_SIZE < SZ_4K);
 +	mapping->nested.start &= ~S2_MMU_IDX_MASK;
-+	mapping->nested.start |= mmu - kvm->arch.nested_mmus;
++	mapping->nested.start |= mmu->s2_mmu_idx;
 +}
 +
 +static struct kvm_s2_mmu *s2_mapping_to_mmu(struct kvm *kvm,
 +					    struct kvm_guest_s2_mapping *mapping)
 +{
-+	return &kvm->arch.nested_mmus[mapping->nested.start & S2_MMU_IDX_MASK];
++	return kvm->arch.nested_mmus[mapping->nested.start & S2_MMU_IDX_MASK];
 +}
 +
 +static unsigned long s2_mapping_to_nested_start(struct kvm_guest_s2_mapping *mapping)
@@ -509,8 +524,8 @@ index 44bb2c9..dacf40b 100644
  void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu)
  {
  	/* CnP being set denotes an invalid entry */
-@@ -1102,6 +1230,60 @@ void kvm_nested_s2_wp(struct kvm *kvm)
- 	kvm_invalidate_vncr_ipa(kvm, 0, BIT(kvm->arch.mmu.pgt->ia_bits));
+@@ -1159,6 +1289,60 @@ void kvm_nested_s2_wp(struct kvm *kvm)
+ 	kvm_invalidate_vncr_ipa_all(kvm);
  }
  
 +void kvm_nested_unmap_cipa_range(struct kvm *kvm, gpa_t cipa, size_t unmap_size,
@@ -570,30 +585,28 @@ index 44bb2c9..dacf40b 100644
  void kvm_nested_s2_unmap(struct kvm *kvm, bool may_block)
  {
  	int i;
-@@ -1134,8 +1316,24 @@ void kvm_nested_s2_flush(struct kvm *kvm)
+@@ -1191,6 +1375,22 @@ void kvm_nested_s2_flush(struct kvm *kvm)
  
  void kvm_arch_flush_shadow_all(struct kvm *kvm)
  {
 +	struct rb_root_cached mappings;
- 	int i;
- 
++
 +	/*
-+	 * The records name their nested MMU by index into nested_mmus, which
-+	 * is freed below without the mmu_lock and before the canonical MMU
-+	 * (whose tree owns the records) is torn down. Drop every record
++	 * The canonical MMU's tree owns the records, and both it and the
++	 * shadow stage-2 page tables are torn down below. Drop every record
 +	 * first, under the mmu_lock, so that a kvm_nested_unmap_cipa_range()
 +	 * that dropped the lock to reschedule finds none when it resumes.
 +	 */
 +	write_lock(&kvm->mmu_lock);
 +	mappings = kvm->arch.mmu.guest_s2_mappings;
 +	kvm->arch.mmu.guest_s2_mappings = RB_ROOT_CACHED;
-+	for (i = 0; i < kvm->arch.nested_mmus_size; i++)
-+		kvm->arch.nested_mmus[i].guest_s2_mappings = RB_ROOT_CACHED;
++	for (int i = 0; i < kvm->arch.nested_mmus_size; i++)
++		kvm->arch.nested_mmus[i]->guest_s2_mappings = RB_ROOT_CACHED;
 +	write_unlock(&kvm->mmu_lock);
 +	kvm_destroy_guest_s2_mappings(&mappings);
 +
- 	for (i = 0; i < kvm->arch.nested_mmus_size; i++) {
- 		struct kvm_s2_mmu *mmu = &kvm->arch.nested_mmus[i];
+ 	for (int i = 0; i < kvm->arch.nested_mmus_size; i++) {
+ 		struct kvm_s2_mmu *mmu = kvm->arch.nested_mmus[i];
  
 -- 
 2.43.0

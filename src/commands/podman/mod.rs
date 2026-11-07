@@ -2962,11 +2962,16 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
             }
             // The namespace holder or pasta died: the VM has lost its network for good.
             // End it with the companion's own name, status and last stderr output (#852).
-            message = crate::companion::registered_death("namespace holder", &mut ctx.holder_child) => {
+            (pid, status) = crate::companion::registered_exit(&mut ctx.holder_child) => {
+                let message =
+                    crate::companion::describe_registered("namespace holder", pid, status).await;
                 tracing::error!("{message}");
                 bail!("a process this VM depends on died: {message}");
             }
-            message = ctx.network.companion_death() => {
+            status = ctx.network.companion_exited() => {
+                let message = ctx.network.describe_companion_exit(status).await;
+                let message =
+                    crate::companion::network_death_report(message, &mut ctx.holder_child).await;
                 tracing::error!("{message}");
                 bail!("a process this VM depends on died: {message}");
             }

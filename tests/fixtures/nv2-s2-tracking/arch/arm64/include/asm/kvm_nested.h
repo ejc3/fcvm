@@ -1,13 +1,12 @@
 /*
- * Verbatim line ranges from Linux v6.18.50 arch/arm64/include/asm/kvm_nested.h:
- * https://raw.githubusercontent.com/gregkh/linux/v6.18.50/arch/arm64/include/asm/kvm_nested.h
- * Complete source SHA256: ddd388bd8a4e981ea207c7c85e107a983f553a3336840e311238980cd37fe9d8
- * Lines 60-140, each range separated by one blank line.
+ * Verbatim line ranges from Linux v6.18.60 arch/arm64/include/asm/kvm_nested.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v6.18.60/arch/arm64/include/asm/kvm_nested.h
+ * Complete source SHA256: 1c66b6e3d831ab77ad1ffc79cab2e46ae604eb5d41923048e9b226346d6febe6
+ * Lines 61-141, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch to these files,
  * then compiles the functions it names from them into a C harness.
  */
-static inline u64 translate_ttbr0_el2_to_ttbr0_el1(u64 ttbr0)
 {
 	/* Clear the ASID field */
 	return ttbr0 & ~GENMASK_ULL(63, 48);
@@ -15,7 +14,8 @@ static inline u64 translate_ttbr0_el2_to_ttbr0_el1(u64 ttbr0)
 
 extern bool forward_smc_trap(struct kvm_vcpu *vcpu);
 extern bool forward_debug_exception(struct kvm_vcpu *vcpu);
-extern void kvm_init_nested(struct kvm *kvm);
+extern int kvm_init_nested(struct kvm *kvm);
+extern void kvm_destroy_nested(struct kvm *kvm);
 extern int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu);
 extern void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu);
 extern struct kvm_s2_mmu *lookup_s2_mmu(struct kvm_vcpu *vcpu);

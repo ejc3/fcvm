@@ -89,13 +89,30 @@ pub trait NetworkManager: Send + Sync {
     fn start_kill_processes(&mut self) {}
 
     /// Resolve when a helper process this network depends on for the VM's life
-    /// dies, with the message that names it (`crate::companion::death_message`).
+    /// dies, with its exit status; the message that names it comes from
+    /// `describe_companion_exit` (`crate::companion::death_message`).
     /// Run loops select on it so a dead helper ends the VM with its own name and
     /// last stderr output instead of whatever its absence breaks next (#852).
     ///
     /// Default: never resolves (bridged and routed have no helper process).
-    async fn companion_death(&mut self) -> String {
+    ///
+    /// Cancel-safe: it only waits for the exit. The caller describes the exit with
+    /// [`describe_companion_exit`](NetworkManager::describe_companion_exit) once its
+    /// select arm has won, so draining the helper's stderr is never cut short.
+    async fn companion_exited(&mut self) -> std::io::Result<std::process::ExitStatus> {
         std::future::pending().await
+    }
+
+    /// The message for the exit [`companion_exited`](NetworkManager::companion_exited)
+    /// returned: the helper's name, pid, status and last stderr output.
+    async fn describe_companion_exit(
+        &mut self,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) -> String {
+        match status {
+            Ok(status) => format!("a network helper exited: {status}"),
+            Err(error) => format!("a network helper could not be watched: {error}"),
+        }
     }
 
     /// Cleanup network after VM stop

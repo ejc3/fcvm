@@ -23,14 +23,17 @@ fn the_vncr_fixture_is_cut_from_the_pinned_arm64_kernel() {
         fixture.contains(&format!("Linux v{pinned} arch/arm64/kvm/nested.c")),
         "tests/fixtures/vncr/nested.c is not cut from the pinned Linux {pinned}. Cut the \
          excerpts again from that release's arch/arm64/kvm/nested.c and record its SHA-256 in \
-         the header. Editing the header alone hides a stale fixture: the file is the same from \
-         6.18.44 to 6.18.50 and changes in 6.18.51"
+         the header. Editing the header alone hides a stale fixture: the VNCR code changed in \
+         6.18.51 and 6.18.52"
     );
 }
 
-/// Exercise the actual stable-kernel functions after applying our carried fix.
-/// Stub only their dependencies, so removing the production patch reintroduces
-/// the stale CPU/flag/count state without running a kernel-crashing NV2 guest.
+/// Exercise the pinned kernel's VNCR functions, unpatched: 6.18.52 took
+/// upstream 5949004d7032 ("KVM: arm64: nv: Fully update VNCR fixmap state in
+/// kvm_translate_vncr()"), which replaced the patch fcvm carried for it. Only
+/// their dependencies are stubbed, so a pin without the fix (6.18.51 and
+/// earlier) leaves the stale CPU/flag state that trips the BUG_ON in
+/// kvm_vcpu_put_hw_mmu(), without running a kernel-crashing NV2 guest.
 #[test]
 fn arm64_vncr_retranslation_releases_cpu_mapping_before_vcpu_put() {
     let temp = tempfile::tempdir().expect("create isolated VNCR fixture");
@@ -46,25 +49,6 @@ fn arm64_vncr_retranslation_releases_cpu_mapping_before_vcpu_put() {
         include_str!("fixtures/vncr/harness.c"),
     )
     .unwrap();
-
-    let patch = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("kernel/patches-arm64/vncr-fixmap-state.patch");
-    // When the fix is absent, execute the original functions and fail on the
-    // broken state, not merely on a missing patch file.
-    if patch.exists() {
-        let applied = Command::new("patch")
-            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
-            .arg(patch)
-            .current_dir(temp.path())
-            .output()
-            .expect("apply the VNCR fix to stable source excerpts");
-        assert!(
-            applied.status.success(),
-            "VNCR patch did not apply:\n{}{}",
-            String::from_utf8_lossy(&applied.stdout),
-            String::from_utf8_lossy(&applied.stderr)
-        );
-    }
 
     let binary = temp.path().join("vncr-regression");
     let compiled = Command::new("cc")
@@ -333,7 +317,7 @@ fn extract_block(text: &str, start: &str, end: &str) -> Option<String> {
     Some(format!("{}\n\n", lines[first..=last].join("\n")))
 }
 
-/// Run Linux 6.18.50's shadow stage-2 unmap paths, with
+/// Run Linux 6.18.60's shadow stage-2 unmap paths, with
 /// `kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch` applied to the
 /// excerpts in `tests/fixtures/nv2-s2-tracking`, in a C harness that stubs the
 /// page tables and logs every range KVM asks them to unmap (fcvm #1274).
@@ -343,9 +327,10 @@ fn extract_block(text: &str, start: &str, end: &str) -> Option<String> {
 /// range, and the `targeted` and `memslot` scenarios fail on that. With it they
 /// must unmap only the shadow mappings of the invalidated range. The other
 /// scenarios cover what the patch adds: record removal on a nested unmap, a
-/// record surviving kvm_vcpu_init_nested() moving the MMU array, and an
-/// invalidation that rescheduled while kvm_arch_flush_shadow_all() freed that
-/// array (built with AddressSanitizer, so a read of the freed array aborts).
+/// record naming the right MMU after kvm_vcpu_init_nested() adds MMUs, and an
+/// invalidation that rescheduled while kvm_arch_flush_shadow_all() freed the
+/// shadow page tables and the canonical MMU (built with AddressSanitizer, so a
+/// read of freed memory aborts).
 #[test]
 fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -358,7 +343,7 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     }
 
     let patch = root.join("kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch");
-    // Without the patch, run 6.18.50's own functions and fail on what they
+    // Without the patch, run 6.18.60's own functions and fail on what they
     // unmap, not on the missing file.
     let patched = patch.exists();
     if patched {
@@ -370,7 +355,7 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
             .expect("run patch");
         assert!(
             applied.status.success(),
-            "nv2-targeted-shadow-s2-unmap.patch does not apply to the 6.18.50 excerpts:\n{}{}",
+            "nv2-targeted-shadow-s2-unmap.patch does not apply to the 6.18.60 excerpts:\n{}{}",
             String::from_utf8_lossy(&applied.stdout),
             String::from_utf8_lossy(&applied.stderr)
         );
@@ -384,7 +369,8 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     let blocks: &[(&str, &str, &str, bool)] = &[
         (&host_h, "struct kvm_guest_s2_mapping {", "};", true),
         (&nested_c, "#define S2_MMU_PER_VCPU", "", false),
-        (&nested_c, "void kvm_init_nested(", "}", false),
+        (&nested_c, "int kvm_init_nested(", "}", false),
+        (&nested_c, "void kvm_destroy_nested(", "}", false),
         (&nested_c, "static int init_nested_s2_mmu(", "}", false),
         (&nested_c, "int kvm_vcpu_init_nested(", "}", false),
         (&nested_c, "#define S2_MMU_IDX_MASK", "", true),
@@ -405,6 +391,12 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
         (&nested_c, "void kvm_remove_guest_s2_mappings(", "}", true),
         (&nested_c, "void kvm_destroy_guest_s2_mappings(", "}", true),
         (&nested_c, "void kvm_init_nested_s2_mmu(", "}", false),
+        (
+            &nested_c,
+            "static void kvm_invalidate_vncr_ipa_all(",
+            "}",
+            false,
+        ),
         (&nested_c, "void kvm_nested_unmap_cipa_range(", "}", true),
         (&nested_c, "void kvm_nested_s2_unmap(", "}", false),
         (&nested_c, "void kvm_arch_flush_shadow_all(", "}", false),
@@ -445,7 +437,7 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
             None => assert!(
                 *with_patch && !patched,
                 "`{start}` is missing from the {} excerpts",
-                if patched { "patched" } else { "6.18.50" }
+                if patched { "patched" } else { "6.18.60" }
             ),
         }
     }

@@ -1,7 +1,7 @@
 /*
- * Verbatim line ranges from Linux v6.18.50 arch/arm64/include/asm/kvm_host.h:
- * https://raw.githubusercontent.com/gregkh/linux/v6.18.50/arch/arm64/include/asm/kvm_host.h
- * Complete source SHA256: 39909c872471b008139145a2fbc88c0b82a19f22e37771b3d567233185552964
+ * Verbatim line ranges from Linux v6.18.60 arch/arm64/include/asm/kvm_host.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v6.18.60/arch/arm64/include/asm/kvm_host.h
+ * Complete source SHA256: a029ba74007e38f49b324274351a97ce8b71574d07288009ab2b293b2e511eff
  * Lines 1-40, 140-230, 295-320, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch to these files,
@@ -155,7 +155,7 @@ struct kvm_s2_mmu {
 	 * Stage 2 paging state for VMs with nested S2 using a virtual
 	 * VMID.
 	 */
-	struct kvm_s2_mmu *nested_mmus;
+	struct kvm_s2_mmu **nested_mmus;
 	size_t nested_mmus_size;
 	int nested_mmus_next;
 
