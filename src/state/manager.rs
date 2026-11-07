@@ -62,6 +62,42 @@ fn lock_opened_state_file(
     }
 }
 
+/// Lock a state file's existing lock, never creating one. `Ok(None)` when there is no lock
+/// at `path`: every saved state has one until `delete_state` removes it, so its absence
+/// means the state is gone. A reader that created the lock instead would leave a lock for a
+/// deleted state behind.
+fn lock_existing_state_file(path: &Path, arg: FlockArg) -> Result<Option<Flock<std::fs::File>>> {
+    use std::os::unix::fs::MetadataExt;
+    loop {
+        let file = match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("opening state lock"),
+        };
+        let guard = match Flock::lock(file, nonblocking(arg)) {
+            Ok(guard) => guard,
+            Err((file, nix::errno::Errno::EWOULDBLOCK)) if nonblocking(arg) != arg => {
+                failpoint::note("lock.wait", path.display());
+                Flock::lock(file, arg)
+                    .map_err(|(_, error)| error)
+                    .context("acquiring state lock")?
+            }
+            Err((_, error)) => return Err(error).context("acquiring state lock"),
+        };
+        let held = guard
+            .metadata()
+            .context("reading held state lock identity")?;
+        match std::fs::metadata(path) {
+            Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
+                return Ok(Some(guard))
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading state lock path identity"),
+        }
+    }
+}
+
 /// The non-blocking form of a blocking lock request, so a wait can be recorded first.
 fn nonblocking(arg: FlockArg) -> FlockArg {
     match arg {
@@ -821,18 +857,19 @@ impl StateManager {
     ///
     /// For a decision another process's locked write must not slip between: `inspect` sees
     /// the state as it is on disk, and no `update_state` of this VM can land until it
-    /// returns. Nothing is written. Returns `Ok(None)` when the state file does not exist.
+    /// returns. Nothing is written, not even a lock. Returns `Ok(None)` when the state, or its
+    /// lock, is gone.
     pub async fn with_locked_state<T, F>(&self, vm_id: &str, inspect: F) -> Result<Option<T>>
     where
         F: FnOnce(&VmState) -> T,
     {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
-        if !state_file.exists() {
+        let Some(flock) = lock_existing_state_file(&lock_file, FlockArg::LockShared)
+            .context("acquiring shared lock to read VM state")?
+        else {
             return Ok(None);
-        }
-        let flock = lock_state_file(&lock_file, FlockArg::LockShared)
-            .context("acquiring shared lock to read VM state")?;
+        };
         let result: Result<Option<T>> = async {
             let state_json = match fs::read_to_string(&state_file).await {
                 Ok(json) => json,
@@ -986,6 +1023,41 @@ impl StateManager {
 
 #[cfg(test)]
 mod tests {
+
+    /// A locked read creates no lock. A state deleted between a reader's look and its
+    /// lock used to leave the reader's freshly created lock behind for good; with no lock
+    /// at the path the state is gone and the read says so. A saved state is read as usual.
+    #[tokio::test]
+    async fn a_locked_read_never_creates_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        manager.init().await.unwrap();
+        let orphan = VmState::new("vm-orphan".to_string(), "alpine".to_string(), 1, 128);
+        std::fs::write(
+            dir.path().join("vm-orphan.json"),
+            serde_json::to_string(&orphan).unwrap(),
+        )
+        .unwrap();
+        let read = manager
+            .with_locked_state("vm-orphan", |state| state.vm_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(read, None);
+        assert!(
+            !dir.path().join("vm-orphan.json.lock").exists(),
+            "a locked read created a lock"
+        );
+
+        let mut saved = VmState::new("vm-saved".to_string(), "alpine".to_string(), 1, 128);
+        saved.pid = Some(std::process::id());
+        manager.save_state(&saved).await.unwrap();
+        let read = manager
+            .with_locked_state("vm-saved", |state| state.vm_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(read.as_deref(), Some("vm-saved"));
+    }
+
     use super::*;
 
     /// Everything `list_vms` logs at WARN or above while scanning `dir`.
