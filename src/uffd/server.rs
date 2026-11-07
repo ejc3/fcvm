@@ -695,6 +695,8 @@ struct CloneWorkingSet {
     /// Per-clone recording window, anchored at the UFFD handshake. Only consulted when
     /// `store` is present, so the zero this derives under `Default` never gates anything.
     record_window: Duration,
+    /// Where this server's warm-up paces itself from: the clone's replay reports to it.
+    progress: Option<Arc<crate::uffd::warmup::ReplayProgressHandle>>,
 }
 
 impl Prefetch {
@@ -1356,6 +1358,7 @@ impl UffdServer {
                                 store: self.working_set.clone(),
                                 persistence: self.working_set_persistence.clone(),
                                 record_window: self.record_window,
+                                progress: self.warmer.as_ref().map(Warmer::progress),
                             };
                             let mem_size = self.mem_size;
                             let admitted_slot = Arc::clone(&admitted);
@@ -2824,6 +2827,8 @@ struct VmState {
     /// Events one read of the userfaultfd returns at most: [`READ_BATCH`]. A test that
     /// needs a fault read ahead of a REMOVE queued behind it reads one at a time.
     read_batch: usize,
+    /// Where this clone's replay reports how far it has got, for the warm-up (#1066).
+    replay_progress: Option<Arc<crate::uffd::warmup::ReplayProgressHandle>>,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -2965,6 +2970,7 @@ async fn handle_vm_page_faults(
         store: working_set,
         persistence: working_set_persistence,
         record_window,
+        progress: replay_progress,
     } = working_set;
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
     let page_mask = !(page_size - 1);
@@ -3030,6 +3036,7 @@ async fn handle_vm_page_faults(
         replaying: false,
         read_batch: READ_BATCH,
         fault_workers: None,
+        replay_progress,
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -3867,6 +3874,19 @@ async fn replay_working_set(
         None => None,
     };
     state.replaying = true;
+    /// Tells the warm-up that this replay ended, on every path out.
+    struct ReplayRunning(Option<Arc<crate::uffd::warmup::ReplayProgressHandle>>);
+    impl Drop for ReplayRunning {
+        fn drop(&mut self) {
+            if let Some(progress) = &self.0 {
+                progress.end();
+            }
+        }
+    }
+    let running = ReplayRunning(state.replay_progress.clone());
+    if let Some(progress) = &running.0 {
+        progress.begin();
+    }
     let ran = replay_segments(ctx, async_uffd, recorded, state, &mut workers).await;
     // A replay error enters the fail-closed path, which kills the VMM: the workers are
     // dropped, which closes the queue and joins them, with no flush and no wait for outcomes
@@ -3880,6 +3900,7 @@ async fn replay_working_set(
         None => ReplayWorkersTally::default(),
     };
     state.replaying = false;
+    drop(running);
     let mut ran = ran?;
     if tally.vm_gone {
         return Ok(Replay::Exited);
@@ -4115,9 +4136,15 @@ async fn replay_segments(
     let mut yields = 0u64;
 
     let mut pacer = ReplayPacer::default();
+    let mut passed = 0u64;
     'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
     {
         segments += 1;
+        // The warm-up paces itself to this (#1066).
+        if let Some(progress) = &state.replay_progress {
+            progress.passed(passed);
+        }
+        passed += segment.len as u64;
         let mut done = 0usize;
         'chunk: while done < segment.len {
             for step in
@@ -5648,6 +5675,7 @@ mod tests {
             replaying: false,
             read_batch: READ_BATCH,
             fault_workers: None,
+            replay_progress: None,
             recorded: None,
             record_until: None,
             started: origin,
@@ -5851,6 +5879,7 @@ mod tests {
             replaying: false,
             read_batch: READ_BATCH,
             fault_workers: None,
+            replay_progress: None,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -5878,6 +5907,7 @@ mod tests {
             replaying: false,
             read_batch: READ_BATCH,
             fault_workers: None,
+            replay_progress: None,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -5923,6 +5953,7 @@ mod tests {
             replaying: false,
             read_batch: READ_BATCH,
             fault_workers: None,
+            replay_progress: None,
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -7057,6 +7088,7 @@ mod tests {
                 replaying: false,
                 read_batch: READ_BATCH,
                 fault_workers: None,
+                replay_progress: None,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -8198,6 +8230,7 @@ mod tests {
                 replaying: false,
                 read_batch: READ_BATCH,
                 fault_workers: None,
+                replay_progress: None,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -9426,6 +9459,7 @@ mod tests {
                 replaying: false,
                 read_batch: READ_BATCH,
                 fault_workers: None,
+                replay_progress: None,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -9763,6 +9797,7 @@ mod tests {
                 replaying: false,
                 read_batch: READ_BATCH,
                 fault_workers: FaultWorkers::start(&self.uffd, &self.source, &self.ctx(), None),
+                replay_progress: None,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
