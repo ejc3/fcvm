@@ -5064,6 +5064,8 @@ class ServeAckVerdict(unittest.TestCase):
              "the memory server's fcvm-ws-warm thread to exit"),
             ("the hole map is being built", whole, True, self.QUIET | {"fcvm-holes"},
              "the memory server's fcvm-holes thread to exit"),
+            ("the working set is being split into first-touch tiers", whole, True,
+             self.QUIET | {"fcvm-ws-order"}, "the memory server's fcvm-ws-order thread to exit"),
             ("everything is done", whole, True, self.QUIET, acked),
             ("another clone's publication", self.lines("connect", "handler", "disconnect")
              + self.lines("merged", vm_id="vm-30"), True, self.QUIET,
