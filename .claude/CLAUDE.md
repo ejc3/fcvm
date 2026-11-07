@@ -2966,10 +2966,16 @@ separately.
   working set into the page cache` with `trigger`, `runs`, `pages`, `failures` and
   `elapsed_ms`, or, for a fresh snapshot, that no working set is recorded yet. Minor mode
   reads the whole image into its memfd at startup, so it has nothing to warm, and
-  `--uffd-prefetch off` starts no warm-up. Known limits, with numbers, are in the module doc:
-  the warm-up is not paced, so on a cold cache another running clone's major fault waits
-  behind its readahead, it can outrun replay when free page cache is smaller than the
-  recorded set, and a minor-mode server starting on the same image drops what it loaded.
+  `--uffd-prefetch off` starts no warm-up. Once its requests pass the free memory it started
+  with (less a sixteenth of the host), the warm-up issues each one only within 1 GiB of the
+  furthest point a running replay has reached, which replay reports after every chunk it
+  copies, and waits while no replay runs (#1066). Without that, a warm-up far ahead of replay read pages the kernel evicted again
+  before replay copied them: under a 200 MiB/s disk with 30 GiB of other active file pages
+  and 3 GiB free, replay of an 18 GiB set read 29.6 to 32.3 GiB and took 150.5 to 164.0 s,
+  against 18.0 GiB and 91.1 to 91.3 s paced. Known limits, with numbers, are in the module
+  doc: it is not paced against the disk, so on a cold cache another running clone's major
+  fault waits behind its readahead, and a minor-mode server starting on the same image drops
+  what it loaded.
 - **Idle snapshots leave the page cache when a server starts** (`src/uffd/release.rs`, #1066):
   a server that starts asks the kernel to drop the memory file of every other snapshot that
   nothing is reading (`posix_fadvise(POSIX_FADV_DONTNEED)`, on a detached thread).

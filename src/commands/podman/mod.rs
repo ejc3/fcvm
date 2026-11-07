@@ -1484,6 +1484,8 @@ async fn prepare_vm_for_lifecycle(
     mut args: RunArgs,
     lifecycle: PodmanLifecycle,
 ) -> Result<VmPreparation> {
+    // Every podman launch, the library's start_vm and prepare_vm included, comes here first.
+    crate::cgroup::require_swap_disabled(args.no_swap)?;
     info!(
         lifecycle = ?lifecycle,
         "Starting fcvm podman lifecycle"

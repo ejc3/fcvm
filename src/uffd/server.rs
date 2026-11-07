@@ -2441,6 +2441,9 @@ struct FaultWorkers {
     answered: Arc<std::sync::atomic::AtomicU64>,
     holes: Arc<std::sync::atomic::AtomicU64>,
     stale: u64,
+    /// Set when the workers are dropped or one finds the clone gone. A worker reads it
+    /// before each job's source read, so jobs still queued then are not read.
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FaultWorkers {
@@ -2487,6 +2490,7 @@ impl FaultWorkers {
         let (back_tx, back) = tokio::sync::mpsc::unbounded_channel();
         let answered = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let holes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut workers = Self {
             jobs: Some(jobs),
             back,
@@ -2495,6 +2499,7 @@ impl FaultWorkers {
             answered: Arc::clone(&answered),
             holes: Arc::clone(&holes),
             stale: 0,
+            stop: Arc::clone(&stop),
         };
         for index in 0..count {
             // F_DUPFD_CLOEXEC: a child the server spawns meanwhile must not inherit it.
@@ -2513,6 +2518,7 @@ impl FaultWorkers {
                 back: back_tx.clone(),
                 answered: Arc::clone(&answered),
                 holes: Arc::clone(&holes),
+                stop: Arc::clone(&stop),
             };
             let handle = std::thread::Builder::new()
                 .name(format!("fcvm-fault-{index}"))
@@ -2536,9 +2542,11 @@ impl FaultWorkers {
 }
 
 impl Drop for FaultWorkers {
-    /// Close the queue and join the workers. A worker finishes the fault it holds, if any:
-    /// one source read and one fill, which with the clone gone fails at once.
+    /// Stop the workers, close the queue and join them. A worker finishes the fault it
+    /// holds, if any: one source read and one fill, which with the clone gone fails at once.
+    /// The jobs still queued are dropped unread.
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
         self.jobs.take();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
@@ -2559,6 +2567,7 @@ struct FaultWorker {
     back: tokio::sync::mpsc::UnboundedSender<WorkerReturn>,
     answered: Arc<std::sync::atomic::AtomicU64>,
     holes: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FaultWorker {
@@ -2575,6 +2584,7 @@ impl FaultWorker {
             back,
             answered,
             holes,
+            stop,
         } = self;
         // SAFETY: `fd` is a userfaultfd this thread now owns.
         let uffd = unsafe { Uffd::from_raw_fd(fd.into_raw_fd()) };
@@ -2586,6 +2596,9 @@ impl FaultWorker {
             // before the fault is answered.
             let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
             let Ok(job) = job else { return };
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
             if job.answer == WorkerAnswer::Snapshot {
                 read_source_range(mmap, job.offset, page_size);
             }
@@ -2614,7 +2627,10 @@ impl FaultWorker {
                     })
                 }
                 Some(Ok((FaultOutcome::Retry, _))) => Some(WorkerReturn::Retry(job)),
-                Some(Ok((FaultOutcome::VmGone, _))) => Some(WorkerReturn::VmGone),
+                Some(Ok((FaultOutcome::VmGone, _))) => {
+                    stop.store(true, Ordering::Release);
+                    Some(WorkerReturn::VmGone)
+                }
                 Some(Err(error)) => Some(WorkerReturn::Failed(format!("{error:#}"))),
             };
             if let Some(reply) = reply {
@@ -4197,18 +4213,27 @@ async fn replay_segments(
     let mut limited = false;
     'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
     {
-        if state
-            .replay_limit
-            .bytes()
-            .is_some_and(|limit| passed >= limit)
-        {
-            limited = true;
-            break;
+        let mut segment = segment;
+        // The limit bounds the bytes replayed, so a segment that would cross it is cut at
+        // the last whole page inside it: one contiguous recorded run can be the whole set.
+        if let Some(limit) = state.replay_limit.bytes() {
+            let room = limit.saturating_sub(passed);
+            let room = usize::try_from(room).unwrap_or(usize::MAX);
+            let room = room - room % ctx.page_size;
+            if room < segment.len {
+                limited = true;
+                if room == 0 {
+                    break;
+                }
+                segment.len = room;
+            }
         }
         segments += 1;
-        // The warm-up paces itself to this (#1066).
+        let segment_start = passed;
+        // The warm-up paces itself to this (#1066), here and after every chunk below, so a
+        // long segment moves the warm-up's window while it is copied.
         if let Some(progress) = &state.replay_progress {
-            progress.passed(passed);
+            progress.passed(segment_start);
         }
         passed += segment.len as u64;
         let mut done = 0usize;
@@ -4343,12 +4368,14 @@ async fn replay_segments(
             // A plain run of the snapshot goes to the replay workers when the clone has them,
             // after any stale job of theirs is re-planned; the handler copies zeros, holes and
             // everything else itself. A dispatched run counts as advanced here and as populated
-            // when its workers report.
+            // when its workers report. It is handed over a chunk at a time, as the handler
+            // copies, so the position the warm-up paces to moves inside a long run too.
             let dispatched = workers.is_some() && zeros.is_none();
             let outcome = match (workers.as_mut(), zeros.is_none()) {
                 (Some(pool), true) => {
                     pool.collect();
                     pool.replan_stale(ctx, async_uffd, state).await?;
+                    let handed = (wanted.len - done_in_wanted).min(prefetch::CHUNK_BYTES);
                     if pool
                         .dispatch_run(
                             ctx,
@@ -4356,7 +4383,7 @@ async fn replay_segments(
                             state,
                             wanted.host_addr.saturating_add(done_in_wanted),
                             wanted.file_offset.saturating_add(done_in_wanted as u64),
-                            wanted.len - done_in_wanted,
+                            handed,
                         )
                         .await?
                     {
@@ -4377,7 +4404,7 @@ async fn replay_segments(
                             });
                         }
                         Ok(prefetch::Progress {
-                            advanced: wanted.len - done_in_wanted,
+                            advanced: handed,
                             populated: 0,
                         })
                     } else {
@@ -4409,6 +4436,9 @@ async fn replay_segments(
                     populated,
                 }) => {
                     done += progress;
+                    if let Some(position) = &state.replay_progress {
+                        position.passed(segment_start + done as u64);
+                    }
                     // A dispatched run is counted when its worker reports it populated.
                     if !dispatched {
                         bytes += progress as u64;
@@ -10007,6 +10037,47 @@ mod tests {
         assert_eq!(state.fault_count, 2);
     }
 
+    /// Dropping the fault workers stops them before the jobs still queued are read: a clone
+    /// that is gone does not pay one source read per queued fault before its handler can
+    /// return. Without the stop the one worker went on to read page 4 after page 2.
+    #[test]
+    fn dropped_fault_workers_read_no_queued_source_page() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::empty());
+        let ctx = clone.ctx();
+        let mut workers =
+            FaultWorkers::spawn(1, &clone.uffd, &clone.source, &ctx, None).expect("one worker");
+        let job = |page: usize| FaultJob {
+            page: clone.guest_addr(page),
+            offset: page * HeldSourceClone::PAGE,
+            write: false,
+            trace_t0: 0,
+            answer: WorkerAnswer::Snapshot,
+            generation: ctx.gate.generation(),
+        };
+        assert!(workers.submit(job(2)));
+        wait_for_uffd_event(&clone.source_uffd, "page 2's source read");
+        assert!(workers.submit(job(4)));
+        let stop = Arc::clone(&workers.stop);
+        let dropper = std::thread::spawn(move || drop(workers));
+        while !stop.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        clone.serve_source(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !dropper.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let in_time = dropper.is_finished();
+        if !in_time {
+            clone.serve_source(4);
+        }
+        dropper.join().unwrap();
+        assert!(
+            in_time,
+            "the dropped workers read the queued page 4 before they stopped"
+        );
+    }
+
     /// A REMOVE that is read while a fault's source page is being read leaves what it leaves
     /// for a parked fault: the page is given back, so the fault is answered with zeros and the
     /// snapshot's bytes are not installed in memory the guest gave back.
@@ -10304,12 +10375,111 @@ mod tests {
                 "replay went past its limit of two pages"
             );
         }
+        drop(async_uffd);
+        clone.unmap();
+
+        // One contiguous recorded run longer than the limit is cut at the limit.
+        let (clone, uffd) = FaultAroundClone::new(0, 0, 10);
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+        {
+            let ctx = clone.ctx();
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            recorded.insert_range(0, (6 * PAGE) as u64);
+            let mut state = clone.state();
+            state.replay_limit = ReplayLimit(Some(2 * PAGE as u64 + 1));
+            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(
+                clone.resident_region_pages(),
+                vec![0, 1],
+                "a six-page run replayed past its limit of two pages and a byte"
+            );
+        }
         assert_eq!(ReplayLimit::parse(" 3\n").unwrap().bytes(), Some(3 << 20));
         assert!(ReplayLimit::parse("lots").is_err());
         assert_eq!(
             ReplayLimit::default().bytes(),
             None,
             "unbounded unless asked"
+        );
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// Replay reports its position as it copies a segment, not only when a segment begins,
+    /// so a warm-up paced to it moves on inside one long recorded run (#1066). Reported only
+    /// at segment starts, a set that is one run left the position at 0 for the whole replay.
+    #[tokio::test]
+    async fn replay_reports_its_position_inside_a_segment() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) = FaultAroundClone::new(0, 0, 10);
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+        let warmer = crate::uffd::warmup::Warmer::new(
+            "position",
+            Arc::new(tempfile::tempfile().unwrap()),
+            (clone.file_pages * PAGE) as u64,
+        );
+        let progress = warmer.progress();
+        {
+            let ctx = clone.ctx();
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            recorded.insert_range(0, (6 * PAGE) as u64);
+            let mut state = clone.state();
+            state.replay_progress = Some(Arc::clone(&progress));
+            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(clone.resident_region_pages(), vec![0, 1, 2, 3, 4, 5]);
+        }
+        assert_eq!(
+            progress.furthest(),
+            (6 * PAGE) as u64,
+            "replay copied the six-page run and reported no progress inside it"
+        );
+        drop(async_uffd);
+        clone.unmap();
+
+        // With replay workers, a run is handed to them a chunk at a time and each hand-over
+        // is reported. Handed over whole, an 8 MiB run reported its start and its end only.
+        const PAGES: usize = 4 * prefetch::CHUNK_BYTES / PAGE;
+        let (mut clone, uffd) = FaultAroundClone::new(1, 0, PAGES);
+        if let PageSource::Copy { replay_threads, .. } = &mut clone.source {
+            *replay_threads = 4;
+        }
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+        let gate = Arc::new(ReplayGate::default());
+        let warmer = crate::uffd::warmup::Warmer::new(
+            "position-workers",
+            Arc::new(tempfile::tempfile().unwrap()),
+            (clone.file_pages * PAGE) as u64,
+        );
+        let progress = warmer.progress();
+        {
+            let ctx = clone.ctx_with_gate(&gate);
+            assert_eq!(ctx.replay_workers().map(|(count, _)| count), Some(4));
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            recorded.insert_range(0, (PAGES * PAGE) as u64);
+            let mut state = clone.state();
+            state.replay_progress = Some(Arc::clone(&progress));
+            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(
+                clone.resident_region_pages(),
+                (0..PAGES).collect::<Vec<_>>()
+            );
+        }
+        let total = (PAGES * PAGE) as u64;
+        let inside: Vec<u64> = progress
+            .reported()
+            .into_iter()
+            .filter(|&at| at > 0 && at < total)
+            .collect();
+        assert_eq!(
+            inside,
+            [1, 2, 3].map(|chunks| chunks * prefetch::CHUNK_BYTES as u64),
+            "the workers' run was reported only at its start and its end"
         );
         drop(async_uffd);
         clone.unmap();
@@ -11474,6 +11644,10 @@ mod tests {
             FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let ctx = clone.ctx();
         let mut state = clone.state();
+        // The kernel hands out pending faults before events, so one event per read takes
+        // the fault ahead of the REMOVE below. A batched read could take both, record the
+        // REMOVE first and answer the fault without parking it.
+        state.read_batch = 1;
         give_back(&clone, &uffd, &mut state, 2, 3);
 
         // One more REMOVE, left unread: the kernel refuses every populate ioctl until the

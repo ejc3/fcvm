@@ -73,10 +73,11 @@ impl Known {
     }
 }
 
-/// A reply to send after the kernel has dropped the listed inodes' caches.
+/// One job of the invalidation thread, which runs them in the order they were queued: the
+/// inodes whose caches the kernel must drop, then the reply that waited for them.
 struct Job {
     inodes: Vec<u64>,
-    reply: Box<dyn FnOnce() + Send>,
+    reply: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// The client's record of regular files and the thread that sends invalidations.
@@ -89,7 +90,12 @@ pub(crate) struct HostChanges {
     /// page waits for its lock, a page under a read is locked until that READ is answered, and
     /// the READ may be queued for the reader that is waiting. The thread sends the reply after
     /// the invalidation, so the request still sees the new data, and the readers keep serving.
+    /// Without the thread nothing is invalidated: on a reader that could deadlock the mount.
     jobs: Option<crossbeam_channel::Sender<Job>>,
+    /// Invalidations queued and not yet sent. While any is, every reply goes through the
+    /// queue behind them: a second refresh of a file that sees the new ctime already
+    /// recorded must not let a read past the pages the first one is about to drop.
+    queued: Arc<AtomicU64>,
 }
 
 fn is_regular(ino: u64, attr: &FileAttr) -> bool {
@@ -100,20 +106,28 @@ impl HostChanges {
     pub(crate) fn new(notifier: NotifierSlot) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded::<Job>();
         let worker_notifier = Arc::clone(&notifier);
+        let queued = Arc::new(AtomicU64::new(0));
+        let worker_queued = Arc::clone(&queued);
         let jobs = std::thread::Builder::new()
             .name("fuse-pipe-inval".to_string())
             .spawn(move || {
                 // Ends when the client, which holds the only sender, is dropped with its session.
                 for job in rx {
-                    send_invalidations(&worker_notifier, &job.inodes);
-                    (job.reply)();
+                    if !job.inodes.is_empty() {
+                        send_invalidations(&worker_notifier, &job.inodes);
+                        worker_queued.fetch_sub(job.inodes.len() as u64, Ordering::AcqRel);
+                    }
+                    if let Some(reply) = job.reply {
+                        reply();
+                    }
                 }
             })
             .map_err(|e| {
                 tracing::error!(
                     target: "fuse-pipe::client",
                     error = %e,
-                    "cannot start the invalidation thread; invalidating on the reader thread"
+                    "cannot start the invalidation thread; a file the host changes without \
+                     changing its size or mtime keeps its cached pages"
                 );
             })
             .ok()
@@ -124,6 +138,7 @@ impl HostChanges {
             clock: AtomicU64::new(0),
             notifier,
             jobs,
+            queued,
         }
     }
 
@@ -145,7 +160,10 @@ impl HostChanges {
     /// The server answered a GETATTR, LOOKUP or READDIRPLUS asked at `asked` with `attr` for node
     /// `ino`, which the kernel will take. `entry` says whether the reply adds to the kernel's
     /// lookup count. Returns whether the kernel must drop the file's caches before it sees the
-    /// reply.
+    /// reply, in which case the invalidation is already queued, before any other refresh of
+    /// the file can see the new ctime recorded; pass the inode to [`reply_after`].
+    ///
+    /// [`reply_after`]: Self::reply_after
     pub(crate) fn refreshed(&self, ino: u64, attr: &FileAttr, asked: u64, entry: bool) -> bool {
         if !is_regular(ino, attr) {
             return false;
@@ -170,7 +188,24 @@ impl HostChanges {
         known.size = attr.size;
         known.mtime = mtime;
         known.ctime = ctime;
-        invalidate
+        invalidate && self.queue_invalidation(ino)
+    }
+
+    /// Queue the invalidation of `ino`. False when there is no invalidation thread.
+    fn queue_invalidation(&self, ino: u64) -> bool {
+        let Some(jobs) = &self.jobs else {
+            return false;
+        };
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        let job = Job {
+            inodes: vec![ino],
+            reply: None,
+        };
+        if jobs.send(job).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 
     /// This mount made `attr`'s file (CREATE, MKNOD): the reply adds a lookup and the file has
@@ -233,15 +268,17 @@ impl HostChanges {
         });
     }
 
-    /// Send `reply` once the kernel has dropped the caches of `inodes`; at once if there are none.
-    pub(crate) fn reply_after(&self, inodes: Vec<u64>, reply: impl FnOnce() + Send + 'static) {
-        if inodes.is_empty() {
+    /// Send `reply` once every invalidation queued so far has been sent, which includes those
+    /// of `stale`, the inodes [`refreshed`](Self::refreshed) found changed for this reply. At
+    /// once on the calling thread when there are none and none is queued.
+    pub(crate) fn reply_after(&self, stale: Vec<u64>, reply: impl FnOnce() + Send + 'static) {
+        if stale.is_empty() && self.queued.load(Ordering::Acquire) == 0 {
             reply();
             return;
         }
         let job = Job {
-            inodes,
-            reply: Box::new(reply),
+            inodes: Vec::new(),
+            reply: Some(Box::new(reply)),
         };
         let job = match &self.jobs {
             Some(jobs) => match jobs.send(job) {
@@ -250,8 +287,9 @@ impl HostChanges {
             },
             None => job,
         };
-        send_invalidations(&self.notifier, &job.inodes);
-        (job.reply)();
+        if let Some(reply) = job.reply {
+            reply();
+        }
     }
 
     #[cfg(test)]
@@ -406,6 +444,48 @@ mod tests {
         // A FORGET for an inode never recorded (a directory) is ignored.
         c.forget(9, 3);
         assert!(!c.tracked(9));
+    }
+
+    /// Two refreshes of one file race: the first finds the host's new ctime and queues the
+    /// invalidation, the second finds it already recorded. The second reply must still wait
+    /// for the invalidation, or the read waiting on it reads the old pages. Before the fix it
+    /// was sent at once on the calling thread.
+    #[test]
+    fn a_second_refresh_waits_for_the_invalidation_the_first_queued() {
+        let c = changes(false);
+        assert!(!c.refreshed(5, &attr(5, 64, 100, 100), c.now(), true));
+        // Hold the invalidation thread inside an earlier reply.
+        assert!(!c.refreshed(7, &attr(7, 64, 100, 100), c.now(), true));
+        assert!(c.refreshed(7, &attr(7, 64, 100, 101), c.now(), false));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, worker_busy) = std::sync::mpsc::channel();
+        c.reply_after(vec![7], move || {
+            entered.send(()).unwrap();
+            let _ = held.recv();
+        });
+        worker_busy
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the invalidation thread ran the earlier reply");
+
+        // The host rewrites file 5 keeping size and mtime; two refreshes answer.
+        assert!(c.refreshed(5, &attr(5, 64, 100, 102), c.now(), false));
+        assert!(!c.refreshed(5, &attr(5, 64, 100, 102), c.now(), false));
+        let queued = Arc::clone(&c.queued);
+        let (sent, second) = std::sync::mpsc::channel();
+        c.reply_after(Vec::new(), move || {
+            sent.send(queued.load(Ordering::Acquire)).unwrap();
+        });
+        assert!(
+            second
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the second reply was sent before file 5's invalidation"
+        );
+        release.send(()).unwrap();
+        let left = second
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second reply was sent after the invalidation");
+        assert_eq!(left, 0, "file 5's invalidation was still queued");
     }
 
     #[test]

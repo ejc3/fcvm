@@ -512,6 +512,41 @@ pub fn enter_this_process(no_swap: bool) -> Result<Option<VmScope>> {
     }
 }
 
+/// Refuse `--no-swap` unless this process already runs in a cgroup whose
+/// `memory.swap.max` is 0. The fcvm binary enters such a scope before the command starts
+/// ([`enter_this_process`]); a library caller of a command that starts a VM or a memory
+/// server with `no_swap` set must do the same, or the VM would start swappable.
+pub fn require_swap_disabled(no_swap: bool) -> Result<()> {
+    if !no_swap {
+        return Ok(());
+    }
+    let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    swap_disabled_in(Path::new(CGROUP2_ROOT), &proc_cgroup)
+}
+
+fn swap_disabled_in(root: &Path, proc_cgroup: &str) -> Result<()> {
+    let Some(own) = proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+    else {
+        bail!("--no-swap: this process is in no cgroup2 cgroup");
+    };
+    let swap_max = root
+        .join(own.trim_start_matches('/'))
+        .join("memory.swap.max");
+    match std::fs::read_to_string(&swap_max) {
+        Ok(value) if value.trim() == "0" => Ok(()),
+        Ok(value) => bail!(
+            "--no-swap: {} is {}, not 0. The fcvm binary enters a cgroup with it set to 0 \
+             before the command starts (fcvm::cgroup::enter_this_process); a library caller \
+             must too",
+            swap_max.display(),
+            value.trim()
+        ),
+        Err(e) => bail!("--no-swap: reading {}: {e}", swap_max.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +685,36 @@ mod tests {
             std::fs::read_to_string(scope.path().join("memory.swap.max")).unwrap(),
             "0"
         );
+    }
+
+    /// A command asked for `--no-swap` runs only inside a cgroup with swap off, so a library
+    /// caller that never entered a scope is refused instead of starting a swappable VM.
+    #[test]
+    fn no_swap_is_refused_outside_a_cgroup_with_swap_off() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = root.path().join("fcvm.slice/fcvm-1-2.scope");
+        std::fs::create_dir_all(&scope).unwrap();
+        let proc_cgroup = "0::/fcvm.slice/fcvm-1-2.scope\n";
+        std::fs::write(scope.join("memory.swap.max"), "0\n").unwrap();
+        swap_disabled_in(root.path(), proc_cgroup).expect("swap off");
+        std::fs::write(scope.join("memory.swap.max"), "max\n").unwrap();
+        assert!(swap_disabled_in(root.path(), proc_cgroup).is_err());
+        assert!(swap_disabled_in(root.path(), "0::/user.slice\n").is_err());
+        assert!(swap_disabled_in(root.path(), "").is_err());
+        require_swap_disabled(false).expect("nothing to check without --no-swap");
+
+        // Every command that starts a VM or a memory server checks it first.
+        let code = |source: &str, function: &str| -> bool {
+            let body = &source[source.find(function).unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            body.contains("crate::cgroup::require_swap_disabled(")
+        };
+        let podman = include_str!("commands/podman/mod.rs");
+        let snapshot = include_str!("commands/snapshot.rs");
+        // podman run, podman prepare and the library's start_vm and prepare_vm.
+        assert!(code(podman, "async fn prepare_vm_for_lifecycle("));
+        assert!(code(snapshot, "pub async fn cmd_snapshot_run("));
+        assert!(code(snapshot, "async fn cmd_snapshot_serve("));
     }
 
     #[test]

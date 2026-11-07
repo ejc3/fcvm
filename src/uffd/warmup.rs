@@ -68,17 +68,23 @@
 //!
 //! # Known limits
 //!
-//! * **It is not paced.** On a cold cache the thread keeps the device queue full for its
-//!   whole run, so another running clone's major fault on an uncached page waits behind
-//!   readahead. A microbenchmark (6 GiB file on btrfs over a virtio disk, `nr_requests` 256,
+//! * **It is not paced against the disk.** While its requests fit in the free memory it
+//!   started with, and within [`PACED_WINDOW_BYTES`] of replay after that, it issues them
+//!   back to back. On a cold cache that keeps the device queue full, so another running
+//!   clone's major fault on an uncached page waits behind readahead. A microbenchmark (6 GiB file on btrfs over a virtio disk, `nr_requests` 256,
 //!   scheduler `none`) measured a cold single-page fault at a median of 125 us alone and
 //!   1,193 us while back-to-back 128 KiB requests ran, with the p90 going from 141 us to
 //!   6.5 ms. With scattered 8 KiB runs the median went from 119 to 152 us and the p99 from
 //!   266 to 1,314 us. The admitted clone gains far more than that costs (see Measured), and
 //!   on a cached image the walk does no I/O.
-//! * **It can outrun replay.** If free page cache is smaller than the recorded set, the
-//!   warm-up can get far enough ahead that the kernel evicts the lowest offsets before
-//!   replay reads them. That case was not measured.
+//! * **Pacing against replay starts once free memory is spent.** Until the requests pass
+//!   the free memory the warm-up started with (less a sixteenth of the host), they run
+//!   unpaced; after that each one waits until it is within [`PACED_WINDOW_BYTES`] of the
+//!   furthest point a running replay has reached, and waits while none runs (#1066). A
+//!   warm-up still waiting when its clone's replay has ended keeps the one warm-up slot, so
+//!   a clone admitted then starts no warm-up of its own; when that clone's replay begins, a
+//!   new group of replays, the waiting warm-up starts over from the beginning of the set,
+//!   taking the recorded set and the free memory again (#1676).
 //! * **A minor-mode server undoes it.** A minor-mode server that starts on the same image
 //!   ends `create_backing_memfd` with a whole-file `POSIX_FADV_DONTNEED`, which drops what a
 //!   copy-mode warm-up loaded. Only the hint is lost.
@@ -167,6 +173,8 @@ struct WarmStats {
     stopped_early: bool,
     /// The warm-up waited for replay at least once.
     paced: bool,
+    /// A new group of replays began, and the warm-up stopped to start over with it.
+    restart: bool,
 }
 
 /// How far the warm-up may read ahead of the replay that copies the pages, once the free
@@ -186,35 +194,76 @@ const PACING_RESERVE_DIVISOR: u64 = 16;
 /// Replay's progress through the recorded set, which a paced warm-up stays ahead of.
 ///
 /// A replay and a warm-up walk the set in the same order, ascending file offset, so the
-/// recorded bytes each has passed place both in it. `position` is the furthest any running
-/// replay has reached since the first of them began.
+/// recorded bytes each has passed place both in it. The position is the furthest any running
+/// replay has reached since the first of them began. Overlapping replays form one group,
+/// numbered so a warm-up can tell a new group from the one it paced with. One lock holds
+/// all of it, so a reader never sees a new group's count with the last group's position;
+/// replay takes it once per chunk it copies.
 #[derive(Debug, Default)]
 pub(crate) struct ReplayProgress {
-    active: std::sync::atomic::AtomicUsize,
-    position: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<ReplayState>,
+    /// Test only: every position reported, in order.
+    #[cfg(test)]
+    reported: std::sync::Mutex<Vec<u64>>,
+}
+
+/// What [`ReplayProgress`] holds: the replays running, the group they are, how far they have
+/// got. A warm-up reads a copy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReplayState {
+    active: usize,
+    group: u64,
+    bytes: u64,
+}
+
+impl ReplayState {
+    fn running(&self) -> bool {
+        self.active > 0
+    }
 }
 
 impl ReplayProgress {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReplayState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A replay starts at the beginning of the set. The first of a group of overlapping
-    /// replays resets the position.
+    /// replays resets the position and starts a new group.
     pub(crate) fn begin(&self) {
-        if self.active.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.position.store(0, Ordering::Release);
+        let mut state = self.lock();
+        if state.active == 0 {
+            state.bytes = 0;
+            state.group += 1;
         }
+        state.active += 1;
     }
 
     /// The replay that has passed `bytes` of the recorded set reports it.
     pub(crate) fn passed(&self, bytes: u64) {
-        self.position.fetch_max(bytes, Ordering::AcqRel);
+        let mut state = self.lock();
+        state.bytes = state.bytes.max(bytes);
+        drop(state);
+        #[cfg(test)]
+        self.reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(bytes);
     }
 
     pub(crate) fn end(&self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self.lock();
+        state.active = state.active.saturating_sub(1);
+    }
+
+    fn state(&self) -> ReplayState {
+        *self.lock()
     }
 
     /// Where replay is, or `None` while none runs.
+    #[cfg(test)]
     fn position(&self) -> Option<u64> {
-        (self.active.load(Ordering::Acquire) > 0).then(|| self.position.load(Ordering::Acquire))
+        let state = self.state();
+        state.running().then_some(state.bytes)
     }
 }
 
@@ -223,6 +272,9 @@ impl ReplayProgress {
 enum Pace {
     Go,
     Wait,
+    /// A new group of replays began after the one the warm-up paced with. Its replay
+    /// copies from the start of the set, so the warm-up starts over too.
+    Restart,
 }
 
 /// Unpaced while the bytes requested fit in the free memory the warm-up started with; after
@@ -234,6 +286,37 @@ fn pace(requested: u64, unpaced_budget: u64, replay_at: Option<u64>) -> Pace {
     match replay_at {
         Some(at) if requested <= at.saturating_add(PACED_WINDOW_BYTES) => Pace::Go,
         _ => Pace::Wait,
+    }
+}
+
+/// [`pace`] for one warm-up, which says [`Pace::Restart`] once a group of replays later than
+/// the one it can pace with is running. That is the group after the one running when the
+/// warm-up began, or, when none was, the group after the next one: the next is the replay
+/// of the clone whose admission started it, and a later one means that replay has ended,
+/// whether or not the warm-up saw it run.
+#[derive(Debug)]
+struct Pacing {
+    restart_at: u64,
+}
+
+impl Pacing {
+    fn starting_at(replay: ReplayState) -> Self {
+        let next = replay.group + 1;
+        Self {
+            restart_at: if replay.running() { next } else { next + 1 },
+        }
+    }
+
+    fn pace(&mut self, requested: u64, unpaced_budget: u64, replay: ReplayState) -> Pace {
+        if replay.running() && replay.group >= self.restart_at {
+            self.restart_at = replay.group + 1;
+            return Pace::Restart;
+        }
+        pace(
+            requested,
+            unpaced_budget,
+            replay.running().then_some(replay.bytes),
+        )
     }
 }
 
@@ -284,7 +367,15 @@ fn warm_paced(
     'runs: for run in recorded.runs() {
         let mut counted = false;
         for request in requests_for(run, floor, page, mem_len) {
-            while pace(requested) == Pace::Wait {
+            loop {
+                match pace(requested) {
+                    Pace::Go => break,
+                    Pace::Restart => {
+                        stats.restart = true;
+                        break 'runs;
+                    }
+                    Pace::Wait => {}
+                }
                 if stop.load(Ordering::Relaxed) {
                     stats.stopped_early = true;
                     break 'runs;
@@ -351,63 +442,99 @@ fn request_read(image: &File, request: Request) -> std::io::Result<()> {
 }
 
 /// One warm-up from start to finish, on whatever thread calls it: read the recorded set,
-/// issue the requests, and log the one line that says what happened.
+/// issue the requests, and log one line for each pass. A pass that a new group of replays
+/// interrupts ([`Pace::Restart`]) is followed by another over the set as it is then, with
+/// the free memory measured again.
 fn warm_up_once(
     snapshot: &str,
     trigger: &'static str,
-    recorded: impl FnOnce() -> PageSet,
+    recorded: &dyn Fn() -> PageSet,
     mem_len: u64,
     stop: &AtomicBool,
     progress: Option<&ReplayProgress>,
-    advise: impl FnMut(Request) -> std::io::Result<()>,
+    mut advise: impl FnMut(Request) -> std::io::Result<()>,
 ) {
-    let started = Instant::now();
-    let recorded = recorded();
     // With no replay to follow, nothing is paced.
-    let budget = match progress {
+    let mut budget = || match progress {
         Some(_) => unpaced_budget(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default()),
         None => u64::MAX,
     };
-    if recorded.is_empty() {
-        // The first clone of a fresh snapshot has recorded nothing yet.
-        info!(
-            target: "uffd",
-            snapshot = %snapshot,
-            trigger,
-            "no working set is recorded yet, so there is nothing to read into the page cache"
-        );
-        return;
-    }
-    let mut pacer = |requested| {
-        pace(
-            requested,
-            budget,
-            progress.and_then(ReplayProgress::position),
-        )
-    };
-    let stats = warm_paced(
-        &recorded,
+    let mut replay_at = || progress.map(ReplayProgress::state).unwrap_or_default();
+    warm_passes(
+        recorded,
+        &mut budget,
+        &mut replay_at,
         mem_len,
         host_page_size(),
         stop,
-        &mut pacer,
-        advise,
+        &mut advise,
+        &mut |pass, stats, budget, elapsed| match stats {
+            None => info!(
+                target: "uffd",
+                snapshot = %snapshot,
+                trigger,
+                pass,
+                "no working set is recorded yet, so there is nothing to read into the page cache"
+            ),
+            Some(stats) => info!(
+                target: "uffd",
+                snapshot = %snapshot,
+                trigger,
+                pass,
+                runs = stats.runs,
+                pages = stats.bytes / GRANULE,
+                mib = stats.bytes / (1024 * 1024),
+                requests = stats.requests,
+                failures = stats.failures,
+                elapsed_ms = elapsed.as_millis(),
+                stopped_early = stats.stopped_early,
+                paced = stats.paced,
+                restarted = stats.restart,
+                unpaced_budget_mib = budget.min(u64::MAX / 2) / (1024 * 1024),
+                "asked the kernel to read the recorded working set into the page cache"
+            ),
+        },
     );
-    info!(
-        target: "uffd",
-        snapshot = %snapshot,
-        trigger,
-        runs = stats.runs,
-        pages = stats.bytes / GRANULE,
-        mib = stats.bytes / (1024 * 1024),
-        requests = stats.requests,
-        failures = stats.failures,
-        elapsed_ms = started.elapsed().as_millis(),
-        stopped_early = stats.stopped_early,
-        paced = stats.paced,
-        unpaced_budget_mib = budget.min(u64::MAX / 2) / (1024 * 1024),
-        "asked the kernel to read the recorded working set into the page cache"
-    );
+}
+
+/// The passes of one warm-up: each takes the recorded set and the free-memory budget when
+/// it begins, and a pass that ends on [`Pace::Restart`] is followed by another. `report`
+/// gets each pass's number, its stats (`None` for an empty set, which ends the warm-up),
+/// its budget and how long it took.
+#[allow(clippy::too_many_arguments)]
+fn warm_passes(
+    recorded: &dyn Fn() -> PageSet,
+    budget: &mut dyn FnMut() -> u64,
+    replay_at: &mut dyn FnMut() -> ReplayState,
+    mem_len: u64,
+    page: u64,
+    stop: &AtomicBool,
+    advise: &mut dyn FnMut(Request) -> std::io::Result<()>,
+    report: &mut dyn FnMut(u64, Option<WarmStats>, u64, std::time::Duration),
+) {
+    let mut pacing = Pacing::starting_at(replay_at());
+    for pass in 1.. {
+        let started = Instant::now();
+        let set = recorded();
+        let budget = budget();
+        if set.is_empty() {
+            // The first clone of a fresh snapshot has recorded nothing yet.
+            report(pass, None, budget, started.elapsed());
+            return;
+        }
+        let stats = warm_paced(
+            &set,
+            mem_len,
+            page,
+            stop,
+            &mut |requested| pacing.pace(requested, budget, replay_at()),
+            &mut *advise,
+        );
+        report(pass, Some(stats), budget, started.elapsed());
+        if !stats.restart {
+            return;
+        }
+    }
 }
 
 /// What one serve's warm-ups share: at most one runs at a time, and none starts once the
@@ -447,6 +574,23 @@ impl ReplayProgressHandle {
 
     pub(crate) fn end(&self) {
         self.0.progress.end();
+    }
+
+    /// The furthest point reported since the last replay began, running or not.
+    #[cfg(test)]
+    pub(crate) fn furthest(&self) -> u64 {
+        self.0.progress.state().bytes
+    }
+
+    /// Every position reported, in order.
+    #[cfg(test)]
+    pub(crate) fn reported(&self) -> Vec<u64> {
+        self.0
+            .progress
+            .reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -492,7 +636,7 @@ impl Warmer {
     pub(crate) fn warm_if_idle(
         &self,
         trigger: &'static str,
-        recorded: impl FnOnce() -> PageSet + Send + 'static,
+        recorded: impl Fn() -> PageSet + Send + 'static,
     ) -> bool {
         let image = Arc::clone(&self.image);
         self.warm_if_idle_with(trigger, recorded, move |request| {
@@ -504,7 +648,7 @@ impl Warmer {
     fn warm_if_idle_with(
         &self,
         trigger: &'static str,
-        recorded: impl FnOnce() -> PageSet + Send + 'static,
+        recorded: impl Fn() -> PageSet + Send + 'static,
         advise: impl FnMut(Request) -> std::io::Result<()> + Send + 'static,
     ) -> bool {
         if self.shared.stop.load(Ordering::Relaxed) {
@@ -529,7 +673,7 @@ impl Warmer {
                 warm_up_once(
                     &snapshot,
                     trigger,
-                    recorded,
+                    &recorded,
                     mem_len,
                     &shared.stop,
                     shared.pacing_progress(),
@@ -902,6 +1046,148 @@ mod tests {
         assert_eq!(*asked.lock().unwrap(), [0]);
     }
 
+    /// A warm-up that paced with one group of replays starts over when the next group
+    /// begins: a clone admitted while it still held the one slot gets no warm-up of its
+    /// own, and its replay copies from the start of the set (#1676). The new pass takes the
+    /// set as it is then, which has grown, and the free memory as it is then, which is
+    /// gone. Without the restart the warm-up went on from where it waited, and the low
+    /// pages the second clone recorded were never asked for.
+    #[test]
+    fn a_warm_up_starts_over_with_the_current_set_and_free_memory() {
+        use std::cell::{Cell, RefCell};
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let run = |group, bytes| ReplayState {
+            active: 1,
+            group,
+            bytes,
+        };
+        let idle = |group| ReplayState {
+            active: 0,
+            group,
+            bytes: 0,
+        };
+
+        // Started at a clone's admission, ahead of its replay: that replay (group 1) is the
+        // one to pace with, and the next group restarts the warm-up.
+        let mut pacing = Pacing::starting_at(idle(0));
+        assert_eq!(pacing.pace(10, 0, idle(0)), Pace::Wait, "no replay yet");
+        assert_eq!(pacing.pace(10, 0, run(1, 0)), Pace::Go);
+        assert_eq!(pacing.pace(GIB + 1, 0, run(1, 0)), Pace::Wait);
+        assert_eq!(
+            pacing.pace(GIB + 1, 0, idle(1)),
+            Pace::Wait,
+            "its replay ended"
+        );
+        assert_eq!(pacing.pace(GIB + 1, 0, run(2, 0)), Pace::Restart);
+        assert_eq!(pacing.pace(0, 0, run(2, 0)), Pace::Go, "once per group");
+        // A replay that began and ended between two looks still counts.
+        let mut pacing = Pacing::starting_at(idle(0));
+        assert_eq!(pacing.pace(GIB + 1, 0, idle(1)), Pace::Wait);
+        assert_eq!(pacing.pace(GIB + 1, 0, run(2, 0)), Pace::Restart);
+        // Started while a group runs: that group is the one to pace with.
+        let mut pacing = Pacing::starting_at(run(3, 0));
+        assert_eq!(pacing.pace(10, 0, run(3, 0)), Pace::Go);
+        assert_eq!(pacing.pace(10, 0, run(4, 0)), Pace::Restart);
+
+        let progress = ReplayProgress::default();
+        progress.begin();
+        progress.passed(7);
+        progress.end();
+        progress.begin();
+        assert_eq!(
+            progress.state(),
+            run(2, 0),
+            "one copy: the new group at its start"
+        );
+
+        // Pass 1: a 2 GiB run at 4 GiB and a budget of 1.5 GiB, so the pass waits once it is
+        // spent. Its replay ends and the next one begins. Pass 2: the set has grown a run at
+        // 0, the budget is 0, and the second replay stays at its start.
+        let mem_len = 8 * GIB;
+        let first = set_of(mem_len, &[(4 * GIB, 2 * GIB)]);
+        let second = set_of(mem_len, &[(0, 2 * MIB), (4 * GIB, 2 * GIB)]);
+        let pass = Cell::new(0u32);
+        let recorded = || {
+            pass.set(pass.get() + 1);
+            if pass.get() == 1 {
+                first.clone()
+            } else {
+                second.clone()
+            }
+        };
+        let mut budgets = [3 * GIB / 2, 0].into_iter();
+        let asked: RefCell<Vec<(u32, u64, u64)>> = RefCell::new(Vec::new());
+        let asked_in_pass = [Cell::new(0u64), Cell::new(0u64)];
+        let stop = AtomicBool::new(false);
+        let waits = Cell::new(0u64);
+        let calls_in_second = Cell::new(0u64);
+        let mut replay_at = || match pass.get() {
+            // Before the first pass: the clone's replay has not begun.
+            0 => idle(0),
+            1 => {
+                if asked_in_pass[0].get() * REQUEST_BYTES < 3 * GIB / 2 {
+                    return run(1, 0);
+                }
+                // The first replay has ended; the next group begins after one wait. A
+                // warm-up that never restarts waits on, and is stopped.
+                waits.set(waits.get() + 1);
+                if waits.get() > 50 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                if waits.get() == 1 {
+                    idle(1)
+                } else {
+                    run(2, 0)
+                }
+            }
+            _ => {
+                // A call more than the requests asked is a wait: the pass is paced.
+                calls_in_second.set(calls_in_second.get() + 1);
+                if calls_in_second.get() > asked_in_pass[1].get() + 1 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                run(2, 0)
+            }
+        };
+        let mut passes = Vec::new();
+        warm_passes(
+            &recorded,
+            &mut || budgets.next().unwrap_or(0),
+            &mut replay_at,
+            mem_len,
+            PAGE,
+            &stop,
+            &mut |request| {
+                let n = pass.get();
+                asked_in_pass[n as usize - 1].set(asked_in_pass[n as usize - 1].get() + 1);
+                asked.borrow_mut().push((n, request.offset, request.len));
+                Ok(())
+            },
+            &mut |number, stats, budget, _| passes.push((number, stats, budget)),
+        );
+        assert_eq!(passes.len(), 2, "one pass, then one after the restart");
+        assert!(passes[0]
+            .1
+            .is_some_and(|stats| stats.restart && stats.paced));
+        assert_eq!(
+            passes[1].2, 0,
+            "the second pass measured the free memory again"
+        );
+        let asked = asked.into_inner();
+        let second_pass: Vec<_> = asked.iter().filter(|a| a.0 == 2).collect();
+        assert_eq!(
+            second_pass.first().map(|a| a.1),
+            Some(0),
+            "the second pass asked for the run the second clone recorded first"
+        );
+        let bytes: u64 = second_pass.iter().map(|a| a.2).sum();
+        assert!(
+            bytes <= PACED_WINDOW_BYTES + REQUEST_BYTES,
+            "the second pass read {bytes} bytes unpaced past a replay at 0"
+        );
+    }
+
     /// The free memory a warm-up may fill unpaced is MemFree less a sixteenth of the host,
     /// and none when meminfo cannot be read.
     #[test]
@@ -942,6 +1228,7 @@ mod tests {
                 failures: 0,
                 stopped_early: false,
                 paced: false,
+                restart: false,
             }
         );
         assert_eq!(stats.bytes, set.bytes());
@@ -1029,6 +1316,7 @@ mod tests {
                 failures: 0,
                 stopped_early: true,
                 paced: false,
+                restart: false,
             }
         );
 
@@ -1054,6 +1342,7 @@ mod tests {
                 failures: 0,
                 stopped_early: true,
                 paced: false,
+                restart: false,
             }
         );
 
@@ -1124,6 +1413,7 @@ mod tests {
                 failures: 2,
                 stopped_early: false,
                 paced: false,
+                restart: false,
             }
         );
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
@@ -1175,8 +1465,11 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
 
         let begun = Instant::now();
-        let started =
-            warmer.warm_if_idle_with("test", move || set, parking_advise(entered_tx, release_rx));
+        let started = warmer.warm_if_idle_with(
+            "test",
+            move || set.clone(),
+            parking_advise(entered_tx, release_rx),
+        );
         let returned_after = begun.elapsed();
 
         assert!(started);
@@ -1211,7 +1504,7 @@ mod tests {
 
         assert!(warmer.warm_if_idle_with(
             "test",
-            move || set,
+            move || set.clone(),
             parking_advise(entered_tx, release_rx)
         ));
         entered_rx
@@ -1295,7 +1588,7 @@ mod tests {
                 warm_up_once(
                     "snap",
                     "clone admission",
-                    move || recorded,
+                    &move || recorded.clone(),
                     mem_len,
                     &AtomicBool::new(false),
                     None,
@@ -1344,7 +1637,7 @@ mod tests {
         let set = set_of(mem_len, &[(G, G)]);
         assert!(warmer.warm_if_idle_with(
             "serve start",
-            move || set,
+            move || set.clone(),
             parking_advise(entered_tx, release_rx)
         ));
         entered_rx
@@ -1369,7 +1662,7 @@ mod tests {
         wait_until_idle(&warmer);
 
         let set = set_of(mem_len, &[(G, G), (5 * G, G)]);
-        let third = warmer.warm_if_idle_with("clone admission", move || set, {
+        let third = warmer.warm_if_idle_with("clone admission", move || set.clone(), {
             let asked = Arc::clone(&asked);
             move |_| {
                 asked.fetch_add(1, Ordering::Relaxed);
@@ -1398,7 +1691,7 @@ mod tests {
         let set = set_of(mem_len, &[(G, G)]);
         assert!(!warmer.warm_if_idle_with(
             "clone admission",
-            move || set,
+            move || set.clone(),
             |_| panic!("a stopped warmer must not call the kernel")
         ));
     }
@@ -1523,6 +1816,7 @@ mod tests {
                 failures: 0,
                 stopped_early: false,
                 paced: false,
+                restart: false,
             }
         );
     }
@@ -1539,7 +1833,7 @@ mod tests {
         warmer.shared.unpaced.store(true, Ordering::Relaxed);
 
         let set = set_of(len, &recorded);
-        assert!(warmer.warm_if_idle("serve start", move || set));
+        assert!(warmer.warm_if_idle("serve start", move || set.clone()));
 
         assert_eq!(wait_until_resident(&mmap, &recorded), Ok(()));
     }
