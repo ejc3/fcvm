@@ -2516,6 +2516,45 @@ fn only_the_x86_guest_kernels_apply_the_async_pf_nmi_fix() {
     );
 }
 
+/// 6.18.50 and 7.0.14 call rcu_barrier() in br_multicast_dev_del(), which runs under RTNL from
+/// a bridge's uninit, so a namespace teardown that removes many bridges holds RTNL for one
+/// rcu_barrier per bridge and every namespace creation on the host waits behind it (#1563: 1.5 s
+/// with 100 rootless clones torn down on a fleet host, 4 to 6 s on a CI runner). Linux removed the
+/// barrier in 25ae123db10b. Each host kernel fcvm builds applies it, as a host patch, not a
+/// `.vm.patch` the host build leaves out.
+#[test]
+fn every_host_kernel_applies_the_bridge_rcu_barrier_removal() {
+    const FIX: &str = " \tcancel_work_sync(&br->mcast_gc_work);\n-\n-\trcu_barrier();\n }";
+    let root = repo_root();
+    let config = rootfs_config();
+    let mut checked = Vec::new();
+    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
+        for (arch, table) in arches.as_table().unwrap() {
+            let Some(dir) = table
+                .get("host_kernel")
+                .and_then(|host| host.get("patches_dir"))
+                .and_then(|dir| dir.as_str())
+            else {
+                continue;
+            };
+            let applies = applied_patches(&root, dir).iter().any(|patch| {
+                !patch.to_string_lossy().ends_with(".vm.patch")
+                    && std::fs::read_to_string(patch).is_ok_and(|text| text.contains(FIX))
+            });
+            checked.push((format!("{profile_name}.{arch}"), applies));
+        }
+    }
+    assert!(
+        checked.len() >= 2,
+        "expected a host kernel for both arches, found {checked:?}"
+    );
+    let missing: Vec<_> = checked.iter().filter(|(_, applies)| !applies).collect();
+    assert!(
+        missing.is_empty(),
+        "these host kernels do not apply the bridge rcu_barrier removal: {missing:?}"
+    );
+}
+
 /// For each default, nested and btrfs guest kernel table, as `("profile.arch", applies)`, whether the
 /// patches it applies contain `fix`.
 fn shipped_guest_kernels_applying(fix: &str) -> Vec<(String, bool)> {
