@@ -2514,6 +2514,17 @@ pub trait RestoreHook {
     async fn run(&self) -> Result<()>;
 }
 
+/// A hook, then a step of the restore's own that must see what the hook left (a
+/// service the hook restarted) and still run before ingress opens.
+pub struct ThenRestoreHook<H, F>(H, F);
+
+impl<H: RestoreHook, F: Fn() -> Result<()>> RestoreHook for ThenRestoreHook<H, F> {
+    async fn run(&self) -> Result<()> {
+        self.0.run().await?;
+        (self.1)()
+    }
+}
+
 /// No hook: the plan named none.
 pub struct NoRestoreHook;
 
@@ -2829,17 +2840,28 @@ impl RestoredNetwork {
         &self.report
     }
 
-    /// Run the plan's restore hook, if any, then open ingress: the clone is
-    /// published. A hook failure keeps it unpublished and fails the restore.
-    pub async fn publish(self, hook: Option<&str>) -> Result<RestoreNetworkReport> {
+    /// Run the plan's restore hook, if any, then `after_hook`, then open ingress: the
+    /// clone is published. A hook or `after_hook` failure keeps it unpublished and
+    /// fails the restore.
+    pub async fn publish(
+        self,
+        hook: Option<&str>,
+        after_hook: impl Fn() -> Result<()>,
+    ) -> Result<RestoreNetworkReport> {
         let report = match hook {
             Some(command) => {
-                let hook = ContainerRestoreHook {
-                    command: command.to_string(),
-                };
+                let hook = ThenRestoreHook(
+                    ContainerRestoreHook {
+                        command: command.to_string(),
+                    },
+                    after_hook,
+                );
                 publish_with(&self.gate, self.report, &hook).await?
             }
-            None => publish_with(&self.gate, self.report, &NoRestoreHook).await?,
+            None => {
+                let hook = ThenRestoreHook(NoRestoreHook, after_hook);
+                publish_with(&self.gate, self.report, &hook).await?
+            }
         };
         eprintln!(
             "[fc-agent] snapshot network published: destroyed={} already_gone={} \
@@ -5169,7 +5191,7 @@ mod tests {
         };
         let nfs = at("mount_nfs_shares(");
         let waits = at("tokio::try_join!(exec_wait, egress_wait)");
-        let publish = at(".publish(restore_hook)");
+        let publish = at(".publish(restore_hook,");
         assert!(
             nfs < publish,
             "the hook runs before the NFS shares are remounted: a hook reading a share \

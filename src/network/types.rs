@@ -368,6 +368,20 @@ impl PortMapping {
                      or routed networking"
                 );
             }
+            // pasta delivers a connection to an IPv6 host address to the guest's IPv6
+            // address, and the guest's DNAT and SNAT for published ports are IPv4 rules.
+            // Routed relays every mapping to the guest's IPv4 address.
+            let ipv6_host = mapping
+                .host_ip
+                .as_deref()
+                .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok());
+            if mode == crate::firecracker::FcNetworkMode::Rootless && ipv6_host {
+                anyhow::bail!(
+                    "port mapping {mapping}: rootless networking delivers a connection to an \
+                     IPv6 host address over the guest's IPv6, where the /{LOOPBACK_CLIENT} rule \
+                     does not apply; publish it on 127.0.0.1 or with no HOSTIP"
+                );
+            }
             if let Some(plain) = mappings.iter().find(|m| {
                 !m.loopback_client && m.guest_port == mapping.guest_port && m.proto == mapping.proto
             }) {
@@ -685,9 +699,21 @@ mod tests {
             error.contains("8097:80/tcp/loopback") && error.contains("8098:80/tcp"),
             "{error}"
         );
+        let error = PortMapping::require_bindable(
+            &mappings(&["[::1]:8097:80/loopback"]),
+            FcNetworkMode::Rootless,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("IPv6"), "{error}");
+        PortMapping::require_bindable(
+            &mappings(&["[::1]:8097:80/loopback"]),
+            FcNetworkMode::Routed,
+        )
+        .unwrap();
         for mode in [FcNetworkMode::Rootless, FcNetworkMode::Routed] {
             PortMapping::require_bindable(
-                &mappings(&["8097:80/loopback", "[::1]:8098:80/loopback"]),
+                &mappings(&["8097:80/loopback", "127.0.0.2:8098:80/loopback"]),
                 mode,
             )
             .unwrap();

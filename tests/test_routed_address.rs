@@ -211,15 +211,7 @@ async fn test_routed_clone_reaches_a_listener_on_the_snapshot_address() -> Resul
         let base_address = guest_ipv6(base_pid).await?;
 
         // A guest process listening on the VM's own address only.
-        let listener = format!(
-            "nohup setsid python3 -c \"import socket\n\
-             s = socket.socket(socket.AF_INET6)\n\
-             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
-             s.bind(('{base_address}', {BOUND_PORT}))\n\
-             s.listen(16)\n\
-             while True:\n    c, _ = s.accept()\n    c.sendall(b'{BOUND_REPLY}')\n    c.close()\n\" \
-             >/dev/null 2>&1 &"
-        );
+        let listener = listener_command(&base_address, BOUND_REPLY);
         common::exec_in_vm(base_pid, &[&listener])
             .await
             .context("starting the guest listener")?;
@@ -277,6 +269,30 @@ async fn test_routed_clone_reaches_a_listener_on_the_snapshot_address() -> Resul
             "the listener bound to the snapshot's {base_address} does not answer on the \
              clone's {clone_address}: {reply:?}"
         );
+
+        // The service restarts on the clone's own address: the old listener closes and
+        // the new one answers within the reconcile period.
+        let rebound = format!(
+            "pkill -f '^python3 -c' ; {}",
+            listener_command(&clone_address, REBOUND_REPLY)
+        );
+        common::exec_in_vm(clone_pid, &[&rebound])
+            .await
+            .context("restarting the guest listener on the clone's address")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut last = Err(String::new());
+        while std::time::Instant::now() < deadline {
+            last = bound_reply(&clone_address, Duration::from_secs(1)).await;
+            if last.as_deref() == Ok(REBOUND_REPLY) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(
+            last.as_deref() == Ok(REBOUND_REPLY),
+            "a listener restarted on the clone's own {clone_address} is not reached there: \
+             {last:?}"
+        );
         Ok(())
     }
     .await;
@@ -289,6 +305,20 @@ async fn test_routed_clone_reaches_a_listener_on_the_snapshot_address() -> Resul
 
 const BOUND_PORT: u16 = 8081;
 const BOUND_REPLY: &str = "BOUND-OK";
+const REBOUND_REPLY: &str = "REBOUND-OK";
+
+/// The guest command that listens on `address` only and answers `reply`.
+fn listener_command(address: &str, reply: &str) -> String {
+    format!(
+        "nohup setsid python3 -c \"import socket\n\
+         s = socket.socket(socket.AF_INET6)\n\
+         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+         s.bind(('{address}', {BOUND_PORT}))\n\
+         s.listen(16)\n\
+         while True:\n    c, _ = s.accept()\n    c.sendall(b'{reply}')\n    c.close()\n\" \
+         >/dev/null 2>&1 &"
+    )
+}
 
 /// The VM's global IPv6 address, as fcvm recorded it, without its prefix length.
 async fn guest_ipv6(pid: u32) -> Result<String> {

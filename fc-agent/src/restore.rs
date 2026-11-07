@@ -479,7 +479,12 @@ pub async fn handle_clone_restore(
     // let datagrams reach the restored workload, and nothing may leave from the
     // snapshot's address once egress is open. The link is UP throughout, and the
     // gate holds new inbound connections off until publication.
-    let move_to_clone_address = || async move {
+    // What the retired-address step carried, for the reconcile after the hook and the
+    // watch after publication.
+    let carried_listeners: std::sync::Mutex<
+        Option<(std::net::Ipv6Addr, crate::retired_address::Plan)>,
+    > = std::sync::Mutex::new(None);
+    let move_to_clone_address = || async {
         let Some(new_ipv6) = clone_ipv6 else {
             return Ok(());
         };
@@ -503,6 +508,7 @@ pub async fn handle_clone_restore(
                 carried.keep, carried.translate
             );
         }
+        *carried_listeners.lock().unwrap() = Some((current, carried));
         Ok(())
     };
     let restored = crate::snapshot_network::restore_snapshot_network(move_to_clone_address)
@@ -679,11 +685,27 @@ pub async fn handle_clone_restore(
     // container's state at this moment, asked of podman, not a marker: a
     // marker stored before podman started was wrong for a snapshot taken in
     // between, in either order.
+    // After the hook and before ingress opens, the translations follow what the hook
+    // left: a service it restarted on the clone's own address is reached there.
+    let reconcile_after_hook = || {
+        let mut carried = carried_listeners.lock().unwrap();
+        if let Some((current, plan)) = carried.as_mut() {
+            if !plan.translate.is_empty() {
+                *plan = crate::retired_address::reconcile(*current, plan)
+                    .context("keeping listeners on a retired IPv6 address reachable")?;
+            }
+        }
+        Ok(())
+    };
     let boundary = restored
-        .publish(restore_hook)
+        .publish(restore_hook, reconcile_after_hook)
         .await
         .context("restore phase publish")?;
     phases.record_boundary(&boundary);
+    // And after publication, for as long as any translation remains.
+    if let Some((current, plan)) = carried_listeners.lock().unwrap().take() {
+        crate::retired_address::watch(current, plan);
+    }
 
     phases.total_ms = elapsed_ms(restore_started);
     eprintln!(
@@ -1059,7 +1081,8 @@ mod tests {
     /// contract is pinned at the source.
     #[test]
     fn the_begin_console_write_is_timed_inside_the_cleanup_phase() {
-        let source = include_str!("restore.rs");
+        // handle_clone_restore alone, so no needle can match this test's own text.
+        let source = handle_clone_restore_source();
         let started = source.find("let tcp_cleanup_started").unwrap();
         let begin = source.find("let begin_console_started").unwrap();
         let line = source[begin..]
@@ -1069,7 +1092,9 @@ mod tests {
         let stored = source
             .find("phases.tcp_begin_console_ms = elapsed_ms(begin_console_started)")
             .unwrap();
-        let boundary = source.find("restore_snapshot_network()").unwrap();
+        let boundary = source
+            .find("crate::snapshot_network::restore_snapshot_network(")
+            .expect("handle_clone_restore runs the boundary");
         assert!(
             started < begin && begin < line && line < stored && stored < boundary,
             "the begin console write must be timed after the phase starts and before the boundary"
@@ -1341,7 +1366,7 @@ mod tests {
             .find("mount_nfs_shares(")
             .expect("the restore path no longer remounts NFS");
         let publish = body
-            .find(".publish(restore_hook)")
+            .find(".publish(restore_hook,")
             .expect("the restore path no longer publishes");
         assert!(
             clock < nfs,
@@ -1379,7 +1404,7 @@ mod tests {
             .find("crate::bootplan::sync_clock_from_host()")
             .expect("the restore path no longer steps the clock");
         let publish = body
-            .find(".publish(restore_hook)")
+            .find(".publish(restore_hook,")
             .expect("the restore path no longer publishes");
         assert!(
             identity < fail_closed
@@ -1404,7 +1429,7 @@ mod tests {
             .find(".context(\"restore phase gpu-attach\")?")
             .expect("the restore path no longer fails closed on a GPU attach error");
         let publish = body
-            .find(".publish(restore_hook)")
+            .find(".publish(restore_hook,")
             .expect("the restore path no longer publishes");
         assert!(
             start < join && join < publish,

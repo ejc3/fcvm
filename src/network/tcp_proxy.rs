@@ -144,8 +144,10 @@ where
 /// the listener and every connection it accepted. Once stopped (`stop_relays`) it closes
 /// the listener, ends the connections and finishes only when their tasks have.
 ///
-/// A connection holds one of `limit`'s permits from before it is accepted until its task
-/// ends, its dial of the upstream included. With none free the relay does not accept.
+/// A connection holds one of `limit`'s permits from just after it is accepted until its
+/// task ends, its dial of the upstream included. With none free the relay holds the
+/// client it accepted until one frees and accepts no other, so a relay waiting for a
+/// client holds no permit, and at the limit each relay holds at most one waiting client.
 /// The dial is bounded by the kernel's SYN retries (`net.ipv4.tcp_syn_retries`, 6 by
 /// default: about 127 s), and a stopped relay ends a dial in progress with its task.
 fn spawn_limited_relay_loop<F, Fut>(
@@ -167,7 +169,30 @@ where
         // drops the set, which aborts each of them.
         let mut connections = tokio::task::JoinSet::new();
         let mut at_limit = false;
-        loop {
+        'relay: loop {
+            let accepted = tokio::select! {
+                _ = stopped.cancelled() => break,
+                accepted = listener.accept() => accepted,
+                // A finished connection leaves the set, so the set holds only live ones.
+                Some(_) = connections.join_next() => continue,
+            };
+            let (client, peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    // accept() can fail transiently (ECONNABORTED, EMFILE/ENFILE
+                    // under fd pressure). The listener is owned by this loop and
+                    // never closed externally, so back off briefly and keep
+                    // accepting instead of silently killing the relay for the
+                    // VM's lifetime.
+                    warn!(error = %e, "{label} accept error, retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            // The permit is taken after the accept, so a relay that waits for a client
+            // holds none: the limit counts connections, not listeners. At the limit
+            // this relay holds the one client it accepted until a permit frees, and
+            // the clients after it wait in the listen queue.
             let permit = match Arc::clone(&limit).try_acquire_owned() {
                 Ok(permit) => {
                     if at_limit {
@@ -185,74 +210,57 @@ where
                              listen queue"
                         );
                     }
-                    tokio::select! {
-                        _ = stopped.cancelled() => break,
-                        permit = Arc::clone(&limit).acquire_owned() => match permit {
-                            Ok(permit) => permit,
-                            Err(_) => break,
-                        },
-                        Some(_) = connections.join_next() => continue,
+                    loop {
+                        tokio::select! {
+                            _ = stopped.cancelled() => break 'relay,
+                            permit = Arc::clone(&limit).acquire_owned() => match permit {
+                                Ok(permit) => break permit,
+                                Err(_) => break 'relay,
+                            },
+                            // Reaped while waiting; the accepted client stays held.
+                            Some(_) = connections.join_next() => {}
+                        }
                     }
                 }
             };
-            let accepted = tokio::select! {
-                _ = stopped.cancelled() => break,
-                accepted = listener.accept() => accepted,
-                // A finished connection leaves the set, so the set holds only live ones.
-                Some(_) = connections.join_next() => continue,
-            };
-            match accepted {
-                Ok((client, peer)) => {
-                    let connect = Arc::clone(&connect);
-                    connections.spawn(async move {
-                        let _permit = permit;
-                        match connect().await {
-                            Ok(mut upstream) => {
-                                let mut client = client;
-                                // A relay writes each read as it arrives and must not
-                                // coalesce: with Nagle on, a write that follows one the
-                                // peer has not acknowledged waits for its (delayed) ACK,
-                                // 40 ms on Linux and longer on macOS, on every message
-                                // sent in more than one piece. The endpoints keep their
-                                // own setting.
-                                for (side, stream) in [("client", &client), ("upstream", &upstream)] {
-                                    if let Err(e) = stream.set_nodelay(true) {
-                                        debug!(error = %e, %peer, "{label} relay: TCP_NODELAY on the {side} socket");
-                                    }
-                                }
-                                match tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                                    .await
-                                {
-                                    Ok((c2u, u2c)) => {
-                                        debug!(
-                                            client_to_upstream = c2u,
-                                            upstream_to_client = u2c,
-                                            %peer,
-                                            "{label} relay completed"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, %peer, "{label} relay error");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, %peer, "{label} connect failed");
+            let connect = Arc::clone(&connect);
+            connections.spawn(async move {
+                let _permit = permit;
+                match connect().await {
+                    Ok(mut upstream) => {
+                        let mut client = client;
+                        // A relay writes each read as it arrives and must not
+                        // coalesce: with Nagle on, a write that follows one the
+                        // peer has not acknowledged waits for its (delayed) ACK,
+                        // 40 ms on Linux and longer on macOS, on every message
+                        // sent in more than one piece. The endpoints keep their
+                        // own setting.
+                        for (side, stream) in [("client", &client), ("upstream", &upstream)] {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                debug!(error = %e, %peer, "{label} relay: TCP_NODELAY on the {side} socket");
                             }
                         }
-                    });
+                        match tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                            .await
+                        {
+                            Ok((c2u, u2c)) => {
+                                debug!(
+                                    client_to_upstream = c2u,
+                                    upstream_to_client = u2c,
+                                    %peer,
+                                    "{label} relay completed"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(error = %e, %peer, "{label} relay error");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, %peer, "{label} connect failed");
+                    }
                 }
-                Err(e) => {
-                    // accept() can fail transiently (ECONNABORTED, EMFILE/ENFILE
-                    // under fd pressure). The listener is owned by this loop and
-                    // never closed externally, so back off briefly and keep
-                    // accepting instead of silently killing the relay for the
-                    // VM's lifetime.
-                    warn!(error = %e, "{label} accept error, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
-            }
+            });
         }
         // Stopped. The listener closes first, so a client that connects from here on is
         // refused. `shutdown` aborts every connection and returns when their tasks have
@@ -836,6 +844,58 @@ mod tests {
         drop((first, second, clients.remove(0), clients.remove(0)));
         settles_at(&dialled, 3).await;
         stop_relays([relay]).await;
+    }
+
+    /// A relay waiting for a client holds no permit: with more relays on one limit than
+    /// the limit allows, a client of any of them is still relayed while the others are
+    /// idle.
+    #[tokio::test]
+    async fn idle_relays_hold_no_permit_of_their_shared_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let limit = relay_limit(2);
+        let dialled = Arc::new(AtomicUsize::new(0));
+        let mut relays = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            let counter = Arc::clone(&dialled);
+            relays.push(spawn_limited_relay_loop(
+                listener,
+                Arc::clone(&limit),
+                move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(tokio::net::TcpStream::connect(upstream_addr).await?)
+                    }
+                },
+                "test",
+            ));
+        }
+        // Every relay has started and is waiting in accept, and none holds a permit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            limit.available_permits(),
+            2,
+            "relays waiting for a client hold permits of their shared limit"
+        );
+        for addr in &addrs {
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let before = dialled.load(Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while dialled.load(Ordering::SeqCst) == before {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a client of the relay on {addr} was not relayed while the others were idle"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let (_served, _) = upstream.accept().await.unwrap();
+        }
+        stop_relays(relays).await;
     }
 
     /// A dial of the upstream that has not finished holds its place under the limit,

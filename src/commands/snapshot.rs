@@ -6492,8 +6492,13 @@ mod tests {
     fn a_memory_clone_keeps_a_ports_loopback_client_setup() {
         let snapshot = publishing(&["8097:80/loopback", "8443:443"]);
         assert_eq!(
-            clone_port_mappings(&snapshot, &requested(&["[::1]:9097:80/loopback"]), false).unwrap(),
-            published(&["[::1]:9097:80/loopback"])
+            clone_port_mappings(
+                &snapshot,
+                &requested(&["127.0.0.2:9097:80/loopback"]),
+                false
+            )
+            .unwrap(),
+            published(&["127.0.0.2:9097:80/loopback"])
         );
         let error = clone_port_mappings(&snapshot, &requested(&["9097:80"]), false)
             .unwrap_err()
