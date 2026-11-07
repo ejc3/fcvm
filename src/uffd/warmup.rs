@@ -177,30 +177,40 @@ impl<R: FnMut(Request) -> bool> Pacer<R> {
     }
 }
 
-/// Whether `request`'s last page is in `image`'s page cache: a one-byte `preadv2` with
-/// `RWF_NOWAIT`, which fails with EAGAIN instead of reading a page the cache does not hold.
-/// Readahead fills a request front to back, so its last page arriving means the request has.
+/// Whether every page of `request` is in `image`'s page cache: a `preadv2` of the whole
+/// request with `RWF_NOWAIT`, which reads only what the cache holds and stops at the first
+/// page it does not, so a full read means the request is resident. `scratch` takes the bytes
+/// and is reused across calls.
 /// Not `mincore`: for a file the process neither owns nor may write, the kernel reports every
 /// page of a mapping resident (`can_do_mincore`), which would retire every request at once
-/// and leave a serve of another user's snapshot unpaced. A filesystem that does not take
-/// `RWF_NOWAIT` answers EOPNOTSUPP, and every other error ends the wait too: the pacer then
-/// lets the warm-up run as it did before it existed.
-fn resident(image: &File, request: Request) -> bool {
+/// and leave a serve of another user's snapshot unpaced. And not one page: readahead skips
+/// pages already cached, so a cached last page says nothing about the pages before it. A
+/// filesystem that does not take `RWF_NOWAIT` answers EOPNOTSUPP, and every error but EAGAIN
+/// ends the wait: the pacer then lets the warm-up run as it did before it existed.
+fn resident(image: &File, request: Request, scratch: &mut Vec<u8>) -> bool {
     use std::os::fd::AsRawFd;
-    if request.len == 0 {
+    let (Ok(offset), Ok(len)) = (
+        libc::off_t::try_from(request.offset),
+        usize::try_from(request.len),
+    ) else {
+        return true;
+    };
+    if len == 0 {
         return true;
     }
-    let Ok(offset) = libc::off_t::try_from(request.offset + request.len - 1) else {
-        return true;
-    };
-    let mut byte = 0u8;
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
     let iov = libc::iovec {
-        iov_base: (&mut byte as *mut u8).cast(),
-        iov_len: 1,
+        iov_base: scratch.as_mut_ptr().cast(),
+        iov_len: len,
     };
-    // SAFETY: one iovec over a live one-byte buffer, on a descriptor this file owns.
+    // SAFETY: one iovec over `len` bytes of a live buffer, on a descriptor this file owns.
     let rc = unsafe { libc::preadv2(image.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
-    rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
+    match usize::try_from(rc) {
+        Ok(read) => read >= len,
+        Err(_) => std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN),
+    }
 }
 
 /// One `WILLNEED` request: `len` bytes of the memory image at `offset`.
@@ -431,7 +441,10 @@ impl Warmer {
         let image = Arc::clone(&self.image);
         let stop = Arc::clone(&self.shared);
         let probe = Arc::clone(&self.image);
-        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| resident(&probe, request));
+        let mut scratch = Vec::new();
+        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| {
+            resident(&probe, request, &mut scratch)
+        });
         self.warm_if_idle_with(trigger, recorded, move |request| {
             if !pacer.wait_for_room(request, &stop.stop) {
                 return Ok(());
@@ -763,19 +776,30 @@ mod tests {
     fn residency_follows_the_page_cache() {
         use testing::{evict, image_on_disk, MIB};
         let file = image_on_disk(4 * MIB);
-        let request = Request {
-            offset: MIB,
+        let at = |offset: u64| Request {
+            offset,
             len: REQUEST_BYTES,
         };
+        let mut scratch = Vec::new();
         evict(&file);
+        // Each request is asked about before anything else touches it: the probe itself
+        // starts the kernel's readahead of the pages it finds missing.
         assert!(
-            !resident(&file, request),
+            !resident(&file, at(3 * MIB), &mut scratch),
             "a cold request reads as resident"
+        );
+        // Only its last page cached: readahead would fill the rest, so it is not resident.
+        let mut page = vec![0u8; PAGE as usize];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut page, MIB + REQUEST_BYTES - PAGE)
+            .unwrap();
+        assert!(
+            !resident(&file, at(MIB), &mut scratch),
+            "a request whose last page alone is cached reads as resident"
         );
         let mut buf = vec![0u8; REQUEST_BYTES as usize];
         std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf, MIB).unwrap();
         assert!(
-            resident(&file, request),
+            resident(&file, at(MIB), &mut scratch),
             "a request just read reads as cold"
         );
     }
@@ -805,6 +829,12 @@ mod tests {
             body.contains("Pacer::new(IN_FLIGHT_BYTES,"),
             "the pacer's window is not IN_FLIGHT_BYTES"
         );
+        // Residency comes from reading the page cache, not from mincore, which reports every
+        // page of a file the process may not write as resident.
+        let start = code.find("fn resident(").expect("no resident");
+        let resident = &code[start..start + code[start..].find("\n}\n").unwrap()];
+        assert!(resident.contains("libc::RWF_NOWAIT"), "{resident}");
+        assert!(!resident.contains("mincore("), "{resident}");
     }
 
     /// The pacer never lets more than its window of requests be outstanding: with the

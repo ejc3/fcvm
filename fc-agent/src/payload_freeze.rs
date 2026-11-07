@@ -24,6 +24,12 @@ const PAYLOAD_PREFIX: &str = "libpod-payload-";
 /// How long a freeze may take to settle before the boundary goes on without it.
 const FREEZE_SETTLE: Duration = Duration::from_secs(5);
 
+/// The cgroups this boundary froze, one path a line. On /run, which is in guest memory, so a
+/// restored clone reads the record its snapshot was taken with. A thaw thaws only these: a
+/// container someone paused before the snapshot (`podman pause` freezes the same cgroup)
+/// stays paused.
+const FROZEN_RECORD: &str = "/run/fcvm-payload-frozen";
+
 /// The container cgroups under `parent`.
 fn payload_cgroups(parent: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -50,26 +56,48 @@ fn is_frozen(cgroup: &Path) -> bool {
         .is_ok_and(|events| events.lines().any(|line| line.trim() == "frozen 1"))
 }
 
-/// Write `value` to each cgroup's `cgroup.freeze`. Returns the cgroups written.
-fn set_frozen(parent: &Path, value: &str) -> Vec<PathBuf> {
-    let mut written = Vec::new();
-    for cgroup in payload_cgroups(parent) {
-        match std::fs::write(cgroup.join("cgroup.freeze"), value) {
-            Ok(()) => written.push(cgroup),
-            Err(error) => eprintln!(
+/// Write `value` to `cgroup`'s `cgroup.freeze`, and say whether it was written.
+fn write_freeze(cgroup: &Path, value: &str) -> bool {
+    match std::fs::write(cgroup.join("cgroup.freeze"), value) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
                 "[fc-agent] WARNING: writing {value} to {}/cgroup.freeze failed: {error}",
                 cgroup.display()
-            ),
+            );
+            false
         }
     }
-    written
 }
 
-/// Freeze the container's cgroup under `parent` and wait, up to [`FREEZE_SETTLE`], for the
-/// kernel to report it frozen. Never fails: a container that is not frozen in time is still
-/// snapshotted correctly, only without the benefit.
-fn freeze_in(parent: &Path) -> usize {
-    let frozen = set_frozen(parent, "1");
+/// Freeze the container's cgroups under `parent` that are not frozen already, record them in
+/// `record`, and wait, up to [`FREEZE_SETTLE`], for the kernel to report them frozen. Never
+/// fails: a container that is not frozen in time is still snapshotted correctly, only without
+/// the benefit.
+fn freeze_in(parent: &Path, record: &Path) -> usize {
+    let mut frozen = Vec::new();
+    for cgroup in payload_cgroups(parent) {
+        let paused = std::fs::read_to_string(cgroup.join("cgroup.freeze"))
+            .is_ok_and(|value| value.trim() == "1");
+        if !paused && write_freeze(&cgroup, "1") {
+            frozen.push(cgroup);
+        }
+    }
+    let listed: String = frozen
+        .iter()
+        .map(|cgroup| format!("{}\n", cgroup.display()))
+        .collect();
+    if let Err(error) = std::fs::write(record, listed) {
+        // Without the record a thaw would leave these frozen, so undo the freeze now.
+        eprintln!(
+            "[fc-agent] WARNING: recording the frozen container cgroups in {} failed: {error}",
+            record.display()
+        );
+        for cgroup in &frozen {
+            write_freeze(cgroup, "0");
+        }
+        return 0;
+    }
     let started = Instant::now();
     while !frozen.iter().all(|cgroup| is_frozen(cgroup)) {
         if started.elapsed() >= FREEZE_SETTLE {
@@ -83,9 +111,19 @@ fn freeze_in(parent: &Path) -> usize {
     frozen.len()
 }
 
-/// Thaw every container cgroup under `parent`.
-fn thaw_in(parent: &Path) -> usize {
-    set_frozen(parent, "0").len()
+/// Thaw the cgroups `record` names, the ones a freeze froze, and remove it. No record, no
+/// thaw.
+fn thaw_in(record: &Path) -> usize {
+    let Ok(listed) = std::fs::read_to_string(record) else {
+        return 0;
+    };
+    let thawed = listed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|line| write_freeze(Path::new(line), "0"))
+        .count();
+    let _ = std::fs::remove_file(record);
+    thawed
 }
 
 /// Freeze the container before the snapshot boundary closes.
@@ -99,7 +137,7 @@ pub fn freeze() {
         return;
     }
     let started = Instant::now();
-    let n = freeze_in(Path::new(PAYLOAD_PARENT));
+    let n = freeze_in(Path::new(PAYLOAD_PARENT), Path::new(FROZEN_RECORD));
     if n > 0 {
         eprintln!(
             "[fc-agent] froze {n} container cgroup(s) for the snapshot boundary in {} ms",
@@ -110,7 +148,7 @@ pub fn freeze() {
 
 /// Thaw the container: on the source when it resumes, on a clone before publication.
 pub fn thaw() {
-    let n = thaw_in(Path::new(PAYLOAD_PARENT));
+    let n = thaw_in(Path::new(FROZEN_RECORD));
     if n > 0 {
         eprintln!("[fc-agent] thawed {n} container cgroup(s)");
     }
@@ -137,10 +175,11 @@ mod tests {
     #[test]
     fn freeze_writes_every_container_cgroup_and_thaw_undoes_it() {
         let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("frozen");
         let a = fake_payload(dir.path(), "libpod-payload-aaa", true);
         let b = fake_payload(dir.path(), "libpod-payload-bbb", true);
         let other = fake_payload(dir.path(), "conmon", false);
-        assert_eq!(freeze_in(dir.path()), 2);
+        assert_eq!(freeze_in(dir.path(), &record), 2);
         for cgroup in [&a, &b] {
             assert_eq!(
                 std::fs::read_to_string(cgroup.join("cgroup.freeze")).unwrap(),
@@ -151,7 +190,8 @@ mod tests {
             std::fs::read_to_string(other.join("cgroup.freeze")).unwrap(),
             "0"
         );
-        assert_eq!(thaw_in(dir.path()), 2);
+        assert_eq!(thaw_in(&record), 2);
+        assert!(!record.exists(), "the thaw left its record");
         for cgroup in [&a, &b] {
             assert_eq!(
                 std::fs::read_to_string(cgroup.join("cgroup.freeze")).unwrap(),
@@ -163,7 +203,32 @@ mod tests {
     #[test]
     fn no_container_is_nothing_to_freeze() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(freeze_in(dir.path()), 0);
-        assert_eq!(freeze_in(&dir.path().join("missing")), 0);
+        let record = dir.path().join("frozen");
+        assert_eq!(freeze_in(dir.path(), &record), 0);
+        assert_eq!(freeze_in(&dir.path().join("missing"), &record), 0);
+        assert_eq!(thaw_in(&dir.path().join("no-record")), 0);
+    }
+
+    /// A container paused before the snapshot (`podman pause` writes the same cgroup.freeze)
+    /// is not the boundary's to thaw: it stays paused through the freeze and the thaw, and the
+    /// boundary thaws only what it froze.
+    #[test]
+    fn a_container_paused_before_the_boundary_stays_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("frozen");
+        let paused = fake_payload(dir.path(), "libpod-payload-paused", true);
+        std::fs::write(paused.join("cgroup.freeze"), "1").unwrap();
+        let running = fake_payload(dir.path(), "libpod-payload-running", true);
+        assert_eq!(freeze_in(dir.path(), &record), 1);
+        assert_eq!(thaw_in(&record), 1);
+        assert_eq!(
+            std::fs::read_to_string(paused.join("cgroup.freeze")).unwrap(),
+            "1",
+            "the thaw resumed a container someone had paused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(running.join("cgroup.freeze")).unwrap(),
+            "0"
+        );
     }
 }
