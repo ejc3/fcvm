@@ -695,6 +695,8 @@ struct CloneWorkingSet {
     /// Per-clone recording window, anchored at the UFFD handshake. Only consulted when
     /// `store` is present, so the zero this derives under `Default` never gates anything.
     record_window: Duration,
+    /// The most of the recorded set the clone replays.
+    replay_limit: ReplayLimit,
     /// Where this server's warm-up paces itself from: the clone's replay reports to it.
     progress: Option<Arc<crate::uffd::warmup::ReplayProgressHandle>>,
 }
@@ -901,6 +903,55 @@ impl FaultAround {
     }
 }
 
+/// The most of the recorded working set one clone replays, in bytes of the set, or no
+/// bound (#955).
+///
+/// The recorded set is a union over clones and only grows, and in copy mode every replayed
+/// page is a private copy in each clone. Clones that do real work inside their recording
+/// window add the pages that work touched: on one 128 GiB guest, 8.6 M to 14.1 M pages over
+/// four such clones, and a clone of it held 52.7 GiB at healthy against 25.4 GiB for a set
+/// recorded at healthy. A limit bounds that cost per clone: replay stops planning once it
+/// has passed the limit, and the pages past it fault on demand. Unbounded by default: those
+/// pages are ones later work wanted, and replaying them cut that guest's first page render
+/// from 541 s to 305 s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayLimit(Option<u64>);
+
+/// Env var for [`ReplayLimit`] for the implicit server inside `snapshot run`, in MiB.
+pub const REPLAY_LIMIT_ENV: &str = "FCVM_UFFD_PREFETCH_MAX_MIB";
+
+impl ReplayLimit {
+    /// No bound.
+    pub const NONE: Self = Self(None);
+
+    /// A bound of `mib` MiB of the recorded set; 0 replays nothing.
+    pub fn mib(mib: u64) -> Self {
+        Self(Some(mib.saturating_mul(1024 * 1024)))
+    }
+
+    /// Parse a [`REPLAY_LIMIT_ENV`] value: a whole number of MiB.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let mib: u64 = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("{REPLAY_LIMIT_ENV}={raw:?} is not a whole number of MiB"))?;
+        Ok(Self::mib(mib))
+    }
+
+    /// From [`REPLAY_LIMIT_ENV`], unbounded when unset.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(REPLAY_LIMIT_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => Ok(Self::NONE),
+        }
+    }
+
+    /// The bound in bytes, if any.
+    pub fn bytes(self) -> Option<u64> {
+        self.0
+    }
+}
+
 /// How a UFFD server serves pages: the materialisation mode plus the working-set
 /// recording and replay knobs. `snapshot serve` resolves one from its CLI flags; the
 /// implicit server inside `snapshot run` resolves one from the environment.
@@ -919,6 +970,8 @@ pub struct ServeShape {
     pub fault_around: FaultAround,
     /// Copy mode only: how many threads replay copies on. See [`ReplayThreads`].
     pub replay_threads: ReplayThreads,
+    /// The most of the recorded set one clone replays. See [`ReplayLimit`].
+    pub replay_limit: ReplayLimit,
     /// The clones run with `--enable-nv2` (ARM64 NV2), which only copy mode serves. Every
     /// fault answered with zeros then gets a private copy of zeros, never the kernel's zero
     /// page. See [`VmContext::zero_fill`].
@@ -936,6 +989,7 @@ pub struct UffdServer {
     working_set: Option<Arc<WorkingSetStore>>,
     working_set_persistence: Option<WorkingSetPersistence>,
     record_window: Duration,
+    replay_limit: ReplayLimit,
     /// Page cache warm-ups for the recorded set. `Some` only for a copy-mode server with
     /// prefetch on: minor mode reads the whole image into its memfd at startup, and prefetch
     /// off loads no recorded set. Cancelling or dropping the server stops a running one.
@@ -981,6 +1035,7 @@ impl UffdServer {
             record_window,
             fault_around,
             replay_threads,
+            replay_limit,
             nv2,
         } = shape;
 
@@ -1196,6 +1251,7 @@ impl UffdServer {
             working_set,
             working_set_persistence,
             record_window,
+            replay_limit,
             warmer,
             _in_use: in_use,
             hole_walk: std::sync::Mutex::new(hole_walk),
@@ -1358,6 +1414,7 @@ impl UffdServer {
                                 store: self.working_set.clone(),
                                 persistence: self.working_set_persistence.clone(),
                                 record_window: self.record_window,
+                                replay_limit: self.replay_limit,
                                 progress: self.warmer.as_ref().map(Warmer::progress),
                             };
                             let mem_size = self.mem_size;
@@ -2829,6 +2886,8 @@ struct VmState {
     read_batch: usize,
     /// Where this clone's replay reports how far it has got, for the warm-up (#1066).
     replay_progress: Option<Arc<crate::uffd::warmup::ReplayProgressHandle>>,
+    /// The most of the recorded set this clone replays (#955).
+    replay_limit: ReplayLimit,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -2970,6 +3029,7 @@ async fn handle_vm_page_faults(
         store: working_set,
         persistence: working_set_persistence,
         record_window,
+        replay_limit,
         progress: replay_progress,
     } = working_set;
     let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
@@ -3037,6 +3097,7 @@ async fn handle_vm_page_faults(
         read_batch: READ_BATCH,
         fault_workers: None,
         replay_progress,
+        replay_limit,
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -3923,6 +3984,7 @@ async fn replay_working_set(
         hole_skipped_mib = ran.hole_skipped / (1024 * 1024),
         hole_zero_filled_pages = ran.hole_zero_filled,
         hole_map_at_start = ran.hole_map_at_start,
+        replay_limited = ran.limited,
         hole_queries_failed = ran.hole_queries_failed,
         yields = ran.yields,
         prefetch_ms = ran.started.elapsed().as_millis(),
@@ -3953,6 +4015,8 @@ struct ReplayedSegments {
     hole_queries_failed: u64,
     yields: u64,
     hole_map_at_start: &'static str,
+    /// Replay stopped at the clone's [`ReplayLimit`].
+    limited: bool,
 }
 
 /// A cursor over the plain runs of `[file_offset, file_offset + len)`: the pages the guest has
@@ -4137,8 +4201,17 @@ async fn replay_segments(
 
     let mut pacer = ReplayPacer::default();
     let mut passed = 0u64;
+    let mut limited = false;
     'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
     {
+        if state
+            .replay_limit
+            .bytes()
+            .is_some_and(|limit| passed >= limit)
+        {
+            limited = true;
+            break;
+        }
         segments += 1;
         // The warm-up paces itself to this (#1066).
         if let Some(progress) = &state.replay_progress {
@@ -4164,6 +4237,7 @@ async fn replay_segments(
                             hole_queries_failed,
                             yields,
                             hole_map_at_start,
+                            limited,
                         })
                     }
                     ReplayStep::RetryPending => {
@@ -4180,6 +4254,7 @@ async fn replay_segments(
                                 hole_queries_failed,
                                 yields,
                                 hole_map_at_start,
+                                limited,
                             });
                         }
                     }
@@ -4305,6 +4380,7 @@ async fn replay_segments(
                                 hole_queries_failed,
                                 yields,
                                 hole_map_at_start,
+                                limited,
                             });
                         }
                         Ok(prefetch::Progress {
@@ -4368,6 +4444,7 @@ async fn replay_segments(
                         hole_queries_failed,
                         yields,
                         hole_map_at_start,
+                        limited,
                     })
                 }
                 Err(prefetch::Stop::Refused) => {
@@ -4394,6 +4471,7 @@ async fn replay_segments(
         hole_queries_failed,
         yields,
         hole_map_at_start,
+        limited,
     })
 }
 
@@ -5676,6 +5754,7 @@ mod tests {
             read_batch: READ_BATCH,
             fault_workers: None,
             replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
             recorded: None,
             record_until: None,
             started: origin,
@@ -5880,6 +5959,7 @@ mod tests {
             read_batch: READ_BATCH,
             fault_workers: None,
             replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -5908,6 +5988,7 @@ mod tests {
             read_batch: READ_BATCH,
             fault_workers: None,
             replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -5954,6 +6035,7 @@ mod tests {
             read_batch: READ_BATCH,
             fault_workers: None,
             replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -6405,6 +6487,7 @@ mod tests {
                     record_window: DEFAULT_PREFETCH_RECORD_WINDOW,
                     fault_around: FaultAround::OFF,
                     replay_threads: ReplayThreads::ONE,
+                    replay_limit: ReplayLimit::NONE,
                     nv2: false,
                 },
             )
@@ -7089,6 +7172,7 @@ mod tests {
                 read_batch: READ_BATCH,
                 fault_workers: None,
                 replay_progress: None,
+                replay_limit: ReplayLimit::NONE,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -8231,6 +8315,7 @@ mod tests {
                 read_batch: READ_BATCH,
                 fault_workers: None,
                 replay_progress: None,
+                replay_limit: ReplayLimit::NONE,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -9146,6 +9231,7 @@ mod tests {
                     record_window: Duration::ZERO,
                     fault_around: FaultAround::for_host_page(65536, 4096).unwrap(),
                     replay_threads: ReplayThreads::ONE,
+                    replay_limit: ReplayLimit::NONE,
                     nv2: false,
                 },
             )
@@ -9460,6 +9546,7 @@ mod tests {
                 read_batch: READ_BATCH,
                 fault_workers: None,
                 replay_progress: None,
+                replay_limit: ReplayLimit::NONE,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -9798,6 +9885,7 @@ mod tests {
                 read_batch: READ_BATCH,
                 fault_workers: FaultWorkers::start(&self.uffd, &self.source, &self.ctx(), None),
                 replay_progress: None,
+                replay_limit: ReplayLimit::NONE,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -10127,6 +10215,52 @@ mod tests {
             assert_eq!(state.fault_count, 0, "nothing faulted");
             assert_eq!(state.fault_around.granules, 0, "replay is not fault-around");
         }
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// Replay stops planning once it has passed the clone's ReplayLimit; the recorded pages
+    /// past it fault on demand (#955). Without the limit all five recorded pages replay.
+    #[tokio::test]
+    async fn replay_stops_at_the_clones_replay_limit() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) = FaultAroundClone::new(0, 0, 10);
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+        {
+            let ctx = clone.ctx();
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            for page in [0, 2, 4, 6, 8] {
+                recorded.insert_range((page * PAGE) as u64, PAGE as u64);
+            }
+            let mut state = clone.state();
+            state.replay_limit = ReplayLimit::mib(0);
+            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(
+                clone.resident_region_pages(),
+                Vec::<usize>::new(),
+                "a zero limit"
+            );
+
+            let mut state = clone.state();
+            state.replay_limit = ReplayLimit(Some(2 * PAGE as u64));
+            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(
+                clone.resident_region_pages(),
+                vec![0, 2],
+                "replay went past its limit of two pages"
+            );
+        }
+        assert_eq!(ReplayLimit::parse(" 3\n").unwrap().bytes(), Some(3 << 20));
+        assert!(ReplayLimit::parse("lots").is_err());
+        assert_eq!(
+            ReplayLimit::default().bytes(),
+            None,
+            "unbounded unless asked"
+        );
         drop(async_uffd);
         clone.unmap();
     }
@@ -12575,6 +12709,7 @@ mod tests {
                     record_window: Duration::ZERO,
                     fault_around: FaultAround::OFF,
                     replay_threads: ReplayThreads::ONE,
+                    replay_limit: ReplayLimit::NONE,
                     nv2: false,
                 },
             )
