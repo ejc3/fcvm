@@ -1081,6 +1081,89 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("kept.txt")).unwrap(), b"A");
     }
 
+    /// A restored server whose inner server answers a CREATE with handle 0 (it opened nothing)
+    /// gives the guest handle 0, and passes 0 back to the inner server for a WRITE through it.
+    /// A handle base added to the 0 would have the guest hold a number the server takes for a
+    /// handle from before the restore. The inner server here is a stand-in, because a read-only
+    /// volume's real one now refuses the CREATE.
+    #[test]
+    fn a_restored_server_keeps_handle_zero_both_ways() {
+        struct Recorder {
+            write_fh: Mutex<Option<u64>>,
+        }
+        impl FilesystemHandler for Recorder {
+            fn handle_request_with_groups(
+                &self,
+                request: &VolumeRequest,
+                _groups: &[u32],
+            ) -> VolumeResponse {
+                match request {
+                    VolumeRequest::Create { .. } => VolumeResponse::Created {
+                        attr: make_attr(77),
+                        generation: 0,
+                        ttl_secs: 1,
+                        fh: 0,
+                        flags: 0,
+                    },
+                    VolumeRequest::Write { fh, data, .. } => {
+                        *self.write_fh.lock().unwrap() = Some(*fh);
+                        VolumeResponse::Written {
+                            size: data.len() as u64,
+                        }
+                    }
+                    _ => VolumeResponse::Ok,
+                }
+            }
+        }
+        let fs = RemapFs::restore_from_table(
+            Recorder {
+                write_fh: Mutex::new(None),
+            },
+            r#"{"handle_base":1000,"paths":{"1":""}}"#,
+        );
+        let created = fs.handle_request_with_groups(
+            &VolumeRequest::Create {
+                parent: 1,
+                name: b"made".to_vec(),
+                mode: 0o644,
+                flags: (libc::O_RDWR | libc::O_CREAT) as u32,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            &[],
+        );
+        let (ino, fh) = match created {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            other => panic!("create: {other:?}"),
+        };
+        assert_eq!(
+            fh, 0,
+            "the handle the guest got for a file the inner server did not open"
+        );
+        let written = fs.handle_request_with_groups(
+            &VolumeRequest::Write {
+                ino,
+                fh,
+                offset: 0,
+                data: b"Z".to_vec(),
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            &[],
+        );
+        assert!(
+            matches!(written, VolumeResponse::Written { size: 1 }),
+            "write: {written:?}"
+        );
+        assert_eq!(
+            *fs.inner.write_fh.lock().unwrap(),
+            Some(0),
+            "the handle the inner server got"
+        );
+    }
+
     /// A table written before the handle base was recorded, a bare map of paths, still restores its
     /// paths, and its handles are treated as stale up to LEGACY_HANDLE_BASE.
     #[test]
