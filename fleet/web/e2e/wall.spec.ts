@@ -26,16 +26,17 @@ const TILE_ERR_MAX = 3;
 const ACROSS_ERR_MAX = 3;
 
 /**
- * Every boundary with at least SEAM_MIN_PAIRS smooth pairs is judged, and every tile has one:
- * a boundary along detail that holds still with the camera (the planet's rings, text) can keep
- * 1 to 3 smooth pairs for minutes, and a mean over so few is one pixel's compression noise
- * (CI read 3.35 on such a boundary, #1348). A tile drawn at another t shows on all of its
- * boundaries, so judging one per tile still catches it.
+ * Every boundary with smooth pixels is judged. One with at least SEAM_MIN_PAIRS pairs must be
+ * under ACROSS_ERR_MAX; one with 1 to 3 (it lies along detail that holds still with the camera,
+ * the planet's rings or text, for minutes) under SPARSE_ACROSS_MAX: a mean over so few is one
+ * pixel's compression noise, which read up to 3.35 on CI (#1348) and 2.31 locally, while a tile
+ * drawn at another t reads 3.8 to 18 at its edges. Every live tile has a well-sampled boundary.
  */
+const SPARSE_ACROSS_MAX = 6;
 function expectSeams(r: Awaited<ReturnType<typeof seamReport>>): void {
   const judged = r.boundaries.filter((b) => b.n >= SEAM_MIN_PAIRS);
   for (const id of r.tiles) expect(judged.some((b) => b.a === id || b.b === id), `a judged boundary of ${id}`).toBe(true);
-  for (const b of judged) expect(b.err, `${b.a} | ${b.b} over ${b.n} pairs`).toBeLessThan(ACROSS_ERR_MAX);
+  for (const b of r.boundaries) if (b.n > 0) expect(b.err, `${b.a} | ${b.b} over ${b.n} pairs`).toBeLessThan(b.n >= SEAM_MIN_PAIRS ? ACROSS_ERR_MAX : SPARSE_ACROSS_MAX);
 }
 
 /** The t drawn now: a capture forces a draw and reports its t. */
