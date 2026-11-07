@@ -804,8 +804,8 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
             "control: run 1 starts from a cold cache and started from a {how_1}"
         );
         pre_start_key = Some(key.clone());
-        let startup = fcvm::commands::podman::startup_snapshot_key(&key, Some(START_MIB));
-        let at_new_target = fcvm::commands::podman::startup_snapshot_key(&key, Some(SET_MIB));
+        let startup = fcvm::commands::podman::startup_snapshot_key(&key, Some(START_MIB), None);
+        let at_new_target = fcvm::commands::podman::startup_snapshot_key(&key, Some(SET_MIB), None);
         let pre_start = ("pre-start snapshot", key.clone());
 
         release_held_run("run 1", pid_1, Some(SET_MIB)).await?;

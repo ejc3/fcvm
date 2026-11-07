@@ -1865,7 +1865,7 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
 ///
 /// Uses the same format as the production code: `{base_key}-startup`
 pub fn startup_snapshot_key(base_key: &str) -> String {
-    fcvm::commands::podman::startup_snapshot_key(base_key, None)
+    fcvm::commands::podman::startup_snapshot_key(base_key, None, None)
 }
 
 /// Find an available TCP port starting from a given port.

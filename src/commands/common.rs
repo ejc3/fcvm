@@ -2892,6 +2892,38 @@ pub struct RestoreParams<'a> {
     /// Host PCI devices (canonical SSSS:BB:DD.F) the snapshot load attaches to the
     /// paused VM before it resumes. Empty for a VM without passthrough devices.
     pub gpus: &'a [String],
+    /// The restoring host's identity, mirrored into MMDS with the restore epoch.
+    pub identity: &'a RestoreIdentity,
+}
+
+/// What a restored guest takes from the host that restores it, not the one that
+/// prepared the snapshot. fc-agent applies it before the restore hook runs
+/// (fc-agent `restore::handle_clone_restore`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreIdentity {
+    /// The host identity IPv6 the guest holds on lo (`snapshot run --host-ipv6`, or a
+    /// `podman run`'s `--env HOST_IPV6`). None removes the address the guest holds.
+    pub host_ipv6: Option<std::net::Ipv6Addr>,
+    /// The resolvers a boot on this host would give the guest. None leaves the
+    /// guest's resolv.conf as it is.
+    pub dns: Option<crate::commands::podman::GuestDns>,
+}
+
+impl RestoreIdentity {
+    /// Add this identity to a restore document. "host-ipv6" is always written, null
+    /// when there is none, because the guest sets its address to exactly this.
+    pub fn write_into(&self, document: &mut serde_json::Value) {
+        document["host-ipv6"] = match self.host_ipv6 {
+            Some(address) => serde_json::Value::String(address.to_string()),
+            None => serde_json::Value::Null,
+        };
+        if let Some(ref dns) = self.dns {
+            document["dns"] = serde_json::json!({
+                "servers": dns.servers,
+                "search": dns.search,
+            });
+        }
+    }
 }
 
 /// Diagnostic helper (#608): the `vm-disks/<id>` directory ids whose **rootfs** path is
@@ -3698,6 +3730,7 @@ pub async fn restore_from_snapshot(
         firecracker_choice,
         balloon_target_mib,
         gpus,
+        identity,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -4037,6 +4070,8 @@ pub async fn restore_from_snapshot(
         mmds_latest["transparent-hugepage"] = serde_json::Value::String(
             crate::commands::snapshot::restore_thp_mode(&vm_state.config.guest_thp),
         );
+        // The same restoring-host identity the restore-only vsock document carries.
+        identity.write_into(&mut mmds_latest);
         client
             .put_mmds(serde_json::json!({ "latest": mmds_latest }))
             .await
@@ -4169,6 +4204,7 @@ pub async fn restore_from_snapshot_ch(
         firecracker_choice: _, // CH restores run find_cloud_hypervisor's binary
         balloon_target_mib,
         gpus,
+        identity: _, // delivered by the caller's boot-plan vsock listener
     } = params;
     // Only the Firecracker restore attaches passthrough devices; `snapshot run` and
     // `podman run` refuse --gpu for this backend before getting here.
@@ -4629,6 +4665,7 @@ pub fn build_snapshot_config(
             restore_hook: vm_state.config.restore_hook.clone(),
             guest_thp: vm_state.config.guest_thp.clone(),
             guest_thp_restore: vm_state.config.guest_thp_restore,
+            dns_override: vm_state.config.dns_override.clone(),
             hugepages: vm_state.config.hugepages,
             extra_disks,
             pmem_devices: vm_state.config.pmem_devices.clone(),
@@ -6350,6 +6387,37 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// The restore document carries the restoring host's identity in the shape
+    /// fc-agent's `RestoreIdentity` reads. "host-ipv6" is written even when there is
+    /// none, because the guest sets its address to exactly what it reads.
+    #[test]
+    fn the_restore_document_carries_the_restoring_hosts_identity() {
+        let identity = super::RestoreIdentity {
+            host_ipv6: Some("2001:db8:b::1".parse().unwrap()),
+            dns: Some(crate::commands::podman::GuestDns {
+                servers: vec!["10.9.0.2".to_string()],
+                search: vec!["restore.example".to_string()],
+            }),
+        };
+        let mut document = serde_json::json!({ "restore-epoch": "e" });
+        identity.write_into(&mut document);
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "restore-epoch": "e",
+                "host-ipv6": "2001:db8:b::1",
+                "dns": { "servers": ["10.9.0.2"], "search": ["restore.example"] },
+            })
+        );
+
+        let mut none = serde_json::json!({ "restore-epoch": "e" });
+        super::RestoreIdentity::default().write_into(&mut none);
+        assert_eq!(
+            none,
+            serde_json::json!({ "restore-epoch": "e", "host-ipv6": null })
+        );
+    }
+
     /// The Full retry moves the diff aside while the VM is paused and removes it after the
     /// resume: an in-place diff shares the parent's extents, so removing it costs one
     /// reference per extent, which must not lengthen the pause (#1391).

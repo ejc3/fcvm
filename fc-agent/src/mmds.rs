@@ -312,17 +312,8 @@ pub async fn watch_restore_epoch(
                     // not capture an old `last_epoch` and mistake its existing
                     // listener for a new restore control generation.
                     last_epoch = Some(current.clone());
-                    apply_restore_epoch(
-                        current,
-                        &signals,
-                        egress_gen_at_last_stable,
-                        metadata.clone_ipv6.as_deref(),
-                        &metadata.host_time_ns,
-                        metadata.restore_hook.as_deref(),
-                        &metadata.gpus,
-                        metadata.transparent_hugepage.as_deref(),
-                    )
-                    .await;
+                    apply_restore_epoch(current, &signals, egress_gen_at_last_stable, &metadata)
+                        .await;
                     // Update the stable generation and stop fast-polling only
                     // after the whole sequence succeeded.
                     egress_gen_at_last_stable =
@@ -337,17 +328,8 @@ pub async fn watch_restore_epoch(
                     // not capture an old `last_epoch` and mistake its existing
                     // listener for a new restore control generation.
                     last_epoch = Some(current.clone());
-                    apply_restore_epoch(
-                        current,
-                        &signals,
-                        egress_gen_at_last_stable,
-                        metadata.clone_ipv6.as_deref(),
-                        &metadata.host_time_ns,
-                        metadata.restore_hook.as_deref(),
-                        &metadata.gpus,
-                        metadata.transparent_hugepage.as_deref(),
-                    )
-                    .await;
+                    apply_restore_epoch(current, &signals, egress_gen_at_last_stable, &metadata)
+                        .await;
                     // Update the stable generation and stop fast-polling only
                     // after the whole sequence succeeded.
                     egress_gen_at_last_stable =
@@ -386,11 +368,7 @@ async fn apply_restore_epoch(
     current: &str,
     signals: &crate::restore::RestoreSignals,
     egress_gen_at_last_stable: Option<u64>,
-    clone_ipv6: Option<&str>,
-    host_time: &str,
-    restore_hook: Option<&str>,
-    gpus: &[String],
-    transparent_hugepage: Option<&str>,
+    metadata: &crate::types::LatestMetadata,
 ) {
     // A snapshot of a running VM was taken with the agent's console held quiet
     // (`--prepare-snapshot-network`), and this clone inherits that hold. Release it
@@ -414,7 +392,7 @@ async fn apply_restore_epoch(
         .store(true, std::sync::atomic::Ordering::Release);
     // Before the workload's next allocation, so a clone never runs in the mode
     // its snapshot's source had when it asked for another.
-    if let Some(mode) = transparent_hugepage {
+    if let Some(mode) = metadata.transparent_hugepage.as_deref() {
         if let Err(error) = crate::thp::apply(mode) {
             signals.restore_status.fail();
             eprintln!(
@@ -427,12 +405,9 @@ async fn apply_restore_epoch(
     }
     let phases = match crate::restore::handle_clone_restore(
         signals,
-        clone_ipv6,
+        metadata,
         egress_gen_at_last_stable,
         current,
-        host_time,
-        restore_hook,
-        gpus,
     )
     .await
     {

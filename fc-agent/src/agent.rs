@@ -71,7 +71,7 @@ pub async fn run() -> Result<()> {
     let transport = bootplan::detect_transport();
 
     // Fetch the container plan with retry.
-    let plan = loop {
+    let mut plan = loop {
         match bootplan::fetch_plan(transport).await {
             Ok(p) => {
                 eprintln!("[fc-agent] received container plan successfully");
@@ -621,42 +621,19 @@ pub async fn run() -> Result<()> {
     // In routed mode, only add to lo — adding to eth0 causes the kernel to use it
     // as source address for outbound IPv6, but the bridge can't deliver replies
     // because NDP for the fbwhoami address isn't configured on the namespace side.
-    if let Some(ipv6) = plan.env.get("HOST_IPV6") {
-        if !ipv6.is_empty() {
-            // Check if routed mode: guest_ipv6 includes /128 prefix in the boot param.
-            // In routed mode, only add fbwhoami to lo — not eth0 — to avoid source
-            // address conflicts (NDP for fbwhoami isn't configured on the namespace side).
-            // Pasta mode uses /64 (or no prefix) and is fine with fbwhoami on eth0.
-            let is_routed_mode = std::fs::read_to_string("/proc/cmdline")
-                .map(|c| {
-                    c.split_whitespace()
-                        .any(|p| p.starts_with("ipv6=") && p.contains("/128"))
-                })
-                .unwrap_or(false);
-            let devices: &[&str] = if is_routed_mode {
-                &["lo"]
-            } else {
-                &["lo", "eth0"]
-            };
-            for dev in devices {
-                let result = std::process::Command::new("ip")
-                    .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])
-                    .output();
-                match result {
-                    Ok(o) if o.status.success() => {
-                        eprintln!("[fc-agent] added {} to {} for host identity", ipv6, dev);
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if stderr.contains("File exists") {
-                            eprintln!("[fc-agent] {} already on {}", ipv6, dev);
-                        }
-                    }
-                    Err(e) => eprintln!("[fc-agent] ip addr add failed: {}", e),
-                }
-            }
-        }
+    //
+    // A restore that ran before this point (a snapshot taken before the container
+    // launched) has set the restoring host's address, which wins over the plan's,
+    // and one that runs beside it waits (`network::add_boot_host_identity`). Routed
+    // mode (a /128 guest_ipv6 in the boot param) holds it on lo only, the other
+    // modes on lo and eth0 (`network::host_identity_devices`).
+    if let Some(ipv6) = plan.env.get("HOST_IPV6").filter(|ipv6| !ipv6.is_empty()) {
+        crate::network::add_boot_host_identity(ipv6);
     }
+
+    // The container is given the identity the guest holds, which a restore of a
+    // snapshot taken before the launch moved to the restoring host's.
+    crate::network::reconcile_host_ipv6_env(&mut plan.env);
 
     // A clone shares its source's machine-id / SSH host keys via the reflinked
     // disk. Regenerate them so concurrent clones have distinct identities.

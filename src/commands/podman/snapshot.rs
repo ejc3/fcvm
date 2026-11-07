@@ -30,11 +30,26 @@ pub async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig>
 /// and saves only its own target's startup snapshot. The pre-start snapshot is
 /// taken before the workload starts and is shared between targets. A run without
 /// `--balloon` keeps the name it always had.
-pub fn startup_snapshot_key(base_key: &str, balloon: Option<u32>) -> String {
-    match balloon {
-        None => format!("{base_key}-startup"),
-        Some(target_mib) => format!("{base_key}-balloon{target_mib}-startup"),
+///
+/// The same holds for the host identity address (`HOST_IPV6`): the pre-start
+/// snapshot leaves it out because a restore gives the guest and the container it
+/// launches the restoring host's, but a startup snapshot holds a container that
+/// already runs with one in its environment, which a restore cannot change. So
+/// its name carries the address, and a run without one keeps the name it had.
+pub fn startup_snapshot_key(
+    base_key: &str,
+    balloon: Option<u32>,
+    host_ipv6: Option<std::net::Ipv6Addr>,
+) -> String {
+    let mut name = base_key.to_string();
+    if let Some(target_mib) = balloon {
+        name.push_str(&format!("-balloon{target_mib}"));
     }
+    if let Some(address) = host_ipv6 {
+        name.push_str(&format!("-host{:032x}", u128::from(address)));
+    }
+    name.push_str("-startup");
+    name
 }
 
 /// What to do when a generation is already installed at the target name.

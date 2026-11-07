@@ -408,6 +408,12 @@ pub fn static_boot_args() -> &'static str {
     }
 }
 
+/// Whether a `KEY=value` env entry is one a restore sets for itself, and so no part
+/// of the snapshot key: `HOST_IPV6`, the host identity address fc-agent adds to lo.
+fn is_restore_set_env(entry: &str) -> bool {
+    entry.split_once('=').map_or(entry, |(key, _)| key) == "HOST_IPV6"
+}
+
 impl FirecrackerConfig {
     /// Compute snapshot key by hashing the JSON representation.
     pub fn snapshot_key(&self) -> String {
@@ -428,11 +434,16 @@ impl FirecrackerConfig {
     /// `commands/snapshot.rs`). With the host side in the key, VMs that differ only in the
     /// host port they publish on, as every slot of a fleet host does, each cold-booted and
     /// kept a snapshot of their own.
+    ///
+    /// The env holds no `HOST_IPV6`: a restore gives the guest its own run's host
+    /// identity address (`commands::common::RestoreIdentity`), so runs on different
+    /// hosts share one snapshot.
     fn keyed(&self) -> std::borrow::Cow<'_, Self> {
-        if self.port_mappings.is_empty() {
+        if self.port_mappings.is_empty() && !self.env_vars.iter().any(|e| is_restore_set_env(e)) {
             return std::borrow::Cow::Borrowed(self);
         }
         let mut keyed = self.clone();
+        keyed.env_vars.retain(|entry| !is_restore_set_env(entry));
         let mut guest: Vec<crate::network::PortMapping> = self
             .port_mappings
             .iter()
@@ -868,6 +879,22 @@ mod tests {
         let mut config2 = test_config();
         config2.env_vars = vec!["MY_VAR=test_value".to_string()];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    /// HOST_IPV6 names the host a VM runs on, and a restore gives the guest its own
+    /// run's (`RestoreIdentity`), so runs that differ only in it, as runs of one
+    /// snapshot on different hosts do, share the snapshot.
+    #[test]
+    fn test_snapshot_key_ignores_host_ipv6() {
+        let with = |env: &[&str]| {
+            let mut config = test_config();
+            config.env_vars = env.iter().map(|e| e.to_string()).collect();
+            config.snapshot_key()
+        };
+        let prepare = with(&["MY_VAR=x", "HOST_IPV6=2001:db8:a::1"]);
+        assert_eq!(prepare, with(&["MY_VAR=x", "HOST_IPV6=2001:db8:b::1"]));
+        assert_eq!(prepare, with(&["MY_VAR=x"]));
+        assert_ne!(prepare, with(&["MY_VAR=y", "HOST_IPV6=2001:db8:a::1"]));
     }
 
     #[test]
