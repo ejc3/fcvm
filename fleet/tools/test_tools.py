@@ -258,7 +258,7 @@ case "$args" in
   # FAKE_SSM_STUCK leaves every command after the reboot Pending; FAKE_SYSTEM_STATUS is the
   # system status check's result. Without it SSM commands are unexpected, as before.
   *" ec2 reboot-instances "*) touch "$FAKE_LOG.rebooted" ;;
-  *" ec2 describe-instance-status "*) echo "${FAKE_SYSTEM_STATUS:-ok}" ;;
+  *" ec2 describe-instance-status "*) [ -z "${FAKE_STATUS_SLOW:-}" ] || sleep "$FAKE_STATUS_SLOW"; echo "${FAKE_SYSTEM_STATUS:-ok}" ;;
   *" ssm send-command "*) [ -n "${FAKE_SSM:-}" ] || { echo "fake aws: unexpected $*" >&2; exit 1; }; if [ -e "$FAKE_LOG.rebooted" ]; then echo cmd-after; else echo cmd-before; fi ;;
   *" ssm get-command-invocation "*"--query Status "*)
     [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"
@@ -468,6 +468,12 @@ class GpuboxWallReserve(unittest.TestCase):
         r, _, _ = self.up(cmd=cmd, **{**fast, "REBOOT_WAIT": "3", "FAKE_SSM_SLOW": "2"})
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("no new boot on i-builder within 3 s", r.stderr)
+        # Nothing in the loop outlives the wait: not a stalled status read, not the pause
+        # between probes.
+        start = time.time()
+        r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", FAKE_STATUS_SLOW="20", **fast)
+        self.assertIn("no new boot on i-builder within 5 s", r.stderr)
+        self.assertLess(time.time() - start, 12)
 
     def test_a_boot_measurement_goes_through_the_wall_reserve(self):
         # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave

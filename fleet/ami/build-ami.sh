@@ -159,13 +159,14 @@ reboot)
   sleep "${REBOOT_SETTLE:-60}"
   end=$(($(now) + ${REBOOT_WAIT:-900}))
   while [ "$(now)" -lt "$end" ]; do
-    sys=$(within "$(($(now) + 30))" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
+    sys=$(within "$end" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
       --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null || true)
     [ "$sys" = impaired ] && { say "$2's system status check failed after the reboot (its EC2 host, not the instance): stop and start it, which moves it to other hardware and boots it"; exit 1; }
     left=$((end - $(now))); [ "$left" -le 60 ] || left=60
     new=$(ssm_try "$2" "cat /proc/sys/kernel/random/boot_id" "$left" | head -1 || true)
     [ -n "$new" ] && [ "$new" != "$old" ] && { echo "rebooted"; exit 0; }
-    sleep 15
+    left=$((end - $(now))); [ "$left" -le 15 ] || left=15
+    [ "$left" -le 0 ] || sleep "$left"
   done
   say "no new boot on $2 within ${REBOOT_WAIT:-900} s of the reboot"; exit 1
   ;;
