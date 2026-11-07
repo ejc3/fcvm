@@ -82,6 +82,37 @@ use nix::unistd::{read, write};
 /// are counted and summarized rather than silent.
 const PENDING_CAP: usize = 1024 * 1024;
 
+/// How long the writer holds the unfinished last line back, waiting for its newline,
+/// before it writes it anyway. `eprintln!` writes a line in pieces (each literal and each
+/// argument, then the newline), and the writer reads the pipe as the pieces arrive, so
+/// without the hold a line reached the console in pieces. Any other console writer (the
+/// kernel, a process writing `/dev/ttyS0`) could then land inside it: CI run 42393525591
+/// logged `[fc-agent] exec server: accepted connection on vsock port 4998UART-TEST-MARKER-...`
+/// when the exec that wrote the marker raced the line that logged its accept.
+const PARTIAL_LINE_HOLD: Duration = Duration::from_millis(100);
+
+/// An unfinished line this long is written without waiting for its newline: the hold is
+/// for a line still being written, not for output that has none.
+const PARTIAL_LINE_CAP: usize = 4096;
+
+/// How much of `pending` to write now: through its last newline, or all of it once the
+/// unfinished tail has waited [`PARTIAL_LINE_HOLD`] (`tail_since`) or reached
+/// [`PARTIAL_LINE_CAP`] bytes.
+fn writable_len(pending: &[u8], tail_since: Option<Instant>, now: Instant) -> usize {
+    let whole = pending
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |at| at + 1);
+    let tail = pending.len() - whole;
+    let held_long_enough =
+        tail_since.is_some_and(|since| now.saturating_duration_since(since) >= PARTIAL_LINE_HOLD);
+    if tail >= PARTIAL_LINE_CAP || held_long_enough {
+        pending.len()
+    } else {
+        whole
+    }
+}
+
 /// Writer thread poll tick. Bounds how quickly the writer notices a gate
 /// transition; pipe data wakes it immediately via POLLIN.
 const POLL_TICK_MS: u16 = 100;
@@ -234,18 +265,32 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
 fn writer_loop(state: Arc<ConsoleShared>) {
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut buf = [0u8; 8192];
+    // When the unfinished line at the end of `pending` began to wait for its newline.
+    let mut tail_since: Option<Instant> = None;
 
     loop {
         // Poll: always watch the pipe; watch the console for writability only
         // when there is something to flush and the gate is open.
-        let want_write = !pending.is_empty() && state.gate.load(Ordering::SeqCst) == 0;
+        // A held unfinished line is not something to write yet: waiting on POLLOUT for it
+        // would spin, so the poll waits for the pipe or the end of the hold instead.
+        let now = Instant::now();
+        let want_write = state.gate.load(Ordering::SeqCst) == 0
+            && writable_len(pending.make_contiguous(), tail_since, now) > 0;
+        let tick = match tail_since {
+            Some(since) if !want_write => {
+                let left = PARTIAL_LINE_HOLD.saturating_sub(now.saturating_duration_since(since));
+                // At least 1 ms, so a hold that just ended does not poll with no wait.
+                (left.as_millis() as u16).clamp(1, POLL_TICK_MS)
+            }
+            _ => POLL_TICK_MS,
+        };
         {
             let mut fds = [
                 PollFd::new(state.pipe_rd.as_fd(), PollFlags::POLLIN),
                 PollFd::new(state.console_fd.as_fd(), PollFlags::POLLOUT),
             ];
             let nfds = if want_write { 2 } else { 1 };
-            match poll(&mut fds[..nfds], PollTimeout::from(POLL_TICK_MS)) {
+            match poll(&mut fds[..nfds], PollTimeout::from(tick)) {
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(_) => {
@@ -259,6 +304,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
         }
 
         // 1) Drain the pipe (non-blocking) so producers can never wedge on it.
+        let mut saw_newline = false;
         loop {
             match read(&state.pipe_rd, &mut buf) {
                 Ok(0) => break, // all write ends closed (cannot happen: we hold one)
@@ -267,6 +313,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                     let room = PENDING_CAP.saturating_sub(pending.len());
                     let keep = n.min(room);
                     pending.extend(&buf[..keep]);
+                    saw_newline |= buf[..keep].contains(&b'\n');
                     if keep < n {
                         let over = (n - keep) as u64;
                         // Dropped bytes are disposed: the enqueued/disposed
@@ -284,18 +331,30 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             }
         }
 
+        // The unfinished line's wait starts when it is first seen and ends with it. A
+        // newline read now ends the line that was waiting, so a tail after it is a new one.
+        if saw_newline || pending.back().is_none_or(|&b| b == b'\n') {
+            tail_since = None;
+        }
+        if pending.back().is_some_and(|&b| b != b'\n') && tail_since.is_none() {
+            tail_since = Some(Instant::now());
+        }
+
         // 2) Flush pending to the console — never while gated, never blocking.
+        // Whole lines only, each write one contiguous run (see PARTIAL_LINE_HOLD).
         let mut wrote_any = false;
         if !pending.is_empty() {
             let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             // Checked under the lock: after quiesce() sets the gate and cycles
             // this lock, no write can start here.
             if state.gate.load(Ordering::SeqCst) == 0 {
-                while !pending.is_empty() {
-                    let (head, _) = pending.as_slices();
+                let mut left = writable_len(pending.make_contiguous(), tail_since, Instant::now());
+                while left > 0 {
+                    let head = &pending.make_contiguous()[..left];
                     match write(state.console_fd.as_fd(), head) {
                         Ok(0) => break,
                         Ok(n) => {
+                            left -= n;
                             pending.drain(..n);
                             state.disposed.fetch_add(n as u64, Ordering::SeqCst);
                             wrote_any = true;
@@ -676,7 +735,7 @@ async fn run_source_request(request: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
     /// Fake console: a pipe whose read end the test controls. Not reading it
@@ -753,6 +812,78 @@ mod tests {
             wait_until(|| state.flushed(), Duration::from_secs(5)),
             "writer must account every relayed byte as disposed"
         );
+    }
+
+    /// A line written in pieces reaches the console whole, so another console writer
+    /// cannot land inside it. Run 42393525591's serial console test logged
+    /// `...accepted connection on vsock port 4998UART-TEST-MARKER-...`: the writer had
+    /// forwarded the line without its newline, and the marker the exec wrote to
+    /// `/dev/ttyS0` landed before the newline did.
+    #[test]
+    fn a_line_written_in_pieces_reaches_the_console_whole() {
+        let (console_wr, mut console_rd) = fake_console();
+        // Another writer to the same console, as `echo ... > /dev/ttyS0` is.
+        let other = std::fs::File::from(console_wr.try_clone().unwrap());
+        let state = setup(console_wr).unwrap();
+        let mut seen: Vec<u8> = Vec::new();
+
+        write_pipe(
+            &state,
+            b"[fc-agent] exec server: accepted connection on vsock port ",
+        );
+        write_pipe(&state, b"4998");
+        // Well inside the hold, and far longer than the writer takes to forward bytes.
+        std::thread::sleep(Duration::from_millis(30));
+        (&other).write_all(b"UART-TEST-MARKER\n").unwrap();
+        write_pipe(&state, b"\n");
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.iter().filter(|&&b| b == b'\n').count() == 2
+                },
+                Duration::from_secs(5)
+            ),
+            "both lines reach the console, got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        let text = String::from_utf8_lossy(&seen);
+        assert!(
+            text.lines()
+                .any(|l| l == "[fc-agent] exec server: accepted connection on vsock port 4998"),
+            "the agent's line was split by another console writer: {text:?}"
+        );
+        assert!(text.lines().any(|l| l == "UART-TEST-MARKER"), "{text:?}");
+
+        // Output with no newline still reaches the console once the hold ends.
+        let before = seen.len();
+        write_pipe(&state, b"prompt> ");
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen[before..] == *b"prompt> "
+                },
+                Duration::from_secs(5)
+            ),
+            "an unfinished line is written after the hold, got {:?}",
+            String::from_utf8_lossy(&seen[before..])
+        );
+        assert!(wait_until(|| state.flushed(), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn writable_len_holds_only_an_unfinished_line_within_its_hold() {
+        let now = Instant::now();
+        assert_eq!(writable_len(b"", None, now), 0);
+        assert_eq!(writable_len(b"a\nb\n", None, now), 4);
+        assert_eq!(writable_len(b"a\nbc", Some(now), now), 2);
+        assert_eq!(
+            writable_len(b"a\nbc", Some(now - PARTIAL_LINE_HOLD), now),
+            4
+        );
+        let long = vec![b'x'; PARTIAL_LINE_CAP];
+        assert_eq!(writable_len(&long, Some(now), now), PARTIAL_LINE_CAP);
     }
 
     #[test]
