@@ -282,13 +282,14 @@ in our Cloud Hypervisor fork, `memory_restore_mode=map`: after the memory manage
 guest RAM, each saved range of the memory file is mapped `MAP_PRIVATE | MAP_FIXED` over the
 RAM that backs it, from its offset in the file. KVM's memory slots already point at those
 host addresses and follow the new mapping through its MMU notifiers. It refuses shared and
-hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode: fcvm's restore
-today reflinks the snapshot's files into each clone's `ch-restore` directory, and a reflink is
-a new inode with its own page cache, so the clone's directory links the snapshot's memory file
-instead (it is immutable once published) and keeps its own copy of the configuration. fcvm
-then restores every Cloud Hypervisor clone with it (stack PR 5),
-measured against `copy` on the same host; it lands only if it wins on time to desktop at 8
-clones and on private memory per clone.
+hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode, and a
+reflink is a new inode with its own page cache, so each clone's `ch-restore` directory holds a
+symbolic link to the snapshot's memory file (immutable once published) and its own copy of
+the configuration. A hard link would do the same, but the snapshot directory is a btrfs
+subvolume and a link across subvolumes fails with `EXDEV`. Against `copy` on the same host it
+cut the first desktop update at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and private
+memory per clone from 4,097 to about 840 MiB (the measurement section). A Cloud Hypervisor
+without `map` fails the restore with an error naming `fcvm setup --cloud-hypervisor`.
 
 fcvm's UFFD memory server (`src/uffd/`, minor mode with working-set replay) would add
 prefetching on top of the same sharing, at the cost of a userfaultfd handshake in the fork.

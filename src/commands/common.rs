@@ -4343,6 +4343,22 @@ async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<
     Ok(())
 }
 
+/// What a failed `--restore` launch says. A Cloud Hypervisor older than the pinned fork rejects
+/// `memory_restore_mode=map` while it parses its arguments ("unable to convert map for
+/// memory_restore_mode"), before any VM exists, so that failure names the fix.
+fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> anyhow::Error {
+    if format!("{error:#}").contains("memory_restore_mode") {
+        error.context(format!(
+            "{} does not support memory_restore_mode=map, which fcvm restores Cloud Hypervisor \
+             clones with; run `fcvm setup --cloud-hypervisor` to build the pinned fork \
+             (rootfs-config.toml [cloud_hypervisor]), or set FCVM_CLOUD_HYPERVISOR_BIN to such a build",
+            ch_bin.display()
+        ))
+    } else {
+        error
+    }
+}
+
 /// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
 ///
 /// The Cloud Hypervisor analogue of [`restore_from_snapshot`]. It reuses the shared clone
@@ -4496,6 +4512,7 @@ pub async fn restore_from_snapshot_ch(
         "--restore source_url=file://{},memory_restore_mode=map,resume=false",
         clone_ch_dir.display()
     );
+    let ch_bin_shown = ch_bin.clone();
     let spec = ProcessSpec {
         binary: ch_bin,
         extra_args: Some(restore_args),
@@ -4511,6 +4528,7 @@ pub async fn restore_from_snapshot_ch(
         .await
         .context("launching Cloud Hypervisor --restore")
     {
+        let error = ch_restore_launch_error(error, &ch_bin_shown);
         let _ = backend.kill().await;
         cleanup_failed_clone_holder(
             &mut substrate.holder_child,
@@ -8118,6 +8136,40 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// A Cloud Hypervisor without `map` (upstream, or a cached build of the fork from before it)
+    /// fails at argument parsing with this stderr; the restore's error then says how to get one
+    /// that has it, and any other launch failure is left as it was.
+    #[test]
+    fn a_ch_without_map_restore_names_the_fix() {
+        let bin = std::path::Path::new("/assets/cloud-hypervisor/cloud-hypervisor-old.bin");
+        let parse = anyhow::anyhow!(
+            "Cloud Hypervisor exited with exit status: 1 before its API socket became ready; last stderr output:\n  \
+             Error: Cloud Hypervisor exited with the following chain of errors:\n  \
+             0: Error parsing restore\n  1: Error parsing --restore\n  \
+             2: unable to convert map for memory_restore_mode"
+        )
+        .context("launching Cloud Hypervisor --restore");
+        let message = format!("{:#}", ch_restore_launch_error(parse, bin));
+        assert!(
+            message.starts_with("/assets/cloud-hypervisor/cloud-hypervisor-old.bin does not support memory_restore_mode=map"),
+            "{message}"
+        );
+        assert!(
+            message.contains("fcvm setup --cloud-hypervisor"),
+            "{message}"
+        );
+        assert!(
+            message.contains("unable to convert map for memory_restore_mode"),
+            "{message}"
+        );
+        let other = anyhow::anyhow!("Cloud Hypervisor exited with signal 9")
+            .context("launching Cloud Hypervisor --restore");
+        assert_eq!(
+            format!("{:#}", ch_restore_launch_error(other, bin)),
+            "launching Cloud Hypervisor --restore: Cloud Hypervisor exited with signal 9"
+        );
     }
 
     /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=map`),
