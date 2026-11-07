@@ -534,6 +534,22 @@ int main() {
       BudgetSchedule g = schedule_after_scene(f, false, false, 140);
       CHECK(g.at(0, &x, &ep) && x == 2.1e5 && ep, "a new clock keeps every_pixel with the budget in force");
     }
+    {
+      // Review of #1565: /health's budget_every_pixel came from the cost model's size
+      // checkpoint (fit_px_, moved only past 1%), not the size last drawn, so a tile 0.8%
+      // taller reported a budget under the one that draws its every pixel and was granted
+      // stride 1 its fit did not reach. The Pipeline needs a GPU; pin the field's source.
+      std::string me = __FILE__;
+      std::string dir = me.substr(0, me.find_last_of('/') + 1);
+      std::ifstream pf(dir + "../src/pipeline.cpp");
+      std::stringstream ps;
+      ps << pf.rdbuf();
+      std::string src = ps.str();
+      size_t at = src.find("\\\"budget_every_pixel\\\":");
+      std::string line = at == std::string::npos ? "" : src.substr(at, src.find('\n', at) - at);
+      CHECK(!line.empty() && line.find("every_pixel_budget(used_px_)") != std::string::npos,
+            "budget_every_pixel is reported from the last frame's drawn pixels: %s", line.c_str());
+    }
     CHECK(std::fabs(budget_fit(1e6, 20.0, 1000.0 / 30) - 1e6 * 0.7 * (1000.0 / 30) / 20.0) < 1, "fit at 70%% of a slot");
     CHECK(ladder_floor(250000) == 250000 && ladder_floor(297302) == 297302 && ladder_floor(297300) == 250000 &&
               ladder_floor(1e6) == 1000000 && ladder_floor(10) == 62500,

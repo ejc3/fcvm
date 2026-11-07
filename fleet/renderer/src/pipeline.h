@@ -179,6 +179,7 @@ class Pipeline : public FrameSource {
   std::deque<FrameLog> frame_log_;  // under hmu_
   const char* budget_source_ = "default";
   bool used_every_pixel_ = false;  // the last frame drew under an every_pixel schedule entry
+  double used_px_ = 0;             // the last frame's drawn pixels (budget_every_pixel); fit_px_ moves only past 1%
   // health
   mutable std::mutex hmu_;
   double last_t_ = 0;

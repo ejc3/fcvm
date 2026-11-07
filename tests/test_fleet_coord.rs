@@ -5173,6 +5173,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 t: Some(t),
                 render_ms_max: None,
                 budget_every_pixel: None,
+                boot_id: None,
             }))
             .unwrap();
     }
@@ -5235,6 +5236,7 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
                 t: Some(5.0),
                 render_ms_max: None,
                 budget_every_pixel: Some(275_448.0),
+                boot_id: Some(format!("boot-{id}")),
             }))
             .unwrap();
     }
@@ -5254,8 +5256,12 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
         "the grid draws a checkerboard: {}",
         got.budget
     );
-    assert!(got.for_tile("slot-1").every_pixel);
-    assert!(!got.for_tile("slot-2").every_pixel);
+    assert!(got.for_tile("slot-1", Some("boot-slot-1")).every_pixel);
+    assert!(!got.for_tile("slot-2", Some("boot-slot-2")).every_pixel);
+    assert!(
+        !got.for_tile("slot-1", Some("boot-other")).every_pixel,
+        "the grant is for the renderer process that earned it"
+    );
 }
 
 /// One instance of [`PoolEc2`]: state, tags, image, spot request.

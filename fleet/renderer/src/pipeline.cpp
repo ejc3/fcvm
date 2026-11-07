@@ -644,6 +644,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     used_budget_ = budget;
     budget_source_ = source;
     used_every_pixel_ = every_pixel;
+    used_px_ = px;
     // a whole-image renderer alone follows its own fit, on the ladder (the
     // latest frames' until the window is ready)
     if (opt_.adapt && whole) {
@@ -922,7 +923,7 @@ std::string Pipeline::health_json() {
   o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
     << "\",\"budget_fit\":" << std::round(fit_) << ",\"budget_fit_now\":" << std::round(fit_now_)
     << ",\"every_pixel\":" << (used_every_pixel_ ? "true" : "false")
-    << ",\"budget_every_pixel\":" << std::ceil(every_pixel_budget(fit_px_))
+    << ",\"budget_every_pixel\":" << std::ceil(every_pixel_budget(used_px_))
     << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {
     // CPU seconds this process has used (user + system), for cost per stream

@@ -612,7 +612,7 @@ async fn post_if_changed(
     let Some(b) = budget
         .borrow_and_update()
         .as_ref()
-        .map(|p| p.for_tile(&ctx.id))
+        .map(|p| p.for_tile(&ctx.id, r.boot.as_deref()))
     else {
         return;
     };

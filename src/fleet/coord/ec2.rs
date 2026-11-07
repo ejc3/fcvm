@@ -347,7 +347,13 @@ async fn post_scenes(
                     }
                 }
                 // This tile's body: the grid's budget, with its every-pixel grant.
-                if let Some(b) = grid.as_ref().map(|p| p.for_tile(&a.id)) {
+                // posted only to the renderer process the grant names: its boot id, last read
+                // from this instance's `/health`
+                let boot = boots
+                    .get(&a.id)
+                    .filter(|(i, _)| *i == l.instance)
+                    .and_then(|(_, b)| b.as_deref());
+                if let Some(b) = grid.as_ref().map(|p| p.for_tile(&a.id, boot)) {
                     if budget_posted.get(&a.id) != Some(&(l.instance.clone(), b)) {
                         match driver.post_budget(&a.id, &l, &b).await {
                             Ok(()) => {

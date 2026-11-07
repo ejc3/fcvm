@@ -223,6 +223,9 @@ pub struct HealthReport {
     /// The budget at which it draws every pixel at its drawn size (`budget_every_pixel`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_every_pixel: Option<f64>,
+    /// The renderer process's `boot_id`, so a grant names the renderer it was given to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 impl HealthReport {
@@ -239,6 +242,7 @@ impl HealthReport {
             t: num(h.get("t")),
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
+            boot_id: boot_id(h),
         }
     }
 }
@@ -475,11 +479,15 @@ pub struct BudgetBody {
     pub every_pixel: bool,
 }
 
-/// One tile's every-pixel grant: on or off from scene time `t`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// One tile's every-pixel grant: on or off from scene time `t`, for the renderer process
+/// whose `/health` names `boot` (its `boot_id`). It is posted to that renderer only, so a
+/// replacement on the same tile never draws under it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EveryPixel {
     pub on: bool,
     pub t: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot: String,
 }
 
 /// The budget of every wall tile: the grid's, and, by tile id, the grants of the tiles
@@ -494,15 +502,16 @@ pub struct BudgetPlan {
 }
 
 impl BudgetPlan {
-    /// The `POST /budget` body for tile `id`: the grid's budget with the tile's grant, from
-    /// the later of the two changes, so a body posted again after a scene post or posted
-    /// late says exactly what is in force from its `t` on.
-    pub fn for_tile(&self, id: &str) -> BudgetBody {
+    /// The `POST /budget` body for tile `id`, whose renderer's `/health` last named `boot`:
+    /// the grid's budget with the tile's grant when the grant is that renderer's, from the
+    /// later of the two changes, so a body posted again after a scene post or posted late
+    /// says exactly what is in force from its `t` on.
+    pub fn for_tile(&self, id: &str, boot: Option<&str>) -> BudgetBody {
         match self.every_pixel.get(id) {
             Some(e) => BudgetBody {
                 budget: self.budget,
                 t: self.t.max(e.t),
-                every_pixel: e.on,
+                every_pixel: e.on && !e.boot.is_empty() && boot == Some(e.boot.as_str()),
             },
             None => BudgetBody {
                 budget: self.budget,

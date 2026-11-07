@@ -1246,18 +1246,20 @@ coordinator runs the rule of the renderer's reference controller
   `budget_every_pixel`, the budget at which it draws every pixel of its drawn size at one
   sample (stride 1). A tile whose `budget_fit` reaches it while the grid's budget is under
   it (the grid's budget would give it a checkerboard) is granted `every_pixel` after three
-  rounds in a row allow it; the grant ends at once when its fit falls under that budget or
-  its `render_ms_max` passes 90% of a slot. A granted tile drawing above the grid's budget
-  answers its own overrun by its grant ending, so its frames do not move the grid's
-  rung down. A grant and its end each take effect at their own `t`, chosen as the grid's
-  is. The coordinator sends the agents the grid's `{budget, t}` with every tile's grant
-  (`every_pixel: {"<tile>": {"on": true, "t": T}}`), and each tile is posted
-  `{budget, t, every_pixel}` with the later of the two times. So every tile that can draw
-  every pixel does, and the slowest tiles keep the grid's checkerboard and its samples per
-  pixel. A tile's pixels are the whole image's at its own stride (the seam test holds per
-  stride, and with neighbours at different strides), so its edge with a neighbour at
-  another stride joins two correct images at one `t`; the neighbours differ only in the
-  grain the extra samples remove.
+  rounds in a row allow it, for the renderer process its `/health` names (`boot_id`); the
+  grant ends at once when its fit falls under that budget, it reports no fit, its
+  `boot_id` changes, or its `render_ms_max` passes 90% of a slot (which also steps the grid
+  down, as any tile's overrun does). A grant and its end each take effect at their own `t`,
+  chosen as the grid's is. The coordinator sends the agents the grid's `{budget, t}` with
+  every tile's grant (`every_pixel: {"<tile>": {"on": true, "t": T, "boot": "<boot_id>"}}`),
+  and each tile is posted `{budget, t, every_pixel}` with the later of the two times;
+  `every_pixel` is true only when the grant names the boot id its poster last read from that
+  renderer's `/health`, so a replacement renderer never draws under another's grant. So every
+  tile that can draw every pixel does, and the slowest tiles keep the grid's checkerboard and
+  its samples per pixel. A tile's pixels are the whole image's at its own stride (the seam
+  test holds per stride, and with neighbours at different strides), so its edge with a
+  neighbour at another stride joins two correct images at one `t`; the neighbours differ
+  only in the grain the extra samples remove.
 
 The renderer's fit is a cost model of its frames: a fixed part per frame and a cost per
 sample on each path. The fast path's and the high-quality path's fits differ, and each

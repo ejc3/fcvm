@@ -2390,45 +2390,70 @@ async fn a_dial_whose_handshake_gets_no_answer_is_tried_again() {
 }
 
 /// A tile granted every pixel is posted the grid's budget with `every_pixel`, from its
-/// grant's time; the end of the grant is posted at its own time. Another tile's grant
-/// changes nothing it is posted.
+/// grant's time, when the grant names its renderer's boot id; the end of the grant is posted at
+/// its own time. Another tile's grant, or a grant naming another renderer process on this tile,
+/// gives it none.
 #[tokio::test]
 async fn a_tile_granted_every_pixel_is_posted_its_own_budget() {
     use fleet_core::protocol::{BudgetPlan, EveryPixel};
     let f = fake(1, &[]);
+    std::fs::write(f.dir.path().join(format!("port-{}.boot", f.base)), "boot-1").unwrap();
     let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
     c.next().await;
     c.send(scene());
     c.assign(&[("slot-1", 0, 1, rect(0.0))]);
     c.until(&["slot-1"], "running", 1).await;
-    let plan = |grants: &[(&str, bool, f64)]| BudgetPlan {
+    // the agent has read the renderer's boot id once it reports the renderer's health
+    loop {
+        if let AgentMsg::Health(h) = c.next().await {
+            assert_eq!(h.boot_id.as_deref(), Some("boot-1"));
+            break;
+        }
+    }
+    let plan = |grants: &[(&str, bool, f64, &str)]| BudgetPlan {
         budget: 210_224,
         t: 11.2,
         every_pixel: grants
             .iter()
-            .map(|(id, on, t)| (id.to_string(), EveryPixel { on: *on, t: *t }))
+            .map(|(id, on, t, boot)| {
+                (
+                    id.to_string(),
+                    EveryPixel {
+                        on: *on,
+                        t: *t,
+                        boot: boot.to_string(),
+                    },
+                )
+            })
             .collect(),
     };
-    c.send(CoordMsg::Budget(plan(&[("slot-2", true, 12.0)])));
+    c.send(CoordMsg::Budget(plan(&[("slot-2", true, 12.0, "boot-9")])));
     wait_len(&f.budgets[0], 1, "the budget was not posted").await;
     assert_eq!(
         f.budgets[0].lock().unwrap()[0],
         serde_json::json!({"budget": 210_224, "t": 11.2}),
         "another tile's grant is not this one's"
     );
-    c.send(CoordMsg::Budget(plan(&[
-        ("slot-1", true, 13.0),
-        ("slot-2", true, 12.0),
-    ])));
-    wait_len(&f.budgets[0], 2, "the grant was not posted").await;
+    c.send(CoordMsg::Budget(plan(&[("slot-1", true, 12.5, "boot-0")])));
+    wait_len(&f.budgets[0], 2, "the budget was not posted").await;
     assert_eq!(
         f.budgets[0].lock().unwrap()[1],
-        serde_json::json!({"budget": 210_224, "t": 13.0, "every_pixel": true})
+        serde_json::json!({"budget": 210_224, "t": 12.5}),
+        "a grant for the tile's previous renderer is not this renderer's"
     );
-    c.send(CoordMsg::Budget(plan(&[("slot-1", false, 15.0)])));
-    wait_len(&f.budgets[0], 3, "the end of the grant was not posted").await;
+    c.send(CoordMsg::Budget(plan(&[
+        ("slot-1", true, 13.0, "boot-1"),
+        ("slot-2", true, 12.0, "boot-9"),
+    ])));
+    wait_len(&f.budgets[0], 3, "the grant was not posted").await;
     assert_eq!(
         f.budgets[0].lock().unwrap()[2],
+        serde_json::json!({"budget": 210_224, "t": 13.0, "every_pixel": true})
+    );
+    c.send(CoordMsg::Budget(plan(&[("slot-1", false, 15.0, "boot-1")])));
+    wait_len(&f.budgets[0], 4, "the end of the grant was not posted").await;
+    assert_eq!(
+        f.budgets[0].lock().unwrap()[3],
         serde_json::json!({"budget": 210_224, "t": 15.0})
     );
     c.close().await;
