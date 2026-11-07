@@ -2874,8 +2874,11 @@ separately.
   rename, and only writes when the union actually grew — so the steady state writes nothing,
   and a clone that was killed mid-restore gets completed by the next one instead of baking in
   a truncated set. Persistence is a performance hint: sidecar lock contention skips that
-  publication attempt without delaying clone teardown, admission slots, or server shutdown;
-  the in-memory union remains available for the next request. Publication also takes the
+  publication attempt without delaying clone teardown or admission slots; the in-memory union
+  remains available for the next request. A stopping server waits up to 10 s for publications
+  already scheduled, after its last clone has gone: without the wait a serve stopped right
+  after its clone exited published nothing, and four restores of a 128 GiB guest in a row
+  replayed no set. Publication also takes the
   snapshot generation lock shared from the final image-identity check through the atomic
   rename. Snapshot replacement takes that lock exclusively, so it either finishes before the
   check (the old clone declines to publish) or waits until an active publication completes; it

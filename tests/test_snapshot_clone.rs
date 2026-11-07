@@ -4642,6 +4642,86 @@ async fn test_snapshot_clone_working_set_replay_uffd_minor() -> Result<()> {
     working_set_replay_impl("minor").await
 }
 
+/// A memory server stopped right after its only clone exits still publishes that clone's
+/// recording. The writer is held at `working_set.pre_persist` for 3 s, so the serve's SIGTERM
+/// arrives while the publication is pending; the serve must wait for it (bounded) instead of
+/// exiting with the union only in memory, which left the next server with nothing to replay.
+#[tokio::test]
+async fn test_serve_stopped_after_its_clone_keeps_the_recording() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("wsdrain");
+    let (mut baseline, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    let created: Result<()> = async {
+        common::poll_health_by_pid(baseline_pid, 120).await?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await
+    }
+    .await;
+    let _ = terminate_and_reap(&mut baseline, baseline_pid, "baseline").await;
+    if let Err(error) = created {
+        let _ = common::delete_snapshot(&snapshot_name).await;
+        return Err(error);
+    }
+
+    let checked: Result<()> = async {
+        let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+        let mem_path = snapshots.load_snapshot(&snapshot_name).await?.memory_path;
+        let working_set_path = fcvm::uffd::WorkingSetStore::path_for(&mem_path);
+        let (mut serve, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
+            &working_set_serve_args(&snapshot_name, "copy"),
+            &[("FCVM_FAILPOINT", "working_set.pre_persist:sleep:3000")],
+        )
+        .await
+        .context("spawning memory server")?;
+        let served: Result<()> = async {
+            common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = spawn_working_set_clone(serve_pid, &clone_name).await?;
+            terminate_and_reap(&mut clone, clone_pid, "clone").await?;
+            serve_log_until(
+                &serve_log,
+                60,
+                "the writer to hold the clone's publication",
+                |log| log.contains("FAILPOINT working_set.pre_persist reached"),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        let status = terminate_and_reap(&mut serve, serve_pid, "memory server").await;
+        served?;
+        require_successful_working_set_exit(status?, "memory server")?;
+        let log = tokio::fs::read_to_string(&serve_log)
+            .await
+            .unwrap_or_default();
+        anyhow::ensure!(
+            log.contains("merged this clone's faults into the snapshot's working set"),
+            "the stopped server never published the clone's recording ({})",
+            serve_log.display()
+        );
+        anyhow::ensure!(
+            working_set_path.exists(),
+            "no working set at {} after the server stopped",
+            working_set_path.display()
+        );
+        Ok(())
+    }
+    .await;
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+    checked?;
+    deleted
+}
+
 async fn working_set_replay_impl(uffd_mode: &str) -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names("wsreplay");
     let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
