@@ -229,7 +229,7 @@ fcvm vm run --name win-1 --firmware <CLOUDHV.fd> --disk <image.raw> --cpu 2 --me
 
 ### Per-clone identity
 
-Every clone of one snapshot has the snapshot's machine SID, computer name (`SANDBOX`),
+Every clone of one snapshot has the snapshot's machine SID, computer name (`FCVM-WIN`),
 passwords, Remote Desktop certificate and private key, and network address.
 That is acceptable for disposable sandboxes and is stated here so nobody builds on it:
 
