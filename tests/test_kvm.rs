@@ -650,6 +650,48 @@ except OSError as e:
     }
 }
 
+/// `localhost/nested-test` as a docker-archive at
+/// `/mnt/fcvm-btrfs/image-cache/{digest}.oci.tar`, the path the nested levels
+/// `podman load` from. The tests used to find this file only when an earlier
+/// launch of the image had left it in the image cache, and a fresh store has
+/// none: every L3 and L4 test then failed in L1 with "stat
+/// /mnt/image-cache/<digest>.oci.tar: no such file or directory" (#660). It is
+/// exported by image ID, under a unique temporary name, and renamed into place.
+async fn nested_test_archive(digest_stripped: &str) -> Result<String> {
+    let path = format!("/mnt/fcvm-btrfs/image-cache/{digest_stripped}.oci.tar");
+    if std::path::Path::new(&path).exists() {
+        return Ok(path);
+    }
+    let id_output = tokio::process::Command::new("podman")
+        .args(["inspect", "localhost/nested-test", "--format", "{{.Id}}"])
+        .output()
+        .await
+        .context("getting the nested-test image ID")?;
+    let image_id = String::from_utf8_lossy(&id_output.stdout)
+        .trim()
+        .to_string();
+    if image_id.is_empty() {
+        bail!(
+            "no image ID for localhost/nested-test: {}",
+            String::from_utf8_lossy(&id_output.stderr)
+        );
+    }
+    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache").await?;
+    let temp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+    fcvm::commands::podman::export_image_archive(
+        &image_id,
+        "localhost/nested-test",
+        std::path::Path::new(&temp),
+        None,
+    )
+    .await
+    .context("exporting localhost/nested-test for the nested levels")?;
+    tokio::fs::rename(&temp, &path)
+        .await
+        .with_context(|| format!("publishing {path}"))?;
+    Ok(path)
+}
+
 /// Run an nested chain test with configurable depth.
 ///
 /// This function attempts to run VMs nested N levels deep:
@@ -782,7 +824,7 @@ except OSError as e:
     }
     // Strip sha256: prefix to match fcvm's cache path format
     let digest_stripped = image_digest.trim_start_matches("sha256:");
-    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let image_cache_path = nested_test_archive(digest_stripped).await?;
     println!("[Setup] Image digest: {}", image_digest);
     println!("[Setup] Cache path: {}", image_cache_path);
 
@@ -1441,17 +1483,20 @@ async fn run_nested_n_levels(
     // This avoids mounting the entire image-cache which could be large
     let image_dir = format!("/mnt/fcvm-btrfs/nested-test/{}", digest_stripped);
     let image_archive = format!("{}/{}.oci.tar", image_dir, digest_stripped);
-    let src_archive = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let src_archive = nested_test_archive(digest_stripped).await?;
 
     // Create directory and reflink-copy the archive (fast CoW copy on btrfs)
-    tokio::fs::create_dir_all(&image_dir).await.ok();
+    tokio::fs::create_dir_all(&image_dir).await?;
     if !tokio::fs::try_exists(&image_archive).await.unwrap_or(false) {
         println!("Copying OCI archive to dedicated directory...");
-        tokio::process::Command::new("cp")
+        let copied = tokio::process::Command::new("cp")
             .args(["--reflink=auto", &src_archive, &image_archive])
             .status()
             .await
             .context("copying OCI archive")?;
+        if !copied.success() {
+            bail!("copying {src_archive} to {image_archive}: {copied}");
+        }
     }
 
     // Both methods mount the same directory, just via different mechanisms
@@ -2032,12 +2077,8 @@ async fn test_podman_load_over_fuse() -> Result<()> {
     }
 
     let digest_stripped = digest.trim_start_matches("sha256:");
-    let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let archive_path = nested_test_archive(digest_stripped).await?;
     println!("   Digest: sha256:{}...", &digest_stripped[..12]);
-
-    if !std::path::Path::new(&archive_path).exists() {
-        bail!("OCI archive not found at {}", archive_path);
-    }
 
     // Get archive size
     let metadata = std::fs::metadata(&archive_path)?;
