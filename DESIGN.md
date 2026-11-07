@@ -3178,6 +3178,14 @@ still load):
   content that changed under an unchanged key, which the pre-start snapshot holds
   too. `test_prepare_and_run_share_the_pre_start_snapshot_across_health_checks`
   covers a prepare and a run restoring a run's pre-start snapshot.
+- **Snapshot space before the boot** (#968): a `podman prepare` fails without
+  its snapshot, and a cold `--gpu` run without its pre-start snapshot, so both
+  check the snapshot filesystem before any VM process exists, with the
+  requirement the snapshot-time check uses (`common::snapshot_space_required`:
+  all of `--mem` for a full snapshot, a tenth for a diff). Any other run is not
+  refused: a refused snapshot only leaves it uncached. The snapshot-time check
+  stays, and for a prepare its refusal adds how far free space fell since the
+  start and what a snapshot being replaced (`--force`, `--tag`) still holds.
 - **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
   rejects sources with extra disks, and reboot-in-place is disabled for restored
   clones that have them (a relaunch would silently drop the data disks).

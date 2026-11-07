@@ -1026,3 +1026,62 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+/// A prepare whose snapshot cannot fit on the snapshot filesystem is refused before its VM
+/// exists (#968). A prepare fails without its snapshot, so a refusal at snapshot time loses
+/// the whole boot and warm-up. `--mem` asks for about 3.7 PiB, more than any host's snapshot
+/// filesystem holds, so the full snapshot a cold prepare takes can never fit.
+#[tokio::test]
+async fn test_prepare_refuses_a_snapshot_that_cannot_fit_before_booting() -> Result<()> {
+    use std::time::Duration;
+
+    let (vm_name, _, tag, _) = common::unique_names("prepare-space");
+    let (mut child, _pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "prepare",
+            "--name",
+            &vm_name,
+            "--tag",
+            &tag,
+            "--mem",
+            "4000000000",
+            "--ready-timeout",
+            "300",
+            common::TEST_IMAGE,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning fcvm podman prepare")?;
+    let status = tokio::time::timeout(Duration::from_secs(300), child.wait())
+        .await
+        .context("the prepare did not end within 300 s")??;
+    assert!(
+        !status.success(),
+        "a prepare whose snapshot cannot fit must fail, got {status}"
+    );
+
+    // The log is written from the child's pipes; give the writer a moment after the exit.
+    let mut text = String::new();
+    for _ in 0..50 {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("no VM was started") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        text.contains("podman prepare's startup snapshot needs up to 4000000000 MiB")
+            && text.contains("no VM was started"),
+        "the prepare was not refused for its snapshot's space before booting; log {}",
+        log.display()
+    );
+    assert!(
+        !text.contains("starting Firecracker process"),
+        "the prepare started Firecracker before refusing; log {}",
+        log.display()
+    );
+    let _ = common::delete_snapshot(&tag).await;
+    Ok(())
+}

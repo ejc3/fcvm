@@ -197,6 +197,15 @@ for healthy as a cold `prepare` does. `--health-check` is not part of that snaps
 key, only of the startup snapshot's. `--force` always boots cold. A `prepare` that boots
 cold takes no pre-start snapshot of its own.
 
+Before any VM starts, `prepare` checks that the snapshot filesystem has room for the
+snapshot it will take: `--mem` MiB for a cold boot's full snapshot, a tenth of that for
+the diff on a restored pre-start snapshot. It refuses when it does not, and so does a
+cold `--gpu` run for its pre-start snapshot. The check is repeated when the snapshot is
+taken, because the VM's own disk and other writers use space meanwhile; a refusal there
+says how far free space fell since the start. A snapshot that `--force` or `--tag`
+replaces keeps its space until the new one is installed, and both refusals say how much
+it holds.
+
 ### Disk-Only (Cold-Boot) Clones
 
 `--disk-only` captures just the disk — no vCPU pause, no memory image. The guest

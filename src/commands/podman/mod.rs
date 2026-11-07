@@ -454,7 +454,153 @@ fn prepare_install_target(options: &PrepareOptions, content_key: &str) -> Result
         content_key: content_key.to_string(),
         guest_thp: None,
         snapshot_type,
+        free_at_start: None,
     })
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// A snapshot an install replaces. Its space comes back only once the new generation is
+/// installed, so it counts against the free space the new one needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplacedSnapshot {
+    name: String,
+    /// Allocated bytes of its files. Extents it shares with other files (reflinks) are
+    /// counted too, so this is what deleting it frees at most.
+    bytes: u64,
+}
+
+/// The generation a prepare replaces at its target: one installed there when the target
+/// replaces what it finds (`--force`, or a `--tag` holding other content).
+async fn replaced_snapshot(target: &PreparedTarget) -> Option<ReplacedSnapshot> {
+    if target.existing != ExistingGeneration::Replace {
+        return None;
+    }
+    let dir = paths::snapshot_dir().join(&target.name);
+    if !dir.join("config.json").exists() {
+        return None;
+    }
+    let bytes = tokio::task::spawn_blocking(move || allocated_bytes(&dir))
+        .await
+        .ok()?;
+    Some(ReplacedSnapshot {
+        name: target.name.clone(),
+        bytes,
+    })
+}
+
+/// The allocated bytes of every file under `dir`, subdirectories included. Unreadable
+/// entries count as nothing.
+fn allocated_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => allocated_bytes(&entry.path()),
+            Ok(meta) if meta.is_file() => meta.blocks() * 512,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Refuse a run whose snapshot the snapshot filesystem cannot hold, before any VM process
+/// exists (#968): `podman prepare` fails without its snapshot, and a cold `--gpu` run
+/// without its pre-start snapshot, so either would otherwise boot, import and warm up for
+/// as long as the workload takes and then fail. `required` is what the snapshot-time check
+/// will ask for (`common::snapshot_space_required`) and `available` what the filesystem
+/// has now; None (statvfs failed) refuses nothing, as at snapshot time. The check at
+/// snapshot time stays: the VM's own disk and other writers can take space meanwhile.
+fn refuse_unfittable_snapshot(
+    what: &str,
+    required: u64,
+    available: Option<u64>,
+    dir: &Path,
+    replaced: Option<&ReplacedSnapshot>,
+) -> Result<()> {
+    let Some(available) = available else {
+        return Ok(());
+    };
+    if available >= required {
+        return Ok(());
+    }
+    let mut message = format!(
+        "{what} needs up to {} MiB on {} and {} MiB are free, so no VM was started. Use --mem \
+         to limit VM memory, or free space on that filesystem (or increase btrfs_size in \
+         rootfs-config.toml).",
+        required / MIB,
+        dir.display(),
+        available / MIB
+    );
+    if let Some(replaced) = replaced {
+        message.push_str(&format!(
+            " The snapshot {} that this replaces holds up to {} MiB of that filesystem until \
+             the new one is installed.",
+            replaced.name,
+            replaced.bytes / MIB
+        ));
+    }
+    bail!(message)
+}
+
+/// `refuse_unfittable_snapshot` against the snapshot filesystem as it is now. Returns the
+/// free bytes it read, for the snapshot-time refusal to compare against.
+async fn check_snapshot_space_before_boot(
+    what: &str,
+    memory_mib: u32,
+    diff: bool,
+    target: Option<&PreparedTarget>,
+) -> Result<Option<u64>> {
+    let dir = paths::snapshot_dir();
+    let required = super::common::snapshot_space_required(memory_mib, diff);
+    let available = super::common::snapshot_space_available(&dir, required).await;
+    let replaced = match target {
+        Some(target) => replaced_snapshot(target).await,
+        None => None,
+    };
+    refuse_unfittable_snapshot(what, required, available, &dir, replaced.as_ref())?;
+    Ok(available)
+}
+
+/// Add to a snapshot refused for space what the prepare knows and the snapshot code does
+/// not: how far free space fell since the prepare checked it before its VM existed, which
+/// points at the VM's own disk writes or another writer, and how much the snapshot it
+/// replaces still holds. Any other error is returned as it is.
+fn explain_snapshot_space_shortfall(
+    error: anyhow::Error,
+    free_at_start: Option<u64>,
+    replaced: Option<&ReplacedSnapshot>,
+) -> anyhow::Error {
+    let Some(shortfall) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::common::SnapshotSpaceShortfall>())
+    else {
+        return error;
+    };
+    let mut parts = Vec::new();
+    if let Some(start) = free_at_start {
+        parts.push(format!(
+            "free space fell from {} MiB when this prepare started to {} MiB: the VM's own \
+             disk writes, or another writer on that filesystem, took {} MiB",
+            start / MIB,
+            shortfall.available_bytes / MIB,
+            start.saturating_sub(shortfall.available_bytes) / MIB
+        ));
+    }
+    if let Some(replaced) = replaced {
+        parts.push(format!(
+            "the snapshot {} that this replaces holds up to {} MiB until the new one is \
+             installed",
+            replaced.name,
+            replaced.bytes / MIB
+        ));
+    }
+    if parts.is_empty() {
+        return error;
+    }
+    error.context(parts.join("; "))
 }
 
 /// Whether an installed generation is the one this invocation asked for.
@@ -1773,10 +1919,19 @@ async fn prepare_vm_for_lifecycle(
                 snapshot_run_firecracker_overrides(&runtime_config),
             );
             if let PodmanLifecycle::Prepare(options) = &lifecycle {
+                let target = prepare_target
+                    .as_mut()
+                    .context("prepare lifecycle has no snapshot install target")?;
+                // The startup snapshot of a restored VM is a diff on this pre-start snapshot.
+                target.free_at_start = check_snapshot_space_before_boot(
+                    "podman prepare's startup snapshot",
+                    args.mem,
+                    true,
+                    Some(target),
+                )
+                .await?;
                 snapshot_args.prepare = Some(PreparedRestore {
-                    target: prepare_target
-                        .clone()
-                        .context("prepare lifecycle has no snapshot install target")?,
+                    target: target.clone(),
                     ready_timeout: options.ready_timeout,
                 });
             }
@@ -1806,6 +1961,26 @@ async fn prepare_vm_for_lifecycle(
             "Snapshot miss, will create snapshot after image load"
         );
         failpoint::hit_async("cache.miss").await;
+        // A cold boot's first snapshot is a full one. A prepare fails without its startup
+        // snapshot and a --gpu run without its pre-start snapshot, so both are refused here
+        // when it cannot fit. Any other run only skips caching when its snapshot is refused.
+        if let Some(target) = prepare_target.as_mut() {
+            target.free_at_start = check_snapshot_space_before_boot(
+                "podman prepare's startup snapshot",
+                args.mem,
+                false,
+                Some(target),
+            )
+            .await?;
+        } else if !args.gpu.is_empty() {
+            check_snapshot_space_before_boot(
+                "the pre-start snapshot that --gpu restores with its devices attached",
+                args.mem,
+                false,
+                None,
+            )
+            .await?;
+        }
         // The cold boot builds each read-only --disk-dir image from a private copy, and
         // refuses one whose content is no longer what the key names.
         on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
@@ -3372,12 +3547,26 @@ pub(crate) async fn install_prepared_startup_snapshot(
         volume_configs,
         remap_refs,
     };
-    let install = snapshot::create_podman_snapshot(
+    let install = match snapshot::create_podman_snapshot(
         &snap,
         super::common::SnapshotSourceDisposition::LeavePaused,
     )
     .await
-    .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
+    {
+        Ok(install) => install,
+        Err(error) => {
+            let replaced = replaced_snapshot(target).await;
+            return Err(explain_snapshot_space_shortfall(
+                error,
+                target.free_at_start,
+                replaced.as_ref(),
+            )
+            .context(format!(
+                "creating prepared startup snapshot {}",
+                target.name
+            )));
+        }
+    };
 
     if cancel.is_cancelled() {
         bail!("interrupted while creating prepared startup snapshot");
@@ -4445,6 +4634,156 @@ mod tests {
         assert!(
             !body.contains("= snapshot_config.metadata.health_check_url"),
             "cmd_snapshot_run_inner takes the snapshot's recorded URL directly"
+        );
+    }
+
+    /// A prepare whose snapshot cannot fit is refused before its VM exists (#968): it fails
+    /// without the snapshot, so a refusal at snapshot time loses the whole boot, warm-up
+    /// included. The check takes the free space as a number, so no small filesystem is
+    /// needed. The numbers are the issue's: a 128 GiB guest, 80791 MiB free.
+    #[test]
+    fn a_snapshot_that_cannot_fit_is_refused_before_the_vm_boots() {
+        let dir = Path::new("/mnt/fcvm-btrfs/snapshots");
+        let need = crate::commands::common::snapshot_space_required(131072, false);
+        assert_eq!(
+            need,
+            131072 * MIB,
+            "a full snapshot needs all of guest memory"
+        );
+        assert_eq!(
+            crate::commands::common::snapshot_space_required(131072, true),
+            131072 * MIB / 10,
+            "a diff snapshot needs a tenth of it, as at snapshot time"
+        );
+
+        let refused = refuse_unfittable_snapshot(
+            "podman prepare's startup snapshot",
+            need,
+            Some(80791 * MIB),
+            dir,
+            None,
+        )
+        .expect_err("a prepare that cannot fit its snapshot must be refused");
+        let text = format!("{refused:#}");
+        assert!(
+            text.contains("podman prepare's startup snapshot needs up to 131072 MiB on /mnt/fcvm-btrfs/snapshots")
+                && text.contains("80791 MiB are free")
+                && text.contains("no VM was started"),
+            "{text}"
+        );
+
+        assert!(refuse_unfittable_snapshot("x", need, Some(need), dir, None).is_ok());
+        // statvfs failed: nothing is refused, as at snapshot time.
+        assert!(refuse_unfittable_snapshot("x", need, None, dir, None).is_ok());
+
+        let replaced = ReplacedSnapshot {
+            name: "warm-tested".to_string(),
+            bytes: 53248 * MIB,
+        };
+        let text = format!(
+            "{:#}",
+            refuse_unfittable_snapshot("x", need, Some(MIB), dir, Some(&replaced)).unwrap_err()
+        );
+        assert!(
+            text.contains("The snapshot warm-tested that this replaces holds up to 53248 MiB"),
+            "{text}"
+        );
+    }
+
+    /// The check runs before any VM process exists: on a pre-start hit before the restore,
+    /// and on a miss before the VM's directory or processes are made. A prepare checks on
+    /// both paths, a --gpu run on a miss (#968).
+    #[test]
+    fn snapshot_space_is_checked_before_the_vm_is_started() {
+        let source = include_str!("mod.rs");
+        let body = &source[source.find("async fn prepare_vm_for_lifecycle(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in prepare_vm_for_lifecycle"))
+        };
+        let checks: Vec<usize> = body
+            .match_indices("check_snapshot_space_before_boot(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            checks.len(),
+            3,
+            "prepare_vm_for_lifecycle checks snapshot space at {checks:?}, not once on a \
+             prepare's pre-start hit and twice on a miss (prepare, --gpu)"
+        );
+        let hit = at("\"Pre-start snapshot hit! Restoring from cached snapshot\"");
+        let restore = hit + body[hit..].find("cmd_snapshot_run_attempt(").unwrap();
+        assert!(
+            hit < checks[0] && checks[0] < restore,
+            "a prepare's pre-start hit restores at {restore} before it checks at {}",
+            checks[0]
+        );
+        let miss = at("\"Snapshot miss, will create snapshot after image load\"");
+        let data_dir = at(".context(\"creating VM data directory\")");
+        let setup = at("run_vm_setup(");
+        assert!(
+            miss < checks[1] && checks[2] < data_dir && data_dir < setup,
+            "a miss makes the VM's directory at {data_dir} and starts it at {setup}, \
+             checks at {checks:?}"
+        );
+    }
+
+    /// The check at snapshot time stays, because the VM's own disk and other writers take
+    /// space during the boot. When it refuses a prepare, the refusal says how far free space
+    /// fell since the prepare started and what the snapshot it replaces still holds (#968).
+    #[test]
+    fn the_snapshot_time_refusal_says_how_far_free_space_fell() {
+        let shortfall = crate::commands::common::SnapshotSpaceShortfall {
+            kind: "full",
+            required_bytes: 131072 * MIB,
+            available_bytes: 80791 * MIB,
+            path: "/mnt/fcvm-btrfs/snapshots/warm-tested".into(),
+        };
+        // The text log searches and the snapshot code always printed.
+        assert_eq!(
+            shortfall.to_string(),
+            "Not enough disk space for full snapshot: need 131072 MiB, have 80791 MiB free on \
+             /mnt/fcvm-btrfs/snapshots/warm-tested. Use --mem to limit VM memory, or increase \
+             btrfs_size in rootfs-config.toml."
+        );
+        let replaced = ReplacedSnapshot {
+            name: "warm-tested".to_string(),
+            bytes: 53248 * MIB,
+        };
+        let error = anyhow::Error::from(shortfall).context("creating podman snapshot");
+        let text = format!(
+            "{:#}",
+            explain_snapshot_space_shortfall(error, Some(136192 * MIB), Some(&replaced))
+        );
+        assert!(
+            text.contains("free space fell from 136192 MiB when this prepare started to 80791 MiB")
+                && text.contains("took 55401 MiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the snapshot warm-tested that this replaces holds up to 53248 MiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Not enough disk space for full snapshot"),
+            "{text}"
+        );
+
+        let other = explain_snapshot_space_shortfall(
+            anyhow::anyhow!("pausing the VM failed"),
+            Some(MIB),
+            Some(&replaced),
+        );
+        assert_eq!(format!("{other:#}"), "pausing the VM failed");
+
+        // The snapshot code refuses with the type the explanation looks for.
+        let common = include_str!("../common.rs");
+        let core = &common[common.find("pub async fn create_snapshot_core(").unwrap()..];
+        let core = &core[..core.find("\n}\n").unwrap()];
+        assert!(
+            core.contains("return Err(SnapshotSpaceShortfall {"),
+            "create_snapshot_core does not refuse with SnapshotSpaceShortfall"
         );
     }
 
