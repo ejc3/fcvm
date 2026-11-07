@@ -2223,12 +2223,19 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 pub(crate) struct SnapshotRunAttempt {
     pub(crate) result: Result<()>,
     pub(crate) generation: Option<SnapshotGeneration>,
+    /// What a restore for `podman prepare` (`SnapshotRunArgs::prepare`) installed.
+    pub(crate) prepared: Option<super::podman::PreparedSnapshot>,
 }
 
 pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotRunAttempt {
     let mut generation = None;
-    let result = cmd_snapshot_run_inner(args, &mut generation).await;
-    SnapshotRunAttempt { result, generation }
+    let mut prepared = None;
+    let result = cmd_snapshot_run_inner(args, &mut generation, &mut prepared).await;
+    SnapshotRunAttempt {
+        result,
+        generation,
+        prepared,
+    }
 }
 
 /// The routed network a clone restores into, before its preflight and loopback
@@ -2316,6 +2323,21 @@ fn restore_document_dns(
     resolvers.guest_dns(mode)
 }
 
+/// The health check a restored clone monitors: the one the restoring `podman` invocation
+/// handed over, else the one the snapshot recorded.
+pub(crate) fn restore_health_check(
+    given: Option<&crate::cli::RestoreHealthCheck>,
+    recorded_url: Option<&str>,
+    recorded_timeout_secs: u64,
+) -> crate::cli::RestoreHealthCheck {
+    given
+        .cloned()
+        .unwrap_or_else(|| crate::cli::RestoreHealthCheck {
+            url: recorded_url.map(str::to_string),
+            timeout_secs: recorded_timeout_secs,
+        })
+}
+
 /// The prefix a routed clone's address is derived from: the one this run was given
 /// (`--ipv6-prefix` or FCVM_IPV6_PREFIX). Without one, routed networking detects the
 /// host's own /64, as a fresh `podman run` does. The prefix belongs to the host that runs
@@ -2331,6 +2353,7 @@ fn restore_ipv6_prefix(network_mode: FcNetworkMode, given: Option<&String>) -> O
 async fn cmd_snapshot_run_inner(
     args: SnapshotRunArgs,
     attempted_generation: &mut Option<SnapshotGeneration>,
+    prepared_out: &mut Option<super::podman::PreparedSnapshot>,
 ) -> Result<()> {
     // Determine mode and get snapshot name
     let (snapshot_name, serve_pid, uffd_socket, serve_uffd_mode) = match (&args.pid, &args.snapshot)
@@ -2793,20 +2816,33 @@ async fn cmd_snapshot_run_inner(
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
     // Channel to know when fc-agent's output connection arrives (gates health monitor)
     let (output_connected_tx, mut output_connected_rx) = tokio::sync::oneshot::channel();
+    // A prepare's stdout carries only its JSON record, so the container's output goes to
+    // the VM's directory and teardown copies it out, as on a cold prepare.
+    let (log_tx, container_log) = if args.prepare.is_some() && !tty_mode {
+        let (tx, _) = tokio::sync::broadcast::channel::<super::podman::LogLine>(1000);
+        let writer = super::podman::ContainerLogWriter::spawn(tx.subscribe(), &data_dir);
+        (Some(tx), Some(writer))
+    } else {
+        (None, None)
+    };
     if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reconnect = output_reconnect.clone();
+        let emit_output = args.prepare.is_none();
+        let drain = container_log
+            .as_ref()
+            .map(|writer| writer.listener_drain.clone());
         setup.output_handle = Some(tokio::spawn(async move {
             match run_output_listener(
                 &socket_path,
                 &vm_id_clone,
-                None,
+                log_tx,
                 reconnect,
                 non_blocking_output,
-                true,
+                emit_output,
                 Some(output_connected_tx),
-                None,
+                drain,
             )
             .await
             {
@@ -2967,10 +3003,17 @@ async fn cmd_snapshot_run_inner(
         None
     };
 
-    // Health check URL comes from snapshot metadata — it's a property of the VM image.
-    // The cache key includes health_check_url, so each config gets its own snapshot.
-    vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
-    vm_state.config.health_check_timeout = snapshot_config.metadata.health_check_timeout;
+    // The health check this clone monitors: on a podman cache hit the run's own, because
+    // the pre-start key leaves out the URL (it only decides when the startup snapshot is
+    // taken, #953) and no key holds the timeout, so the snapshot's recorded check may be
+    // another run's. A command-line `snapshot run` monitors the check the snapshot recorded.
+    let health_check = restore_health_check(
+        args.health_check.as_ref(),
+        snapshot_config.metadata.health_check_url.as_deref(),
+        snapshot_config.metadata.health_check_timeout,
+    );
+    vm_state.config.health_check_url = health_check.url;
+    vm_state.config.health_check_timeout = health_check.timeout_secs;
     // The restore hook: this invocation's when it gave one, else the snapshot's
     // for a command-line `snapshot run`, else none. The clone's restore runs it,
     // and a snapshot taken from this clone records it.
@@ -3301,7 +3344,7 @@ async fn cmd_snapshot_run_inner(
     // for dirty tracking, negating the TLB benefit of hugepages.
     let needs_dirty_tracking = if hugepages {
         false // hugepage VMs must not split 2MB TLB entries
-    } else if args.startup_snapshot_base_key.is_some() {
+    } else if args.startup_snapshot_base_key.is_some() || args.prepare.is_some() {
         true // podman path — needs dirty tracking for startup snapshot
     } else {
         !args.no_dirty_tracking // CLI default: on. --no-dirty-tracking: off.
@@ -3544,7 +3587,10 @@ async fn cmd_snapshot_run_inner(
     // exec rebind → wait for confirmation → output.reconnect(). No host-side
     // notify needed — the listener will accept fc-agent's new connection naturally.
 
-    if let Ok(RestoreAck::Acked { guest_phases }) = &restore_completion_result {
+    // A prepare's stdout carries only its JSON record.
+    if let (Ok(RestoreAck::Acked { guest_phases }), None) =
+        (&restore_completion_result, &args.prepare)
+    {
         let is_uffd = use_uffd || implicit_uffd_handle.is_some();
         if is_uffd {
             info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
@@ -3744,7 +3790,7 @@ async fn cmd_snapshot_run_inner(
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
-    ) = if args.startup_snapshot_base_key.is_some() {
+    ) = if args.startup_snapshot_base_key.is_some() || args.prepare.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {
@@ -3882,6 +3928,8 @@ async fn cmd_snapshot_run_inner(
     let mut health_monitor_handle = None;
     let mut lifecycle_ready_result: Result<()> = Ok(());
     let mut lifecycle_cancelled = false;
+    // What a prepare's restore did (`SnapshotRunArgs::prepare`), when it got that far.
+    let mut prepare_result: Option<Result<super::podman::PreparedSnapshot>> = None;
 
     if verify_result.is_ok() {
         // Spawn health monitor task with startup snapshot trigger support
@@ -3939,7 +3987,9 @@ async fn cmd_snapshot_run_inner(
         // the serial watchdog is armed when applicable, the health monitor is running,
         // and any serve-process pidfd has been pinned. A cancellation observed before
         // this point deliberately leaves lifecycle_ready=false while cleanup runs.
-        if clone_failure.is_none() {
+        // A prepare's disposable VM is never published, as on a cold prepare, so no other
+        // command can adopt or snapshot it.
+        if clone_failure.is_none() && args.prepare.is_none() {
             match lifecycle_gate.publish(&state_manager, &mut vm_state).await {
                 Ok(super::common::LifecycleReadyOutcome::Published) => {}
                 Ok(super::common::LifecycleReadyOutcome::Cancelled) => {
@@ -3949,14 +3999,36 @@ async fn cmd_snapshot_run_inner(
             }
         }
 
+        if let (Some(prepare), None) = (args.prepare.as_ref(), clone_failure.as_ref()) {
+            prepare_result = Some(
+                restored_prepare(
+                    prepare,
+                    startup_rx.take(),
+                    &cancel,
+                    vm_manager.as_mut(),
+                    args.balloon,
+                    &vm_state,
+                    &disk_path,
+                    &volume_configs,
+                    &volume_servers.remap_refs,
+                )
+                .await,
+            );
+        }
+
         // Bounds the wait for a guest that never powers off after its container exited (#998).
         let mut watchdog = super::podman::PoweroffWatchdog::new(
             container_exit_seen.clone(),
             super::podman::GUEST_POWEROFF_DEADLINE,
         );
         let mut watchdog_killed = false;
-        // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger
-        while clone_failure.is_none() && lifecycle_ready_result.is_ok() && !lifecycle_cancelled {
+        // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger.
+        // A prepare's VM is done once its snapshot is installed or its wait failed.
+        while args.prepare.is_none()
+            && clone_failure.is_none()
+            && lifecycle_ready_result.is_ok()
+            && !lifecycle_cancelled
+        {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     vm_exit = None;
@@ -4358,24 +4430,38 @@ async fn cmd_snapshot_run_inner(
         let _ = handle.await;
     }
 
-    // Cleanup common resources
-    super::common::cleanup_vm(
-        super::common::CleanupContext {
-            vm_id: vm_id.clone(),
-            volume_server_handles: volume_servers.handles,
-            remap_refs: volume_servers.remap_refs,
-            data_dir: data_dir.clone(),
-            health_cancel_token: Some(health_cancel_token),
-            health_monitor_handle,
-            output_listener_handle: output_handle, // abort output listener task
-            container_log: None,
-        },
-        vm_manager.as_mut(),
-        &mut holder_child,
-        network.as_mut(),
-        &state_manager,
-    )
-    .await;
+    // Cleanup common resources. A prepare's teardown is verified, as on a cold prepare,
+    // so it never reports an installed snapshot beside host state that survived.
+    let cleanup_context = super::common::CleanupContext {
+        vm_id: vm_id.clone(),
+        volume_server_handles: volume_servers.handles,
+        remap_refs: volume_servers.remap_refs,
+        data_dir: data_dir.clone(),
+        health_cancel_token: Some(health_cancel_token),
+        health_monitor_handle,
+        output_listener_handle: output_handle, // abort output listener task
+        container_log,
+    };
+    let cleanup_result = if args.prepare.is_some() {
+        super::common::cleanup_vm_verified(
+            cleanup_context,
+            vm_manager.as_mut(),
+            &mut holder_child,
+            network.as_mut(),
+            &state_manager,
+        )
+        .await
+    } else {
+        super::common::cleanup_vm(
+            cleanup_context,
+            vm_manager.as_mut(),
+            &mut holder_child,
+            network.as_mut(),
+            &state_manager,
+        )
+        .await;
+        Ok(())
+    };
 
     if let Some(handle) = implicit_uffd_handle.take() {
         match handle.await {
@@ -4396,8 +4482,22 @@ async fn cmd_snapshot_run_inner(
     }
 
     // Propagate post-restore verification failure only after cleanup has run
-    verify_result?;
-    lifecycle_ready_result?;
+    let verified = verify_result.and(lifecycle_ready_result);
+    if args.prepare.is_some() {
+        let operation = verified.and_then(|()| match clone_failure {
+            Some(reason) => Err(anyhow::anyhow!(
+                "disposable prepare VM '{vm_name}' FAILED: {reason}"
+            )),
+            None => prepare_result.unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "interrupted before the container became healthy"
+                ))
+            }),
+        });
+        *prepared_out = Some(super::podman::finish_prepare(operation, cleanup_result)?);
+        return Ok(());
+    }
+    verified?;
 
     // A clone whose VMM died under us is a FAILED clone, not a finished one. Reporting it
     // only in the log would leave the caller — a benchmark harness, a request router, a
@@ -4412,6 +4512,51 @@ async fn cmd_snapshot_run_inner(
         Some(container_exit_code) => super::podman::container_exit_status(container_exit_code),
         None => Ok(()),
     }
+}
+
+/// The rest of a `podman prepare` whose disposable VM was restored from its pre-start
+/// snapshot: wait for the VM's first Healthy within the prepare's budget, then install the
+/// startup snapshot at the prepare's target with the VM left paused, as a cold prepare
+/// does (`run_prepare_loop`). The VM never acknowledges Healthy, and is torn down after.
+#[allow(clippy::too_many_arguments)]
+async fn restored_prepare(
+    prepare: &super::podman::PreparedRestore,
+    startup_rx: Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    vm_manager: &mut dyn crate::hypervisor::Hypervisor,
+    balloon: Option<u32>,
+    vm_state: &VmState,
+    disk_path: &Path,
+    volume_configs: &[VolumeConfig],
+    remap_refs: &[Option<Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+) -> Result<super::podman::PreparedSnapshot> {
+    let startup_rx = startup_rx.context("prepare restore has no startup health trigger")?;
+    let startup_ack = super::podman::await_prepare_healthy(
+        startup_rx,
+        cancel,
+        prepare.ready_timeout,
+        vm_manager.wait(),
+    )
+    .await?;
+    let fc_backend = vm_manager
+        .as_any()
+        .downcast_ref::<crate::hypervisor::firecracker::FirecrackerBackend>()
+        .context("podman prepare requires the Firecracker backend")?;
+    let prepared = super::podman::install_prepared_startup_snapshot(
+        fc_backend,
+        &prepare.target,
+        balloon,
+        vm_state,
+        disk_path,
+        volume_configs,
+        remap_refs,
+        cancel,
+    )
+    .await?;
+    // Never acknowledge Healthy in the disposable source; dropping the ack releases the
+    // monitor so its task can observe cancellation.
+    drop(startup_ack);
+    Ok(prepared)
 }
 
 /// What a VMM exit means for the clone's report. A guest reboot is orderly, and so is a VMM that
@@ -6191,6 +6336,8 @@ mod tests {
             on_restore: None,
             inherit_recorded_hook: true,
             guest_thp: None,
+            health_check: None,
+            prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
@@ -6513,6 +6660,8 @@ mod tests {
             on_restore: None,
             inherit_recorded_hook: true,
             guest_thp: None,
+            health_check: None,
+            prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,

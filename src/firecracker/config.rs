@@ -92,9 +92,11 @@ pub struct FirecrackerConfig {
     /// Minimum free space on root filesystem (e.g., "10G").
     /// Affects disk size after CoW copy, so must be in cache key.
     pub rootfs_size: String,
-    /// Health check URL for the VM (e.g., "http://localhost/").
-    /// Part of cache key because it's a property of the VM configuration —
-    /// clones must inherit the same health check behavior.
+    /// Health check URL for the VM (e.g., "http://localhost/"). Host-side only: fc-agent
+    /// never sees it. It decides when the run is Healthy, which is when its startup
+    /// snapshot is taken, so it is in the startup snapshot's key
+    /// (`startup_snapshot_base_key`) and not in the pre-start key (`snapshot_key`). A
+    /// restore monitors the check of the run that restores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_url: Option<String>,
     /// User specification (uid:gid) for rootless podman inside the VM.
@@ -415,14 +417,33 @@ fn is_restore_set_env(entry: &str) -> bool {
 }
 
 impl FirecrackerConfig {
-    /// Compute snapshot key by hashing the JSON representation.
+    /// The pre-start snapshot's key: the config without what only matters once the
+    /// container has started. That is the health-check URL, which decides when a run is
+    /// Healthy and so when its startup snapshot is taken. The pre-start snapshot is taken
+    /// before the container starts, and a restore of it monitors the restoring run's own
+    /// check, so runs and prepares that differ only in the URL share it (#953).
     pub fn snapshot_key(&self) -> String {
+        let mut pre_start = self.keyed().into_owned();
+        pre_start.health_check_url = None;
+        pre_start.key_of()
+    }
+
+    /// The base of the startup snapshot's name (`startup_snapshot_key`): the whole config,
+    /// health-check URL included. Without a URL it equals `snapshot_key()`, and with one it
+    /// is the key both snapshots had before the URL left the pre-start key, so every
+    /// startup snapshot, and every `podman prepare` content key, keeps its name.
+    pub fn startup_snapshot_base_key(&self) -> String {
+        self.keyed().key_of()
+    }
+
+    /// Hash the JSON of a config already in its keyed form.
+    fn key_of(&self) -> String {
         use crate::setup::rootfs::compute_sha256;
         // SnapshotConfig generation IDs are required as of schema 2. Include the
         // schema in the cache key so an old cache directory cannot become a
         // permanent parse miss that also blocks creation at the same tag.
         const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
-        let json = serde_json::to_string(&(SNAPSHOT_SCHEMA_VERSION, self.keyed()))
+        let json = serde_json::to_string(&(SNAPSHOT_SCHEMA_VERSION, self))
             .expect("FirecrackerConfig serialization failed");
         compute_sha256(json.as_bytes())[..12].to_string()
     }
@@ -1116,12 +1137,34 @@ mod tests {
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
+    /// The health-check URL decides when a run is Healthy, which is when its startup
+    /// snapshot is taken. The pre-start snapshot is taken before the container starts,
+    /// so runs that differ only in the URL share it, and each keeps a startup snapshot
+    /// of its own (#953). The startup snapshot's base key is the whole config, URL
+    /// included, which is the key both snapshots had before: a startup snapshot made
+    /// before this change keeps its name.
     #[test]
-    fn test_snapshot_key_changes_with_health_check_url() {
-        let config1 = test_config();
-        let mut config2 = test_config();
-        config2.health_check_url = Some("http://localhost/".to_string());
-        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    fn the_health_check_url_is_in_the_startup_key_and_not_the_pre_start_key() {
+        let plain = test_config();
+        let mut status = test_config();
+        status.health_check_url = Some("http://localhost/".to_string());
+        let mut ready = test_config();
+        ready.health_check_url = Some("http://localhost/ready".to_string());
+
+        assert_eq!(plain.snapshot_key(), status.snapshot_key());
+        assert_eq!(status.snapshot_key(), ready.snapshot_key());
+        assert_ne!(
+            plain.startup_snapshot_base_key(),
+            status.startup_snapshot_base_key()
+        );
+        assert_ne!(
+            status.startup_snapshot_base_key(),
+            ready.startup_snapshot_base_key()
+        );
+        // Without a URL the startup snapshot's base is the pre-start key, as it was.
+        assert_eq!(plain.startup_snapshot_base_key(), plain.snapshot_key());
+        // With one it is the key the whole config hashed to before this change.
+        assert_eq!(status.startup_snapshot_base_key(), "d2f3072bd94a");
     }
 
     #[test]

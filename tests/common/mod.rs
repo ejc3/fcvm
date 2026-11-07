@@ -2617,6 +2617,28 @@ pub fn cache_choice(log: &std::path::Path) -> Option<(&'static str, String)> {
     })
 }
 
+/// The startup snapshot one `podman run` or `podman prepare` uses, from the line it logs
+/// when it decides how to start: the snapshot it restored on a startup-snapshot hit, else
+/// the one it looks up and saves (a prepare's content key). Its base holds the
+/// health-check URL and the pre-start key does not, so for a run with `--health-check` it
+/// is not `<pre-start key>-startup`.
+pub fn startup_choice_key(log: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines().find_map(|line| {
+        let field = if line.contains("Startup snapshot hit!") {
+            "snapshot_key="
+        } else if line.contains("Pre-start snapshot hit!")
+            || line.contains("Snapshot miss, will create snapshot")
+        {
+            "startup_snapshot_key="
+        } else {
+            return None;
+        };
+        let key = line.split(field).nth(1)?.split_whitespace().next()?;
+        Some(key.to_string())
+    })
+}
+
 /// Get the host's global IPv6 address.
 /// Uses `ip -6 addr show scope global` and returns the first non-link-local address.
 pub async fn get_host_ipv6() -> anyhow::Result<String> {

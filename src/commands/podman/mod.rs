@@ -16,8 +16,8 @@ mod types;
 mod vm_config;
 
 pub use types::{
-    shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedTarget, SharedCacheVerdict,
-    SnapshotOutcome, VmContext, VmHandle,
+    shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedRestore, PreparedTarget,
+    SharedCacheVerdict, SnapshotOutcome, VmContext, VmHandle,
 };
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
@@ -335,6 +335,20 @@ fn validate_balloon_target(balloon: Option<u32>, mem: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether this invocation restores a pre-start snapshot it finds. A `podman run` does.
+/// So does a `podman prepare`: the snapshot is taken before the container starts, so a
+/// prepare boots from it to the same point a cold boot reaches after the image import,
+/// and then waits for Healthy and installs its startup snapshot as a cold prepare does
+/// (#953). `prepare --force` cold-boots: it is for content that changed without its key
+/// changing, a repointed remote image reference, and the pre-start snapshot under that
+/// key holds the old content too.
+fn restores_pre_start(lifecycle: &PodmanLifecycle) -> bool {
+    match lifecycle {
+        PodmanLifecycle::Run => true,
+        PodmanLifecycle::Prepare(options) => !options.force,
+    }
+}
+
 /// Whether a run takes a startup snapshot (memory and disk of the running container) at
 /// its first Healthy, so the next identical run restores the container already running
 /// instead of starting it with `podman run`.
@@ -497,7 +511,7 @@ struct PreparedSnapshotOutput {
     config_digest: String,
 }
 
-struct PreparedSnapshot {
+pub(crate) struct PreparedSnapshot {
     output: PreparedSnapshotOutput,
     // Held through JSON publication so a concurrent creator/deleter cannot replace the
     // generation between verification and the successful command response.
@@ -957,6 +971,13 @@ fn snapshot_restore_args(
         // guest kernel's own, which the restore asks for by name.
         inherit_recorded_hook: false,
         guest_thp: args.guest_thp.clone(),
+        // This run's own check: the URL is not in the pre-start key, so the snapshot's
+        // recorded check may be another run's (#953), and the timeout is in no key.
+        health_check: Some(crate::cli::RestoreHealthCheck {
+            url: args.health_check.clone(),
+            timeout_secs: args.health_check_timeout,
+        }),
+        prepare: None,
     }
 }
 
@@ -1640,8 +1661,9 @@ async fn prepare_vm_for_lifecycle(
         disk_dir_staging = Some(staging);
     }
 
-    let (fc_config, snapshot_key, prepare_target): (
+    let (fc_config, snapshot_key, startup_snapshot_base_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
+        Option<String>,
         Option<String>,
         Option<PreparedTarget>,
     ) = if !no_snapshot {
@@ -1662,11 +1684,15 @@ async fn prepare_vm_for_lifecycle(
             &volume_mappings,
         );
         let key = config.snapshot_key();
+        // The startup snapshot's name also holds what decides when the run is Healthy
+        // (the health-check URL); the pre-start key does not (#953).
+        let startup_base = config.startup_snapshot_base_key();
 
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
         // The startup snapshot is this run's balloon target's own; the pre-start one is
         // shared between targets.
-        let startup_key = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
+        let startup_key =
+            startup_snapshot_key(&startup_base, args.balloon, run_host_ipv6(&args.env));
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -1729,24 +1755,40 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
-        if !lifecycle.is_prepare() && check_podman_snapshot(&key).await.is_some() {
+        if restores_pre_start(&lifecycle) && check_podman_snapshot(&key).await.is_some() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
+                startup_snapshot_key = %startup_key,
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
             // Call snapshot run with startup snapshot creation enabled
-            // (see should_arm_startup_snapshot)
-            let snapshot_args = snapshot_restore_args(
+            // (see should_arm_startup_snapshot). A prepare installs its own startup
+            // snapshot at its target instead.
+            let mut snapshot_args = snapshot_restore_args(
                 &args,
                 &key,
-                run_takes_startup_snapshot(&args).then(|| key.clone()),
+                (!lifecycle.is_prepare() && run_takes_startup_snapshot(&args))
+                    .then(|| startup_base.clone()),
                 snapshot_run_firecracker_overrides(&runtime_config),
             );
+            if let PodmanLifecycle::Prepare(options) = &lifecycle {
+                snapshot_args.prepare = Some(PreparedRestore {
+                    target: prepare_target
+                        .clone()
+                        .context("prepare lifecycle has no snapshot install target")?,
+                    ready_timeout: options.ready_timeout,
+                });
+            }
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
                 Ok(()) => {
                     complete_unused_owner(reclaim_owner).await;
+                    if lifecycle.is_prepare() {
+                        return Ok(VmPreparation::Prepared(attempt.prepared.context(
+                            "the restored prepare VM finished without installing its snapshot",
+                        )?));
+                    }
                     return Ok(VmPreparation::RunCompleted);
                 }
                 Err(e) if is_snapshot_load_failure(&e) => {
@@ -1760,13 +1802,14 @@ async fn prepare_vm_for_lifecycle(
         info!(
             snapshot_key = %key,
             image = %args.image,
+            startup_snapshot_key = %startup_key,
             "Snapshot miss, will create snapshot after image load"
         );
         failpoint::hit_async("cache.miss").await;
         // The cold boot builds each read-only --disk-dir image from a private copy, and
         // refuses one whose content is no longer what the key names.
         on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
-        (Some(config), Some(key), prepare_target)
+        (Some(config), Some(key), Some(startup_base), prepare_target)
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
@@ -1776,7 +1819,7 @@ async fn prepare_vm_for_lifecycle(
         } else {
             info!("Snapshot disabled via --no-snapshot flag");
         }
-        (None, None, None)
+        (None, None, None, None)
     };
 
     if !volume_mappings.is_empty() {
@@ -2363,6 +2406,7 @@ async fn prepare_vm_for_lifecycle(
         startup_rx,
         balloon_check_due,
         snapshot_key,
+        startup_snapshot_base_key,
         prepare_target,
         volume_configs,
         args,
@@ -2993,9 +3037,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 // quiesce the console), so the startup snapshot is behind it too.
                 settle_balloon_check(ctx).await?;
 
-                if let Some(ref key) = ctx.snapshot_key {
+                if let Some(ref base) = ctx.startup_snapshot_base_key {
                     let startup_key =
-                        startup_snapshot_key(key, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
+                        startup_snapshot_key(base, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3199,7 +3243,7 @@ fn with_container_output(
 ///
 /// Split out of [`run_prepare_loop`] so every outcome is exercised without a VM: the
 /// VM-exit arm takes its future from the caller.
-async fn await_prepare_healthy<F>(
+pub(crate) async fn await_prepare_healthy<F>(
     startup_rx: tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>,
     cancel: &CancellationToken,
     budget: std::time::Duration,
@@ -3271,18 +3315,50 @@ async fn run_prepare_loop(
         .prepare_target
         .clone()
         .context("prepare lifecycle has no snapshot install target")?;
+    let fc_backend = ctx
+        .vm_manager
+        .as_any()
+        .downcast_ref::<FirecrackerBackend>()
+        .context("podman prepare requires the Firecracker backend")?;
+    let prepared = install_prepared_startup_snapshot(
+        fc_backend,
+        &target,
+        ctx.args.balloon,
+        &ctx.vm_state,
+        &ctx.disk_path,
+        &ctx.volume_configs,
+        &ctx.volume_servers.remap_refs,
+        cancel,
+    )
+    .await?;
+
+    // Never acknowledge Healthy in the disposable source. It remains paused until cleanup;
+    // dropping this ack only releases the monitor so its task can observe cancellation.
+    drop(startup_ack);
+    Ok(prepared)
+}
+
+/// Install a prepare's startup snapshot from its healthy disposable VM, with the VM left
+/// paused, and verify the generation it installed. The cold prepare (`run_prepare_loop`)
+/// and a prepare restored from its pre-start snapshot (`snapshot run` with
+/// `SnapshotRunArgs::prepare`) both end here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn install_prepared_startup_snapshot(
+    fc_backend: &FirecrackerBackend,
+    target: &PreparedTarget,
+    balloon: Option<u32>,
+    vm_state: &VmState,
+    disk_path: &Path,
+    volume_configs: &[VolumeConfig],
+    remap_refs: &[Option<Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+    cancel: &CancellationToken,
+) -> Result<PreparedSnapshot> {
     info!(
         snapshot_key = %target.name,
         content_key = %target.content_key,
         snapshot_type = %target.snapshot_type,
         "Creating prepared startup snapshot (VM healthy)"
     );
-
-    let fc_backend = ctx
-        .vm_manager
-        .as_any()
-        .downcast_ref::<FirecrackerBackend>()
-        .context("podman prepare requires the Firecracker backend")?;
     let snap = CreateSnapshotParams {
         vm_manager: fc_backend,
         snapshot_key: &target.name,
@@ -3290,15 +3366,18 @@ async fn run_prepare_loop(
         snapshot_type: target.snapshot_type,
         existing: target.existing,
         // What prepare installs is a startup snapshot.
-        balloon: BalloonRequirement::StartedAt(ctx.args.balloon),
-        vm_state: &ctx.vm_state,
-        disk_path: &ctx.disk_path,
-        volume_configs: &ctx.volume_configs,
-        remap_refs: &ctx.volume_servers.remap_refs,
+        balloon: BalloonRequirement::StartedAt(balloon),
+        vm_state,
+        disk_path,
+        volume_configs,
+        remap_refs,
     };
-    let install = snapshot::create_podman_snapshot(&snap, snapshot_source_disposition(lifecycle))
-        .await
-        .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
+    let install = snapshot::create_podman_snapshot(
+        &snap,
+        super::common::SnapshotSourceDisposition::LeavePaused,
+    )
+    .await
+    .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
 
     if cancel.is_cancelled() {
         bail!("interrupted while creating prepared startup snapshot");
@@ -3317,19 +3396,14 @@ async fn run_prepare_loop(
             snapshot::balloon_text(now)
         ),
     };
-    let prepared = verify_prepared_snapshot(&target, cache)
+    verify_prepared_snapshot(target, cache)
         .await?
         .with_context(|| {
             format!(
                 "prepared startup snapshot {} no longer names the generation this prepare installed",
                 target.name
             )
-        })?;
-
-    // Never acknowledge Healthy in the disposable source. It remains paused until cleanup;
-    // dropping this ack only releases the monitor so its task can observe cancellation.
-    drop(startup_ack);
-    Ok(prepared)
+        })
 }
 
 /// Clean up all resources associated with a VM.
@@ -3420,7 +3494,7 @@ async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
     }
 }
 
-fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
+pub(crate) fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (operation, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(operation), Ok(())) => Err(operation),
@@ -3511,7 +3585,9 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         snapshot_restore_args(
             &ctx.args,
             key,
-            run_takes_startup_snapshot(&ctx.args).then(|| key.clone()),
+            ctx.startup_snapshot_base_key
+                .clone()
+                .filter(|_| run_takes_startup_snapshot(&ctx.args)),
             (None, None),
         )
     });
@@ -4174,8 +4250,8 @@ mod tests {
         };
         let podman = code(include_str!("mod.rs"));
         for call in [
-            "startup_snapshot_key(&key,args.balloon,run_host_ipv6(&args.env))",
-            "startup_snapshot_key(key,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
+            "startup_snapshot_key(&startup_base,args.balloon,run_host_ipv6(&args.env))",
+            "startup_snapshot_key(base,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
         ] {
             assert!(podman.contains(call), "podman run no longer calls {call}");
         }
@@ -4306,6 +4382,88 @@ mod tests {
         // A run with no --balloon matched a snapshot with no device, and sets nothing.
         let plain = snapshot_restore_args(&test_args(), "k", None, (None, None));
         assert_eq!(plain.balloon, None);
+    }
+
+    /// The pre-start key leaves out the health-check URL (#953), so a cache hit can
+    /// restore a snapshot that another run's check recorded, and no key holds the timeout.
+    /// The restored VM has to monitor THIS run's check: its URL, or the container's start
+    /// when it gave none, and its timeout.
+    #[test]
+    fn a_cache_restore_monitors_this_runs_health_check() {
+        let recorded = (Some("http://localhost/status"), 30);
+
+        let mut args = test_args();
+        args.health_check = Some("http://localhost/ready".to_string());
+        args.health_check_timeout = 7;
+        let restore = snapshot_restore_args(&args, "k", None, (None, None));
+        let monitored = crate::commands::snapshot::restore_health_check(
+            restore.health_check.as_ref(),
+            recorded.0,
+            recorded.1,
+        );
+        assert_eq!(
+            monitored,
+            crate::cli::RestoreHealthCheck {
+                url: Some("http://localhost/ready".to_string()),
+                timeout_secs: 7,
+            }
+        );
+
+        // A run without --health-check is healthy when its container starts, whatever the
+        // snapshot's creator checked.
+        let plain = snapshot_restore_args(&test_args(), "k", None, (None, None));
+        let monitored = crate::commands::snapshot::restore_health_check(
+            plain.health_check.as_ref(),
+            recorded.0,
+            recorded.1,
+        );
+        assert_eq!(monitored.url, None);
+        assert_eq!(monitored.timeout_secs, test_args().health_check_timeout);
+
+        // A command-line `snapshot run` hands over nothing and monitors the recorded check.
+        let recorded_check =
+            crate::commands::snapshot::restore_health_check(None, recorded.0, recorded.1);
+        assert_eq!(
+            recorded_check.url.as_deref(),
+            Some("http://localhost/status")
+        );
+        assert_eq!(recorded_check.timeout_secs, 30);
+    }
+
+    /// The restore puts the check `restore_health_check` chose into the clone's state,
+    /// which is what the health monitor reads. Taking the snapshot's recorded URL there
+    /// instead would undo the test above for every restore.
+    #[test]
+    fn the_restore_records_the_health_check_it_was_handed() {
+        let source = include_str!("../snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.contains("restore_health_check(\n        args.health_check.as_ref(),"),
+            "cmd_snapshot_run_inner does not choose the clone's health check with restore_health_check"
+        );
+        assert!(
+            !body.contains("= snapshot_config.metadata.health_check_url"),
+            "cmd_snapshot_run_inner takes the snapshot's recorded URL directly"
+        );
+    }
+
+    /// A prepare boots from a pre-start snapshot it finds, as a run does: the snapshot is
+    /// taken before the container starts, so the image import it holds is shared (#953).
+    /// `--force` cold-boots, because it is for content that changed under an unchanged key,
+    /// which the pre-start snapshot holds too.
+    #[test]
+    fn a_prepare_restores_the_pre_start_snapshot_unless_forced() {
+        assert!(restores_pre_start(&PodmanLifecycle::Run));
+        assert!(restores_pre_start(&PodmanLifecycle::Prepare(
+            PrepareOptions::default()
+        )));
+        assert!(!restores_pre_start(&PodmanLifecycle::Prepare(
+            PrepareOptions {
+                force: true,
+                ..PrepareOptions::default()
+            }
+        )));
     }
 
     /// A balloon target above the guest's memory is refused before the snapshot
@@ -4446,7 +4604,7 @@ mod tests {
         let prepare = body_of("async fn run_prepare_loop(");
         let waited = position(prepare, "await_prepare_healthy(");
         let checked = position(prepare, check);
-        let saved = position(prepare, "create_podman_snapshot(");
+        let saved = position(prepare, "install_prepared_startup_snapshot(");
         assert!(
             waited < checked && checked < saved,
             "podman prepare's snapshot is not behind the check: health wait at {waited}, check \

@@ -191,6 +191,12 @@ same reference and use `--force`. Without `--tag` the snapshot is installed unde
 content key as cache, which `snapshots prune` reclaims; with `--tag` it is a user
 snapshot that survives a prune.
 
+A `prepare` whose image import is already in the cache, from a `podman run` of the same
+image and VM shape, restores that pre-start snapshot instead of booting cold, then waits
+for healthy as a cold `prepare` does. `--health-check` is not part of that snapshot's
+key, only of the startup snapshot's. `--force` always boots cold. A `prepare` that boots
+cold takes no pre-start snapshot of its own.
+
 ### Disk-Only (Cold-Boot) Clones
 
 `--disk-only` captures just the disk — no vCPU pause, no memory image. The guest

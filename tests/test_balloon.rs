@@ -697,14 +697,14 @@ const HELD_NGINX: &str =
 
 /// One `podman run --balloon 64 --health-check` whose workload is held. Returns
 /// once its container is running, which is after its pre-start snapshot, with the
-/// run's cache choice.
+/// run's cache choice and the startup snapshot it uses.
 #[cfg(feature = "privileged-tests")]
 async fn held_startup_run(
     run: &str,
     name: &str,
     env_unique: &str,
     cleanup_pids: &mut Vec<u32>,
-) -> Result<(u32, (&'static str, String))> {
+) -> Result<(u32, (&'static str, String), String)> {
     let (_child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
@@ -738,7 +738,9 @@ async fn held_startup_run(
     }
     let choice = common::cache_choice(&log)
         .with_context(|| format!("{run}'s log has no line that says how it started"))?;
-    Ok((pid, choice))
+    let startup = common::startup_choice_key(&log)
+        .with_context(|| format!("{run}'s log names no startup snapshot"))?;
+    Ok((pid, choice, startup))
 }
 
 /// Set the held run's balloon target when `set_mib` is given, then let its workload
@@ -795,17 +797,26 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
     let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
 
     let mut cleanup_pids = Vec::new();
-    let mut pre_start_key: Option<String> = None;
+    let mut test_keys: Vec<String> = Vec::new();
     let result: Result<()> = async {
-        let (pid_1, (how_1, key)) =
+        let (pid_1, (how_1, key), startup) =
             held_startup_run("run 1", &name_1, &env_unique, &mut cleanup_pids).await?;
         anyhow::ensure!(
             how_1 == "cold boot",
             "control: run 1 starts from a cold cache and started from a {how_1}"
         );
-        pre_start_key = Some(key.clone());
-        let startup = fcvm::commands::podman::startup_snapshot_key(&key, Some(START_MIB), None);
-        let at_new_target = fcvm::commands::podman::startup_snapshot_key(&key, Some(SET_MIB), None);
+        test_keys.push(key.clone());
+        // The startup snapshot's base holds the --health-check URL, which the pre-start
+        // key does not (#953), so its name is read from the run, not made from `key`.
+        let startup_base = startup
+            .strip_suffix(&format!("-balloon{START_MIB}-startup"))
+            .with_context(|| {
+                format!("run 1's startup snapshot {startup} is not named for {START_MIB} MiB")
+            })?
+            .to_string();
+        test_keys.push(startup_base.clone());
+        let at_new_target =
+            fcvm::commands::podman::startup_snapshot_key(&startup_base, Some(SET_MIB), None);
         let pre_start = ("pre-start snapshot", key.clone());
 
         release_held_run("run 1", pid_1, Some(SET_MIB)).await?;
@@ -826,7 +837,7 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
         );
         common::kill_process(pid_1).await;
 
-        let (pid_2, choice_2) =
+        let (pid_2, choice_2, _) =
             held_startup_run("run 2", &name_2, &env_unique, &mut cleanup_pids).await?;
         anyhow::ensure!(
             choice_2 == pre_start,
@@ -845,7 +856,7 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
         );
         common::kill_process(pid_2).await;
 
-        let (pid_3, choice_3) =
+        let (pid_3, choice_3, _) =
             held_startup_run("run 3", &name_3, &env_unique, &mut cleanup_pids).await?;
         anyhow::ensure!(
             choice_3 == pre_start,
@@ -865,16 +876,16 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
         common::kill_process(pid).await;
     }
     // Every snapshot of this test's runs is a directory named from run 1's pre-start
-    // key, which the unique --env makes this test's own.
-    if let Some(pre_start) = &pre_start_key {
-        let named_from_it = format!("{pre_start}-");
+    // key or its startup snapshot's base, which the unique --env makes this test's own.
+    for test_key in &test_keys {
+        let named_from_it = format!("{test_key}-");
         if let Ok(entries) = std::fs::read_dir(fcvm::paths::snapshot_dir()) {
             for entry in entries.flatten() {
                 let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
                 let Ok(name) = entry.file_name().into_string() else {
                     continue;
                 };
-                if is_dir && (&name == pre_start || name.starts_with(&named_from_it)) {
+                if is_dir && (&name == test_key || name.starts_with(&named_from_it)) {
                     let _ = common::delete_snapshot(&name).await;
                 }
             }

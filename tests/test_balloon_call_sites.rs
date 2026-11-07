@@ -187,7 +187,19 @@ fn every_startup_snapshot_is_asked_for_at_the_target_its_run_started_with() {
         (
             "src/commands/podman/mod.rs",
             "`podman prepare` asks for the snapshot it installs at the run's --balloon",
-            "existing: target.existing, balloon: BalloonRequirement::StartedAt(ctx.args.balloon),",
+            "existing: target.existing, balloon: BalloonRequirement::StartedAt(balloon),",
+        ),
+        (
+            "src/commands/podman/mod.rs",
+            "a cold `podman prepare` installs at the target its run started with",
+            "install_prepared_startup_snapshot( fc_backend, &target, ctx.args.balloon,",
+        ),
+        (
+            "src/commands/snapshot.rs",
+            "a `podman prepare` restored from its pre-start snapshot installs at the target the \
+             restore set",
+            "restored_prepare( prepare, startup_rx.take(), &cancel, vm_manager.as_mut(), \
+             args.balloon,",
         ),
         (
             "src/commands/podman/mod.rs",

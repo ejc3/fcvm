@@ -67,6 +67,15 @@ pub struct PreparedTarget {
     pub guest_thp: Option<String>,
 }
 
+/// A `podman prepare` that restores its pre-start snapshot: `snapshot run` waits for the
+/// restored VM to turn healthy within `ready_timeout` and installs the startup snapshot at
+/// `target`, as a cold prepare does after its boot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRestore {
+    pub target: PreparedTarget,
+    pub ready_timeout: std::time::Duration,
+}
+
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
 pub struct VmContext {
     pub vm_id: String,
@@ -107,7 +116,11 @@ pub struct VmContext {
     /// device has been seen active (`settle_balloon_check`), which has to happen
     /// before any snapshot of the VM is taken.
     pub balloon_check_due: bool,
+    /// The pre-start snapshot's key.
     pub snapshot_key: Option<String>,
+    /// The base of the startup snapshot's name (`FirecrackerConfig::startup_snapshot_base_key`),
+    /// which also holds the health-check URL.
+    pub startup_snapshot_base_key: Option<String>,
     /// Set only for the `podman prepare` lifecycle: where its startup snapshot goes.
     pub prepare_target: Option<PreparedTarget>,
     pub volume_configs: Vec<VolumeConfig>,
