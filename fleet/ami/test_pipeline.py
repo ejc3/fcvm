@@ -60,6 +60,8 @@ class Broker:
         self.ready_after = 0
         self.status_reads = 0
         self.midwait_change = None
+        self.slow_final_cleanup = False
+        self.final_cleanup_had_manifest = []
 
     def invoke(self, **arguments):
         request = json.loads(arguments["Payload"])
@@ -93,8 +95,11 @@ class Broker:
                 self.slots[slot]["image_state"] = "available"
                 reply = {"image_id": image, "state": "available"}
             elif action == "cleanup":
+                final = any(name.endswith("-verify") for name in self.slots)
+                if final:
+                    self.final_cleanup_had_manifest.append(any(key.endswith("manifest.json") for key in self.worker.objects))
                 for value in self.slots.values():
-                    value["state"] = "terminated"
+                    value["state"] = "shutting-down" if final and self.slow_final_cleanup else "terminated"
                 reply = {"cleaned": True}
             elif action == "status":
                 if slot:
@@ -154,7 +159,9 @@ class Worker:
         assert key.startswith("runs/" + hashlib.sha256(CONFIG["build_id"].encode()).hexdigest() + "/")
         assert key not in self.objects
         if key.endswith("manifest.json"):
-            assert all(value["state"] == "terminated" for value in self.broker.slots.values())
+            assert set(self.broker.slots) == set(pipeline.SLOTS)
+            assert all(self.broker.slots[kind + "-build"]["state"] == "terminated" for kind in ("host", "tile"))
+            assert sum("pipeline_guest.py verify " in item["Parameters"]["commands"][0] for item in self.commands) == 6
         self.objects[key] = arguments["Body"]
         return {}
 
@@ -286,6 +293,33 @@ class PipelineTests(unittest.TestCase):
             upgrade = next(index for index, text in enumerate(commands) if "--with-new-pkgs upgrade" in text)
             prep = next(index for index, text in enumerate(commands) if "/build.sh prep" in text)
             self.assertLess(upgrade, prep)
+
+    def test_validated_manifest_survives_final_shutdown_past_the_compute_deadline(self):
+        self.broker.slow_final_cleanup = True
+        try:
+            result = self.run_driver()
+        except RuntimeError:
+            result = None
+        self.assertIsNotNone(result, "EC2 final shutdown latency discarded completed validation")
+        self.assertIn(self.driver.prefix + "manifest.json", self.worker.objects)
+        self.assertTrue(all(self.broker.final_cleanup_had_manifest))
+        self.assertEqual({value["state"] for name, value in self.broker.slots.items() if name.endswith("-verify")}, {"shutting-down"})
+        self.assertLess(self.now, self.broker.deadline)
+        self.now = self.broker.deadline + 600
+        self.assertEqual(len(self.worker.commands), len(self.worker.responses))
+        self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 4)
+
+    def test_failed_manifest_upload_still_requests_final_cleanup_without_success(self):
+        put = self.worker.put_object
+        def fail_manifest(**arguments):
+            if arguments["Key"].endswith("manifest.json"):
+                raise TimeoutError("manifest storage unavailable")
+            return put(**arguments)
+        with patch.object(self.worker, "put_object", side_effect=fail_manifest), self.assertRaises(TimeoutError):
+            self.run_driver()
+        self.no_manifest()
+        self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+        self.assertEqual(self.broker.calls[-1]["action"], "cleanup")
 
     def test_isolated_sdk_bootstrap_precedes_every_guest_on_all_four_slots(self):
         self.run_driver()
