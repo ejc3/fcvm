@@ -458,6 +458,18 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any('case "$(uname -r)" in' in line for line in guard), guard)
         self.assertIn("*-fcvm-*)", build.split("make build")[0])
 
+    def test_host_prep_runs_on_fcvms_host_kernel_too(self):
+        # Revising a host image that already boots fcvm's host kernel runs prep on it, and that
+        # kernel has neither Ubuntu's apparmor_restrict_unprivileged_userns nor Debian's
+        # unprivileged_userns_clone: a plain `sysctl -p` exits 1 on the missing keys. Prep skips
+        # keys the kernel lacks and checks what they are for, a user namespace the build user
+        # can open.
+        source = (HERE / "host/build.sh").read_text()
+        prep = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["prep"]
+        applies = [line.strip() for line in prep.splitlines() if re.match(r"\s*sysctl\b", line)]
+        self.assertEqual(applies, ["sysctl -e -p /etc/sysctl.d/99-fcvm.conf"])
+        self.assertLess(prep.index("sysctl -e -p"), prep.index('runuser -u "$U" -- unshare -U -r true'))
+
     def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
         source = (HERE / "host/build.sh").read_text()
         preamble, _ = source.split('\ncase "$PHASE" in\n', 1)

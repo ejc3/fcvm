@@ -10,6 +10,7 @@ pub mod setup;
 pub mod snapshot;
 pub mod snapshots;
 pub mod tty;
+pub mod vm;
 
 // Re-export command functions
 pub use balloon::cmd_balloon;
@@ -25,3 +26,4 @@ pub use serve::cmd_serve;
 pub use setup::cmd_setup;
 pub use snapshot::cmd_snapshot;
 pub use snapshots::cmd_snapshots;
+pub use vm::cmd_vm;

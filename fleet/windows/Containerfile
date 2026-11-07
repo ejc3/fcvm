@@ -1,0 +1,63 @@
+# The Windows bridge (bridge/, fleet/PROTOCOL.md "Windows bridge"): one per sandbox on the host,
+# connected to the sandbox's Remote Desktop through its rdp.sock, serving the desktop as the
+# renderer's frame stream. `make -C fleet/windows bridge-image` builds it, with the renderer's
+# server and wire code from the `renderer` build context (fleet/renderer).
+
+# FreeRDP 3 with H.264. Ubuntu's FreeRDP packages are built without it, so the graphics
+# pipeline would never offer AVC420 or AVC444. Built with FFmpeg's decoder, no X11, Wayland,
+# SDL or server, and without the client side of every channel the bridge must never negotiate
+# (clipboard, drives and the rest of device redirection, printers, smart cards, serial and
+# parallel ports, USB, audio playback and capture, cameras, RemoteApp, remote assistance,
+# multimedia redirection, TCP tunnels, the SSH agent): the code for them is not in the image.
+FROM docker.io/library/ubuntu:24.04 AS freerdp
+RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      ca-certificates git build-essential cmake ninja-build pkg-config libssl-dev zlib1g-dev \
+      libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
+ARG FREERDP_TAG=3.17.2
+ARG FREERDP_COMMIT=955ad49545919c35ed731bc7716b26ddf888833a
+RUN git clone -q --depth 1 --branch "$FREERDP_TAG" https://github.com/FreeRDP/FreeRDP.git /src/freerdp \
+    && test "$(git -C /src/freerdp rev-parse HEAD)" = "$FREERDP_COMMIT"
+RUN cmake -S /src/freerdp -B /src/freerdp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/freerdp -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=OFF \
+      -DWITH_FFMPEG=ON -DWITH_SWSCALE=ON -DWITH_VIDEO_FFMPEG=ON -DWITH_DSP_FFMPEG=OFF \
+      -DWITH_OPENH264=OFF -DWITH_VAAPI=OFF \
+      -DWITH_CLIENT=OFF -DWITH_CLIENT_SDL=OFF -DWITH_SERVER=OFF -DWITH_SAMPLE=OFF -DWITH_PROXY=OFF \
+      -DWITH_SHADOW=OFF -DWITH_X11=OFF -DWITH_WAYLAND=OFF -DWITH_MANPAGES=OFF -DWITH_WEBVIEW=OFF \
+      -DWITH_PULSE=OFF -DWITH_ALSA=OFF -DWITH_OSS=OFF -DWITH_CUPS=OFF -DWITH_PCSC=OFF -DWITH_FUSE=OFF \
+      -DWITH_KRB5=OFF -DWITH_AAD=OFF -DWITH_SSO_MIB=OFF -DWITH_PKCS11=OFF -DWITH_JSON_DISABLED=ON \
+      -DWITH_FAAC=OFF -DWITH_FAAD2=OFF -DWITH_LAME=OFF -DWITH_SOXR=OFF -DWITH_OPUS=OFF \
+      -DWITH_LIBSYSTEMD=OFF -DUSE_UNWIND=OFF -DWITH_UNICODE_BUILTIN=ON \
+      -DCHANNEL_CLIPRDR=OFF -DCHANNEL_RDPDR=OFF -DCHANNEL_DRIVE=OFF -DCHANNEL_PRINTER=OFF \
+      -DCHANNEL_SMARTCARD=OFF -DCHANNEL_SERIAL=OFF -DCHANNEL_PARALLEL=OFF -DCHANNEL_URBDRC=OFF \
+      -DCHANNEL_RDPSND=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_RDPECAM=OFF -DCHANNEL_RAIL=OFF \
+      -DCHANNEL_ENCOMSP=OFF -DCHANNEL_REMDESK=OFF -DCHANNEL_TSMF=OFF -DCHANNEL_RDP2TCP=OFF \
+      -DCHANNEL_SSHAGENT=OFF -DCHANNEL_RDPEAR=OFF \
+    && cmake --build /src/freerdp/build -j"$(nproc)" && cmake --install /src/freerdp/build
+
+# The bridge, with the renderer's server, wire and admission code. Its host tests run here
+# too, and the build refuses a FreeRDP without H.264.
+FROM freerdp AS bridge
+RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      libx264-dev libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=renderer src /src/renderer/src
+COPY --from=renderer tests/check.h /src/renderer/tests/check.h
+COPY bridge /src/windows/bridge
+# test-host reads the sources beside it by a path relative to where it was compiled
+RUN rm -rf /src/windows/bridge/build \
+    && make -C /src/windows/bridge -j"$(nproc)" RSRC=/src/renderer/src RTESTS=/src/renderer/tests FREERDP=/opt/freerdp all \
+    && cd /src/windows/bridge && build/test-host && build/windows-bridge check-build
+
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      libssl3t64 zlib1g libx264-164 libpng16-16t64 libavcodec60 libavutil58 libswscale7 libswresample4 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=bridge /opt/freerdp/lib/ /opt/freerdp/lib/
+COPY --from=bridge /src/windows/bridge/build/windows-bridge /usr/local/bin/windows-bridge
+RUN rm -rf /opt/freerdp/lib/cmake /opt/freerdp/lib/pkgconfig \
+    && ! ldd /usr/local/bin/windows-bridge | grep -q "not found" && windows-bridge check-build
+ENV PORT=8080 RDP_USER=sandbox RDP_WIDTH=1280 RDP_HEIGHT=720
+EXPOSE 8080 443
+ENTRYPOINT ["/usr/local/bin/windows-bridge"]
+CMD ["serve"]

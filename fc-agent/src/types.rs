@@ -126,7 +126,22 @@ pub struct NfsMount {
     pub mount_path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// The server port the guest mounts at; None is NFS's own (2049). A restore
+    /// alternates it (`restore::nfs_remounts`).
+    #[serde(default)]
+    pub port: Option<u16>,
 }
+
+/// The first of the ports a restored clone mounts its NFS shares at. The kernel reuses an
+/// NFS client for a server address and port it already holds, and a file held open keeps
+/// a client alive, so a remount at a port any earlier generation's mount used would take
+/// that generation's client and its identity. Each restore takes the next port of
+/// `NFS_RESTORE_PORT .. NFS_RESTORE_PORT + NFS_RESTORE_PORTS`, after 2049 for the boot,
+/// so a port comes round again only after that many restores in one chain. Every clone
+/// namespace forwards the range to the host's nfsd (src/network/veth.rs, which must
+/// match).
+pub const NFS_RESTORE_PORT: u16 = 20049;
+pub const NFS_RESTORE_PORTS: u16 = 16;
 
 #[derive(Debug, Deserialize)]
 pub struct LatestMetadata {
@@ -169,6 +184,21 @@ pub struct RestoreIdentity {
     /// None leaves resolv.conf as it is.
     #[serde(default)]
     pub dns: Option<RestoreDns>,
+    /// The restoring run's proxies. Each absent field means none: the guest drops the
+    /// proxy of the run that made the snapshot (`system::apply_proxy_settings`).
+    #[serde(default)]
+    pub proxy: RestoreProxy,
+}
+
+/// The proxy settings a guest is given, at boot (the plan's fields) or at a restore.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct RestoreProxy {
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    #[serde(default)]
+    pub https_proxy: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
 }
 
 /// The guest's resolvers, as `fcvm_dns=` and `fcvm_dns_search=` carry them at boot.
@@ -205,6 +235,26 @@ mod tests {
         let bare: LatestMetadata =
             serde_json::from_str(r#"{"host-time-ns": "1", "host-ipv6": null}"#).unwrap();
         assert!(bare.identity.host_ipv6.is_none() && bare.identity.dns.is_none());
+        assert_eq!(
+            bare.identity.proxy,
+            RestoreProxy::default(),
+            "no proxy named is none"
+        );
+
+        let proxied: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "host-ipv6": null,
+                "proxy": {"http_proxy": "http://10.0.2.2:3128", "https_proxy": null,
+                          "no_proxy": "localhost"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proxied.identity.proxy,
+            RestoreProxy {
+                http_proxy: Some("http://10.0.2.2:3128".to_string()),
+                https_proxy: None,
+                no_proxy: Some("localhost".to_string()),
+            }
+        );
     }
 
     #[test]

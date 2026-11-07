@@ -774,6 +774,21 @@ fn host_ntp_servers() -> Vec<String> {
     addrs
 }
 
+/// The proxies a guest is given, at boot and at every restore: [`guest_proxies`] and the
+/// host's `no_proxy`. `env` reads one host variable.
+pub(crate) fn guest_proxy(
+    network_config: &crate::network::NetworkConfig,
+    network_mode: crate::firecracker::FcNetworkMode,
+    env: impl Fn(&str) -> Option<String>,
+) -> crate::commands::common::GuestProxy {
+    let (http_proxy, https_proxy) = guest_proxies(network_config, network_mode, |name| env(name));
+    crate::commands::common::GuestProxy {
+        http_proxy,
+        https_proxy,
+        no_proxy: env("no_proxy").or_else(|| env("NO_PROXY")),
+    }
+}
+
 /// The `(http_proxy, https_proxy)` URLs a guest is given: the network's proxy for each
 /// scheme (its HTTPS proxy, else its HTTP one, for HTTPS), or else the host's proxy
 /// variables (`env`), with the host name resolved to an address and a
@@ -924,14 +939,15 @@ pub(super) fn build_boot_plan_json(
         })
         .collect();
 
-    // Resolve proxy URLs — runtime behavior, not part of cache key.
-    let (http_proxy, https_proxy) =
-        guest_proxies(network_config, launch_config.network_mode, |name: &str| {
-            std::env::var(name).ok()
-        });
-    let no_proxy = std::env::var("no_proxy")
-        .or_else(|_| std::env::var("NO_PROXY"))
-        .ok();
+    // Resolve proxy URLs: runtime behavior, not part of the cache key. A restore gives
+    // the guest its own run's the same way (`RestoreIdentity::proxy`).
+    let crate::commands::common::GuestProxy {
+        http_proxy,
+        https_proxy,
+        no_proxy,
+    } = guest_proxy(network_config, launch_config.network_mode, |name: &str| {
+        std::env::var(name).ok()
+    });
 
     let (subuid_range, subgid_range) = if launch_config.user.is_some() {
         (get_host_subuid_range(), get_host_subgid_range())
@@ -960,6 +976,32 @@ pub(super) fn build_boot_plan_json(
     };
 
     launch_config.to_mmds_json(runtime)
+}
+
+/// Where every change to /etc/exports.d and every `exportfs -ra` takes its lock.
+const NFS_EXPORTS_LOCK: &str = "/run/lock/fcvm-nfs-exports.lock";
+
+/// Hold the host-wide NFS exports lock. `exportfs -ra` reads every file in
+/// /etc/exports.d and then makes the kernel's export table match what it read, so
+/// two of them at once, one by a VM writing its export and one by a VM removing its
+/// own, can each undo the other's change: the newer export is dropped and that
+/// guest's mount never answers. Two clones of one NFS snapshot starting together did
+/// that (#1009).
+async fn lock_nfs_exports() -> Result<nix::fcntl::Flock<std::fs::File>> {
+    tokio::task::spawn_blocking(|| {
+        std::fs::create_dir_all("/run/lock").ok();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(NFS_EXPORTS_LOCK)
+            .with_context(|| format!("opening {NFS_EXPORTS_LOCK}"))?;
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| error)
+            .with_context(|| format!("locking {NFS_EXPORTS_LOCK}"))
+    })
+    .await
+    .context("joining the NFS exports lock task")?
 }
 
 /// Set up NFS exports for VM.
@@ -997,6 +1039,7 @@ pub(crate) async fn setup_nfs_exports(
 
     // Create exports directory if needed
     tokio::fs::create_dir_all("/etc/exports.d").await.ok();
+    let _exports = lock_nfs_exports().await?;
 
     // Self-heal: drop fcvm export files whose exported directories no longer
     // exist (left behind when a VM was SIGKILLed before its cleanup ran).
@@ -1075,6 +1118,13 @@ pub(crate) async fn setup_nfs_exports(
 /// no host registration remains.
 pub(crate) async fn cleanup_nfs_exports(vm_id: &str) -> Result<()> {
     let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
+    // Every VM's cleanup comes here, and only this VM writes its export: a VM without
+    // one (every rootless VM) has nothing to remove and must not need the root-owned
+    // lock, which an unprivileged process cannot open.
+    if !std::path::Path::new(&exports_path).exists() {
+        return Ok(());
+    }
+    let _exports = lock_nfs_exports().await?;
     match tokio::fs::remove_file(&exports_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2130,6 +2180,48 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every `exportfs` this file runs is under the NFS exports lock, taken before the
+    /// export file is written or removed (#1009: two clones starting together dropped
+    /// one's export).
+    #[test]
+    fn every_exportfs_runs_under_the_nfs_exports_lock() {
+        let source = include_str!("vm_config.rs");
+        let body = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let mut calls = 0;
+        for (at, _) in body.match_indices("Command::new(\"exportfs\")") {
+            calls += 1;
+            let function = &body[body[..at].rfind("async fn ").expect("enclosing fn")..at];
+            let locked = function
+                .find("lock_nfs_exports().await?")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "an exportfs runs without the NFS exports lock: {}",
+                        &function[..80]
+                    )
+                });
+            for touch in ["File::create(", "remove_file("] {
+                if let Some(t) = function.find(touch) {
+                    assert!(
+                        locked < t,
+                        "{touch} runs before the NFS exports lock is taken"
+                    );
+                }
+            }
+        }
+        assert_eq!(calls, 2, "setup_nfs_exports and cleanup_nfs_exports");
+        let cleanup = &source[source
+            .find("pub(crate) async fn cleanup_nfs_exports(")
+            .expect("cleanup_nfs_exports")..];
+        let absent = cleanup
+            .find(".exists()")
+            .expect("cleanup checks for the export first");
+        let locked = cleanup.find("lock_nfs_exports().await?").unwrap();
+        assert!(
+            absent < locked,
+            "a VM without an NFS export takes the exports lock in its cleanup"
+        );
+    }
 
     /// The cold-boot writer: a VM's state records the Firecracker it launches.
     #[test]

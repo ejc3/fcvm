@@ -2998,6 +2998,13 @@ pub struct RestoreParams<'a> {
     pub gpus: &'a [String],
     /// The restoring host's identity, mirrored into MMDS with the restore epoch.
     pub identity: &'a RestoreIdentity,
+    /// For a raw guest (no fc-agent): where the restore puts the clone's namespace helper
+    /// (`commands::vm::NsHelper`: its rdp.sock relay and clock line), which it starts in the
+    /// clone's namespace once the namespace has its address and before the guest resumes.
+    /// The slot holds it whether or not the restore then fails, and the caller stops it. None
+    /// for a Linux guest, whose fc-agent takes its generation and clock from the restore
+    /// epoch. Cloud Hypervisor only.
+    pub raw_ns_helper: Option<&'a mut Option<crate::commands::vm::NsHelper>>,
 }
 
 /// What a restored guest takes from the host that restores it, not the one that
@@ -3011,6 +3018,19 @@ pub struct RestoreIdentity {
     /// The resolvers a boot on this host would give the guest. None leaves the
     /// guest's resolv.conf as it is.
     pub dns: Option<crate::commands::podman::GuestDns>,
+    /// The proxies this run gives the guest, or none. Always applied: the snapshot
+    /// records no proxy, and a guest restored without one must not keep the proxy of
+    /// the run that made the snapshot.
+    pub proxy: GuestProxy,
+}
+
+/// The proxy settings a guest is given (`vm_config::guest_proxy`), at boot in the boot
+/// plan and at every restore in the restore document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestProxy {
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
 }
 
 impl RestoreIdentity {
@@ -3027,6 +3047,11 @@ impl RestoreIdentity {
                 "search": dns.search,
             });
         }
+        document["proxy"] = serde_json::json!({
+            "http_proxy": self.proxy.http_proxy,
+            "https_proxy": self.proxy.https_proxy,
+            "no_proxy": self.proxy.no_proxy,
+        });
     }
 }
 
@@ -3420,10 +3445,25 @@ fn assert_ch_config_disks_covered(
 /// starts: accepting a guessed or stale path could make the clone bind the still-live
 /// source VM's socket, or fail with `EADDRINUSE`. This is deliberately a pure check so it
 /// can run before [`prepare_clone_substrate`] creates a holder, disk, or namespace.
+///
+/// A raw guest (no fc-agent) is booted without a vsock device, so its config must name
+/// none: one that does was not made by `fcvm vm run`, and restoring it would bind a socket
+/// no redirect was planned for.
 fn assert_ch_config_vsock_source_matches(
     cfg: &serde_json::Value,
     source_path: &Path,
+    guest: crate::state::Guest,
 ) -> Result<()> {
+    if !guest.runs_fc_agent() {
+        let vsock = cfg.get("vsock").filter(|vsock| !vsock.is_null());
+        anyhow::ensure!(
+            vsock.is_none(),
+            "refusing to restore: the snapshot of a raw VM has a vsock device in its Cloud \
+             Hypervisor config.json ({}); delete and recreate the snapshot",
+            vsock.map(ToString::to_string).unwrap_or_default()
+        );
+        return Ok(());
+    }
     let configured_path = cfg
         .get("vsock")
         .and_then(|vsock| vsock.get("socket"))
@@ -3815,7 +3855,11 @@ pub async fn restore_from_snapshot(
         balloon_target_mib,
         gpus,
         identity,
+        raw_ns_helper,
     } = params;
+    if raw_ns_helper.is_some() {
+        bail!("a raw VM restores on Cloud Hypervisor, not Firecracker");
+    }
     let vm_dir = data_dir.join("disks");
 
     // #608: abort BEFORE any side effects (holder/disk) if vmstate's rootfs path would not
@@ -4295,6 +4339,7 @@ pub async fn restore_from_snapshot_ch(
         balloon_target_mib,
         gpus,
         identity: _, // delivered by the caller's boot-plan vsock listener
+        raw_ns_helper,
     } = params;
     // Only the Firecracker restore attaches passthrough devices; `snapshot run` and
     // `podman run` refuse --gpu for this backend before getting here.
@@ -4331,7 +4376,11 @@ pub async fn restore_from_snapshot_ch(
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
     )?;
-    assert_ch_config_vsock_source_matches(&cfg, &restore_config.source_vsock_socket_path)?;
+    assert_ch_config_vsock_source_matches(
+        &cfg,
+        &restore_config.source_vsock_socket_path,
+        vm_state.config.guest,
+    )?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let mut substrate = prepare_clone_substrate(
@@ -4451,6 +4500,26 @@ pub async fn restore_from_snapshot_ch(
         // pasta's published-port listeners live, guest not yet running, PID not
         // yet published. See the Firecracker path for the full rationale.
         failpoint::hit_async("restore.post_network_pre_resume").await;
+
+        // A raw guest learns it was restored, and the host's time, from the clock line its
+        // namespace helper serves, which needs the namespace's 10.0.2.1 (added by
+        // post_start) and has to be answering before the guest runs, whose agent polls it.
+        if let Some(slot) = raw_ns_helper {
+            let (user_ns, net_ns) = substrate
+                .namespace
+                .user_namespace_path
+                .as_deref()
+                .zip(substrate.namespace.net_namespace_path.as_deref())
+                .context("a raw VM's namespace helper needs its rootless namespace")?;
+            let rdp_port = vm_state
+                .config
+                .health_port
+                .context("a raw VM's state names no health port")?;
+            *slot = Some(
+                crate::commands::vm::NsHelper::start(user_ns, net_ns, vm_id, data_dir, rdp_port)
+                    .await?,
+            );
+        }
 
         // The run's own balloon target, set while the VM is paused, as a Firecracker restore
         // sets it on the loaded VM: a pre-start snapshot is shared between targets.
@@ -4742,7 +4811,14 @@ pub fn build_snapshot_config(
             image: vm_state.config.image.clone(),
             vcpu: vm_state.config.vcpu,
             memory_mib: vm_state.config.memory_mib,
-            network_config: vm_state.config.network.clone(),
+            // The proxies are not recorded: each restore gives the guest its own run's
+            // (`RestoreIdentity::proxy`), and a snapshot is a cache entry other callers
+            // restore, which must not hold one caller's proxy URL.
+            network_config: crate::network::NetworkConfig {
+                http_proxy: None,
+                https_proxy: None,
+                ..vm_state.config.network.clone()
+            },
             volumes,
             health_check_url: vm_state.config.health_check_url.clone(),
             health_check_timeout: vm_state.config.health_check_timeout,
@@ -4774,6 +4850,9 @@ pub fn build_snapshot_config(
             // Read from the guest by `create_snapshot_core`, just before the pause.
             page_reporting_order: None,
             parked_gpus: 0,
+            guest: vm_state.config.guest,
+            health_port: vm_state.config.health_port,
+            firmware: vm_state.config.firmware.clone(),
         },
     })
 }
@@ -6360,11 +6439,90 @@ pub const CH_SNAPSHOT_SUBDIR: &str = "ch";
 /// `vm.pause` → `vm.snapshot` → `vm.resume` instead of Firecracker's snapshot API.
 ///
 /// The VM is resumed regardless of success or failure, mirroring the Firecracker path.
+/// What a Cloud Hypervisor snapshot asks of the guest around its pause.
+///
+/// A Linux guest's fc-agent closes the guest network boundary before the pause (dumping
+/// the socket cookies a restore retires) and reopens it after the resume, and the pause
+/// orphans its vsock connections, which the state's vsock epoch records. A raw guest has no
+/// fc-agent and no vsock: nothing in it can be told to close anything, so its snapshot is
+/// pause, save, resume. Every guest-facing step of [`create_snapshot_ch`] goes through
+/// this type.
+#[derive(Debug, Clone, Copy)]
+pub enum ChSnapshotGuest<'a> {
+    /// fc-agent, reached over this vsock socket.
+    FcAgent { vsock_socket_path: &'a Path },
+    /// A guest that runs no fc-agent (`fcvm vm run`).
+    Raw,
+}
+
+impl<'a> ChSnapshotGuest<'a> {
+    /// The guest of `vm_state`: fc-agent over `vsock_socket_path` for a Linux guest, none
+    /// for a raw one. A Linux guest without a vsock socket is refused.
+    pub fn of(
+        vm_state: &VmState,
+        vsock_socket_path: Option<&'a Path>,
+    ) -> Result<ChSnapshotGuest<'a>> {
+        if !vm_state.config.guest.runs_fc_agent() {
+            return Ok(ChSnapshotGuest::Raw);
+        }
+        let vsock_socket_path = vsock_socket_path.with_context(|| {
+            format!(
+                "VM {} runs fc-agent but has no recorded vsock socket",
+                vm_state.vm_id
+            )
+        })?;
+        Ok(ChSnapshotGuest::FcAgent { vsock_socket_path })
+    }
+
+    /// Close the guest network boundary before the pause.
+    async fn prepare(&self, vm_id: &str) -> Result<()> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                run_snapshot_network_command(vsock_socket_path, vm_id, "--prepare-snapshot-network")
+                    .await
+            }
+            ChSnapshotGuest::Raw => Ok(()),
+        }
+    }
+
+    /// Reopen the boundary after a failed `prepare`, whose failure does not prove it did
+    /// not run. Guest-side flock serialization makes the unconditional reopen exact.
+    async fn reopen_after_failed_prepare(&self, vm_id: &str) -> Result<()> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                run_snapshot_network_command(vsock_socket_path, vm_id, "--resume-snapshot-network")
+                    .await
+            }
+            ChSnapshotGuest::Raw => Ok(()),
+        }
+    }
+
+    /// Record the vsock reset the pause caused, before the VM resumes.
+    async fn record_pause(&self, vm_id: &str, snapshot_name: &str) {
+        match self {
+            ChSnapshotGuest::FcAgent { .. } => {
+                record_vsock_reset_for_snapshot(vm_id, snapshot_name).await
+            }
+            ChSnapshotGuest::Raw => {}
+        }
+    }
+
+    /// Reopen the guest network after the resume, and set the guest's clock.
+    async fn resume(&self, vm_id: &str) -> Result<()> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                resume_paused_source(vsock_socket_path, vm_id).await
+            }
+            ChSnapshotGuest::Raw => Ok(()),
+        }
+    }
+}
+
 pub async fn create_snapshot_ch(
     client: &crate::hypervisor::cloud_hypervisor::api::ChClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
-    vsock_socket_path: &Path,
+    guest: ChSnapshotGuest<'_>,
     extra_files: SnapshotExtraFiles<'_>,
 ) -> Result<()> {
     // CH snapshots are always self-contained (no diff base / parent chain).
@@ -6427,26 +6585,17 @@ pub async fn create_snapshot_ch(
     // As on Firecracker, no fallible or blocking work may separate successful
     // guest preparation from the pause that captures its manifest.
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing Cloud Hypervisor VM for snapshot");
-    if let Err(error) = run_snapshot_network_command(
-        vsock_socket_path,
-        &snapshot_config.vm_id,
-        "--prepare-snapshot-network",
-    )
-    .await
-    {
+    if let Err(error) = guest.prepare(&snapshot_config.vm_id).await {
         // A failed exec response does not prove that preparation did not run.
         // Guest-side flock serialization makes an unconditional resume the
         // exact recovery operation even if the prepare command is still
         // finishing when this second exec arrives.
         let operation_error =
             error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
-        let guest_network_resume_result = run_snapshot_network_command(
-            vsock_socket_path,
-            &snapshot_config.vm_id,
-            "--resume-snapshot-network",
-        )
-        .await
-        .context("reopening guest network after Cloud Hypervisor preparation failure");
+        let guest_network_resume_result = guest
+            .reopen_after_failed_prepare(&snapshot_config.vm_id)
+            .await
+            .context("reopening guest network after Cloud Hypervisor preparation failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
@@ -6462,7 +6611,9 @@ pub async fn create_snapshot_ch(
     // A failed pause response can still mean CH reached Paused. Always attempt
     // resume after invoking pause, then reopen the guest network gate.
     if let Err(pause_error) = pause_result {
-        record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
+        guest
+            .record_pause(&snapshot_config.vm_id, &snapshot_config.name)
+            .await;
         let hypervisor_resume_result = client
             .resume_vm()
             .await
@@ -6471,10 +6622,10 @@ pub async fn create_snapshot_ch(
             error!(snapshot = %snapshot_config.name, error = %error,
                 "CRITICAL: failed to resume Cloud Hypervisor VM after pause error — VM may be paused!");
         }
-        let guest_network_resume_result =
-            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
-                .await
-                .context("reopening guest network after Cloud Hypervisor pause failure");
+        let guest_network_resume_result = guest
+            .resume(&snapshot_config.vm_id)
+            .await
+            .context("reopening guest network after Cloud Hypervisor pause failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
@@ -6509,7 +6660,9 @@ pub async fn create_snapshot_ch(
 
     // Same as the Firecracker path: record the vsock reset caused by the
     // pause/save BEFORE resuming, so blocked exec sessions abort loudly.
-    record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
+    guest
+        .record_pause(&snapshot_config.vm_id, &snapshot_config.name)
+        .await;
 
     // Resume ALWAYS, even if the snapshot or disk copy failed.
     let hypervisor_resume_result = client
@@ -6521,10 +6674,10 @@ pub async fn create_snapshot_ch(
             "CRITICAL: failed to resume Cloud Hypervisor VM after snapshot — VM may be paused!");
     }
 
-    let guest_network_resume_result =
-        resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
-            .await
-            .context("reopening guest network after Cloud Hypervisor snapshot");
+    let guest_network_resume_result = guest
+        .resume(&snapshot_config.vm_id)
+        .await
+        .context("reopening guest network after Cloud Hypervisor snapshot");
     if let Err(e) = &guest_network_resume_result {
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
@@ -6571,6 +6724,11 @@ mod tests {
                 servers: vec!["10.9.0.2".to_string()],
                 search: vec!["restore.example".to_string()],
             }),
+            proxy: super::GuestProxy {
+                http_proxy: Some("http://10.0.2.2:3128".to_string()),
+                https_proxy: Some("http://10.0.2.2:3129".to_string()),
+                no_proxy: Some("localhost".to_string()),
+            },
         };
         let mut document = serde_json::json!({ "restore-epoch": "e" });
         identity.write_into(&mut document);
@@ -6580,6 +6738,11 @@ mod tests {
                 "restore-epoch": "e",
                 "host-ipv6": "2001:db8:b::1",
                 "dns": { "servers": ["10.9.0.2"], "search": ["restore.example"] },
+                "proxy": {
+                    "http_proxy": "http://10.0.2.2:3128",
+                    "https_proxy": "http://10.0.2.2:3129",
+                    "no_proxy": "localhost",
+                },
             })
         );
 
@@ -6587,7 +6750,11 @@ mod tests {
         super::RestoreIdentity::default().write_into(&mut none);
         assert_eq!(
             none,
-            serde_json::json!({ "restore-epoch": "e", "host-ipv6": null })
+            serde_json::json!({
+                "restore-epoch": "e",
+                "host-ipv6": null,
+                "proxy": { "http_proxy": null, "https_proxy": null, "no_proxy": null },
+            })
         );
     }
 
@@ -7955,9 +8122,21 @@ mod tests {
     #[test]
     fn every_reopen_after_a_pause_sets_the_sources_clock() {
         let source = include_str!("common.rs");
-        for (name, pause) in [
-            ("create_snapshot_core", "state: \"Paused\".to_string()"),
-            ("create_snapshot_ch", ".pause_vm()"),
+        // Cloud Hypervisor reaches the guest through `ChSnapshotGuest`, whose fc-agent
+        // steps are the calls the Firecracker creator makes directly.
+        for (name, pause, failed_prepare_reopen, reopen) in [
+            (
+                "create_snapshot_core",
+                "state: \"Paused\".to_string()",
+                "\"--resume-snapshot-network\"",
+                "resume_paused_source(",
+            ),
+            (
+                "create_snapshot_ch",
+                ".pause_vm()",
+                ".reopen_after_failed_prepare(",
+                ".resume(&snapshot_config.vm_id)",
+            ),
         ] {
             let body = body_of(source, &format!("pub async fn {name}("));
             let (before, after) = body.split_at(
@@ -7965,21 +8144,33 @@ mod tests {
                     .unwrap_or_else(|| panic!("{name} has no `{pause}`")),
             );
             assert_eq!(
-                before.matches("\"--resume-snapshot-network\"").count(),
+                before.matches(failed_prepare_reopen).count(),
                 1,
                 "{name}: the reopen after a failed prepare changed"
             );
             assert!(
-                !after.contains("\"--resume-snapshot-network\""),
+                !after.contains("\"--resume-snapshot-network\"")
+                    && !after.contains(".reopen_after_failed_prepare("),
                 "{name} reopens the source after its pause without setting its clock"
             );
             assert_eq!(
-                after.matches("resume_paused_source(").count(),
+                after.matches(reopen).count(),
                 2,
-                "{name} must reopen through resume_paused_source after a failed pause and \
-                 after the save"
+                "{name} must reopen through {reopen} after a failed pause and after the save"
             );
         }
+        let guest = body_of(source, "impl<'a> ChSnapshotGuest<'a> {");
+        let step = |name: &str| {
+            let start = guest
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("ChSnapshotGuest has no `{name}`"));
+            // The last method ends where `body_of` cuts the impl, without its newline.
+            let end = guest[start..].find("\n    }").unwrap();
+            &guest[start..start + end]
+        };
+        assert!(step("reopen_after_failed_prepare").contains("\"--resume-snapshot-network\""));
+        assert!(step("resume").contains("resume_paused_source(vsock_socket_path"));
+        assert!(!step("resume").contains("\"--resume-snapshot-network\""));
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside
@@ -8145,6 +8336,88 @@ mod tests {
             "publish_snapshot_dir",
             body_of(source, "async fn publish_snapshot_dir("),
             &["extra_files()", "\"config.json\"", "atomic_replace_dir("],
+        );
+    }
+
+    /// A Cloud Hypervisor snapshot asks the guest for nothing except through
+    /// `ChSnapshotGuest`, and a raw guest's asks nothing: no network boundary over fc-agent
+    /// before the pause, no vsock reset bookkeeping, no reopen after the resume. A Windows
+    /// guest is raw even with a vsock path at hand, and a Linux guest without one is refused.
+    #[tokio::test]
+    async fn a_raw_guests_snapshot_asks_nothing_of_the_guest() {
+        let source = include_str!("common.rs");
+        let create = body_of(source, "pub async fn create_snapshot_ch(");
+        for direct in [
+            "run_snapshot_network_command(",
+            "resume_paused_source(",
+            "record_vsock_reset_for_snapshot(",
+            "run_fc_agent",
+        ] {
+            assert!(
+                !create.contains(direct),
+                "create_snapshot_ch calls `{direct}` without going through ChSnapshotGuest"
+            );
+        }
+        assert_in_order(
+            "create_snapshot_ch",
+            create,
+            &[
+                "guest.prepare(",
+                ".pause_vm()",
+                ".snapshot_vm(",
+                "reflink_disks_to_snapshot(",
+                "guest\n        .record_pause(",
+                "\"resuming Cloud Hypervisor VM after snapshot\"",
+                "guest\n        .resume(",
+            ],
+        );
+
+        let mut state = make_vm_state("vm-raw", None);
+        let vsock = Path::new("/srv/vm-raw/vsock.sock");
+        assert!(matches!(
+            ChSnapshotGuest::of(&state, Some(vsock)).unwrap(),
+            ChSnapshotGuest::FcAgent { vsock_socket_path } if vsock_socket_path == vsock
+        ));
+        assert!(ChSnapshotGuest::of(&state, None).is_err());
+        state.config.guest = crate::state::Guest::Windows;
+        let raw = ChSnapshotGuest::of(&state, Some(vsock)).unwrap();
+        assert!(matches!(raw, ChSnapshotGuest::Raw));
+        // Nothing to reach: every step succeeds without a socket.
+        raw.prepare("vm-raw").await.unwrap();
+        raw.reopen_after_failed_prepare("vm-raw").await.unwrap();
+        raw.resume("vm-raw").await.unwrap();
+
+        // `snapshot create` reads the fc-agent socket only for a guest that runs fc-agent.
+        let create_cmd = body_of(include_str!("snapshot.rs"), "async fn cmd_snapshot_create(");
+        let read = create_cmd
+            .find("recorded_vsock_socket_path(&fresh_state)")
+            .expect("cmd_snapshot_create no longer reads the recorded vsock socket");
+        let gate = create_cmd[..read]
+            .rfind("if fresh_state.config.guest.runs_fc_agent()")
+            .expect("the recorded vsock socket is read without asking whether fc-agent runs");
+        assert!(
+            read - gate < 120,
+            "the vsock read is not inside the fc-agent gate"
+        );
+        assert!(create_cmd.contains("ChSnapshotGuest::of(&vm_state"));
+    }
+
+    /// A raw clone's namespace helper starts after the network's post-start (which adds the
+    /// namespace's 10.0.2.1) and before the restored guest resumes.
+    #[test]
+    fn a_raw_restore_serves_the_helper_before_the_guest_resumes() {
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn restore_from_snapshot_ch(",
+        );
+        assert_in_order(
+            "restore_from_snapshot_ch",
+            body,
+            &[
+                ".post_start(post_start_pid)",
+                "NsHelper::start(",
+                ".resume()",
+            ],
         );
     }
 
@@ -10430,7 +10703,8 @@ mod tests {
                 "socket": "/srv/source-vsock/vsock.sock"
             }
         });
-        assert_ch_config_vsock_source_matches(&matching, source).unwrap();
+        let linux = crate::state::Guest::Linux;
+        assert_ch_config_vsock_source_matches(&matching, source, linux).unwrap();
 
         let stale = json!({
             "vsock": {
@@ -10438,15 +10712,32 @@ mod tests {
                 "socket": "/runtime/default/vsock.sock"
             }
         });
-        let error = assert_ch_config_vsock_source_matches(&stale, source).unwrap_err();
+        let error = assert_ch_config_vsock_source_matches(&stale, source, linux).unwrap_err();
         assert!(error.to_string().contains("does not match recorded source"));
         assert!(error.to_string().contains("/runtime/default/vsock.sock"));
         assert!(error.to_string().contains("/srv/source-vsock/vsock.sock"));
 
         for invalid in [json!({}), json!({ "vsock": null }), json!({ "vsock": {} })] {
-            let error = assert_ch_config_vsock_source_matches(&invalid, source).unwrap_err();
+            let error = assert_ch_config_vsock_source_matches(&invalid, source, linux).unwrap_err();
             assert!(error.to_string().contains("has no vsock.socket"));
         }
+    }
+
+    /// A raw guest's snapshot (no fc-agent) has no vsock device: its config restores with
+    /// none, and one that names a vsock socket is refused.
+    #[test]
+    fn a_raw_guest_restores_a_ch_config_without_a_vsock() {
+        use serde_json::json;
+        let source = Path::new("/srv/vm-raw/vsock.sock");
+        let windows = crate::state::Guest::Windows;
+        for none in [json!({}), json!({ "vsock": null })] {
+            assert_ch_config_vsock_source_matches(&none, source, windows).unwrap();
+        }
+        let with_vsock = json!({ "vsock": { "cid": 3, "socket": "/srv/vm-raw/vsock.sock" } });
+        let error = assert_ch_config_vsock_source_matches(&with_vsock, source, windows)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("raw VM has a vsock device"), "{error}");
     }
 }
 

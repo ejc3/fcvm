@@ -4,5 +4,7 @@ pub mod utils;
 
 // Re-export all state types and functions for convenience
 pub use manager::{owner_is_live, StateManager};
-pub use types::{present, truncate_id, HealthStatus, ProcessType, VmConfig, VmState, VmStatus};
+pub use types::{
+    present, truncate_id, Guest, HealthStatus, ProcessType, VmConfig, VmState, VmStatus,
+};
 pub use utils::{generate_vm_id, validate_vm_name};

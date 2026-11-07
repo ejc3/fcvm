@@ -12,6 +12,8 @@ import android.util.Log
 import android.view.Surface
 import dev.fcvm.robotpark.scene.Command
 import dev.fcvm.robotpark.scene.FrameState
+import dev.fcvm.robotpark.scene.HeldLayout
+import dev.fcvm.robotpark.scene.Stamp
 import dev.fcvm.robotpark.scene.Tile
 import java.io.File
 import java.util.concurrent.CompletableFuture
@@ -37,6 +39,10 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
     private val tasks = ArrayDeque<() -> Unit>()
     /** Called on the UI thread's behalf when the frame's chrome flag changes. */
     @Volatile var onChrome: ((Boolean) -> Unit)? = null
+    /** Called on the UI thread's behalf when the frame's held flag changes, after a frame drawn with it. */
+    @Volatile var onHeld: ((Boolean) -> Unit)? = null
+    /** Set by the UI thread when it has lifted its bars, cleared when it has lowered them. */
+    @Volatile var barsLifted = false
 
     // the GL thread's own
     private var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -47,6 +53,8 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
     private var boundGen = -1
     private var renderer: SceneRenderer? = null
     private var lastChrome: Boolean? = null
+    private var lastHeld: Boolean? = null
+    private val heldLayout = HeldLayout()
     private var fpsFrames = 0
     private var fpsSince = 0L
 
@@ -192,7 +200,9 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         val (rect, aspect) = scene.viewAt(t, w, h)
         val tile = Tile.of(rect, aspect, w, h)
         val fs = FrameState.compute(scene.copy(imageAspect = aspect), t, w.toDouble() / h, Store.systemNight)
-        r.drawToWindow(fs, tile, Store.robots, if (scene.stamp) fs.frameIndex else -1)
+        // held, the bars are lifted above the band and the stamp says so (Stamp.HELD_BIT)
+        val held = heldLayout.next(scene.held, barsLifted)
+        r.drawToWindow(fs, tile, Store.robots, if (scene.stamp) Stamp.value(fs.frameIndex, held) else -1)
         if (!EGL14.eglSwapBuffers(dpy, win)) {
             eglFailed("eglSwapBuffers")
             return
@@ -210,6 +220,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
             fpsFrames = 0; fpsSince = now
         }
         if (fs.chrome != lastChrome) { lastChrome = fs.chrome; onChrome?.invoke(fs.chrome) }
+        if (scene.held != lastHeld) { lastHeld = scene.held; onHeld?.invoke(scene.held) }
     }
 
     private fun ensureContext(): Boolean {
@@ -315,6 +326,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         dpy = EGL14.EGL_NO_DISPLAY; ctx = EGL14.EGL_NO_CONTEXT; pbuffer = EGL14.EGL_NO_SURFACE; win = EGL14.EGL_NO_SURFACE
         boundGen = -1
         lastChrome = null
+        lastHeld = null
         synchronized(lock) { bound = null; lock.notifyAll() }
         Log.i(TAG, "EGL torn down: $why")
     }

@@ -601,15 +601,16 @@ void PhoneSource::run() {
       std::lock_guard<std::mutex> l(mu_);
       sc = scene_;
     }
-    uint32_t k = 0;
-    bool stamped = stamp_read(pic, w, h, (size_t)w * 4, &k);
-    bool scene = stamped && stamp_plausible(k, ts_ms, sc);
+    uint32_t raw = 0;
+    bool stamped = stamp_read(pic, w, h, (size_t)w * 4, &raw);
+    PhoneFrame pf = phone_frame(stamped, raw, ts_ms, sc);
+    bool scene = pf.kind == PhonePicture::Scene;
     double t = 0;
     bool admit;
     {
       std::lock_guard<std::mutex> l(hmu_);
-      if (stamped && !scene) implausible_++;
-      admit = gate_.admit(scene, k, ts_ms, sc, &t);
+      if (stamped && pf.kind == PhonePicture::Screen) implausible_++;
+      admit = gate_.admit_frame(pf, ts_ms, sc, &t);
       copies_++;
       screen_w_ = w;
       screen_h_ = h;
@@ -621,7 +622,7 @@ void PhoneSource::run() {
       last_h_ = h;
     }
     if (!admit) continue;
-    PhoneGeo g = phone_geometry(scene, k, w, h, sc);
+    PhoneGeo g = phone_frame_geometry(pf, w, h, sc);
     nv12_host_.resize((size_t)g.w * g.h * 3 / 2);
     rgba_to_nv12(pic, (size_t)w * 4, g.w, g.h, nv12_host_.data(), (size_t)g.w);
     frame_no_++;
@@ -668,7 +669,7 @@ std::string PhoneSource::health_json() {
            "\"t\":%.6f,\"frame\":%u,\"boot_id\":\"%s\",\"ready\":%s,%s"
            "\"startup_ms\":{\"first_capture\":%.0f,\"first_frame_sent\":%.0f},"
            "\"phone\":{\"picture\":\"%s\",\"screen\":[%d,%d],\"copies\":%llu,\"scene_frames\":%llu,\"screen_frames\":%llu,"
-           "\"implausible\":%llu,\"odd\":%llu,\"repeats\":%llu,\"verified\":%s,\"screen_error\":%s,"
+           "\"held_frames\":%llu,\"implausible\":%llu,\"odd\":%llu,\"repeats\":%llu,\"verified\":%s,\"screen_error\":%s,"
            "\"screen_connects\":%llu,"
            "\"app_connects\":%llu,\"app_error\":%s,"
            "\"draw_to_capture_ms\":%s,\"capture_to_sent_ms\":%s,\"encode_ms\":%s}}",
@@ -677,7 +678,7 @@ std::string PhoneSource::health_json() {
            t_, frame_, boot_id_.c_str(), ready_ && fatal_.empty() ? "true" : "false",
            fatal_.empty() ? "" : ("\"error\":\"" + json_escape(fatal_) + "\",").c_str(), first_capture_ms_, first_sent_ms_,
            frame_ ? (geo_.scene ? "scene" : "screen") : "none", screen_w_, screen_h_, (unsigned long long)copies_,
-           (unsigned long long)gate_.scene, (unsigned long long)gate_.screen, (unsigned long long)implausible_, (unsigned long long)gate_.odd, (unsigned long long)gate_.repeats,
+           (unsigned long long)gate_.scene, (unsigned long long)gate_.screen, (unsigned long long)gate_.held, (unsigned long long)implausible_, (unsigned long long)gate_.odd, (unsigned long long)gate_.repeats,
            verified_ ? "true" : "false",
            screen_error_.empty() ? "null" : ("\"" + json_escape(screen_error_) + "\"").c_str(),
            (unsigned long long)app_screen_connects_,

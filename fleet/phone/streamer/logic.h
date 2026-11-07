@@ -62,6 +62,17 @@ std::string app_reply_error(const std::string& line);
 bool stamp_plausible(uint32_t k, double capture_unix_ms, const PhoneScene& sc);
 #define STAMP_PLAUSIBLE_S 5.0
 
+// What a screen copy is, from the stamp read off it (`stamped`, its raw 32 bits): a scene
+// frame, placed in the whole image; a held frame (the stamp's held bit), the whole screen
+// with the band cropped and timed by its stamp, never placed as a scene frame whatever the
+// streamer's own scene says; or a screen, with no plausible stamp.
+enum class PhonePicture { Screen, Scene, Held };
+struct PhoneFrame {
+  PhonePicture kind = PhonePicture::Screen;
+  uint32_t k = 0;  // the frame number, without the held bit
+};
+PhoneFrame phone_frame(bool stamped, uint32_t raw, double capture_unix_ms, const PhoneScene& sc);
+
 // The picture a frame carries (always the whole screen) and where its scene sits in the
 // whole image: the rows above the stamp's band.
 struct PhoneGeo {
@@ -83,6 +94,8 @@ struct PhoneGeo {
 // x0 = round(rect.x * full_w), y0 = round(rect.y * full_h). A screen frame is the whole
 // screen, an image of its own.
 PhoneGeo phone_geometry(bool scene, uint32_t k, int screen_w, int screen_h, const PhoneScene& sc);
+// A frame's geometry by its kind: a held frame is the screen's, with the stamp's rows cropped.
+PhoneGeo phone_frame_geometry(const PhoneFrame& f, int screen_w, int screen_h, const PhoneScene& sc);
 
 // The text header that opens a stream and precedes a change of geometry.
 std::string phone_header_json(const PhoneGeo& g, const std::string& codec, int fps, const char* q, uint32_t bitrate);
@@ -94,7 +107,9 @@ class FrameGate {
  public:
   explicit FrameGate(int fps) : fps_(fps) {}
   bool admit(bool scene, uint32_t k, double now_ms, const PhoneScene& sc, double* t);
-  uint64_t repeats = 0, odd = 0, scene = 0, screen = 0;
+  // By the frame's kind: a held frame is gated as a screen frame and timed by its stamp.
+  bool admit_frame(const PhoneFrame& f, double now_ms, const PhoneScene& sc, double* t);
+  uint64_t repeats = 0, odd = 0, scene = 0, screen = 0, held = 0;
 
  private:
   int fps_;

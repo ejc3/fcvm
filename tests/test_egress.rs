@@ -605,7 +605,12 @@ async fn test_routed_run_under_a_new_prefix_reuses_its_snapshot() -> Result<()> 
     test_server.stop().await;
     for key in keys {
         for snapshot in [
-            fcvm::commands::podman::startup_snapshot_key(&key, None, None),
+            fcvm::commands::podman::startup_snapshot_key(
+                &key,
+                None,
+                None,
+                fcvm::commands::podman::host_proxy_identity().as_deref(),
+            ),
             key.clone(),
         ] {
             if common::snapshot_exists(&snapshot) {
@@ -1032,4 +1037,272 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32, egress_url: &str) ->
     println!("    ✓ Container egress succeeded (got TEST_SUCCESS)");
 
     Ok(())
+}
+
+/// The proxy variables, all six spellings.
+const PROXY_VARIABLES: [&str; 6] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// Every proxy setting the guest and its container hold, as `<place> NAME=value` lines,
+/// sorted: the settings file every exec reads (`file`), the environment a command run in
+/// the VM gets, which is fc-agent's own plus that file (`vm`), and the environment a
+/// command run in the container gets (`container`).
+async fn guest_proxy_settings(pid: u32) -> Result<Vec<String>> {
+    let pattern = "^(http_proxy|HTTP_PROXY|https_proxy|HTTPS_PROXY|no_proxy|NO_PROXY)=";
+    let file = common::exec_in_vm(
+        pid,
+        &[&format!(
+            "/usr/bin/grep -E '{pattern}' /etc/fcvm-proxy.env 2>/dev/null | /usr/bin/sed 's/^/file /'; true"
+        )],
+    )
+    .await
+    .context("reading the guest's proxy settings file")?;
+    let vm = common::exec_in_vm(
+        pid,
+        &[&format!(
+            "/usr/bin/env | /usr/bin/grep -E '{pattern}' | /usr/bin/sed 's/^/vm /'; true"
+        )],
+    )
+    .await
+    .context("reading a VM command's environment")?;
+    let container = common::exec_in_container(
+        pid,
+        &[&format!(
+            "env | grep -E '{pattern}' | sed 's/^/container /'; true"
+        )],
+    )
+    .await
+    .context("reading a container command's environment")?;
+    let mut lines: Vec<String> = [file, vm, container]
+        .iter()
+        .flat_map(|out| out.lines().map(str::to_string).collect::<Vec<_>>())
+        .filter(|line| !line.trim().is_empty())
+        // fcvm hands the guest a proxy URL rebuilt from its parts, which ends in a slash.
+        .map(|line| line.trim_end_matches('/').to_string())
+        .collect();
+    lines.sort();
+    Ok(lines)
+}
+
+/// Whether `lines` from [`guest_proxy_settings`] are exactly the four proxy variables in
+/// each of the three places, every one naming the proxy on host port `port` (the guest
+/// reaches the host's loopback at its gateway, so the host part differs from the host's).
+fn proxied_through(lines: &[String], port: u16) -> bool {
+    let mut names: Vec<String> = lines
+        .iter()
+        .filter(|line| line.ends_with(&format!(":{port}")))
+        .filter_map(|line| line.split('=').next().map(str::to_string))
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = ["container", "file", "vm"]
+        .iter()
+        .flat_map(|place| {
+            ["HTTPS_PROXY", "HTTP_PROXY", "http_proxy", "https_proxy"]
+                .iter()
+                .map(move |name| format!("{place} {name}"))
+        })
+        .collect();
+    expected.sort();
+    lines.len() == expected.len() && names == expected
+}
+
+/// A forwarding proxy on the host's loopback that serves CONNECT, which the guest's image
+/// pull uses for the registry. Returns its port; it serves until the task is aborted.
+async fn start_connect_proxy() -> Result<(u16, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let request = {
+                    let mut reader = BufReader::new(&mut client);
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut header = String::new();
+                        match reader.read_line(&mut header).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) if header.trim().is_empty() => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    // A CONNECT client sends nothing more until it has the answer, so the
+                    // reader holds no bytes past the headers.
+                    request
+                };
+                let mut words = request.split_whitespace();
+                let (Some("CONNECT"), Some(target)) = (words.next(), words.next()) else {
+                    let _ = client
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return;
+                };
+                if client
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+            });
+        }
+    });
+    Ok((port, task))
+}
+
+/// A proxy is a restore-time value: the snapshot records none, and every run restored
+/// from it holds its own run's proxy settings or none, never those of the run that made
+/// the snapshot (#1727). Run 1 cold-boots with proxy A and makes the pre-start snapshot;
+/// run 2 has no proxy and run 3 has proxy B, and both restore that same pre-start
+/// snapshot, so the cache key does not fragment by proxy. Run 1's startup snapshot holds
+/// a container running with A, so runs 2 and 3 do not restore it.
+#[tokio::test]
+async fn test_a_restored_guest_holds_its_own_runs_proxy() -> Result<()> {
+    let (name, _, _, _) = common::unique_names("proxyrestore");
+    // Two working proxies, because run 1 pulls its image through A.
+    let (port_a, proxy_a_task) = start_connect_proxy().await?;
+    let (port_b, proxy_b_task) = start_connect_proxy().await?;
+    let proxy_a = format!("http://127.0.0.1:{port_a}");
+    let proxy_b = format!("http://127.0.0.1:{port_b}");
+    let env_unique = format!("PROXYRESTORE_ID={name}");
+    let mut keys: Vec<String> = Vec::new();
+    let mut running = Vec::new();
+    let result: Result<()> = async {
+        let boot = |run: &'static str, proxy: Option<String>| {
+            let vm_name = format!("{name}-{run}");
+            let env_unique = env_unique.clone();
+            async move {
+                let set: Vec<(&str, &str)> = match proxy.as_deref() {
+                    Some(url) => vec![("http_proxy", url), ("https_proxy", url)],
+                    None => vec![],
+                };
+                let remove: Vec<&str> = PROXY_VARIABLES
+                    .iter()
+                    .copied()
+                    .filter(|var| !set.iter().any(|(set, _)| set == var))
+                    .collect();
+                let (_child, pid, log) =
+                    common::spawn_fcvm_snapshots_enabled_with_env_removed_and_log_path(
+                        &[
+                            "podman",
+                            "run",
+                            "--name",
+                            &vm_name,
+                            "--network",
+                            "rootless",
+                            "--env",
+                            &env_unique,
+                            "--health-check",
+                            "http://localhost/",
+                            common::TEST_IMAGE,
+                        ],
+                        &set,
+                        &remove,
+                    )
+                    .await
+                    .with_context(|| format!("spawning {run}"))?;
+                Ok::<_, anyhow::Error>((pid, log))
+            }
+        };
+
+        let (pid_1, log_1) = boot("run1", Some(proxy_a.clone())).await?;
+        running.push(pid_1);
+        common::poll_health_by_pid(pid_1, 300).await.context("run 1 never turned healthy")?;
+        let (how_1, key) = common::cache_choice(&log_1).context("run 1 logged no cache choice")?;
+        anyhow::ensure!(how_1 == "cold boot", "control: run 1 started from a {how_1}");
+        keys.push(key.clone());
+        let startup_1 = common::startup_choice_key(&log_1).context("run 1 names no startup snapshot")?;
+        // Its base, from which every startup snapshot of this test is named.
+        let startup_base = startup_1
+            .split("-proxy")
+            .next()
+            .and_then(|base| base.strip_suffix("-startup").or(Some(base)))
+            .unwrap_or(&startup_1)
+            .to_string();
+        keys.push(startup_base);
+        let settings_1 = guest_proxy_settings(pid_1).await?;
+        anyhow::ensure!(
+            proxied_through(&settings_1, port_a),
+            "control: run 1's guest does not hold its own proxy (port {port_a}): {settings_1:#?}"
+        );
+        common::kill_process(pid_1).await;
+        running.retain(|pid| *pid != pid_1);
+
+        for (run, proxy, port) in [("run2", None, None), ("run3", Some(proxy_b.clone()), Some(port_b))] {
+            let (pid, log) = boot(run, proxy).await?;
+            running.push(pid);
+            common::poll_health_by_pid(pid, 300)
+                .await
+                .with_context(|| format!("{run} never turned healthy"))?;
+            let settings = guest_proxy_settings(pid).await?;
+            let own = match port {
+                Some(port) => proxied_through(&settings, port),
+                None => settings.is_empty(),
+            };
+            anyhow::ensure!(
+                own,
+                "{run} restored a snapshot of run 1 and holds proxy settings that are not its \
+                 own (its proxy port: {port:?}, run 1's: {port_a}): {settings:#?}"
+            );
+            let choice = common::cache_choice(&log).with_context(|| format!("{run} logged no cache choice"))?;
+            anyhow::ensure!(
+                choice == ("pre-start snapshot", key.clone()),
+                "{run} has only run 1's pre-start snapshot {key} to restore and started from {choice:?}"
+            );
+            common::kill_process(pid).await;
+            running.retain(|other| *other != pid);
+        }
+        // The snapshot itself names no proxy, so no caller can read another's from it.
+        anyhow::ensure!(common::snapshot_exists(&key), "run 1 left no pre-start snapshot {key}");
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            fcvm::paths::snapshot_dir().join(&key).join("config.json"),
+        )?)?;
+        let network = &config["metadata"]["network_config"];
+        anyhow::ensure!(
+            network["http_proxy"].is_null() && network["https_proxy"].is_null(),
+            "the pre-start snapshot {key} records a proxy: {network}"
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    proxy_a_task.abort();
+    proxy_b_task.abort();
+    // Every snapshot of this test is named from run 1's pre-start key or its startup
+    // snapshot's base, which the unique --env makes this test's own.
+    for test_key in &keys {
+        let named_from_it = format!("{test_key}-");
+        if let Ok(entries) = std::fs::read_dir(fcvm::paths::snapshot_dir()) {
+            for entry in entries.flatten() {
+                let Ok(found) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && (&found == test_key || found.starts_with(&named_from_it))
+                {
+                    let _ = common::delete_snapshot(&found).await;
+                }
+            }
+        }
+    }
+    result
 }

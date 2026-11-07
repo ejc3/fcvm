@@ -440,6 +440,105 @@ async fn test_nfs_clone_restore() -> Result<()> {
     Ok(())
 }
 
+/// Two clones of one snapshot with an NFS share both mount it and use it at once.
+///
+/// A restored guest carries the NFSv4 client identity of the VM it was snapshotted
+/// from. Two clones of one snapshot, or a clone restored while the server still holds
+/// state for the VM it came from, then mount the same server under one identity from
+/// two addresses, and the server refused the second ("mount.nfs: Operation not
+/// permitted"), so that clone failed its restore closed. Found by the fuzz gym (#1009).
+#[tokio::test]
+async fn test_nfs_two_clones_of_one_snapshot_both_mount() -> Result<()> {
+    let (vm_name, clone_name, snap, _serve) = common::unique_names("nfs-twins");
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("shared.txt"), "shared content\n").await?;
+    let mount_spec = format!("{}:/mydata", source_dir.path().display());
+
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        "--nfs",
+        &mount_spec,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning NFS baseline")?;
+    common::poll_health_by_pid(pid, 180).await?;
+    // State at the server under the baseline's identity: a file held open. The holder
+    // says so once its open succeeded, so the snapshot below is sure to capture it.
+    common::exec_in_container(
+        pid,
+        &["sh -c 'exec 3< /mydata/shared.txt && touch /tmp/held; sleep 600' >/dev/null 2>&1 &"],
+    )
+    .await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let held =
+            common::exec_in_container(pid, &["test -e /tmp/held && echo held || echo waiting"])
+                .await?;
+        if held.trim() == "held" {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the baseline's holder never opened /mydata/shared.txt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    common::create_snapshot_by_pid(pid, &snap)
+        .await
+        .context("creating snapshot of NFS baseline")?;
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let mut clones = Vec::new();
+    for i in 0..2 {
+        let name = format!("{clone_name}-{i}");
+        let (clone_child, clone_pid) =
+            common::spawn_fcvm(&["snapshot", "run", "--snapshot", &snap, "--name", &name])
+                .await
+                .with_context(|| format!("restoring NFS clone {i}"))?;
+        clones.push((clone_child, clone_pid));
+    }
+    let mut result = Ok(());
+    for (i, (_, clone_pid)) in clones.iter().enumerate() {
+        let read = async {
+            common::poll_health_by_pid(*clone_pid, 120)
+                .await
+                .with_context(|| format!("clone {i} never became healthy"))?;
+            let content =
+                common::exec_in_container(*clone_pid, &["cat", "/mydata/shared.txt"]).await?;
+            anyhow::ensure!(
+                content.contains("shared content"),
+                "clone {i} read {content:?}"
+            );
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            result = read;
+        }
+    }
+    for (mut clone_child, clone_pid) in clones {
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+    }
+    let _ = std::fs::remove_dir_all(
+        std::env::var("FCVM_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs/root"))
+            .join("snapshots")
+            .join(&snap),
+    );
+    result
+}
+
 /// Runs `podman run --disk-dir DIR:/data:ro` with the snapshot cache on, reads
 /// /data/marker.txt in the container, and stops the VM. Returns the content, the
 /// cache decision the run logged, its snapshot key, and whether it copied the directory.

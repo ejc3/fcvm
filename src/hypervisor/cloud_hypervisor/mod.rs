@@ -59,6 +59,9 @@ struct PendingConfig {
     vsock: Option<VsockConfig>,
     entropy: bool,
     balloon_mib: Option<u32>,
+    /// UEFI firmware to boot instead of a kernel (a raw guest such as Windows, which runs
+    /// no fc-agent). Set by [`CloudHypervisorBackend::configure_firmware_boot`].
+    firmware: Option<PathBuf>,
 }
 
 /// Cloud Hypervisor implementation of the [`Hypervisor`](super::Hypervisor) trait.
@@ -92,6 +95,10 @@ pub struct CloudHypervisorBackend {
     console_lines: Arc<std::sync::atomic::AtomicU64>,
     /// One event reader per VMM child. It must finish before the API path is reused.
     reboot_monitor: Option<JoinHandle<Result<()>>>,
+    /// Set by the event monitor when the guest reset itself (CH's `vm` `rebooting` event),
+    /// before it shuts the VMM down, so the caller can tell a reboot it must relaunch from a
+    /// power-off. Cleared by every spawn.
+    guest_reset: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CloudHypervisorBackend {
@@ -116,7 +123,14 @@ impl CloudHypervisorBackend {
             console_tail: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reboot_monitor: None,
+            guest_reset: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Whether this VMM's guest reset itself, which made the event monitor shut the VMM
+    /// down (as opposed to a guest power-off or a kill). Read after [`Hypervisor::wait`].
+    pub fn guest_reset(&self) -> bool {
+        self.guest_reset.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn client(&self) -> Result<&ChClient> {
@@ -254,31 +268,72 @@ impl CloudHypervisorBackend {
     }
 
     /// Build the Cloud Hypervisor VmConfig from the buffered `configure_*` state.
+    /// Boot UEFI firmware (`CLOUDHV.fd`) instead of a kernel: the guest's boot loader comes
+    /// from its own disk, so there is no kernel command line and no initramfs. Turns on the
+    /// Hyper-V enlightenments Windows needs, and sends the 16550 serial port (where Windows'
+    /// Emergency Management Services writes the boot's progress) to the console log the
+    /// console tail reads; the virtio console is off.
+    pub fn configure_firmware_boot(&mut self, firmware: &Path, vcpus: u8, mem_mib: u32) {
+        self.pending.firmware = Some(firmware.to_path_buf());
+        self.pending.kernel = None;
+        self.pending.initramfs = None;
+        self.pending.cmdline.clear();
+        self.pending.vcpus = vcpus;
+        self.pending.mem_mib = mem_mib;
+    }
+
     fn build_vm_config(&self) -> Result<VmConfig> {
-        let kernel = self
-            .pending
-            .kernel
-            .as_ref()
-            .context("no kernel configured for Cloud Hypervisor boot")?;
+        let firmware_boot = self.pending.firmware.is_some();
+        let payload = match (&self.pending.firmware, &self.pending.kernel) {
+            (Some(firmware), None) => PayloadConfig {
+                kernel: None,
+                cmdline: None,
+                initramfs: None,
+                firmware: Some(firmware.display().to_string()),
+            },
+            (None, Some(kernel)) => PayloadConfig {
+                kernel: Some(kernel.display().to_string()),
+                cmdline: Some(self.pending.cmdline.clone()),
+                initramfs: self
+                    .pending
+                    .initramfs
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                firmware: None,
+            },
+            (Some(_), Some(_)) => bail!("both a kernel and firmware configured for one VM"),
+            (None, None) => bail!("no kernel or firmware configured for Cloud Hypervisor boot"),
+        };
+        let console_file = self.console_path().map(|p| ConsoleConfig {
+            mode: "File".to_string(),
+            file: Some(p.display().to_string()),
+        });
+        let off = |mode: &str| ConsoleConfig {
+            mode: mode.to_string(),
+            file: None,
+        };
+        // Virtio console (hvc0) to a file in the VM dir, which spawn() tails into fcvm's
+        // tracing logs. CH's "Tty" mode needs a controlling terminal, which a piped child
+        // does not have, so file + tail is the portable equivalent of Firecracker's
+        // serial-to-stdout capture. A firmware-booted guest writes to the 16550 serial
+        // port instead, so that one goes to the file and the virtio console is off.
+        let (console, serial) = if firmware_boot {
+            (off("Off"), console_file.unwrap_or_else(|| off("Null")))
+        } else {
+            (console_file.unwrap_or_else(|| off("Off")), off("Null"))
+        };
         Ok(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: self.pending.vcpus,
                 max_vcpus: self.pending.vcpus,
+                kvm_hyperv: firmware_boot,
             },
             memory: MemoryConfig {
                 size: self.pending.mem_mib as u64 * 1024 * 1024,
                 shared: false,
                 thp: false,
             },
-            payload: PayloadConfig {
-                kernel: kernel.display().to_string(),
-                cmdline: self.pending.cmdline.clone(),
-                initramfs: self
-                    .pending
-                    .initramfs
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
-            },
+            payload,
             disks: self.pending.disks.clone(),
             net: self
                 .pending
@@ -293,24 +348,8 @@ impl CloudHypervisorBackend {
                 cid: v.cid,
                 socket: v.socket.clone(),
             }),
-            // Virtio console (hvc0) to a file in the VM dir, which spawn() tails into
-            // fcvm's tracing logs. CH's "Tty" mode needs a controlling terminal, which a
-            // piped child does not have, so file + tail is the portable equivalent of
-            // Firecracker's serial-to-stdout capture.
-            console: match self.console_path() {
-                Some(p) => ConsoleConfig {
-                    mode: "File".to_string(),
-                    file: Some(p.display().to_string()),
-                },
-                None => ConsoleConfig {
-                    mode: "Off".to_string(),
-                    file: None,
-                },
-            },
-            serial: ConsoleConfig {
-                mode: "Null".to_string(),
-                file: None,
-            },
+            console,
+            serial,
             rng: self.pending.entropy.then(|| RngConfig {
                 src: "/dev/urandom".to_string(),
             }),
@@ -422,15 +461,14 @@ impl Hypervisor for CloudHypervisorBackend {
         self.wait_for_api().await?;
         self.client = Some(ChClient::new(self.api_socket.clone()));
         let client = self.client()?.clone();
+        self.guest_reset
+            .store(false, std::sync::atomic::Ordering::Release);
+        let guest_reset = Arc::clone(&self.guest_reset);
         self.reboot_monitor = Some(tokio::spawn(async move {
-            if read_reboot_event(BufReader::new(events)).await? {
-                // The guest's vsock notification is early intent, before shutdown
-                // writeback. CH emits this event only when it handles the actual
-                // reset. Exit the VMM here so fcvm consumes intent and cold-relaunches.
-                info!("Cloud Hypervisor guest reset, shutting down VMM for host relaunch");
-                client.shutdown_vmm().await?;
-            }
-            Ok(())
+            watch_guest_reset(BufReader::new(events), &guest_reset, || async move {
+                client.shutdown_vmm().await
+            })
+            .await
         }));
 
         // Tail the guest console (hvc0 → file) into fcvm's tracing logs, mirroring the
@@ -654,6 +692,29 @@ impl Drop for CloudHypervisorBackend {
             monitor.abort();
         }
     }
+}
+
+/// Wait for the guest to reset itself (`read_reboot_event`); then record it in `guest_reset`
+/// and call `shutdown`. The guest's vsock notification is early intent, before shutdown
+/// writeback. CH emits this event only when it handles the actual reset. The VMM exits here so
+/// fcvm consumes the intent and cold-relaunches (a Linux guest's run loop, and a raw VM's
+/// `commands::vm::run_until_exit`, which has no other notice). A stream that ends without
+/// the event (a power-off) records nothing and shuts nothing down.
+async fn watch_guest_reset<F, Fut>(
+    events: impl AsyncBufRead + Unpin,
+    guest_reset: &std::sync::atomic::AtomicBool,
+    shutdown: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if read_reboot_event(events).await? {
+        guest_reset.store(true, std::sync::atomic::Ordering::Release);
+        info!("Cloud Hypervisor guest reset, shutting down VMM for host relaunch");
+        shutdown().await?;
+    }
+    Ok(())
 }
 
 /// CH writes pretty-printed JSON objects separated by a blank line, not JSONL.
@@ -1178,6 +1239,39 @@ mod tests {
         assert!(read_reboot_event(b"not-json\n\n".as_slice()).await.is_err());
     }
 
+    /// A guest reset is recorded before the monitor shuts the VMM down, so whoever waits on
+    /// the VMM sees it; a guest power-off records nothing and shuts nothing down.
+    #[tokio::test]
+    async fn a_guest_reset_is_recorded_and_a_power_off_is_not() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reset = AtomicBool::new(false);
+        let shut_down = AtomicBool::new(false);
+        let rebooting = "{\n  \"source\": \"vm\",\n  \"event\": \"rebooting\"\n}\n\n";
+        watch_guest_reset(rebooting.as_bytes(), &reset, || async {
+            assert!(
+                reset.load(Ordering::Acquire),
+                "shut down before the reset was recorded"
+            );
+            shut_down.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(reset.load(Ordering::Acquire) && shut_down.load(Ordering::Acquire));
+
+        let reset = AtomicBool::new(false);
+        let power_off = concat!(
+            "{\n  \"source\": \"vm\",\n  \"event\": \"shutdown\"\n}\n\n",
+            "{\n  \"source\": \"vmm\",\n  \"event\": \"shutdown\"\n}\n\n",
+        );
+        watch_guest_reset(power_off.as_bytes(), &reset, || async {
+            panic!("a power-off shut the VMM down as a reset")
+        })
+        .await
+        .unwrap();
+        assert!(!reset.load(Ordering::Acquire));
+    }
+
     fn backend() -> CloudHypervisorBackend {
         CloudHypervisorBackend::new(
             "vm-test".to_string(),
@@ -1214,6 +1308,86 @@ mod tests {
             error.contains("--free-page-reporting") && error.contains("Cloud Hypervisor"),
             "{error}"
         );
+    }
+
+    fn backend_with_log() -> CloudHypervisorBackend {
+        CloudHypervisorBackend::new(
+            "vm-test".to_string(),
+            PathBuf::from("/tmp/ch-test.sock"),
+            Some(PathBuf::from("/vm/firecracker.log")),
+        )
+    }
+
+    /// A Windows guest boots UEFI firmware: `vm.create` names the firmware and no kernel,
+    /// command line or initramfs, turns on the Hyper-V enlightenments Cloud Hypervisor
+    /// requires for Windows, and logs the 16550 serial port (Windows' EMS) to the console
+    /// file the tail reads, with the virtio console off.
+    #[test]
+    fn a_firmware_boot_names_the_firmware_and_turns_on_hyperv() {
+        let mut be = backend_with_log();
+        be.configure_firmware_boot(Path::new("/assets/CLOUDHV.fd"), 2, 4096);
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert_eq!(
+            config["payload"],
+            serde_json::json!({"firmware": "/assets/CLOUDHV.fd"}),
+            "{config}"
+        );
+        assert_eq!(config["cpus"]["kvm_hyperv"], true, "{config}");
+        assert_eq!(config["cpus"]["boot_vcpus"], 2, "{config}");
+        assert_eq!(config["memory"]["size"], 4096u64 << 20, "{config}");
+        assert_eq!(
+            config["serial"],
+            serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
+            "{config}"
+        );
+        assert_eq!(
+            config["console"],
+            serde_json::json!({"mode": "Off"}),
+            "{config}"
+        );
+    }
+
+    /// The kernel path is unchanged by firmware support: a kernel, its command line and
+    /// initramfs, no firmware, no Hyper-V enlightenments, the virtio console to the file.
+    #[test]
+    fn a_kernel_boot_names_no_firmware_and_no_hyperv() {
+        let mut be = backend_with_log();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        be.pending.initramfs = Some(PathBuf::from("/boot/initrd"));
+        be.pending.cmdline = "console=hvc0".to_string();
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert_eq!(
+            config["payload"],
+            serde_json::json!({"kernel": "/boot/Image", "cmdline": "console=hvc0", "initramfs": "/boot/initrd"}),
+            "{config}"
+        );
+        assert!(config["cpus"].get("kvm_hyperv").is_none(), "{config}");
+        assert_eq!(
+            config["serial"],
+            serde_json::json!({"mode": "Null"}),
+            "{config}"
+        );
+        assert_eq!(
+            config["console"],
+            serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
+            "{config}"
+        );
+    }
+
+    /// A VM boots one payload: firmware after a kernel replaces it, and with neither the
+    /// request is refused before Cloud Hypervisor sees it.
+    #[test]
+    fn a_vm_boots_firmware_or_a_kernel_never_both() {
+        let mut be = backend_with_log();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        be.configure_firmware_boot(Path::new("/assets/CLOUDHV.fd"), 1, 1024);
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert!(config["payload"].get("kernel").is_none(), "{config}");
+        let error = backend_with_log()
+            .build_vm_config()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no kernel or firmware"), "{error}");
     }
 
     /// CH madvises guest RAM MADV_HUGEPAGE unless the request says `thp: false`, so an

@@ -177,6 +177,10 @@ pub struct VmConfig {
 pub struct CpusConfig {
     pub boot_vcpus: u8,
     pub max_vcpus: u8,
+    /// Hyper-V enlightenments (reference TSC page, synthetic timers, APIC assists). Cloud
+    /// Hypervisor requires them for a Windows guest; a Linux guest does not use them.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub kvm_hyperv: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,12 +197,18 @@ pub struct MemoryConfig {
     pub thp: bool,
 }
 
+/// What the VM boots: a kernel (with its command line and initramfs) or UEFI firmware
+/// (`CLOUDHV.fd`), which loads the guest's own boot loader from its disk.
 #[derive(Debug, Serialize)]
 pub struct PayloadConfig {
-    pub kernel: String,
-    pub cmdline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initramfs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

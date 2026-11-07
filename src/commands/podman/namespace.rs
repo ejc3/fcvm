@@ -10,7 +10,7 @@ use crate::state::VmState;
 /// Spawns a holder process with retry logic, runs network setup via nsenter,
 /// and verifies TAP device creation. Records the namespace paths + holder PID into
 /// `process_spec` so the VMM is launched into them, and returns the holder child.
-pub(super) async fn setup_rootless_namespace(
+pub(crate) async fn setup_rootless_namespace(
     pasta_net: &PastaNetwork,
     network_config: &crate::network::NetworkConfig,
     process_spec: &mut ProcessSpec,

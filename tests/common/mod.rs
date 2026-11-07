@@ -561,6 +561,18 @@ pub async fn spawn_fcvm_snapshots_enabled_with_env_and_log_path(
     spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &["FCVM_NO_SNAPSHOT"]).await
 }
 
+/// Like [`spawn_fcvm_snapshots_enabled_with_env_and_log_path`], and also removes each of
+/// `env_remove` from the child's environment.
+pub async fn spawn_fcvm_snapshots_enabled_with_env_removed_and_log_path(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+    env_remove: &[&str],
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    let mut remove = vec!["FCVM_NO_SNAPSHOT"];
+    remove.extend_from_slice(env_remove);
+    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &remove).await
+}
+
 /// Shared implementation: spawn fcvm with `env_vars` set and `env_remove`
 /// explicitly REMOVED from the child's environment (overriding inheritance).
 async fn spawn_fcvm_with_env_and_log_path_inner(
@@ -1865,7 +1877,12 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
 ///
 /// Uses the same format as the production code: `{base_key}-startup`
 pub fn startup_snapshot_key(base_key: &str) -> String {
-    fcvm::commands::podman::startup_snapshot_key(base_key, None, None)
+    fcvm::commands::podman::startup_snapshot_key(
+        base_key,
+        None,
+        None,
+        fcvm::commands::podman::host_proxy_identity().as_deref(),
+    )
 }
 
 /// Find an available TCP port starting from a given port.

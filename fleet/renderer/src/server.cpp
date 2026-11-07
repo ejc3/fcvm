@@ -16,7 +16,7 @@
 #include <thread>
 
 #include "json.h"
-#include "nvenc.h"
+#include "h264.h"
 #include "jpeg.h"
 #include "proto.h"
 #include "threads.h"
@@ -30,6 +30,16 @@ void respond(Conn& c, int code, const char* reason, const std::string& body, con
            code, reason, ctype, body.size(), cors ? "Access-Control-Allow-Origin: *\r\n" : "");
   std::string out = std::string(h) + body;
   c.write_all(out.data(), out.size());
+}
+const char* status_reason(int code) {
+  switch (code) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 503: return "Service Unavailable";
+    default: return "Error";
+  }
 }
 std::string lower(std::string s) {
   for (char& c : s) c = (char)tolower((unsigned char)c);
@@ -215,7 +225,7 @@ void Server::handle(Conn& c) {
     }
     return respond(c, 200, "OK", h, "application/json", true);
   }
-  if (path == "/scene" || path == "/budget") {
+  if (path == "/scene" || path == "/budget" || (path == "/action" && p_.serves_action())) {
     if (method != "POST") return respond(c, 405, "Method Not Allowed", "{\"error\":\"POST only\"}");
     // A fleet renderer takes a scene or a budget only from a holder of the scene token.
     int denied = scene_access(fleet(), fleet() ? token_->current() : std::string(), hdr["authorization"]);
@@ -234,6 +244,11 @@ void Server::handle(Conn& c) {
       body.append(tmp, (size_t)r);
     }
     body.resize((size_t)len);
+    if (path == "/action") {
+      std::string reply;
+      int code = p_.post_action(body, &reply);
+      return respond(c, code, status_reason(code), reply);
+    }
     std::string err;
     bool ok = path == "/scene" ? p_.post_scene(body, &err) : p_.post_budget(body, &err);
     if (!ok) return respond(c, 400, "Bad Request", "{\"error\":\"" + json_escape(err) + "\"}");

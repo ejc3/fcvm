@@ -12,5 +12,8 @@ tasks.test {
     systemProperty("shaderDir", rootProject.file("app/src/main/assets/shaders").absolutePath)
     // Two contracts of the app's render thread are pinned against its source.
     systemProperty("appSrcDir", rootProject.file("app/src/main/kotlin/dev/fcvm/robotpark").absolutePath)
+    // so a change to those sources alone runs the tests again
+    inputs.dir(rootProject.file("app/src/main/kotlin/dev/fcvm/robotpark"))
+    inputs.dir(rootProject.file("app/src/main/assets/shaders"))
     testLogging { events("passed", "failed"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }

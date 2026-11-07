@@ -83,6 +83,17 @@ const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `None`, and refusing those would make every VM already running across a CLI
 /// upgrade permanently uncontrollable. The conventional path is only used when it
 /// is actually there, so this still cannot invent a target.
+/// exec runs commands through fc-agent, which a raw VM (`fcvm vm run`) does not have.
+fn refuse_raw_vm(vm_state: &crate::state::VmState) -> Result<()> {
+    if !vm_state.config.guest.runs_fc_agent() {
+        bail!(
+            "VM {} is a raw VM: a raw VM runs no fc-agent, so fcvm cannot exec in it",
+            vm_state.name.as_deref().unwrap_or(&vm_state.vm_id)
+        );
+    }
+    Ok(())
+}
+
 fn exec_vsock_socket_path(vm_state: &crate::state::VmState) -> Result<PathBuf> {
     match super::common::recorded_vsock_socket_path(vm_state) {
         Ok(path) => Ok(path.to_path_buf()),
@@ -724,6 +735,7 @@ async fn exec(args: ExecArgs, quiet: bool) -> Result<()> {
 
     let vm_state =
         super::common::load_vm_state(&state_manager, args.pid, args.name.as_deref()).await?;
+    refuse_raw_vm(&vm_state)?;
 
     // Use the exact persisted path. `--vsock-dir` deliberately places the
     // socket outside vm_runtime_dir, so reconstructing it breaks exec/health.
@@ -1035,6 +1047,26 @@ mod exec_fuzz_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// exec refuses a raw VM, which runs no fc-agent, before it looks for a socket.
+    #[test]
+    fn exec_refuses_a_raw_vm() {
+        let mut state =
+            crate::state::VmState::new("vm-raw".to_string(), "win.raw".to_string(), 2, 4096);
+        refuse_raw_vm(&state).expect("a Linux guest runs fc-agent");
+        state.config.guest = crate::state::Guest::Windows;
+        let error = refuse_raw_vm(&state).unwrap_err().to_string();
+        assert!(error.contains("a raw VM runs no fc-agent"), "{error}");
+        let body = &include_str!("exec.rs")[include_str!("exec.rs")
+            .find("async fn exec(args: ExecArgs")
+            .unwrap()..];
+        let refused = body.find("refuse_raw_vm(&vm_state)?").unwrap();
+        let socket = body.find("exec_vsock_socket_path(&vm_state)").unwrap();
+        assert!(
+            refused < socket,
+            "exec looks for a socket before refusing a raw VM"
+        );
+    }
 
     #[test]
     fn exec_uses_exact_persisted_custom_vsock_path() {

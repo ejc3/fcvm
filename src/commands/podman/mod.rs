@@ -14,6 +14,7 @@ mod namespace;
 mod snapshot;
 mod types;
 mod vm_config;
+pub(crate) use vm_config::guest_proxy;
 
 pub use types::{
     shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedRestore, PreparedTarget,
@@ -40,14 +41,17 @@ pub(crate) use listeners::{
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
-    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
-    CreateSnapshotParams, ExistingGeneration, SnapshotInstall, SnapshotVmm,
+    check_podman_snapshot, create_snapshot_interruptible, host_proxy_identity, proxy_identity,
+    startup_snapshot_key, BalloonRequirement, CreateSnapshotParams, ExistingGeneration,
+    SnapshotInstall, SnapshotVmm,
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
     guest_dns, setup_nfs_exports, GuestBootInputs, GuestDns,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
+// `fcvm vm run` builds a raw VM's rootless namespace the way a container VM's is built.
+pub(crate) use namespace::setup_rootless_namespace;
 
 use crate::hypervisor::firecracker::FirecrackerBackend;
 
@@ -1011,6 +1015,22 @@ fn validate_free_page_reporting(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `--nfs` without bridged networking. The share is exported to the guest's IP.
+/// A rootless guest reaches the host through pasta, so the host's nfsd sees the mount
+/// come from pasta's host-side address and refuses it ("access denied by server"); a
+/// routed guest's IPv4 stays inside its namespace, and its mount of the gateway is
+/// refused ("Connection refused"). Both failed only after the VM booted. Found by the
+/// fuzz gym (#1009).
+fn validate_nfs_network(args: &RunArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.nfs.is_empty() || matches!(args.network, NetworkMode::Bridged),
+        "--nfs needs --network bridged: a rootless VM reaches the host through pasta, so the \
+         host's NFS server sees its mount come from pasta, not from the address the share is \
+         exported to, and a routed VM's IPv4 does not leave its namespace"
+    );
+    Ok(())
+}
+
 /// `--gpu` devices are attached when fcvm restores the pre-start snapshot, which is
 /// taken without them. A run that never restores that snapshot would run without them.
 fn validate_gpu_run(args: &RunArgs, lifecycle: &PodmanLifecycle, no_snapshot: bool) -> Result<()> {
@@ -1280,7 +1300,7 @@ async fn invalidate_unusable_snapshot(
 /// before the VM is fully set up. When setup fails partway, remove both so failed
 /// runs don't leave phantom `fcvm ls` entries, allocated loopback IPs, or per-VM
 /// disk directories behind.
-async fn cleanup_failed_prepare(
+pub(crate) async fn cleanup_failed_prepare(
     state_manager: &StateManager,
     vm_id: &str,
     data_dir: &std::path::Path,
@@ -1581,6 +1601,7 @@ async fn prepare_vm_for_lifecycle(
     }
     validate_balloon_target(args.balloon, args.mem)?;
     validate_free_page_reporting(&args)?;
+    validate_nfs_network(&args)?;
     // Refuse a bad --pmem before the snapshot cache is looked up, so a cache hit
     // and a cold boot refuse it the same way.
     if !args.pmem.is_empty()
@@ -1911,8 +1932,12 @@ async fn prepare_vm_for_lifecycle(
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
         // The startup snapshot is this run's balloon target's own; the pre-start one is
         // shared between targets.
-        let startup_key =
-            startup_snapshot_key(&startup_base, args.balloon, run_host_ipv6(&args.env));
+        let startup_key = startup_snapshot_key(
+            &startup_base,
+            args.balloon,
+            run_host_ipv6(&args.env),
+            host_proxy_identity().as_deref(),
+        );
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -3333,7 +3358,12 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
 
                 if let Some(ref base) = ctx.startup_snapshot_base_key {
                     let startup_key =
-                        startup_snapshot_key(base, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
+                        startup_snapshot_key(
+                            base,
+                            ctx.args.balloon,
+                            run_host_ipv6(&ctx.args.env),
+                            host_proxy_identity().as_deref(),
+                        );
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3834,7 +3864,7 @@ pub(crate) fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Re
 /// VM state file, and the data directory behind. Shutdown is deferred until setup finishes,
 /// then the caller's cleanup runs. The request cancels every lifecycle gate of the process,
 /// including one a cache-hit restore creates later (`common::request_process_shutdown`).
-fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
+pub(crate) fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
@@ -4842,7 +4872,7 @@ mod tests {
             let mut args = test_args();
             args.balloon = balloon;
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon, None);
+            let startup = startup_snapshot_key(&key, args.balloon, None, None);
             (key, startup)
         };
         let (key_64, startup_64) = names(Some(64));
@@ -4868,7 +4898,7 @@ mod tests {
             "a run without --balloon keeps the startup name it had"
         );
         assert_eq!(
-            startup_snapshot_key("abc123def456", None, None),
+            startup_snapshot_key("abc123def456", None, None, None),
             "abc123def456-startup"
         );
     }
@@ -4885,7 +4915,7 @@ mod tests {
                 .map(|a| vec![format!("HOST_IPV6={a}")])
                 .unwrap_or_default();
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
+            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env), None);
             (key, startup)
         };
         let (key_a, startup_a) = names(Some("2001:db8:a::1"));
@@ -4906,6 +4936,7 @@ mod tests {
             &key_a,
             Some(u32::MAX),
             Some("2001:db8:a::1".parse().unwrap()),
+            proxy_identity(|_| Some("http://203.0.113.9:3128".to_string())).as_deref(),
         ))
         .expect("the longest startup name is a valid snapshot name");
 
@@ -4917,16 +4948,45 @@ mod tests {
         };
         let podman = code(include_str!("mod.rs"));
         for call in [
-            "startup_snapshot_key(&startup_base,args.balloon,run_host_ipv6(&args.env))",
-            "startup_snapshot_key(base,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
+            "startup_snapshot_key(&startup_base,args.balloon,run_host_ipv6(&args.env),host_proxy_identity().as_deref(),)",
+            "startup_snapshot_key(base,ctx.args.balloon,run_host_ipv6(&ctx.args.env),host_proxy_identity().as_deref(),)",
         ] {
             assert!(podman.contains(call), "podman run no longer calls {call}");
         }
         assert_eq!(podman.matches("startup_snapshot_key(").count(), 2);
         assert!(
             code(include_str!("../snapshot.rs"))
-                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6)"),
-            "a clone saves the startup snapshot under the address it restored with"
+                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6,crate::commands::podman::host_proxy_identity().as_deref(),)"),
+            "a clone saves the startup snapshot under the address and proxies it restored with"
+        );
+    }
+
+    /// A startup snapshot holds a container that runs with the proxy variables it started
+    /// with, which a restore cannot change, so runs with different proxies share the
+    /// pre-start snapshot and have a startup snapshot each. The name carries a digest, not
+    /// the URL. A run without a proxy keeps the startup name it had.
+    #[test]
+    fn two_proxies_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let env_a =
+            |name: &str| (name == "https_proxy").then(|| "http://203.0.113.7:3128".to_string());
+        let env_b =
+            |name: &str| (name == "https_proxy").then(|| "http://203.0.113.8:3128".to_string());
+        let a = proxy_identity(env_a).expect("a proxy has an identity");
+        let b = proxy_identity(env_b).unwrap();
+        assert_eq!(proxy_identity(|_| None), None);
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 12);
+        let key = key_for(&test_args(), GuestBootInputs::default());
+        let startup_a = startup_snapshot_key(&key, None, None, Some(&a));
+        assert_eq!(startup_a, format!("{key}-proxy{a}-startup"));
+        assert!(
+            !startup_a.contains("203.0.113"),
+            "the name holds a proxy URL: {startup_a}"
+        );
+        assert_ne!(startup_a, startup_snapshot_key(&key, None, None, Some(&b)));
+        assert_eq!(
+            startup_snapshot_key(&key, None, None, None),
+            format!("{key}-startup")
         );
     }
 
@@ -5325,6 +5385,38 @@ mod tests {
         assert!(
             switch_checked < looked_up,
             "prepare_vm_for_lifecycle looks the snapshot cache up before it checks --free-page-reporting"
+        );
+    }
+
+    /// A rootless or routed `--nfs` run is refused before it boots, by name (#1009: they
+    /// booted and then failed to mount).
+    #[test]
+    fn nfs_without_bridged_networking_is_refused_before_boot() {
+        let mut args = test_args();
+        args.nfs = vec!["/srv:/mnt".to_string()];
+        args.network = NetworkMode::Rootless;
+        let error = validate_nfs_network(&args).expect_err("rootless --nfs");
+        assert!(
+            error.to_string().contains("--nfs needs --network bridged"),
+            "{error}"
+        );
+        args.network = NetworkMode::Routed;
+        validate_nfs_network(&args).expect_err("routed --nfs");
+        args.network = NetworkMode::Bridged;
+        validate_nfs_network(&args).expect("bridged --nfs");
+        args.network = NetworkMode::Rootless;
+        args.nfs.clear();
+        validate_nfs_network(&args).expect("rootless without --nfs");
+        let prepare = include_str!("mod.rs");
+        let checked = prepare
+            .find("validate_nfs_network(&args)?;")
+            .expect("never checked");
+        let looked_up = prepare
+            .find("check_podman_snapshot(")
+            .expect("no cache lookup");
+        assert!(
+            checked < looked_up,
+            "--nfs is checked after the snapshot cache lookup"
         );
     }
 
