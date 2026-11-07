@@ -10,6 +10,8 @@
 #                                  on that port answers while the file exists. The client
 #                                  passes SIGTERM on to the container and exits with it.
 #                                  FAKE_BRIDGE_STUCK=1: the container ignores SIGTERM.
+#                                  FAKE_BRIDGE_CLIENT_DIES=1: the client exits 3 at once and
+#                                  the container runs on, never serving.
 #   stop -t N <name>               SIGTERM to the container, SIGKILL after N s
 #   rm -f <name>                   SIGKILL to the container, and its state removed
 #
@@ -63,13 +65,18 @@ echo "$marker" > "$dir/container-$name.port"
 (
     if [ -n "${FAKE_BRIDGE_STUCK:-}" ]; then trap '' TERM; else trap 'rm -f "$marker"; exit 0' TERM; fi
     sleep "${FAKE_BRIDGE_SECS:-0.2}"
-    date +%s%3N > "$marker"
+    [ -n "${FAKE_BRIDGE_CLIENT_DIES:-}" ] || date +%s%3N > "$marker"
     # The test's directory going away ends a container nothing stopped.
     while [ -d "$dir" ]; do sleep 0.2; done
 ) &
 cpid=$!
 echo "$cpid" > "$dir/container-$name.pid"
 trap 'kill -TERM "$cpid" 2>/dev/null' TERM INT
+if [ -n "${FAKE_BRIDGE_CLIENT_DIES:-}" ]; then
+    sleep 0.3
+    echo "died $name $$ $(date +%s%N)" >> "$log"
+    exit 3
+fi
 while ! gone "$cpid"; do wait "$cpid"; done
 rm -f "$dir/container-$name.pid"
 echo "exit $name $$ $(date +%s%N)" >> "$log"

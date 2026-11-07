@@ -815,7 +815,7 @@ impl Windows {
             let _ = t.await;
         }
         // The gold flow stops its VM and bridge itself; aborted only past its budget.
-        let budget = self.agent.stop_grace + self.cfg.bridge_stop + Duration::from_secs(60);
+        let budget = teardown_budget(&self.cfg, &self.agent);
         let mut flow = self.flow;
         if tokio::time::timeout(budget, &mut flow).await.is_err() {
             tracing::warn!(
@@ -1055,7 +1055,7 @@ impl Bridge {
     /// is awaited, and killed if it still has not exited. Returns once the client is reaped.
     async fn stop(&mut self, cfg: &WindowsCfg) {
         let secs = cfg.bridge_stop.as_secs().max(1).to_string();
-        let budget = cfg.bridge_stop + Duration::from_secs(20);
+        let budget = cfg.bridge_stop + PODMAN_SLACK;
         for args in [
             vec!["stop", "-t", secs.as_str(), self.name.as_str()],
             vec!["rm", "-f", self.name.as_str()],
@@ -1074,8 +1074,24 @@ impl Bridge {
                 }
             }
         }
-        self.client.stop(Duration::from_secs(5)).await;
+        self.client.stop(CLIENT_GRACE).await;
     }
+}
+
+/// How much longer than its own `-t` a podman command may take, and how long the `podman run`
+/// client has to exit once its container is gone.
+const PODMAN_SLACK: Duration = Duration::from_secs(20);
+const CLIENT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long reaping a child takes once it is sent SIGKILL.
+const KILL_REAP: Duration = Duration::from_secs(10);
+
+/// How long a sandbox's teardown may take: the sum of its steps' bounds, from the constants
+/// the steps use (`Sandbox::stop`: the bridge's podman stop and rm, its client, then the VM's
+/// SIGTERM grace, each escalating to SIGKILL), and some for reaping. A replacement, or the agent
+/// stopping, waits this long before it gives up on a teardown.
+fn teardown_budget(cfg: &WindowsCfg, agent: &AgentCfg) -> Duration {
+    (cfg.bridge_stop + PODMAN_SLACK) * 2 + CLIENT_GRACE + agent.stop_grace + KILL_REAP * 2
 }
 
 /// What the gold flow has started, stopped and awaited on every way out of it.
@@ -1179,51 +1195,51 @@ impl Sandbox {
 
     /// Post each action of the running launch not yet carried out to the bridge, oldest
     /// first, each once. A failed one is logged and not tried again.
-    /// A reset, the end of a borrow or the sandbox's removal (its desired generation moving,
-    /// or its sender gone) ends the batch at once, the action in flight included: the rest is
-    /// for a launch that is going away. Returns whether the desired state changed meanwhile,
-    /// so the caller looks at it again.
-    async fn run_actions(&self, r: &mut Running, desired: &mut watch::Receiver<Desired>) -> bool {
-        let want = desired.borrow().clone();
-        let moved = |d: &watch::Receiver<Desired>| d.borrow().generation != r.generation;
-        for a in &want.actions {
-            if a.seq <= r.actions_done || a.generation != r.generation {
-                continue;
-            }
-            if moved(desired) || desired.has_changed().is_err() {
-                return true;
-            }
-            r.actions_done = a.seq;
-            let Some(body) = action_body(a.action) else {
-                continue;
-            };
-            let send = self
-                .agent
+    /// The next action of the running launch not yet carried out, marked carried out.
+    fn next_action(
+        r: &mut Running,
+        desired: &Desired,
+    ) -> Option<fleet_core::windows::WindowsActionReq> {
+        let a = desired
+            .actions
+            .iter()
+            .find(|a| a.seq > r.actions_done && a.generation == r.generation)?
+            .clone();
+        r.actions_done = a.seq;
+        Some(a)
+    }
+
+    /// The request that carries out `action` on the bridge, or none for `reset` and for an
+    /// action this build does not know.
+    fn post_action(&self, action: WindowsAction) -> Option<Sending> {
+        let body = action_body(action)?;
+        Some(Box::pin(
+            self.agent
                 .scene_token
                 .authorize(self.http.post(self.url("/action")))
                 .timeout(ACTION_TIMEOUT)
                 .json(&body)
-                .send();
-            let sent = tokio::select! {
-                sent = send => sent,
-                _ = generation_moves(desired, r.generation) => {
-                    tracing::info!(sandbox = %self.id, action = a.action.as_str(), seq = a.seq, "the sandbox is being reset; its remaining actions are dropped");
-                    return true;
-                }
-            };
-            match sent {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(sandbox = %self.id, action = a.action.as_str(), seq = a.seq, "sandbox action done")
-                }
-                Ok(resp) => {
-                    tracing::warn!(sandbox = %self.id, action = a.action.as_str(), status = %resp.status(), "sandbox action refused by the bridge")
-                }
-                Err(e) => {
-                    tracing::warn!(sandbox = %self.id, action = a.action.as_str(), error = %e, "sandbox action not delivered")
-                }
+                .send(),
+        ))
+    }
+
+    fn log_action(
+        &self,
+        a: &fleet_core::windows::WindowsActionReq,
+        sent: reqwest::Result<reqwest::Response>,
+    ) {
+        let (action, seq) = (a.action.as_str(), a.seq);
+        match sent {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(sandbox = %self.id, action, seq, "sandbox action done")
+            }
+            Ok(resp) => {
+                tracing::warn!(sandbox = %self.id, action, seq, status = %resp.status(), "sandbox action refused by the bridge")
+            }
+            Err(e) => {
+                tracing::warn!(sandbox = %self.id, action, seq, error = %e, "sandbox action not delivered")
             }
         }
-        *desired.borrow() != want
     }
 
     async fn relaunch(
@@ -1327,12 +1343,13 @@ impl Sandbox {
                 }
                 status = r.vm.exited() => {
                     let e = fail(format!("fcvm exited ({status}) before the desktop"), &r);
-                    r.bridge.stop(&self.cfg).await;
+                    self.stop(&mut r).await;
                     return Err(e);
                 }
                 status = r.bridge.client.exited() => {
+                    // Its client is gone, its container may not be: stopped through podman too.
                     let e = fail(format!("the bridge exited ({status}) before the desktop"), &r);
-                    r.vm.stop(self.agent.stop_grace).await;
+                    self.stop(&mut r).await;
                     return Err(e);
                 }
                 _ = &mut deadline => {
@@ -1362,13 +1379,20 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Resolves when the desired generation is no longer `generation`, or the sandbox was
-/// unassigned.
-async fn generation_moves(desired: &mut watch::Receiver<Desired>, generation: u64) {
-    loop {
-        if desired.changed().await.is_err() || desired.borrow().generation != generation {
-            return;
-        }
+/// An action's request to the bridge.
+type Sending =
+    std::pin::Pin<Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send>>;
+
+/// The action in flight's outcome; pending forever with none in flight.
+async fn in_flight(
+    f: &mut Option<(fleet_core::windows::WindowsActionReq, Sending)>,
+) -> (
+    fleet_core::windows::WindowsActionReq,
+    reqwest::Result<reqwest::Response>,
+) {
+    match f {
+        Some((a, send)) => (a.clone(), send.await),
+        None => std::future::pending().await,
     }
 }
 
@@ -1385,7 +1409,7 @@ async fn supervise(
 ) {
     // The sandbox that held this index stops its VM and bridge first (each stop is bounded and
     // escalates to SIGKILL); one that overruns that is aborted.
-    let budget = ctx.agent.stop_grace + ctx.cfg.bridge_stop + Duration::from_secs(30);
+    let budget = teardown_budget(&ctx.cfg, &ctx.agent);
     for mut old in before {
         if tokio::time::timeout(budget, &mut old).await.is_err() {
             tracing::warn!(sandbox = %ctx.id, "the index's previous sandbox did not stop in {} s; aborting it", budget.as_secs());
@@ -1398,6 +1422,9 @@ async fn supervise(
     // the evaluation expires), not only at its next relaunch.
     let mut image_tick = tokio::time::interval(ctx.cfg.image_check);
     image_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The action being carried out: one event among the others below, so a reset, the
+    // sandbox's removal or the cutoff is never held back by it, and drops it.
+    let mut action: Option<(fleet_core::windows::WindowsActionReq, Sending)> = None;
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
@@ -1408,6 +1435,7 @@ async fn supervise(
             .as_ref()
             .is_none_or(|r| r.generation < want.generation);
         if behind {
+            action = None;
             // The gold snapshot first: every sandbox restores from it.
             let tag = loop {
                 let g = gold.borrow_and_update().clone();
@@ -1478,10 +1506,20 @@ async fn supervise(
             continue;
         }
         let r = running.as_mut().expect("not behind, so a sandbox runs");
-        if ctx.run_actions(r, &mut desired).await {
-            continue;
+        while action.is_none() {
+            let Some(a) = Sandbox::next_action(r, &desired.borrow()) else {
+                break;
+            };
+            if let Some(send) = ctx.post_action(a.action) {
+                action = Some((a, send));
+            }
         }
         let died = tokio::select! {
+            (a, sent) = in_flight(&mut action) => {
+                action = None;
+                ctx.log_action(&a, sent);
+                None
+            }
             changed = desired.changed() => {
                 if changed.is_err() {
                     break;
@@ -1491,6 +1529,7 @@ async fn supervise(
             _ = image_tick.tick() => {
                 if ctx.cfg.image(&GoldState::Ready(String::new()), Utc::now()).refused.is_some() {
                     // The next pass stops nothing more and reports the refusal with its date.
+                    action = None;
                     let mut r = running.take().unwrap();
                     tracing::warn!(sandbox = %ctx.id, "the Windows image is refused; stopping the sandbox");
                     ctx.stop(&mut r).await;
@@ -1508,6 +1547,7 @@ async fn supervise(
             }
         };
         if let Some(error) = died {
+            action = None;
             let mut r = running.take().unwrap();
             let ran = r.started.elapsed();
             tracing::warn!(sandbox = %ctx.id, %error, "sandbox died");
@@ -1528,6 +1568,7 @@ async fn supervise(
             retry_after = Some(delay);
         }
     }
+    drop(action);
     if let Some(mut r) = running.take() {
         ctx.stop(&mut r).await;
     }
@@ -1670,6 +1711,26 @@ mod tests {
             raw.iter().all(|i| (helper..helper_end).contains(i)),
             "a Command::new outside `child`, at bytes {raw:?}"
         );
+    }
+
+    /// A replacement waits at least as long as every step of the old sandbox's teardown may
+    /// take, from the same constants: podman stop and podman rm (each `bridge_stop` plus its
+    /// slack), the client's grace, and the VM's (its SIGTERM grace, then SIGKILL). Waiting less
+    /// gives up on a child that is still stopping.
+    #[test]
+    fn a_replacement_waits_out_every_step_of_a_teardown() {
+        for (stop_grace, bridge_stop) in [(30, 10), (10, 1), (60, 30)] {
+            let mut agent = test_agent();
+            agent.stop_grace = Duration::from_secs(stop_grace);
+            let mut cfg = test_cfg();
+            cfg.bridge_stop = Duration::from_secs(bridge_stop);
+            let steps = (cfg.bridge_stop + PODMAN_SLACK) * 2 + CLIENT_GRACE + agent.stop_grace;
+            assert!(
+                teardown_budget(&cfg, &agent) > steps,
+                "{:?} for steps that may take {steps:?}",
+                teardown_budget(&cfg, &agent)
+            );
+        }
     }
 
     #[test]

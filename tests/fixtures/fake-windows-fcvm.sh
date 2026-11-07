@@ -9,6 +9,7 @@
 #
 #   FAKE_HEALTHY_SECS  time before a VM is listed healthy (default 0.2)
 #   FAKE_STOP_SECS     time a VM takes to stop after SIGTERM (default 0)
+#   FAKE_DIE_AFTER_SECS  a VM exits with status 3 this long after it is listed healthy
 #
 # It logs `<event> <name> <pid> <ns>` lines to $FAKE_FCVM_DIR/events.log and each VM's
 # arguments, one per line, to $FAKE_FCVM_DIR/args-<name>.
@@ -60,4 +61,10 @@ trap stop TERM INT
 sleep "${FAKE_HEALTHY_SECS:-0.2}" & wait $!
 printf '{"name":"%s","pid":%s,"health_status":"healthy","config":{"guest":"windows","rdp_socket":"%s"}}' \
     "$name" "$$" "$dir/rdp-$$.sock" > "$dir/ls/$$.json"
+if [ -n "${FAKE_DIE_AFTER_SECS:-}" ]; then
+    sleep "$FAKE_DIE_AFTER_SECS" & wait $!
+    rm -f "$dir/ls/$$.json"
+    echo "died $name $$ $(date +%s%N)" >> "$log"
+    exit 3
+fi
 while true; do sleep 1 & wait $!; done

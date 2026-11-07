@@ -732,61 +732,6 @@ async fn a_sandbox_running_when_its_image_reaches_the_cutoff_is_stopped() {
     c.close().await;
 }
 
-/// An action the bridge is slow to carry out does not hold back a reset: the reset relaunches
-/// at once, and the rest of the old launch's batch is never sent.
-#[tokio::test]
-async fn a_slow_action_does_not_hold_back_a_reset() {
-    let f = fake(1);
-    let (installed, expires) = recent();
-    let w = f.windows(1, f.image(&installed, &expires));
-    with_gold(&f, &w);
-    let mut c = Coord::start(&f, w);
-    c.assign(&[("win-1", 0, 1, None, vec![])]);
-    c.until(&["win-1"], "running", 1).await;
-    let req = |seq, action| WindowsActionReq {
-        seq,
-        action,
-        at: 1,
-        generation: 1,
-    };
-    c.assign(&[(
-        "win-1",
-        0,
-        1,
-        None,
-        vec![
-            req(1, WindowsAction::TaskManager),
-            req(2, WindowsAction::Notepad),
-        ],
-    )]);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while f.actions[0].lock().unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the slow action never started"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let reset = std::time::Instant::now();
-    c.assign(&[("win-1", 0, 2, Some(9), vec![])]);
-    c.report_within("win-1", "running", 2, 8)
-        .await
-        .expect("the reset runs within 8 s, not after the slow action");
-    assert!(reset.elapsed() < Duration::from_secs(8));
-    let posted: Vec<serde_json::Value> = f.actions[0]
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(_, b)| b["name"].clone())
-        .collect();
-    assert_eq!(
-        posted,
-        ["task_manager"],
-        "the old launch's notepad is dropped"
-    );
-    c.close().await;
-}
-
 /// The same host index is handed to a new sandbox id while the old one is still stopping:
 /// the new sandbox starts only once the old VM and bridge have exited, so two never hold the
 /// index's ports.
@@ -884,4 +829,144 @@ async fn an_agent_stopping_during_the_gold_flow_stops_the_gold_vm() {
         log.contains(&("exit".into(), "win-gold".into())),
         "the agent returned with the gold VM running: {log:?}"
     );
+}
+
+/// What happens to a sandbox while its bridge is slow to carry out an action.
+enum During {
+    /// Its generation moves (a reset, a borrow's end).
+    Reset,
+    /// It leaves the assignment.
+    Unassign,
+    /// Its image reaches the cutoff.
+    Cutoff,
+}
+
+/// One case of the matrix: whatever else happens to a sandbox, a slow action never holds it
+/// back, because the action is one event among the supervisor's others.
+async fn during_a_slow_action(during: During) {
+    let f = fake(1);
+    let now = chrono::Utc::now();
+    let expires = match during {
+        During::Cutoff => now + chrono::Duration::days(7) + chrono::Duration::seconds(4),
+        _ => now + chrono::Duration::days(160),
+    };
+    let img = f.image(
+        &(now - chrono::Duration::days(20)).to_rfc3339(),
+        &expires.to_rfc3339(),
+    );
+    let w = f.windows(1, img);
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    let req = |seq, action| WindowsActionReq {
+        seq,
+        action,
+        at: 1,
+        generation: 1,
+    };
+    // task_manager takes the fake bridge 30 s; notepad would follow it.
+    c.assign(&[(
+        "win-1",
+        0,
+        1,
+        None,
+        vec![
+            req(1, WindowsAction::TaskManager),
+            req(2, WindowsAction::Notepad),
+        ],
+    )]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while f.actions[0].lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow action never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    match during {
+        During::Reset => {
+            c.assign(&[("win-1", 0, 2, Some(9), vec![])]);
+            c.report_within("win-1", "running", 2, 8)
+                .await
+                .expect("the reset runs within 8 s, not after the slow action");
+        }
+        During::Unassign => {
+            c.assign(&[]);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !f.log().contains(&("exit".into(), "win-1".into())) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the unassigned sandbox was not torn down in 10 s"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        During::Cutoff => {
+            c.report_within("win-1", "failed", 1, 12)
+                .await
+                .expect("the cutoff stops the sandbox while the action is in flight");
+        }
+    }
+    let posted: Vec<serde_json::Value> = f.actions[0]
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, b)| b["name"].clone())
+        .collect();
+    assert_eq!(posted, ["task_manager"], "the rest of the batch is dropped");
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_during_a_slow_action_relaunches_at_once() {
+    during_a_slow_action(During::Reset).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unassignment_during_a_slow_action_tears_down_at_once() {
+    during_a_slow_action(During::Unassign).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cutoff_during_a_slow_action_stops_the_sandbox() {
+    during_a_slow_action(During::Cutoff).await;
+}
+
+/// Every teardown stops the bridge's container through podman, whatever ended the launch: the
+/// `podman run` client dying before the desktop, or the VM dying under a container that
+/// ignores SIGTERM. (The agent stopping is a_stuck_bridge_container_is_stopped_through_podman.)
+async fn no_container_outlives(env: &[(&str, &str)]) {
+    let f = fake_with(1, env);
+    let (installed, expires) = recent();
+    let w = f.windows(1, f.image(&installed, &expires));
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    let failed = c
+        .report_within("win-1", "failed", 1, 20)
+        .await
+        .expect("the launch fails");
+    assert!(failed.retry_in_ms.is_some(), "{failed:?}");
+    let log = f.log();
+    assert!(
+        log.contains(&("podman_rm".into(), "fleet-win-1-bridge".into())),
+        "the container was not removed: {log:?}"
+    );
+    assert!(
+        f.containers().is_empty(),
+        "a container outlived its launch: {:?}",
+        f.containers()
+    );
+    c.close().await;
+}
+
+#[tokio::test]
+async fn a_bridge_client_that_dies_at_startup_leaves_no_container() {
+    no_container_outlives(&[("FAKE_BRIDGE_CLIENT_DIES", "1")]).await;
+}
+
+#[tokio::test]
+async fn a_vm_that_dies_under_a_stuck_bridge_leaves_no_container() {
+    no_container_outlives(&[("FAKE_DIE_AFTER_SECS", "1"), ("FAKE_BRIDGE_STUCK", "1")]).await;
 }

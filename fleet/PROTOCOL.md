@@ -1278,9 +1278,10 @@ none is placed). For each slot the agent reconciles:
   and reports `running` once the bridge's `/health` says `windows.state` is `desktop`. Each
   action of the running launch with a `seq` above the last carried out is posted once, in
   order, to the bridge (`POST /action {"name": "<action>"}`, the scene token as the bearer
-  token); `reset` never appears (the coordinator relaunches the sandbox). A new generation, or
-  the sandbox leaving the assignment, ends a batch at once, the request in flight included,
-  so a slow action never holds back a reset or a borrow's end. A sandbox whose VM or
+  token); `reset` never appears (the coordinator relaunches the sandbox). An action is one of the
+  sandbox's events: a new generation, the sandbox leaving the assignment or its image's refusal
+  ends the batch at once, the request in flight included, so a slow action never holds back a
+  reset, a borrow's end, a teardown or the cutoff. A sandbox whose VM or
   bridge exits, or whose bridge reports `failed`, is relaunched with the slots' backoff.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
@@ -1538,8 +1539,10 @@ container without ports or certificate, with `--volume <state dir>/<image id>:/r
 --env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `logon`; the image's entrypoint
 is the bridge, so the mode is its only argument. A bridge is stopped through podman, since the
 container outlives a killed `podman run` client: `podman stop -t 10 <name>`, `podman rm -f
-<name>`, then the client is awaited (killed after 5 s more). A sandbox that replaces another
-on the same index starts only once the old one's VM and bridge have exited. Every fcvm and
+<name>`, then the client is awaited (killed after 5 s more). Every failure of a launch stops both its
+VM and its bridge this way. A sandbox that replaces another on the same index starts only once
+the old one's VM and bridge have exited, waiting as long as the steps of a teardown may take
+together (both podman commands, the client, the VM's grace and the SIGKILLs). Every fcvm and
 podman child is armed with `PR_SET_PDEATHSIG`.
 
 With `--aggregate-port` the agent runs `fcvm fleet aggregate --listen <publish ip>:<port>`
