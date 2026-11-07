@@ -774,6 +774,21 @@ fn host_ntp_servers() -> Vec<String> {
     addrs
 }
 
+/// The proxies a guest is given, at boot and at every restore: [`guest_proxies`] and the
+/// host's `no_proxy`. `env` reads one host variable.
+pub(crate) fn guest_proxy(
+    network_config: &crate::network::NetworkConfig,
+    network_mode: crate::firecracker::FcNetworkMode,
+    env: impl Fn(&str) -> Option<String>,
+) -> crate::commands::common::GuestProxy {
+    let (http_proxy, https_proxy) = guest_proxies(network_config, network_mode, |name| env(name));
+    crate::commands::common::GuestProxy {
+        http_proxy,
+        https_proxy,
+        no_proxy: env("no_proxy").or_else(|| env("NO_PROXY")),
+    }
+}
+
 /// The `(http_proxy, https_proxy)` URLs a guest is given: the network's proxy for each
 /// scheme (its HTTPS proxy, else its HTTP one, for HTTPS), or else the host's proxy
 /// variables (`env`), with the host name resolved to an address and a
@@ -924,14 +939,15 @@ pub(super) fn build_boot_plan_json(
         })
         .collect();
 
-    // Resolve proxy URLs — runtime behavior, not part of cache key.
-    let (http_proxy, https_proxy) =
-        guest_proxies(network_config, launch_config.network_mode, |name: &str| {
-            std::env::var(name).ok()
-        });
-    let no_proxy = std::env::var("no_proxy")
-        .or_else(|_| std::env::var("NO_PROXY"))
-        .ok();
+    // Resolve proxy URLs: runtime behavior, not part of the cache key. A restore gives
+    // the guest its own run's the same way (`RestoreIdentity::proxy`).
+    let crate::commands::common::GuestProxy {
+        http_proxy,
+        https_proxy,
+        no_proxy,
+    } = guest_proxy(network_config, launch_config.network_mode, |name: &str| {
+        std::env::var(name).ok()
+    });
 
     let (subuid_range, subgid_range) = if launch_config.user.is_some() {
         (get_host_subuid_range(), get_host_subgid_range())

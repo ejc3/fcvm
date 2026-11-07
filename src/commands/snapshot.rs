@@ -3673,6 +3673,11 @@ async fn cmd_snapshot_run_inner(
     let restore_identity = super::common::RestoreIdentity {
         host_ipv6: args.host_ipv6,
         dns: restore_document_dns(&snapshot_config.metadata, &resolvers, network_mode),
+        // This run's proxies, or none: the snapshot records none, and the guest takes
+        // these in place of whatever the run that made the snapshot had.
+        proxy: super::podman::guest_proxy(&network_config, network_mode, |name| {
+            std::env::var(name).ok()
+        }),
     };
     restore_identity.write_into(&mut restore_latest);
     let bootplan_socket = format!(
@@ -4639,7 +4644,12 @@ async fn cmd_snapshot_run_inner(
                     startup_rx = None;
 
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
-                        let startup_key = startup_snapshot_key(base_key, args.balloon, args.host_ipv6);
+                        let startup_key = startup_snapshot_key(
+                            base_key,
+                            args.balloon,
+                            args.host_ipv6,
+                            crate::commands::podman::host_proxy_identity().as_deref(),
+                        );
 
                         // Skip if startup snapshot already exists. Both backends take one
                         // (`create_podman_snapshot`): a Cloud Hypervisor clone saves a full

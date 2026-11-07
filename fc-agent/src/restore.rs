@@ -451,6 +451,9 @@ pub async fn handle_clone_restore(
     if let Some(ref dns) = identity.dns {
         network::apply_restore_dns(dns).context("restore phase host-identity resolvers")?;
     }
+    // The restoring run's proxies, or none, in place of the snapshot's: before the restore
+    // hook and before a pre-start restore's container starts, which inherits them.
+    crate::system::apply_proxy_settings(&identity.proxy);
     eprintln!(
         "[fc-agent] restore phase=host-identity epoch={restore_epoch} elapsed_ms={:.3}",
         elapsed_ms(identity_started)
@@ -1439,6 +1442,9 @@ mod tests {
         let dns = body
             .find("network::apply_restore_dns(dns).context(\"restore phase host-identity resolvers\")?")
             .expect("the restore path no longer gives the guest the restoring host's resolvers, or no longer fails closed when it cannot");
+        let proxy = body
+            .find("crate::system::apply_proxy_settings(&identity.proxy);")
+            .expect("the restore path no longer gives the guest the restoring run's proxies");
         let boundary = body
             .find("crate::snapshot_network::restore_snapshot_network(")
             .expect("the restore path no longer runs the snapshot boundary");
@@ -1452,12 +1458,13 @@ mod tests {
             identity < fail_closed
                 && fail_closed < boundary
                 && dns < boundary
+                && proxy < boundary
                 && boundary < clock
                 && clock < publish,
             "the host identity and resolvers must be replaced before the boundary opens \
              egress, the clock steps and the hook runs: identity={identity} \
-             fail_closed={fail_closed} dns={dns} boundary={boundary} clock={clock} \
-             publish={publish}"
+             fail_closed={fail_closed} dns={dns} proxy={proxy} boundary={boundary} \
+             clock={clock} publish={publish}"
         );
     }
 

@@ -36,10 +36,16 @@ pub async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig>
 /// launches the restoring host's, but a startup snapshot holds a container that
 /// already runs with one in its environment, which a restore cannot change. So
 /// its name carries the address, and a run without one keeps the name it had.
+///
+/// The proxy settings follow the same rule (`proxy`, from [`host_proxy_identity`]): a
+/// restore gives the guest the restoring run's proxies, or none, but a container that
+/// already runs holds the proxy variables it started with. So the name carries a digest
+/// of them, never the URLs, and a run without a proxy keeps the name it had.
 pub fn startup_snapshot_key(
     base_key: &str,
     balloon: Option<u32>,
     host_ipv6: Option<std::net::Ipv6Addr>,
+    proxy: Option<&str>,
 ) -> String {
     let mut name = base_key.to_string();
     if let Some(target_mib) = balloon {
@@ -48,8 +54,44 @@ pub fn startup_snapshot_key(
     if let Some(address) = host_ipv6 {
         name.push_str(&format!("-host{:032x}", u128::from(address)));
     }
+    if let Some(digest) = proxy {
+        name.push_str(&format!("-proxy{digest}"));
+    }
     name.push_str("-startup");
     name
+}
+
+/// The proxy variables a guest's proxies are made from (`vm_config::guest_proxies`).
+pub const PROXY_VARIABLES: [&str; 6] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// A digest of the run's proxy variables for a startup snapshot's name (12 hex digits of
+/// SHA-256), or None when none is set. `env` reads one variable.
+pub fn proxy_identity(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut any = false;
+    for name in PROXY_VARIABLES {
+        if let Some(value) = env(name) {
+            any = true;
+            hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    any.then(|| hex::encode(hasher.finalize())[..12].to_string())
+}
+
+/// [`proxy_identity`] of this process's environment.
+pub fn host_proxy_identity() -> Option<String> {
+    proxy_identity(|name| std::env::var(name).ok())
 }
 
 /// What to do when a generation is already installed at the target name.

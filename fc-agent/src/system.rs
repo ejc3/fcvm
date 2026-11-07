@@ -337,32 +337,57 @@ pub async fn get_clone_id() -> String {
 
 /// Save proxy settings from plan to file and environment.
 pub fn save_proxy_settings(plan: &Plan) {
+    apply_proxy_settings(&crate::types::RestoreProxy {
+        http_proxy: plan.http_proxy.clone(),
+        https_proxy: plan.https_proxy.clone(),
+        no_proxy: plan.no_proxy.clone(),
+    });
+}
+
+/// Make `proxy` the guest's proxy settings: the agent's environment, which the container
+/// podman starts inherits, and [`PROXY_SETTINGS_FILE`], which every exec reads. A
+/// variable `proxy` does not set is removed from both, so a restored guest keeps none of
+/// the snapshot's.
+pub fn apply_proxy_settings(proxy: &crate::types::RestoreProxy) {
     use std::io::Write as _;
 
     let mut content = String::new();
-    let mut env_vars = Vec::new();
-
-    if let Some(ref proxy) = plan.http_proxy {
-        content.push_str(&format!("http_proxy={}\n", proxy));
-        content.push_str(&format!("HTTP_PROXY={}\n", proxy));
-        env_vars.push(("http_proxy", proxy.clone()));
-        env_vars.push(("HTTP_PROXY", proxy.clone()));
-    }
-    if let Some(ref proxy) = plan.https_proxy {
-        content.push_str(&format!("https_proxy={}\n", proxy));
-        content.push_str(&format!("HTTPS_PROXY={}\n", proxy));
-        env_vars.push(("https_proxy", proxy.clone()));
-        env_vars.push(("HTTPS_PROXY", proxy.clone()));
-    }
-    if let Some(ref no_proxy) = plan.no_proxy {
-        content.push_str(&format!("no_proxy={}\n", no_proxy));
-        content.push_str(&format!("NO_PROXY={}\n", no_proxy));
-        env_vars.push(("no_proxy", no_proxy.clone()));
-        env_vars.push(("NO_PROXY", no_proxy.clone()));
+    let mut env_vars: Vec<(&str, String)> = Vec::new();
+    for (lower, upper, value) in [
+        ("http_proxy", "HTTP_PROXY", &proxy.http_proxy),
+        ("https_proxy", "HTTPS_PROXY", &proxy.https_proxy),
+        ("no_proxy", "NO_PROXY", &proxy.no_proxy),
+    ] {
+        if let Some(value) = value {
+            for key in [lower, upper] {
+                content.push_str(&format!("{key}={value}\n"));
+                env_vars.push((key, value.clone()));
+            }
+        }
     }
 
+    for key in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        if !env_vars.iter().any(|(set, _)| *set == key) {
+            std::env::remove_var(key);
+        }
+    }
     if content.is_empty() {
-        eprintln!("[fc-agent] no proxy settings configured");
+        match std::fs::remove_file(PROXY_SETTINGS_FILE) {
+            Ok(()) => eprintln!("[fc-agent] no proxy settings configured; removed {PROXY_SETTINGS_FILE}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("[fc-agent] no proxy settings configured")
+            }
+            Err(e) => eprintln!(
+                "[fc-agent] WARNING: failed to remove the proxy settings file {PROXY_SETTINGS_FILE}: {e}"
+            ),
+        }
         return;
     }
 
