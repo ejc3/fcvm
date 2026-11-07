@@ -3927,7 +3927,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout).await;
+                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -3963,7 +3963,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             };
             let prepared = finish_prepare(operation, cleanup)?;
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout).await;
+                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -3979,7 +3979,11 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
 /// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
 /// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
 /// A recording that fails is logged and the prepare still succeeds: the set is a hint.
-async fn record_working_set(snapshot_key: &str, timeout: std::time::Duration) {
+async fn record_working_set(
+    snapshot_key: &str,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) {
     let memory = paths::snapshot_dir().join(snapshot_key).join("memory.bin");
     let sidecar = crate::uffd::WorkingSetStore::path_for(&memory);
     if sidecar.exists() {
@@ -3990,7 +3994,7 @@ async fn record_working_set(snapshot_key: &str, timeout: std::time::Duration) {
         return;
     }
     let started = std::time::Instant::now();
-    match recording_restore(snapshot_key, timeout).await {
+    match recording_restore(snapshot_key, timeout, cancel).await {
         Ok(()) if sidecar.exists() => info!(
             snapshot_key,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -4013,25 +4017,51 @@ async fn record_working_set(snapshot_key: &str, timeout: std::time::Duration) {
 /// The `fcvm snapshot run` that records a prepared snapshot's working set: this binary,
 /// stdout discarded so the prepare's own JSON record stays alone on it, killed when this
 /// process exits or `timeout` passes.
-async fn recording_restore(snapshot_key: &str, timeout: std::time::Duration) -> Result<()> {
+async fn recording_restore(
+    snapshot_key: &str,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let exe = std::env::current_exe().context("locating the fcvm binary")?;
-    let name = format!("record-{}-{}", std::process::id(), snapshot_key);
-    let mut command = recording_restore_command(&exe, snapshot_key, &name);
+    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
+    run_recording(&mut command, timeout, cancel).await
+}
+
+/// The recording clone's VM name: `record-<this pid>`. Not built from the snapshot key, which
+/// may hold a dot or run past the 63 characters a VM name allows (a startup key with a host
+/// address is 57 characters).
+fn recording_vm_name() -> String {
+    format!("record-{}", std::process::id())
+}
+
+/// Run the recording restore to its end, or stop it when `timeout` passes or the prepare is
+/// cancelled: SIGTERM, so the clone tears down, then SIGKILL after 10 s.
+async fn run_recording(
+    command: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let mut child = command.spawn().context("spawning the recording restore")?;
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(status) => {
+    let why = tokio::select! {
+        status = child.wait() => {
             let status = status.context("waiting for the recording restore")?;
-            anyhow::ensure!(
-                status.success(),
-                "the recording restore exited with {status}"
-            );
-            Ok(())
+            anyhow::ensure!(status.success(), "the recording restore exited with {status}");
+            return Ok(());
         }
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("the recording restore did not finish within {timeout:?}")
-        }
+        _ = tokio::time::sleep(timeout) => format!("did not finish within {timeout:?}"),
+        _ = cancel.cancelled() => "was interrupted with the prepare".to_string(),
+    };
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(2) on the child this function spawned and has not reaped.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
+    if tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    bail!("the recording restore {why}")
 }
 
 fn recording_restore_command(
@@ -4150,11 +4180,50 @@ mod tests {
         );
         for branch in prepare.split("record_working_set(&prepared").skip(1) {
             assert!(
-                branch.find("publish_prepared_snapshot_gated").is_some(),
+                branch.contains("publish_prepared_snapshot_gated"),
                 "the record comes before the publish"
             );
         }
         assert!(prepare.contains("let record = !args.no_record_working_set;"));
+    }
+
+    /// The recording clone's name is a valid VM name whatever the snapshot key. Built from
+    /// the key, as it was, a dotted tag or a startup key with a host address (57 characters)
+    /// made an invalid name, and the recording failed before it restored anything.
+    #[test]
+    fn the_recording_clone_has_a_valid_name_for_any_snapshot_key() {
+        let long_key = format!("{}-host{:032x}-startup", "abc123def456", u128::MAX);
+        assert!(crate::state::validate_vm_name(&format!("record-1-{long_key}")).is_err());
+        assert!(crate::state::validate_vm_name("record-1-my.tag").is_err());
+        crate::state::validate_vm_name(&recording_vm_name()).expect("a valid VM name");
+        let source = include_str!("mod.rs");
+        let restore = &source[source.find("async fn recording_restore(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(restore.contains("&recording_vm_name()"));
+    }
+
+    /// A prepare cancelled while its recording restore runs stops that restore and returns,
+    /// instead of waiting out the ready timeout. Before, the wait observed only the timeout.
+    #[tokio::test]
+    async fn a_cancelled_prepare_stops_its_recording_restore() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").kill_on_drop(true);
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancelling.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = run_recording(&mut command, std::time::Duration::from_secs(20), &cancel)
+            .await
+            .expect_err("a cancelled recording is an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the cancelled recording ran for {:?}",
+            started.elapsed()
+        );
+        assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
     }
 
     fn test_args() -> RunArgs {
