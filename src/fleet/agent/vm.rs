@@ -544,7 +544,7 @@ fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
 
 /// The kernel sends the child SIGTERM when the agent thread that spawned it dies. The
 /// spawning threads are the runtime's workers, which live as long as the agent.
-fn arm_pdeathsig(command: &mut std::process::Command) {
+pub(super) fn arm_pdeathsig(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     let agent = std::process::id() as libc::pid_t;
     // SAFETY: runs in the forked child before exec and makes two async-signal-safe calls;

@@ -8,7 +8,7 @@
 //! The gold flow runs once per image id when the agent starts, unless the snapshot and the
 //! desktop reference it leaves are already there: cold boot `win-gold`, wait until fcvm reports
 //! it healthy (Remote Desktop answers and the guest agent acknowledged its clock), log on with
-//! the bridge (`windows-bridge logon`, which saves the desktop it reached as the reference and
+//! the bridge (its `logon` mode, which saves the desktop it reached as the reference and
 //! disconnects), wait until the VM's processes use under `--windows-idle-cpu` of one core for
 //! 10 s in a row, `fcvm snapshot create --stop`. Every sandbox then restores from it at once.
 //!
@@ -130,6 +130,27 @@ pub fn verdict(installed: DateTime<Utc>, expires: DateTime<Utc>, now: DateTime<U
     }
 }
 
+/// What names one installation of an image: its id, and a hash of its manifest (which holds
+/// the installation and expiry dates) and of its sandbox password. The id hashes the build's
+/// recipe only, so a rebuild of the same recipe is a new installation with the same id; a
+/// gold snapshot of the old one would log on with the wrong password and be aged by the
+/// wrong dates.
+pub fn gold_key(image_dir: &Path, manifest: &Manifest) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for f in ["manifest.json", "sandbox-password"] {
+        let p = image_dir.join(f);
+        let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    Ok(format!(
+        "{}-{}",
+        manifest.id,
+        &hex::encode(h.finalize())[..12]
+    ))
+}
+
 /// The gold snapshot's tag for an image: one per image id, so a new image makes a new one and
 /// an agent that restarts reuses the one it made.
 pub fn gold_tag(image_id: &str) -> String {
@@ -198,13 +219,13 @@ pub fn restore_argv(tag: &str, name: &str) -> Vec<String> {
 /// How the bridge is run: logging on for the gold snapshot, or serving a sandbox.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BridgeMode {
-    /// `windows-bridge logon`: log on, wait for the desktop, save it to `ref_out` (in
+    /// The bridge's `logon` mode: log on, wait for the desktop, save it to `ref_out` (in
     /// `state_dir`), disconnect, exit.
     Logon {
         state_dir: PathBuf,
         ref_out: PathBuf,
     },
-    /// `windows-bridge serve`: connect to the session, stream it, carry out actions.
+    /// The bridge's `serve` mode: connect to the session, stream it, carry out actions.
     Serve {
         desktop_ref: PathBuf,
         /// The sandbox's HTTP port on `publish_ip`, and its TLS port there and on its own
@@ -258,7 +279,6 @@ pub fn bridge_argv(
                 "--env",
                 &format!("DESKTOP_REF_OUT={IN_STATE}/{file}"),
                 image,
-                "windows-bridge",
                 "logon",
             ]));
         }
@@ -298,7 +318,8 @@ pub fn bridge_argv(
                     a.extend(strings(&["--publish", &format!("[{v6}]:{PORT}:{PORT}")]));
                 }
             }
-            a.extend(strings(&[image, "windows-bridge", "serve"]));
+            // The image's entrypoint is the bridge; its argument is the mode.
+            a.extend(strings(&[image, "serve"]));
         }
     }
     a
@@ -540,6 +561,12 @@ pub struct WindowsCfg {
     pub poll: Duration,
     /// The certificate directory, when the agent has a certificate (`--tls-secret`).
     pub tls_dir: Option<PathBuf>,
+    /// The installation the gold snapshot is made of and reused for ([`gold_key`]).
+    pub gold_key: String,
+    /// How often a running sandbox checks that its image may still run.
+    pub image_check: Duration,
+    /// `podman stop -t`: how long a bridge container has to stop on SIGTERM.
+    pub bridge_stop: Duration,
 }
 
 impl WindowsCfg {
@@ -626,8 +653,13 @@ pub struct Windows {
     http: reqwest::Client,
     gold: watch::Receiver<GoldState>,
     sandboxes: BTreeMap<String, Handle>,
-    retired: Vec<JoinHandle<()>>,
-    tasks: Vec<JoinHandle<()>>,
+    /// Supervisors told to stop, by the host index they held: a new sandbox on that index
+    /// starts only once its old one has stopped.
+    retired: Vec<(u32, JoinHandle<()>)>,
+    /// Tells the gold flow the agent is stopping.
+    stop: watch::Sender<bool>,
+    flow: JoinHandle<()>,
+    reports: JoinHandle<()>,
 }
 
 impl Windows {
@@ -640,11 +672,12 @@ impl Windows {
         http: reqwest::Client,
     ) -> Windows {
         let (gold_tx, gold) = watch::channel(GoldState::Building);
+        let (stop, stop_rx) = watch::channel(false);
         let flow = {
             let cfg = cfg.clone();
             let agent = agent.clone();
             tokio::spawn(async move {
-                let r = gold_flow(&cfg, &agent).await;
+                let r = gold_flow(&cfg, &agent, stop_rx.clone()).await;
                 let state = match r {
                     Ok(tag) => {
                         tracing::info!(%tag, "the gold snapshot is ready");
@@ -658,7 +691,10 @@ impl Windows {
                 };
                 gold_tx.send_replace(state);
                 // Kept until the agent stops, so the receivers see the outcome, not a close.
-                gold_tx.closed().await;
+                tokio::select! {
+                    _ = gold_tx.closed() => {}
+                    _ = stopping(stop_rx) => {}
+                }
             })
         };
         let reports = {
@@ -695,7 +731,9 @@ impl Windows {
             gold,
             sandboxes: BTreeMap::new(),
             retired: Vec::new(),
-            tasks: vec![flow, reports],
+            stop,
+            flow,
+            reports,
         }
     }
 
@@ -715,9 +753,9 @@ impl Windows {
         for id in gone {
             let h = self.sandboxes.remove(&id).unwrap();
             drop(h.desired);
-            self.retired.push(h.task);
+            self.retired.push((h.index, h.task));
         }
-        self.retired.retain(|t| !t.is_finished());
+        self.retired.retain(|(_, t)| !t.is_finished());
         for a in list {
             let Some(w) = &a.windows else { continue };
             let want = Desired::of(a.generation, w);
@@ -747,7 +785,13 @@ impl Windows {
                 out: self.out.clone(),
                 http: self.http.clone(),
             };
-            let task = tokio::spawn(supervise(ctx, rx, self.gold.clone()));
+            // The index's ports and address are free once its old sandbox has stopped.
+            let (before, kept) = std::mem::take(&mut self.retired)
+                .into_iter()
+                .partition(|(i, _)| *i == w.index);
+            self.retired = kept;
+            let before = before.into_iter().map(|(_, t)| t).collect();
+            let task = tokio::spawn(supervise(ctx, rx, self.gold.clone(), before));
             self.sandboxes.insert(
                 a.id.clone(),
                 Handle {
@@ -762,27 +806,45 @@ impl Windows {
     /// Stop every sandbox and wait until each VM and bridge has exited; a gold flow in
     /// progress stops with its VM.
     pub async fn stop(mut self) {
+        self.stop.send_replace(true);
         for (_, h) in std::mem::take(&mut self.sandboxes) {
             drop(h.desired);
-            self.retired.push(h.task);
+            self.retired.push((h.index, h.task));
         }
-        for t in self.retired {
+        for (_, t) in self.retired {
             let _ = t.await;
         }
-        for t in self.tasks {
-            t.abort();
-            let _ = t.await;
+        // The gold flow stops its VM and bridge itself; aborted only past its budget.
+        let budget = self.agent.stop_grace + self.cfg.bridge_stop + Duration::from_secs(60);
+        let mut flow = self.flow;
+        if tokio::time::timeout(budget, &mut flow).await.is_err() {
+            tracing::warn!(
+                "the gold flow did not stop in {} s; aborting it",
+                budget.as_secs()
+            );
+            flow.abort();
+            let _ = flow.await;
         }
+        self.reports.abort();
+        let _ = self.reports.await;
     }
+}
+
+/// A command for a child that is not a VM or a bridge (`fcvm ls`, `fcvm snapshot create`,
+/// `podman stop` and `rm`), armed with PR_SET_PDEATHSIG as every VM is, so none outlives a
+/// killed agent.
+fn child(program: &Path) -> tokio::process::Command {
+    let mut c = std::process::Command::new(program);
+    c.stdin(std::process::Stdio::null());
+    super::vm::arm_pdeathsig(&mut c);
+    let mut c = tokio::process::Command::from(c);
+    c.kill_on_drop(true);
+    c
 }
 
 /// Run `fcvm ls --json` and find the VM.
 async fn ls(fcvm: &Path, name: &str, pid: u32) -> Option<Listed> {
-    let run = tokio::process::Command::new(fcvm)
-        .args(["ls", "--json"])
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
+    let run = child(fcvm).args(["ls", "--json"]).output();
     let out = tokio::time::timeout(Duration::from_secs(10), run)
         .await
         .ok()?
@@ -817,27 +879,55 @@ async fn wait_healthy(
     }
 }
 
-async fn gold_flow(cfg: &WindowsCfg, agent: &AgentCfg) -> Result<String> {
-    let id = &cfg.manifest.id;
-    let tag = gold_tag(id);
-    if gold_ready(&cfg.snapshot_dir, &cfg.state_dir, id) {
+/// Make (or reuse) the gold snapshot. Every way out, a failure, success and the agent
+/// stopping included, stops the gold VM and the logon bridge and waits for both, escalating
+/// to SIGKILL, so none is left running unsupervised.
+async fn gold_flow(
+    cfg: &WindowsCfg,
+    agent: &AgentCfg,
+    stop: watch::Receiver<bool>,
+) -> Result<String> {
+    let tag = gold_tag(&cfg.gold_key);
+    if gold_ready(&cfg.snapshot_dir, &cfg.state_dir, &cfg.gold_key) {
         tracing::info!(%tag, "reusing the gold snapshot");
         return Ok(tag);
     }
+    let mut kids = GoldChildren::default();
+    let r = tokio::select! {
+        r = gold_steps(cfg, agent, &tag, &mut kids) => r,
+        _ = stopping(stop) => Err(anyhow::anyhow!("the agent is stopping")),
+    };
+    if let Some(b) = kids.bridge.as_mut() {
+        b.stop(cfg).await;
+    }
+    if let Some(vm) = kids.vm.as_mut() {
+        vm.stop(agent.stop_grace).await;
+    }
+    r
+}
+
+async fn gold_steps(
+    cfg: &WindowsCfg,
+    agent: &AgentCfg,
+    tag: &str,
+    kids: &mut GoldChildren,
+) -> Result<String> {
+    let id = &cfg.gold_key;
+    let tag = tag.to_string();
     let dir = cfg.state_dir.join(id);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let ref_out = desktop_ref(&cfg.state_dir, id);
     let _ = std::fs::remove_file(&ref_out);
     let t0 = Instant::now();
     tracing::info!(%tag, image = %cfg.image_dir.display(), "making the gold snapshot");
-    let mut vm = Vm::spawn_args(
+    let vm = kids.vm.insert(Vm::spawn_args(
         &agent.fcvm,
         &cold_boot_argv(GOLD_VM, &cfg.image_dir),
         GOLD_VM,
-    )?;
+    )?);
     let rdp = wait_healthy(
         &agent.fcvm,
-        &mut vm,
+        vm,
         GOLD_VM,
         cfg.gold_healthy_deadline,
         cfg.poll,
@@ -847,32 +937,28 @@ async fn gold_flow(cfg: &WindowsCfg, agent: &AgentCfg) -> Result<String> {
         secs = t0.elapsed().as_secs(),
         "the gold VM is healthy; logging on"
     );
-    let mut bridge = Vm::spawn_args(
-        &cfg.podman,
-        &bridge_argv(
-            "fleet-win-gold-bridge",
-            &cfg.bridge_image,
-            &rdp,
-            &cfg.password(),
-            &BridgeMode::Logon {
-                state_dir: dir.clone(),
-                ref_out: ref_out.clone(),
-            },
-        ),
-        "win-gold-bridge",
-    )?;
+    let bridge = kids.bridge.insert(Bridge::spawn(
+        cfg,
+        "fleet-win-gold-bridge",
+        &rdp,
+        &BridgeMode::Logon {
+            state_dir: dir.clone(),
+            ref_out: ref_out.clone(),
+        },
+    )?);
     tokio::select! {
-        status = bridge.exited() => {
+        status = bridge.client.exited() => {
             if !status.success() {
-                bail!("the bridge's logon failed ({status}): {}", bridge.tail());
+                bail!("the bridge's logon failed ({status}): {}", bridge.client.tail());
             }
         }
         status = vm.exited() => bail!("fcvm exited ({status}) during the logon; fcvm said: {}", vm.tail()),
         _ = tokio::time::sleep(cfg.logon_deadline) => {
-            bridge.stop(Duration::from_secs(10)).await;
-            bail!("the bridge did not reach the desktop in {} s: {}", cfg.logon_deadline.as_secs(), bridge.tail());
+            bail!("the bridge did not reach the desktop in {} s: {}", cfg.logon_deadline.as_secs(), bridge.client.tail());
         }
     }
+    // It exited 0: its container is gone (`--rm`).
+    kids.bridge = None;
     if !ref_out.is_file() {
         bail!(
             "the bridge's logon saved no desktop reference at {}",
@@ -915,10 +1001,8 @@ async fn gold_flow(cfg: &WindowsCfg, agent: &AgentCfg) -> Result<String> {
         secs = t0.elapsed().as_secs(),
         "the desktop is idle; taking the snapshot"
     );
-    let run = tokio::process::Command::new(&agent.fcvm)
+    let run = child(&agent.fcvm)
         .args(snapshot_argv(vm.pid, &tag))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
         .output();
     let out = tokio::time::timeout(cfg.snapshot_deadline, run)
         .await
@@ -948,6 +1032,68 @@ async fn gold_flow(cfg: &WindowsCfg, agent: &AgentCfg) -> Result<String> {
     Ok(tag)
 }
 
+/// A bridge container and its `podman run` client. The container is podman's (conmon keeps
+/// it), so killing the client does not stop it: it is stopped through podman by its name, one
+/// of its own per launch.
+struct Bridge {
+    client: Vm,
+    name: String,
+}
+
+impl Bridge {
+    fn spawn(cfg: &WindowsCfg, prefix: &str, rdp: &Path, mode: &BridgeMode) -> Result<Bridge> {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("{prefix}-{}", &nonce[..8]);
+        let argv = bridge_argv(&name, &cfg.bridge_image, rdp, &cfg.password(), mode);
+        Ok(Bridge {
+            client: Vm::spawn_args(&cfg.podman, &argv, &name)?,
+            name,
+        })
+    }
+
+    /// `podman stop -t <bridge_stop>` (SIGTERM, then SIGKILL), `podman rm -f`, then the client
+    /// is awaited, and killed if it still has not exited. Returns once the client is reaped.
+    async fn stop(&mut self, cfg: &WindowsCfg) {
+        let secs = cfg.bridge_stop.as_secs().max(1).to_string();
+        let budget = cfg.bridge_stop + Duration::from_secs(20);
+        for args in [
+            vec!["stop", "-t", secs.as_str(), self.name.as_str()],
+            vec!["rm", "-f", self.name.as_str()],
+        ] {
+            let run = child(&cfg.podman).args(&args).output();
+            match tokio::time::timeout(budget, run).await {
+                Ok(Ok(o)) if o.status.success() => {}
+                Ok(Ok(o)) => {
+                    tracing::debug!(bridge = %self.name, cmd = args[0], status = %o.status, out = %String::from_utf8_lossy(&o.stderr).trim(), "podman refused")
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(bridge = %self.name, cmd = args[0], error = %e, "podman did not start")
+                }
+                Err(_) => {
+                    tracing::warn!(bridge = %self.name, cmd = args[0], "podman timed out")
+                }
+            }
+        }
+        self.client.stop(Duration::from_secs(5)).await;
+    }
+}
+
+/// What the gold flow has started, stopped and awaited on every way out of it.
+#[derive(Default)]
+struct GoldChildren {
+    vm: Option<Vm>,
+    bridge: Option<Bridge>,
+}
+
+/// Resolves once the agent is stopping (or nothing can tell it to any more).
+async fn stopping(mut stop: watch::Receiver<bool>) {
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 struct Sandbox {
     id: String,
     place: Place,
@@ -959,7 +1105,7 @@ struct Sandbox {
 
 struct Running {
     vm: Vm,
-    bridge: Vm,
+    bridge: Bridge,
     generation: u64,
     started: Instant,
     actions_done: u64,
@@ -1027,29 +1173,44 @@ impl Sandbox {
     }
 
     async fn stop(&self, r: &mut Running) {
-        r.bridge.stop(Duration::from_secs(10)).await;
+        r.bridge.stop(&self.cfg).await;
         r.vm.stop(self.agent.stop_grace).await;
     }
 
     /// Post each action of the running launch not yet carried out to the bridge, oldest
     /// first, each once. A failed one is logged and not tried again.
-    async fn run_actions(&self, r: &mut Running, want: &Desired) {
+    /// A reset, the end of a borrow or the sandbox's removal (its desired generation moving,
+    /// or its sender gone) ends the batch at once, the action in flight included: the rest is
+    /// for a launch that is going away. Returns whether the desired state changed meanwhile,
+    /// so the caller looks at it again.
+    async fn run_actions(&self, r: &mut Running, desired: &mut watch::Receiver<Desired>) -> bool {
+        let want = desired.borrow().clone();
+        let moved = |d: &watch::Receiver<Desired>| d.borrow().generation != r.generation;
         for a in &want.actions {
             if a.seq <= r.actions_done || a.generation != r.generation {
                 continue;
+            }
+            if moved(desired) || desired.has_changed().is_err() {
+                return true;
             }
             r.actions_done = a.seq;
             let Some(body) = action_body(a.action) else {
                 continue;
             };
-            let sent = self
+            let send = self
                 .agent
                 .scene_token
                 .authorize(self.http.post(self.url("/action")))
                 .timeout(ACTION_TIMEOUT)
                 .json(&body)
-                .send()
-                .await;
+                .send();
+            let sent = tokio::select! {
+                sent = send => sent,
+                _ = generation_moves(desired, r.generation) => {
+                    tracing::info!(sandbox = %self.id, action = a.action.as_str(), seq = a.seq, "the sandbox is being reset; its remaining actions are dropped");
+                    return true;
+                }
+            };
             match sent {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!(sandbox = %self.id, action = a.action.as_str(), seq = a.seq, "sandbox action done")
@@ -1062,6 +1223,7 @@ impl Sandbox {
                 }
             }
         }
+        *desired.borrow() != want
     }
 
     async fn relaunch(
@@ -1114,21 +1276,15 @@ impl Sandbox {
             }
         }
         let mode = BridgeMode::Serve {
-            desktop_ref: desktop_ref(&self.cfg.state_dir, &self.cfg.manifest.id),
+            desktop_ref: desktop_ref(&self.cfg.state_dir, &self.cfg.gold_key),
             publish_ip: self.agent.publish_ip.clone(),
             port: self.place.port,
             tls_port: self.place.tls_port,
             ipv6: self.place.ipv6,
             tls_dir: self.cfg.tls_dir.clone(),
         };
-        let argv = bridge_argv(
-            &format!("fleet-{}-bridge", self.id),
-            &self.cfg.bridge_image,
-            &rdp,
-            &self.cfg.password(),
-            &mode,
-        );
-        let bridge = match Vm::spawn_args(&self.cfg.podman, &argv, &format!("{}-bridge", self.id)) {
+        let prefix = format!("fleet-{}-bridge-g{generation}", self.id);
+        let bridge = match Bridge::spawn(&self.cfg, &prefix, &rdp, &mode) {
             Ok(b) => b,
             Err(e) => {
                 vm.stop(self.agent.stop_grace).await;
@@ -1147,7 +1303,7 @@ impl Sandbox {
             Some(format!(
                 "{why}; fcvm said: {} | the bridge said: {}",
                 r.vm.tail(),
-                r.bridge.tail()
+                r.bridge.client.tail()
             ))
         };
         loop {
@@ -1171,10 +1327,10 @@ impl Sandbox {
                 }
                 status = r.vm.exited() => {
                     let e = fail(format!("fcvm exited ({status}) before the desktop"), &r);
-                    r.bridge.stop(Duration::from_secs(10)).await;
+                    r.bridge.stop(&self.cfg).await;
                     return Err(e);
                 }
-                status = r.bridge.exited() => {
+                status = r.bridge.client.exited() => {
                     let e = fail(format!("the bridge exited ({status}) before the desktop"), &r);
                     r.vm.stop(self.agent.stop_grace).await;
                     return Err(e);
@@ -1206,6 +1362,16 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Resolves when the desired generation is no longer `generation`, or the sandbox was
+/// unassigned.
+async fn generation_moves(desired: &mut watch::Receiver<Desired>, generation: u64) {
+    loop {
+        if desired.changed().await.is_err() || desired.borrow().generation != generation {
+            return;
+        }
+    }
+}
+
 /// Resolves when the sandbox's desired-state sender is dropped (it was unassigned).
 async fn removed(desired: &mut watch::Receiver<Desired>) {
     while desired.changed().await.is_ok() {}
@@ -1215,8 +1381,23 @@ async fn supervise(
     ctx: Sandbox,
     mut desired: watch::Receiver<Desired>,
     mut gold: watch::Receiver<GoldState>,
+    before: Vec<JoinHandle<()>>,
 ) {
+    // The sandbox that held this index stops its VM and bridge first (each stop is bounded and
+    // escalates to SIGKILL); one that overruns that is aborted.
+    let budget = ctx.agent.stop_grace + ctx.cfg.bridge_stop + Duration::from_secs(30);
+    for mut old in before {
+        if tokio::time::timeout(budget, &mut old).await.is_err() {
+            tracing::warn!(sandbox = %ctx.id, "the index's previous sandbox did not stop in {} s; aborting it", budget.as_secs());
+            old.abort();
+            let _ = old.await;
+        }
+    }
     let mut running: Option<Running> = None;
+    // A running sandbox stops once its image may no longer run (day 170, or a week before
+    // the evaluation expires), not only at its next relaunch.
+    let mut image_tick = tokio::time::interval(ctx.cfg.image_check);
+    image_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
@@ -1297,7 +1478,9 @@ async fn supervise(
             continue;
         }
         let r = running.as_mut().expect("not behind, so a sandbox runs");
-        ctx.run_actions(r, &want).await;
+        if ctx.run_actions(r, &mut desired).await {
+            continue;
+        }
         let died = tokio::select! {
             changed = desired.changed() => {
                 if changed.is_err() {
@@ -1305,8 +1488,18 @@ async fn supervise(
                 }
                 None
             }
+            _ = image_tick.tick() => {
+                if ctx.cfg.image(&GoldState::Ready(String::new()), Utc::now()).refused.is_some() {
+                    // The next pass stops nothing more and reports the refusal with its date.
+                    let mut r = running.take().unwrap();
+                    tracing::warn!(sandbox = %ctx.id, "the Windows image is refused; stopping the sandbox");
+                    ctx.stop(&mut r).await;
+                    continue;
+                }
+                None
+            }
             status = r.vm.exited() => Some(format!("fcvm exited ({status}): {}", r.vm.tail())),
-            status = r.bridge.exited() => Some(format!("the bridge exited ({status}): {}", r.bridge.tail())),
+            status = r.bridge.client.exited() => Some(format!("the bridge exited ({status}): {}", r.bridge.client.tail())),
             _ = health_tick.tick() => {
                 match ctx.health().await.as_ref().map(bridge_state) {
                     Some((Some("failed"), _)) => Some("the bridge lost the session".to_string()),
@@ -1419,6 +1612,66 @@ mod tests {
         assert!(!gold_ready(&snaps, &state, "abd"), "another image's");
     }
 
+    /// The image id hashes the build's recipe, so building the same recipe again gives the
+    /// same id with a new installation: a new sandbox password and new evaluation dates. A
+    /// gold snapshot of the old installation would log on with the wrong password and be aged
+    /// by the wrong dates, so the key changes with either file.
+    #[test]
+    fn a_reinstalled_image_names_a_new_gold_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |installed: &str, password: &str| {
+            std::fs::write(
+                dir.path().join("manifest.json"),
+                serde_json::json!({"id": "3f9c0a1b2c4d", "edition": "e", "build": "b",
+                    "installed_at": installed, "eval_expires": "2027-05-06T10:00:00+00:00"})
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("sandbox-password"), password).unwrap();
+            let m = Manifest::read(dir.path()).unwrap();
+            gold_key(dir.path(), &m).unwrap()
+        };
+        let first = write("2026-11-07T10:00:00Z", "Sbaaaa!7");
+        assert_eq!(
+            first,
+            write("2026-11-07T10:00:00Z", "Sbaaaa!7"),
+            "the same installation"
+        );
+        assert!(first.starts_with("3f9c0a1b2c4d-"), "{first}");
+        assert_ne!(
+            first,
+            write("2026-11-07T10:00:00Z", "Sbbbbb!7"),
+            "a new password"
+        );
+        assert_ne!(
+            first,
+            write("2026-12-01T10:00:00Z", "Sbaaaa!7"),
+            "a new installation date"
+        );
+        assert!(gold_tag(&first).len() <= 64);
+    }
+
+    /// Every process the Windows mode starts gets PR_SET_PDEATHSIG: a VM or bridge through
+    /// `Vm::spawn_args`, every other command through `child`. A raw `Command::new` here would
+    /// outlive a killed agent (a snapshot create still writing, a podman stop half done).
+    #[test]
+    fn every_child_the_windows_agent_starts_dies_with_it() {
+        let src = include_str!("windows.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let raw: Vec<usize> = code
+            .match_indices("Command::new(")
+            .map(|(i, _)| i)
+            .collect();
+        let helper = code
+            .find("fn child(")
+            .expect("windows.rs has its child helper");
+        let helper_end = helper + code[helper..].find("\n}\n").unwrap();
+        assert!(
+            raw.iter().all(|i| (helper..helper_end).contains(i)),
+            "a Command::new outside `child`, at bytes {raw:?}"
+        );
+    }
+
     #[test]
     fn a_manifest_needs_a_hex_id_and_both_dates() {
         let dir = tempfile::tempdir().unwrap();
@@ -1519,7 +1772,10 @@ mod tests {
         assert!(joined.contains("--env RDP_USER=sandbox"));
         assert!(joined.contains("--env RDP_PASSWORD_FILE=/run/windows/sandbox-password"));
         assert!(joined.contains("--volume /st/3f9c:/run/windows/state --env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm"));
-        assert!(joined.ends_with("localhost/windows-bridge:fleet windows-bridge logon"));
+        assert!(
+            joined.ends_with("localhost/windows-bridge:fleet logon"),
+            "{joined}"
+        );
         assert!(!joined.contains("--publish"), "the logon serves nothing");
 
         let serve = bridge_argv(
@@ -1542,7 +1798,10 @@ mod tests {
         assert!(joined.contains("--volume /run/fcvm-fleet/tls:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443"));
         assert!(joined.contains("--publish [2001:db8::10]:21105:443"));
         assert!(joined.contains("--publish [2001:db8:1::7]:443:443"));
-        assert!(joined.ends_with("localhost/windows-bridge:fleet windows-bridge serve"));
+        assert!(
+            joined.ends_with("localhost/windows-bridge:fleet serve"),
+            "{joined}"
+        );
         // Without a certificate the bridge serves plain HTTP on its port only.
         let plain = bridge_argv(
             "fleet-win-2-bridge",
@@ -1761,6 +2020,9 @@ mod tests {
             start_timeout: Duration::from_secs(300),
             poll: Duration::from_millis(100),
             tls_dir: None,
+            gold_key: "3f9c0a1b2c4d".into(),
+            image_check: Duration::from_secs(60),
+            bridge_stop: Duration::from_secs(10),
         }
     }
 

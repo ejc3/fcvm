@@ -298,6 +298,9 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 args.windows_idle_cpu
             );
             Some(windows::WindowsCfg {
+                gold_key: windows::gold_key(dir, &manifest)?,
+                image_check: Duration::from_secs(60),
+                bridge_stop: Duration::from_secs(10),
                 count: args.windows,
                 image_dir: dir.clone(),
                 manifest,

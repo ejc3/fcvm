@@ -7,6 +7,9 @@
 #   snapshot create --pid P --tag T --stop   writes $FAKE_SNAPSHOT_DIR/T/config.json and stops P
 #   ls --json                                every VM up, as fcvm lists them
 #
+#   FAKE_HEALTHY_SECS  time before a VM is listed healthy (default 0.2)
+#   FAKE_STOP_SECS     time a VM takes to stop after SIGTERM (default 0)
+#
 # It logs `<event> <name> <pid> <ns>` lines to $FAKE_FCVM_DIR/events.log and each VM's
 # arguments, one per line, to $FAKE_FCVM_DIR/args-<name>.
 set -u
@@ -48,6 +51,7 @@ done
 echo "$kind $name $$ $(date +%s%N)" >> "$log"
 printf '%s\n' "${argv[@]}" > "$dir/args-$name"
 stop() {
+    sleep "${FAKE_STOP_SECS:-0}"
     rm -f "$dir/ls/$$.json"
     echo "exit $name $$ $(date +%s%N)" >> "$log"
     exit 0

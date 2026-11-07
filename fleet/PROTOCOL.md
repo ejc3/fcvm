@@ -1151,7 +1151,8 @@ on the host's clock, the evaluation rules' verdict and the gold snapshot's state
 `ready`, `failed` with `gold_error`). Sent after the hello, whenever any of it changes (the age
 is read every minute), and again at the start of every connection. `warning` is set from 150
 days after `installed_at`; `refused` from 170 days, or from 7 days before `eval_expires`,
-whichever is first, and then every sandbox reports `failed` with it and none starts. The
+whichever is first, and then every sandbox reports `failed` with it and none starts; a running
+sandbox is stopped within a minute of it (the agent checks the image every minute). The
 coordinator logs a new warning, refusal or gold failure.
 
 ```json
@@ -1277,7 +1278,9 @@ none is placed). For each slot the agent reconciles:
   and reports `running` once the bridge's `/health` says `windows.state` is `desktop`. Each
   action of the running launch with a `seq` above the last carried out is posted once, in
   order, to the bridge (`POST /action {"name": "<action>"}`, the scene token as the bearer
-  token); `reset` never appears (the coordinator relaunches the sandbox). A sandbox whose VM or
+  token); `reset` never appears (the coordinator relaunches the sandbox). A new generation, or
+  the sandbox leaving the assignment, ends a batch at once, the request in flight included,
+  so a slow action never holds back a reset or a borrow's end. A sandbox whose VM or
   bridge exits, or whose bridge reports `failed`, is relaunched with the slots' backoff.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
@@ -1495,40 +1498,49 @@ metadata URL (IMDSv2) for `spot/instance-action` every 5 s.
 With `--windows N --windows-image <dir>` (Windows mode, an x86_64 host) the agent runs N
 Windows sandboxes from the image directory `fleet/windows/build-image.sh` made (`disk.raw`,
 `CLOUDHV.fd`, `sandbox-password`, `manifest.json`). At start it makes the gold snapshot,
-`win-gold-<image id>` (reused when the snapshot's `config.json` in `--windows-snapshot-dir`
-and the desktop reference in `--windows-state-dir/<image id>/desktop-ref.ppm` are both
-there):
+`win-gold-<key>`, where the key is the image id and the first 12 hex digits of a SHA-256 of
+`manifest.json` and `sandbox-password` (the id hashes the build's recipe only, so a rebuild of
+the same recipe is a new installation, with a new password and new dates, under the same id).
+It is reused when the snapshot's `config.json` in `--windows-snapshot-dir` and the desktop
+reference in `--windows-state-dir/<key>/desktop-ref.ppm` are both there. Otherwise:
 
 1. `fcvm vm run --name win-gold --firmware <dir>/CLOUDHV.fd --disk <dir>/disk.raw --cpu 2
    --mem 4096 --guest windows --health-port 3389`, until `fcvm ls --json` shows it `healthy`
    (600 s at most);
-2. the bridge in logon mode (`windows-bridge logon`, below, with `DESKTOP_REF_OUT`), which logs
+2. the bridge in logon mode (`logon`, below, with `DESKTOP_REF_OUT`), which logs
    on, saves the desktop it reached as the reference, disconnects and exits 0 (300 s);
 3. until the gold VM's processes (its fcvm and every process below it, from `/proc`) use
    under `--windows-idle-cpu` of one core (0.15) over every second of 10 s in a row (300 s; an
    idle disconnected desktop measured 0.12 to 0.13 of a core);
-4. `fcvm snapshot create --pid <pid> --tag win-gold-<image id> --stop`.
+4. `fcvm snapshot create --pid <pid> --tag win-gold-<key> --stop`.
 
 A step that fails reports the gold snapshot `failed` (`windows_image`) and every sandbox
-`failed` with it. Each sandbox's bridge runs in a container on the host, one per sandbox:
+`failed` with it. Every way out of the flow (success, a failure, the agent stopping) stops the
+gold VM and the logon container and waits for both before the outcome is reported. Each
+sandbox's bridge runs in a container on the host, one per sandbox, named afresh for every
+launch (`fleet-<slot>-bridge-g<generation>-<8 hex>`):
 
 ```
-podman run --rm --replace --pull=never --name fleet-<slot>-bridge
+podman run --rm --replace --pull=never --name fleet-<slot>-bridge-g<generation>-<8 hex>
   --volume <rdp_socket>:/run/windows/rdp.sock --volume <dir>/sandbox-password:/run/windows/sandbox-password:ro
   --env RDP_SOCKET=/run/windows/rdp.sock --env RDP_USER=sandbox --env RDP_PASSWORD_FILE=/run/windows/sandbox-password
   --volume <state dir>/<image id>/desktop-ref.ppm:/run/windows/desktop-ref.ppm:ro --env DESKTOP_REF=/run/windows/desktop-ref.ppm
   --env PORT=8080 --publish <publish ip>:<port>:8080
   [--volume <tls dir>:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443
    [--publish <publish ip>:<tls port>:443] [--publish [<ipv6>]:443:443]]
-  <--windows-bridge-image> windows-bridge serve
+  <--windows-bridge-image> serve
 ```
 
 with the ports a slot at its index would have (`--base-port`, `--tls-publish-base`, and with
 an IPv6 prefix its address, which the agent puts on the host's default IPv6 interface as for
 the aggregator); the scene token is in `tls.json`, as for a renderer. The logon is the same
 container without ports or certificate, with `--volume <state dir>/<image id>:/run/windows/state
---env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `windows-bridge logon`. Every
-fcvm and podman child is armed with `PR_SET_PDEATHSIG`.
+--env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `logon`; the image's entrypoint
+is the bridge, so the mode is its only argument. A bridge is stopped through podman, since the
+container outlives a killed `podman run` client: `podman stop -t 10 <name>`, `podman rm -f
+<name>`, then the client is awaited (killed after 5 s more). A sandbox that replaces another
+on the same index starts only once the old one's VM and bridge have exited. Every fcvm and
+podman child is armed with `PR_SET_PDEATHSIG`.
 
 With `--aggregate-port` the agent runs `fcvm fleet aggregate --listen <publish ip>:<port>`
 as a child (it dies with the agent, and is restarted with backoff if it exits), posts it

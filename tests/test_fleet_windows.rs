@@ -62,7 +62,12 @@ async fn action(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let slow = body["name"] == "task_manager";
     b.actions.lock().unwrap().push((auth, body));
+    // One slow action, longer than the agent's 20 s for one.
+    if slow {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
     StatusCode::OK
 }
 
@@ -90,10 +95,16 @@ fn wrapper(dir: &Path, name: &str, target: &Path, env: &[(&str, String)]) -> Pat
 /// A temp dir with an image directory, a snapshot directory, wrappers for the fake fcvm and
 /// podman, and `n` fake bridges on consecutive ports.
 fn fake(n: usize) -> Fake {
+    fake_with(n, &[])
+}
+
+/// As [`fake`], with the fakes' environment (`FAKE_STOP_SECS`, `FAKE_BRIDGE_STUCK`, ...).
+fn fake_with(n: usize, extra: &[(&str, &str)]) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let snaps = dir.path().join("snapshots");
     std::fs::create_dir_all(&snaps).unwrap();
-    let env = [("FAKE_SNAPSHOT_DIR", snaps.display().to_string())];
+    let mut env = vec![("FAKE_SNAPSHOT_DIR", snaps.display().to_string())];
+    env.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
     let fcvm = wrapper(dir.path(), "fcvm", &fixture("fake-windows-fcvm.sh"), &env);
     let podman = wrapper(
         dir.path(),
@@ -145,9 +156,13 @@ impl Fake {
     }
 
     fn windows(&self, count: u32, img: PathBuf) -> WindowsCfg {
+        let manifest = Manifest::read(&img).unwrap();
         WindowsCfg {
             count,
-            manifest: Manifest::read(&img).unwrap(),
+            gold_key: fcvm::fleet::agent::windows::gold_key(&img, &manifest).unwrap(),
+            image_check: Duration::from_millis(300),
+            bridge_stop: Duration::from_secs(1),
+            manifest,
             image_dir: img,
             bridge_image: "localhost/fcvm-windows-bridge:test".into(),
             podman: self.podman.clone(),
@@ -167,22 +182,57 @@ impl Fake {
         }
     }
 
+    /// The fakes' events, `(kind, name)`, a bridge container named by its sandbox
+    /// (`fleet-win-2-bridge`) whatever launch it is of.
     fn log(&self) -> Vec<(String, String)> {
         std::fs::read_to_string(self.dir.path().join("events.log"))
             .unwrap_or_default()
             .lines()
             .filter_map(|l| {
                 let mut p = l.split_whitespace();
-                Some((p.next()?.to_string(), p.next()?.to_string()))
+                let kind = p.next()?.to_string();
+                let name = p.next()?;
+                let name = match name.find("-bridge") {
+                    Some(i) => &name[..i + "-bridge".len()],
+                    None => name,
+                };
+                Some((kind, name.to_string()))
             })
             .collect()
     }
 
+    /// The arguments of the newest process named `name` (a bridge by its sandbox).
     fn args(&self, name: &str) -> Vec<String> {
-        std::fs::read_to_string(self.dir.path().join(format!("args-{name}")))
+        let newest = std::fs::read_dir(self.dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("args-{name}"))
+            })
+            .max_by_key(|e| e.metadata().unwrap().modified().unwrap())
+            .unwrap_or_else(|| panic!("no args-{name}*"));
+        std::fs::read_to_string(newest.path())
             .unwrap()
             .lines()
             .map(str::to_string)
+            .collect()
+    }
+
+    /// The pids of every bridge container still alive.
+    fn containers(&self) -> Vec<u32> {
+        std::fs::read_dir(self.dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".pid"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok()?.trim().parse().ok())
+            .filter(|pid: &u32| {
+                std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|st| {
+                    !st.lines()
+                        .any(|l| l.starts_with("State:") && l.contains('Z'))
+                })
+            })
             .collect()
     }
 }
@@ -294,6 +344,29 @@ impl Coord {
             .expect("agent connection open")
     }
 
+    /// The next slot report of `id` in `phase` at `generation` within `secs`, or none.
+    async fn report_within(
+        &mut self,
+        id: &str,
+        phase: &str,
+        generation: u64,
+        secs: u64,
+    ) -> Option<SlotReport> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let m = tokio::time::timeout_at(deadline, self.from_agent.next::<AgentMsg>())
+                .await
+                .ok()?
+                .unwrap()
+                .expect("agent connection open");
+            if let AgentMsg::Slot(r) = m {
+                if r.id == id && r.phase == phase && r.generation == generation {
+                    return Some(r);
+                }
+            }
+        }
+    }
+
     /// Read until every sandbox in `ids` reported `phase` at `generation`; also returns the
     /// image reports read meanwhile.
     async fn until(
@@ -345,7 +418,10 @@ async fn the_gold_flow_runs_in_order_and_every_sandbox_restores_from_it() {
     let f = fake(2);
     let (installed, expires) = recent();
     let img = f.image(&installed, &expires);
-    let mut c = Coord::start(&f, f.windows(2, img.clone()));
+    let w = f.windows(2, img.clone());
+    let tag = format!("win-gold-{}", w.gold_key);
+    let tag = tag.as_str();
+    let mut c = Coord::start(&f, w);
     match c.next().await {
         AgentMsg::Hello {
             windows,
@@ -420,7 +496,6 @@ async fn the_gold_flow_runs_in_order_and_every_sandbox_restores_from_it() {
             .position(|(k, n)| k == kind && n == name)
             .unwrap_or_else(|| panic!("no {kind} {name} in {log:?}"))
     };
-    let tag = "win-gold-3f9c0a1b2c4d";
     assert!(at("vm_run", "win-gold") < at("podman_logon", "fleet-win-gold-bridge"));
     assert!(at("podman_logon", "fleet-win-gold-bridge") < at("snapshot_create", tag));
     assert!(at("snapshot_create", tag) < at("exit", "win-gold"));
@@ -522,7 +597,11 @@ async fn the_gold_flow_runs_in_order_and_every_sandbox_restores_from_it() {
     for name in ["win-1", "win-2", "fleet-win-1-bridge", "fleet-win-2-bridge"] {
         let starts = log
             .iter()
-            .filter(|(k, n)| k != "exit" && n == name && !k.starts_with("snapshot_create"))
+            .filter(|(k, n)| {
+                n == name
+                    && !["exit", "snapshot_create", "podman_stop", "podman_rm"]
+                        .contains(&k.as_str())
+            })
             .count();
         let exits = log.iter().filter(|(k, n)| k == "exit" && n == name).count();
         assert_eq!(starts, exits, "{name}: {log:?}");
@@ -538,13 +617,20 @@ async fn a_gold_snapshot_made_before_is_reused() {
     let f = fake(1);
     let (installed, expires) = recent();
     let img = f.image(&installed, &expires);
-    let tag_dir = f.dir.path().join("snapshots/win-gold-3f9c0a1b2c4d");
+    let w = f.windows(1, img.clone());
+    let tag_dir = f
+        .dir
+        .path()
+        .join(format!("snapshots/win-gold-{}", w.gold_key));
     std::fs::create_dir_all(&tag_dir).unwrap();
     std::fs::write(tag_dir.join("config.json"), "{}").unwrap();
-    let r = f.dir.path().join("state/3f9c0a1b2c4d/desktop-ref.ppm");
+    let r = f
+        .dir
+        .path()
+        .join(format!("state/{}/desktop-ref.ppm", w.gold_key));
     std::fs::create_dir_all(r.parent().unwrap()).unwrap();
     std::fs::write(&r, "P6\n").unwrap();
-    let mut c = Coord::start(&f, f.windows(1, img));
+    let mut c = Coord::start(&f, w);
     c.assign(&[("win-1", 0, 1, None, vec![])]);
     c.until(&["win-1"], "running", 1).await;
     let log = f.log();
@@ -565,13 +651,20 @@ async fn an_image_170_days_old_starts_no_sandbox() {
         &installed.to_rfc3339(),
         &(installed + chrono::Duration::days(180)).to_rfc3339(),
     );
-    let tag_dir = f.dir.path().join("snapshots/win-gold-3f9c0a1b2c4d");
+    let w = f.windows(1, img.clone());
+    let tag_dir = f
+        .dir
+        .path()
+        .join(format!("snapshots/win-gold-{}", w.gold_key));
     std::fs::create_dir_all(&tag_dir).unwrap();
     std::fs::write(tag_dir.join("config.json"), "{}").unwrap();
-    let r = f.dir.path().join("state/3f9c0a1b2c4d/desktop-ref.ppm");
+    let r = f
+        .dir
+        .path()
+        .join(format!("state/{}/desktop-ref.ppm", w.gold_key));
     std::fs::create_dir_all(r.parent().unwrap()).unwrap();
     std::fs::write(&r, "P6\n").unwrap();
-    let mut c = Coord::start(&f, f.windows(1, img));
+    let mut c = Coord::start(&f, w);
     c.assign(&[("win-1", 0, 1, None, vec![])]);
     let (failed, images) = c.until(&["win-1"], "failed", 1).await;
     let e = failed["win-1"].error.clone().unwrap();
@@ -585,4 +678,210 @@ async fn an_image_170_days_old_starts_no_sandbox() {
     );
     assert!(!f.log().iter().any(|(k, _)| k == "snapshot_run"));
     c.close().await;
+}
+
+/// A gold snapshot already there, so a test starts at the sandboxes' restore.
+fn with_gold(f: &Fake, w: &WindowsCfg) {
+    let tag_dir = f
+        .dir
+        .path()
+        .join(format!("snapshots/win-gold-{}", w.gold_key));
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    std::fs::write(tag_dir.join("config.json"), "{}").unwrap();
+    let r = f
+        .dir
+        .path()
+        .join(format!("state/{}/desktop-ref.ppm", w.gold_key));
+    std::fs::create_dir_all(r.parent().unwrap()).unwrap();
+    std::fs::write(&r, "P6\n").unwrap();
+}
+
+/// The image crosses its refusal point (7 days before its evaluation expires) while its
+/// sandbox runs: the sandbox is stopped and reported failed with the date, not left running
+/// until its next relaunch.
+#[tokio::test]
+async fn a_sandbox_running_when_its_image_reaches_the_cutoff_is_stopped() {
+    let f = fake(1);
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::days(7) + chrono::Duration::seconds(4);
+    let img = f.image(
+        &(now - chrono::Duration::days(20)).to_rfc3339(),
+        &expires.to_rfc3339(),
+    );
+    let w = f.windows(1, img);
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    let failed = c
+        .report_within("win-1", "failed", 1, 15)
+        .await
+        .expect("the sandbox is reported failed once its image is refused");
+    let e = failed.error.unwrap();
+    assert!(
+        e.contains(&expires.format("%Y-%m-%d").to_string()),
+        "names the expiry: {e}"
+    );
+    assert_eq!(failed.retry_in_ms, None);
+    let log = f.log();
+    assert!(
+        log.iter().any(|(k, n)| k == "exit" && n == "win-1"),
+        "the VM is stopped: {log:?}"
+    );
+    assert!(f.containers().is_empty(), "the bridge is stopped");
+    c.close().await;
+}
+
+/// An action the bridge is slow to carry out does not hold back a reset: the reset relaunches
+/// at once, and the rest of the old launch's batch is never sent.
+#[tokio::test]
+async fn a_slow_action_does_not_hold_back_a_reset() {
+    let f = fake(1);
+    let (installed, expires) = recent();
+    let w = f.windows(1, f.image(&installed, &expires));
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    let req = |seq, action| WindowsActionReq {
+        seq,
+        action,
+        at: 1,
+        generation: 1,
+    };
+    c.assign(&[(
+        "win-1",
+        0,
+        1,
+        None,
+        vec![
+            req(1, WindowsAction::TaskManager),
+            req(2, WindowsAction::Notepad),
+        ],
+    )]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while f.actions[0].lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow action never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reset = std::time::Instant::now();
+    c.assign(&[("win-1", 0, 2, Some(9), vec![])]);
+    c.report_within("win-1", "running", 2, 8)
+        .await
+        .expect("the reset runs within 8 s, not after the slow action");
+    assert!(reset.elapsed() < Duration::from_secs(8));
+    let posted: Vec<serde_json::Value> = f.actions[0]
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, b)| b["name"].clone())
+        .collect();
+    assert_eq!(
+        posted,
+        ["task_manager"],
+        "the old launch's notepad is dropped"
+    );
+    c.close().await;
+}
+
+/// The same host index is handed to a new sandbox id while the old one is still stopping:
+/// the new sandbox starts only once the old VM and bridge have exited, so two never hold the
+/// index's ports.
+#[tokio::test]
+async fn a_new_sandbox_on_an_index_waits_for_the_old_one_to_stop() {
+    let f = fake_with(1, &[("FAKE_STOP_SECS", "1")]);
+    let (installed, expires) = recent();
+    let w = f.windows(1, f.image(&installed, &expires));
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    c.assign(&[("win-7", 0, 1, None, vec![])]);
+    c.until(&["win-7"], "running", 1).await;
+    let log = f.log();
+    let at = |kind: &str, name: &str| {
+        log.iter()
+            .position(|(k, n)| k == kind && n == name)
+            .unwrap_or_else(|| panic!("no {kind} {name} in {log:?}"))
+    };
+    assert!(at("exit", "win-1") < at("snapshot_run", "win-7"), "{log:?}");
+    assert!(
+        at("exit", "fleet-win-1-bridge") < at("snapshot_run", "win-7"),
+        "{log:?}"
+    );
+    c.close().await;
+}
+
+/// A bridge container that ignores SIGTERM is stopped by podman (`stop`, then `rm -f`), not
+/// left running with its ports after the `podman run` client is killed.
+#[tokio::test]
+async fn a_stuck_bridge_container_is_stopped_through_podman() {
+    let f = fake_with(1, &[("FAKE_BRIDGE_STUCK", "1")]);
+    let (installed, expires) = recent();
+    let w = f.windows(1, f.image(&installed, &expires));
+    with_gold(&f, &w);
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    assert_eq!(f.containers().len(), 1);
+    c.close().await;
+    assert!(
+        f.containers().is_empty(),
+        "the container outlived the agent: {:?}",
+        f.containers()
+    );
+    let log = f.log();
+    assert!(log.contains(&("podman_stop".into(), "fleet-win-1-bridge".into())));
+    assert!(log.contains(&("podman_rm".into(), "fleet-win-1-bridge".into())));
+    let name = f.args("fleet-win-1-bridge");
+    let name = &name[name.iter().position(|a| a == "--name").unwrap() + 1];
+    assert!(
+        name.starts_with("fleet-win-1-bridge-") && name.len() > "fleet-win-1-bridge-".len(),
+        "a name of its own per launch: {name}"
+    );
+}
+
+/// The gold flow fails at the logon: the gold VM has exited before the failure is reported.
+#[tokio::test]
+async fn a_failed_gold_flow_stops_its_vm_before_it_reports() {
+    let f = fake_with(1, &[("FAKE_LOGON_EXIT", "1"), ("FAKE_STOP_SECS", "1")]);
+    let (installed, expires) = recent();
+    let mut c = Coord::start(&f, f.windows(1, f.image(&installed, &expires)));
+    loop {
+        if let AgentMsg::WindowsImage(w) = c.next().await {
+            if w.gold == Gold::Failed {
+                assert!(w.gold_error.unwrap().contains("logon"));
+                break;
+            }
+        }
+    }
+    let log = f.log();
+    assert!(
+        log.contains(&("exit".into(), "win-gold".into())),
+        "the gold VM still ran when the failure was reported: {log:?}"
+    );
+    c.close().await;
+}
+
+/// The agent stops during the gold flow: the gold VM has exited when the agent returns.
+#[tokio::test]
+async fn an_agent_stopping_during_the_gold_flow_stops_the_gold_vm() {
+    let f = fake_with(1, &[("FAKE_HEALTHY_SECS", "100"), ("FAKE_STOP_SECS", "1")]);
+    let (installed, expires) = recent();
+    let mut c = Coord::start(&f, f.windows(1, f.image(&installed, &expires)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !f.log().iter().any(|(k, _)| k == "vm_run") {
+        assert!(std::time::Instant::now() < deadline, "no gold boot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = c.next().await;
+    c.close().await;
+    let log = f.log();
+    assert!(
+        log.contains(&("exit".into(), "win-gold".into())),
+        "the agent returned with the gold VM running: {log:?}"
+    );
 }
