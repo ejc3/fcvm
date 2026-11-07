@@ -3895,13 +3895,18 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let cancel = lifecycle_gate.cancellation_token();
     spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
+    let record = !args.no_record_working_set;
+    let ready_timeout = std::time::Duration::from_secs(args.ready_timeout);
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
-        ready_timeout: std::time::Duration::from_secs(args.ready_timeout),
+        ready_timeout,
     });
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
+            if record {
+                record_working_set(&prepared.output.snapshot_key, ready_timeout).await;
+            }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
         VmPreparation::RunCompleted => {
@@ -3935,9 +3940,113 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
                 (operation, _) => operation,
             };
             let prepared = finish_prepare(operation, cleanup)?;
+            if record {
+                record_working_set(&prepared.output.snapshot_key, ready_timeout).await;
+            }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
     }
+}
+
+/// Record a working set for a prepared snapshot that has none (#955 part 3).
+///
+/// The recorded set exists only once a clone has run, so the first restore of a fresh
+/// snapshot replayed nothing: measured on a 128 GiB guest, it reached healthy in 2m29s and
+/// the next five, each replaying a set, in 1m14s to 1m42s. A prepare builds its snapshot
+/// ahead of time and can afford the recording itself: it restores the snapshot once with
+/// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
+/// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
+/// A recording that fails is logged and the prepare still succeeds: the set is a hint.
+async fn record_working_set(snapshot_key: &str, timeout: std::time::Duration) {
+    let memory = paths::snapshot_dir().join(snapshot_key).join("memory.bin");
+    let sidecar = crate::uffd::WorkingSetStore::path_for(&memory);
+    if sidecar.exists() {
+        info!(
+            snapshot_key,
+            "the prepared snapshot already has a recorded working set"
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    match recording_restore(snapshot_key, timeout).await {
+        Ok(()) if sidecar.exists() => info!(
+            snapshot_key,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "recorded a working set for the prepared snapshot"
+        ),
+        Ok(()) => warn!(
+            snapshot_key,
+            "the recording restore ran but wrote no working set; the first restore will \
+             fault its pages in on demand"
+        ),
+        Err(error) => warn!(
+            snapshot_key,
+            error = %format!("{error:#}"),
+            "could not record a working set for the prepared snapshot; the first restore \
+             will fault its pages in on demand"
+        ),
+    }
+}
+
+/// The `fcvm snapshot run` that records a prepared snapshot's working set: this binary,
+/// stdout discarded so the prepare's own JSON record stays alone on it, killed when this
+/// process exits or `timeout` passes.
+async fn recording_restore(snapshot_key: &str, timeout: std::time::Duration) -> Result<()> {
+    let exe = std::env::current_exe().context("locating the fcvm binary")?;
+    let name = format!("record-{}-{}", std::process::id(), snapshot_key);
+    let mut command = recording_restore_command(&exe, snapshot_key, &name);
+    let mut child = command.spawn().context("spawning the recording restore")?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => {
+            let status = status.context("waiting for the recording restore")?;
+            anyhow::ensure!(
+                status.success(),
+                "the recording restore exited with {status}"
+            );
+            Ok(())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("the recording restore did not finish within {timeout:?}")
+        }
+    }
+}
+
+fn recording_restore_command(
+    exe: &std::path::Path,
+    snapshot_key: &str,
+    name: &str,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .args([
+            "snapshot",
+            "run",
+            "--snapshot",
+            snapshot_key,
+            "--name",
+            name,
+        ])
+        .args(["--exec", "true"])
+        .env("FCVM_FORCE_UFFD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // SAFETY: getpid() before the fork; in the child only async-signal-safe calls (prctl,
+    // getppid) run before exec.
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+    command
 }
 
 /// The IPv6 prefix a run gives its VM: the run's own for routed networking, and none for
@@ -3976,6 +4085,54 @@ mod tests {
             format!("{error:#}").contains("missing exact configured Firecracker artifact"),
             "{error:#}"
         );
+    }
+
+    /// The recording restore is `snapshot run --snapshot <key> --exec true` of this binary
+    /// through a memory server, with its stdout discarded, and a prepare runs it before it
+    /// publishes, on a cache hit and after a cold or restored boot alike, unless told not
+    /// to (#955).
+    #[test]
+    fn a_prepare_records_its_snapshots_working_set_before_it_publishes() {
+        let command = recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap");
+        let std = command.as_std();
+        let args: Vec<_> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "snapshot",
+                "run",
+                "--snapshot",
+                "snap",
+                "--name",
+                "record-1-snap",
+                "--exec",
+                "true"
+            ]
+        );
+        assert!(std
+            .get_envs()
+            .any(|(k, v)| k == "FCVM_FORCE_UFFD" && v == Some(std::ffi::OsStr::new("1"))));
+
+        let source = include_str!("mod.rs");
+        let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert_eq!(
+            prepare
+                .matches("record_working_set(&prepared.output.snapshot_key")
+                .count(),
+            2,
+            "both ways a prepare ends record before they publish"
+        );
+        for branch in prepare.split("record_working_set(&prepared").skip(1) {
+            assert!(
+                branch.find("publish_prepared_snapshot_gated").is_some(),
+                "the record comes before the publish"
+            );
+        }
+        assert!(prepare.contains("let record = !args.no_record_working_set;"));
     }
 
     fn test_args() -> RunArgs {
