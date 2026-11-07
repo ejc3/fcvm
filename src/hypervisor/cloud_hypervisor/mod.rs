@@ -59,6 +59,9 @@ struct PendingConfig {
     vsock: Option<VsockConfig>,
     entropy: bool,
     balloon_mib: Option<u32>,
+    /// UEFI firmware to boot instead of a kernel (a raw guest such as Windows, which runs
+    /// no fc-agent). Set by [`CloudHypervisorBackend::configure_firmware_boot`].
+    firmware: Option<PathBuf>,
 }
 
 /// Cloud Hypervisor implementation of the [`Hypervisor`](super::Hypervisor) trait.
@@ -254,31 +257,72 @@ impl CloudHypervisorBackend {
     }
 
     /// Build the Cloud Hypervisor VmConfig from the buffered `configure_*` state.
+    /// Boot UEFI firmware (`CLOUDHV.fd`) instead of a kernel: the guest's boot loader comes
+    /// from its own disk, so there is no kernel command line and no initramfs. Turns on the
+    /// Hyper-V enlightenments Windows needs, and sends the 16550 serial port (where Windows'
+    /// Emergency Management Services writes the boot's progress) to the console log the
+    /// console tail reads; the virtio console is off.
+    pub fn configure_firmware_boot(&mut self, firmware: &Path, vcpus: u8, mem_mib: u32) {
+        self.pending.firmware = Some(firmware.to_path_buf());
+        self.pending.kernel = None;
+        self.pending.initramfs = None;
+        self.pending.cmdline.clear();
+        self.pending.vcpus = vcpus;
+        self.pending.mem_mib = mem_mib;
+    }
+
     fn build_vm_config(&self) -> Result<VmConfig> {
-        let kernel = self
-            .pending
-            .kernel
-            .as_ref()
-            .context("no kernel configured for Cloud Hypervisor boot")?;
+        let firmware_boot = self.pending.firmware.is_some();
+        let payload = match (&self.pending.firmware, &self.pending.kernel) {
+            (Some(firmware), None) => PayloadConfig {
+                kernel: None,
+                cmdline: None,
+                initramfs: None,
+                firmware: Some(firmware.display().to_string()),
+            },
+            (None, Some(kernel)) => PayloadConfig {
+                kernel: Some(kernel.display().to_string()),
+                cmdline: Some(self.pending.cmdline.clone()),
+                initramfs: self
+                    .pending
+                    .initramfs
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                firmware: None,
+            },
+            (Some(_), Some(_)) => bail!("both a kernel and firmware configured for one VM"),
+            (None, None) => bail!("no kernel or firmware configured for Cloud Hypervisor boot"),
+        };
+        let console_file = self.console_path().map(|p| ConsoleConfig {
+            mode: "File".to_string(),
+            file: Some(p.display().to_string()),
+        });
+        let off = |mode: &str| ConsoleConfig {
+            mode: mode.to_string(),
+            file: None,
+        };
+        // Virtio console (hvc0) to a file in the VM dir, which spawn() tails into fcvm's
+        // tracing logs. CH's "Tty" mode needs a controlling terminal, which a piped child
+        // does not have, so file + tail is the portable equivalent of Firecracker's
+        // serial-to-stdout capture. A firmware-booted guest writes to the 16550 serial
+        // port instead, so that one goes to the file and the virtio console is off.
+        let (console, serial) = if firmware_boot {
+            (off("Off"), console_file.unwrap_or_else(|| off("Null")))
+        } else {
+            (console_file.unwrap_or_else(|| off("Off")), off("Null"))
+        };
         Ok(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: self.pending.vcpus,
                 max_vcpus: self.pending.vcpus,
+                kvm_hyperv: firmware_boot,
             },
             memory: MemoryConfig {
                 size: self.pending.mem_mib as u64 * 1024 * 1024,
                 shared: false,
                 thp: false,
             },
-            payload: PayloadConfig {
-                kernel: kernel.display().to_string(),
-                cmdline: self.pending.cmdline.clone(),
-                initramfs: self
-                    .pending
-                    .initramfs
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
-            },
+            payload,
             disks: self.pending.disks.clone(),
             net: self
                 .pending
@@ -293,24 +337,8 @@ impl CloudHypervisorBackend {
                 cid: v.cid,
                 socket: v.socket.clone(),
             }),
-            // Virtio console (hvc0) to a file in the VM dir, which spawn() tails into
-            // fcvm's tracing logs. CH's "Tty" mode needs a controlling terminal, which a
-            // piped child does not have, so file + tail is the portable equivalent of
-            // Firecracker's serial-to-stdout capture.
-            console: match self.console_path() {
-                Some(p) => ConsoleConfig {
-                    mode: "File".to_string(),
-                    file: Some(p.display().to_string()),
-                },
-                None => ConsoleConfig {
-                    mode: "Off".to_string(),
-                    file: None,
-                },
-            },
-            serial: ConsoleConfig {
-                mode: "Null".to_string(),
-                file: None,
-            },
+            console,
+            serial,
             rng: self.pending.entropy.then(|| RngConfig {
                 src: "/dev/urandom".to_string(),
             }),
@@ -1214,6 +1242,75 @@ mod tests {
             error.contains("--free-page-reporting") && error.contains("Cloud Hypervisor"),
             "{error}"
         );
+    }
+
+    fn backend_with_log() -> CloudHypervisorBackend {
+        CloudHypervisorBackend::new(
+            "vm-test".to_string(),
+            PathBuf::from("/tmp/ch-test.sock"),
+            Some(PathBuf::from("/vm/firecracker.log")),
+        )
+    }
+
+    /// A Windows guest boots UEFI firmware: `vm.create` names the firmware and no kernel,
+    /// command line or initramfs, turns on the Hyper-V enlightenments Cloud Hypervisor
+    /// requires for Windows, and logs the 16550 serial port (Windows' EMS) to the console
+    /// file the tail reads, with the virtio console off.
+    #[test]
+    fn a_firmware_boot_names_the_firmware_and_turns_on_hyperv() {
+        let mut be = backend_with_log();
+        be.configure_firmware_boot(Path::new("/assets/CLOUDHV.fd"), 2, 4096);
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert_eq!(
+            config["payload"],
+            serde_json::json!({"firmware": "/assets/CLOUDHV.fd"}),
+            "{config}"
+        );
+        assert_eq!(config["cpus"]["kvm_hyperv"], true, "{config}");
+        assert_eq!(config["cpus"]["boot_vcpus"], 2, "{config}");
+        assert_eq!(config["memory"]["size"], 4096u64 << 20, "{config}");
+        assert_eq!(
+            config["serial"],
+            serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
+            "{config}"
+        );
+        assert_eq!(config["console"], serde_json::json!({"mode": "Off"}), "{config}");
+    }
+
+    /// The kernel path is unchanged by firmware support: a kernel, its command line and
+    /// initramfs, no firmware, no Hyper-V enlightenments, the virtio console to the file.
+    #[test]
+    fn a_kernel_boot_names_no_firmware_and_no_hyperv() {
+        let mut be = backend_with_log();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        be.pending.initramfs = Some(PathBuf::from("/boot/initrd"));
+        be.pending.cmdline = "console=hvc0".to_string();
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert_eq!(
+            config["payload"],
+            serde_json::json!({"kernel": "/boot/Image", "cmdline": "console=hvc0", "initramfs": "/boot/initrd"}),
+            "{config}"
+        );
+        assert!(config["cpus"].get("kvm_hyperv").is_none(), "{config}");
+        assert_eq!(config["serial"], serde_json::json!({"mode": "Null"}), "{config}");
+        assert_eq!(
+            config["console"],
+            serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
+            "{config}"
+        );
+    }
+
+    /// A VM boots one payload: firmware after a kernel replaces it, and with neither the
+    /// request is refused before Cloud Hypervisor sees it.
+    #[test]
+    fn a_vm_boots_firmware_or_a_kernel_never_both() {
+        let mut be = backend_with_log();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        be.configure_firmware_boot(Path::new("/assets/CLOUDHV.fd"), 1, 1024);
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert!(config["payload"].get("kernel").is_none(), "{config}");
+        let error = backend_with_log().build_vm_config().unwrap_err().to_string();
+        assert!(error.contains("no kernel or firmware"), "{error}");
     }
 
     /// CH madvises guest RAM MADV_HUGEPAGE unless the request says `thp: false`, so an
