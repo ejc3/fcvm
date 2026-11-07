@@ -34,7 +34,7 @@ const ACROSS_ERR_MAX = 3;
  */
 function expectSeams(r: Awaited<ReturnType<typeof seamReport>>): void {
   const judged = r.boundaries.filter((b) => b.n >= SEAM_MIN_PAIRS);
-  for (const id of Object.keys(r.perTile)) expect(judged.some((b) => b.a === id || b.b === id), `a judged boundary of ${id}`).toBe(true);
+  for (const id of r.tiles) expect(judged.some((b) => b.a === id || b.b === id), `a judged boundary of ${id}`).toBe(true);
   for (const b of judged) expect(b.err, `${b.a} | ${b.b} over ${b.n} pairs`).toBeLessThan(ACROSS_ERR_MAX);
 }
 
