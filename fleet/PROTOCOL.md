@@ -727,7 +727,9 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   they run; an instance a launch named counts as pending while lists leave it out (60 s at
   most), and a launch whose answer is lost is asked again with the same idempotency token and
   the same `CreateFleet` parameters, also after the fleet sleeps (an asleep pass terminates
-  what it launched), for up to 2 minutes; by then a list names whatever it launched. The
+  what it launched), for 2 minutes. The region then launches nothing new, and an on-demand
+  launch keeps its place under the cap, until 2 minutes after the token's last ask, by when a
+  list names whatever that ask launched. The
   coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
   `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
   region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,

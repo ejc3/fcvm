@@ -225,9 +225,34 @@ fn lifecycle(state: &str) -> &'static str {
     }
 }
 
-/// Per region and market: the token and count of a launch whose outcome is unknown, and when
-/// it was first asked.
-type Tokens = HashMap<(String, Market), (String, u32, Instant)>;
+/// Per region and market: the token and count of a launch whose outcome is unknown, when it
+/// was first asked, and when it was last asked.
+type Tokens = HashMap<(String, Market), (String, u32, Instant, Instant)>;
+
+/// What a lost launch's token does in a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenStep {
+    /// Asked again with its token.
+    Ask,
+    /// Not asked any more, but its region still launches nothing new and its on-demand count
+    /// stays reserved: its last ask may have launched a host no list names yet.
+    Hold,
+    /// Forgotten: every ask was long enough ago for a list to name what it launched.
+    Drop,
+}
+
+/// A token is asked again while younger than `ttl`, then held until `ttl` has passed since its
+/// last ask as well (`ttl` is longer than `LIST_GRACE`), then dropped. A retry that is never
+/// answered so holds its region for at most twice `ttl`.
+fn token_step(first: Instant, last: Instant, now: Instant, ttl: Duration) -> TokenStep {
+    if now.duration_since(first) < ttl {
+        TokenStep::Ask
+    } else if now.duration_since(last) < ttl {
+        TokenStep::Hold
+    } else {
+        TokenStep::Drop
+    }
+}
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -270,8 +295,8 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
         let now = Instant::now();
         // Tokens are kept across power changes (an asleep pass terminates what a lost launch
         // started), but not for ever.
-        tokens.retain(|(region, market), (_, count, at)| {
-            let keep = now.duration_since(*at) < cfg.lost_launch_ttl;
+        tokens.retain(|(region, market), (_, count, first, last)| {
+            let keep = token_step(*first, *last, now, cfg.lost_launch_ttl) != TokenStep::Drop;
             if !keep {
                 tracing::warn!(%region, market = market.name(), hosts = *count,
                     "a lost GPU host launch got no answer in time; the hosts lists name what it launched");
@@ -310,7 +335,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
             *n += tokens
                 .iter()
                 .filter(|((_, m), _)| *m == Market::OnDemand)
-                .map(|(_, (_, c, _))| *c)
+                .map(|(_, (_, c, _, _))| *c)
                 .sum::<u32>();
         }
         let mut report = Vec::new();
@@ -499,12 +524,20 @@ async fn reconcile(
     errors: &mut Vec<String>,
 ) -> Option<Vec<String>> {
     let mut found = Vec::new();
+    let mut held = false;
     for market in [Market::Spot, Market::OnDemand] {
         let key = (region.to_string(), market);
-        let Some((token, count, _)) = tokens.get(&key).cloned() else {
+        let Some((token, count, first, last)) = tokens.get(&key).cloned() else {
             continue;
         };
         let asked = Instant::now();
+        if token_step(first, last, asked, cfg.lost_launch_ttl) != TokenStep::Ask {
+            held = true;
+            continue;
+        }
+        if let Some(t) = tokens.get_mut(&key) {
+            t.3 = asked;
+        }
         match cfg.driver.launch(region, market, count, &token).await {
             Ok(got) => {
                 tokens.remove(&key);
@@ -545,7 +578,8 @@ async fn reconcile(
             }
         }
     }
-    Some(found)
+    // A held token's last ask may have launched what no list names yet: launch nothing new.
+    (!held).then_some(found)
 }
 
 /// Launch `short` hosts in `region`: spot, then what spot refused for capacity on demand
@@ -599,7 +633,7 @@ async fn launch_shortfall(
             Err(e) => {
                 // It may have launched: [`reconcile`] asks again with this token, and an
                 // on-demand count is reserved against the cap until then.
-                tokens.insert((region.to_string(), market), (token, ask, asked));
+                tokens.insert((region.to_string(), market), (token, ask, asked, asked));
                 if market == Market::OnDemand {
                     if let Some(n) = on_demand.as_mut() {
                         *n += ask;
@@ -1280,6 +1314,23 @@ impl HostDriver for FakeHosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token whose last ask launched a host just before its time ran out is held, not
+    /// dropped: dropping it then would release its on-demand reservation while that host is
+    /// still missing from the lists, and another region could take the place (Codex on #1585).
+    #[test]
+    fn a_token_is_held_after_its_last_ask_until_a_list_can_name_what_it_launched() {
+        let ttl = Duration::from_secs(120);
+        let first = Instant::now();
+        let at = |s: u64| first + Duration::from_secs(s);
+        assert_eq!(token_step(first, first, at(119), ttl), TokenStep::Ask);
+        // Asked last at 118 s: asked no more at 120 s, but held until 238 s.
+        assert_eq!(token_step(first, at(118), at(120), ttl), TokenStep::Hold);
+        assert_eq!(token_step(first, at(118), at(237), ttl), TokenStep::Hold);
+        assert_eq!(token_step(first, at(118), at(238), ttl), TokenStep::Drop);
+        // A token that never got an answer and was last asked at 119 s goes at 239 s.
+        assert_eq!(token_step(first, at(119), at(239), ttl), TokenStep::Drop);
+    }
 
     fn host(id: &str, state: &str, market: Market) -> Host {
         Host {
