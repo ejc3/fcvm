@@ -676,9 +676,16 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
         if file_type.is_dir() {
             synced.extend(sync_generation(&path)?);
         } else if file_type.is_file() {
-            std::fs::File::open(&path)
-                .with_context(|| format!("opening prepared artifact {}", path.display()))?
-                .sync_all()
+            // A file renamed away between the listing and the open is not this generation's
+            // to sync: a working-set writer publishes `memory.bin.working-set` from a
+            // temporary beside it, under the sidecar lock and not this one, so a recording
+            // or a serve of the same snapshot can rename one away mid-scan.
+            let file = match std::fs::File::open(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                opened => opened
+                    .with_context(|| format!("opening prepared artifact {}", path.display()))?,
+            };
+            file.sync_all()
                 .with_context(|| format!("syncing prepared artifact {}", path.display()))?;
             synced.push(path);
         }
@@ -3984,9 +3991,8 @@ async fn record_working_set(
     timeout: std::time::Duration,
     cancel: &CancellationToken,
 ) {
-    let memory = paths::snapshot_dir().join(snapshot_key).join("memory.bin");
-    let sidecar = crate::uffd::WorkingSetStore::path_for(&memory);
-    if sidecar.exists() {
+    let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
+    if recorded_pages(&snapshot_dir) > 0 {
         info!(
             snapshot_key,
             "the prepared snapshot already has a recorded working set"
@@ -3995,7 +4001,7 @@ async fn record_working_set(
     }
     let started = std::time::Instant::now();
     match recording_restore(snapshot_key, timeout, cancel).await {
-        Ok(()) if sidecar.exists() => info!(
+        Ok(()) if recorded_pages(&snapshot_dir) > 0 => info!(
             snapshot_key,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "recorded a working set for the prepared snapshot"
@@ -4025,6 +4031,16 @@ async fn recording_restore(
     let exe = std::env::current_exe().context("locating the fcvm binary")?;
     let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
     run_recording(&mut command, timeout, cancel).await
+}
+
+/// Pages of the working set a serve of this snapshot would replay: 0 when there is no
+/// sidecar, or one the store does not accept (another image's, a corrupt one) or that holds
+/// nothing. A file existing is not enough: a copied snapshot keeps a sidecar its image no
+/// longer matches, and skipping on it left the first restore with nothing to replay.
+fn recorded_pages(snapshot_dir: &std::path::Path) -> u64 {
+    super::snapshot::open_snapshot_working_set(snapshot_dir)
+        .map(|(store, _)| store.to_prefetch().len())
+        .unwrap_or(0)
 }
 
 /// The recording clone's VM name: `record-<this pid>`. Not built from the snapshot key, which
@@ -4224,6 +4240,45 @@ mod tests {
             started.elapsed()
         );
         assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+    }
+
+    /// A prepare records unless the snapshot already has a working set the store accepts and
+    /// that holds pages. An empty or unusable sidecar does not count: before, the file merely
+    /// existing skipped the recording.
+    #[test]
+    fn a_sidecar_that_holds_nothing_does_not_skip_the_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_pages(dir.path()), 0, "no snapshot at all");
+        std::fs::write(dir.path().join("memory.bin"), vec![0u8; 64 * 4096]).unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            crate::uffd::WorkingSetStore::path_for(&dir.path().join("memory.bin")),
+            b"not a working set",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_pages(dir.path()),
+            0,
+            "a corrupt sidecar counted as recorded"
+        );
+        let source = include_str!("mod.rs");
+        let record = &source[source.find("async fn record_working_set(").unwrap()..];
+        let record = &record[..record.find("\n}\n").unwrap()];
+        assert!(!record.contains("sidecar.exists()"));
+    }
+
+    /// The durability scan skips a file renamed away between its listing and its open, as a
+    /// working-set writer's temporary is, instead of failing the prepare.
+    #[test]
+    fn a_file_renamed_away_mid_scan_does_not_fail_the_sync() {
+        let source = include_str!("mod.rs");
+        let scan = &source[source.find("fn sync_generation(").unwrap()..];
+        let scan = &scan[..scan.find("\n}\n").unwrap()];
+        assert!(scan.contains("std::io::ErrorKind::NotFound => continue"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept"), b"1").unwrap();
+        let synced = sync_generation(dir.path()).unwrap();
+        assert!(synced.iter().any(|p| p.ends_with("kept")));
     }
 
     fn test_args() -> RunArgs {

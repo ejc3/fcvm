@@ -956,7 +956,9 @@ async fn load_snapshot_create_target(
 }
 
 /// A snapshot directory's working-set store, and the length of its memory image.
-fn open_snapshot_working_set(snapshot_dir: &Path) -> Result<(crate::uffd::WorkingSetStore, u64)> {
+pub(crate) fn open_snapshot_working_set(
+    snapshot_dir: &Path,
+) -> Result<(crate::uffd::WorkingSetStore, u64)> {
     let memory = snapshot_dir.join("memory.bin");
     let mem_len = std::fs::metadata(&memory)
         .with_context(|| format!("reading the size of {}", memory.display()))?
