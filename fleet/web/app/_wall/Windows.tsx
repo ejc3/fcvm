@@ -65,7 +65,7 @@ function Caption({ c, onTake }: { c: WindowCard; onTake: () => void }) {
             {c.desktopIn}
           </span>
         ) : null}
-        {!c.compact ? (
+        {c.showTake ? (
           <button type="button" className="btn take" disabled={c.take.disabled} title={c.take.title ?? undefined} onClick={onTake} data-testid={`sandbox-take-${c.slot}`}>
             {c.take.label}
           </button>

@@ -480,3 +480,16 @@ describe("the draw plan", () => {
     expect(v.banner).toMatch(/Sandboxes stream only to viewers with a direct seat/);
   });
 });
+
+describe("captions", () => {
+  it("a caption narrower than a full one is compact, and on a phone the desktops are as large as compact captions allow", () => {
+    const w = windowsOf(8);
+    const phone = { x: 8, y: 150, w: 374, h: 690 };
+    const L = layoutWindows({ area: phone, tiles: w.tiles, imageAspect: w.image_aspect, narrow: true, panel: false, dpr: 3 });
+    expect(L.every((b) => b.compact)).toBe(true);
+    // two columns of full captions would be 110 px wide desktops, under the full width
+    expect(L[0]!.box.w).toBeGreaterThan(100);
+    const wide = layoutWindows({ area: STAGE, tiles: windowsOf(4).tiles, imageAspect: windowsOf(4).image_aspect, narrow: false, panel: false, dpr: 1 });
+    expect(wide.every((b) => !b.compact)).toBe(true);
+  });
+});

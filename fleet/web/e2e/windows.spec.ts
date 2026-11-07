@@ -4,7 +4,7 @@
 // fixed actions, and that nothing on the page sends anything but the four Windows intents.
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { COORD, admin, mockState } from "./helpers.ts";
+import { COORD, admin, labelIsWhole, mockState } from "./helpers.ts";
 
 const SANDBOXES = 4;
 const SLOTS = ["win-1", "win-2", "win-3", "win-4"];
@@ -287,6 +287,7 @@ test.describe("on a 390 px phone", () => {
       await expect(label).toBeVisible();
       const caption = await page.getByTestId(`sandbox-caption-${slot}`).boundingBox();
       expect(inside(await label.boundingBox(), caption), `${slot}'s label is clipped by its caption`).toBe(true);
+      expect(await labelIsWhole(page, slot), `${slot}'s label text overflows`).toEqual({ fits: true, inside: true });
     }
   }
 

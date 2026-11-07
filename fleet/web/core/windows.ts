@@ -21,7 +21,9 @@ export const WINDOWS_TILE_GAP = 12;
 /** Room under a tile for its slot, edition, time to desktop and label, and the same with the panel open on a narrow screen. */
 export const WINDOWS_CAPTION_H = 96;
 export const WINDOWS_CAPTION_H_NARROW = 120;
-export const WINDOWS_CAPTION_H_COMPACT = 84;
+export const WINDOWS_CAPTION_H_COMPACT = 104;
+/** A caption narrower than this is compact: its words smaller, its edition left out. */
+export const WINDOWS_CAPTION_FULL_MIN_W = 170;
 /** One action a second from a holder (PROTOCOL.md, "Windows mode": Actions). */
 export const WINDOWS_ACTION_INTERVAL_MS = 1000;
 
@@ -55,6 +57,8 @@ export interface WindowBox {
   box: Box;
   /** Under it. */
   caption: Box;
+  /** The caption is drawn compact (`WINDOWS_CAPTION_FULL_MIN_W`). */
+  compact: boolean;
 }
 
 export interface WindowsLayoutInput {
@@ -77,16 +81,19 @@ export function windowTileAspect(tiles: readonly WindowTile[], imageAspect: numb
 
 /**
  * Every desktop's box and the caption under it. The rows and columns are the snapshot's (one row
- * of up to four, then rows of equal length); a narrow screen takes two columns, or one row while
- * the panel is open. Each cell is as large as the area allows with the caption's room taken off,
- * and the block is centred across and starts at the top.
+ * of up to four, then rows of equal length); a narrow screen takes two columns, or rows of up to
+ * four while the panel is open. Each cell is as large as the area allows with the caption's room
+ * taken off, and the block is centred across and starts at the top. A cell narrower than
+ * `WINDOWS_CAPTION_FULL_MIN_W` gets a compact caption, and on a narrow screen then the columns
+ * that make the desktops largest.
  */
 export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
   const { area, dpr, tiles } = inp;
   if (tiles.length === 0) return [];
   const sorted = [...tiles].sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
   const n = sorted.length;
-  const capH = inp.narrow ? (inp.panel ? WINDOWS_CAPTION_H_COMPACT : WINDOWS_CAPTION_H_NARROW) : WINDOWS_CAPTION_H;
+  let compact = inp.narrow && inp.panel;
+  let capH = compact ? WINDOWS_CAPTION_H_COMPACT : inp.narrow ? WINDOWS_CAPTION_H_NARROW : WINDOWS_CAPTION_H;
   const aspect = windowTileAspect(tiles, inp.imageAspect);
   /** The cell width, in whole device pixels, that `cols` columns allow. */
   const cellFor = (cols: number) => {
@@ -94,10 +101,21 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
     const availH = area.h - rows * capH - (rows - 1) * WINDOWS_TILE_GAP;
     return Math.max(0, Math.floor(Math.min((area.w - (cols - 1) * WINDOWS_TILE_GAP) / cols, (availH / rows) * aspect) * dpr) / dpr);
   };
+  const largest = (from: number) => {
+    let best = from;
+    for (let c = 1; c <= n; c++) if (cellFor(c) > cellFor(best)) best = c;
+    return best;
+  };
   const rectCols = Math.max(1, gridOf(sorted).cols);
-  let cols = inp.narrow ? (inp.panel ? n : Math.min(2, n)) : rectCols;
+  let cols = inp.narrow ? (inp.panel ? Math.min(4, n) : Math.min(2, n)) : rectCols;
   // Beside the open panel the room is narrow: take the columns that make the desktops largest.
-  if (inp.panel && !inp.narrow) for (let c = 1; c <= n; c++) if (cellFor(c) > cellFor(cols)) cols = c;
+  if (inp.panel && !inp.narrow) cols = largest(cols);
+  if (!compact && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
+    compact = true;
+    capH = WINDOWS_CAPTION_H_COMPACT;
+    // A wide screen keeps the snapshot's rows; a phone takes the largest desktops.
+    if (inp.narrow) cols = largest(cols);
+  }
   const cellW = cellFor(cols);
   const cellH = snap(cellW / aspect, dpr);
   const top = area.y;
@@ -108,7 +126,7 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
     const x = area.x + (area.w - rowW) / 2 + (i % cols) * (cellW + WINDOWS_TILE_GAP);
     const y = top + row * (cellH + capH + WINDOWS_TILE_GAP);
     const box: Box = { x: snap(x, dpr), y: snap(y, dpr), w: cellW, h: cellH };
-    return { id: t.id, box, caption: { x: box.x, y: box.y + box.h + 4, w: box.w, h: capH - 4 } };
+    return { id: t.id, box, caption: { x: box.x, y: box.y + box.h + 4, w: box.w, h: capH - 4 }, compact };
   });
 }
 
@@ -191,8 +209,10 @@ export interface WindowCard {
   box: Box | null;
   caption: Box | null;
   dark: boolean;
-  /** Only the slot, the time and the label, for the room a narrow screen leaves beside the panel. */
+  /** Smaller words and no edition, for a narrow caption (`WINDOWS_CAPTION_FULL_MIN_W`). */
   compact: boolean;
+  /** Whether the caption draws Take over (a compact caption leaves it out while the panel is open). */
+  showTake: boolean;
   /** Clicking the tile resets this sandbox. */
   reset: { label: string; disabled: boolean };
   take: { label: string; disabled: boolean; title: string | null };
@@ -333,7 +353,6 @@ export function windowsView(inp: WindowsInput): WindowsView {
   const panelOpen = held !== null;
   const area = inp.stage === null ? null : panelOpen ? openedArea(inp.stage, inp.narrow) : inp.stage;
   const placed = new Map(area === null ? [] : layoutWindows({ area, tiles: w.tiles, imageAspect: w.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }).map((b) => [b.id, b]));
-  const compact = inp.narrow && panelOpen;
   const cards: WindowCard[] = w.tiles.map((t) => {
     const p = placed.get(t.id);
     const slot = sandboxName(t);
@@ -356,7 +375,9 @@ export function windowsView(inp: WindowsInput): WindowsView {
       box: p?.box ?? null,
       caption: p?.caption ?? null,
       dark: !running,
-      compact,
+      compact: p?.compact ?? false,
+      // With its panel open, this viewer takes nothing more.
+      showTake: !(p?.compact === true && panelOpen),
       reset: { label: `Reset ${slot}`, disabled: !online || t.borrowed !== null },
       take: { label: "Take over", disabled: !online || !running || t.borrowed !== null || held !== null, title: takeTitle },
       lentText: mine(t) ? "Yours" : lentToOther ? `Lent to another viewer until ${fmt.utcClock(t.borrowed!.until)} UTC` : null,
