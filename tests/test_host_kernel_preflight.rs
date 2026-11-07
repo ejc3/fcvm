@@ -368,3 +368,27 @@ fn a_loop_device_without_a_readable_backing_file_fails_the_check() {
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("backing file"), "stderr: {stderr}");
 }
+
+/// A `findmnt` that fails names no device, so the check cannot tell whether the
+/// build directory is loop-backed: it fails closed instead of taking the
+/// not-a-loop path (review of #1333).
+#[test]
+fn a_failed_device_lookup_fails_the_check() {
+    let stubs = tempfile::tempdir().unwrap();
+    stub_dpkg_query(stubs.path(), &[]);
+    let backing_dir = tempfile::tempdir().unwrap();
+    stub_loop_backed(stubs.path(), &backing_dir.path().join("x.img"), 500);
+    std::fs::write(stubs.path().join("findmnt"), "#!/bin/sh\nexit 1\n").unwrap();
+    let build = tempfile::tempdir().unwrap();
+    let out = run(
+        stubs.path(),
+        &[
+            ("FCVM_HOST_KERNEL_BUILD_DIR", build.path().to_str().unwrap()),
+            ("FCVM_HOST_KERNEL_MIN_FREE_GIB", "40"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("findmnt --target"), "stderr: {stderr}");
+    assert!(out.stdout.is_empty(), "no build directory on failure");
+}

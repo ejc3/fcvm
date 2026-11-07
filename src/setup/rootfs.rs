@@ -76,13 +76,9 @@ pub struct PastaConfig {
     /// content-addressed binary path is computable offline.
     pub commit: String,
     /// SHA-256 of the pinned commit's source archive (passt.top's snapshot).
-    /// Empty in a config written before the field existed, which still loads:
-    /// only a pasta build needs it, and that build says to regenerate the config.
-    #[serde(default)]
     pub archive_sha256: String,
     /// Where that archive can be downloaded, tried in order. Any copy that
     /// matches `archive_sha256` is the same source.
-    #[serde(default)]
     pub archives: Vec<String>,
 }
 
@@ -2784,17 +2780,16 @@ fn path_to_str(path: &Path) -> Result<&str> {
 mod tests {
     use super::*;
 
-    /// A config generated before [pasta] named its source archives must still load
-    /// (#1008 review): VM launches and setup read it, and the pasta binary it names
-    /// is usually built already.
+    /// A [pasta] section without its source archives is refused when the config
+    /// loads, not accepted until a pasta build needs them: make build regenerates
+    /// the config, and fcvm keeps no older schema (review of #1008).
     #[test]
-    fn a_pasta_section_from_before_the_archive_sources_still_loads() {
-        let pasta: PastaConfig = toml::from_str(
+    fn a_pasta_section_without_its_archive_sources_is_refused() {
+        let error = toml::from_str::<PastaConfig>(
             "repo = \"https://passt.top/passt\"\ncommit = \"4e8aa70379a3f3d2c5d4e3b3a1f0e9d8c7b6a5f4\"\n",
         )
-        .expect("a [pasta] section with only repo and commit");
-        assert!(pasta.archives.is_empty());
-        assert!(pasta.archive_sha256.is_empty());
+        .expect_err("a [pasta] section with only repo and commit");
+        assert!(error.to_string().contains("archive_sha256"), "{error}");
     }
 
     /// A proxy that only tunnels (CONNECT) answers a plain-HTTP request with 405, so a
