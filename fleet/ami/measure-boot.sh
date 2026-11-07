@@ -14,7 +14,14 @@ set -euo pipefail
 KIND=$1; AMI=$2
 REGION=${REGION:-us-east-1}
 A() { aws --region "$REGION" "$@"; }
-now() { date +%s%3N; }
+now_ms() { date +%s%3N; }
+# The instance is a G instance in the wall's host region: it goes through the wall's reserve.
+say() { echo "measure-boot: $*" >&2; }
+now() { date +%s; }
+BUCKET=fcvm-fleet-assets-$(aws sts get-caller-identity --query Account --output text)
+S3REGION=${S3REGION:-us-east-2}
+# shellcheck source=../tools/g-admission.sh
+. "$(dirname "$0")/../tools/g-admission.sh"
 sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
 case "$KIND" in
   tile) type=g4dn.xlarge; profile=fcvm-fleet-tile; net="Ipv6AddressCount=1"
@@ -24,19 +31,26 @@ case "$KIND" in
 esac
 # MARKET=on-demand measures a tile when spot has no capacity: the boot does not depend on it.
 [ "${MARKET:-}" = on-demand ] && market=()
+mkt=on-demand vcpus=96; [ "$KIND" = tile ] && vcpus=4; [ ${#market[@]} -gt 0 ] && mkt=spot
+# shellcheck disable=SC2034  # read by g-admission.sh
+owner=ami-measure-$KIND GA_WHAT="$type to measure"
+admit_lock || { say "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"; exit 1; }
+trap admit_unlock EXIT
+room_for "$mkt" "$vcpus" || exit 1
 # Like the coordinator, an AZ that has no capacity is skipped; the time spent on refusals
 # is reported apart (capacity wait) and the clock starts at the request that was accepted.
-tw=$(now); id=""
+tw=$(now_ms); id=""
 for az in ${AZS:-a b c d f}; do
   subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
-  t0=$(now)
+  t0=$(now_ms)
+  admit_held || { say "the admission lock was broken, or held too long to launch under it; nothing launched"; exit 1; }
   # VOLUME=Throughput=1000,Iops=4000 (gp3 settings of the root volume) measures a tile with another EBS volume.
   vol=(); [ -n "${VOLUME:-}" ] && vol=(--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeType=gp3,VolumeSize=32,DeleteOnTermination=true,${VOLUME}}")
   id=$(A ec2 run-instances --image-id "$AMI" --instance-type $type "${market[@]}" "${vol[@]}" \
     --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,$net,DeleteOnTermination=true" \
     --iam-instance-profile Name=$profile \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build},$ADMISSION_TAG]" \
     --query 'Instances[0].InstanceId' --output text 2>/tmp/measure-boot.err.$$) && break
   grep -q -E 'InsufficientInstanceCapacity|capacity' /tmp/measure-boot.err.$$ || { cat /tmp/measure-boot.err.$$ >&2; exit 1; }
   echo "no $type capacity in ${REGION}${az}"
@@ -44,7 +58,9 @@ done
 rm -f /tmp/measure-boot.err.$$
 [ -n "$id" ] || { echo "no capacity in any AZ"; exit 1; }
 echo "capacity wait $((t0 - tw)) ms (not counted below), AZ ${REGION}${az}"
-t_accepted=$(now)
+t_accepted=$(now_ms)
+ledger_add "$id" "$mkt" "$vcpus" || { A ec2 terminate-instances --instance-ids "$id" >/dev/null; say "terminated $id: its admission could not be recorded"; exit 1; }
+admit_unlock
 trap 'A ec2 terminate-instances --instance-ids "$id" >/dev/null; echo "terminated $id"' EXIT
 echo "launched $id: accepted after $((t_accepted - t0)) ms"
 ip=""
@@ -52,12 +68,12 @@ while [ -z "$ip" ] || [ "$ip" = None ]; do sleep 1; ip=$(A ec2 describe-instance
 t_running=""
 if [ "$KIND" = tile ]; then
   while :; do
-    [ -z "$t_running" ] && [ "$(A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].State.Name' --output text)" = running ] && t_running=$(now)
+    [ -z "$t_running" ] && [ "$(A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].State.Name' --output text)" = running ] && t_running=$(now_ms)
     if curl -fsS -m 2 --connect-to "tile.fcvm.dev:443:$ip:443" https://tile.fcvm.dev/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1; then break; fi
-    [ $(( $(now) - t0 )) -lt 900000 ] || { echo "no frame in 15 minutes"; exit 1; }
+    [ $(( $(now_ms) - t0 )) -lt 900000 ] || { echo "no frame in 15 minutes"; exit 1; }
     sleep 0.5
   done
-  t_frame=$(now)
+  t_frame=$(now_ms)
   echo "tile: request->accepted $((t_accepted - t0)) ms, ->running (seen) $((t_running - t0)) ms, ->first frame over HTTPS $((t_frame - t0)) ms"
 fi
 ssm() {
@@ -70,7 +86,7 @@ ssm() {
   [ "$st" = Success ] || { echo "measure-boot: command ended $st on the instance" >&2; return 1; }
 }
 until [ "$(A ssm describe-instance-information --filters Key=InstanceIds,Values="$id" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)" = Online ]; do sleep 5; done
-t_ssm=$(now)
+t_ssm=$(now_ms)
 launch=$(A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].LaunchTime' --output text)
 echo "ssm online after $((t_ssm - t0)) ms; EC2 LaunchTime $launch"
 units="fcvm-fleet-vfio fcvm-fleet-store"; [ "$KIND" = tile ] && units="nvidia-persistenced cloud-init fcvm-fleet-tls fcvm-fleet-renderer fcvm-fleet-nginx"
@@ -115,6 +131,6 @@ if [ "$KIND" = host ]; then
   # lines are info, and fcvm logs warnings and up unless RUST_LOG says otherwise.
   ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 RUST_LOG=fcvm=info bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" > /tmp/warm.out 2>&1; rc=\$?; tail -3 /tmp/warm.out; jq -cR 'fromjson? | objects | select(.status == \"restored\")' /tmp/warm.log | head -1; l=\$(grep -E 'snapshot hit|Snapshot miss' /tmp/warm.log | tail -1); case \"\$l\" in *'snapshot hit'*) echo 'snapshot: hit' ;; *'Snapshot miss'*) echo 'snapshot: miss' ;; *) echo 'snapshot: warm.log has no snapshot-cache line' ;; esac; echo \"\$l\"; exit \$rc" ||
     { echo "host: the first GPU VM failed"; exit 1; }
-  t_vm=$(now)
+  t_vm=$(now_ms)
   echo "host: first GPU VM done $((t_vm - t0)) ms after the request (includes SSM round trips)"
 fi

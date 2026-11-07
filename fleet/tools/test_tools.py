@@ -198,7 +198,7 @@ class RunScripts(unittest.TestCase):
 FAKE_AWS = r"""#!/bin/bash
 # A stand-in for the AWS CLI: answers what `gpubox.sh up` asks, from FAKE_* variables, and
 # logs every call to $FAKE_LOG. The box it launches is listed from then on, at FAKE_MY_TIME.
-echo "$*" >> "$FAKE_LOG"
+echo "$*" | tr '\n' ' ' >> "$FAKE_LOG"; echo >> "$FAKE_LOG"
 args=" $* "
 case "$args" in
   *" sts get-caller-identity "*) echo 123456789012 ;;
@@ -219,6 +219,11 @@ case "$args" in
     case "$args" in *MarketType=spot*) echo spot ;; *) echo on-demand ;; esac > "$FAKE_LOG.launched"
     echo i-fakebox ;;
   *" ec2 terminate-instances "*) : ;;
+  *" ec2 describe-instance-types "*g4dn.metal*) echo 96 ;;
+  *" ec2 describe-instance-types "*g4dn.xlarge*) echo 4 ;;
+  *" ssm get-parameter "*) echo ami-ubuntu ;;
+  *" ec2 wait "*) : ;;
+  *" ssm describe-instance-information "*) echo Online ;;
   # S3 in $FAKE_S3: a key is a file, its ETag beside it; put-object --if-none-match * creates
   # it only if absent, delete-object --if-match deletes it only at that ETag.
   *" s3api put-object "*)
@@ -254,7 +259,7 @@ def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00"):
 class GpuboxWallReserve(unittest.TestCase):
     """`gpubox.sh up` leaves the wall's GPU host room in the account's G quotas (#1257)."""
 
-    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", s3=None, **extra):
+    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", s3=None, cmd=None, **extra):
         import tempfile
         d = tempfile.mkdtemp()
         s3 = s3 or os.path.join(d, "s3")
@@ -266,8 +271,8 @@ class GpuboxWallReserve(unittest.TestCase):
                    GPUBOX_AZS="a", FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
                    FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
                    FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **extra)
-        r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"],
-                           env=env, capture_output=True, text=True, timeout=60)
+        cmd = cmd or ["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
         def named(word):
@@ -343,6 +348,72 @@ class GpuboxWallReserve(unittest.TestCase):
             r, launches, _ = self.up(od_in_use=boxes(3), s3=s3, FAKE_S3_READ_FAIL="1", GPUBOX_ADMIT_WAIT_S="4")
             self.assertNotEqual(r.returncode, 0, r.stderr)
             self.assertEqual(launches, [], r.stderr)
+
+    def test_every_admitted_launch_carries_the_admission_tag(self):
+        # ejc3/aws denies the fleet's Terraform role a G RunInstances without it, so a launcher
+        # that skips the reserve (an old checkout's gpubox.sh, 2026-11-07) is refused by EC2.
+        r, launches, _ = self.up(od_in_use=boxes(3))
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertIn("{Key=fcvm-admission,Value=wall-reserve}", launches[0])
+
+    def ami_launch(self, kind, **kw):
+        return self.up(cmd=["bash", os.path.join(HERE, "..", "ami", "build-ami.sh"), "launch", kind], **kw)
+
+    def test_an_ami_builder_goes_through_the_wall_reserve(self):
+        # A host builder (96 vCPU) on demand at 192 of 384 in use would leave the wall 96 of
+        # its 128: refused. A tile builder (4) fits, tagged, and its ledger entry says 4.
+        import tempfile
+        r, launches, _ = self.ami_launch("host", od_in_use=boxes(2))
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("g4dn.metal builder", r.stderr)
+        s3 = tempfile.mkdtemp()
+        r, launches, _ = self.ami_launch("tile", od_in_use=boxes(2), s3=s3)
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertIn("{Key=fcvm-admission,Value=wall-reserve}", launches[0])
+        with open(os.path.join(s3, "gpubox", "admitted")) as f:
+            self.assertEqual(f.read().split()[2:], ["on-demand", "4"])
+
+    def test_a_boot_measurement_goes_through_the_wall_reserve(self):
+        # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave
+        # the wall 96 of its 128.
+        r, launches, _ = self.up(od_in_use=boxes(2),
+                                 cmd=["bash", os.path.join(HERE, "..", "ami", "measure-boot.sh"), "host", "ami-x"])
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("g4dn.metal to measure", r.stderr)
+
+    def test_every_fleet_launcher_goes_through_g_admission(self):
+        # Every script under fleet/ that calls run-instances sources g-admission.sh, checks
+        # room_for and tags the launch: a launcher that does not is the 2026-11-07 outage.
+        import glob, re
+        fleet = os.path.join(HERE, "..")
+        launchers = [f for f in glob.glob(os.path.join(fleet, "**", "*.sh"), recursive=True)
+                     if re.search(r"^[^#]*\bec2 run-instances\b", open(f).read(), re.M)]
+        self.assertEqual(sorted(os.path.basename(f) for f in launchers),
+                         ["build-ami.sh", "gpubox.sh", "measure-boot.sh"])
+        for f in launchers:
+            src = open(f).read()
+            with self.subTest(f=os.path.basename(f)):
+                self.assertTrue(re.search(r'(?m)^\s*\. ".*/g-admission\.sh"$', src), "does not source g-admission.sh")
+                self.assertIn("room_for ", src)
+                self.assertIn("admit_held", src)
+                self.assertIn("ledger_add ", src)
+                self.assertIn("$ADMISSION_TAG]", src)
+
+    def test_a_ledger_entry_counts_its_own_vcpus(self):
+        # An admission a moment ago, not listed yet. 96 listed + 4 + this box's 96 + the wall's
+        # 128 = 324 of 384: admitted. The same entry at 96 makes it 416: refused.
+        import tempfile
+        for vcpus, admitted in ((4, 1), (96, 0)):
+            s3 = tempfile.mkdtemp()
+            os.makedirs(os.path.join(s3, "gpubox"))
+            with open(os.path.join(s3, "gpubox", "admitted"), "w") as f:
+                f.write(f"{int(time.time())} i-other on-demand {vcpus}\n")
+            r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(1), s3=s3)
+            self.assertEqual(len(launches), admitted, (vcpus, r.stderr))
+            for c in launches:
+                self.assertNotIn("MarketType=spot", c)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile

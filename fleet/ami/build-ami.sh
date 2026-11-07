@@ -26,6 +26,11 @@ BUCKET=fcvm-fleet-assets-$ACCOUNT
 A() { aws --region "$REGION" "$@"; }
 S3REGION=${S3REGION:-us-east-2}   # the asset bucket is in the home region
 S3() { aws --region "$S3REGION" "$@"; }
+say() { echo "build-ami: $*" >&2; }
+now() { date +%s; }
+# A builder is a G instance in the wall's host region: it goes through the wall's reserve.
+# shellcheck source=../tools/g-admission.sh
+. "$HERE/../tools/g-admission.sh"
 
 ubuntu_ami() { A ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text; }
 subnet() {
@@ -68,12 +73,22 @@ launch)
   # (warm-root.sh) launches a routed VM at an address in it.
   net="DeviceIndex=0,SubnetId=$(subnet),Groups=$(sg),AssociatePublicIpAddress=true,DeleteOnTermination=true"
   [ "$kind" = host ] && net="$net,Ipv6PrefixCount=1"
+  vcpus=$(A ec2 describe-instance-types --instance-types "$type" --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text)
+  [[ "$vcpus" =~ ^[0-9]+$ ]] || { say "no vCPU count for $type"; exit 1; }
+  # shellcheck disable=SC2034  # read by g-admission.sh
+  owner=ami-build-$kind GA_WHAT="$type builder"
+  admit_lock || { say "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"; exit 1; }
+  trap admit_unlock EXIT
+  room_for on-demand "$vcpus" || exit 1
+  admit_held || { say "the admission lock was broken, or held too long to launch under it; nothing launched"; exit 1; }
   id=$(A ec2 run-instances --image-id "${BASE_AMI:-$(ubuntu_ami)}" --instance-type "$type" \
     --network-interfaces "$net" --iam-instance-profile Name=$profile \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$size,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-builder-$kind},{Key=Purpose,Value=fcvm-fleet-ami-build}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-builder-$kind},{Key=Purpose,Value=fcvm-fleet-ami-build},$ADMISSION_TAG]" \
     --query 'Instances[0].InstanceId' --output text)
+  ledger_add "$id" on-demand "$vcpus" || { A ec2 terminate-instances --instance-ids "$id" >/dev/null; say "terminated $id: its admission could not be recorded"; exit 1; }
+  admit_unlock; trap - EXIT
   echo "$id"
   A ec2 wait instance-running --instance-ids "$id" >&2
   wait_ssm "$id" >&2
