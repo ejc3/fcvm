@@ -691,6 +691,11 @@ pub async fn handle_clone_restore(
         );
     }
 
+    // The container was frozen at the snapshot boundary, so this restore's own page-ins
+    // did not queue behind the container's (payload_freeze). It runs again before the
+    // hook, which may exec into it.
+    crate::payload_freeze::thaw();
+
     // Publication, last: the plan's restore hook runs now, with egress open,
     // the NFS shares remounted and the egress proxy reconnected, so whatever
     // it reaches for (a loopback admin port, a share, the network) is there;

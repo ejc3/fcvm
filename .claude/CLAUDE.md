@@ -68,6 +68,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 | no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
+| a restored clone's own page faults must not queue behind its workload's | the container's cgroup frozen (`cgroup.freeze`) from the prepare until the source resumes or the clone is about to publish (`fc-agent/src/payload_freeze.rs`) | yes: a thaw undoes it, and the guest agent's watchdog thread thaws it itself once it has found the freeze on 60 looks a second apart (time the guest ran, which a clock does not measure across a pause or a restore), so a resume that never arrives, a killed prepare or a killed fcvm cannot leave it frozen; the record `/run/fcvm-payload-frozen` names the frozen cgroups, written before they are frozen, under one lock |
 
 The dump has to happen at snapshot time and cannot move to restore: by the time
 a clone runs, the restored workload and an early published-port client can both
