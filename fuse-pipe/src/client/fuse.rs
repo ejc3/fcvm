@@ -66,7 +66,7 @@ pub struct FuseClient {
     writeback_cache: bool,
     /// What this client told the kernel about each regular file, to find the host's changes
     /// the kernel would not act on (see `host_change`).
-    host_changes: HostChanges,
+    host_changes: Arc<HostChanges>,
 }
 
 impl FuseClient {

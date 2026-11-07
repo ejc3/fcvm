@@ -5491,12 +5491,18 @@ class ServeAcknowledgementSourcePin(unittest.TestCase):
                        for name in sorted(os.listdir(uffd)) if name.endswith(".rs"))
         builders = len(re.findall(r"thread::Builder::new\(\)", text))
         names = re.findall(r'thread::Builder::new\(\)\s*\.name\(\s*"([^"]+)"', text)
-        # The replay workers are the one numbered family. ReplayWorkers joins them before the
-        # clone's replay ends, so they are per-clone work, not detached threads.
-        numbered = re.findall(r'thread::Builder::new\(\)\s*\.name\(\s*format!\("(fcvm-replay-)\{index\}"\)', text)
-        self.assertEqual(numbered, ["fcvm-replay-"], "the replay workers are named fcvm-replay-<index>")
-        most = int(re.search(r"pub const MAX: usize = (\d+);", self.source("src/uffd/server.rs")).group(1))
+        # The replay workers and the fault workers are the numbered families. Both are joined
+        # before their clone's task returns (ReplayWorkers when replay ends, FaultWorkers when
+        # the clone's state is dropped), so they are per-clone work, not detached threads.
+        numbered = re.findall(
+            r'thread::Builder::new\(\)\s*\.name\(\s*format!\("(fcvm-replay-|fcvm-fault-)\{index\}"\)', text)
+        self.assertEqual(sorted(numbered), ["fcvm-fault-", "fcvm-replay-"],
+                         "the replay and fault workers are named fcvm-replay-<index>, fcvm-fault-<index>")
+        server = self.source("src/uffd/server.rs")
+        most = int(re.search(r"pub const MAX: usize = (\d+);", server).group(1))
         self.assertLessEqual(len(f"fcvm-replay-{most - 1}"), 15, "/proc comm truncates the last replay worker")
+        most = int(re.search(r"const MAX_FAULT_WORKERS: usize = (\d+);", server).group(1))
+        self.assertLessEqual(len(f"fcvm-fault-{most - 1}"), 15, "/proc comm truncates the last fault worker")
         self.assertEqual(len(names) + len(numbered), builders,
                          "a server thread is spawned without a literal name")
         self.assertNotRegex(text, r"thread::spawn\(",
