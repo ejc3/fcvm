@@ -718,6 +718,7 @@ async fn launch_shortfall(
         refused = got.refused;
     }
     if launched < short {
+        // `refused` is the last market's: on demand's, when spot fell back to it.
         tracing::warn!(%region, launched, short, reason = %refused.join("; "),
             "GPU hosts still short; asking again after the capacity retry");
     }
@@ -1380,6 +1381,64 @@ mod tests {
 
     /// Every region listed and at its capacity: its live hosts less the excess. A region
     /// unlisted or short, or asleep, says nothing.
+    /// A pass that leaves a region short says why its last market refused: on 2026-11-05
+    /// the wall's host waited 13 minutes and the log named only spot's refusal, while on
+    /// demand was refused with VcpuLimitExceeded (#1257).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_region_still_short_logs_the_on_demand_refusal() {
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        let fake = Arc::new(FakeHosts::default());
+        for m in [Market::Spot, Market::OnDemand] {
+            fake.capacity.lock().unwrap().insert(("r".into(), m), 0);
+        }
+        let cfg = HostConfig {
+            driver: fake.clone(),
+            regions: vec!["r".into()],
+            awake_capacity: 1,
+            on_demand_max: 8,
+            poll: Duration::from_millis(50),
+            liveness: Duration::from_millis(50),
+            capacity_retry: Duration::from_millis(50),
+            lost_launch_ttl: Duration::from_secs(120),
+        };
+        let (mut on_demand, mut recent, mut tokens, mut errors) =
+            (Some(0), HashMap::new(), HashMap::new(), Vec::new());
+        let (launched, _) = launch_shortfall(
+            &cfg,
+            "r",
+            1,
+            &mut on_demand,
+            &mut recent,
+            &mut tokens,
+            &mut errors,
+        )
+        .await;
+        assert_eq!(launched, 0);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("GPU hosts still short"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains("no on-demand capacity"), "{line}");
+    }
+
     #[test]
     fn expected_hosts_are_the_kept_hosts_of_full_regions_only() {
         let a = vec![
