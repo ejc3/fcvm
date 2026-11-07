@@ -2120,6 +2120,22 @@ impl RestoreResolvers {
     }
 }
 
+/// The resolvers the restore document gives the guest.
+///
+/// A snapshot made before `dns_override` was recorded gives none, which leaves the
+/// guest's resolv.conf as it is, as every restore did when it was made: its
+/// recorded resolver may be the source's --dns or the one its host chose, and
+/// rewriting resolv.conf from it as an override would drop the search domains the
+/// guest booted with.
+fn restore_document_dns(
+    meta: &crate::storage::SnapshotMetadata,
+    resolvers: &RestoreResolvers,
+    mode: FcNetworkMode,
+) -> Option<super::podman::GuestDns> {
+    meta.dns_override.as_ref()?;
+    resolvers.guest_dns(mode)
+}
+
 /// The prefix a routed clone's address is derived from: the one this run was given
 /// (`--ipv6-prefix` or FCVM_IPV6_PREFIX). Without one, routed networking detects the
 /// host's own /64, as a fresh `podman run` does. The prefix belongs to the host that runs
@@ -2772,12 +2788,7 @@ async fn cmd_snapshot_run_inner(
     );
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // The source's --dns goes with the guest, so a snapshot of this clone keeps it.
-    vm_state.config.dns_override = Some(
-        snapshot_config
-            .metadata
-            .source_dns_override()
-            .map(str::to_string),
-    );
+    vm_state.config.dns_override = snapshot_config.metadata.dns_override.clone();
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
@@ -3127,7 +3138,7 @@ async fn cmd_snapshot_run_inner(
     // host identity address it was given and the resolvers chosen above.
     let restore_identity = super::common::RestoreIdentity {
         host_ipv6: args.host_ipv6,
-        dns: resolvers.guest_dns(network_mode),
+        dns: restore_document_dns(&snapshot_config.metadata, &resolvers, network_mode),
     };
     restore_identity.write_into(&mut restore_latest);
     let bootplan_socket = format!(
@@ -6010,6 +6021,34 @@ mod tests {
         assert_eq!(read(&document).source_dns_override(), None);
         document["dns_override"] = serde_json::json!("192.0.2.53");
         assert_eq!(read(&document).source_dns_override(), Some("192.0.2.53"));
+
+        // The restore leaves a legacy snapshot's resolv.conf alone, as restores did
+        // when it was made, even on a bridged host whose resolver would differ.
+        let host = || {
+            host_inputs(&[(&["10.9.0.2"], &["restore.example"])])
+                .for_launch(FcNetworkMode::Bridged, &[])
+        };
+        let mut bridged = legacy.clone();
+        bridged.network_mode = FcNetworkMode::Bridged;
+        let given = |meta: &crate::storage::SnapshotMetadata| {
+            let resolvers = restore_resolvers(
+                FcNetworkMode::Bridged,
+                meta.source_dns_override(),
+                if meta.source_dns_override().is_some() {
+                    crate::commands::podman::GuestBootInputs::default()
+                } else {
+                    host()
+                },
+            );
+            restore_document_dns(meta, &resolvers, FcNetworkMode::Bridged)
+        };
+        assert_eq!(given(&bridged), None);
+        bridged.dns_override = Some(None);
+        assert_eq!(
+            given(&bridged),
+            Some(dns(&["10.9.0.2"], &["restore.example"])),
+            "a snapshot that records no --dns takes this host's resolvers"
+        );
 
         // Written back, a recorded none stays recorded.
         fixture.dns_override = Some(None);
