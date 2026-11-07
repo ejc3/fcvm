@@ -850,6 +850,8 @@ pub struct PastaNetwork {
 
     // State (populated during setup)
     pasta_process: Option<Child>,
+    /// pasta's pid as `companion_exited` last read it, before the wait that reaps it.
+    exited_pid: Option<u32>,
     stderr_tail: crate::companion::StderrTail, // last few pasta stderr lines, for failure attribution
     // Reader task for pasta's stderr pipe. Awaited (bounded) before rendering
     // `stderr_tail` on the paths that report a dead pasta, so the attribution
@@ -967,6 +969,7 @@ impl PastaNetwork {
             guest_ip: GUEST_IP.to_string(),
             guest_ipv6: GUEST_IPV6.to_string(),
             pasta_process: None,
+            exited_pid: None,
             stderr_tail: crate::companion::StderrTail::new(),
             stderr_reader: None,
             pid_file: None,
@@ -1999,12 +2002,20 @@ fn port_forward_deadline_error(addr: &str, budget: std::time::Duration) -> anyho
 
 #[async_trait::async_trait]
 impl NetworkManager for PastaNetwork {
-    async fn companion_death(&mut self) -> String {
+    async fn companion_exited(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let Some(child) = self.pasta_process.as_mut() else {
             return std::future::pending().await;
         };
-        let pid = child.id();
-        match child.wait().await {
+        // Read before the wait, which reaps pasta only when it returns.
+        self.exited_pid = child.id();
+        child.wait().await
+    }
+
+    async fn describe_companion_exit(
+        &mut self,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) -> String {
+        match status {
             Ok(status) => {
                 // pasta's exit closed the pipe; drain it so the tail is complete.
                 crate::utils::wait_for_stderr_eof(
@@ -2012,7 +2023,12 @@ impl NetworkManager for PastaNetwork {
                     PASTA_STDERR_EOF_TIMEOUT,
                 )
                 .await;
-                crate::companion::death_message("pasta", pid, &status, &self.stderr_tail)
+                crate::companion::death_message(
+                    "pasta",
+                    self.exited_pid,
+                    &status,
+                    &self.stderr_tail,
+                )
             }
             Err(error) => format!("pasta could not be watched: {error}"),
         }
