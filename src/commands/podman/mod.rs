@@ -680,6 +680,8 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
             // to sync: a working-set writer publishes `memory.bin.working-set` from a
             // temporary beside it, under the sidecar lock and not this one, so a recording
             // or a serve of the same snapshot can rename one away mid-scan.
+            #[cfg(test)]
+            sync_hooks::before_open(&path);
             let file = match std::fs::File::open(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 opened => opened
@@ -696,6 +698,31 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
         .with_context(|| format!("syncing prepared generation {}", dir.display()))?;
     synced.push(dir.to_path_buf());
     Ok(synced)
+}
+
+/// A test's hook into `sync_generation` between listing an entry and opening it, where a
+/// working-set writer can rename its temporary away.
+#[cfg(test)]
+mod sync_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(&std::path::Path)>;
+
+    thread_local! {
+        static BEFORE_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set_before_open(hook: Option<Hook>) {
+        BEFORE_OPEN.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(super) fn before_open(path: &std::path::Path) {
+        BEFORE_OPEN.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
 }
 
 /// Verify the generation installed at `target.name`.
@@ -4247,17 +4274,21 @@ mod tests {
     /// existing skipped the recording.
     #[test]
     fn a_sidecar_that_holds_nothing_does_not_skip_the_recording() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(recorded_pages(dir.path()), 0, "no snapshot at all");
-        std::fs::write(dir.path().join("memory.bin"), vec![0u8; 64 * 4096]).unwrap();
-        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        // The snapshot sits in a child directory: its generation lock is created beside it,
+        // and a lock beside the temporary directory itself would outlive the test.
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        assert_eq!(recorded_pages(&snapshot), 0, "no snapshot at all");
+        std::fs::write(snapshot.join("memory.bin"), vec![0u8; 64 * 4096]).unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
         std::fs::write(
-            crate::uffd::WorkingSetStore::path_for(&dir.path().join("memory.bin")),
+            crate::uffd::WorkingSetStore::path_for(&snapshot.join("memory.bin")),
             b"not a working set",
         )
         .unwrap();
         assert_eq!(
-            recorded_pages(dir.path()),
+            recorded_pages(&snapshot),
             0,
             "a corrupt sidecar counted as recorded"
         );
@@ -4271,14 +4302,36 @@ mod tests {
     /// working-set writer's temporary is, instead of failing the prepare.
     #[test]
     fn a_file_renamed_away_mid_scan_does_not_fail_the_sync() {
-        let source = include_str!("mod.rs");
-        let scan = &source[source.find("fn sync_generation(").unwrap()..];
-        let scan = &scan[..scan.find("\n}\n").unwrap()];
-        assert!(scan.contains("std::io::ErrorKind::NotFound => continue"));
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("kept"), b"1").unwrap();
-        let synced = sync_generation(dir.path()).unwrap();
-        assert!(synced.iter().any(|p| p.ends_with("kept")));
+        let generation = dir.path().join("generation");
+        std::fs::create_dir_all(generation.join("disk")).unwrap();
+        std::fs::write(generation.join("kept"), b"1").unwrap();
+        std::fs::write(generation.join("disk").join("disk.raw"), b"2").unwrap();
+        std::fs::write(generation.join("memory.bin.working-set.tmp"), b"3").unwrap();
+        let away = dir.path().join("published");
+        let renamed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = renamed.clone();
+        sync_hooks::set_before_open(Some(Box::new(move |path: &std::path::Path| {
+            if path.ends_with("memory.bin.working-set.tmp") {
+                std::fs::rename(path, &away).unwrap();
+                seen.set(true);
+            }
+        })));
+        let synced = sync_generation(&generation);
+        sync_hooks::set_before_open(None);
+        assert!(renamed.get(), "the hook never ran on the temporary");
+        let synced = synced.expect("a file renamed away mid-scan failed the sync");
+        for kept in [
+            generation.join("kept"),
+            generation.join("disk").join("disk.raw"),
+            generation.join("disk"),
+            generation.clone(),
+        ] {
+            assert!(synced.contains(&kept), "{} was not synced", kept.display());
+        }
+        assert!(!synced
+            .iter()
+            .any(|p| p.ends_with("memory.bin.working-set.tmp")));
     }
 
     fn test_args() -> RunArgs {
