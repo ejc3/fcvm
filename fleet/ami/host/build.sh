@@ -60,7 +60,10 @@ vm.unprivileged_userfaultfd=1
 # advertisements itself (the kernel's accept_ra is 0 there), so its default route stays.
 net.ipv6.conf.all.forwarding=1
 X
-  sysctl -p /etc/sysctl.d/99-fcvm.conf
+  # -e: fcvm's host kernel, which a revised image already boots, has neither Ubuntu's
+  # apparmor key nor Debian's userns_clone key; both only open user namespaces, checked here.
+  sysctl -e -p /etc/sysctl.d/99-fcvm.conf
+  runuser -u "$U" -- unshare -U -r true
   grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo user_allow_other >> /etc/fuse.conf
   cat > /etc/udev/rules.d/70-fcvm-fleet.rules <<'X'
 KERNEL=="userfaultfd", MODE="0666"
