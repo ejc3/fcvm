@@ -175,14 +175,14 @@ fn every_startup_snapshot_is_asked_for_at_the_target_its_run_started_with() {
         (
             "src/commands/podman/mod.rs",
             "the `podman run` loop asks for its startup snapshot at the run's --balloon",
-            "let snap = CreateSnapshotParams::cache_entry( fc_backend, &startup_key, \
-             BalloonRequirement::StartedAt(ctx.args.balloon),",
+            "let snap = CreateSnapshotParams::cache_entry( SnapshotVmm::of(ctx.vm_manager.as_ref())?, \
+             &startup_key, BalloonRequirement::StartedAt(ctx.args.balloon),",
         ),
         (
             "src/commands/snapshot.rs",
             "the restore loop asks for its startup snapshot at the target the restore set",
-            "let snap = CreateSnapshotParams::cache_entry( fc_backend, &startup_key, \
-             BalloonRequirement::StartedAt(args.balloon),",
+            "let snap = CreateSnapshotParams::cache_entry( SnapshotVmm::of(vm_manager.as_ref())?, \
+             &startup_key, BalloonRequirement::StartedAt(args.balloon),",
         ),
         (
             "src/commands/podman/mod.rs",
