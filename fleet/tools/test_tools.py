@@ -254,6 +254,15 @@ case "$args" in
     echo "${FAKE_RELEASE:-{\"host_amis\": {\"us-east-1\": {\"x86_64\": \"ami-00000000000000ea1\"}}}}" ;;
   *" ssm get-parameter "*) echo ami-ubuntu ;;
   *" ec2 wait "*) : ;;
+  # With FAKE_SSM, a builder's reboot: the boot id changes once reboot-instances has run.
+  # FAKE_SSM_STUCK leaves every command after the reboot Pending; FAKE_SYSTEM_STATUS is the
+  # system status check's result. Without it SSM commands are unexpected, as before.
+  *" ec2 reboot-instances "*) touch "$FAKE_LOG.rebooted" ;;
+  *" ec2 describe-instance-status "*) echo "${FAKE_SYSTEM_STATUS:-ok}" ;;
+  *" ssm send-command "*) [ -n "${FAKE_SSM:-}" ] || { echo "fake aws: unexpected $*" >&2; exit 1; }; if [ -e "$FAKE_LOG.rebooted" ]; then echo cmd-after; else echo cmd-before; fi ;;
+  *" ssm get-command-invocation "*"--query Status "*)
+    case "$args" in *cmd-after*) [ -z "${FAKE_SSM_STUCK:-}" ] || { echo Pending; exit 0; } ;; esac; echo Success ;;
+  *" ssm get-command-invocation "*) case "$args" in *cmd-after*) echo boot-2 ;; *) echo boot-1 ;; esac ;;
   *" ssm describe-instance-information "*) echo Online ;;
   # S3 in $FAKE_S3: a key is a file, its ETag beside it; put-object --if-none-match * creates
   # it only if absent, delete-object --if-match deletes it only at that ETag.
@@ -437,6 +446,22 @@ class GpuboxWallReserve(unittest.TestCase):
                 r, launches, _ = self.up(FAKE_IMAGE_REGION="us-east-1", **kw)
                 self.assertEqual(len(launches), 1, r.stderr)
                 self.assertIn(f"--image-id {ami} ", launches[0])
+
+    def test_a_builder_reboot_ends_on_a_new_boot_an_impaired_host_or_its_deadline(self):
+        # 2026-11-07: a host builder's EC2 host failed its system status check during the
+        # reboot step; every SSM command stayed Pending and the step never returned.
+        cmd = ["bash", os.path.join(HERE, "..", "ami", "build-ami.sh"), "reboot", "i-builder"]
+        fast = {"REBOOT_SETTLE": "0", "REBOOT_WAIT": "5", "FAKE_SSM": "1"}
+        r, _, _ = self.up(cmd=cmd, **fast)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "rebooted"), r.stderr)
+        start = time.time()
+        r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", FAKE_SYSTEM_STATUS="impaired", **fast)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("system status check failed", r.stderr)
+        r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", **fast)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no new boot on i-builder within 5 s", r.stderr)
+        self.assertLess(time.time() - start, 120)
 
     def test_a_boot_measurement_goes_through_the_wall_reserve(self):
         # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave

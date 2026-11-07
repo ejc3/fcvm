@@ -39,10 +39,10 @@ subnet() {
 }
 sg() { A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text; }
 
-ssm_send() { # id, command -> command id
+ssm_send() { # id, command[, delivery timeout s] -> command id
   local params; params=$(jq -nc --arg c "$2" '{commands: [$c], executionTimeout: ["7200"]}')
   A ssm send-command --instance-ids "$1" --document-name AWS-RunShellScript --parameters "$params" \
-    --timeout-seconds 600 --query Command.CommandId --output text
+    --timeout-seconds "${3:-600}" --query Command.CommandId --output text
 }
 ssm_sh() { # id, command: wait and print stdout and stderr; exit with its status
   local cid st; cid=$(ssm_send "$1" "$2")
@@ -52,6 +52,19 @@ ssm_sh() { # id, command: wait and print stdout and stderr; exit with its status
   done
   A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query '[StandardOutputContent,StandardErrorContent]' --output text
   [ "$st" = Success ]
+}
+# ssm_try ID COMMAND SECONDS: ssm_sh that gives up after SECONDS. A command the agent never
+# picks up (an instance that did not come back from a reboot) stays Pending until its delivery
+# timeout, and ssm_sh waits all of it.
+ssm_try() {
+  local cid st=Pending end=$(($(now) + $3))
+  cid=$(ssm_send "$1" "$2" 30) || return 1
+  while [ "$(now)" -lt "$end" ]; do
+    st=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>/dev/null || echo Pending)
+    case "$st" in Pending|InProgress|Delayed) sleep 3 ;; *) break ;; esac
+  done
+  [ "$st" = Success ] || return 1
+  A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query StandardOutputContent --output text
 }
 wait_ssm() {
   for _ in $(seq 1 120); do
@@ -129,15 +142,24 @@ wait)
   ;;
 sh) ssm_sh "$2" "$3" ;;
 reboot)
-  old=$(ssm_sh "$2" "cat /proc/sys/kernel/random/boot_id" | head -1)
+  # Each probe is bounded, and a failed system status check ends the wait: on 2026-11-07 a
+  # host builder's EC2 host failed its reachability check during this reboot, every SSM command
+  # stayed Pending, and the step waited without end.
+  old=$(ssm_try "$2" "cat /proc/sys/kernel/random/boot_id" 300 | head -1)
+  [ -n "$old" ] || { say "no boot id from $2 before the reboot; nothing rebooted"; exit 1; }
   A ec2 reboot-instances --instance-ids "$2"
-  sleep 60
-  for _ in $(seq 1 60); do
-    new=$(ssm_sh "$2" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null | head -1 || true)
+  sleep "${REBOOT_SETTLE:-60}"
+  end=$(($(now) + ${REBOOT_WAIT:-900}))
+  while [ "$(now)" -lt "$end" ]; do
+    sys=$(A ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
+      --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null || true)
+    [ "$sys" = impaired ] && { say "$2's system status check failed after the reboot (its EC2 host, not the instance): stop and start it, which moves it to other hardware and boots it"; exit 1; }
+    left=$((end - $(now))); [ "$left" -le 60 ] || left=60
+    new=$(ssm_try "$2" "cat /proc/sys/kernel/random/boot_id" "$left" | head -1 || true)
     [ -n "$new" ] && [ "$new" != "$old" ] && { echo "rebooted"; exit 0; }
     sleep 15
   done
-  echo "no new boot on $2" >&2; exit 1
+  say "no new boot on $2 within ${REBOOT_WAIT:-900} s of the reboot"; exit 1
   ;;
 image)
   # Publish only the guard actually installed on this builder, checked against
