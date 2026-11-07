@@ -575,3 +575,112 @@ async fn test_no_dirty_tracking_clone() -> Result<()> {
     fixture.cleanup().await;
     Ok(())
 }
+
+/// #806: the restore's gate repair runs in a real guest. A clone whose inherited snapshot
+/// gate is not the one the snapshot closed (here a rule inserted ahead of the gate's own
+/// in `FCVM_SNAPSHOT_IN` while the restore is held at `restore.pre_gate_verify`) must not
+/// trust it: the restore reinstalls the gate (`tcp_verified=false` in its ACK telemetry),
+/// still publishes, and leaves no gate chain behind.
+///
+/// The golden cold-boots with the hold armed and without a pre-start snapshot, so only the
+/// clone's restore reaches it.
+#[tokio::test]
+async fn test_restore_reinstalls_a_tampered_snapshot_gate() -> Result<()> {
+    let (golden_name, clone_name, snapshot_name, _) = common::unique_names("tampergate");
+    let (mut golden_child, golden_pid, _golden_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &golden_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &[
+            (
+                "FCVM_GUEST_FAILPOINT",
+                "restore.pre_gate_verify:sleep:15000",
+            ),
+            ("FCVM_NO_SNAPSHOT", "1"),
+        ],
+    )
+    .await
+    .context("spawning the golden VM with the gate hold armed")?;
+    let created: Result<()> = async {
+        common::poll_health_by_pid(golden_pid, 180).await?;
+        common::create_snapshot_by_pid(golden_pid, &snapshot_name).await
+    }
+    .await;
+    common::kill_process(golden_pid).await;
+    let _ = golden_child.wait().await;
+    if let Err(error) = created {
+        let _ = common::delete_snapshot(&snapshot_name).await;
+        return Err(error);
+    }
+
+    let (mut clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning the restored clone")?;
+    let checked: Result<()> = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !std::fs::read_to_string(&clone_log)
+            .unwrap_or_default()
+            .contains("FAILPOINT restore.pre_gate_verify reached")
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the clone's restore never reached the gate hold ({})",
+                clone_log.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The exec server comes back early in the restore; retry until it answers.
+        let tamper = "/usr/sbin/iptables -w -I FCVM_SNAPSHOT_IN 1 -p tcp -j RETURN";
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            if common::exec_in_vm(clone_pid, &[tamper]).await.is_ok() {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "could not reach the restoring clone to change its gate"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+        anyhow::ensure!(
+            !log.contains("FAILPOINT restore.pre_gate_verify released"),
+            "the gate was read before the test changed it, so nothing was tested"
+        );
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+        anyhow::ensure!(
+            log.contains("\"tcp_verified\":false"),
+            "the restore trusted a gate that was not the snapshot's ({})",
+            clone_log.display()
+        );
+        let rules = common::exec_in_vm(clone_pid, &["/usr/sbin/iptables -w -S"]).await?;
+        anyhow::ensure!(
+            !rules.contains("FCVM_SNAPSHOT"),
+            "the published clone kept a gate chain:\n{rules}"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+    checked?;
+    deleted
+}
