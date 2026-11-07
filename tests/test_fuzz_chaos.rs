@@ -885,6 +885,131 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
     println!("FUZZ ===== end forensics =====");
 }
 
+/// How a seed ends ([`ending_for`]). The kill point comes from a stream of its
+/// own (the seed XOR a constant), so adding it changed no seed's op schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// SIGTERM to fcvm, the shutdown every seed had before.
+    Graceful,
+    /// SIGKILL one companion of the running VM (#852).
+    KillCompanion(Companion),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Companion {
+    Pasta,
+    NamespaceHolder,
+}
+
+impl Companion {
+    /// The start of its `comm` under fcvm: pasta runs as `pasta-<sha>.bin`, and
+    /// the holder is `unshare ... -- sleep infinity`.
+    fn comm(self) -> &'static str {
+        match self {
+            Companion::Pasta => "pasta",
+            Companion::NamespaceHolder => "sleep",
+        }
+    }
+
+    /// The name fcvm reports it by.
+    fn reported_as(self) -> &'static str {
+        match self {
+            Companion::Pasta => "pasta",
+            Companion::NamespaceHolder => "namespace holder",
+        }
+    }
+}
+
+/// How seed `seed` ends, and the op after which a companion is killed (the
+/// schedule stops there: every later op would only meet the VM's death). The
+/// ending is `seed % 3`, so any three consecutive seeds cover all three, and
+/// seed 1, the per-PR run, keeps the graceful shutdown; a draw from a stream
+/// seeded with neighbouring seeds gave all of seeds 1 to 6 the same ending.
+fn ending_for(seed: u64, total_ops: usize) -> (Ending, usize) {
+    let mut stream = SmallRng::seed_from_u64(seed ^ 0x636f_6d70_616e_696f);
+    let ending = match seed % 3 {
+        1 => Ending::Graceful,
+        2 => Ending::KillCompanion(Companion::Pasta),
+        _ => Ending::KillCompanion(Companion::NamespaceHolder),
+    };
+    (ending, stream.gen_range(0..=total_ops))
+}
+
+/// The attribution oracle for a companion death: SIGKILL the companion, and
+/// require fcvm to exit with an error, within the shutdown budget, whose log
+/// names that companion, its pid and the signal. A death reported as whatever
+/// it broke next, or not reported at all, fails the seed.
+async fn kill_companion_and_check_attribution(
+    seed: u64,
+    companion: Companion,
+    child: &mut tokio::process::Child,
+    pid: u32,
+    log_path: &std::path::Path,
+) -> Result<()> {
+    let mut targets = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+        let children = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        for c in children
+            .split_whitespace()
+            .filter_map(|c| c.parse::<u32>().ok())
+        {
+            let comm = std::fs::read_to_string(format!("/proc/{c}/comm")).unwrap_or_default();
+            if comm.trim().starts_with(companion.comm()) {
+                targets.push(c);
+            }
+        }
+    }
+    ensure!(
+        targets.len() == 1,
+        "seed {seed}: expected one {} child of fcvm {pid}, found {targets:?}",
+        companion.comm()
+    );
+    let target = targets[0];
+    println!("FUZZ seed={seed} killing {:?} (pid {target})", companion);
+    unsafe { libc::kill(target as i32, libc::SIGKILL) };
+    let status = match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(waited) => waited.context("waiting for fcvm exit")?,
+        Err(_) => bail!(
+            "seed {seed}: fcvm (pid {pid}) still running {:?} after its {:?} (pid {target}) was killed",
+            SHUTDOWN_TIMEOUT,
+            companion
+        ),
+    };
+    ensure!(
+        !status.success(),
+        "seed {seed}: fcvm exited cleanly after its {:?} died",
+        companion
+    );
+    let expected = format!(
+        "{} (pid {target}) exited: signal: 9",
+        companion.reported_as()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = tokio::fs::read_to_string(log_path)
+            .await
+            .unwrap_or_default();
+        if let Some(line) = text.lines().find(|l| l.contains(&expected)) {
+            // The report carries the companion's stderr, or says it printed none.
+            let name = companion.reported_as();
+            ensure!(
+                line.contains(&format!("; last {name} stderr output:"))
+                    || line.contains(&format!("; no stderr output captured from {name}")),
+                "seed {seed}: the report of {name}'s death carries no stderr section: {line}"
+            );
+            println!("FUZZ seed={seed} attribution OK: {expected}");
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "seed {seed}: fcvm's log does not name the dead companion as `{expected}` (log {})",
+                log_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Execute one op. `draw` is the op's pre-drawn randomness (one u64 per op).
 /// Returns a short human detail for the trace line.
 #[allow(clippy::too_many_arguments)]
@@ -1022,21 +1147,24 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
     let map_arg = format!("{}:/mnt/fuzz", host_dir.display());
     let publish_arg = format!("{}:80", host_port);
 
-    let (mut child, pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
+    let (mut child, pid, log_path) = common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--map",
+            &map_arg,
+            "--publish",
+            &publish_arg,
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
         &vm_name,
-        "--network",
-        "rootless",
-        "--map",
-        &map_arg,
-        "--publish",
-        &publish_arg,
-        "--health-check",
-        "http://localhost/",
-        common::TEST_IMAGE,
-    ])
+    )
     .await?;
     println!(
         "FUZZ seed={} vm={} pid={} port={} scratch={}",
@@ -1057,6 +1185,7 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
     let body = run_seed_body(
         seed,
         total_ops,
+        &log_path,
         &mut rng,
         &mut child,
         pid,
@@ -1129,6 +1258,7 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
 async fn run_seed_body(
     seed: u64,
     total_ops: usize,
+    log_path: &std::path::Path,
     rng: &mut SmallRng,
     child: &mut tokio::process::Child,
     pid: u32,
@@ -1222,7 +1352,14 @@ async fn run_seed_body(
     );
 
     // -- Op loop ------------------------------------------------------------
+    let (ending, kill_after) = ending_for(seed, total_ops);
+    if let Ending::KillCompanion(companion) = ending {
+        println!("FUZZ seed={seed} ends by killing {companion:?} after op {kill_after}");
+    }
     for i in 1..=total_ops {
+        if matches!(ending, Ending::KillCompanion(_)) && i > kill_after {
+            break;
+        }
         let mut op = sample_op(rng);
         // One uniform draw per op keeps rng consumption identical whatever
         // the op does with it (nonce, jitter ms, or nothing).
@@ -1269,6 +1406,12 @@ async fn run_seed_body(
         }
     }
 
+    // A companion death is checked while the schedule's state (the serve
+    // included) is still up, as it would be at that point of a real run.
+    if let Ending::KillCompanion(companion) = ending {
+        kill_companion_and_check_attribution(seed, companion, child, pid, log_path).await?;
+    }
+
     // The UFFD serve goes first: it is an fcvm process this seed started, and
     // the leak oracles below (correctly) refuse to see stray fcvm/firecracker
     // processes after shutdown. Killing it here also proves the clones that
@@ -1278,22 +1421,28 @@ async fn run_seed_body(
         let _ = serve_child.wait().await;
     }
 
-    // -- Graceful shutdown --------------------------------------------------
-    println!("FUZZ seed={} shutting down (SIGTERM to {})", seed, pid);
-    let term = tokio::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .await
-        .context("sending SIGTERM")?;
-    ensure!(term.status.success(), "kill -TERM {} failed", pid);
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => println!("FUZZ seed={} fcvm exited: {:?}", seed, status),
-        Ok(Err(e)) => bail!("waiting for fcvm exit: {}", e),
-        Err(_) => bail!(
-            "fcvm (pid {}) did not exit within {:?} of SIGTERM",
-            pid,
-            SHUTDOWN_TIMEOUT
-        ),
+    match ending {
+        // -- Graceful shutdown ----------------------------------------------
+        Ending::Graceful => {
+            println!("FUZZ seed={} shutting down (SIGTERM to {})", seed, pid);
+            let term = tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output()
+                .await
+                .context("sending SIGTERM")?;
+            ensure!(term.status.success(), "kill -TERM {} failed", pid);
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => println!("FUZZ seed={} fcvm exited: {:?}", seed, status),
+                Ok(Err(e)) => bail!("waiting for fcvm exit: {}", e),
+                Err(_) => bail!(
+                    "fcvm (pid {}) did not exit within {:?} of SIGTERM",
+                    pid,
+                    SHUTDOWN_TIMEOUT
+                ),
+            }
+        }
+        // -- A companion died: fcvm already exited, checked above -------------
+        Ending::KillCompanion(_) => {}
     }
 
     // -- Oracles ------------------------------------------------------------

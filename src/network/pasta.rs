@@ -1,16 +1,12 @@
+use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping, Protocol};
+use crate::paths;
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
-
-use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping, Protocol};
-use crate::paths;
 
 /// Guest network addressing — pasta provides L2↔L4 translation via bridge
 const GUEST_IP: &str = "10.0.2.100";
@@ -56,14 +52,11 @@ const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// published ports must accept, within this window.
 const GUEST_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Number of recent pasta stderr lines kept for error reporting
-const PASTA_STDERR_TAIL_LINES: usize = 20;
-
 /// Upper bound on waiting for the stderr reader to reach EOF after pasta exits,
 /// so the failure error can include what it actually printed. The wait ends on
 /// EOF (pasta's exit closed the write end); this only bounds the pathological
 /// case of an inherited, still-open pipe.
-const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PASTA_STDERR_EOF_TIMEOUT: std::time::Duration = crate::companion::STDERR_EOF_TIMEOUT;
 
 /// Bounded window for a dying pasta to become reapable when a network-setup
 /// step fails. pasta drops its TAP before it can be reaped, so the failing
@@ -857,7 +850,7 @@ pub struct PastaNetwork {
 
     // State (populated during setup)
     pasta_process: Option<Child>,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few pasta stderr lines, for failure attribution
+    stderr_tail: crate::companion::StderrTail, // last few pasta stderr lines, for failure attribution
     // Reader task for pasta's stderr pipe. Awaited (bounded) before rendering
     // `stderr_tail` on the paths that report a dead pasta, so the attribution
     // carries what pasta printed instead of racing the reader task.
@@ -974,7 +967,7 @@ impl PastaNetwork {
             guest_ip: GUEST_IP.to_string(),
             guest_ipv6: GUEST_IPV6.to_string(),
             pasta_process: None,
-            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_tail: crate::companion::StderrTail::new(),
             stderr_reader: None,
             pid_file: None,
             loopback_ip: None,
@@ -1609,18 +1602,11 @@ impl PastaNetwork {
         // dropped by all of them, so a fatal line like "Listen failed for
         // HOST TCP port ...: Address already in use" never reached any log.
         if let Some(stderr) = child.stderr.take() {
-            self.stderr_reader = Some(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    warn!(target: "fcvm::pasta", "{}", line);
-                    if let Ok(mut tail) = stderr_tail.lock() {
-                        if tail.len() >= PASTA_STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                }
-            }));
+            self.stderr_reader = Some(crate::companion::capture(
+                stderr,
+                stderr_tail,
+                |line| warn!(target: "fcvm::pasta", "{}", line),
+            ));
         }
 
         self.adopt_and_await_pasta(child, pid_file, &mut pid_file_watch)
@@ -1659,13 +1645,13 @@ impl PastaNetwork {
     /// race where that old reader appends after the next attempt starts. Give
     /// every attempt a distinct tail and cancel any reader we no longer own so
     /// stale output is structurally unable to enter the current diagnostic.
-    fn begin_stderr_attempt(&mut self) -> Arc<Mutex<VecDeque<String>>> {
+    fn begin_stderr_attempt(&mut self) -> crate::companion::StderrTail {
         if let Some(previous_reader) = self.stderr_reader.take() {
             previous_reader.abort();
         }
 
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        self.stderr_tail = Arc::clone(&stderr_tail);
+        let stderr_tail = crate::companion::StderrTail::new();
+        self.stderr_tail = stderr_tail.clone();
         stderr_tail
     }
 
@@ -1788,16 +1774,7 @@ impl PastaNetwork {
 
     /// Render the captured pasta stderr tail for error messages.
     fn stderr_tail_message(&self) -> String {
-        let lines: Vec<String> = self
-            .stderr_tail
-            .lock()
-            .map(|tail| tail.iter().cloned().collect())
-            .unwrap_or_default();
-        if lines.is_empty() {
-            "; no stderr output captured from pasta".to_string()
-        } else {
-            format!("; last pasta stderr output:\n  {}", lines.join("\n  "))
-        }
+        self.stderr_tail.render("pasta")
     }
 
     /// Wait for pasta's TAP device to appear in the namespace, supervising pasta itself.
@@ -2047,6 +2024,25 @@ fn port_forward_deadline_error(addr: &str, budget: std::time::Duration) -> anyho
 
 #[async_trait::async_trait]
 impl NetworkManager for PastaNetwork {
+    async fn companion_death(&mut self) -> String {
+        let Some(child) = self.pasta_process.as_mut() else {
+            return std::future::pending().await;
+        };
+        let pid = child.id();
+        match child.wait().await {
+            Ok(status) => {
+                // pasta's exit closed the pipe; drain it so the tail is complete.
+                crate::utils::wait_for_stderr_eof(
+                    &mut self.stderr_reader,
+                    PASTA_STDERR_EOF_TIMEOUT,
+                )
+                .await;
+                crate::companion::death_message("pasta", pid, &status, &self.stderr_tail)
+            }
+            Err(error) => format!("pasta could not be watched: {error}"),
+        }
+    }
+
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
 
@@ -2411,6 +2407,7 @@ mod tests {
     }
 
     use super::*;
+    use std::collections::VecDeque;
 
     /// Render an argument vector as strings for assertions.
     fn arg_strings(args: &[OsString]) -> Vec<String> {
@@ -3230,14 +3227,11 @@ mod tests {
         let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
         let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
         let (release_reader_tx, release_reader_rx) = tokio::sync::oneshot::channel();
-        let stderr_tail = Arc::clone(&net.stderr_tail);
+        let stderr_tail = net.stderr_tail.clone();
         net.stderr_reader = Some(tokio::spawn(async move {
             let _ = reader_started_tx.send(());
             let _ = release_reader_rx.await;
-            stderr_tail
-                .lock()
-                .expect("stderr tail lock")
-                .push_back("final pasta stderr".to_string());
+            stderr_tail.push("final pasta stderr".to_string());
         }));
         reader_started_rx.await.expect("stderr reader parked");
 
@@ -3266,14 +3260,11 @@ mod tests {
         let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
         let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
         let (release_reader_tx, release_reader_rx) = tokio::sync::oneshot::channel();
-        let stderr_tail = Arc::clone(&net.stderr_tail);
+        let stderr_tail = net.stderr_tail.clone();
         net.stderr_reader = Some(tokio::spawn(async move {
             let _ = reader_started_tx.send(());
             let _ = release_reader_rx.await;
-            stderr_tail
-                .lock()
-                .expect("stderr tail lock")
-                .push_back("stderr written immediately before timeout kill".to_string());
+            stderr_tail.push("stderr written immediately before timeout kill".to_string());
         }));
         reader_started_rx.await.expect("stderr reader parked");
 
@@ -3379,26 +3370,13 @@ mod tests {
         let mut net = PastaNetwork::new("wait-test".to_string(), "tap0".to_string(), vec![]);
 
         let previous_attempt = net.begin_stderr_attempt();
-        previous_attempt
-            .lock()
-            .expect("previous stderr tail lock")
-            .push_back("previous attempt before retry".to_string());
+        previous_attempt.push("previous attempt before retry".to_string());
 
         let current_attempt = net.begin_stderr_attempt();
-        previous_attempt
-            .lock()
-            .expect("previous stderr tail lock")
-            .push_back("previous attempt after retry".to_string());
-        current_attempt
-            .lock()
-            .expect("current stderr tail lock")
-            .push_back("current attempt output".to_string());
+        previous_attempt.push("previous attempt after retry".to_string());
+        current_attempt.push("current attempt output".to_string());
 
         let message = net.stderr_tail_message();
-        assert!(
-            !Arc::ptr_eq(&previous_attempt, &current_attempt),
-            "a retry must publish a fresh tail so a detached old reader cannot append to it"
-        );
         assert!(message.contains("current attempt output"), "{message}");
         assert!(!message.contains("previous attempt"), "{message}");
     }

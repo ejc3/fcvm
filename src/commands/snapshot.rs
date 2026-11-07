@@ -70,7 +70,7 @@ struct CloneSetupResources {
     tty_cancel: tokio_util::sync::CancellationToken,
     tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
     output_handle: Option<tokio::task::JoinHandle<()>>,
-    egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    egress_proxy_handle: Option<tokio::task::JoinHandle<Option<String>>>,
     network: Option<Box<dyn NetworkManager>>,
     implicit_uffd_cancel: tokio_util::sync::CancellationToken,
     implicit_uffd_handle: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -3035,11 +3035,10 @@ async fn cmd_snapshot_run_inner(
     // Start egress proxy for rootless mode only
     if matches!(network_mode, FcNetworkMode::Rootless) {
         let socket_path = clone_vsock_base.clone();
-        setup.egress_proxy_handle = Some(tokio::spawn(async move {
-            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
-                tracing::warn!("Egress proxy error: {}", e);
-            }
-        }));
+        setup.egress_proxy_handle =
+            Some(crate::companion::spawn_task("egress proxy", async move {
+                crate::network::egress_proxy::run_egress_proxy(&socket_path).await
+            }));
     }
 
     // Setup networking - use saved network config from snapshot
@@ -4304,6 +4303,23 @@ async fn cmd_snapshot_run_inner(
                          clone was killed rather than left frozen with no error.",
                         serve_pid.unwrap_or(0)
                     ));
+                    vm_exit = None;
+                    break;
+                }
+                // The namespace holder or pasta died: the clone has lost its network for
+                // good. Report the companion's own name, status and stderr (#852).
+                message = crate::companion::registered_death("namespace holder", &mut holder_child) => {
+                    clone_failure = Some(format!("a process it depends on died: {message}"));
+                    vm_exit = None;
+                    break;
+                }
+                message = network.companion_death() => {
+                    clone_failure = Some(format!("a process it depends on died: {message}"));
+                    vm_exit = None;
+                    break;
+                }
+                message = crate::companion::task_death("egress proxy", &mut egress_proxy_handle) => {
+                    clone_failure = Some(format!("a process it depends on died: {message}"));
                     vm_exit = None;
                     break;
                 }

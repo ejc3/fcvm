@@ -100,6 +100,16 @@ pub trait NetworkManager: Send + Sync {
         tcp_proxy::PortListeners::default()
     }
 
+    /// Resolve when a helper process this network depends on for the VM's life
+    /// dies, with the message that names it (`crate::companion::death_message`).
+    /// Run loops select on it so a dead helper ends the VM with its own name and
+    /// last stderr output instead of whatever its absence breaks next (#852).
+    ///
+    /// Default: never resolves (bridged and routed have no helper process).
+    async fn companion_death(&mut self) -> String {
+        std::future::pending().await
+    }
+
     /// Cleanup network after VM stop
     async fn cleanup(&mut self) -> Result<()>;
 
