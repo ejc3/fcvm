@@ -257,6 +257,8 @@ jobs:
           python3 -B fleet/ami/test_request.py
       - name: Operator script tests (fleet/tools)
         run: make -C fleet/tools test
+      - name: Windows image build tests (fleet/windows)
+        run: python3 -B fleet/windows/test_image.py
       # Robot Park's scene model, control protocol and shader check (fleet/phone-app), in
       # its build container. The app itself needs the AOSP build's tools and is built by phone-test.
       - name: Phone app scene tests (fleet/phone-app)
