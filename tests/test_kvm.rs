@@ -1678,6 +1678,18 @@ async fn run_nested_n_levels(
         ""
     };
 
+    // L1 reads the archive through the mount under test (FUSE or NFS). It starts
+    // its L2 with only `--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs`, so L2 and deeper
+    // read the same file through that map; /mnt/image-cache does not exist there
+    // (#660: every L3 and L4 run failed in L2 with "stat /mnt/image-cache/...").
+    let level_image_cache = |level: usize| {
+        if level == 1 {
+            image_cache_guest_path.clone()
+        } else {
+            image_dir.clone()
+        }
+    };
+
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
@@ -1740,7 +1752,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1803,7 +1815,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1864,7 +1876,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
