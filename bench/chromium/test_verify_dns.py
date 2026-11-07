@@ -594,6 +594,10 @@ exit 1
 ''' % ("a" * 64, "b" * 64))
         env = dict(os.environ)
         env.pop("GUEST_DNS", None)
+        # The stand-in prepare records no guest_thp, and the golden refuses a snapshot that
+        # does not record the GUEST_THP it asked for (#1621, default never). These tests are
+        # about the resolver, so they ask for the guest's own THP mode.
+        env["GUEST_THP"] = ""
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
