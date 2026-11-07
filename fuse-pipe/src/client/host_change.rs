@@ -77,6 +77,8 @@ impl Known {
 /// inodes whose caches the kernel must drop, then the reply that waited for them.
 struct Job {
     inodes: Vec<u64>,
+    /// Inodes whose attributes alone the kernel must drop (a restore).
+    attrs: Vec<u64>,
     reply: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -103,7 +105,7 @@ fn is_regular(ino: u64, attr: &FileAttr) -> bool {
 }
 
 impl HostChanges {
-    pub(crate) fn new(notifier: NotifierSlot) -> Self {
+    pub(crate) fn new(notifier: NotifierSlot) -> Arc<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<Job>();
         let worker_notifier = Arc::clone(&notifier);
         let queued = Arc::new(AtomicU64::new(0));
@@ -116,6 +118,9 @@ impl HostChanges {
                     if !job.inodes.is_empty() {
                         send_invalidations(&worker_notifier, &job.inodes);
                         worker_queued.fetch_sub(job.inodes.len() as u64, Ordering::AcqRel);
+                    }
+                    if !job.attrs.is_empty() {
+                        send_attribute_invalidations(&worker_notifier, &job.attrs);
                     }
                     if let Some(reply) = job.reply {
                         reply();
@@ -132,14 +137,47 @@ impl HostChanges {
             })
             .ok()
             .map(|_| tx);
-        Self {
+        let changes = Arc::new(Self {
             writeback: AtomicBool::new(false),
             files: DashMap::new(),
             clock: AtomicU64::new(0),
             notifier,
             jobs,
             queued,
+        });
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        live.retain(|weak| weak.strong_count() > 0);
+        live.push(Arc::downgrade(&changes));
+        drop(live);
+        changes
+    }
+
+    /// Make the kernel drop the attributes it holds for every regular file this mount
+    /// knows, so the next access asks the server for them; returns how many. A clone
+    /// restored from a snapshot holds the attributes its source last saw, with however much
+    /// of their timeout was left, so a file the host rewrote since, keeping its size and
+    /// mtime, would be read from the old pages until that timeout passed in the clone. The
+    /// refresh that follows finds the new ctime and drops the pages ([`refreshed`]).
+    ///
+    /// [`refreshed`]: Self::refreshed
+    fn expire_attributes(&self) -> usize {
+        let attrs: Vec<u64> = self.files.iter().map(|entry| *entry.key()).collect();
+        let Some(jobs) = &self.jobs else {
+            return 0;
+        };
+        if attrs.is_empty() {
+            return 0;
         }
+        let count = attrs.len();
+        let job = Job {
+            inodes: Vec::new(),
+            attrs,
+            reply: None,
+        };
+        if jobs.send(job).is_err() {
+            return 0;
+        }
+        count
     }
 
     /// The slot the mount fills with the session's notifier.
@@ -199,6 +237,7 @@ impl HostChanges {
         self.queued.fetch_add(1, Ordering::AcqRel);
         let job = Job {
             inodes: vec![ino],
+            attrs: Vec::new(),
             reply: None,
         };
         if jobs.send(job).is_err() {
@@ -278,6 +317,7 @@ impl HostChanges {
         }
         let job = Job {
             inodes: Vec::new(),
+            attrs: Vec::new(),
             reply: Some(Box::new(reply)),
         };
         let job = match &self.jobs {
@@ -314,6 +354,50 @@ impl Drop for OwnChange<'_> {
         if let Some(mut known) = self.changes.files.get_mut(&self.ino) {
             known.own_in_flight = known.own_in_flight.saturating_sub(1);
             known.own_done = known.own_done.max(done);
+        }
+    }
+}
+
+/// Every mount's record in this process, so a restore can reach them all.
+static LIVE: std::sync::Mutex<Vec<std::sync::Weak<HostChanges>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// After a restore from a snapshot: make the kernel drop the attributes it holds for every
+/// regular file of every fuse-pipe mount in this process, so the next access refreshes
+/// them and a file the host rewrote since the snapshot is read afresh. Returns the number
+/// of files. fc-agent calls it while it handles a restore.
+pub fn expire_cached_attributes() -> usize {
+    let live: Vec<Arc<HostChanges>> = LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    live.iter().map(|changes| changes.expire_attributes()).sum()
+}
+
+/// Test only: the inodes whose attributes were dropped with no session to tell.
+#[cfg(test)]
+static ATTRS_SENT: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn send_attribute_invalidations(notifier: &NotifierSlot, inodes: &[u64]) {
+    let Some(notifier) = notifier.get() else {
+        #[cfg(test)]
+        ATTRS_SENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(inodes);
+        return;
+    };
+    for &ino in inodes {
+        // A negative offset drops the attributes alone and keeps the pages.
+        if let Err(e) = notifier.inval_inode(INodeNo(ino), -1, 0) {
+            tracing::debug!(
+                target: "fuse-pipe::client",
+                ino,
+                error = %e,
+                "the kernel refused to drop a file's attributes after a restore"
+            );
         }
     }
 }
@@ -359,7 +443,7 @@ mod tests {
         }
     }
 
-    fn changes(writeback: bool) -> HostChanges {
+    fn changes(writeback: bool) -> Arc<HostChanges> {
         let changes = HostChanges::new(Arc::new(OnceLock::new()));
         changes.set_writeback(writeback);
         changes
@@ -512,6 +596,33 @@ mod tests {
             source.matches(concat!("send_invalidations", "(&")).count(),
             1,
             "the thread's call"
+        );
+    }
+
+    /// After a restore every tracked regular file's attributes are dropped, through the
+    /// process-wide registry fc-agent calls, so a clone does not read a file the host
+    /// rewrote since the snapshot from the old pages while its inherited attribute timeout
+    /// runs (test_read_only_map_reads_a_rewrite_that_keeps_size_and_mtime failed that way).
+    #[test]
+    fn a_restore_drops_the_attributes_of_every_tracked_file() {
+        const INO: u64 = 0x1049_0001;
+        let c = changes(false);
+        assert!(!c.refreshed(INO, &attr(INO, 64, 100, 100), c.now(), true));
+        let mut dir = attr(INO + 1, 4096, 100, 100);
+        dir.mode = libc::S_IFDIR | 0o755;
+        assert!(!c.refreshed(INO + 1, &dir, c.now(), true));
+        assert!(super::expire_cached_attributes() >= 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ATTRS_SENT.lock().unwrap().contains(&INO) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restore dropped no attributes of the tracked file"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !ATTRS_SENT.lock().unwrap().contains(&(INO + 1)),
+            "directories are not tracked"
         );
     }
 
