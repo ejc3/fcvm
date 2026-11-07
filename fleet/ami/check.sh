@@ -239,6 +239,14 @@ fx=$(mktemp -d)
   for i in 1 2 3 4; do printf 'h%s' "$i" > "$fx/src/f/h$i" && ln "$fx/src/f/h$i" "$fx/src/f/h$i-link" || exit 1; done
   truncate -s 64M "$fx/src/d/sparse" || exit 1
   printf 'tail' | dd of="$fx/src/d/sparse" bs=1 seek=$((32 << 20)) conv=notrunc status=none || exit 1
+  # A file with more data than --split-mib 1: cut into pieces that land in several parts,
+  # with its own mode and a time to the nanosecond. Its 1 MiB hole is inside a run (it
+  # travels as zeros and comes back a hole); its 10 MiB hole is between runs.
+  truncate -s 16M "$fx/src/d/big" || exit 1
+  for at in 0 2 13 14; do
+    head -c $((1 << 20)) /dev/urandom | dd of="$fx/src/d/big" bs=1M seek=$at conv=notrunc status=none || exit 1
+  done
+  chmod 0640 "$fx/src/d/big" && touch -d '2026-01-04 05:06:07.987654321' "$fx/src/d/big" || exit 1
   chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05.123456789' "$fx/src/d/a" || exit 1
   # A directory that holds a file (so a part creates it) and an empty directory (which only
   # the directory pass creates): its mtime must survive the empty one being made in it.
@@ -247,7 +255,10 @@ fx=$(mktemp -d)
   ex=(--exclude=./vm-disks --exclude='./*.lock')
   tar -c --sparse --numeric-owner --format=posix "${ex[@]}" -C "$fx/src" . > "$fx/one.tar" || exit 1
   mkdir "$fx/one" && tar -x --sparse --same-owner --numeric-owner -C "$fx/one" < "$fx/one.tar" || exit 1
-  python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 "${ex[@]}" > /dev/null || exit 1
+  python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 --split-mib 1 "${ex[@]}" > "$fx/pack.out" || exit 1
+  grep -qx 'store-pack: 1 files split into 5 pieces of at most 1 MiB' "$fx/pack.out" || exit 1
+  # The pieces are spread: at least two parts hold one.
+  [ "$(grep -c ' [1-9][0-9]* pieces' "$fx/pack.out")" -ge 2 ] || exit 1
   mapfile -t parts < "$fx/pack/parts"
   [ "${#parts[@]}" = 3 ] || exit 1
   fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
@@ -277,6 +288,8 @@ fx=$(mktemp -d)
     [ "$(stat -c %h "$fx/$mode/d/a")" = 2 ] || exit 1
     # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
     [ "$(stat -c %b "$fx/$mode/d/sparse")" -lt 1024 ] || exit 1
+    [ "$(stat -c %b "$fx/$mode/d/big")" -le $(( (4 << 20) / 512 + 64 )) ] || exit 1
+    [ "$(stat -c %y "$fx/$mode/d/big")" = "$(stat -c %y "$fx/src/d/big")" ] || { touch "$fx/mtime-lost"; exit 1; }
   done
 ) 2>/dev/null || no "store.sh does not restore store-pack.py's parts at once into the tree one tar gives"
 [ -e "$fx/mtime-lost" ] && no "the store parts drop the fraction of a modification time"
