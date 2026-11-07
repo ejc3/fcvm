@@ -3718,8 +3718,8 @@ class ScaleOutputHonoursThePublicationGate(unittest.TestCase):
 
 class RestorePathIsWhatItSays(unittest.TestCase):
     def test_a_file_arm_that_would_restore_through_uffd_is_refused(self):
-        """Red before the check: hugepage, NV2 (kernel profile) and forced
-        restores made the FILE arm an implicit UFFD one."""
+        """Red before the check: hugepage, NV2 (kernel profile), forced and
+        free page reporting restores made the FILE arm an implicit UFFD one."""
         plain = {"metadata": {"hugepages": False, "kernel_profile": None}}
         self.assertIsNone(reqscale.file_restore_refusal(plain, {}))
         self.assertIn("hugepages", reqscale.file_restore_refusal(
@@ -3728,6 +3728,8 @@ class RestorePathIsWhatItSays(unittest.TestCase):
             {"metadata": {"kernel_profile": "nested"}}, {}))
         self.assertIn("FCVM_FORCE_UFFD", reqscale.file_restore_refusal(
             plain, {"FCVM_FORCE_UFFD": "1"}))
+        self.assertIn("free pages", reqscale.file_restore_refusal(
+            {"metadata": {"balloon_free_page_reporting": True}}, {}))
 
     def test_the_server_must_run_the_requested_mode(self):
         """Red before the check: NV2 coerced minor to copy and the UFFD cells

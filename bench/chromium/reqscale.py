@@ -2541,11 +2541,13 @@ def file_restore_refusal(snapshot_config: dict, environ) -> Optional[str]:
     """Why this run's FILE arm would not be a file-backed restore, or None.
 
     `fcvm snapshot run` without a memory server serves a hugepage snapshot, an
-    NV2 snapshot, or any restore under FCVM_FORCE_UFFD through an implicit
-    in-process UFFD server (src/commands/snapshot.rs direct_restore_memory),
-    so the FILE-versus-UFFD comparison would be UFFD against UFFD. NV2 comes
-    from the snapshot's kernel profile; any recorded profile is refused rather
-    than resolving whether it enables NV2.
+    NV2 snapshot, any restore under FCVM_FORCE_UFFD, and a snapshot whose guest
+    reports free pages in more blocks than vm.max_map_count allows mappings
+    through an implicit in-process UFFD server (src/commands/snapshot.rs
+    direct_restore_memory), so the FILE-versus-UFFD comparison would be UFFD
+    against UFFD. NV2 comes from the snapshot's kernel profile; any recorded
+    profile is refused rather than resolving whether it enables NV2, and any
+    guest that reports free pages is refused rather than repeating the count.
     """
     metadata = snapshot_config.get("metadata")
     if not isinstance(metadata, dict):
@@ -2557,6 +2559,9 @@ def file_restore_refusal(snapshot_config: dict, environ) -> Optional[str]:
                 "which can restore through an implicit UFFD server (NV2)")
     if "FCVM_FORCE_UFFD" in environ:
         return "FCVM_FORCE_UFFD is set, which restores through an implicit UFFD server"
+    if metadata.get("balloon_free_page_reporting"):
+        return ("the snapshot's guest reports free pages, which fcvm restores through an "
+                "implicit UFFD server when vm.max_map_count is too low for its blocks")
     return None
 
 

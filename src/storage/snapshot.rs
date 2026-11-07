@@ -332,6 +332,15 @@ pub struct SnapshotMetadata {
     /// device.
     #[serde(default)]
     pub balloon_free_page_reporting: bool,
+    /// The order the guest reported free pages at (`page_reporting_order`; a reported block
+    /// is at least 4 KiB << order), read from the guest's
+    /// `/sys/module/page_reporting/parameters/page_reporting_order` just before the pause
+    /// when its balloon offers free page reporting. It holds the boot argument
+    /// `page_reporting.page_reporting_order=` or a later write inside the guest. None when
+    /// reporting is off, when the read failed, and for snapshots written before this field
+    /// existed; a restore then assumes [`DEFAULT_PAGE_REPORTING_ORDER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_reporting_order: Option<u32>,
     /// GPUs the source parked for this snapshot (`snapshot create --gpu-warm`): its
     /// CUDA processes are checkpointed into guest memory and wait to be restored onto
     /// this many GPUs. A restore must attach exactly this many (`--gpu`); 0 for every
@@ -342,6 +351,24 @@ pub struct SnapshotMetadata {
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+/// The order a guest reports free pages at unless told otherwise. virtio_balloon leaves
+/// `page_reporting_order` to `pageblock_order` (it sets its own order only on arm64 with
+/// 64 KiB pages), which is 9 on fcvm's 4 KiB-page guest kernels: 2 MiB blocks.
+pub const DEFAULT_PAGE_REPORTING_ORDER: u32 = 9;
+
+/// The guest page size `page_reporting_order` counts in. fcvm's guest kernels use 4 KiB
+/// pages on both architectures (the arm64 configs leave `CONFIG_ARM64_4K_PAGES` at its
+/// default).
+pub const GUEST_PAGE_BYTES: u64 = 4096;
+
+/// Parse what the guest's `page_reporting_order` parameter reads. The kernel holds -1
+/// (read back as 4294967295) until a reporting device registers, and a value above
+/// `MAX_PAGE_ORDER` is never stored, so anything that is not an order a block can have is
+/// no order at all.
+pub fn parse_page_reporting_order(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|order| *order <= 10)
 }
 
 impl SnapshotMetadata {
@@ -919,6 +946,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                page_reporting_order: None,
                 parked_gpus: 0,
             },
         };
@@ -1127,6 +1155,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                page_reporting_order: None,
                 parked_gpus: 0,
             },
         };
@@ -1218,6 +1247,7 @@ mod tests {
                     firecracker_bin: None,
                     balloon_mib: None,
                     balloon_free_page_reporting: false,
+                    page_reporting_order: None,
                     parked_gpus: 0,
                 },
             };
@@ -1296,6 +1326,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                page_reporting_order: None,
                 parked_gpus: 0,
             },
         };
@@ -1499,6 +1530,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                page_reporting_order: None,
                 parked_gpus: 0,
             },
         };
@@ -1624,6 +1656,40 @@ mod tests {
         assert_eq!(meta.balloon_device(), None);
     }
 
+    /// The guest's free page reporting order reaches config.json and comes back from it, a
+    /// snapshot written before the field reads as having none, and only an order a block
+    /// can have is taken from the guest's parameter.
+    #[test]
+    fn snapshot_metadata_records_the_page_reporting_order() {
+        let legacy = r#"{
+            "image": "x", "vcpu": 1, "memory_mib": 128,
+            "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" },
+            "balloon_mib": 64, "balloon_free_page_reporting": true
+        }"#;
+        let mut meta: SnapshotMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(meta.page_reporting_order, None);
+        assert!(
+            !serde_json::to_string(&meta)
+                .unwrap()
+                .contains("page_reporting_order"),
+            "a snapshot without an order writes none"
+        );
+
+        meta.page_reporting_order = Some(2);
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["page_reporting_order"], 2);
+        let reparsed: SnapshotMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(reparsed.page_reporting_order, Some(2));
+
+        assert_eq!(parse_page_reporting_order("9\n"), Some(9));
+        assert_eq!(parse_page_reporting_order("0"), Some(0));
+        assert_eq!(parse_page_reporting_order("10"), Some(10));
+        // -1 until a reporting device registers.
+        assert_eq!(parse_page_reporting_order("4294967295\n"), None);
+        assert_eq!(parse_page_reporting_order(""), None);
+        assert_eq!(parse_page_reporting_order("cat: no such file"), None);
+    }
+
     #[test]
     fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
         let metadata = SnapshotMetadata {
@@ -1658,6 +1724,7 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
+            page_reporting_order: None,
             parked_gpus: 0,
         };
 

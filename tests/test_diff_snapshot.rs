@@ -1623,3 +1623,108 @@ async fn test_snapshot_restore_survives_ancestor_dir_cleanup() -> Result<()> {
     let _ = std::fs::remove_dir_all(snapshot_dir().join(&tag2));
     Ok(())
 }
+
+/// A memory snapshot of a guest that reports free pages records the order its balloon
+/// reports at, whether the boot arguments set it or a write inside the guest changed it
+/// later, and taking the snapshot leaves the guest's order as it was. A restore uses the
+/// recorded order to count the mappings free page reporting can add to its guest memory
+/// (#1095).
+#[tokio::test]
+async fn test_snapshot_records_the_guest_page_reporting_order() -> Result<()> {
+    const ORDER_PATH: &str = "/sys/module/page_reporting/parameters/page_reporting_order";
+    const BOOT_ORDER: u32 = 4;
+    const WRITTEN_ORDER: u32 = 6;
+    let (vm_name, _, tag, _) = common::unique_names("fpr-order");
+    let written_tag = format!("{tag}-written");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let _remove_snapshot = RemoveSnapshotOnDrop(snapshot_dir().join(&tag));
+    let _remove_written = RemoveSnapshotOnDrop(snapshot_dir().join(&written_tag));
+    let boot_args = format!("page_reporting.page_reporting_order={BOOT_ORDER}");
+
+    let (mut child, pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--no-snapshot",
+            "--balloon",
+            "0",
+            "--free-page-reporting",
+            "--health-check",
+            HEALTH_CHECK_URL,
+            TEST_IMAGE,
+        ],
+        &[("FCVM_BOOT_ARGS", &boot_args)],
+    )
+    .await
+    .context("spawning the source VM")?;
+
+    let result = async {
+        common::poll_health_by_pid(pid, 180).await?;
+        let guest_order = || async {
+            let text = common::exec_in_vm(pid, &[&format!("/usr/bin/cat {ORDER_PATH}")]).await?;
+            text.trim()
+                .parse::<u32>()
+                .with_context(|| format!("the guest's order reads {text:?}"))
+        };
+        let recorded_order = |tag: &str| -> Result<Option<u64>> {
+            let path = snapshot_dir().join(tag).join("config.json");
+            let config: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )?;
+            Ok(config["metadata"]["page_reporting_order"].as_u64())
+        };
+        let create = |tag: String| {
+            let fcvm_path = fcvm_path.clone();
+            async move {
+                let output = tokio::time::timeout(
+                    Duration::from_secs(180),
+                    snapshot_create(&fcvm_path, pid, &tag),
+                )
+                .await
+                .context("snapshot create did not return within 180s")??;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "snapshot create {tag} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                anyhow::Ok(())
+            }
+        };
+
+        anyhow::ensure!(
+            guest_order().await? == BOOT_ORDER,
+            "control: the guest did not take page_reporting_order={BOOT_ORDER} from its boot \
+             arguments"
+        );
+        create(tag.clone()).await?;
+        assert_eq!(
+            recorded_order(&tag)?,
+            Some(u64::from(BOOT_ORDER)),
+            "the snapshot does not record the order the guest booted with"
+        );
+        assert_eq!(
+            guest_order().await?,
+            BOOT_ORDER,
+            "taking the snapshot changed the source's order"
+        );
+
+        common::exec_in_vm(pid, &[&format!("echo {WRITTEN_ORDER} > {ORDER_PATH}")]).await?;
+        anyhow::ensure!(
+            guest_order().await? == WRITTEN_ORDER,
+            "control: the write to {ORDER_PATH} did not change the guest's order"
+        );
+        create(written_tag.clone()).await?;
+        assert_eq!(
+            recorded_order(&written_tag)?,
+            Some(u64::from(WRITTEN_ORDER)),
+            "the snapshot does not record the order the guest held when it was taken"
+        );
+        anyhow::Ok(())
+    }
+    .await;
+    stop(pid, &mut child).await;
+    result
+}

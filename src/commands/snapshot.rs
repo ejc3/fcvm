@@ -401,15 +401,171 @@ enum ImplicitUffdReason {
     Nv2,
     /// `FCVM_FORCE_UFFD`, for debugging and tests.
     Forced,
+    /// The snapshot's guest reports free pages, and on the File backend each reported
+    /// block can become a mapping of its own, more than `vm.max_map_count` allows. Copy
+    /// mode's guest memory is anonymous, so Firecracker discards a reported block with
+    /// `MADV_DONTNEED` and the mapping stays whole.
+    MapCount(MapCountShortfall),
 }
 
 impl std::fmt::Display for ImplicitUffdReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Hugepages => "hugepages require UFFD",
-            Self::Nv2 => "NV2 guests avoid the File backend's copy-on-write",
-            Self::Forced => "FCVM_FORCE_UFFD",
-        })
+        match self {
+            Self::Hugepages => f.write_str("hugepages require UFFD"),
+            Self::Nv2 => f.write_str("NV2 guests avoid the File backend's copy-on-write"),
+            Self::Forced => f.write_str("FCVM_FORCE_UFFD"),
+            Self::MapCount(shortfall) => write!(f, "{shortfall}"),
+        }
+    }
+}
+
+/// Mappings a Firecracker process holds besides the ones free page reporting can add to
+/// its guest memory, bounded with headroom. A 4 GiB guest's Firecracker held 46 after a
+/// cold boot at 1 vCPU, 102 at 8 and 294 at 32 (Firecracker's limit), about 8 per vCPU.
+/// The 8-vCPU guest's File-backend restore held 108 before its guest freed memory, and 164
+/// after it freed 1.5 GiB once, 32 of them pieces of memory.bin. 4096 leaves room for
+/// allocator arenas and devices and is under 1 percent of the 1,048,576 Ubuntu sets.
+const FIRECRACKER_BASELINE_MAPPINGS: u64 = 4096;
+
+/// A restore whose guest can report free pages in more blocks than `vm.max_map_count`
+/// allows mappings, on a transport that gives each reported block a mapping of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MapCountShortfall {
+    /// The most mappings the restored Firecracker can need.
+    needed: u64,
+    /// The host's `vm.max_map_count`.
+    max_map_count: u64,
+    /// The guest's `page_reporting_order` the count assumes.
+    order: u32,
+}
+
+impl std::fmt::Display for MapCountShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "free page reporting at page_reporting_order {} can split guest memory into up to \
+             {} mappings, and vm.max_map_count is {}",
+            self.order, self.needed, self.max_map_count
+        )
+    }
+}
+
+/// The most mappings a restored Firecracker can hold when its guest reports free pages in
+/// blocks of `order` and the memory transport replaces each reported range with a fresh
+/// anonymous mapping (the File backend and minor mode: `discard_range` in the fork's
+/// `vstate/memory.rs`).
+///
+/// A reported block is a free buddy block of at least `GUEST_PAGE_BYTES << order` bytes,
+/// aligned to its size, so every split falls on a block boundary and no mapping of guest
+/// memory is smaller than one block. Guest memory therefore never holds more mappings than
+/// it holds blocks, which is reached when reported and unreported blocks alternate. The
+/// split points between guest memory regions (two on x86 above 3 GiB) are within the
+/// baseline's headroom.
+fn free_page_reporting_mappings(memory_mib: u32, order: u32) -> u64 {
+    let block = crate::storage::snapshot::GUEST_PAGE_BYTES << order.min(32);
+    let memory = u64::from(memory_mib) * 1024 * 1024;
+    memory.div_ceil(block) + FIRECRACKER_BASELINE_MAPPINGS
+}
+
+/// Whether a restore that splits guest memory on free page reports can exceed
+/// `vm.max_map_count`: None when the guest does not report free pages, or when the
+/// sysctl allows every mapping it can need.
+fn free_page_reporting_shortfall(
+    free_page_reporting: bool,
+    memory_mib: u32,
+    order: u32,
+    max_map_count: u64,
+) -> Option<MapCountShortfall> {
+    if !free_page_reporting {
+        return None;
+    }
+    let needed = free_page_reporting_mappings(memory_mib, order);
+    (needed > max_map_count).then_some(MapCountShortfall {
+        needed,
+        max_map_count,
+        order,
+    })
+}
+
+/// [`free_page_reporting_shortfall`] for a snapshot's restore, with `vm.max_map_count` from
+/// `max_map_count`, which is read only when the snapshot's guest reports free pages. A
+/// snapshot that records no order was taken before fcvm recorded it (or the read failed),
+/// and its guest is assumed to have held the default.
+fn restore_map_count_shortfall_with(
+    metadata: &crate::storage::SnapshotMetadata,
+    memory_mib: u32,
+    max_map_count: impl FnOnce() -> Result<u64>,
+) -> Result<Option<MapCountShortfall>> {
+    if !metadata.balloon_free_page_reporting {
+        return Ok(None);
+    }
+    let order = match metadata.page_reporting_order {
+        Some(order) => order,
+        None => {
+            let order = crate::storage::snapshot::DEFAULT_PAGE_REPORTING_ORDER;
+            info!(
+                order,
+                block_kib = (crate::storage::snapshot::GUEST_PAGE_BYTES << order) / 1024,
+                "the snapshot records no free page reporting order; assuming the guest default"
+            );
+            order
+        }
+    };
+    Ok(free_page_reporting_shortfall(
+        true,
+        memory_mib,
+        order,
+        max_map_count()?,
+    ))
+}
+
+/// [`restore_map_count_shortfall_with`] against this host's `vm.max_map_count`.
+fn restore_map_count_shortfall(
+    metadata: &crate::storage::SnapshotMetadata,
+    memory_mib: u32,
+) -> Result<Option<MapCountShortfall>> {
+    restore_map_count_shortfall_with(metadata, memory_mib, read_max_map_count)
+}
+
+fn read_max_map_count() -> Result<u64> {
+    const PATH: &str = "/proc/sys/vm/max_map_count";
+    let text = std::fs::read_to_string(PATH).with_context(|| format!("reading {PATH}"))?;
+    text.trim()
+        .parse()
+        .with_context(|| format!("parsing {PATH}: {:?}", text.trim()))
+}
+
+/// The UFFD mode an implicit server runs for a restore that cannot take a minor-mode split
+/// of its guest memory: copy, whose anonymous memory a reported block does not split.
+fn backing_within_map_count(
+    backing: UffdBacking,
+    shortfall: Option<MapCountShortfall>,
+) -> UffdBacking {
+    match (backing, shortfall) {
+        (UffdBacking::Minor { .. }, Some(_)) => UffdBacking::Copy,
+        _ => backing,
+    }
+}
+
+/// Refuse a minor-mode restore that can exceed `vm.max_map_count`. A minor-mode clone maps
+/// its guest memory `MAP_PRIVATE` over the server's memfd, so Firecracker replaces each
+/// block the guest reports with a mapping of its own, and once the count passes the sysctl
+/// the replacement fails after `MAP_FIXED` has unmapped the range and Firecracker panics.
+/// The mode is the serve's, so the restore has no other transport to fall back to.
+fn ensure_minor_within_map_count(
+    backing: UffdBacking,
+    shortfall: Option<MapCountShortfall>,
+    remedy: &str,
+) -> Result<()> {
+    match (backing, shortfall) {
+        (UffdBacking::Minor { .. }, Some(shortfall)) => bail!(
+            "{shortfall}: a minor-mode restore of this snapshot can exceed vm.max_map_count and \
+             Firecracker would panic. Raise it to at least {} (`sysctl -w vm.max_map_count={}`), \
+             or {remedy}",
+            shortfall.needed,
+            shortfall.needed
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -486,13 +642,24 @@ enum DirectRestoreMemory {
 /// (`RuntimeConfig::effective_firecracker_args`). Unless the caller overrides them, the
 /// restore resolves those arguments from the snapshot's recorded kernel profile
 /// (`snapshot_restore_runtime_config`), so an NV2 snapshot restores with the flag.
-fn direct_restore_memory(hugepages: bool, nv2: bool, forced: bool) -> DirectRestoreMemory {
+///
+/// `map_count` is set when the File backend could take more mappings than `vm.max_map_count`
+/// allows (`restore_map_count_shortfall`). Such a restore runs on a copy-mode server instead
+/// of failing, so a cache hit restores wherever the cold boot that made the snapshot ran.
+fn direct_restore_memory(
+    hugepages: bool,
+    nv2: bool,
+    forced: bool,
+    map_count: Option<MapCountShortfall>,
+) -> DirectRestoreMemory {
     if hugepages {
         DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages)
     } else if nv2 {
         DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
     } else if forced {
         DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Forced)
+    } else if let Some(shortfall) = map_count {
+        DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::MapCount(shortfall))
     } else {
         DirectRestoreMemory::File
     }
@@ -1672,6 +1839,15 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             requested = requested.name(),
             "--uffd-mode does not apply to an NV2 snapshot; serving in copy mode"
         );
+    }
+    // Every clone of a minor-mode serve splits its guest memory on each free page report,
+    // so refuse the serve here rather than each clone at its restore.
+    if matches!(backing, UffdBacking::Minor { .. }) {
+        let shortfall = restore_map_count_shortfall(
+            &snapshot_config.metadata,
+            snapshot_config.metadata.memory_mib,
+        )?;
+        ensure_minor_within_map_count(backing, shortfall, "serve it in copy mode")?;
     }
 
     // Whether clones replay the snapshot's recorded working set instead of faulting it in
@@ -2928,7 +3104,19 @@ async fn cmd_snapshot_run_inner(
             ));
         }
         let mode = serve_uffd_mode.as_deref().unwrap_or("copy");
-        match setup_try!(UffdBacking::parse_mode(mode, hugepages)) {
+        let backing = setup_try!(UffdBacking::parse_mode(mode, hugepages));
+        if matches!(backing, UffdBacking::Minor { .. }) {
+            let shortfall = setup_try!(restore_map_count_shortfall(
+                &snapshot_config.metadata,
+                args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+            ));
+            setup_try!(ensure_minor_within_map_count(
+                backing,
+                shortfall,
+                "restart the serve in copy mode (`snapshot serve --uffd-mode copy`)",
+            ));
+        }
+        match backing {
             UffdBacking::Copy => MemoryBackend::Uffd {
                 socket_path: uffd_socket_path.clone(),
             },
@@ -2941,9 +3129,29 @@ async fn cmd_snapshot_run_inner(
             .effective_firecracker_args()
             .as_deref()
             .is_some_and(crate::setup::firecracker_args_enable_nv2);
-        let direct_memory =
-            direct_restore_memory(hugepages, nv2, std::env::var("FCVM_FORCE_UFFD").is_ok());
+        // The File backend and a minor-mode server split guest memory on each free page
+        // report; copy mode does not.
+        let map_count = setup_try!(restore_map_count_shortfall(
+            &snapshot_config.metadata,
+            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+        ));
+        let direct_memory = direct_restore_memory(
+            hugepages,
+            nv2,
+            std::env::var("FCVM_FORCE_UFFD").is_ok(),
+            map_count,
+        );
         if let DirectRestoreMemory::ImplicitUffd(reason) = direct_memory {
+            if let ImplicitUffdReason::MapCount(shortfall) = reason {
+                warn!(
+                    needed = shortfall.needed,
+                    max_map_count = shortfall.max_map_count,
+                    order = shortfall.order,
+                    "free page reporting could exceed vm.max_map_count on the File backend; \
+                     restoring through a copy-mode UFFD server. Raise vm.max_map_count to at \
+                     least the needed count to restore on the File backend"
+                );
+            }
             if hugepages {
                 // Same admission logic as the serve-process path above: refuse to spawn a
                 // hugepage clone the pool cannot hold at its CoW worst case.
@@ -2959,6 +3167,15 @@ async fn cmd_snapshot_run_inner(
                     "FCVM_UFFD_MODE does not apply to an NV2 snapshot; restoring in copy mode"
                 );
             }
+            let within = backing_within_map_count(backing, map_count);
+            if within != backing {
+                warn!(
+                    requested = backing.name(),
+                    "FCVM_UFFD_MODE=minor would let free page reporting exceed \
+                     vm.max_map_count; restoring in copy mode"
+                );
+            }
+            let backing = within;
             let prefetch = setup_try!(Prefetch::from_env());
             let record_window = setup_try!(record_window_from_env());
             let fault_around = setup_try!(FaultAround::from_env());
@@ -5398,6 +5615,7 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
+            page_reporting_order: None,
             parked_gpus: 0,
         }
     }
@@ -6570,7 +6788,7 @@ mod tests {
             .as_deref()
             .is_some_and(crate::setup::firecracker_args_enable_nv2);
         assert_eq!(
-            direct_restore_memory(false, nv2, false),
+            direct_restore_memory(false, nv2, false, None),
             DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
         );
     }
@@ -6600,7 +6818,7 @@ mod tests {
             .as_deref()
             .is_some_and(crate::setup::firecracker_args_enable_nv2);
         assert_eq!(
-            direct_restore_memory(false, nv2, false),
+            direct_restore_memory(false, nv2, false, None),
             DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
         );
     }
@@ -6608,18 +6826,18 @@ mod tests {
     #[test]
     fn restores_that_are_not_nv2_keep_their_memory_transport() {
         assert_eq!(
-            direct_restore_memory(false, false, false),
+            direct_restore_memory(false, false, false, None),
             DirectRestoreMemory::File
         );
         assert_eq!(
-            direct_restore_memory(false, false, true),
+            direct_restore_memory(false, false, true, None),
             DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Forced)
         );
         // An NV2 hugepage snapshot reports the hugepage reason; uffd_backing_for still
         // pins it to copy mode.
         for nv2 in [false, true] {
             assert_eq!(
-                direct_restore_memory(true, nv2, false),
+                direct_restore_memory(true, nv2, false, None),
                 DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages)
             );
         }
@@ -6629,6 +6847,214 @@ mod tests {
         assert!(crate::setup::firecracker_args_enable_nv2(
             "--no-seccomp --enable-nv2"
         ));
+    }
+
+    const GIB_MIB: u32 = 1024;
+
+    /// The worst case is one mapping per reported block of guest memory, plus the
+    /// mappings the VMM holds anyway: the issue's table, 65,536 mappings for a 128 GiB
+    /// guest at the default 2 MiB blocks and 8,388,608 at 16 KiB.
+    #[test]
+    fn free_page_reporting_mappings_are_guest_memory_over_the_block_size() {
+        let base = FIRECRACKER_BASELINE_MAPPINGS;
+        assert_eq!(
+            free_page_reporting_mappings(128 * GIB_MIB, 9),
+            65_536 + base
+        );
+        assert_eq!(
+            free_page_reporting_mappings(128 * GIB_MIB, 2),
+            8_388_608 + base
+        );
+        assert_eq!(free_page_reporting_mappings(GIB_MIB, 0), 262_144 + base);
+        // A partial block at the end is a block.
+        assert_eq!(free_page_reporting_mappings(3, 9), 2 + base);
+    }
+
+    #[test]
+    fn free_page_reporting_shortfall_compares_the_count_with_the_sysctl() {
+        let needed = free_page_reporting_mappings(128 * GIB_MIB, 9);
+        // The kernel default is short for a 128 GiB guest at the default blocks.
+        assert_eq!(
+            free_page_reporting_shortfall(true, 128 * GIB_MIB, 9, 65_530),
+            Some(MapCountShortfall {
+                needed,
+                max_map_count: 65_530,
+                order: 9
+            })
+        );
+        // Ubuntu 24.04's default holds it, and the exact count is enough.
+        assert_eq!(
+            free_page_reporting_shortfall(true, 128 * GIB_MIB, 9, 1_048_576),
+            None
+        );
+        assert_eq!(
+            free_page_reporting_shortfall(true, 128 * GIB_MIB, 9, needed),
+            None
+        );
+        assert!(free_page_reporting_shortfall(true, 128 * GIB_MIB, 9, needed - 1).is_some());
+        // At 16 KiB blocks even Ubuntu's default is short.
+        assert!(free_page_reporting_shortfall(true, 128 * GIB_MIB, 2, 1_048_576).is_some());
+        // A guest that does not report free pages adds no mappings.
+        assert_eq!(
+            free_page_reporting_shortfall(false, 128 * GIB_MIB, 0, 1),
+            None
+        );
+    }
+
+    /// A File-backend restore that free page reporting could take past vm.max_map_count
+    /// restores through copy-mode UFFD instead, so a cache hit does not panic where its
+    /// cold boot ran. An implicit minor-mode server becomes a copy-mode one, and only a
+    /// minor-mode serve, whose clones have no other transport, is refused.
+    #[test]
+    fn a_restore_past_the_map_count_runs_in_copy_mode_or_is_refused() {
+        let shortfall = MapCountShortfall {
+            needed: 69_632,
+            max_map_count: 65_530,
+            order: 9,
+        };
+        assert_eq!(
+            direct_restore_memory(false, false, false, Some(shortfall)),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::MapCount(shortfall))
+        );
+        assert_eq!(
+            direct_restore_memory(false, false, false, None),
+            DirectRestoreMemory::File
+        );
+        // Restores that already page in through UFFD keep their reason.
+        assert_eq!(
+            direct_restore_memory(false, true, false, Some(shortfall)),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
+        );
+        assert_eq!(
+            direct_restore_memory(false, false, true, Some(shortfall)),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Forced)
+        );
+
+        let minor = UffdBacking::Minor { hugepages: false };
+        assert_eq!(
+            backing_within_map_count(minor, Some(shortfall)),
+            UffdBacking::Copy
+        );
+        assert_eq!(backing_within_map_count(minor, None), minor);
+        assert_eq!(
+            backing_within_map_count(UffdBacking::Copy, Some(shortfall)),
+            UffdBacking::Copy
+        );
+
+        let error = ensure_minor_within_map_count(minor, Some(shortfall), "serve it in copy mode")
+            .expect_err("a minor-mode restore past the sysctl must be refused")
+            .to_string();
+        for part in [
+            "vm.max_map_count is 65530",
+            "sysctl -w vm.max_map_count=69632",
+            "page_reporting_order 9",
+            "serve it in copy mode",
+        ] {
+            assert!(error.contains(part), "{part:?} missing from {error:?}");
+        }
+        ensure_minor_within_map_count(minor, None, "").unwrap();
+        ensure_minor_within_map_count(UffdBacking::Copy, Some(shortfall), "").unwrap();
+    }
+
+    /// The sysctl is read only for a snapshot whose guest reports free pages, the recorded
+    /// order is used, and a snapshot without one is taken to hold the default.
+    #[test]
+    fn restore_map_count_shortfall_uses_the_recorded_order() {
+        let mut meta = metadata_fixture();
+        meta.memory_mib = 128 * GIB_MIB;
+        assert_eq!(
+            restore_map_count_shortfall_with(&meta, meta.memory_mib, || panic!(
+                "a guest without free page reporting needs no sysctl"
+            ))
+            .unwrap(),
+            None
+        );
+
+        meta.balloon_free_page_reporting = true;
+        let shortfall = restore_map_count_shortfall_with(&meta, meta.memory_mib, || Ok(65_530))
+            .unwrap()
+            .expect("the default order is short at the kernel default");
+        assert_eq!(
+            shortfall.order,
+            crate::storage::snapshot::DEFAULT_PAGE_REPORTING_ORDER
+        );
+        assert_eq!(
+            restore_map_count_shortfall_with(&meta, meta.memory_mib, || Ok(1_048_576)).unwrap(),
+            None
+        );
+
+        meta.page_reporting_order = Some(2);
+        let shortfall = restore_map_count_shortfall_with(&meta, meta.memory_mib, || Ok(1_048_576))
+            .unwrap()
+            .expect("16 KiB blocks are short at Ubuntu's default");
+        assert_eq!(shortfall.order, 2);
+        assert_eq!(
+            shortfall.needed,
+            free_page_reporting_mappings(128 * GIB_MIB, 2)
+        );
+
+        assert!(
+            restore_map_count_shortfall_with(&meta, meta.memory_mib, || {
+                anyhow::bail!("unreadable")
+            })
+            .is_err()
+        );
+    }
+
+    /// Every restore that can split guest memory checks the map count before it chooses
+    /// a transport: the direct restore before `direct_restore_memory`, whose choice and the
+    /// implicit server's mode both take the result, a clone of a serve before it asks for
+    /// the minor backend, and a minor-mode serve before it starts its server.
+    #[test]
+    fn restores_check_the_map_count_before_choosing_a_transport() {
+        let source = include_str!("snapshot.rs");
+        let body = |from: &str, to: &str| {
+            let start = source.find(from).unwrap_or_else(|| panic!("no {from}"));
+            let end = source[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to} no longer follows {from}"));
+            &source[start..start + end]
+        };
+        let ordered = |body: &str, first: &str, then: &str| {
+            let first_at = body.find(first).unwrap_or_else(|| panic!("no {first}"));
+            let then_at = body.find(then).unwrap_or_else(|| panic!("no {then}"));
+            assert!(first_at < then_at, "{first} must come before {then}");
+        };
+
+        let run = body(
+            "async fn cmd_snapshot_run_inner(",
+            "\n/// What a VMM exit means for the clone's report.",
+        );
+        let explicit = &run[run
+            .find("else if let Some(ref uffd_socket_path) = uffd_socket")
+            .expect("no explicit UFFD branch")..];
+        ordered(
+            explicit,
+            "ensure_minor_within_map_count(",
+            "MemoryBackend::UffdMinor {",
+        );
+        let direct = &explicit[explicit
+            .find("let nv2 = runtime_config")
+            .expect("no direct restore branch")..];
+        ordered(
+            direct,
+            "restore_map_count_shortfall(",
+            "direct_restore_memory(",
+        );
+        let choice = &direct[direct.find("direct_restore_memory(").unwrap()..];
+        let call = &choice[..choice.find(");").unwrap()];
+        assert!(
+            call.contains("map_count"),
+            "direct_restore_memory is not given the map count: {call}"
+        );
+        ordered(
+            direct,
+            "backing_within_map_count(backing, map_count)",
+            "UffdServer::new(",
+        );
+
+        let serve = body("async fn cmd_snapshot_serve(", "\n/// ");
+        ordered(serve, "ensure_minor_within_map_count(", "UffdServer::new(");
     }
 
     /// MINOR maps the snapshot memfd MAP_PRIVATE, which brings back the first-write

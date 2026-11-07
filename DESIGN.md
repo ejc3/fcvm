@@ -3406,16 +3406,35 @@ the paragraph above. While a REMOVE is unread the kernel refuses populate calls 
 clone, so demand faults are parked, and one still refused after 2 s stops the clone. Replay
 treats a refused chunk as speculation lost and leaves the rest of that recorded run to
 demand faults, so reports that arrive while replay runs cost replay coverage, not data.
-On the File backend, which every `podman run` cache hit uses except an NV2 guest and a run
-with `FCVM_FORCE_UFFD` set, and in minor mode, Firecracker replaces each reported range
-with fresh anonymous memory, the kernel zero-fills later touches, and the page server
-hears nothing. Each isolated range adds mappings to the VMM. The worst case is guest
-memory divided by the reported block size: 512 mappings per GiB at the guest's default of
-2 MiB blocks. The block size can be lowered with `page_reporting.page_reporting_order=` in
-the boot arguments or by a write inside the guest, and at single pages the worst case is
-262,144 mappings per GiB. Past `vm.max_map_count` (65,530 by kernel default, 1,048,576 on
-Ubuntu 24.04) the replacement mapping fails and Firecracker panics. fcvm does not set the
-block size.
+On the File backend, which every `podman run` cache hit uses except an NV2 guest, a run with
+`FCVM_FORCE_UFFD` set and one past `vm.max_map_count` (below), and in minor mode,
+Firecracker replaces each reported range with fresh anonymous memory, the kernel zero-fills
+later touches, and the page server hears nothing. Each isolated range adds mappings to the
+VMM. The worst case is guest memory divided by the reported block size: 512 mappings per GiB
+at the guest's default of 2 MiB blocks. The block size can be lowered with
+`page_reporting.page_reporting_order=` in the boot arguments or by a write inside the guest,
+and at single pages the worst case is 262,144 mappings per GiB. Past `vm.max_map_count`
+(65,530 by kernel default, 1,048,576 on Ubuntu 24.04) the replacement mapping fails after
+`MAP_FIXED` has unmapped the range, and Firecracker panics. Copy mode's guest memory is
+anonymous, so Firecracker discards a reported block with `MADV_DONTNEED` and adds no
+mapping. fcvm does not set the block size.
+
+fcvm records the order and checks the count at restore. A memory snapshot of a guest that
+reports free pages reads the guest's `page_reporting_order` parameter
+(`/sys/module/page_reporting/parameters/page_reporting_order`, which holds the boot argument
+or a later write) over the exec channel just before the network gate closes, and stores it
+as `metadata.page_reporting_order`. A snapshot without the field (taken before it existed,
+or whose read failed) is assumed to hold the default order, 9 (2 MiB blocks), and the
+restore logs that. A restore that would split guest memory counts guest memory over the
+block size, plus 4,096 for the mappings the VMM holds anyway (46 measured at 1 vCPU, 294 at
+32), and compares that with `vm.max_map_count` (`free_page_reporting_shortfall` in
+`src/commands/snapshot.rs`). When the sysctl is lower, a restore with no serve process,
+which every `podman run` cache hit is, restores through an implicit copy-mode UFFD server
+instead of the File backend, and an implicit server asked for minor mode by `FCVM_UFFD_MODE`
+runs in copy mode; both log why. A minor-mode `snapshot serve`, and a clone of one, has no
+other transport, so it is refused with an error that names `vm.max_map_count`, its value and
+the value needed. The check covers the order recorded at the snapshot: a clone's workload
+that lowers the order after its restore can still take the count past it.
 
 **KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
 with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.

@@ -1343,7 +1343,9 @@ pub struct SnapshotRunArgs {
     pub pid: Option<u32>,
 
     /// Snapshot name to clone from, with no serve process. Hugepage and NV2 snapshots
-    /// page in through an in-process UFFD server; others map the memory file directly.
+    /// page in through an in-process UFFD server, and so does a snapshot whose guest
+    /// reports free pages in more blocks than vm.max_map_count allows mappings; others
+    /// map the memory file directly.
     #[arg(long, conflicts_with = "pid")]
     pub snapshot: Option<String>,
 
