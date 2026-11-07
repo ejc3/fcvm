@@ -40,6 +40,111 @@ pub enum Commands {
     Completions(CompletionsArgs),
     /// The GPU wall's control plane: coordinator and host agent (docs/fleet/ARCHITECTURE.md)
     Fleet(FleetArgs),
+    /// Raw VMs: a guest that runs no fc-agent (Windows), booted from UEFI firmware
+    Vm(VmArgs),
+}
+
+// ============================================================================
+// Vm Command (raw VMs: no container, no fc-agent)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct VmArgs {
+    #[command(subcommand)]
+    pub cmd: VmCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VmCommands {
+    /// Boot a raw VM from UEFI firmware and a disk image, on Cloud Hypervisor, in a
+    /// namespace with no route out. Healthy when its agent has acknowledged the clock and
+    /// Remote Desktop answers through rdp.sock; `fcvm exec` refuses it.
+    Run(VmRunArgs),
+    /// Internal: a raw VM's helper in its namespace (the RDP relay and the clock line)
+    #[command(hide = true)]
+    NsHelper(NsHelperArgs),
+}
+
+/// The guest a raw VM runs. One value today; the flag says what the disk holds.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+pub enum RawGuest {
+    /// Windows (Server 2025), which needs the Hyper-V enlightenments and an x86_64 host
+    Windows,
+}
+
+impl From<RawGuest> for crate::state::types::Guest {
+    fn from(guest: RawGuest) -> Self {
+        match guest {
+            RawGuest::Windows => crate::state::types::Guest::Windows,
+        }
+    }
+}
+
+impl VmRunArgs {
+    /// The guest port Remote Desktop listens on unless `--health-port` says otherwise.
+    pub const DEFAULT_HEALTH_PORT: u16 = 3389;
+}
+
+#[derive(Args, Debug)]
+pub struct VmRunArgs {
+    /// VM name (required)
+    #[arg(long)]
+    pub name: String,
+
+    /// UEFI firmware the VM boots (Cloud Hypervisor's CLOUDHV.fd)
+    #[arg(long, value_name = "PATH")]
+    pub firmware: std::path::PathBuf,
+
+    /// Raw disk image the guest boots from. The VM runs on its own reflink copy, so the
+    /// image must be on the same btrfs filesystem as fcvm's data directory.
+    #[arg(long, value_name = "PATH")]
+    pub disk: std::path::PathBuf,
+
+    /// vCPUs, or "unlimited" to use all host CPUs (max: 32)
+    #[arg(long, default_value = "2", value_parser = parse_cpu)]
+    pub cpu: u8,
+
+    /// Memory in MiB, or "unlimited" to use all host memory
+    #[arg(long, default_value = "4096", value_parser = parse_mem)]
+    pub mem: u32,
+
+    /// What the disk holds
+    #[arg(long, value_enum)]
+    pub guest: RawGuest,
+
+    /// Guest TCP port the health probe asks for an RDP connection confirm
+    #[arg(long, default_value_t = VmRunArgs::DEFAULT_HEALTH_PORT)]
+    pub health_port: u16,
+
+    /// Balloon device target MiB. If not specified, no balloon device is configured.
+    #[arg(long)]
+    pub balloon: Option<u32>,
+
+    /// Network mode. A raw VM supports only its default, rootless: a user and network
+    /// namespace with no pasta and no route out. Remote Desktop is reached through the
+    /// VM's `rdp.sock` in its data directory; no port is published.
+    #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
+    pub network: NetworkMode,
+}
+
+#[derive(Args, Debug)]
+pub struct NsHelperArgs {
+    /// The file naming the VM's current generation (`<vm id>-b<boot>`), read for every
+    /// clock line connection and expected in the guest's acknowledgement
+    #[arg(long, value_name = "PATH")]
+    pub generation_file: std::path::PathBuf,
+
+    /// Unix socket to listen on; each connection is relayed to the guest's RDP port
+    #[arg(long, value_name = "PATH")]
+    pub rdp_socket: std::path::PathBuf,
+
+    /// Guest TCP port the relay connects to
+    #[arg(long, default_value_t = 3389)]
+    pub rdp_port: u16,
+
+    /// Where the guest's acknowledgement of the generation is written
+    #[arg(long, value_name = "PATH")]
+    pub ack_file: std::path::PathBuf,
 }
 
 // ============================================================================

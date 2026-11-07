@@ -354,6 +354,19 @@ pub struct SnapshotMetadata {
     /// other snapshot.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parked_gpus: usize,
+    /// What ran in the source VM's guest (`VmConfig::guest`). `snapshot run` restores a
+    /// raw guest's snapshot without fc-agent's restore handshake. Linux for snapshots
+    /// written before this field existed, and not written for a Linux guest.
+    #[serde(default, skip_serializing_if = "crate::state::types::Guest::is_linux")]
+    pub guest: crate::state::types::Guest,
+    /// The guest port a raw guest's health probe asks for an RDP connection confirm
+    /// (`VmConfig::health_port`). None for a Linux guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_port: Option<u16>,
+    /// The UEFI firmware a raw guest booted (`VmConfig::firmware`), which a raw clone boots
+    /// again when its guest restarts. None for a Linux guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<PathBuf>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -966,6 +979,9 @@ mod tests {
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
                 parked_gpus: 0,
+                guest: Default::default(),
+                health_port: None,
+                firmware: None,
             },
         };
 
@@ -1178,6 +1194,9 @@ mod tests {
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
                 parked_gpus: 0,
+                guest: Default::default(),
+                health_port: None,
+                firmware: None,
             },
         };
 
@@ -1273,6 +1292,9 @@ mod tests {
                     balloon_free_page_reporting: false,
                     page_reporting_order: None,
                     parked_gpus: 0,
+                    guest: Default::default(),
+                    health_port: None,
+                    firmware: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1355,6 +1377,9 @@ mod tests {
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
                 parked_gpus: 0,
+                guest: Default::default(),
+                health_port: None,
+                firmware: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1562,6 +1587,9 @@ mod tests {
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
                 parked_gpus: 0,
+                guest: Default::default(),
+                health_port: None,
+                firmware: None,
             },
         };
 
@@ -1757,6 +1785,9 @@ mod tests {
             balloon_free_page_reporting: false,
             page_reporting_order: None,
             parked_gpus: 0,
+            guest: Default::default(),
+            health_port: None,
+            firmware: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

@@ -861,6 +861,9 @@ pub struct PastaNetwork {
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
     restore_mode: bool,          // Skip port probe in post_start (VM not loaded yet)
+    // No pasta and no route out: the namespace, its TAP and the bridge with 10.0.2.1 only
+    // (`isolated`, a raw VM's network).
+    isolated: bool,
     // The resolver this launch bakes into the guest's resolv.conf (--dns, or
     // the snapshot's baked value on a restore). None for the default rootless
     // guest, which takes pasta's own DNS handling.
@@ -976,8 +979,26 @@ impl PastaNetwork {
             loopback_ip: None,
             holder_pid: None,
             restore_mode: false,
+            isolated: false,
             dns_server: None,
         }
+    }
+
+    /// A namespace with no way out, for a raw VM (`fcvm vm run`): the holder's user and
+    /// network namespaces, the VM's TAP and the bridge with 10.0.2.1 and the pinned
+    /// [`NAMESPACE_MAC`], and nothing else. No pasta starts, so the namespace has no
+    /// default route, no gateway and no published port: the guest reaches the
+    /// namespace's own address and nothing beyond it, whatever is set inside it.
+    pub fn isolated(vm_id: String, tap_device: String) -> Self {
+        Self {
+            isolated: true,
+            ..Self::new(vm_id, tap_device, Vec::new())
+        }
+    }
+
+    /// Whether this namespace has no pasta and no route out ([`Self::isolated`]).
+    pub fn is_isolated(&self) -> bool {
+        self.isolated
     }
 
     /// Set a unique loopback IP for port forwarding (127.x.y.z)
@@ -1102,6 +1123,9 @@ impl PastaNetwork {
     /// All six `ip` commands run in ONE `ip -batch` process; enabling IP
     /// forwarding is a shell redirect (no extra process).
     pub fn build_bridge_script(&self) -> IpBatchScript {
+        if self.isolated {
+            return self.build_isolated_bridge_script();
+        }
         let bridge = BRIDGE_DEVICE;
         IpBatchScript::new(
             vec![
@@ -1145,6 +1169,40 @@ impl PastaNetwork {
             ],
             // Enable IP forwarding — a bash redirect, not another process.
             &["echo 1 > /proc/sys/net/ipv4/ip_forward"],
+        )
+    }
+
+    /// The bridge of an isolated namespace ([`Self::isolated`]): the VM's TAP on `br0` with
+    /// the pinned MAC and 10.0.2.1/24, no pasta device, no route and no IP forwarding.
+    fn build_isolated_bridge_script(&self) -> IpBatchScript {
+        let bridge = BRIDGE_DEVICE;
+        IpBatchScript::new(
+            vec![
+                (
+                    format!("create L2 bridge {}", bridge),
+                    format!("link add {} type bridge", bridge),
+                ),
+                (
+                    format!("pin bridge {} MAC to {}", bridge, NAMESPACE_MAC),
+                    format!("link set {} address {}", bridge, NAMESPACE_MAC),
+                ),
+                (
+                    format!("bring bridge {} up", bridge),
+                    format!("link set {} up", bridge),
+                ),
+                (
+                    format!("add the VM's TAP {} to bridge {}", self.tap_device, bridge),
+                    format!("link set {} master {}", self.tap_device, bridge),
+                ),
+                (
+                    format!(
+                        "add the namespace address {}/24 to {}",
+                        NAMESPACE_IP, bridge
+                    ),
+                    format!("addr add {}/24 dev {}", NAMESPACE_IP, bridge),
+                ),
+            ],
+            &[],
         )
     }
 
@@ -1733,6 +1791,37 @@ impl PastaNetwork {
         }
     }
 
+    /// Run the bridge script ([`Self::build_bridge_script`]) in the holder's namespaces.
+    async fn run_bridge_script(&mut self, holder_pid: u32) -> Result<()> {
+        let bridge_script = self.build_bridge_script();
+        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+
+        debug!(
+            holder_pid = holder_pid,
+            script = %bridge_script.summary(),
+            "running bridge setup script"
+        );
+
+        let output = Command::new(&nsenter_prefix[0])
+            .args(&nsenter_prefix[1..])
+            .arg("bash")
+            .arg("-c")
+            .arg(bridge_script.script())
+            .output()
+            .await
+            .context("running bridge setup via nsenter")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "bridge setup failed: {}{}",
+                bridge_script.describe_failure(&stderr),
+                self.pasta_exit_context().await
+            );
+        }
+        Ok(())
+    }
+
     /// pasta's exit status and captured stderr, for appending to
     /// network-setup errors.
     ///
@@ -2060,6 +2149,15 @@ impl NetworkManager for PastaNetwork {
     }
 
     async fn setup(&mut self) -> Result<NetworkConfig> {
+        if self.isolated {
+            info!(vm_id = %self.vm_id, guest_ip = %self.guest_ip, "setting up an isolated namespace (no pasta, no route out)");
+            return Ok(NetworkConfig {
+                tap_device: self.tap_device.clone(),
+                guest_mac: generate_mac(),
+                guest_ip: Some(format!("{}/24", self.guest_ip)),
+                ..Default::default()
+            });
+        }
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
 
         info!(
@@ -2119,6 +2217,9 @@ impl NetworkManager for PastaNetwork {
 
     async fn post_start(&mut self, holder_pid: u32) -> Result<()> {
         self.holder_pid = Some(holder_pid);
+        if self.isolated {
+            return self.run_bridge_script(holder_pid).await;
+        }
 
         info!(
             holder_pid = holder_pid,
@@ -2177,32 +2278,7 @@ impl NetworkManager for PastaNetwork {
         }
 
         // Phase 3: Create bridge connecting pasta0 and Firecracker's TAP
-        let bridge_script = self.build_bridge_script();
-        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
-
-        debug!(
-            holder_pid = holder_pid,
-            script = %bridge_script.summary(),
-            "running bridge setup script"
-        );
-
-        let output = Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(bridge_script.script())
-            .output()
-            .await
-            .context("running bridge setup via nsenter")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "bridge setup failed: {}{}",
-                bridge_script.describe_failure(&stderr),
-                self.pasta_exit_context().await
-            );
-        }
+        self.run_bridge_script(holder_pid).await?;
 
         // Phase 4: Verify port forwarding is actually working
         // The PID file only means pasta spawned, not that ports are bound.
@@ -4190,6 +4266,51 @@ mod tests {
             "ip_forward must still be enabled (as a shell redirect, not a process)"
         );
         assert!(script.script().starts_with("set -e\n"));
+    }
+
+    /// An isolated namespace (a raw VM) has the VM's TAP on the bridge with the pinned MAC
+    /// and 10.0.2.1, and nothing that leads out: no pasta device, no route, no forwarding,
+    /// no gateway or resolver handed to the guest, no published port.
+    #[tokio::test]
+    async fn an_isolated_namespace_has_no_way_out() {
+        let mut net = PastaNetwork::isolated("vm-raw123".to_string(), "tap-fc".to_string());
+        assert!(net.is_isolated());
+        let script = net.build_bridge_script();
+        assert_eq!(
+            batch_lines(script.script()),
+            vec![
+                "link add br0 type bridge",
+                "link set br0 address 02:fc:00:00:02:01",
+                "link set br0 up",
+                "link set tap-fc master br0",
+                "addr add 10.0.2.1/24 dev br0",
+            ]
+        );
+        for absent in ["pasta0", "route", "ip_forward"] {
+            assert!(
+                !script.script().contains(absent),
+                "{absent} in {}",
+                script.script()
+            );
+        }
+        assert!(!net.build_setup_script().script().contains("route"));
+        let config = net.setup().await.unwrap();
+        assert_eq!(config.guest_ip.as_deref(), Some("10.0.2.100/24"));
+        assert_eq!(config.host_ip, None, "an isolated guest has no gateway");
+        assert_eq!(config.dns_server, None);
+        assert_eq!(config.guest_ipv6, None);
+        assert_eq!(config.loopback_ip, None);
+        assert!(net.port_mappings.is_empty());
+        // post_start runs the bridge script and returns before anything starts pasta.
+        let source = include_str!("pasta.rs");
+        let start = source
+            .find("    async fn post_start(&mut self, holder_pid: u32)")
+            .unwrap();
+        let body = &source[start..];
+        let isolated = body.find("if self.isolated {").unwrap();
+        let pasta = body.find("self.start_pasta(holder_pid)").unwrap();
+        assert!(isolated < pasta);
+        assert!(body[isolated..pasta].contains("return self.run_bridge_script(holder_pid).await;"));
     }
 
     #[test]

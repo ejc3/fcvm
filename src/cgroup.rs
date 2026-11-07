@@ -440,7 +440,7 @@ pub fn enter(
 /// prepare`, `snapshot run` and `snapshot serve`, the commands that start a VMM or a memory
 /// server. Other commands stay where they are.
 pub fn scope_request(cmd: &crate::cli::Commands) -> Option<bool> {
-    use crate::cli::{Commands, PodmanCommands, SnapshotCommands};
+    use crate::cli::{Commands, PodmanCommands, SnapshotCommands, VmCommands};
     match cmd {
         Commands::Podman(args) => Some(match &args.cmd {
             PodmanCommands::Run(run) => run.no_swap,
@@ -450,6 +450,10 @@ pub fn scope_request(cmd: &crate::cli::Commands) -> Option<bool> {
             SnapshotCommands::Serve(serve) => Some(serve.no_swap),
             SnapshotCommands::Run(run) => Some(run.no_swap),
             SnapshotCommands::Create(_) | SnapshotCommands::Ls => None,
+        },
+        Commands::Vm(args) => match &args.cmd {
+            VmCommands::Run(_) => Some(false),
+            VmCommands::NsHelper(_) => None,
         },
         _ => None,
     }

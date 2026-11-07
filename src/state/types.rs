@@ -331,6 +331,49 @@ pub struct VmConfig {
     /// `snapshot create` refuses to snapshot.
     #[serde(default)]
     pub container_start_version: Option<u32>,
+    /// What runs in the guest: a Linux guest with fc-agent (every VM `podman run` starts),
+    /// or a raw guest such as Windows (`fcvm vm run`), which runs no fc-agent. Linux for
+    /// state files written before this field existed. Always written, so `fcvm ls --json`
+    /// names it for every VM.
+    #[serde(default)]
+    pub guest: Guest,
+    /// UEFI firmware a raw VM booted (`fcvm vm run --firmware`). None for a kernel boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<std::path::PathBuf>,
+    /// The guest TCP port a raw VM's health probe asks for an RDP connection confirm
+    /// (`fcvm vm run --health-port`). None for a Linux guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_port: Option<u16>,
+    /// A raw VM's Unix socket that reaches its Remote Desktop port (`<data dir>/rdp.sock`,
+    /// absolute), which is how the bridge connects to it; `fcvm ls --json` shows it as
+    /// `.config.rdp_socket`. None for a Linux guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdp_socket: Option<std::path::PathBuf>,
+}
+
+/// What runs in a VM's guest. Everything fcvm does inside a Linux guest goes through
+/// fc-agent: the boot plan, the container, exec, volumes, health and the snapshot's
+/// network boundary. A raw guest has none of it, so fcvm only boots, probes, snapshots
+/// and restores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Guest {
+    /// A Linux guest running fc-agent.
+    #[default]
+    Linux,
+    /// A Windows guest booted from UEFI firmware, running no fc-agent.
+    Windows,
+}
+
+impl Guest {
+    pub fn is_linux(&self) -> bool {
+        *self == Guest::Linux
+    }
+
+    /// Whether fc-agent runs in this guest.
+    pub fn runs_fc_agent(&self) -> bool {
+        self.is_linux()
+    }
 }
 
 impl VmConfig {
@@ -423,6 +466,10 @@ impl VmState {
                 container_start_version: Some(
                     crate::storage::snapshot::SNAPSHOT_CONTAINER_START_VERSION,
                 ),
+                guest: Guest::Linux,
+                firmware: None,
+                health_port: None,
+                rdp_socket: None,
             },
         }
     }
@@ -582,6 +629,51 @@ mod tests {
         let roundtrip: VmState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert!(roundtrip.lifecycle_ready);
+    }
+
+    /// A state file written before raw guests existed has no `guest`, `firmware`,
+    /// `health_port` or `rdp_socket` and loads as a Linux guest with none of them; a
+    /// Windows guest's state round-trips. Every state names its guest, so `fcvm ls --json`
+    /// shows `.config.guest` for every VM, and a raw VM's `.config.rdp_socket`.
+    #[test]
+    fn a_state_file_without_a_guest_kind_is_a_linux_guest() {
+        let state = VmState::new("vm-old".to_string(), "alpine:latest".to_string(), 1, 128);
+        let mut json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["config"]["guest"], "linux");
+        for field in ["firmware", "health_port", "rdp_socket"] {
+            assert!(
+                json["config"].get(field).is_none(),
+                "{field} written for Linux"
+            );
+        }
+        json["config"].as_object_mut().unwrap().remove("guest");
+        let loaded: VmState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.config.guest, Guest::Linux);
+        assert!(loaded.config.guest.runs_fc_agent());
+        assert_eq!(loaded.config.firmware, None);
+        assert_eq!(loaded.config.health_port, None);
+        assert_eq!(loaded.config.rdp_socket, None);
+
+        let mut raw = state.clone();
+        raw.config.guest = Guest::Windows;
+        raw.config.firmware = Some(std::path::PathBuf::from("/fw/CLOUDHV.fd"));
+        raw.config.health_port = Some(3389);
+        raw.config.rdp_socket = Some(std::path::PathBuf::from("/vm-disks/vm-raw/rdp.sock"));
+        let json = serde_json::to_value(&raw).unwrap();
+        assert_eq!(json["config"]["guest"], "windows");
+        assert_eq!(json["config"]["rdp_socket"], "/vm-disks/vm-raw/rdp.sock");
+        let loaded: VmState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.config.guest, Guest::Windows);
+        assert!(!loaded.config.guest.runs_fc_agent());
+        assert_eq!(
+            loaded.config.firmware.as_deref(),
+            Some(std::path::Path::new("/fw/CLOUDHV.fd"))
+        );
+        assert_eq!(loaded.config.health_port, Some(3389));
+        assert_eq!(
+            loaded.config.rdp_socket.as_deref(),
+            Some(std::path::Path::new("/vm-disks/vm-raw/rdp.sock"))
+        );
     }
 
     #[test]
