@@ -1376,6 +1376,8 @@ fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
         slot.observed.gpu_stats = None;
         slot.observed.budget_fit = None;
         slot.observed.render_ms_max = None;
+        slot.observed.budget_every_pixel = None;
+        slot.observed.boot_id = None;
         slot.observed.frame_t = None;
         return false;
     }
@@ -1540,6 +1542,8 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
     slot.observed.gpu_stats = Some(h.gpu.clone());
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
+    slot.observed.budget_every_pixel = h.budget_every_pixel.filter(|v| v.is_finite() && *v > 0.0);
+    slot.observed.boot_id = h.boot_id.clone().filter(|b| !b.is_empty());
     slot.observed.frame_t = h.t.filter(|v| v.is_finite());
 }
 
@@ -1558,16 +1562,29 @@ fn budget_round(f: &mut Fleet, at: u64) {
         .filter(|s| renders_on_wall(s) && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
-    let overloaded = tiles.iter().any(|s| {
+    let over = |s: &Slot| {
         s.observed
             .render_ms_max
             .is_some_and(|ms| ms > crate::budget::OVERLOAD_MS)
-    });
+    };
+    let overloaded = tiles.iter().any(|s| over(s));
     let newest = tiles
         .iter()
         .filter_map(|s| s.observed.frame_t)
         .fold(0.0, f64::max);
+    let observed: Vec<crate::budget::TileFit> = tiles
+        .iter()
+        .map(|s| crate::budget::TileFit {
+            id: &s.id,
+            // the renderer process a grant is given to, and posted to only (BudgetPlan::for_tile)
+            owner: s.observed.boot_id.clone().unwrap_or_default(),
+            fit: s.observed.budget_fit,
+            every_pixel_budget: s.observed.budget_every_pixel,
+            overloaded: over(s),
+        })
+        .collect();
     f.budget.round(&fits, overloaded, newest);
+    f.budget.strides(&observed, newest);
 }
 
 /// Races stop waiting for tiles that leave (their host is reclaimed); a half that then has

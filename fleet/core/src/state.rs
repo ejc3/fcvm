@@ -279,6 +279,12 @@ pub struct Observed {
     /// The slowest render over the renderer's last 2 s (`frames_2s.render_ms_max`).
     #[serde(default)]
     pub render_ms_max: Option<f64>,
+    /// The budget at which the renderer draws every pixel at its drawn size, and the
+    /// renderer process's `boot_id`.
+    #[serde(default)]
+    pub budget_every_pixel: Option<f64>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,

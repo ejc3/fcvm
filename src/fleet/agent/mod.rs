@@ -15,7 +15,7 @@ use crate::cli::FleetAgentArgs;
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{Context, Result};
-use fleet_core::protocol::{AgentMsg, AssignSlot, BudgetBody, CoordMsg, SharedScene};
+use fleet_core::protocol::{AgentMsg, AssignSlot, BudgetPlan, CoordMsg, SharedScene};
 use fleet_core::state::Gpu;
 use slot::{supervise, AgentCfg, Desired, SlotCtx};
 use std::collections::{BTreeMap, HashMap};
@@ -465,7 +465,7 @@ where
 
     let cfg = Arc::new(agent.cfg);
     let (scene_tx, scene_rx) = watch::channel::<Option<SharedScene>>(None);
-    let (budget_tx, budget_rx) = watch::channel::<Option<BudgetBody>>(None);
+    let (budget_tx, budget_rx) = watch::channel::<Option<BudgetPlan>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
     let aggregator = agent.aggregate.clone().map(|a| {
@@ -613,7 +613,7 @@ fn assign(
     out: &mpsc::UnboundedSender<AgentMsg>,
     http: &reqwest::Client,
     scene_rx: &watch::Receiver<Option<SharedScene>>,
-    budget_rx: &watch::Receiver<Option<BudgetBody>>,
+    budget_rx: &watch::Receiver<Option<BudgetPlan>>,
 ) {
     // Slots no longer listed, or moved to another GPU, are torn down by their tasks.
     let keep: HashMap<&str, &str> = list
