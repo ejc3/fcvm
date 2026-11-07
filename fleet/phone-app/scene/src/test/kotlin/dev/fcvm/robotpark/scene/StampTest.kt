@@ -19,10 +19,20 @@ class StampTest {
     @Test
     fun theHeldBitOutlastsTheHoldByTheTail() {
         val h = HeldLayout()
-        assertFalse(h.next(false))
-        assertTrue(h.next(true))
-        assertTrue(h.next(true))
-        repeat(Stamp.HELD_TAIL_FRAMES) { assertTrue("tail frame $it", h.next(false)) }
-        assertFalse(h.next(false))
+        assertFalse(h.next(held = false, barsLifted = false))
+        assertTrue(h.next(held = true, barsLifted = false))
+        assertTrue(h.next(held = true, barsLifted = true))
+        repeat(Stamp.HELD_TAIL_FRAMES) { assertTrue("tail frame $it", h.next(held = false, barsLifted = false)) }
+        assertFalse(h.next(held = false, barsLifted = false))
+    }
+
+    /** Given back, the bit stays set for as long as the UI has not lowered the bars, then the tail. */
+    @Test
+    fun theHeldBitStaysWhileTheBarsAreStillLifted() {
+        val h = HeldLayout()
+        assertTrue(h.next(held = true, barsLifted = true))
+        repeat(10 * Stamp.HELD_TAIL_FRAMES) { assertTrue("lifted frame $it", h.next(held = false, barsLifted = true)) }
+        repeat(Stamp.HELD_TAIL_FRAMES) { assertTrue("tail frame $it", h.next(held = false, barsLifted = false)) }
+        assertFalse(h.next(held = false, barsLifted = false))
     }
 }

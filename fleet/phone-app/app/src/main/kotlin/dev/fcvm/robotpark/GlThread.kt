@@ -41,6 +41,8 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
     @Volatile var onChrome: ((Boolean) -> Unit)? = null
     /** Called on the UI thread's behalf when the frame's held flag changes, after a frame drawn with it. */
     @Volatile var onHeld: ((Boolean) -> Unit)? = null
+    /** Set by the UI thread when it has lifted its bars, cleared when it has lowered them. */
+    @Volatile var barsLifted = false
 
     // the GL thread's own
     private var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -199,7 +201,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         val tile = Tile.of(rect, aspect, w, h)
         val fs = FrameState.compute(scene.copy(imageAspect = aspect), t, w.toDouble() / h, Store.systemNight)
         // held, the bars are lifted above the band and the stamp says so (Stamp.HELD_BIT)
-        val held = heldLayout.next(scene.held)
+        val held = heldLayout.next(scene.held, barsLifted)
         r.drawToWindow(fs, tile, Store.robots, if (scene.stamp) Stamp.value(fs.frameIndex, held) else -1)
         if (!EGL14.eglSwapBuffers(dpy, win)) {
             eglFailed("eglSwapBuffers")

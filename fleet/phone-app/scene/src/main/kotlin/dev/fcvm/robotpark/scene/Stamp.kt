@@ -19,16 +19,17 @@ object Stamp {
 }
 
 /**
- * Whether the frame drawn now carries the held bit: from the first frame drawn held, and for
- * [Stamp.HELD_TAIL_FRAMES] frames after the last. The bars are lifted only after a held frame
- * reports it and come down when the phone is given back, so every frame drawn while they are
- * lifted carries the bit.
+ * Whether the frame drawn now carries the held bit: while the phone is held or the UI says its
+ * bars are still lifted, and for [Stamp.HELD_TAIL_FRAMES] frames after both are over, while
+ * the lowered layout reaches the screen. The bars are lifted only after a held frame reports
+ * it, so every frame drawn while they are lifted carries the bit, however long the UI thread
+ * takes to lower them.
  */
 class HeldLayout {
     private var tail = 0
 
-    fun next(held: Boolean): Boolean {
-        if (held) {
+    fun next(held: Boolean, barsLifted: Boolean): Boolean {
+        if (held || barsLifted) {
             tail = Stamp.HELD_TAIL_FRAMES
             return true
         }

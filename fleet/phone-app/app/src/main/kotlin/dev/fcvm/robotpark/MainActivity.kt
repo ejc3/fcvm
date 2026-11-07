@@ -176,6 +176,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // held, the bottom bar and the info screen end Stamp.ROWS above the screen's bottom,
         // where the scene's stamp band shows (the stamp carries the held bit while they do)
         val lift = if (heldFromScene) Stamp.ROWS else 0
+        // lifted: the stamp keeps its held bit (GlThread.barsLifted) until they are lowered
+        if (lift > 0 && ::gl.isInitialized) gl.barsLifted = true
         for (v in listOf(tabBar, info)) {
             val lp = v.layoutParams as FrameLayout.LayoutParams
             if (lp.bottomMargin != lift) {
@@ -183,6 +185,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 v.layoutParams = lp
             }
         }
+        if (lift == 0 && ::gl.isInitialized) gl.barsLifted = false
         val night = night()
         val on = if (night) 0xFFD0BCFF.toInt() else 0xFF6750A4.toInt()
         val off = if (night) 0xFFCAC4D0.toInt() else 0xFF49454F.toInt()
