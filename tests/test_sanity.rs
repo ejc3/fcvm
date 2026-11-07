@@ -437,6 +437,68 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     Ok(())
 }
 
+/// #806: `podman run --hypervisor cloud-hypervisor` uses the snapshot cache like a
+/// Firecracker run. The first run of a command takes the pre-start snapshot; the second,
+/// the same command, restores it and runs the container. A unique echo token makes the key
+/// this test's own.
+///
+/// RED BEFORE THE FIX: a Cloud Hypervisor run opted out of the cache, so neither run took
+/// or restored a snapshot.
+#[tokio::test]
+async fn test_cloud_hypervisor_podman_run_uses_the_snapshot_cache() -> Result<()> {
+    use std::time::Duration;
+
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+        return Ok(());
+    }
+    let (first_name, second_name, token, _) = common::unique_names("ch-cache");
+    let mut logs = Vec::new();
+    for name in [&first_name, &second_name] {
+        let (mut child, fcvm_pid, log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    name,
+                    "--hypervisor",
+                    "cloud-hypervisor",
+                    common::TEST_IMAGE,
+                    "echo",
+                    &token,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning fcvm --hypervisor cloud-hypervisor")?;
+        println!("  fcvm PID: {fcvm_pid} ({name})");
+        let status = tokio::time::timeout(Duration::from_secs(240), child.wait())
+            .await
+            .context("timeout waiting for the Cloud Hypervisor VM")?
+            .context("waiting for child")?;
+        assert!(
+            status.success(),
+            "{name} failed: {status} ({})",
+            log.display()
+        );
+        logs.push(log);
+    }
+    let first = std::fs::read_to_string(&logs[0])?;
+    assert!(
+        first.contains("Pre-start snapshot created successfully"),
+        "the first Cloud Hypervisor run took no pre-start snapshot ({})",
+        logs[0].display()
+    );
+    let second = std::fs::read_to_string(&logs[1])?;
+    assert!(
+        second.contains("Pre-start snapshot hit"),
+        "the second Cloud Hypervisor run did not restore the first one's snapshot ({})",
+        logs[1].display()
+    );
+    Ok(())
+}
+
 /// #806: a Cloud Hypervisor guest keeps the kernel's `eth0` for its PCI virtio-net NIC.
 /// fc-agent and fcvm configure the guest's network by that name (IPv6 address and route,
 /// the gateway's neighbour entry, the snapshot gate) and the rootfs's networkd unit matches
