@@ -68,6 +68,21 @@ class TraceAttribution(unittest.TestCase):
             self.assertEqual(ambiguous, [], "absence is not ambiguity")
 
 
+class TraceOrder(unittest.TestCase):
+    """The trace is read in demand order, the order the handler read the faults."""
+
+    def test_records_are_read_in_demand_order(self):
+        import struct
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trace.faults"
+            records = [(8192, 30, 35), (0, 10, 90), (4096, 20, 25)]
+            path.write_bytes(b"".join(struct.pack("<QQQ", *r) for r in records))
+            self.assertEqual(
+                [off for off, _, _ in faultanalyze.read_fault_trace(path)], [0, 4096, 8192]
+            )
+
+
 class SerialIsolation(unittest.TestCase):
     """A request may only be measured with no clone left over from the previous one."""
 

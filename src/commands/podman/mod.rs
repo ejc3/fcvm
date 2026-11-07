@@ -3354,7 +3354,7 @@ const PREPARE_ERROR_TAIL_BYTES: u64 = 16 << 10;
 /// The copies are in /tmp, where another local user can put something at those names before
 /// teardown writes them, so a path is read only when it is a regular file, opened without
 /// following a symlink or waiting on a FIFO.
-fn with_container_output(
+pub(crate) fn with_container_output(
     error: anyhow::Error,
     saved: &std::path::Path,
     rotated: &std::path::Path,
@@ -3420,6 +3420,23 @@ fn with_container_output(
 ///
 /// Split out of [`run_prepare_loop`] so every outcome is exercised without a VM: the
 /// VM-exit arm takes its future from the caller.
+/// A prepare's wait for Healthy that failed because its source stopped says what the
+/// container exited with; any other failure is returned as it is. A cold prepare and one
+/// restored from a pre-start snapshot both report through this.
+pub(crate) async fn with_container_exit_code(
+    error: anyhow::Error,
+    container_exit_seen: &std::sync::atomic::AtomicBool,
+    data_dir: &Path,
+) -> anyhow::Error {
+    if error.downcast_ref::<PrepareSourceStopped>().is_none() {
+        return error;
+    }
+    match read_container_exit_code(container_exit_seen, data_dir).await {
+        Some(code) => error.context(format!("the container exited with code {code}")),
+        None => error.context("the container reported no exit code"),
+    }
+}
+
 pub(crate) async fn await_prepare_healthy<F>(
     startup_rx: tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>,
     cancel: &CancellationToken,
@@ -3471,15 +3488,11 @@ async fn run_prepare_loop(
     };
     let startup_ack = match await_prepare_healthy(startup_rx, cancel, budget, vm_exited).await {
         Ok(startup_ack) => startup_ack,
-        // The container's exit is why its source stopped: say what it exited with.
-        Err(error) if error.downcast_ref::<PrepareSourceStopped>().is_some() => {
-            let code = read_container_exit_code(&ctx.container_exit_seen, &ctx.data_dir).await;
-            return Err(match code {
-                Some(code) => error.context(format!("the container exited with code {code}")),
-                None => error.context("the container reported no exit code"),
-            });
+        Err(error) => {
+            return Err(
+                with_container_exit_code(error, &ctx.container_exit_seen, &ctx.data_dir).await,
+            )
         }
-        Err(error) => return Err(error),
     };
 
     // The container is healthy, so the guest's agent is up. A cold boot with

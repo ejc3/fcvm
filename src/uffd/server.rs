@@ -1972,6 +1972,10 @@ impl FaultTrace {
 
 impl Drop for FaultTrace {
     fn drop(&mut self) {
+        // Fault workers finish out of order: a fault that waits on the disk is recorded after
+        // later ones whose pages were cached. The file is in demand order, the time the
+        // handler read each fault, which is what faultanalyze.py reads it as.
+        self.records.sort_by_key(|record| record[1]);
         let mut buf = Vec::with_capacity(self.records.len() * 24);
         for rec in &self.records {
             for v in rec {
@@ -5732,8 +5736,10 @@ mod tests {
             origin: std::time::Instant::now(),
             records: Vec::new(),
         };
-        trace.record(0x1000, 10, 20);
+        // Recorded in demand order (by the second field), as the handler reads faults, so
+        // the file keeps it; the_fault_trace_is_written_in_demand_order covers the sort.
         trace.record(u64::MAX, 0, u64::MAX);
+        trace.record(0x1000, 10, 20);
         drop(trace);
 
         let raw = std::fs::read(&path).expect("trace file written on drop");
@@ -5749,7 +5755,7 @@ mod tests {
                 [field(0), field(1), field(2)]
             })
             .collect();
-        assert_eq!(decoded, vec![[0x1000, 10, 20], [u64::MAX, 0, u64::MAX]]);
+        assert_eq!(decoded, vec![[u64::MAX, 0, u64::MAX], [0x1000, 10, 20]]);
     }
 
     /// A fault parked on EAGAIN is still blocking its vCPU, so its trace interval must
@@ -8678,6 +8684,16 @@ mod tests {
         pair
     }
 
+    /// One of the least busy allowed CPUs, for a test that puts the handler and the balloon
+    /// on the same CPU: it needs only one, so it still runs with a single CPU allowed.
+    fn one_cpu() -> usize {
+        let cpus = allowed_cpus();
+        let busy = cpu_busy_over(Duration::from_millis(50));
+        let cpu = idle_one(&cpus, &busy, std::process::id() as usize);
+        eprintln!("pinned to CPU {cpu} of {} allowed", cpus.len());
+        cpu
+    }
+
     /// Ticks each CPU spent busy (not idle, not waiting on I/O) over `window`, from
     /// /proc/stat. A CPU missing from the file reads as busy.
     fn cpu_busy_over(window: Duration) -> std::collections::HashMap<usize, u64> {
@@ -8717,6 +8733,22 @@ mod tests {
     /// move away from other work on its CPU, so every pinned test of a parallel suite, and
     /// whatever else the host ran there, shared CPUs 0 and 1, and one fault in 200 waited out
     /// that work: hundreds of milliseconds against a median of under one.
+    fn idle_one(
+        cpus: &[usize],
+        busy: &std::collections::HashMap<usize, u64>,
+        spread: usize,
+    ) -> usize {
+        let mut ranked: Vec<usize> = cpus.to_vec();
+        ranked.sort_by_key(|cpu| (busy.get(cpu).copied().unwrap_or(u64::MAX), *cpu));
+        let least = busy.get(&ranked[0]).copied().unwrap_or(u64::MAX);
+        let idle = ranked
+            .iter()
+            .take_while(|cpu| busy.get(cpu).copied().unwrap_or(u64::MAX) <= least.saturating_add(1))
+            .count()
+            .max(1);
+        ranked[spread % idle]
+    }
+
     fn idle_pair(
         cpus: &[usize],
         busy: &std::collections::HashMap<usize, u64>,
@@ -8758,6 +8790,21 @@ mod tests {
         // With only two CPUs allowed, those two.
         let (a, b) = idle_pair(&[7, 9], &busy, 3);
         assert_eq!([a.min(b), a.max(b)], [7, 9]);
+        // The test that pins both threads to one CPU needs only one: with a single CPU
+        // allowed it takes that one, where two_cpus() panicked before the test ran.
+        assert_eq!(idle_one(&[7], &busy, 3), 7);
+        assert!(![0, 1].contains(&idle_one(&cpus, &busy, 4)), "a busy CPU");
+        let test = include_str!("server.rs");
+        let test = &test[test
+            .find(concat!(
+                "async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_",
+                "waits_for_the_balloon"
+            ))
+            .unwrap()..];
+        assert!(
+            test[..test.find("PinnedThread::to(").unwrap()].contains("one_cpu()"),
+            "the same-CPU balloon test asks for two CPUs"
+        );
     }
 
     /// The calling thread pinned to one CPU until dropped, when its old affinity comes back.
@@ -9066,7 +9113,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing()
     {
-        let cpu = two_cpus().0;
+        let cpu = one_cpu();
         let _pinned = PinnedThread::to(cpu);
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
@@ -10483,6 +10530,31 @@ mod tests {
         );
         drop(async_uffd);
         clone.unmap();
+    }
+
+    /// The fault trace is written in demand order, the time the handler read each fault,
+    /// although fault workers report them in the order they finish. Written as recorded, a
+    /// three-page sequential demand finished 1, 2, 0 read as non-sequential.
+    #[test]
+    fn the_fault_trace_is_written_in_demand_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.faults");
+        {
+            let mut trace = FaultTrace {
+                path: path.clone(),
+                origin: std::time::Instant::now(),
+                records: Vec::new(),
+            };
+            trace.record(4096, 20, 25);
+            trace.record(8192, 30, 35);
+            trace.record(0, 10, 90);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let offsets: Vec<u64> = bytes
+            .chunks_exact(24)
+            .map(|record| u64::from_le_bytes(record[..8].try_into().unwrap()))
+            .collect();
+        assert_eq!(offsets, [0, 4096, 8192]);
     }
 
     /// A job planned before a REMOVE was read is not copied after it: the worker finds the
