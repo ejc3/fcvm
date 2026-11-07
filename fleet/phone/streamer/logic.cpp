@@ -197,6 +197,22 @@ bool stamp_plausible(uint32_t k, double capture_unix_ms, const PhoneScene& sc) {
   return fabs(t - now) <= STAMP_PLAUSIBLE_S;
 }
 
+PhoneFrame phone_frame(bool stamped, uint32_t raw, double capture_unix_ms, const PhoneScene& sc) {
+  PhoneFrame f;
+  if (!stamped) return f;
+  uint32_t k = raw & ~STAMP_HELD_BIT;
+  if (!stamp_plausible(k, capture_unix_ms, sc)) return f;
+  f.k = k;
+  f.kind = (raw & STAMP_HELD_BIT) ? PhonePicture::Held : PhonePicture::Scene;
+  return f;
+}
+
+PhoneGeo phone_frame_geometry(const PhoneFrame& f, int screen_w, int screen_h, const PhoneScene& sc) {
+  PhoneGeo g = phone_geometry(f.kind == PhonePicture::Scene, f.k, screen_w, screen_h, sc);
+  if (f.kind == PhonePicture::Held) g.crop_bottom = STAMP_ROWS;
+  return g;
+}
+
 PhoneGeo phone_geometry(bool scene, uint32_t k, int screen_w, int screen_h, const PhoneScene& sc) {
   PhoneGeo g;
   g.scene = scene;
@@ -236,6 +252,15 @@ std::string phone_header_json(const PhoneGeo& g, const std::string& codec, int f
            codec.c_str(), g.w, g.h, g.full_w, g.full_h, g.x0, g.y0, fps, g.crop_bottom, q, bitrate,
            g.layout_generation >= 0 ? std::to_string(g.layout_generation).c_str() : "null", g.scene ? "scene" : "screen");
   return b;
+}
+
+bool FrameGate::admit_frame(const PhoneFrame& f, double now_ms, const PhoneScene& sc, double* t) {
+  if (f.kind != PhonePicture::Held) return admit(f.kind == PhonePicture::Scene, f.k, now_ms, sc, t);
+  if (!admit(false, f.k, now_ms, sc, t)) return false;
+  screen--;
+  held++;
+  *t = (double)f.k / STAMP_FPS;
+  return true;
 }
 
 bool FrameGate::admit(bool is_scene, uint32_t k, double now_ms, const PhoneScene& sc, double* t) {

@@ -2226,7 +2226,7 @@ The renderer's `POST /scene` body with `"type": "scene"`, plus the phone's field
 | `moves` | `dance`: the crowd stops, faces the camera and dances on one 120 bpm beat under confetti; `wave`: the crowd stops and waves. Each lasts 8 s with 0.6 s ramps | optional, at most 256 |
 | `night` | night palette: dark sky, stars, the moon, glowing eyes, fireflies | optional boolean; absent follows the phone's own dark mode |
 | `chrome` | keys: from `t`, show (`on: true`) or hide the app's top and tab bars over the scene. Zooming out is a key at a `t` every phone reaches together | optional, at most 64; absent means hidden (seamless) |
-| `stamp` | write the frame number `k` (the `t = k / 60` grid) into the bottom 8 rows: 32 cells across the surface, most significant bit first, white for 1 and black for 0, for the phone streamer to read and crop | optional boolean, default false |
+| `stamp` | write the frame number `k` (the `t = k / 60` grid) into the bottom 8 rows: 32 cells across the surface, most significant bit first, white for 1 and black for 0, for the phone streamer to read and crop. With `held`, the top bit is set and the app lifts its bars and info screen 8 rows above the screen's bottom, so the band shows below them (the bit stays set for 10 frames after `held` ends, while they come down) | optional boolean, default false |
 | `held` | a viewer holds this phone (the phone streamer sets it while the scene names a holder): the phone draws the whole image on its own, at its own aspect, with the held camera instead of `camera`, 5.5 m in front of the phone's own robot and following it along the lawn, until a scene without it arrives. The robot is a grown walker near the front of the lawn, the k-th of them for the phone in column k of `rect` | optional boolean, default false |
 | `layout_generation`, `rect_from_frame`, `previous_rect` | as the renderer's: frames before `rect_from_frame` (on the renderer's 1/30 s grid) use `previous_rect` | optional |
 | `time_of_day`, `weather`, `budget` | the renderer's; accepted and ignored | |
@@ -2405,7 +2405,7 @@ the clone's GPU.
 
 ```json
 {"picture":"scene","screen":[720,1280],"copies":890,"scene_frames":294,"screen_frames":171,
- "implausible":0,"odd":290,"repeats":135,"verified":true,"screen_error":null,"screen_connects":1,
+ "held_frames":0,"implausible":0,"odd":290,"repeats":135,"verified":true,"screen_error":null,"screen_connects":1,
  "app_connects":1,"app_error":null,
  "draw_to_capture_ms":{"p50":36.3,"p90":36.6,"n":300},
  "capture_to_sent_ms":{"p50":14.0,"p90":15.0,"n":300},"encode_ms":{"p50":4.6,"p90":4.7,"n":300}}
@@ -2414,6 +2414,11 @@ the clone's GPU.
 and `mirror`: `{"open": false, "opened": 3, "behind": 0, "tap_bytes": 51234567, "wire_bytes": 9876543,
 "error": null}`, the streams opened, the ones closed for falling behind, the tap's bytes and the
 compressed bytes sent, and the tap's last failure.
+
+A screen image whose stamp has the held bit (Robot Park's held layout) is sent as the whole
+screen (`picture` `screen`) with the band cropped (`crop.bottom` 8) and the scene time of its
+stamp, never placed in the shared image as a scene frame, and is counted in `held_frames`; the
+GPU mirror reads the same band, so the page can say how far the mirror runs ahead of the video.
 
 `draw_to_capture_ms` is the time a screen image reached the streamer minus the scene time of
 the frame number the stamp names; `capture_to_sent_ms` is from then to the frame queued on
