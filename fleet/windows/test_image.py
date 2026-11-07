@@ -94,6 +94,20 @@ class Build(unittest.TestCase):
         self.assertIn('OUT_ROOT=$(realpath -m', s)
 
 
+class Quiet(unittest.TestCase):
+    """A restored sandbox's clock jumps forward and Task Scheduler runs every overdue task: the
+    .NET native image service took 1.1 cores of a 2-vCPU clone for minutes after each restore."""
+
+    def test_the_build_drains_the_dotnet_queue_and_disables_maintenance(self):
+        setup = read(HERE, "fcvm-setup.ps1")
+        finish = re.search(r"@'(.*?)'@", setup, flags=re.S).group(1)
+        self.assertIn("executeQueuedItems /silent", finish)
+        self.assertIn("foreach ($fw in 'Framework64', 'Framework')", finish)
+        self.assertIn("MaintenanceDisabled 1", setup)
+        for path in (".NET Framework", "Servicing", "Maintenance", "Defrag", "UpdateOrchestrator"):
+            self.assertIn("'\\Microsoft\\Windows\\" + path + "\\'", setup, path)
+
+
 class Pins(unittest.TestCase):
     def test_every_download_is_pinned_by_sha256(self):
         s = read(HERE, "build-image.sh")
