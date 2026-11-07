@@ -326,7 +326,12 @@ fn listen_for_port_forward(addr: SocketAddr) -> std::io::Result<tokio::net::TcpL
 }
 
 /// The host-side listeners of a VM's published ports, one per mapping and in mapping
-/// order, bound and listening, until `start_port_forwards` hands them to their relays.
+/// order, bound and listening.
+///
+/// A relay accepts on a duplicate of its listener's descriptor (`start_port_forwards`),
+/// so the socket stays open, and keeps queueing connections in its backlog, for as long
+/// as this value holds it, also after the relay has stopped. Dropping it closes every
+/// listener whose relay has stopped.
 #[derive(Debug, Default)]
 pub struct PortListeners {
     listeners: Vec<std::net::TcpListener>,
@@ -340,6 +345,25 @@ impl std::ops::Index<usize> for PortListeners {
 }
 
 impl PortListeners {
+    /// Keep the listeners `keep` selects, by position, and close the others.
+    pub fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        let mut index = 0;
+        self.listeners.retain(|_| {
+            let kept = keep(index);
+            index += 1;
+            kept
+        });
+    }
+
+    /// Take the listener bound to exactly `addr`, if there is one.
+    fn take(&mut self, addr: SocketAddr) -> Option<std::net::TcpListener> {
+        let at = self
+            .listeners
+            .iter()
+            .position(|listener| listener.local_addr().is_ok_and(|bound| bound == addr))?;
+        Some(self.listeners.remove(at))
+    }
+
     #[cfg(test)]
     fn into_tokio(self) -> Vec<tokio::net::TcpListener> {
         self.listeners
@@ -352,20 +376,43 @@ impl PortListeners {
 /// Bind the host-side listener of every mapping, or of none.
 ///
 /// A mapping listens on the host address its HOSTIP names, or on `loopback_ip` (the VM's
-/// own loopback address) when it names none. No relay runs yet, so an error drops, and
-/// with that closes, the listeners already bound before it is returned.
-pub fn bind_port_forwards(loopback_ip: &str, mappings: &[PortMapping]) -> Result<PortListeners> {
+/// own loopback address) when it names none. A listener in `handed` that is bound to a
+/// mapping's address is used for that mapping instead of binding again: a VM that is
+/// torn down and restored in one process hands its listeners to the restore, so its
+/// published ports stay open in between (#1025). The listeners of `handed` that no
+/// mapping uses are closed.
+///
+/// No relay runs yet, so an error drops, and with that closes, the listeners already
+/// bound before it is returned.
+pub fn bind_port_forwards(
+    loopback_ip: &str,
+    mappings: &[PortMapping],
+    mut handed: PortListeners,
+) -> Result<PortListeners> {
     let mut listeners = Vec::with_capacity(mappings.len());
     for mapping in mappings {
         let addr = port_forward_bind_addr(mapping, loopback_ip)?;
-        let listener = listen_for_port_forward(addr)
-            .and_then(|listener| listener.into_std())
-            .with_context(|| format!("binding port forward on {addr}"))?;
-        info!(
-            listen = %addr,
-            guest_port = mapping.guest_port,
-            "port forwarding via TCP proxy"
-        );
+        let listener = match handed.take(addr) {
+            Some(listener) => {
+                info!(
+                    listen = %addr,
+                    guest_port = mapping.guest_port,
+                    "port forwarding via TCP proxy, on the listener the torn-down VM handed over"
+                );
+                listener
+            }
+            None => {
+                let listener = listen_for_port_forward(addr)
+                    .and_then(|listener| listener.into_std())
+                    .with_context(|| format!("binding port forward on {addr}"))?;
+                info!(
+                    listen = %addr,
+                    guest_port = mapping.guest_port,
+                    "port forwarding via TCP proxy"
+                );
+                listener
+            }
+        };
         listeners.push(listener);
     }
     Ok(PortListeners { listeners })
@@ -374,9 +421,11 @@ pub fn bind_port_forwards(loopback_ip: &str, mappings: &[PortMapping]) -> Result
 /// Start port forwarding on `listeners` (`bind_port_forwards` of the same `mappings`):
 /// relay each connection to the guest inside the namespace.
 ///
-/// Returns a `Relay` per port mapping, for `stop_relays`.
+/// Each relay accepts on a duplicate of its listener, so `listeners` still holds every
+/// socket when the relays stop (`PortListeners`). Returns a `Relay` per port mapping, for
+/// `stop_relays`.
 pub fn start_port_forwards(
-    listeners: PortListeners,
+    listeners: &PortListeners,
     mappings: &[PortMapping],
     ns_name: &str,
     guest_ip: &str,
@@ -390,14 +439,15 @@ pub fn start_port_forwards(
     let guest_ip: IpAddr = guest_ip
         .parse()
         .with_context(|| format!("invalid guest address {guest_ip}"))?;
-    // Every listener is registered with the runtime before any relay starts, so an
-    // error starts none.
+    // Every duplicate before any relay starts, so an error starts none.
     let accepting = listeners
         .listeners
-        .into_iter()
+        .iter()
         .map(|listener| {
-            tokio::net::TcpListener::from_std(listener)
-                .context("registering a port forward listener for its relay")
+            listener
+                .try_clone()
+                .and_then(tokio::net::TcpListener::from_std)
+                .context("duplicating a port forward listener for its relay")
         })
         .collect::<Result<Vec<_>>>()?;
     let ns_name: Arc<str> = ns_name.into();
@@ -980,6 +1030,7 @@ mod tests {
         let listeners = bind_port_forwards(
             &loopback.to_string(),
             &[mapping(Some(&host_ip.to_string()), 0), mapping(None, 0)],
+            Default::default(),
         )
         .unwrap();
         let (named, unnamed) = (
@@ -1006,7 +1057,8 @@ mod tests {
     /// the listener whether the client resolves localhost to 127.0.0.1 or to ::1.
     #[tokio::test]
     async fn a_listener_on_the_ipv6_wildcard_accepts_ipv4_and_ipv6_clients() {
-        let listeners = bind_port_forwards("127.0.0.1", &[mapping(Some("::"), 0)]).unwrap();
+        let listeners =
+            bind_port_forwards("127.0.0.1", &[mapping(Some("::"), 0)], Default::default()).unwrap();
         let listening = listeners[0].local_addr().unwrap();
         assert_eq!(listening.ip(), IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
         let v6only =
@@ -1042,7 +1094,7 @@ mod tests {
             mapping(Some(&free.to_string()), port),
             mapping(Some(&taken.to_string()), port),
         ];
-        let error = bind_port_forwards(&loopback.to_string(), &mappings)
+        let error = bind_port_forwards(&loopback.to_string(), &mappings, Default::default())
             .expect_err("the second mapping's address is in use");
         let error = format!("{error:#}");
         assert!(error.contains(&format!("{taken}:{port}")), "{error}");
@@ -1058,7 +1110,7 @@ mod tests {
 
         // 192.0.2.1 is TEST-NET-1, an address no host has.
         let absent = [mapping(Some("192.0.2.1"), port)];
-        let error = bind_port_forwards(&loopback.to_string(), &absent)
+        let error = bind_port_forwards(&loopback.to_string(), &absent, Default::default())
             .expect_err("192.0.2.1 is not an address of this host");
         let error = format!("{error:#}");
         assert!(error.contains(&format!("192.0.2.1:{port}")), "{error}");
@@ -1075,9 +1127,13 @@ mod tests {
             .await
             .unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
-        let listeners = bind_port_forwards(&test_ip(8).to_string(), &[mapping(None, 0)])
-            .unwrap()
-            .into_tokio();
+        let listeners = bind_port_forwards(
+            &test_ip(8).to_string(),
+            &[mapping(None, 0)],
+            Default::default(),
+        )
+        .unwrap()
+        .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<Relay> = listeners
             .into_iter()
@@ -1119,9 +1175,13 @@ mod tests {
     /// task has closed it.
     #[tokio::test]
     async fn stopped_relays_have_closed_their_listeners() {
-        let listeners = bind_port_forwards(&test_ip(6).to_string(), &[mapping(None, 0)])
-            .unwrap()
-            .into_tokio();
+        let listeners = bind_port_forwards(
+            &test_ip(6).to_string(),
+            &[mapping(None, 0)],
+            Default::default(),
+        )
+        .unwrap()
+        .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<Relay> = listeners
             .into_iter()
@@ -1163,9 +1223,13 @@ mod tests {
 
         let finished = Arc::new(AtomicBool::new(false));
         let (entered, entered_rx) = std::sync::mpsc::channel::<()>();
-        let listeners = bind_port_forwards(&test_ip(9).to_string(), &[mapping(None, 0)])
-            .unwrap()
-            .into_tokio();
+        let listeners = bind_port_forwards(
+            &test_ip(9).to_string(),
+            &[mapping(None, 0)],
+            Default::default(),
+        )
+        .unwrap()
+        .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<_> = listeners
             .into_iter()
@@ -1209,9 +1273,13 @@ mod tests {
     /// once the runtime has dropped the task, which is soon after and not at once.
     #[tokio::test]
     async fn a_dropped_relay_releases_its_listener() {
-        let listeners = bind_port_forwards(&test_ip(10).to_string(), &[mapping(None, 0)])
-            .unwrap()
-            .into_tokio();
+        let listeners = bind_port_forwards(
+            &test_ip(10).to_string(),
+            &[mapping(None, 0)],
+            Default::default(),
+        )
+        .unwrap()
+        .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<_> = listeners
             .into_iter()
@@ -1240,6 +1308,68 @@ mod tests {
                 Err(e) => panic!("binding {listening}: {e}"),
             }
         }
+    }
+
+    /// The inode of a socket's descriptor: two descriptors with one inode are one socket.
+    fn socket_inode(socket: &impl AsFd) -> u64 {
+        nix::sys::stat::fstat(socket.as_fd()).unwrap().st_ino
+    }
+
+    /// A VM torn down and restored in one process hands its listeners to the restore
+    /// (#1025). From the teardown to the restore's bind, a client of the published address
+    /// is queued, not refused, and no other socket can take the port; the restore binds
+    /// the very socket the torn-down VM listened on, and accepts that client. A listener
+    /// whose address the restore does not publish is closed.
+    #[tokio::test]
+    async fn handed_over_listeners_stay_open_from_the_teardown_to_the_restore() {
+        let (loopback, host, other) = (test_ip(11), test_ip(12), test_ip(13));
+        let probe = std::net::TcpListener::bind((host, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let published = [mapping(Some(&host.to_string()), port)];
+
+        // The torn-down VM: its relay ran on a duplicate and has stopped.
+        let first_mappings = [published[0].clone(), mapping(Some(&other.to_string()), 0)];
+        let first =
+            bind_port_forwards(&loopback.to_string(), &first_mappings, Default::default()).unwrap();
+        let first_inode = socket_inode(&first[0]);
+        let dropped_addr = first[1].local_addr().unwrap();
+        let relays = start_port_forwards(&first, &first_mappings, "unused", "10.0.2.100").unwrap();
+        stop_relays(relays).await;
+
+        // The gap: no relay accepts, and the socket still listens.
+        let gap_client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect((host, port)),
+        )
+        .await
+        .expect("a connect in the gap completes")
+        .expect("a client in the gap is queued, not refused");
+        let squatter = std::net::TcpListener::bind((host, port))
+            .expect_err("no other socket may take the port in the gap");
+        assert_eq!(squatter.kind(), std::io::ErrorKind::AddrInUse, "{squatter}");
+
+        // The restore publishes only the first mapping.
+        let second = bind_port_forwards(&loopback.to_string(), &published, first).unwrap();
+        assert_eq!(
+            socket_inode(&second[0]),
+            first_inode,
+            "the restore must listen on the torn-down VM's socket"
+        );
+        let (_, peer) = second[0].accept().unwrap();
+        assert_eq!(
+            peer,
+            gap_client.local_addr().unwrap(),
+            "the client queued in the gap is accepted by the restore"
+        );
+        let refused = tokio::net::TcpStream::connect(dropped_addr)
+            .await
+            .expect_err("a handed listener the restore does not publish is closed");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{refused}"
+        );
     }
 
     /// A socket bound to `addr` that does not listen: connections to it are refused, and
@@ -1560,8 +1690,8 @@ mod tests {
         };
 
         let mappings = [mapping];
-        let listeners = bind_port_forwards("127.0.0.1", &mappings)?;
-        let handles = start_port_forwards(listeners, &mappings, &ns_name, "127.0.0.1")?;
+        let listeners = bind_port_forwards("127.0.0.1", &mappings, Default::default())?;
+        let handles = start_port_forwards(&listeners, &mappings, &ns_name, "127.0.0.1")?;
 
         // Give the listener a moment to start accepting
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

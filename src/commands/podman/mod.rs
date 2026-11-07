@@ -3850,6 +3850,14 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             (None, None),
         )
     });
+    // The restore listens on this VM's published host listeners, so its ports stay
+    // open across the teardown (#1025). Taken before the teardown, which would close
+    // them.
+    let port_listeners = if restore_args.is_some() {
+        ctx.network.take_port_listeners()
+    } else {
+        Default::default()
+    };
     cleanup_vm_context(ctx).await;
 
     // The run loop stopped on purpose right after producing the pre-start
@@ -3858,7 +3866,8 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         // A signal during the teardown window cancelled this process's gates, so
         // the restore's own gate is created cancelled and it stops before
         // allocating anything (`common::ShutdownRegistry`).
-        return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+        return super::snapshot::cmd_snapshot_run_with_listeners(snapshot_args, port_listeners)
+            .await;
     }
 
     // None here is a cancelled run; the loop already failed a VM that exited unreported.
@@ -7317,6 +7326,46 @@ mod container_exit_status_tests {
         );
         assert_eq!(process_exit_status(&unreported), 1);
         assert_eq!(process_exit_status(&anyhow::anyhow!("anything else")), 1);
+    }
+
+    /// An NV2 or --gpu snapshot miss tears its VM down and restores it in one process. The
+    /// routed VM's published host listeners are taken before the teardown closes them and
+    /// handed to the restore's network, so a client of the published address is never
+    /// refused in between and no other process can take the port (#1025;
+    /// `handed_over_listeners_stay_open_from_the_teardown_to_the_restore` covers the
+    /// sockets). The run needs an NV2 host to reach, so the wiring is pinned by source.
+    #[test]
+    fn a_restore_in_the_same_process_listens_on_the_torn_down_vms_listeners() {
+        fn body<'a>(source: &'a str, start: &str) -> &'a str {
+            let from = source.find(start).unwrap_or_else(|| panic!("no {start:?}"));
+            let rest = &source[from..];
+            &rest[..rest.find("\n}\n").expect("unterminated fn")]
+        }
+        let run = body(include_str!("mod.rs"), "pub async fn cmd_podman_run(");
+        let at = |needle: &str| {
+            run.find(needle)
+                .unwrap_or_else(|| panic!("cmd_podman_run has no {needle:?}"))
+        };
+        let taken = at("ctx.network.take_port_listeners()");
+        let torn_down = at("cleanup_vm_context(ctx).await;\n\n    // The run loop stopped");
+        let restored = at("cmd_snapshot_run_with_listeners(snapshot_args, port_listeners)");
+        assert!(
+            taken < torn_down && torn_down < restored,
+            "the listeners must be taken before the teardown and handed to the restore"
+        );
+        assert!(
+            !run.contains("super::snapshot::cmd_snapshot_run(snapshot_args)"),
+            "the restore must not bind its ports again"
+        );
+
+        let restore = body(
+            include_str!("../snapshot.rs"),
+            "async fn cmd_snapshot_run_inner(",
+        );
+        assert!(
+            restore.contains(".with_port_listeners(port_listeners.take().unwrap_or_default())"),
+            "a routed restore must be given the handed-over listeners"
+        );
     }
 
     /// Every run that waits for its VM to exit reports the container through
