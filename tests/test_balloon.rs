@@ -768,9 +768,34 @@ async fn release_held_run(run: &str, pid: u32, set_mib: Option<u32>) -> Result<(
         !matches!(health, fcvm::state::HealthStatus::Healthy),
         "control: {run} is healthy before its workload was let go"
     );
-    common::exec_in_container(pid, &["touch /tmp/go"])
-        .await
-        .with_context(|| format!("letting {run}'s workload start"))?;
+    // The release's own effect can start a snapshot under it: nginx starts, the run turns
+    // healthy and takes its startup snapshot at once, and the pause resets vsock under this
+    // exec if its answer has not arrived yet. fcvm exec then reports the session orphaned
+    // and does not resend (CI run 42393525591, run 3: orphaned 2.0 s after GO). That is how
+    // an exec whose effect starts a snapshot can end, so it is not a failure here: the
+    // health wait below says whether the release took effect. A run that declines the
+    // startup snapshot takes none, and its release must answer.
+    //
+    // The run that takes the snapshot keeps its exec open across it (`sleep`), so this path
+    // runs every time instead of whenever the race lands.
+    let release = if set_mib.is_none() {
+        "touch /tmp/go; sleep 30"
+    } else {
+        "touch /tmp/go"
+    };
+    match common::exec_in_container(pid, &[release]).await {
+        Ok(_) => {}
+        Err(error)
+            if set_mib.is_none()
+                && format!("{error:#}")
+                    .contains("exec session orphaned by a VM snapshot pause") =>
+        {
+            println!("{run}: the startup snapshot orphaned the release's exec, as expected");
+        }
+        Err(error) => {
+            return Err(error.context(format!("letting {run}'s workload start")));
+        }
+    }
     common::poll_health_by_pid(pid, 300)
         .await
         .with_context(|| format!("{run} never turned healthy"))
