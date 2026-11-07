@@ -1500,11 +1500,17 @@ has moved on since the snapshot, it opens a new tab page instead), then Ctrl+R. 
 | the phone that was never snapshotted | 136 to 599 ms | 473 to 971 ms | 524 ms |
 | `restart_app` with the browser in front (its tabs closed, started on the page) | | 846 to 1145 ms | |
 
-The first time is gfxstream restoring the browser's GL state: after a snapshot load it restores
-a share group when one of its contexts is first made current (`ShareGroup::postLoadRestore`),
-and the browser's first frame waits for it (HWUI reports one frame of 2672 ms). The source
-phone pays it too, once, after its own warm snapshot (3138 ms). Restoring the share groups
-before a viewer asks is tracked in #1492.
+That first time was gfxstream restoring the browser's GL state: after a snapshot load it
+restored a share group when one of its contexts was first made current
+(`ShareGroup::postLoadRestore`), and the browser's first frame waited for it (HWUI reported one
+frame of 2672 ms). The browser's group holds 122 programs and 244 shaders, and compiling and
+linking them again took 2.2 to 2.5 s on a T4. Since #1619 a retake restores the loaded share
+groups on a thread of its own once the guest posts a frame, and since #1708 (ejc3/gfxstream#10)
+a restore loads each program from the host binary the release kept (glProgramBinary) and
+compiles a shader object only when a link or a query needs it: the browser's group restores in
+45 to 272 ms. Measured on one g4dn.metal, five in-place retakes per arm, generation six's
+emulator against this one, the browser opened as soon as the retake drew: 2609 to 3178 ms to
+the front, against 192 to 269 ms.
 
 **Network.** A phone VM is routed over IPv6 only (`--network routed`: no IPv4 leaves the
 VM), and www.nvidia.com has no AAAA record (a CNAME to Akamai's edgekey with A records only),
