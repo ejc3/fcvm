@@ -4732,6 +4732,8 @@ pub fn build_snapshot_config(
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
             balloon_mib: vm_state.config.balloon_mib,
             balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
+            // Read from the guest by `create_snapshot_core`, just before the pause.
+            page_reporting_order: None,
             parked_gpus: 0,
         },
     })
@@ -5437,6 +5439,50 @@ async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The guest's free page reporting parameter, which holds the order its balloon reports at.
+const GUEST_PAGE_REPORTING_ORDER_PATH: &str =
+    "/sys/module/page_reporting/parameters/page_reporting_order";
+
+/// Read the order the guest reports free pages at, over the exec channel. A guest that
+/// cannot answer leaves the snapshot without an order, which a restore reads as the
+/// default (`DEFAULT_PAGE_REPORTING_ORDER`); the snapshot itself does not depend on it.
+async fn read_guest_page_reporting_order(vsock_socket: &Path, vm_id: &str) -> Option<u32> {
+    let command = [
+        "/usr/bin/cat".to_string(),
+        GUEST_PAGE_REPORTING_ORDER_PATH.to_string(),
+    ];
+    let output =
+        crate::commands::exec::run_exec_in_vm_captured(vsock_socket, &command, false, vm_id).await;
+    let read = match output {
+        Ok(output) if output.exit_code == 0 => {
+            crate::storage::snapshot::parse_page_reporting_order(&output.stdout)
+                .ok_or_else(|| format!("unexpected value {:?}", output.stdout))
+        }
+        Ok(output) => Err(format!(
+            "exit code {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        )),
+        Err(error) => Err(format!("{error:#}")),
+    };
+    match read {
+        Ok(order) => {
+            debug!(vm_id, order, "read the guest's free page reporting order");
+            Some(order)
+        }
+        Err(error) => {
+            warn!(
+                vm_id,
+                error,
+                default_order = crate::storage::snapshot::DEFAULT_PAGE_REPORTING_ORDER,
+                "could not read the guest's free page reporting order; the snapshot records \
+                 none and its restores assume the default"
+            );
+            None
+        }
+    }
+}
+
 /// Run `fc-agent <flag>` in the guest over the exec channel and fail unless it exits 0.
 pub(crate) async fn run_fc_agent_one_shot(
     vsock_socket: &Path,
@@ -5785,6 +5831,17 @@ pub async fn create_snapshot_core(
     let pause_client = client.with_timeout(std::time::Duration::from_secs(30));
     let snapshot_client =
         client.with_timeout(std::time::Duration::from_secs(snapshot_timeout_secs));
+
+    // The block size the guest reports free pages in decides how many mappings a restore
+    // that splits guest memory can need (`free_page_reporting_shortfall` in
+    // snapshot.rs). It is read before the gate closes, so the read adds nothing to the
+    // gated window, and it is a read of a sysfs parameter, so the source is left as it
+    // was. The guest can change it between this read and the pause, as a clone can after
+    // its restore; the record is the order the guest held immediately before the snapshot.
+    if snapshot_config.metadata.balloon_free_page_reporting {
+        snapshot_config.metadata.page_reporting_order =
+            read_guest_page_reporting_order(vsock_socket_path, &snapshot_config.vm_id).await;
+    }
 
     // Close the guest's new-flow gate immediately before pausing. The manifest
     // written by this command is captured in guest memory, creating the exact
