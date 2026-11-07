@@ -129,7 +129,7 @@ pub struct VmRunArgs {
 
 #[derive(Args, Debug)]
 pub struct NsHelperArgs {
-    /// The file naming the VM's current generation (`<vm id>.<boot>`), read for every
+    /// The file naming the VM's current generation (`<vm id>-b<boot>`), read for every
     /// clock line connection and expected in the guest's acknowledgement
     #[arg(long, value_name = "PATH")]
     pub generation_file: std::path::PathBuf,

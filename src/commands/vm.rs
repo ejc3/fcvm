@@ -35,7 +35,7 @@ pub const RDP_SOCKET_DIR: &str = "rdp";
 /// The Unix socket that reaches a raw VM's Remote Desktop port, in [`RDP_SOCKET_DIR`].
 pub const RDP_SOCKET: &str = "rdp.sock";
 
-/// The file in a raw VM's data directory naming its current generation, `<vm id>.<boot>`:
+/// The file in a raw VM's data directory naming its current generation, `<vm id>-b<boot>`:
 /// the helper serves it on every clock line connection and health requires an
 /// acknowledgement of it. fcvm writes it whole before the first boot and before every
 /// relaunch, so each boot of one VM has its own generation and no acknowledgement from an
@@ -119,9 +119,12 @@ pub fn generation_path(data_dir: &Path) -> PathBuf {
     data_dir.join(GENERATION_FILE)
 }
 
-/// The generation of boot `boot` of the VM `vm_id`.
+/// The generation of boot `boot` of the VM `vm_id`, `<vm id>-b<boot>`: letters, digits and
+/// '-' only, at most 57 characters for an fcvm VM id (`vm-` and 32 hex digits) and any boot,
+/// which is what the guest agent's clock line pattern accepts (fleet/windows/fcvm-agent.ps1,
+/// `[A-Za-z0-9_-]{1,64}`; `the_guest_agent_parses_every_generation_fcvm_serves`).
 pub fn boot_generation(vm_id: &str, boot: u64) -> String {
-    format!("{vm_id}.{boot}")
+    format!("{vm_id}-b{boot}")
 }
 
 /// Make boot `boot` of `vm_id` the raw VM's current generation, written whole, and return it.
@@ -887,7 +890,7 @@ pub(crate) struct RawVm {
     pub ns_helper: Option<NsHelper>,
     pub boot: RawBoot,
     /// Which boot of this VM is running: 0 at the cold boot or restore, one more at every
-    /// relaunch. The current generation is `<vm id>.<boot number>`.
+    /// relaunch. The current generation is `<vm id>-b<boot number>`.
     pub boot_number: u64,
     pub state_manager: StateManager,
     pub vm_state: VmState,
@@ -1251,6 +1254,39 @@ mod tests {
         assert_eq!(parse_clock_ack("ack vm-2 5\n", "vm-1"), None);
     }
 
+    /// The guest agent in the built images (fleet/windows/fcvm-agent.ps1) parses a clock line
+    /// only when it matches its pattern, and acknowledges the generation it captured. Every
+    /// line the helper serves, for any VM id fcvm makes and any boot number, must match it
+    /// and capture the generation whole, or the agent never acknowledges and the VM is never
+    /// healthy.
+    #[test]
+    fn the_guest_agent_parses_every_generation_fcvm_serves() {
+        let agent = include_str!("../../fleet/windows/fcvm-agent.ps1");
+        let pattern = regex::Regex::new(r"-match '([^']+)'")
+            .unwrap()
+            .captures(agent)
+            .expect("the agent matches its clock line against a pattern")[1]
+            .to_string();
+        let line_pattern = regex::Regex::new(&pattern).unwrap();
+        let vm_id = crate::state::generate_vm_id();
+        for boot in [0, 1, 7, u64::MAX] {
+            let generation = boot_generation(&vm_id, boot);
+            let line = clock_line(
+                &generation,
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_794_074_699_656),
+            );
+            // The agent reads the line without its newline.
+            let line = line.trim_end_matches('\n');
+            let captured = line_pattern
+                .captures(line)
+                .unwrap_or_else(|| panic!("the agent ({pattern}) does not parse {line:?}"));
+            assert_eq!(
+                &captured[1], generation,
+                "the agent would acknowledge another generation"
+            );
+        }
+    }
+
     /// Every boot of a raw VM has its own generation, and an acknowledgement for a boot that
     /// has ended cannot make the next one healthy: a clock line connection served before a
     /// relaunch, whose guest acknowledges after the relaunch wrote the new generation, records
@@ -1259,8 +1295,8 @@ mod tests {
     async fn a_previous_boots_ack_does_not_make_the_relaunch_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let first = write_generation(dir.path(), "vm-raw", 0).unwrap();
-        assert_eq!(first, "vm-raw.0");
-        assert_eq!(read_generation(dir.path()).unwrap(), "vm-raw.0");
+        assert_eq!(first, "vm-raw-b0");
+        assert_eq!(read_generation(dir.path()).unwrap(), "vm-raw-b0");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_clock_line(
@@ -1278,7 +1314,7 @@ mod tests {
             .read_line(&mut line)
             .await
             .unwrap();
-        assert!(line.starts_with("vm-raw.0 "), "{line}");
+        assert!(line.starts_with("vm-raw-b0 "), "{line}");
         let relaunched = write_generation(dir.path(), "vm-raw", 1).unwrap();
         assert_ne!(
             relaunched, first,
@@ -1291,7 +1327,7 @@ mod tests {
             .unwrap();
         drop(writer);
         let recorded = read_when_written(&clock_ack_path(dir.path())).await;
-        assert!(recorded.is_some_and(|r| r.starts_with("vm-raw.0 ")));
+        assert!(recorded.is_some_and(|r| r.starts_with("vm-raw-b0 ")));
         let current = read_generation(dir.path()).unwrap();
         assert!(
             crate::health::check_clock_ack(
@@ -1305,16 +1341,16 @@ mod tests {
         );
         // The relaunched boot's own acknowledgement is recorded and accepted.
         let line = clock_exchange(addr, &format!("ack {relaunched} {now}\n")).await;
-        assert!(line.starts_with("vm-raw.1 "), "{line}");
+        assert!(line.starts_with("vm-raw-b1 "), "{line}");
         for _ in 0..100 {
             let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
-            if text.starts_with("vm-raw.1 ") {
+            if text.starts_with("vm-raw-b1 ") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
-        assert!(text.starts_with("vm-raw.1 "), "{text}");
+        assert!(text.starts_with("vm-raw-b1 "), "{text}");
         server.abort();
     }
 
