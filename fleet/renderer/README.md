@@ -112,6 +112,7 @@ src/subscriber.cpp a subscriber's queue: header and keyframe rules, a slow reade
 src/server.cpp     HTTP/1.1 and WebSocket
 src/threads.h      starting a connection's threads when the system has none to give
 src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-codec-headers, MIT)
+src/h264.cpp       an SPS's reordering and codec string, quality names (no encoder)
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
 tests/test_host.cpp  scene parsing, splines and holds, tile geometry, wire formats (no GPU)
 tests/test_gpu.cpp   the seam test, and a moving frame's error against a held reference (GPU)

@@ -3018,6 +3018,19 @@ pub struct RestoreIdentity {
     /// The resolvers a boot on this host would give the guest. None leaves the
     /// guest's resolv.conf as it is.
     pub dns: Option<crate::commands::podman::GuestDns>,
+    /// The proxies this run gives the guest, or none. Always applied: the snapshot
+    /// records no proxy, and a guest restored without one must not keep the proxy of
+    /// the run that made the snapshot.
+    pub proxy: GuestProxy,
+}
+
+/// The proxy settings a guest is given (`vm_config::guest_proxy`), at boot in the boot
+/// plan and at every restore in the restore document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestProxy {
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
 }
 
 impl RestoreIdentity {
@@ -3034,6 +3047,11 @@ impl RestoreIdentity {
                 "search": dns.search,
             });
         }
+        document["proxy"] = serde_json::json!({
+            "http_proxy": self.proxy.http_proxy,
+            "https_proxy": self.proxy.https_proxy,
+            "no_proxy": self.proxy.no_proxy,
+        });
     }
 }
 
@@ -4828,7 +4846,14 @@ pub fn build_snapshot_config(
             image: vm_state.config.image.clone(),
             vcpu: vm_state.config.vcpu,
             memory_mib: vm_state.config.memory_mib,
-            network_config: vm_state.config.network.clone(),
+            // The proxies are not recorded: each restore gives the guest its own run's
+            // (`RestoreIdentity::proxy`), and a snapshot is a cache entry other callers
+            // restore, which must not hold one caller's proxy URL.
+            network_config: crate::network::NetworkConfig {
+                http_proxy: None,
+                https_proxy: None,
+                ..vm_state.config.network.clone()
+            },
             volumes,
             health_check_url: vm_state.config.health_check_url.clone(),
             health_check_timeout: vm_state.config.health_check_timeout,
@@ -4862,6 +4887,7 @@ pub fn build_snapshot_config(
             parked_gpus: 0,
             guest: vm_state.config.guest,
             health_port: vm_state.config.health_port,
+            firmware: vm_state.config.firmware.clone(),
         },
     })
 }
@@ -6733,6 +6759,11 @@ mod tests {
                 servers: vec!["10.9.0.2".to_string()],
                 search: vec!["restore.example".to_string()],
             }),
+            proxy: super::GuestProxy {
+                http_proxy: Some("http://10.0.2.2:3128".to_string()),
+                https_proxy: Some("http://10.0.2.2:3129".to_string()),
+                no_proxy: Some("localhost".to_string()),
+            },
         };
         let mut document = serde_json::json!({ "restore-epoch": "e" });
         identity.write_into(&mut document);
@@ -6742,6 +6773,11 @@ mod tests {
                 "restore-epoch": "e",
                 "host-ipv6": "2001:db8:b::1",
                 "dns": { "servers": ["10.9.0.2"], "search": ["restore.example"] },
+                "proxy": {
+                    "http_proxy": "http://10.0.2.2:3128",
+                    "https_proxy": "http://10.0.2.2:3129",
+                    "no_proxy": "localhost",
+                },
             })
         );
 
@@ -6749,7 +6785,11 @@ mod tests {
         super::RestoreIdentity::default().write_into(&mut none);
         assert_eq!(
             none,
-            serde_json::json!({ "restore-epoch": "e", "host-ipv6": null })
+            serde_json::json!({
+                "restore-epoch": "e",
+                "host-ipv6": null,
+                "proxy": { "http_proxy": null, "https_proxy": null, "no_proxy": null },
+            })
         );
     }
 

@@ -839,8 +839,12 @@ async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed
             })?
             .to_string();
         test_keys.push(startup_base.clone());
-        let at_new_target =
-            fcvm::commands::podman::startup_snapshot_key(&startup_base, Some(SET_MIB), None);
+        let at_new_target = fcvm::commands::podman::startup_snapshot_key(
+            &startup_base,
+            Some(SET_MIB),
+            None,
+            fcvm::commands::podman::host_proxy_identity().as_deref(),
+        );
         let pre_start = ("pre-start snapshot", key.clone());
 
         release_held_run("run 1", pid_1, Some(SET_MIB)).await?;

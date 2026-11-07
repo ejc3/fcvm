@@ -82,6 +82,67 @@ use nix::unistd::{read, write};
 /// are counted and summarized rather than silent.
 const PENDING_CAP: usize = 1024 * 1024;
 
+/// Where the next console write of `pending` ends: after its first newline, or at its end
+/// when it holds none.
+///
+/// The writer hands the console one line per write. The console is non-blocking and takes
+/// what fits, so a write of several lines could end inside one, and another console writer
+/// (the kernel, a process writing `/dev/ttyS0`) could land in the rest of it; one line per
+/// write splits a line only when the console has less room than that line (#1723).
+///
+/// The search resumes where it stopped, so a long line written in many short writes is
+/// scanned once, not once per write.
+#[derive(Default)]
+struct LineCursor {
+    /// Bytes at the front of `pending` known to hold no newline.
+    searched: usize,
+    /// Bytes at the front of `pending` that end the current line, once its newline is found.
+    line: Option<usize>,
+    /// Bytes examined, for tests.
+    #[cfg(test)]
+    scanned: usize,
+}
+
+impl LineCursor {
+    /// How many bytes from the front of `pending` the next write may take.
+    fn next_len(&mut self, pending: &VecDeque<u8>) -> usize {
+        if let Some(line) = self.line {
+            return line;
+        }
+        let from = self.searched.min(pending.len());
+        #[cfg(test)]
+        {
+            self.scanned += pending.len() - from;
+        }
+        match pending.range(from..).position(|&b| b == b'\n') {
+            Some(at) => {
+                let line = from + at + 1;
+                self.line = Some(line);
+                line
+            }
+            None => {
+                self.searched = pending.len();
+                pending.len()
+            }
+        }
+    }
+
+    /// `n` bytes left the front of `pending`.
+    fn consumed(&mut self, n: usize) {
+        self.searched = self.searched.saturating_sub(n);
+        self.line = match self.line {
+            Some(line) if line > n => Some(line - n),
+            _ => None,
+        };
+    }
+
+    /// `pending` was emptied.
+    fn cleared(&mut self) {
+        self.searched = 0;
+        self.line = None;
+    }
+}
+
 /// Writer thread poll tick. Bounds how quickly the writer notices a gate
 /// transition; pipe data wakes it immediately via POLLIN.
 const POLL_TICK_MS: u16 = 100;
@@ -266,6 +327,7 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
 fn writer_loop(state: Arc<ConsoleShared>) {
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut buf = [0u8; 8192];
+    let mut cursor = LineCursor::default();
 
     loop {
         // Poll: always watch the pipe; watch the console for writability only
@@ -324,11 +386,18 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             // this lock, no write can start here.
             if state.gate.load(Ordering::SeqCst) == 0 {
                 while !pending.is_empty() {
+                    let len = cursor.next_len(&pending);
+                    // A line across the ring's wrap is made contiguous, so it is still one
+                    // write; that moves the buffer only when a line spans the wrap.
+                    if pending.as_slices().0.len() < len {
+                        pending.make_contiguous();
+                    }
                     let (head, _) = pending.as_slices();
-                    match write(state.console_fd.as_fd(), head) {
+                    match write(state.console_fd.as_fd(), &head[..len]) {
                         Ok(0) => break,
                         Ok(n) => {
                             pending.drain(..n);
+                            cursor.consumed(n);
                             state.disposed.fetch_add(n as u64, Ordering::SeqCst);
                             wrote_any = true;
                         }
@@ -340,6 +409,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                             // come back, and producers must never feel this.
                             let len = pending.len() as u64;
                             pending.clear();
+                            cursor.cleared();
                             state.dropped.fetch_add(len, Ordering::SeqCst);
                             state.disposed.fetch_add(len, Ordering::SeqCst);
                             break;
@@ -708,7 +778,7 @@ async fn run_source_request(request: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
     /// Fake console: a pipe whose read end the test controls. Not reading it
@@ -887,6 +957,91 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Close the console gate as quiesce does: no write is in flight once this returns.
+    fn hold_writer(state: &Arc<ConsoleShared>) {
+        state.gate.fetch_add(1, Ordering::SeqCst);
+        drop(state.write_lock.lock().unwrap());
+    }
+
+    /// A console with less room than the writer's backlog takes whole lines, so another
+    /// console writer cannot land inside one (#1723). The writer is held until all six lines
+    /// are in its backlog, so the old writer's single write of all 6000 bytes is forced.
+    #[test]
+    fn a_console_short_of_room_takes_whole_lines() {
+        let (console_wr, mut console_rd) = fake_console();
+        unsafe {
+            libc::fcntl(console_wr.as_raw_fd(), libc::F_SETPIPE_SZ, 4096);
+        }
+        let other = std::fs::File::from(console_wr.try_clone().unwrap());
+        let state = setup(console_wr).unwrap();
+        hold_writer(&state);
+        for i in 0..6u8 {
+            let mut line = vec![b'0' + i; 999];
+            line.push(b'\n');
+            write_pipe(&state, &line);
+        }
+        assert!(
+            wait_until(
+                || state.enqueued.load(Ordering::SeqCst) == 6000,
+                Duration::from_secs(5)
+            ),
+            "the writer did not take the backlog"
+        );
+        state.gate.fetch_sub(1, Ordering::SeqCst);
+        // The console fills: 4096 bytes in one write before, 4000 in four lines now.
+        assert!(
+            wait_until(
+                || state.disposed.load(Ordering::SeqCst) >= 4000,
+                Duration::from_secs(5)
+            ),
+            "the writer never filled the console"
+        );
+        hold_writer(&state);
+        let mut seen: Vec<u8> = Vec::new();
+        drain_console(&mut console_rd, &mut seen);
+        (&other).write_all(b"MARKER\n").unwrap();
+        state.gate.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.len() == 6000 + 7
+                },
+                Duration::from_secs(5)
+            ),
+            "{} bytes reached the console",
+            seen.len()
+        );
+        for line in String::from_utf8_lossy(&seen).lines() {
+            assert!(
+                line == "MARKER" || (line.len() == 999 && !line.contains("MARKER")),
+                "a line was split by another console writer: {} bytes, starting {:?}",
+                line.len(),
+                &line[..line.len().min(8)]
+            );
+        }
+    }
+
+    /// A line with no newline written in many short writes is scanned once.
+    #[test]
+    fn a_long_line_is_scanned_once() {
+        const LEN: usize = 1 << 20;
+        let mut pending: VecDeque<u8> = std::iter::repeat_n(b'x', LEN).collect();
+        let mut cursor = LineCursor::default();
+        while !pending.is_empty() {
+            let take = cursor.next_len(&pending).min(4096);
+            pending.drain(..take);
+            cursor.consumed(take);
+        }
+        assert_eq!(cursor.scanned, LEN, "bytes examined for a {LEN}-byte line");
+        // A newline that arrives later is found where the search stopped.
+        pending.extend(b"tail\nnext");
+        assert_eq!(cursor.next_len(&pending), 5);
+        pending.drain(..5);
+        cursor.consumed(5);
+        assert_eq!(cursor.next_len(&pending), 4);
     }
 
     #[test]

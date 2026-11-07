@@ -282,12 +282,24 @@ jobs:
           # The phone streamer's host tests (stamp, colour conversion, geometry, frame
           # selection, the app's requests, scene checks), with the renderer's code.
           make -C fleet/phone/streamer test-host
+      # The Windows bridge's host tests (fleet/windows/bridge/test_host.cpp: the desktop
+      # check and its reference files, colour conversion, the x264 stream, the action table,
+      # the channel check, /health, the reconnect schedule), with the renderer's code. They
+      # need g++, x264, libpng and OpenSSL, and no FreeRDP or Windows.
+      - name: Windows bridge host tests (fleet/windows/bridge)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            libx264-dev libpng-dev libssl-dev
+          make -C fleet/windows/bridge test-host
       - name: Phone container script tests (phone.sh serve, the GPU hook)
         run: |
           bash scripts/phone/test-phone-sh.sh
           bash scripts/phone/test-gpu-hook.sh
           bash scripts/phone/test-seam.sh
           bash scripts/phone/test-app-sh.sh
+          bash scripts/phone/test-held-check.sh
           bash fleet/phone-app/test-build-apk.sh
 
   # Plans which self-hosted jobs this run needs.

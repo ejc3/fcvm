@@ -14,6 +14,7 @@ mod namespace;
 mod snapshot;
 mod types;
 mod vm_config;
+pub(crate) use vm_config::guest_proxy;
 
 pub use types::{
     shared_cache_verdict, CacheRequest, CacheVerdict, LogLine, PreparedRestore, PreparedTarget,
@@ -40,8 +41,9 @@ pub(crate) use listeners::{
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
-    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
-    CreateSnapshotParams, ExistingGeneration, SnapshotInstall, SnapshotVmm,
+    check_podman_snapshot, create_snapshot_interruptible, host_proxy_identity, proxy_identity,
+    startup_snapshot_key, BalloonRequirement, CreateSnapshotParams, ExistingGeneration,
+    SnapshotInstall, SnapshotVmm,
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
@@ -1913,8 +1915,12 @@ async fn prepare_vm_for_lifecycle(
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
         // The startup snapshot is this run's balloon target's own; the pre-start one is
         // shared between targets.
-        let startup_key =
-            startup_snapshot_key(&startup_base, args.balloon, run_host_ipv6(&args.env));
+        let startup_key = startup_snapshot_key(
+            &startup_base,
+            args.balloon,
+            run_host_ipv6(&args.env),
+            host_proxy_identity().as_deref(),
+        );
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -3335,7 +3341,12 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
 
                 if let Some(ref base) = ctx.startup_snapshot_base_key {
                     let startup_key =
-                        startup_snapshot_key(base, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
+                        startup_snapshot_key(
+                            base,
+                            ctx.args.balloon,
+                            run_host_ipv6(&ctx.args.env),
+                            host_proxy_identity().as_deref(),
+                        );
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -4844,7 +4855,7 @@ mod tests {
             let mut args = test_args();
             args.balloon = balloon;
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon, None);
+            let startup = startup_snapshot_key(&key, args.balloon, None, None);
             (key, startup)
         };
         let (key_64, startup_64) = names(Some(64));
@@ -4870,7 +4881,7 @@ mod tests {
             "a run without --balloon keeps the startup name it had"
         );
         assert_eq!(
-            startup_snapshot_key("abc123def456", None, None),
+            startup_snapshot_key("abc123def456", None, None, None),
             "abc123def456-startup"
         );
     }
@@ -4887,7 +4898,7 @@ mod tests {
                 .map(|a| vec![format!("HOST_IPV6={a}")])
                 .unwrap_or_default();
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
+            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env), None);
             (key, startup)
         };
         let (key_a, startup_a) = names(Some("2001:db8:a::1"));
@@ -4908,6 +4919,7 @@ mod tests {
             &key_a,
             Some(u32::MAX),
             Some("2001:db8:a::1".parse().unwrap()),
+            proxy_identity(|_| Some("http://203.0.113.9:3128".to_string())).as_deref(),
         ))
         .expect("the longest startup name is a valid snapshot name");
 
@@ -4919,16 +4931,45 @@ mod tests {
         };
         let podman = code(include_str!("mod.rs"));
         for call in [
-            "startup_snapshot_key(&startup_base,args.balloon,run_host_ipv6(&args.env))",
-            "startup_snapshot_key(base,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
+            "startup_snapshot_key(&startup_base,args.balloon,run_host_ipv6(&args.env),host_proxy_identity().as_deref(),)",
+            "startup_snapshot_key(base,ctx.args.balloon,run_host_ipv6(&ctx.args.env),host_proxy_identity().as_deref(),)",
         ] {
             assert!(podman.contains(call), "podman run no longer calls {call}");
         }
         assert_eq!(podman.matches("startup_snapshot_key(").count(), 2);
         assert!(
             code(include_str!("../snapshot.rs"))
-                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6)"),
-            "a clone saves the startup snapshot under the address it restored with"
+                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6,crate::commands::podman::host_proxy_identity().as_deref(),)"),
+            "a clone saves the startup snapshot under the address and proxies it restored with"
+        );
+    }
+
+    /// A startup snapshot holds a container that runs with the proxy variables it started
+    /// with, which a restore cannot change, so runs with different proxies share the
+    /// pre-start snapshot and have a startup snapshot each. The name carries a digest, not
+    /// the URL. A run without a proxy keeps the startup name it had.
+    #[test]
+    fn two_proxies_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let env_a =
+            |name: &str| (name == "https_proxy").then(|| "http://203.0.113.7:3128".to_string());
+        let env_b =
+            |name: &str| (name == "https_proxy").then(|| "http://203.0.113.8:3128".to_string());
+        let a = proxy_identity(env_a).expect("a proxy has an identity");
+        let b = proxy_identity(env_b).unwrap();
+        assert_eq!(proxy_identity(|_| None), None);
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 12);
+        let key = key_for(&test_args(), GuestBootInputs::default());
+        let startup_a = startup_snapshot_key(&key, None, None, Some(&a));
+        assert_eq!(startup_a, format!("{key}-proxy{a}-startup"));
+        assert!(
+            !startup_a.contains("203.0.113"),
+            "the name holds a proxy URL: {startup_a}"
+        );
+        assert_ne!(startup_a, startup_snapshot_key(&key, None, None, Some(&b)));
+        assert_eq!(
+            startup_snapshot_key(&key, None, None, None),
+            format!("{key}-startup")
         );
     }
 

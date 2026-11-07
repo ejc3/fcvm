@@ -68,6 +68,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 | no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
+| a restored clone's own page faults must not queue behind its workload's | the container's cgroup frozen (`cgroup.freeze`) from the prepare until the source resumes or the clone is about to publish (`fc-agent/src/payload_freeze.rs`) | yes: a thaw undoes it, and the guest agent's watchdog thread thaws it itself once it has found the freeze on 60 looks a second apart (time the guest ran, which a clock does not measure across a pause or a restore), so a resume that never arrives, a killed prepare or a killed fcvm cannot leave it frozen; the record `/run/fcvm-payload-frozen` names the frozen cgroups, written before they are frozen, under one lock |
 
 The dump has to happen at snapshot time and cannot move to restore: by the time
 a clone runs, the restored workload and an early published-port client can both
@@ -265,6 +266,12 @@ so nothing is built or booted twice when it doesn't have to be.
   loaded, paused VM before the guest resumes, so runs at different targets share the
   pre-start snapshot. The startup snapshot holds a workload that initialised under one
   target, which a restore cannot replay, so its name carries the target.
+- **The proxy settings are a restore-time value, and a snapshot records none.** Every
+  restore gives the guest its own run's `http_proxy`, `https_proxy` and `no_proxy`, or
+  none (`RestoreIdentity::proxy`), so runs with and without a proxy share the pre-start
+  snapshot and a clone never holds another caller's proxy URL. A startup snapshot holds
+  a container already running with one, so its name carries a digest of the run's proxy
+  variables, never the URLs (`startup_snapshot_key`, #1727).
 - **Never add per-caller data to the content key when restore can reconcile it.**
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this

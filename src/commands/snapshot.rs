@@ -3673,6 +3673,11 @@ async fn cmd_snapshot_run_inner(
     let restore_identity = super::common::RestoreIdentity {
         host_ipv6: args.host_ipv6,
         dns: restore_document_dns(&snapshot_config.metadata, &resolvers, network_mode),
+        // This run's proxies, or none: the snapshot records none, and the guest takes
+        // these in place of whatever the run that made the snapshot had.
+        proxy: super::podman::guest_proxy(&network_config, network_mode, |name| {
+            std::env::var(name).ok()
+        }),
     };
     restore_identity.write_into(&mut restore_latest);
     let bootplan_socket = format!(
@@ -4639,7 +4644,12 @@ async fn cmd_snapshot_run_inner(
                     startup_rx = None;
 
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
-                        let startup_key = startup_snapshot_key(base_key, args.balloon, args.host_ipv6);
+                        let startup_key = startup_snapshot_key(
+                            base_key,
+                            args.balloon,
+                            args.host_ipv6,
+                            crate::commands::podman::host_proxy_identity().as_deref(),
+                        );
 
                         // Skip if startup snapshot already exists. Both backends take one
                         // (`create_podman_snapshot`): a Cloud Hypervisor clone saves a full
@@ -5434,6 +5444,8 @@ async fn cmd_snapshot_run_raw(
     vm_state.config.balloon_mib = meta.balloon_mib;
     vm_state.config.published_guest_ports = Some(Vec::new());
     vm_state.config.vsock_socket_path = None;
+    vm_state.config.firmware = meta.firmware.clone();
+    let ch_bin = super::common::find_cloud_hypervisor()?;
 
     let data_dir = paths::vm_runtime_dir(&vm_id);
     vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
@@ -5454,7 +5466,7 @@ async fn cmd_snapshot_run_raw(
 
     let mut network =
         PastaNetwork::isolated(vm_id.clone(), format!("tap-{}", truncate_id(&vm_id, 8)));
-    let network_config = match network.setup().await.context("setting up network") {
+    let mut network_config = match network.setup().await.context("setting up network") {
         Ok(config) => config,
         Err(e) => {
             if let Err(error) = network.cleanup().await {
@@ -5463,6 +5475,20 @@ async fn cmd_snapshot_run_raw(
             super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
             return Err(e);
         }
+    };
+    // The restored NIC keeps the snapshot's MAC (the restore rewrites only its TAP), and a
+    // relaunch after a guest reset keeps it too, so the guest sees the same adapter.
+    network_config.guest_mac = meta.network_config.guest_mac.clone();
+    let boot = super::vm::RawBoot {
+        ch_bin,
+        vm_name: vm_name.clone(),
+        firmware: meta.firmware.clone(),
+        vcpus: meta.vcpu,
+        mem_mib: meta.memory_mib,
+        disk: data_dir.join("disks/rootfs.raw"),
+        tap_device: network_config.tap_device.clone(),
+        guest_mac: network_config.guest_mac.clone(),
+        balloon_mib: args.balloon.or(meta.balloon_mib),
     };
 
     let restore_config = SnapshotRestoreConfig {
@@ -5486,6 +5512,14 @@ async fn cmd_snapshot_run_raw(
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
     };
+    // The clone's first boot is generation 0 of its own id, served from before it resumes.
+    if let Err(e) = super::vm::write_generation(&data_dir, &vm_id, 0) {
+        if let Err(error) = network.cleanup().await {
+            warn!(%error, "failed to clean up the network after a setup error");
+        }
+        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        return Err(e);
+    }
     let mut ns_helper = None;
     let restore_started = std::time::Instant::now();
     let restored = super::common::restore_from_snapshot_ch(
@@ -5541,6 +5575,8 @@ async fn cmd_snapshot_run_raw(
             holder_child,
             network: Box::new(network),
             ns_helper,
+            boot,
+            boot_number: 0,
             state_manager,
             vm_state,
             reclaim_owner,
@@ -6352,6 +6388,7 @@ mod tests {
             parked_gpus: 0,
             guest: Default::default(),
             health_port: None,
+            firmware: None,
         }
     }
 

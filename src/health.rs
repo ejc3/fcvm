@@ -1011,7 +1011,7 @@ async fn rdp_health(
 ) -> HealthStatus {
     let timeout = Duration::from_secs(state.config.health_check_timeout.max(1));
     let data_dir = paths::vm_runtime_dir(&state.vm_id);
-    match raw_guest_health(&data_dir, &state.vm_id, timeout).await {
+    match raw_guest_health(&data_dir, timeout).await {
         Ok(()) => {
             debug!(target: "health-monitor", "clock acknowledged and RDP connection confirmed");
             *last_failure_log = None;
@@ -1027,13 +1027,11 @@ async fn rdp_health(
     }
 }
 
-/// The health of the raw VM whose data directory is `data_dir` and whose current
-/// generation is `generation`: Ok when the clock is acknowledged and RDP confirms.
-pub async fn raw_guest_health(
-    data_dir: &std::path::Path,
-    generation: &str,
-    timeout: Duration,
-) -> Result<()> {
+/// The health of the raw VM whose data directory is `data_dir`: Ok when the guest has
+/// acknowledged the current generation (the generation file, one per boot) and RDP confirms.
+pub async fn raw_guest_health(data_dir: &std::path::Path, timeout: Duration) -> Result<()> {
+    let generation = crate::commands::vm::read_generation(data_dir)?;
+    let generation = generation.as_str();
     let ack_path = crate::commands::vm::clock_ack_path(data_dir);
     let ack = match std::fs::read_to_string(&ack_path) {
         Ok(text) => Some(text),
@@ -1100,21 +1098,35 @@ pub const RDP_CONNECTION_REQUEST: [u8; 19] = [
     0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, // RDP_NEG_REQ: PROTOCOL_SSL
 ];
 
-/// Whether a reply is an X.224 Connection Confirm: a TPKT header (version 3, a length that
-/// holds an X.224 header) whose X.224 code (offset 5) is CC, 0xD in its high nibble.
+/// The longest reply the RDP probe reads. Windows' connection confirm is 19 bytes; the length
+/// field allows 65535, which a probe has no reason to buffer.
+pub const RDP_REPLY_MAX: usize = 512;
+
+/// Whether `reply`, one whole TPKT, is a well-formed X.224 Connection Confirm
+/// ([MS-RDPBCGR] 2.2.1.2): TPKT version 3 whose length is the reply's, an X.224 length
+/// indicator that covers the rest of the TPDU, the CC code 0xD0, and either no negotiation
+/// block or an RDP_NEG_RSP (type 0x02, length 8). An RDP_NEG_FAILURE (type 0x03) is a refusal.
 pub fn is_rdp_connection_confirm(reply: &[u8]) -> bool {
-    let [version, reserved, len_hi, len_lo, _li, code, ..] = reply else {
+    let [0x03, 0x00, len_hi, len_lo, tpdu @ ..] = reply else {
         return false;
     };
-    *version == 0x03
-        && *reserved == 0x00
-        && u16::from_be_bytes([*len_hi, *len_lo]) >= 7
-        && code & 0xf0 == 0xd0
+    if usize::from(u16::from_be_bytes([*len_hi, *len_lo])) != reply.len() {
+        return false;
+    }
+    // LI, code, DST-REF (2), SRC-REF (2), class option, then the variable part.
+    let [li, code, _, _, _, _, _, negotiation @ ..] = tpdu else {
+        return false;
+    };
+    if usize::from(*li) + 1 != tpdu.len() || *code != 0xd0 {
+        return false;
+    }
+    matches!(negotiation, [] | [0x02, _, 0x08, 0x00, _, _, _, _])
 }
 
-/// Send the RDP connection request on `stream` and read the start of the reply. Ok(true)
-/// only for a connection confirm; a closed connection or any other reply is Ok(false).
-/// No deadline of its own: the caller bounds it.
+/// Send the RDP connection request on `stream` and read the whole reply TPKT (its length
+/// field, at most [`RDP_REPLY_MAX`] bytes). Ok(true) only for a well-formed connection
+/// confirm; a connection closed before the TPKT is complete, or any other reply, is
+/// Ok(false). No deadline of its own: the caller bounds it.
 pub async fn rdp_connection_confirmed<S>(stream: &mut S) -> std::io::Result<bool>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1122,9 +1134,22 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(&RDP_CONNECTION_REQUEST).await?;
     stream.flush().await?;
-    let mut reply = [0u8; 6];
-    match stream.read_exact(&mut reply).await {
-        Ok(_) => Ok(is_rdp_connection_confirm(&reply)),
+    let mut reply = vec![0u8; 4];
+    let read = async {
+        stream.read_exact(&mut reply).await?;
+        if reply[0] != 0x03 || reply[1] != 0x00 {
+            return Ok(false);
+        }
+        let len = usize::from(u16::from_be_bytes([reply[2], reply[3]]));
+        if !(11..=RDP_REPLY_MAX).contains(&len) {
+            return Ok(false);
+        }
+        reply.resize(len, 0);
+        stream.read_exact(&mut reply[4..]).await?;
+        Ok::<_, std::io::Error>(is_rdp_connection_confirm(&reply))
+    };
+    match read.await {
+        Ok(verdict) => Ok(verdict),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }
@@ -1588,13 +1613,20 @@ mod tests {
         Disconnect,
         /// Read the request and never answer.
         Silent,
+        /// Send the first six bytes of a connection confirm, then close.
+        Prefix,
+        /// Reply with a well-formed X.224 CC carrying RDP_NEG_FAILURE (0x03).
+        NegotiationFailure,
+        /// Reply with an X.224 CC that carries no negotiation block.
+        ConfirmWithoutNegotiation,
     }
 
     /// Serve one connection on `<dir>/rdp.sock` as `fake` does; the task returns the request.
     fn fake_rdp_sock(dir: &std::path::Path, fake: FakeRdp) -> tokio::task::JoinHandle<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener =
-            tokio::net::UnixListener::bind(crate::commands::vm::rdp_socket_path(dir)).unwrap();
+            crate::commands::vm::bind_private_unix(&crate::commands::vm::rdp_socket_path(dir))
+                .unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; RDP_CONNECTION_REQUEST.len()];
@@ -1616,6 +1648,23 @@ mod tests {
                     .await
                     .unwrap(),
                 FakeRdp::Silent => tokio::time::sleep(Duration::from_secs(30)).await,
+                FakeRdp::Prefix => socket
+                    .write_all(&[0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0])
+                    .await
+                    .unwrap(),
+                FakeRdp::NegotiationFailure => socket
+                    .write_all(&[
+                        0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x03,
+                        0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+                    ])
+                    .await
+                    .unwrap(),
+                FakeRdp::ConfirmWithoutNegotiation => socket
+                    .write_all(&[
+                        0x03, 0x00, 0x00, 0x0b, 0x06, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00,
+                    ])
+                    .await
+                    .unwrap(),
             }
             request
         })
@@ -1623,6 +1672,16 @@ mod tests {
 
     fn write_ack(dir: &std::path::Path, record: &str) {
         std::fs::write(crate::commands::vm::clock_ack_path(dir), record).unwrap();
+    }
+
+    /// The health of the raw VM in `dir` whose current generation is `generation`.
+    async fn health_with(dir: &std::path::Path, generation: &str, timeout: Duration) -> Result<()> {
+        std::fs::write(
+            crate::commands::vm::generation_path(dir),
+            format!("{generation}\n"),
+        )
+        .unwrap();
+        raw_guest_health(dir, timeout).await
     }
 
     /// With the clock acknowledged, a raw VM is healthy only when Remote Desktop confirms
@@ -1636,7 +1695,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
         let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-        raw_guest_health(dir.path(), "vm-raw", timeout)
+        health_with(dir.path(), "vm-raw", timeout)
             .await
             .expect("an acknowledged clock and a connection confirm are healthy");
         assert_eq!(
@@ -1656,18 +1715,40 @@ mod tests {
             write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
             let server = fake_rdp_sock(dir.path(), fake);
             assert!(
-                raw_guest_health(dir.path(), "vm-raw", timeout)
-                    .await
-                    .is_err(),
+                health_with(dir.path(), "vm-raw", timeout).await.is_err(),
                 "{name} was reported healthy"
             );
             server.abort();
         }
         let dir = tempfile::tempdir().unwrap();
         write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
-        assert!(raw_guest_health(dir.path(), "vm-raw", timeout)
-            .await
-            .is_err());
+        assert!(health_with(dir.path(), "vm-raw", timeout).await.is_err());
+    }
+
+    /// Only a whole, well-formed X.224 Connection Confirm is healthy: the reply's full TPKT is
+    /// read, so the first six bytes of a confirm followed by a close are not healthy, and a
+    /// confirm whose negotiation block is RDP_NEG_FAILURE is a refusal, not a confirm. A
+    /// confirm with no negotiation block (an RDP server that negotiates nothing) is healthy.
+    #[tokio::test]
+    async fn only_a_whole_rdp_connection_confirm_is_healthy() {
+        let timeout = Duration::from_millis(500);
+        for (fake, healthy, name) in [
+            (FakeRdp::Prefix, false, "a six-byte prefix then close"),
+            (FakeRdp::NegotiationFailure, false, "a negotiation failure"),
+            (
+                FakeRdp::ConfirmWithoutNegotiation,
+                true,
+                "a confirm without negotiation",
+            ),
+            (FakeRdp::Confirm, true, "a full confirm"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
+            let server = fake_rdp_sock(dir.path(), fake);
+            let verdict = health_with(dir.path(), "vm-raw", timeout).await;
+            assert_eq!(verdict.is_ok(), healthy, "{name}: {verdict:?}");
+            server.abort();
+        }
     }
 
     /// A Remote Desktop that confirms is not enough: the guest agent must have acknowledged
@@ -1698,7 +1779,7 @@ mod tests {
                 write_ack(dir.path(), record);
             }
             let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-            let verdict = raw_guest_health(dir.path(), "vm-clone", timeout).await;
+            let verdict = health_with(dir.path(), "vm-clone", timeout).await;
             assert!(verdict.is_err(), "{why} was reported healthy");
             server.abort();
         }
@@ -1709,7 +1790,7 @@ mod tests {
                 &format!("vm-clone 1700000000000 {}\n", 1_700_000_000_000 + skew_ms),
             );
             let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-            raw_guest_health(dir.path(), "vm-clone", timeout)
+            health_with(dir.path(), "vm-clone", timeout)
                 .await
                 .unwrap_or_else(|e| panic!("an ack {skew_ms} ms off and a confirm: {e:#}"));
             server.await.unwrap();

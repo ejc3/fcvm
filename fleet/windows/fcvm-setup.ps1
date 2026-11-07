@@ -52,6 +52,27 @@ Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' No
 Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 Uninstall-WindowsFeature -Name Windows-Defender -ErrorAction SilentlyContinue | Out-String | Write-Output
 
+Step 'no maintenance work in a sandbox: Automatic Maintenance and its tasks off'
+# A restored sandbox's clock jumps from the snapshot's time to the host's, and Task Scheduler
+# then starts every task whose time has passed. The .NET native image service (mscorsvw,
+# queued by the .NET Framework NGEN tasks) took 1.1 cores of a 2-vCPU clone for minutes
+# after every restore (measured 2026-11-07 in Task Manager over RDP). Its queue is drained at
+# the next start, below, and the tasks that would refill or rerun it are disabled.
+New-Item -Force 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' | Out-Null
+Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' MaintenanceDisabled 1
+foreach ($p in '\Microsoft\Windows\.NET Framework\', '\Microsoft\Windows\Application Experience\',
+               '\Microsoft\Windows\Customer Experience Improvement Program\', '\Microsoft\Windows\Defrag\',
+               '\Microsoft\Windows\DiskCleanup\', '\Microsoft\Windows\Servicing\', '\Microsoft\Windows\Maintenance\',
+               '\Microsoft\Windows\Windows Error Reporting\', '\Microsoft\Windows\UpdateOrchestrator\',
+               '\Microsoft\Windows\WindowsUpdate\', '\Microsoft\Windows\Diagnosis\', '\Microsoft\Windows\DiskDiagnostic\',
+               '\Microsoft\Windows\Power Efficiency Diagnostics\', '\Microsoft\Windows\Feedback\Siuf\',
+               '\Microsoft\Windows\Autochk\', '\Microsoft\Windows\Chkdsk\', '\Microsoft\Windows\Data Integrity Scan\',
+               '\Microsoft\Windows\Registry\', '\Microsoft\Windows\SoftwareProtectionPlatform\') {
+  Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+}
+Get-ScheduledTask | Where-Object { $_.TaskPath -like '\Microsoft\Windows\*' -and $_.State -ne 'Disabled' -and
+  ($_.TaskPath -like '*.NET Framework*' -or $_.TaskPath -like '*Servicing*') } | Format-Table TaskPath, TaskName, State
+
 Step 'serial console: EMS/SAC on COM1 for boot logs'
 bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200
 bcdedit /ems '{current}' on
@@ -73,6 +94,12 @@ Step 'at the next start: activate again if needed, close outbound traffic, power
 @'
 & {
 Start-Sleep 30
+# Compile the .NET native images now, while the image is being built, so no sandbox does.
+foreach ($fw in 'Framework64', 'Framework') {
+  $ngen = "$env:windir\Microsoft.NET\$fw\v4.0.30319\ngen.exe"
+  $t = Measure-Command { & $ngen executeQueuedItems /silent | Out-Null }
+  "ngen $fw executeQueuedItems: exit $LASTEXITCODE in $([int]$t.TotalSeconds) s"
+}
 cscript //nologo C:\Windows\System32\slmgr.vbs /ato
 cscript //nologo C:\Windows\System32\slmgr.vbs /dli
 cscript //nologo C:\Windows\System32\slmgr.vbs /xpr

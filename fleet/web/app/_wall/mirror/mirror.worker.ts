@@ -48,7 +48,10 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let pixel: number[] | null = null;
 let stampAt: { k: number; at: number } | null = null;
 
-/** The app's frame number in one row of the stamp band (fleet/phone/streamer/stamp.cpp), or null. */
+/**
+ * The app's frame number in one row of the stamp band (fleet/phone/streamer/stamp.cpp), or null.
+ * The top bit says the app drew its held layout (STAMP_HELD_BIT in stamp.h); the number is the rest.
+ */
 function stampOf(row: Uint8Array, w: number): number | null {
   let v = 0;
   for (let i = 0; i < 32; i++) {
@@ -59,7 +62,7 @@ function stampOf(row: Uint8Array, w: number): number | null {
     else if (hi <= 96) v = v * 2;
     else return null;
   }
-  return v === 0 || v === 0xffffffff ? null : v;
+  return v === 0 || v === 0xffffffff ? null : v % 0x8000_0000;
 }
 
 function fresh(): void {

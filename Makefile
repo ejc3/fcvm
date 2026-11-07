@@ -952,6 +952,7 @@ phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	./scripts/phone/test-run-checks.sh
 	./scripts/phone/test-seam.sh
 	./scripts/phone/test-app-sh.sh
+	./scripts/phone/test-held-check.sh
 	./fleet/phone-app/test-build-apk.sh
 	./scripts/phone/aosp.sh
 	./scripts/phone/app.sh > /dev/null
