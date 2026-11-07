@@ -164,6 +164,11 @@ while :; do
 			echo "- stray microVM guard (${PHASE}): found ${COUNT}, survivor scan incomplete" >>"$GITHUB_STEP_SUMMARY"
 		exit 0
 	fi
+	# Whether new groups are killed is decided once, for the whole scan that
+	# saw them, so the time the kills and the report take cannot leave a group
+	# seen inside the window running.
+	in_late_window=0
+	[ "$SECONDS" -lt "$late_kill_deadline" ] && in_late_window=1
 	SURVIVOR_TGIDS=()
 	NEW_LATE=()
 	pending=0
@@ -190,7 +195,7 @@ while :; do
 			done
 		done <"$THREADS_AFTER"
 		for tgid in "${NEW_LATE[@]}"; do
-			if [ "$SECONDS" -lt "$late_kill_deadline" ]; then
+			if [ "$in_late_window" -eq 1 ]; then
 				timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
 				KILLED_AT[$tgid]=$SECONDS
 				LATE_TGIDS+=("$tgid")
