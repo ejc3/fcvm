@@ -1058,7 +1058,7 @@ impl NetworkManager for RoutedNetwork {
                 name: host_veth.clone(),
             },
         )?;
-        veth::create_veth_pair(&host_veth, &guest_veth, &ns_name).await?;
+        let (host_mac, _) = veth::create_veth_pair(&host_veth, &guest_veth, &ns_name).await?;
         self.host_veth = Some(host_veth.clone());
 
         // 2b. Stop the kernel from autogenerating the host veth's link-local BEFORE
@@ -1089,78 +1089,63 @@ impl NetworkManager for RoutedNetwork {
         //     Fresh boots hid this: DAD ran in the shadow of the multi-second guest
         //     boot. Restored clones are ready in ~700ms, so it landed on the critical
         //     path and cost every routed clone ~1s of egress downtime.
-        run_host_command(
+        write_host_sysctls(
             "disabling kernel IPv6 address autogeneration on host veth",
-            "sysctl",
             &[
-                "-w",
-                &format!("net.ipv6.conf.{}.addr_gen_mode=1", host_veth),
-                &format!("net.ipv6.conf.{}.keep_addr_on_down=1", host_veth),
+                (&format!("net/ipv6/conf/{}/addr_gen_mode", host_veth), "1"),
+                (
+                    &format!("net/ipv6/conf/{}/keep_addr_on_down", host_veth),
+                    "1",
+                ),
             ],
         )
         .await;
 
         // 3. Create TAP in namespace
-        veth::create_tap_in_ns(&ns_name, &self.tap_device).await?;
-
-        // 4. Create bridge with BOTH TAP and veth.
-        //    The bridge does L2 forwarding: VM → TAP → bridge → veth → host.
-        //    IPv6 for the bridge's own address (fd00::1) is locally delivered.
-        //    IPv6 for external destinations traverses the bridge to the veth peer on the host.
-        veth::connect_tap_to_veth(&ns_name, &self.tap_device, &guest_veth).await?;
-        // Bring up all interfaces (connect_tap_to_veth only brings up the bridge)
-        namespace::exec_in_namespace_checked(&ns_name, &["ip", "link", "set", "lo", "up"]).await?;
-        namespace::exec_in_namespace_checked(
-            &ns_name,
-            &["ip", "link", "set", &self.tap_device, "up"],
-        )
-        .await?;
-        namespace::exec_in_namespace_checked(&ns_name, &["ip", "link", "set", &guest_veth, "up"])
-            .await?;
-
-        // Pin the bridge MAC before it carries traffic. The guest holds a
-        // PERMANENT neighbour entry for GUEST_GATEWAY pointing at this exact
-        // address (fc-agent's NAMESPACE_MAC), so a kernel-assigned MAC here
-        // would send every reply to an address nothing owns. Routed mode uses
-        // 10.0.2.1 as the guest's DEFAULT GATEWAY, so that is not a degraded
-        // published port -- it is all IPv4 egress.
-        namespace::exec_in_namespace_checked(
-            &ns_name,
-            &[
-                "ip",
-                "link",
-                "set",
-                BRIDGE_DEVICE,
-                "address",
-                crate::network::pasta::NAMESPACE_MAC,
-            ],
-        )
-        .await?;
-
-        // 5. Assign gateway IPs to bridge (VM connects here via TAP)
+        // 3-5. In one `ip -batch` (each of these was a process of its own): the TAP Firecracker
+        //      uses, and a bridge with BOTH the TAP and the veth. The bridge does L2
+        //      forwarding: VM → TAP → bridge → veth → host. IPv6 for the bridge's own address
+        //      (fd00::1) is locally delivered; IPv6 for external destinations traverses the
+        //      bridge to the veth peer on the host.
+        //
+        //      The bridge MAC is pinned before the bridge comes up. The guest holds a
+        //      PERMANENT neighbour entry for GUEST_GATEWAY pointing at this exact address
+        //      (fc-agent's NAMESPACE_MAC), so a kernel-assigned MAC here would send every
+        //      reply to an address nothing owns. Routed mode uses 10.0.2.1 as the guest's
+        //      DEFAULT GATEWAY, so that is not a degraded published port -- it is all IPv4
+        //      egress.
+        //
+        //      The gateway IPv6 address takes nodad, so it is usable at once: without it the
+        //      address stays "tentative" for ~1-3s and the kernel silently drops all IPv6
+        //      packets to it, breaking the VM's default route via fd00::1.
+        let tap = self.tap_device.clone();
         let gw_cidr = format!("{}/24", GUEST_GATEWAY);
-        namespace::exec_in_namespace_checked(
-            &ns_name,
-            &["ip", "addr", "add", &gw_cidr, "dev", BRIDGE_DEVICE],
-        )
-        .await?;
-        // nodad: skip Duplicate Address Detection so the address is usable immediately.
-        // Without nodad, the address stays "tentative" for ~1-3s and the kernel silently
-        // drops all IPv6 packets to it — breaking the VM's default route via fd00::1.
-        namespace::exec_in_namespace_checked(
+        let gw6_cidr = &format!("{ROUTED_GATEWAY_IPV6}/64");
+        namespace::ip_batch_in_namespace(
             &ns_name,
             &[
-                "ip",
-                "-6",
-                "addr",
-                "add",
-                &format!("{ROUTED_GATEWAY_IPV6}/64"),
-                "dev",
-                BRIDGE_DEVICE,
-                "nodad",
+                vec!["tuntap", "add", &tap, "mode", "tap"],
+                vec!["link", "add", BRIDGE_DEVICE, "type", "bridge"],
+                vec![
+                    "link",
+                    "set",
+                    BRIDGE_DEVICE,
+                    "address",
+                    crate::network::pasta::NAMESPACE_MAC,
+                ],
+                vec!["link", "set", &tap, "master", BRIDGE_DEVICE],
+                vec!["link", "set", &guest_veth, "master", BRIDGE_DEVICE],
+                vec!["link", "set", "lo", "up"],
+                vec!["link", "set", &tap, "up"],
+                vec!["link", "set", &guest_veth, "up"],
+                vec!["link", "set", BRIDGE_DEVICE, "up"],
+                vec!["addr", "add", &gw_cidr, "dev", BRIDGE_DEVICE],
+                vec!["addr", "add", gw6_cidr, "dev", BRIDGE_DEVICE, "nodad"],
             ],
         )
-        .await?;
+        .await
+        .context("configuring the VM namespace's TAP and bridge")?;
+        veth::spread_tap_receive(&ns_name, &tap).await;
 
         // 6. Bring up host veth
         let output = tokio::process::Command::new("ip")
@@ -1174,10 +1159,9 @@ impl NetworkManager for RoutedNetwork {
         }
         // 7. Enable IPv6 forwarding on the host veth only (not all.forwarding —
         //    that prevents link-local auto-assignment on future interfaces).
-        run_host_command(
+        write_host_sysctls(
             "enabling IPv6 forwarding on host veth",
-            "sysctl",
-            &["-w", &format!("net.ipv6.conf.{}.forwarding=1", host_veth)],
+            &[(&format!("net/ipv6/conf/{}/forwarding", host_veth), "1")],
         )
         .await;
 
@@ -1222,9 +1206,9 @@ impl NetworkManager for RoutedNetwork {
         //    `tentative` — the instant the VM starts sending. Step 2b keeps the kernel
         //    from claiming it first; assign_link_local_nodad repairs the address if
         //    anything did claim it anyway (see its doc comment).
-        let host_ll = generate_link_local_from_mac(&host_veth)
-            .await
-            .context("failed to generate link-local for host veth")?;
+        // the veth was created with this MAC, so its link-local needs no `ip link show`
+        let host_ll = link_local_from_mac(&host_mac)
+            .with_context(|| format!("deriving a link-local from host veth MAC {host_mac}"))?;
         assign_link_local_nodad(&host_veth, &host_ll)
             .await
             .with_context(|| {
@@ -1288,13 +1272,9 @@ impl NetworkManager for RoutedNetwork {
         )?;
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
-        run_host_command(
+        write_host_sysctls(
             "enabling proxy NDP on default interface",
-            "sysctl",
-            &[
-                "-w",
-                &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
-            ],
+            &[(&format!("net/ipv6/conf/{}/proxy_ndp", default_iface), "1")],
         )
         .await;
         if run_host_command(
@@ -1559,6 +1539,20 @@ impl NetworkManager for RoutedNetwork {
 /// these commands legitimately fail on re-runs (e.g. a stale proxy-NDP entry
 /// left by a previous VM). Callers should only log success messages when this
 /// returns true.
+/// Write host sysctls (paths under /proc/sys, and values) from this process, where each
+/// was a `sysctl` process. Logs and goes on when one fails, as a failed `sysctl` did.
+async fn write_host_sysctls(what: &str, values: &[(&str, &str)]) -> bool {
+    let mut ok = true;
+    for (path, value) in values {
+        let path = std::path::Path::new("/proc/sys").join(path);
+        if let Err(e) = tokio::fs::write(&path, value).await {
+            warn!(path = %path.display(), error = %e, "{} failed", what);
+            ok = false;
+        }
+    }
+    ok
+}
+
 async fn run_host_command(what: &str, program: &str, args: &[&str]) -> bool {
     match tokio::process::Command::new(program)
         .args(args)
@@ -1687,33 +1681,21 @@ async fn iface_holds_ipv6_address(iface: &str, address: &str) -> Result<bool> {
 /// This is the same address the kernel would autogenerate. Setup suppresses that
 /// autogeneration (step 2b) precisely so it can install this address itself with
 /// `nodad`, so fcvm has to compute it rather than read it back.
-async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
-    let output = tokio::process::Command::new("ip")
-        .args(["link", "show", iface])
-        .output()
-        .await
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("link/ether ") {
-            if let Some(mac) = rest.split_whitespace().next() {
-                let bytes: Vec<u8> = mac
-                    .split(':')
-                    .filter_map(|h| u8::from_str_radix(h, 16).ok())
-                    .collect();
-                if bytes.len() == 6 {
-                    // EUI-64: flip bit 6 of first byte, insert ff:fe in middle
-                    let b0 = bytes[0] ^ 0x02;
-                    return Some(format!(
-                        "fe80::{:02x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
-                        b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-                    ));
-                }
-            }
-        }
+/// The EUI-64 link-local of a MAC written `aa:bb:cc:dd:ee:ff`: bit 1 of the first byte
+/// flipped, ff:fe in the middle.
+fn link_local_from_mac(mac: &str) -> Option<String> {
+    let bytes: Vec<u8> = mac
+        .split(':')
+        .filter_map(|h| u8::from_str_radix(h, 16).ok())
+        .collect();
+    if bytes.len() != 6 {
+        return None;
     }
-    None
+    let b0 = bytes[0] ^ 0x02;
+    Some(format!(
+        "fe80::{:02x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
+        b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    ))
 }
 
 /// Whether `setup` probes for an IPv6 resolver: only a fresh launch whose
@@ -1868,6 +1850,52 @@ mod tests {
         assert!(routed.contains("host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string())"));
         assert!(routed.contains("&format!(\"{ROUTED_GATEWAY_IPV6}/64\")"));
         assert!(routed.contains("crate::network::pasta::NAMESPACE_MAC"));
+    }
+
+    /// The network step of a routed setup, from "setting up routed networking" to the host
+    /// veth's link-local, runs as few helper processes as it can: each was 4 to 9 ms in a
+    /// row, and the step took 144 ms at the median with 8 restores at once against 76 ms
+    /// once the namespace's links went into one `ip -batch`, the host sysctls were written
+    /// from fcvm and the link-local came from the MAC the veth was created with.
+    ///
+    /// RED BEFORE THE FIX: the step ran 7 `exec_in_namespace_checked` calls besides the
+    /// TAP and bridge helpers, `sysctl` for the host veth, and `ip link show` for its MAC.
+    #[test]
+    fn the_routed_network_step_runs_few_helper_processes() {
+        let source = include_str!("routed.rs");
+        let start = source.find("\"setting up routed networking\"").unwrap();
+        let end = source.find("\"assigned link-local to host veth\"").unwrap();
+        let step = &source[start..end];
+        assert_eq!(
+            step.matches("exec_in_namespace_checked(").count(),
+            1,
+            "one in-namespace command besides the batch (the DAD sysctls)"
+        );
+        assert_eq!(step.matches("ip_batch_in_namespace(").count(), 1);
+        assert_eq!(
+            step.matches("\"sysctl\"").count(),
+            1,
+            "a sysctl process besides the namespace's DAD one"
+        );
+        for one_process_each in [
+            "create_tap_in_ns(",
+            "connect_tap_to_veth(",
+            "generate_link_local_from_mac(",
+        ] {
+            assert!(
+                !step.contains(one_process_each),
+                "the network step calls {one_process_each}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_local_is_the_mac_in_eui64() {
+        assert_eq!(
+            link_local_from_mac("02:48:4d:4a:7b:c3").as_deref(),
+            Some("fe80::0048:4dff:fe4a:7bc3")
+        );
+        assert_eq!(link_local_from_mac("02:48:4d"), None);
     }
 
     const NET_2600: u128 = 0x2600_1f1c_0494_0201 << 64;
