@@ -258,3 +258,36 @@ fn sudo_fcvm_adds_nothing_when_the_config_dir_is_unset() {
          recipes must not see the variable at all (fcvm rejects an empty one)"
     );
 }
+
+/// Every setup step reads this checkout's rootfs-config.toml, not the shared
+/// ~/.config/fcvm (or root's) copy. `make build` and `fcvm setup --generate-config`
+/// rewrite that copy from whichever checkout ran last, so with two checkouts of
+/// different kernels a setup step read the other's `kernel_sha` and refused this
+/// checkout's patches: "kernel_sha '...' does not match build_inputs hash '...'",
+/// seen on the btrfs step, the last of setup-fcvm.
+#[test]
+fn every_setup_step_reads_this_checkouts_config() {
+    let makefile = makefile().replace("\\\n", " ");
+    let steps: Vec<&str> = makefile
+        .lines()
+        .filter(|line| line.contains("./target/release/fcvm setup "))
+        .filter(|line| !line.trim_start().starts_with('@'))
+        .filter(|line| !line.contains("--generate-config"))
+        .collect();
+    assert!(
+        steps.len() >= 10,
+        "expected the setup steps of setup-default, setup-fcvm, setup-gpu and the others, found {steps:#?}"
+    );
+    let shared: Vec<&str> = steps
+        .iter()
+        .copied()
+        .filter(|line| !line.contains(r#"--config "$(CURDIR)/rootfs-config.toml""#))
+        .map(str::trim)
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "these setup steps read the shared config, which another checkout may have rewritten; \
+         pass --config \"$(CURDIR)/rootfs-config.toml\":\n{}",
+        shared.join("\n")
+    );
+}
