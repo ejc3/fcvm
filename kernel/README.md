@@ -40,17 +40,13 @@ about one guest shutdown in 200 spins forever in `virtnet_poll_cleantx()`
 shipped guest kernel carries them. Drop a patch once the pinned release contains
 it: the build then fails when the patch no longer applies.
 
-x86-only patches live in `kernel/patches-default-x86`, which the x86 default
-profile applies in place of `kernel/patches-default` and which also links the
-shared patches. `kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for
-the btrfs and nested x86 kernels, so the arm64 kernels and their release
-identities do not change. Today that is a fix for a race Linux has not fixed: a
-page fault taken inside an NMI could consume the reason flags of an async page
-fault delivered just before the NMI, and the guest then panics with "Host
-injected async #PF in interrupt disabled region". A restored clone takes an
-async page fault for every page it touches that the host has not paged in yet,
-so perf sampling with call chains in a clone hits it within seconds. The nested
-link is a `.vm.patch` so the x86 host kernel does not apply it.
+x86 patches live in `kernel/patches-default-x86`, which the x86 default profile
+applies in place of `kernel/patches-default` and which links the shared patches.
+`kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for the btrfs and
+nested x86 kernels. The directory held an x86-only fix for an async page fault
+taken inside an NMI ("Host injected async #PF in interrupt disabled region")
+until upstream took it as 81d99abe2bd8, which 6.18.59 carries; it holds no
+x86-only patch today.
 
 The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
 x86_64): the default patches, linked, plus one Kconfig patch that gives

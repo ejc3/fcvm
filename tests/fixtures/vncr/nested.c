@@ -3,12 +3,13 @@
  * Author: Jintack Lim <jintack.lim@linaro.org>
  */
 /*
- * Verbatim function excerpts from Linux v6.18.50 arch/arm64/kvm/nested.c:
- * https://raw.githubusercontent.com/gregkh/linux/v6.18.50/arch/arm64/kvm/nested.c
- * Complete source SHA256: 6d9e8d4eaf264de6bcbb7b73c2c58f6da1488b0dc195b78074445dcf4d5ea12d
- * The file has that hash in every release from v6.18.44 to v6.18.50.
- * kvm_vcpu_load_hw_mmu is retained as context for the upstream patch.
- * The test applies the production patch to this file, then executes the C.
+ * Verbatim function excerpts from Linux v6.18.60 arch/arm64/kvm/nested.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v6.18.60/arch/arm64/kvm/nested.c
+ * Complete source SHA256: 725634c89893a145c50c1aa1fee97e76d53eed9f65c428041b5ca5ddb5ddb93f
+ * kvm_vcpu_load_hw_mmu is retained as context. unmap_l1_vncr and
+ * this_cpu_reset_vncr_fixmap are what the put and translation paths call.
+ * The pinned release carries upstream 5949004d7032 itself, so the test
+ * executes this C unpatched.
  */
 
 void kvm_vcpu_load_hw_mmu(struct kvm_vcpu *vcpu)
@@ -31,18 +32,47 @@ void kvm_vcpu_load_hw_mmu(struct kvm_vcpu *vcpu)
 	}
 }
 
+/*
+ * Unmapping an L1 VNCR can happen concurrently without the mmu lock being
+ * effective (vcpu_put() vs TLBI handling). The atomic_xchg below ensures
+ * that only one CPU sets it to -1 while getting a valid CPU number back.
+ */
+static int unmap_l1_vncr(struct vncr_tlb *vt)
+{
+	int cpu = atomic_xchg_relaxed(&vt->cpu, -1);
+
+	if (cpu != -1)
+		clear_fixmap(vncr_fixmap(cpu));
+
+	return cpu;
+}
+
+static void this_cpu_reset_vncr_fixmap(struct kvm_vcpu *vcpu)
+{
+	if (!host_data_test_flag(L1_VNCR_MAPPED))
+		return;
+
+	BUG_ON(is_hyp_ctxt(vcpu));
+
+	/*
+	 * Unconditionally unmap the local VNCR if we have lost the race
+	 * against a concurrent TLBI. Otherwise we could end-up running
+	 * another vcpu with VNCR still mapped if the TLBI thread is
+	 * preempted between the exchange and the clear_fixmap().
+	 *
+	 * Note that we do not care about the TLBI nuking the fixmap behind
+	 * the back of an running vcpu. This will only generate a fault and
+	 * possibly a retranslation.
+	 */
+	if (unmap_l1_vncr(vcpu->arch.vncr_tlb) == -1)
+		clear_fixmap(vncr_fixmap(smp_processor_id()));
+	host_data_clear_flag(L1_VNCR_MAPPED);
+}
+
 void kvm_vcpu_put_hw_mmu(struct kvm_vcpu *vcpu)
 {
 	/* Unconditionally drop the VNCR mapping if we have one */
-	if (host_data_test_flag(L1_VNCR_MAPPED)) {
-		BUG_ON(vcpu->arch.vncr_tlb->cpu != smp_processor_id());
-		BUG_ON(is_hyp_ctxt(vcpu));
-
-		clear_fixmap(vncr_fixmap(vcpu->arch.vncr_tlb->cpu));
-		vcpu->arch.vncr_tlb->cpu = -1;
-		host_data_clear_flag(L1_VNCR_MAPPED);
-		atomic_dec(&vcpu->kvm->arch.vncr_map_count);
-	}
+	this_cpu_reset_vncr_fixmap(vcpu);
 
 	/*
 	 * Keep a reference on the associated stage-2 MMU if the vCPU is
@@ -57,12 +87,7 @@ void kvm_vcpu_put_hw_mmu(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.hw_mmu = NULL;
 }
-static void invalidate_vncr(struct vncr_tlb *vt)
-{
-	vt->valid = false;
-	if (vt->cpu != -1)
-		clear_fixmap(vncr_fixmap(vt->cpu));
-}
+
 static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 {
 	struct kvm_memory_slot *memslot;
@@ -84,7 +109,8 @@ static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 	 * We also prepare the next walk wilst we're at it.
 	 */
 	scoped_guard(write_lock, &vcpu->kvm->mmu_lock) {
-		invalidate_vncr(vt);
+		this_cpu_reset_vncr_fixmap(vcpu);
+		vt->valid = false;
 
 		vt->wi = (struct s1_walk_info) {
 			.regime	= TR_EL20,
@@ -98,14 +124,14 @@ static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 
 	va =  read_vncr_el2(vcpu);
 
+	mmu_seq = vcpu->kvm->mmu_invalidate_seq;
+	smp_rmb();
+
 	ret = __kvm_translate_va(vcpu, &vt->wi, &vt->wr, va);
 	if (ret)
 		return ret;
 
 	write_fault = kvm_is_write_fault(vcpu);
-
-	mmu_seq = vcpu->kvm->mmu_invalidate_seq;
-	smp_rmb();
 
 	gfn = vt->wr.pa >> PAGE_SHIFT;
 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
@@ -154,7 +180,7 @@ static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 		vt->hpa = pfn << PAGE_SHIFT;
 		vt->hpa_writable = writable;
 		vt->valid = true;
-		vt->cpu = -1;
+		atomic_set(&vt->cpu, -1);
 
 		kvm_make_request(KVM_REQ_MAP_L1_VNCR_EL2, vcpu);
 		kvm_release_faultin_page(vcpu->kvm, page, false, vt->wr.pw && vt->hpa_writable);

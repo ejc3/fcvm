@@ -9,6 +9,9 @@
 //! started reach neither that VM nor a restore of its snapshot, and that two runs of one
 //! image map one copy.
 //!
+//! Another runs a program stored on the image, so a page fault is served from a DAX
+//! mapping.
+//!
 //! Two more boots must fail before the VM turns healthy: one where a second pmem image
 //! covers the first through the guest's /var/run -> /run symlink, and one where a pmem
 //! image covers an extra disk the same way.
@@ -165,6 +168,61 @@ async fn test_pmem_dax_keeps_file_data_out_of_guest_ram() -> Result<()> {
         ensure!(
             in_container.split_whitespace().next() == Some(host_sha.as_str()),
             "container sha256 {in_container:?} does not match the host's {host_sha}"
+        );
+        Ok(())
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    child.wait().await.ok();
+    remove_logged_store_copies(&log_path).await;
+    result
+}
+
+/// A page fault on a DAX mapping of the pmem image, here the exec of a program stored
+/// on it, has to be served. On the 6.18.50 guest kernel it was an Oops instead:
+/// dax_disassociate_entry() took the folio of a zero entry before checking for one and
+/// faulted in the vmemmap (`Unable to handle kernel paging request` from
+/// dax_insert_entry, dax_iomap_pte_fault, ext4_dax_fault), and the program never ran.
+/// Reading the image with read(2), as the test above does, never takes that path.
+#[tokio::test]
+async fn test_pmem_dax_serves_a_page_fault_on_a_mapped_program() -> Result<()> {
+    let dir = image_dir()?;
+    let content = dir.path().join("content");
+    std::fs::create_dir(&content)?;
+    std::fs::copy("/bin/busybox", content.join("busybox"))
+        .context("copying busybox into the image (busybox-static is a quickstart package)")?;
+    let image = dir.path().join("prog.ext4");
+    std::fs::File::create(&image)?.set_len(64 << 20)?;
+    run(
+        "mkfs.ext4",
+        &["-q", "-F", "-b", "4096", "-d", content.to_str().unwrap(), image.to_str().unwrap()],
+    )
+    .await?;
+    let spec = format!("{}:{GUEST_MOUNT}:ro", image.display());
+
+    let (vm_name, _, _, _) = common::unique_names("pmem-exec");
+    let (mut child, pid, log_path) = common::spawn_fcvm_with_log_path(
+        &["podman", "run", "--name", &vm_name, "--pmem", &spec, common::TEST_IMAGE],
+        &vm_name,
+    )
+    .await
+    .context("spawning fcvm podman run --pmem")?;
+
+    let result = async {
+        common::poll_health_by_pid(pid, 300).await?;
+        let ran = common::exec_in_container(pid, &[&format!("{GUEST_MOUNT}/busybox echo dax-exec-ran")])
+            .await
+            .context("running a program from the pmem mount")?;
+        ensure!(
+            ran.trim() == "dax-exec-ran",
+            "the program on the pmem mount printed {ran:?}"
+        );
+        let log = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+        ensure!(
+            !log.contains("Unable to handle kernel paging request") && !log.contains("Internal error: Oops"),
+            "the guest kernel faulted serving the DAX mapping; see {}",
+            log_path.display()
         );
         Ok(())
     }
