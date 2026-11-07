@@ -803,6 +803,17 @@ jobs:
           fi
           mkdir -p /tmp/fcvm-test-logs
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
+      - name: Save VMM logs
+        if: always()
+        run: |
+          # Teardown keeps the end of each VM's VMM log in /tmp (Firecracker's, or Cloud
+          # Hypervisor's at -v). Without a copy here a guest that hung left no record of what
+          # its VMM saw: a Cloud Hypervisor clone whose CPU 1 never ran again after a restore
+          # (run 42009469756) had only the guest's side.
+          mkdir -p /tmp/fcvm-test-logs/vmm
+          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -mmin -360 \
+            -exec cp -t /tmp/fcvm-test-logs/vmm/ {} + || echo "no VMM logs were kept"
+          sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -1112,6 +1123,17 @@ jobs:
           fi
           mkdir -p /tmp/fcvm-test-logs
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
+      - name: Save VMM logs
+        if: always()
+        run: |
+          # Teardown keeps the end of each VM's VMM log in /tmp (Firecracker's, or Cloud
+          # Hypervisor's at -v). Without a copy here a guest that hung left no record of what
+          # its VMM saw: a Cloud Hypervisor clone whose CPU 1 never ran again after a restore
+          # (run 42009469756) had only the guest's side.
+          mkdir -p /tmp/fcvm-test-logs/vmm
+          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -mmin -360 \
+            -exec cp -t /tmp/fcvm-test-logs/vmm/ {} + || echo "no VMM logs were kept"
+          sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
