@@ -110,6 +110,12 @@ pub fn plan_ordered(
     mem_len: u64,
 ) -> Plan<'_> {
     let usable = page_size.is_power_of_two() && (4096..=CHUNK_BYTES).contains(&page_size);
+    // A clone page larger than a recorded granule can hold granules of several tiers, and each
+    // tier would plan it again. A bit per clone page keeps it to its earliest tier.
+    let planned = (usable && page_size as u64 > super::working_set::GRANULE).then(|| {
+        let pages = mem_len.div_ceil(page_size as u64);
+        vec![0u64; usize::try_from(pages.div_ceil(64)).unwrap_or(0)]
+    });
     Plan {
         runs: usable.then(|| OrderedRuns::from_tiers(tiers)),
         regions,
@@ -118,6 +124,8 @@ pub fn plan_ordered(
         run: None,
         next_region: 0,
         pending: None,
+        planned,
+        pieces: std::collections::VecDeque::new(),
     }
 }
 
@@ -135,6 +143,60 @@ pub struct Plan<'a> {
     next_region: usize,
     /// The newest segment, held back because the next piece may merge into it.
     pending: Option<Segment>,
+    /// With clone pages larger than a granule: the clone pages already planned, by file
+    /// offset, one bit each.
+    planned: Option<Vec<u64>>,
+    /// What is left of a placed segment once its planned pages are cut out.
+    pieces: std::collections::VecDeque<Segment>,
+}
+
+impl Plan<'_> {
+    /// Merge `segment` into the pending one, or make it pending and hand back the previous.
+    fn offer(&mut self, segment: Segment) -> Option<Segment> {
+        let merged = self
+            .pending
+            .as_mut()
+            .is_some_and(|previous| merge(previous, &segment));
+        if merged {
+            None
+        } else {
+            self.pending.replace(segment)
+        }
+    }
+
+    /// Queue the pages of `segment` not planned yet, as contiguous pieces, and mark them.
+    fn queue_unplanned(&mut self, segment: Segment) {
+        let Some(planned) = self.planned.as_mut() else {
+            self.pieces.push_back(segment);
+            return;
+        };
+        let page = self.page_size;
+        let first = (segment.file_offset / page as u64) as usize;
+        let mut piece: Option<Segment> = None;
+        for index in 0..segment.len / page {
+            let bit = first + index;
+            let (word, mask) = (bit / 64, 1u64 << (bit % 64));
+            let fresh = planned.get(word).is_some_and(|w| w & mask == 0);
+            if fresh {
+                planned[word] |= mask;
+                match piece.as_mut() {
+                    Some(open) => open.len += page,
+                    None => {
+                        piece = Some(Segment {
+                            host_addr: segment.host_addr + index * page,
+                            file_offset: segment.file_offset + (index * page) as u64,
+                            len: page,
+                        })
+                    }
+                }
+            } else if let Some(done) = piece.take() {
+                self.pieces.push_back(done);
+            }
+        }
+        if let Some(done) = piece {
+            self.pieces.push_back(done);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +212,12 @@ impl Iterator for Plan<'_> {
 
     fn next(&mut self) -> Option<Segment> {
         loop {
+            if let Some(piece) = self.pieces.pop_front() {
+                if let Some(previous) = self.offer(piece) {
+                    return Some(previous);
+                }
+                continue;
+            }
             let Some((run_offset, run_end)) = self.run else {
                 let Some(run) = self.runs.as_mut().and_then(Iterator::next) else {
                     return self.pending.take();
@@ -170,15 +238,7 @@ impl Iterator for Plan<'_> {
             else {
                 continue;
             };
-            let merged = self
-                .pending
-                .as_mut()
-                .is_some_and(|previous| merge(previous, &segment));
-            if !merged {
-                if let Some(previous) = self.pending.replace(segment) {
-                    return Some(previous);
-                }
-            }
+            self.queue_unplanned(segment);
         }
     }
 }
@@ -791,6 +851,35 @@ mod tests {
             order,
             vec![1000, 512, 0],
             "replay order is not first-touch order"
+        );
+    }
+
+    /// A clone page larger than a granule that holds granules of several tiers is planned
+    /// once, in its earliest tier. Planned again in each later tier, a 2 MiB page replayed
+    /// twice and a replay limit spent its budget on the repeat.
+    #[test]
+    fn a_large_clone_page_is_planned_once_across_tiers() {
+        const HUGE: usize = 2 * 1024 * 1024;
+        let mem_len = 4 * HUGE as u64;
+        let mut set = PageSet::empty(mem_len);
+        for (granule, time) in [(1u64, 1), (1025, 1), (300, 15), (1537, 15)] {
+            set.insert_range_at(granule * G, G, time);
+        }
+        let regions = [Region {
+            base_host_virt_addr: 0x4000_0000,
+            file_offset: 0,
+            size: usize::try_from(mem_len).unwrap(),
+        }];
+        let pages: Vec<u64> = plan(&set, &regions, HUGE, mem_len)
+            .flat_map(|segment| {
+                let first = segment.file_offset / HUGE as u64;
+                first..first + (segment.len / HUGE) as u64
+            })
+            .collect();
+        assert_eq!(
+            pages,
+            vec![0, 2, 3],
+            "a clone page was planned more than once"
         );
     }
 

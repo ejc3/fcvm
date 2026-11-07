@@ -270,7 +270,14 @@ impl PageSet {
     /// Sets built for different image sizes merge over their overlap; the caller validates
     /// sizes, this just refuses to read or write out of bounds.
     pub fn union_from(&mut self, other: &PageSet) -> u64 {
+        self.union_changes(other).0
+    }
+
+    /// [`union_from`](Self::union_from), also saying whether any granule already in the set
+    /// took an earlier first-touch time: `(added, made_earlier)`.
+    fn union_changes(&mut self, other: &PageSet) -> (u64, bool) {
         let mut added = 0u64;
+        let mut made_earlier = false;
         let common = self.words.len().min(other.words.len());
         for i in 0..common {
             let before = self.words[i];
@@ -288,7 +295,9 @@ impl PageSet {
                     self.first[granule] = if before & (1u64 << (granule % 64)) == 0 {
                         *time
                     } else {
-                        earlier(*mine, *time)
+                        let kept = earlier(*mine, *time);
+                        made_earlier |= kept != *mine;
+                        kept
                     };
                 }
             }
@@ -296,7 +305,7 @@ impl PageSet {
             added += (after & !before).count_ones() as u64;
             self.words[i] = after;
         }
-        added
+        (added, made_earlier)
     }
 
     /// The set split by first-touch tier: one bitmap per tier, earliest first, each holding the
@@ -955,8 +964,12 @@ impl WorkingSetStore {
     /// Add one clone's observations to the in-process union without touching the filesystem.
     fn remember(&self, observed: &PageSet) -> u64 {
         let mut known = self.known.lock().expect("working set mutex");
-        let added = known.union_from(observed);
-        self.resplit_after_change(&known);
+        let (added, made_earlier) = known.union_changes(observed);
+        // An unchanged union keeps its split: a new one would put the next clone's split back
+        // on its fault path until the thread finished.
+        if added > 0 || made_earlier {
+            self.resplit_after_change(&known);
+        }
         added
     }
 
@@ -1078,8 +1091,10 @@ impl WorkingSetStore {
         // can still prefetch it, and a later successful merge will retry the disk union.
         {
             let mut known = self.known.lock().expect("working set mutex");
-            known.union_from(&merged);
-            self.resplit_after_change(&known);
+            let (added, made_earlier) = known.union_changes(&merged);
+            if added > 0 || made_earlier {
+                self.resplit_after_change(&known);
+            }
         }
 
         result?;
@@ -1602,6 +1617,14 @@ mod tests {
         clone1.insert_range_at(0, GRANULE, 600);
         store.merge_and_persist(&clone1).unwrap();
         let reopened = open_store(&image, mem_len);
+        {
+            // The split exists before any clone asks for it: made when the set loaded.
+            let ordered = reopened.ordered.lock().unwrap();
+            assert!(
+                ordered.tiers.is_some() && ordered.split_from == ordered.version,
+                "loading the set did not split it"
+            );
+        }
         let first = reopened.to_prefetch_ordered();
         assert!(
             Arc::ptr_eq(&first, &reopened.to_prefetch_ordered()),
@@ -1631,6 +1654,20 @@ mod tests {
             vec![100, 0],
             "the new split holds the change, earliest first"
         );
+
+        // A clone that adds nothing and moves no time earlier leaves the split as it is.
+        let version = reopened.ordered.lock().unwrap().version;
+        let split = reopened.to_prefetch_ordered();
+        let mut same = reopened.recorder();
+        same.insert_range_at(100 * GRANULE, GRANULE, 9);
+        reopened.remember(&same);
+        reopened.remember(&reopened.recorder());
+        assert_eq!(
+            reopened.ordered.lock().unwrap().version,
+            version,
+            "an unchanged union invalidated the split"
+        );
+        assert!(Arc::ptr_eq(&split, &reopened.to_prefetch_ordered()));
     }
 
     #[test]

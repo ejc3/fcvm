@@ -564,6 +564,10 @@ fn warm_paced(
     let mut requested = 0u64;
     let mut runs = super::working_set::OrderedRuns::new(recorded);
     let mut tier = 0;
+    // A host page larger than a granule can hold granules of several tiers; a bit per host
+    // page keeps it to one request, as replay plans each clone page once.
+    let mut asked =
+        (page > GRANULE).then(|| vec![0u64; mem_len.div_ceil(page).div_ceil(64) as usize]);
     'runs: while let Some(run) = runs.next() {
         // Runs come tier by tier, each tier in ascending offset; a new tier starts again from
         // the bottom of the image.
@@ -572,58 +576,107 @@ fn warm_paced(
             floor = 0;
         }
         let mut counted = false;
-        for request in requests_for(run, floor, page, mem_len) {
-            loop {
-                match pace(requested) {
-                    Pace::Go => break,
-                    Pace::Restart => {
-                        stats.restart = true;
+        for whole in requests_for(run, floor, page, mem_len) {
+            for request in unasked(&mut asked, whole, page) {
+                loop {
+                    match pace(requested) {
+                        Pace::Go => break,
+                        Pace::Restart => {
+                            stats.restart = true;
+                            break 'runs;
+                        }
+                        Pace::Wait => {}
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        stats.stopped_early = true;
                         break 'runs;
                     }
-                    Pace::Wait => {}
+                    stats.paced = true;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 if stop.load(Ordering::Relaxed) {
                     stats.stopped_early = true;
                     break 'runs;
                 }
-                stats.paced = true;
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            if stop.load(Ordering::Relaxed) {
-                stats.stopped_early = true;
-                break 'runs;
-            }
-            requested += request.len;
-            if !counted {
-                stats.runs += 1;
-                counted = true;
-            }
-            stats.requests += 1;
-            match advise(request) {
-                Ok(()) => stats.bytes += request.len,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    stats.requests -= 1;
-                    stats.stopped_early = true;
-                    break 'runs;
+                requested += request.len;
+                if !counted {
+                    stats.runs += 1;
+                    counted = true;
                 }
-                Err(error) => {
-                    if stats.failures == 0 {
-                        warn!(
-                            target: "uffd",
-                            offset = request.offset,
-                            len = request.len,
-                            error = %error,
-                            "page cache warm-up request was refused; clones still restore \
-                             correctly, and further refusals are only counted"
-                        );
+                stats.requests += 1;
+                match advise(request) {
+                    Ok(()) => stats.bytes += request.len,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        stats.requests -= 1;
+                        stats.stopped_early = true;
+                        break 'runs;
                     }
-                    stats.failures += 1;
+                    Err(error) => {
+                        if stats.failures == 0 {
+                            warn!(
+                                target: "uffd",
+                                offset = request.offset,
+                                len = request.len,
+                                error = %error,
+                                "page cache warm-up request was refused; clones still restore \
+                                 correctly, and further refusals are only counted"
+                            );
+                        }
+                        stats.failures += 1;
+                    }
                 }
             }
-            floor = request.offset + request.len;
+            floor = whole.offset + whole.len;
         }
     }
     stats
+}
+
+/// The parts of `request` whose host pages no earlier request asked for, marking them asked.
+/// Without a bitmap (host pages of one granule) the request itself.
+fn unasked(asked: &mut Option<Vec<u64>>, request: Request, page: u64) -> Pieces {
+    let Some(bits) = asked.as_mut() else {
+        return Pieces::Whole(Some(request));
+    };
+    let mut pieces: Vec<Request> = Vec::new();
+    let mut open: Option<Request> = None;
+    let first = request.offset / page;
+    for index in 0..request.len.div_ceil(page) {
+        let bit = (first + index) as usize;
+        let (word, mask) = (bit / 64, 1u64 << (bit % 64));
+        let fresh = bits.get(word).is_some_and(|w| w & mask == 0);
+        let at = request.offset + index * page;
+        let len = page.min(request.offset + request.len - at);
+        if fresh {
+            bits[word] |= mask;
+            match open.as_mut() {
+                Some(piece) => piece.len += len,
+                None => open = Some(Request { offset: at, len }),
+            }
+        } else if let Some(piece) = open.take() {
+            pieces.push(piece);
+        }
+    }
+    pieces.extend(open);
+    Pieces::Parts(pieces.into_iter())
+}
+
+/// What [`unasked`] gives back: the request itself, with no allocation on the common path,
+/// or its unasked parts.
+enum Pieces {
+    Whole(Option<Request>),
+    Parts(std::vec::IntoIter<Request>),
+}
+
+impl Iterator for Pieces {
+    type Item = Request;
+
+    fn next(&mut self) -> Option<Request> {
+        match self {
+            Pieces::Whole(request) => request.take(),
+            Pieces::Parts(parts) => parts.next(),
+        }
+    }
 }
 
 /// The host's page size, or [`GRANULE`] if `sysconf` has no usable answer.
@@ -1570,6 +1623,26 @@ mod tests {
             bytes <= PACED_WINDOW_BYTES + REQUEST_BYTES,
             "the second pass read {bytes} bytes unpaced past a replay at 0"
         );
+    }
+
+    /// With host pages larger than a granule, a page holding granules of several tiers is
+    /// asked for once, so the warm-up's count of bytes asked stays a count of distinct pages.
+    /// Before, each tier asked for the page again.
+    #[test]
+    fn a_large_host_page_is_asked_for_once_across_tiers() {
+        const PAGE16: u64 = 16 * 1024;
+        let mem_len = 64 * G;
+        let mut set = PageSet::empty(mem_len);
+        for (granule, time) in [(0u64, 1), (1, 15), (4, 30)] {
+            set.insert_range_at(granule * G, G, time);
+        }
+        let mut seen = Vec::new();
+        let stats = warm(&set, mem_len, PAGE16, &AtomicBool::new(false), |request| {
+            seen.push((request.offset, request.len));
+            Ok(())
+        });
+        assert_eq!(seen, vec![(0, PAGE16), (PAGE16, PAGE16)]);
+        assert_eq!(stats.bytes, 2 * PAGE16);
     }
 
     /// The free memory a warm-up may fill unpaced is MemFree less a sixteenth of the host,
