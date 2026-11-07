@@ -20,6 +20,7 @@ pub mod ecs;
 pub mod hosts;
 pub mod live;
 pub mod poster;
+pub mod potato_log;
 pub mod scene_token;
 pub mod secrets;
 pub mod sigv4;
@@ -273,11 +274,13 @@ impl Actor {
         set_at(&mut event, at);
         let before = self.state.version;
         let marks = wake_log::Marks::of(&self.state);
+        let potato_marks = potato_log::Marks::of(&self.state);
         let was_asleep = self.state.fleet.power.state == "asleep";
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
         self.name_launches();
         wake_log::log(&wake_log::notes(&marks, &self.state, at));
+        potato_log::log_rounds(&potato_log::notes(&potato_marks, &self.state));
         let f = &self.state.fleet;
         if !was_asleep && f.power.state == "asleep" {
             tracing::info!(
@@ -649,6 +652,8 @@ impl Actor {
                 if let AgentMsg::Potato(e) = &msg {
                     // the agent's stamp beside this read's, so a late report is told from a lost one
                     tracing::debug!(target: "fcvm::fleet::potato_reports", host = %host, player = e.player, agent_at = e.at, coord_at = now_ms(), kind = ?e.kind, "potato event received");
+                    let round = self.state.fleet.potato.round.as_ref().map(|r| r.id);
+                    potato_log::log_event(&host, round, e);
                 }
                 let quarantined = match &msg {
                     AgentMsg::Quarantine { sbdf, report, .. } => {

@@ -258,6 +258,37 @@ async fn run_fcvm(fcvm: &std::path::Path, args: &[String]) -> Result<String> {
     Ok(text)
 }
 
+/// How long the agent waits for a slept player's fcvm to exit after `snapshot create --stop`.
+const REAP_DEADLINE: Duration = Duration::from_secs(40);
+
+/// The agent's own steps of a sleep, which together make up its `sleep_ms`: telling the
+/// player its round is over (`ask_ms`, a sleep at a round's end only), `fcvm snapshot create
+/// --stop` from start to exit (`create_ms`, which fcvm's own stages split), and waiting for
+/// the player's fcvm to exit (`reap_ms`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SleepSteps {
+    ask_ms: f64,
+    create_ms: f64,
+    reap_ms: f64,
+}
+
+impl SleepSteps {
+    fn into_stages(self, mut stages: BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+        let tenth = |v: f64| (v * 10.0).round() / 10.0;
+        stages.insert("ask_ms".into(), tenth(self.ask_ms));
+        stages.insert("create_ms".into(), tenth(self.create_ms));
+        stages.insert("reap_ms".into(), tenth(self.reap_ms));
+        stages
+    }
+
+    fn describe(self) -> String {
+        format!(
+            "after {:.0} ms telling it the round is over, {:.0} ms in snapshot create and {:.0} ms waiting for its fcvm to exit",
+            self.ask_ms, self.create_ms, self.reap_ms
+        )
+    }
+}
+
 /// The numbers fcvm's `snapshot create --stop` logs: the boundary's steps and the stop.
 pub fn sleep_stages(log: &str) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
@@ -285,6 +316,8 @@ pub fn sleep_stages(log: &str) -> BTreeMap<String, f64> {
                 ("save_ms", "save_ms"),
                 ("disk_ms", "disk_ms"),
             ]
+        } else if line.contains("snapshot created successfully") {
+            &[("stage_ms", "stage_ms"), ("publish_ms", "publish_ms")]
         } else if line.contains("stopped the VM after its snapshot") {
             &[("stop_ms", "stop_ms")]
         } else if line.contains("diff written in place") || line.contains("memory file written") {
@@ -506,6 +539,7 @@ impl Ops for FcvmOps {
                     tracing::warn!(player = n, round, error = %format!("{e:#}"), "potato: a round's end did not reach a player");
                 }
             }
+            let asked = started.elapsed();
             let Some(mut vm) = vm else {
                 let _ = done.send(Done::Slept(
                     n,
@@ -514,6 +548,7 @@ impl Ops for FcvmOps {
                 ));
                 return;
             };
+            let create = Instant::now();
             let r = run_fcvm(
                 &cfg.fcvm,
                 &[
@@ -527,13 +562,25 @@ impl Ops for FcvmOps {
                 ],
             )
             .await;
+            let created = create.elapsed();
             // --stop has stopped the VM's fcvm (also on failure); reap it
-            let _ = tokio::time::timeout(Duration::from_secs(40), vm.exited()).await;
+            let reap = Instant::now();
+            let _ = tokio::time::timeout(REAP_DEADLINE, vm.exited()).await;
+            let reaped = reap.elapsed();
             drop(vm);
+            let steps = SleepSteps {
+                ask_ms: ms(asked),
+                create_ms: ms(created),
+                reap_ms: ms(reaped),
+            };
+            let total = ms(started.elapsed());
             let _ = done.send(Done::Slept(
                 n,
-                r.map(|log| sleep_stages(&log)),
-                ms(started.elapsed()),
+                match r {
+                    Ok(log) => Ok(steps.into_stages(sleep_stages(&log))),
+                    Err(e) => Err(e.context(steps.describe())),
+                },
+                total,
             ));
         });
     }
@@ -1436,14 +1483,35 @@ mod tests {
     fn sleep_stages_reads_the_boundary_and_the_stop() {
         let log = "2026-11-05T04:00:00Z  INFO fcvm::commands::common: snapshot boundary timings snapshot=potato-3 prepare_ms=20.1 pause_ms=0.3 save_ms=61.5 disk_ms=40.2 resume_ms=0\n\
                    2026-11-05T04:00:00Z  INFO fcvm::commands::common: diff written in place, building atomic update snapshot=potato-3 written_bytes=20971520 ranges=2\n\
+                   2026-11-05T04:00:00Z  INFO fcvm::commands::common: snapshot created successfully snapshot=potato-3 snapshot_type=\"Diff\" disk=/s/potato-3/disk/disk.raw stage_ms=412.5 publish_ms=7218.3\n\
                    2026-11-05T04:00:00Z  INFO fcvm::commands::snapshot: stopped the VM after its snapshot pid=7 stop_ms=96.4 killed=false\n";
         let s = sleep_stages(log);
+        assert_eq!(s["stage_ms"], 412.5);
+        assert_eq!(s["publish_ms"], 7218.3);
         assert_eq!(s["prepare_ms"], 20.1);
         assert_eq!(s["save_ms"], 61.5);
         assert_eq!(s["disk_ms"], 40.2);
         assert_eq!(s["stop_ms"], 96.4);
         assert_eq!(s["written_bytes"], 20971520.0);
         assert!(!s.contains_key("resume_ms"), "a stopped VM is not resumed");
+    }
+
+    #[test]
+    fn a_sleep_carries_the_agents_own_steps() {
+        let steps = SleepSteps {
+            ask_ms: 1.04,
+            create_ms: 99_120.0,
+            reap_ms: 40_000.0,
+        };
+        let s = steps.into_stages(BTreeMap::from([("stop_ms".to_string(), 96.4)]));
+        assert_eq!(s["ask_ms"], 1.0);
+        assert_eq!(s["create_ms"], 99_120.0);
+        assert_eq!(s["reap_ms"], 40_000.0);
+        assert_eq!(s["stop_ms"], 96.4);
+        assert_eq!(
+            steps.describe(),
+            "after 1 ms telling it the round is over, 99120 ms in snapshot create and 40000 ms waiting for its fcvm to exit"
+        );
     }
 
     #[test]

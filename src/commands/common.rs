@@ -5704,6 +5704,7 @@ pub async fn create_snapshot_core(
     );
 
     // Clean up any leftover temp directory from previous failed attempt
+    let stage_started = std::time::Instant::now();
     crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
 
     // A diff snapshot whose parent's directory is a btrfs subvolume is staged as a subvolume
@@ -5769,6 +5770,7 @@ pub async fn create_snapshot_core(
             .await
             .context("creating temp snapshot directory")?;
     }
+    let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     let temp_memory_path = if has_base && !diff_in_place {
         temp_snapshot_dir.join("memory.diff")
     } else {
@@ -6196,6 +6198,7 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
+    let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
         snapshot_dir,
@@ -6203,12 +6206,18 @@ pub async fn create_snapshot_core(
         extra_files,
     )
     .await?;
+    let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
 
+    // stage_ms: the new generation's directory and its memory file, before the pause;
+    // publish_ms: the atomic replace, the old generation's removal included
+    let tenth = |ms: f64| (ms * 10.0).round() / 10.0;
     let actual_type = if use_diff { "Diff" } else { "Full" };
     info!(
         snapshot = %snapshot_config.name,
         snapshot_type = actual_type,
         disk = %snapshot_config.disk_path.display(),
+        stage_ms = tenth(stage_ms),
+        publish_ms = tenth(publish_ms),
         "snapshot created successfully"
     );
 

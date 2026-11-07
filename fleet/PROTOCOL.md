@@ -1070,7 +1070,7 @@ that happened to player `player`, at `at` on the host's clock. `kind` is one of:
 | `caught` | `round`, `seq`, `colour`, `counter`, `chain` | it caught the ball |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
 | `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to` |
-| `slept` | `sleep_ms`, `stages` (`prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `stop_ms`), `written_mib` | its snapshot is written and its fcvm has exited |
+| `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
 | `waking` | | its restore started |
 | `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`) | its ball port accepts again |
 | `listening` | `round`, `seq`, `after_ms` | the catcher of a dropped ball accepted, `after_ms` after the drop |
