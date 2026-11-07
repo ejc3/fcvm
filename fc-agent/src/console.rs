@@ -86,9 +86,9 @@ const PENDING_CAP: usize = 1024 * 1024;
 /// before it writes it anyway. `eprintln!` writes a line in pieces (each literal and each
 /// argument, then the newline), and the writer reads the pipe as the pieces arrive, so
 /// without the hold a line reached the console in pieces. Any other console writer (the
-/// kernel, a process writing `/dev/ttyS0`) could then land inside it: CI run 42393525591
-/// logged `[fc-agent] exec server: accepted connection on vsock port 4998UART-TEST-MARKER-...`
-/// when the exec that wrote the marker raced the line that logged its accept.
+/// kernel, a process writing `/dev/ttyS0`) could then land inside it: the serial console
+/// test once read `[fc-agent] exec server: accepted connection on vsock port 4998<marker>`,
+/// where the exec that wrote the marker raced the line that logged its accept.
 const PARTIAL_LINE_HOLD: Duration = Duration::from_millis(100);
 
 /// An unfinished line this long is written without waiting for its newline: the hold is
@@ -815,10 +815,10 @@ mod tests {
     }
 
     /// A line written in pieces reaches the console whole, so another console writer
-    /// cannot land inside it. Run 42393525591's serial console test logged
-    /// `...accepted connection on vsock port 4998UART-TEST-MARKER-...`: the writer had
-    /// forwarded the line without its newline, and the marker the exec wrote to
-    /// `/dev/ttyS0` landed before the newline did.
+    /// cannot land inside it. The serial console test once read
+    /// `...accepted connection on vsock port 4998<marker>`: the writer had forwarded the
+    /// line without its newline, and the marker the exec wrote to `/dev/ttyS0` landed
+    /// before the newline did.
     #[test]
     fn a_line_written_in_pieces_reaches_the_console_whole() {
         let (console_wr, mut console_rd) = fake_console();
