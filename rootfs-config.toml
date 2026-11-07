@@ -451,10 +451,12 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # PR: https://github.com/firecracker-microvm/firecracker/pull/5696
 # nv2-on-main plus a Full snapshot that leaves never-written guest memory as
 # holes instead of reading it, which would map it to the zero page and make
-# the resumed guest's first write to each page a copy-on-write (#1264).
+# the resumed guest's first write to each page a copy-on-write (#1264), and a
+# dirty log reset that turns logging off and on instead of KVM_GET_DIRTY_LOG,
+# which write-protects every nested stage-2 MMU once per 64 dirty pages.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "fix/nv2-dump-skip-absent"
-firecracker_commit = "ad2ff71e8bdc79734849e9a71c0310af26b101c4"
+firecracker_branch = "fix/nv2-dirty-log-reset"
+firecracker_commit = "21410dbead251b39248b75c8dd6f1e3b9443331e"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
