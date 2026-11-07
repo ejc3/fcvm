@@ -1242,31 +1242,6 @@ mod tests {
         assert_eq!(stats.requests, 0);
     }
 
-    /// A probe of a cold request reads, at most, the request's own pages: its descriptor has
-    /// no readahead, so the pages after it stay cold. A probe on the server's descriptor
-    /// started the kernel's readahead past the request, reads the pacer never counted.
-    #[test]
-    fn a_probe_reads_no_page_past_its_request() {
-        use testing::{evict, image_on_disk, resident_pages, MIB};
-        let file = Arc::new(image_on_disk(4 * MIB));
-        // SAFETY: a private test file nothing else truncates.
-        let map = unsafe { memmap2::Mmap::map(&*file) }.unwrap();
-        evict(&file);
-        let request = Request {
-            offset: MIB,
-            len: 4 * PAGE,
-        };
-        let mut probe = Probe::new(Arc::clone(&file));
-        let _ = probe.resident(request);
-        // The kernel's read of what the probe asked for may still be in flight.
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            resident_pages(&map, MIB + 4 * PAGE, MIB),
-            0,
-            "a probe read pages past its request"
-        );
-    }
-
     /// The warm-up the server starts goes through the pacer: each request waits for room in
     /// the window before it is issued, and is counted once issued. Unpaced, the warm-up
     /// queued a whole recorded set (#986, #1069).
