@@ -94,6 +94,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::state::types::PmemDevice;
+use crate::storage::inode_flags::match_nodatacow;
+#[cfg(test)]
+use crate::storage::inode_flags::{inode_flags, set_inode_flags, FS_NOCOW_FL};
 
 /// Domain tag hashed ahead of an entry's owner and content digest, so a change to how
 /// entries are named changes every name.
@@ -1730,28 +1733,6 @@ pub(crate) fn ficlone(src: &File, dst: &File) -> std::io::Result<()> {
     }
 }
 
-/// Set or clear the nodatacow flag of the empty `dst` to match `src`, and report whether
-/// it changed. The flag can only change while a file is empty, and a temp inherits it
-/// from a store directory marked `chattr +C`. `copy_image` calls this only after btrfs
-/// refused a clone, so a byte copy (from another filesystem, for one) keeps the flag the
-/// store directory gives its files.
-fn match_nodatacow(src: &File, dst: &File) -> bool {
-    let (Some(src_flags), Some(dst_flags)) = (inode_flags(src), inode_flags(dst)) else {
-        return false;
-    };
-    let wanted = (dst_flags & !FS_NOCOW_FL) | (src_flags & FS_NOCOW_FL);
-    if wanted == dst_flags {
-        return false;
-    }
-    match set_inode_flags(dst, wanted) {
-        Ok(()) => true,
-        Err(error) => {
-            debug!(%error, "could not match the pmem store temp's nodatacow flag to its source");
-            false
-        }
-    }
-}
-
 /// Copy the data runs of `src` into `dst` at the same offsets with pread and pwrite, then
 /// set the length, so holes stay holes. All-zero 4 KiB blocks inside a run are not written
 /// either, so the copy stays sparse when the source reports every block as data.
@@ -1803,29 +1784,6 @@ fn write_nonzero_blocks(dst: &File, data: &[u8], offset: u64) -> Result<()> {
 fn write_run(dst: &File, bytes: &[u8], offset: u64) -> Result<()> {
     dst.write_all_at(bytes, offset)
         .with_context(|| format!("writing at {offset}"))
-}
-
-/// `FS_NOCOW_FL` from linux/fs.h, which libc does not export: the file is written in place
-/// instead of copy-on-write (btrfs nodatacow, `chattr +C`).
-const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
-
-/// The inode flags of `file` (FS_IOC_GETFLAGS), or `None` on a filesystem without them.
-fn inode_flags(file: &File) -> Option<libc::c_int> {
-    let mut flags: libc::c_int = 0;
-    // SAFETY: FS_IOC_GETFLAGS writes one int to `flags`, which outlives the call.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS as _, &mut flags) };
-    (rc == 0).then_some(flags)
-}
-
-/// Set the inode flags of `file` (FS_IOC_SETFLAGS).
-fn set_inode_flags(file: &File, flags: libc::c_int) -> std::io::Result<()> {
-    // SAFETY: FS_IOC_SETFLAGS reads one int from `flags`, which outlives the call.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS as _, &flags) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// lseek with SEEK_DATA or SEEK_HOLE; `None` when no data follows `offset` (ENXIO).
