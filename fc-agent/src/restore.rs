@@ -150,7 +150,9 @@ pub struct RestoreSignals {
     /// `container-plan` is gone by the time restore runs. This cache lives in the
     /// snapshot's memory image, so a restored VM sees exactly the mounts that were active
     /// when the snapshot was taken.
-    pub nfs_mounts: std::sync::Arc<std::sync::OnceLock<Vec<crate::mounts::MountedNfsShare>>>,
+    /// A restore that remounts them records the new mounts' IDs here, so the next restore of a
+    /// snapshot of this clone finds them.
+    pub nfs_mounts: crate::mounts::NfsMountRecords,
 }
 
 /// Per-phase milliseconds for one guest-side restore, carried to the host in
@@ -499,7 +501,9 @@ pub async fn handle_clone_restore(
     let nfs_started = std::time::Instant::now();
     let mounted_nfs = signals
         .nfs_mounts
-        .get()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
         .context("restored before the boot recorded its NFS mounts")?;
     if !mounted_nfs.is_empty() {
         eprintln!(
@@ -512,7 +516,7 @@ pub async fn handle_clone_restore(
             .await
             .context("reading /proc/self/mountinfo to remount NFS shares after restore")?;
         let mut shares = Vec::with_capacity(mounted_nfs.len());
-        for mounted in mounted_nfs {
+        for mounted in &mounted_nfs {
             let point = crate::mounts::nfs_remount_point(&mountinfo, mounted)
                 .context("remounting NFS shares after restore, so the clone stays unpublished")?;
             let _ = tokio::process::Command::new("umount")
@@ -531,6 +535,11 @@ pub async fn handle_clone_restore(
         // exists to prevent.
         crate::mounts::mount_nfs_shares(&shares, None)
             .context("remounting NFS shares after restore, so the clone stays unpublished")?;
+        // The remount made new mounts. Their IDs replace the boot's, so a snapshot of this
+        // clone, restored, remounts these and not the ones this restore unmounted.
+        let remounted = crate::mounts::record_nfs_mounts(&shares)
+            .context("recording the NFS shares remounted after restore")?;
+        *signals.nfs_mounts.lock().unwrap_or_else(|e| e.into_inner()) = Some(remounted);
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
 
@@ -1275,5 +1284,28 @@ mod tests {
             "restore must flush inherited neighbours, then pin the health-check \
              entry, then announce. Got flush={flush} pin={pin} announce={announce}"
         );
+    }
+}
+
+#[cfg(test)]
+mod nfs_remount_record_tests {
+    /// A restore remounts each NFS share as a new mount, and records the new mounts' IDs in
+    /// place of the boot's after the mount: a snapshot of the restored clone, restored again,
+    /// looks the shares up by ID and must find these, not the ones the first restore
+    /// unmounted. Pinned by source order, since the mounts need a live NFS server.
+    #[test]
+    fn a_restore_records_the_nfs_mounts_it_made() {
+        let body = super::handle_clone_restore_source();
+        let squeezed: String = body.split_whitespace().collect();
+        let mounted = squeezed
+            .find("crate::mounts::mount_nfs_shares(&shares,None)")
+            .expect("the restore does not remount the NFS shares");
+        let recorded = squeezed
+            .find("crate::mounts::record_nfs_mounts(&shares)")
+            .expect("the restore does not record the mounts it made");
+        let stored = squeezed
+            .find("*signals.nfs_mounts.lock().unwrap_or_else(|e|e.into_inner())=Some(remounted);")
+            .expect("the restore does not store the new records");
+        assert!(mounted < recorded && recorded < stored);
     }
 }

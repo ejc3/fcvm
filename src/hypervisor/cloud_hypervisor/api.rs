@@ -136,6 +136,15 @@ impl ChClient {
         .await
     }
 
+    /// Set the balloon's target size, in bytes (`vm.resize` with only `desired_balloon`).
+    pub async fn resize_balloon(&self, bytes: u64) -> Result<()> {
+        self.put_json(
+            "/api/v1/vm.resize",
+            &serde_json::json!({ "desired_balloon": bytes }),
+        )
+        .await
+    }
+
     /// Shut down the VMM process via the API.
     pub async fn shutdown_vmm(&self) -> Result<()> {
         self.put_empty("/api/v1/vmm.shutdown").await

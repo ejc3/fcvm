@@ -439,6 +439,10 @@ pub struct MountedNfsShare {
     pub mount_id: u64,
 }
 
+/// The NFS shares fc-agent mounted, with their mount IDs: set by the boot, replaced by each
+/// restore that remounts them.
+pub type NfsMountRecords = std::sync::Arc<std::sync::Mutex<Option<Vec<MountedNfsShare>>>>;
+
 /// Record which mount each share's guest path reaches, right after `mount_nfs_shares`
 /// mounted them. The restore remounts that mount where it is, not whatever the guest path
 /// reaches by then (#1086).

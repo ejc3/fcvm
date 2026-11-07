@@ -4227,14 +4227,6 @@ pub async fn restore_from_snapshot_ch(
     if !gpus.is_empty() {
         bail!("a Cloud Hypervisor restore cannot attach passthrough devices ({gpus:?})");
     }
-    // No Cloud Hypervisor call sets a balloon target on a restored VM, so a target
-    // named here would be dropped. `podman run` keeps this backend out of the
-    // snapshot cache and names none.
-    if let Some(target_mib) = balloon_target_mib {
-        bail!(
-            "a Cloud Hypervisor restore cannot set a balloon target (asked for {target_mib} MiB)"
-        );
-    }
     let vm_dir = data_dir.join("disks");
 
     // CH's own snapshot files live in the `ch/` subdir (written by create_snapshot_ch).
@@ -4385,6 +4377,12 @@ pub async fn restore_from_snapshot_ch(
         // pasta's published-port listeners live, guest not yet running, PID not
         // yet published. See the Firecracker path for the full rationale.
         failpoint::hit_async("restore.post_network_pre_resume").await;
+
+        // The run's own balloon target, set while the VM is paused, as a Firecracker restore
+        // sets it on the loaded VM: a pre-start snapshot is shared between targets.
+        if let Some(target_mib) = balloon_target_mib {
+            backend.set_balloon_target(target_mib).await?;
+        }
 
         backend
             .resume()
@@ -8103,14 +8101,11 @@ mod tests {
         assert_eq!(saw, [READ], "a device without free page reporting");
     }
 
-    /// Cloud Hypervisor has no call that sets a balloon target on a restored VM.
-    /// `podman run` keeps that backend out of the snapshot cache, so no caller
-    /// names a target today. One that did would have it dropped without a word, so
-    /// the restore refuses it, naming the target, before it prepares the clone's
-    /// network and disk. This shows the order of those two steps and nothing about
-    /// the checks that run before the refusal.
+    /// A Cloud Hypervisor restore sets the run's balloon target on the restored, paused VM
+    /// (`vm.resize`) before it resumes it, as a Firecracker restore sets it on the loaded VM,
+    /// so runs at different targets share one pre-start snapshot (#806).
     #[test]
-    fn a_cloud_hypervisor_restore_refuses_a_balloon_target_before_it_prepares_the_clone() {
+    fn a_cloud_hypervisor_restore_sets_the_balloon_target_before_it_resumes() {
         let source = include_str!("common.rs");
         let start = source
             .find("pub async fn restore_from_snapshot_ch(")
@@ -8119,16 +8114,13 @@ mod tests {
             .find("pub fn build_snapshot_config(")
             .expect("build_snapshot_config no longer follows the Cloud Hypervisor restore");
         let body = &source[start..start + end];
-        let refused = body
-            .find("(asked for {target_mib} MiB)")
-            .expect("the Cloud Hypervisor restore does not refuse a balloon target by its number");
-        let first_side_effect = body
-            .find("prepare_clone_substrate(")
-            .expect("the Cloud Hypervisor restore no longer prepares a clone substrate");
-        assert!(
-            refused < first_side_effect,
-            "the Cloud Hypervisor restore prepares the clone before it refuses a balloon target"
-        );
+        let set = body
+            .find("backend.set_balloon_target(target_mib)")
+            .expect("the Cloud Hypervisor restore does not set the balloon target");
+        let resumed = body[set..]
+            .find(".resume()")
+            .expect("the Cloud Hypervisor restore does not resume after setting the target");
+        assert!(resumed > 0);
     }
 
     #[test]
