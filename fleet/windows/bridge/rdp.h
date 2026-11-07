@@ -52,7 +52,8 @@ class RdpLink {
   void stop();
   bool connected() const { return connected_.load(); }
   // Sends the events in order from the connection's thread and returns once they are sent;
-  // false when there is no connection, another batch is pending, a send fails, the connection
+  // false when there is no connection, another batch is pending, a send fails (the batch's
+  // pressed keys are then released, or the link reconnects when they cannot be), the connection
   // ends first, or 5 s pass (the batch is then dropped if the connection's thread has not
   // taken it). Only Bridge::play calls it, with events from step_keys().
   bool send_keys(const std::vector<KeyEvent>& ev, std::string* err);
@@ -66,7 +67,9 @@ class RdpLink {
  private:
   // One attempt; the error, "" when it connected and was stopped. *reached: RDP connected.
   std::string attempt(bool* reached, bool* fatal);
-  void drain_keys(void* context);
+  // Sends a queued batch; false when a send failed and a key it pressed may still be down,
+  // after which the connection is ended and made again.
+  bool drain_keys(void* context);
   void fail_keys(const std::string& why);
   // A refusal that retrying cannot help (the channel check, the desktop size, a redirection),
   // from whichever FreeRDP thread finds it; attempt() ends the link with it.

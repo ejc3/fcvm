@@ -113,10 +113,17 @@ void wipe(std::string* s) {
 }  // namespace
 
 struct RdpLink::Hooks {
+  // Every access to the GDI's primary bitmap, its DC, window and invalid region (and the
+  // surface, in emit) is under the update lock: gdi_resize_ex frees and replaces them under it,
+  // and calls EndPaint before it takes it, so another thread's resize can be in progress while
+  // FreeRDP calls these. The lock is a recursive critical section, so a hold FreeRDP already
+  // has nests.
   static BOOL begin_paint(rdpContext* c) {
+    rdp_update_lock(c->update);
     rdpGdi* gdi = c->gdi;
     if (gdi && gdi->primary && gdi->primary->hdc && gdi->primary->hdc->hwnd && gdi->primary->hdc->hwnd->invalid)
       gdi->primary->hdc->hwnd->invalid->null = TRUE;
+    rdp_update_unlock(c->update);
     return TRUE;
   }
   // gdi_resize frees and replaces the surface under the update lock, from whichever thread
@@ -133,14 +140,16 @@ struct RdpLink::Hooks {
     rdp_update_unlock(c->update);
   }
   static BOOL end_paint(rdpContext* c) {
+    rdp_update_lock(c->update);
     rdpGdi* gdi = c->gdi;
-    if (!gdi || !gdi->primary || !gdi->primary->hdc || !gdi->primary->hdc->hwnd) return TRUE;
-    if (gdi->primary->hdc->hwnd->invalid->null) return TRUE;  // nothing drawn
-    if (t_in_gfx_frame) {
-      t_gfx_dirty = true;
-      return TRUE;
+    HGDI_WND w = gdi && gdi->primary && gdi->primary->hdc ? gdi->primary->hdc->hwnd : nullptr;
+    if (w && w->invalid && !w->invalid->null) {  // something was drawn
+      if (t_in_gfx_frame)
+        t_gfx_dirty = true;
+      else
+        emit(c, false);
     }
-    emit(c, false);
+    rdp_update_unlock(c->update);
     return TRUE;
   }
   // The server resizes the desktop (a DesktopResize, or an rdpgfx ResetGraphics, which calls
@@ -434,7 +443,11 @@ std::string RdpLink::attempt(bool* reached, bool* fatal) {
       err = "the server ended the connection";
       break;
     }
-    drain_keys(ctx);
+    // a key the server may still hold down is cleared by a new connection
+    if (!drain_keys(ctx)) {
+      err = "a key could not be released after a failed send; reconnecting";
+      break;
+    }
     sink_->on_tick(unix_ms_now());
   }
   if (std::string f = fatal_reason(); !f.empty()) {
@@ -449,23 +462,23 @@ std::string RdpLink::attempt(bool* reached, bool* fatal) {
   return err;
 }
 
-void RdpLink::drain_keys(void* context) {
+bool RdpLink::drain_keys(void* context) {
   rdpContext* ctx = (rdpContext*)context;
   std::vector<KeyEvent> batch;
   {
     std::lock_guard<std::mutex> l(mu_);
-    if (!keyq_.take(&batch)) return;
+    if (!keyq_.take(&batch)) return true;
   }
   std::string err;
-  bool ok = send_key_batch(
-      batch,
-      [&](const KeyEvent& k) {
-        return freerdp_input_send_keyboard_event_ex(ctx->input, k.down ? TRUE : FALSE, FALSE, k.scancode) != FALSE;
-      },
-      &err);
+  bool released = true;
+  auto send = [&](const KeyEvent& k) {
+    return freerdp_input_send_keyboard_event_ex(ctx->input, k.down ? TRUE : FALSE, FALSE, k.scancode) != FALSE;
+  };
+  bool ok = send_key_batch(batch, send, &err, &released);
   std::lock_guard<std::mutex> l(mu_);
-  keyq_.done(ok, err);
+  keyq_.done(ok, err, released);
   cv_.notify_all();
+  return released;
 }
 
 void RdpLink::fail_keys(const std::string& why) {

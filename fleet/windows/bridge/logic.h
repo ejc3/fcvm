@@ -180,7 +180,9 @@ class KeyQueue {
   // The link's thread takes the queued batch (SENDING until done()); false when none is queued.
   bool take(std::vector<KeyEvent>* out);
   // The batch taken was sent (ok) or failed with err.
-  void done(bool ok, const std::string& err);
+  // released false: a key may still be down, and no batch is taken until fail() (the
+  // connection ends; the link reconnects).
+  void done(bool ok, const std::string& err, bool released = true);
   // The waiter of ticket gave up: true when its batch was still queued and is now dropped.
   bool cancel(uint64_t ticket);
   // The connection ended: a queued batch is dropped and fails with why.
@@ -194,9 +196,14 @@ class KeyQueue {
   Status status_ = SENT;
   std::vector<KeyEvent> batch_;
   std::string err_;
+  bool held_ = false;  // a key may be held down until the connection ends
 };
 // Sends the events in order through send, stopping at the first it refuses; false with which.
-bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err);
+// On a failure it then sends, best effort, a release for every key the batch pressed and has
+// not released (the failed event's key included), in reverse press order, so a failure does
+// not leave Ctrl or Shift down for the next action; *released says whether every one went.
+bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err,
+                    bool* released = nullptr);
 
 // ---- the desktop size
 

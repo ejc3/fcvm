@@ -389,6 +389,10 @@ bool step_keys(const Step& s, std::vector<KeyEvent>* out) {
 const Step kCloseWindowStep = chord2(SC_LMENU, SC_F4);
 
 bool KeyQueue::submit(const std::vector<KeyEvent>& ev, uint64_t* ticket, std::string* err) {
+  if (held_) {
+    *err = "a key may still be held down; the link reconnects first";
+    return false;
+  }
   if (status_ == QUEUED || status_ == SENDING) {
     *err = "another key batch is still pending";
     return false;
@@ -408,8 +412,9 @@ bool KeyQueue::take(std::vector<KeyEvent>* out) {
   return true;
 }
 
-void KeyQueue::done(bool ok, const std::string& err) {
+void KeyQueue::done(bool ok, const std::string& err, bool released) {
   if (status_ != SENDING) return;
+  if (!released) held_ = true;
   status_ = ok ? SENT : FAILED;
   err_ = ok ? "" : err;
 }
@@ -423,6 +428,7 @@ bool KeyQueue::cancel(uint64_t ticket) {
 }
 
 void KeyQueue::fail(const std::string& why) {
+  held_ = false;
   if (status_ != QUEUED && status_ != SENDING) return;
   batch_.clear();
   status_ = FAILED;
@@ -438,12 +444,26 @@ KeyQueue::Status KeyQueue::status(uint64_t ticket, std::string* err) const {
   return status_;
 }
 
-bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err) {
-  for (size_t i = 0; i < ev.size(); i++)
-    if (!send(ev[i])) {
-      *err = "key event " + std::to_string(i + 1) + " of " + std::to_string(ev.size()) + " could not be sent";
-      return false;
+bool send_key_batch(const std::vector<KeyEvent>& ev, const std::function<bool(const KeyEvent&)>& send, std::string* err,
+                    bool* released) {
+  if (released) *released = true;
+  std::vector<uint16_t> down;  // pressed by this batch and not released, in press order
+  for (size_t i = 0; i < ev.size(); i++) {
+    const KeyEvent& k = ev[i];
+    auto it = std::find(down.begin(), down.end(), k.scancode);
+    if (send(k)) {
+      if (k.down && it == down.end()) down.push_back(k.scancode);
+      if (!k.down && it != down.end()) down.erase(it);
+      continue;
     }
+    *err = "key event " + std::to_string(i + 1) + " of " + std::to_string(ev.size()) + " could not be sent";
+    // a press that failed may still have reached the server; a release that failed did not
+    if (k.down && it == down.end()) down.push_back(k.scancode);
+    bool all = true;
+    for (auto r = down.rbegin(); r != down.rend(); ++r) all = send(KeyEvent{*r, false}) && all;
+    if (released) *released = all;
+    return false;
+  }
   return true;
 }
 

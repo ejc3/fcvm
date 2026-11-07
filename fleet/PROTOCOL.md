@@ -2508,7 +2508,8 @@ doubling to 2 s, for ever: it starts before the sandbox restores.
   keyboard input and answers `200 {"ok":true,"action":..,"ms":..}` once the sequence has been
   sent. `400` for a name not in the table (the message lists the allowed names, and
   `actions` lists them as an array), `409` while another action runs, `503` with no
-  connection or when a step's keys were not sent (a send failed, the connection ended, or they
+  connection or when a step's keys were not sent (a send failed, after which every key the step
+  pressed is released, and the link reconnects when a release fails; the connection ended; or they
   were not sent within 5 s; keys not yet sent are then dropped, never sent later, and a new
   step is refused while an earlier one is still being sent), `504` when a step that waits for
   the screen to change saw no change. Nothing a

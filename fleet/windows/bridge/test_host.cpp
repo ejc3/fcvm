@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -374,7 +375,7 @@ int main() {
     std::string rdp = source_text("rdp.cpp"), bridge = source_text("bridge.cpp"), main = source_text("main.cpp"),
                 logic = source_text("logic.cpp");
     CHECK(!rdp.empty() && !bridge.empty() && !main.empty() && !logic.empty(), "sources read");
-    std::string drain = function_body(rdp, "void RdpLink::drain_keys(");
+    std::string drain = function_body(rdp, "bool RdpLink::drain_keys(");
     CHECK(count(rdp, "freerdp_input_send") == 1 && count(drain, "freerdp_input_send_keyboard_event_ex") == 1,
           "one FreeRDP input call, in drain_keys");
     for (const std::string* s : {&rdp, &bridge, &main, &logic})
@@ -634,15 +635,16 @@ int main() {
   {  // 5: every send is checked; the first failure stops the batch and fails it
     std::vector<KeyEvent> ev = {{SC_LCONTROL, true}, {SC_LSHIFT, true}, {SC_ESCAPE, true},
                                 {SC_ESCAPE, false}, {SC_LSHIFT, false}, {SC_LCONTROL, false}};
-    int calls = 0;
+    int calls = 0, presses_after = 0;
     std::string err;
-    bool ok = send_key_batch(ev, [&](const KeyEvent&) { return ++calls != 3; }, &err);
-    CHECK(!ok && calls == 3 && err == "key event 3 of 6 could not be sent", "stops at the first failure: %d calls, %s", calls,
-          err.c_str());
+    bool ok = send_key_batch(
+        ev, [&](const KeyEvent& k) { if (++calls > 3 && k.down) presses_after++; return calls != 3; }, &err);
+    CHECK(!ok && presses_after == 0 && err == "key event 3 of 6 could not be sent",
+          "stops at the first failure (only releases follow it): %d presses after, %s", presses_after, err.c_str());
     calls = 0;
     CHECK(send_key_batch(ev, [&](const KeyEvent&) { return ++calls > 0; }, &err) && calls == 6, "all sent");
     std::string rdp = source_text("rdp.cpp");
-    std::string drain = function_body(rdp, "void RdpLink::drain_keys(");
+    std::string drain = function_body(rdp, "bool RdpLink::drain_keys(");
     CHECK(count(drain, "send_key_batch(") == 1 && count(drain, "keyq_.done(") == 1 &&
               count(drain, "return freerdp_input_send_keyboard_event_ex(") == 1,
           "drain_keys sends through send_key_batch with each call's result and reports it");
@@ -703,6 +705,102 @@ int main() {
               frame_slot(NAN, 0, 30) == 0 && frame_slot(1.8e12, -INFINITY, 30) == FRAME_SLOT_LIMIT,
           "out-of-range slots are clamped, not converted");
     CHECK(frame_slot(2050, 1000, 30) == 31, "in range, unchanged");
+  }
+
+  // ---- second review (PR #1732, 25bc5372..2d7bcaef): each block fails without its fix
+  {  // 10: every access to the GDI's primary bitmap, its DC, window and invalid region is under
+     // the update lock, which gdi_resize_ex holds while it frees them
+    std::string rdp = source_text("rdp.cpp");
+    struct Span {
+      size_t lock, unlock;
+    };
+    std::vector<Span> locked;
+    for (const char* head : {"  static BOOL begin_paint(", "  static void emit(", "  static BOOL end_paint("}) {
+      size_t a = rdp.find(head);
+      std::string body = function_body(rdp, head);
+      size_t l = body.find("rdp_update_lock(c->update);"), u = body.rfind("rdp_update_unlock(c->update);");
+      CHECK(a != std::string::npos && l != std::string::npos && u != std::string::npos && l < u, "%s takes the update lock", head);
+      if (a != std::string::npos && l != std::string::npos && u != std::string::npos) locked.push_back({a + l, a + u});
+    }
+    size_t n = 0, outside = 0;
+    for (const char* tok : {"->primary", "->hdc", "->hwnd", "->invalid"})
+      for (size_t p = rdp.find(tok); p != std::string::npos; p = rdp.find(tok, p + 1)) {
+        n++;
+        bool in = false;
+        for (const Span& s : locked) in = in || (p > s.lock && p < s.unlock);
+        if (!in) {
+          outside++;
+          fprintf(stderr, "outside the update lock: %s\n", rdp.substr(rdp.rfind('\n', p) + 1, 100).c_str());
+        }
+      }
+    CHECK(n > 0 && outside == 0, "%zu accesses, %zu outside the update lock", n, outside);
+    for (const char* f : {"bridge.cpp", "main.cpp", "logic.cpp", "x264enc.cpp"}) {
+      std::string s = source_text(f);
+      CHECK(!s.empty() && count(s, "->primary") + count(s, "->hdc") + count(s, "->hwnd") + count(s, "->invalid") == 0,
+            "%s does not touch the GDI", f);
+    }
+  }
+  {  // 11: a send that fails mid-batch releases every key the batch pressed
+    auto held_after = [](const std::vector<KeyEvent>& sent) {
+      std::vector<uint16_t> h;
+      for (const KeyEvent& e : sent) {
+        auto it = std::find(h.begin(), h.end(), e.scancode);
+        if (e.down && it == h.end()) h.push_back(e.scancode);
+        if (!e.down && it != h.end()) h.erase(it);
+      }
+      return h;
+    };
+    std::vector<KeyEvent> ev = {{SC_LCONTROL, true}, {SC_LSHIFT, true}, {SC_ESCAPE, true},
+                                {SC_ESCAPE, false}, {SC_LSHIFT, false}, {SC_LCONTROL, false}};
+    for (int fail_at = 1; fail_at <= 6; fail_at++) {
+      std::vector<KeyEvent> sent;
+      int calls = 0;
+      std::string err;
+      bool released = false;
+      bool ok = send_key_batch(
+          ev, [&](const KeyEvent& k) { if (++calls == fail_at) return false; sent.push_back(k); return true; }, &err, &released);
+      CHECK(!ok && released && held_after(sent).empty() &&
+                err == "key event " + std::to_string(fail_at) + " of 6 could not be sent",
+            "failing at event %d leaves no key down (%zu held): %s", fail_at, held_after(sent).size(), err.c_str());
+    }
+    std::vector<KeyEvent> sent;
+    int calls = 0;
+    std::string err;
+    bool released = true;
+    send_key_batch(ev, [&](const KeyEvent& k) { if (++calls == 3) return false; sent.push_back(k); return true; }, &err, &released);
+    CHECK(sent == std::vector<KeyEvent>({{SC_LCONTROL, true}, {SC_LSHIFT, true}, {SC_ESCAPE, false}, {SC_LSHIFT, false},
+                                         {SC_LCONTROL, false}}),
+          "the releases follow the failure, in reverse press order (the failed press released too)");
+    sent.clear();
+    calls = 0;
+    released = true;
+    bool ok = send_key_batch(ev, [&](const KeyEvent& k) { if (++calls >= 3) return false; sent.push_back(k); return true; }, &err,
+                             &released);
+    CHECK(!ok && !released && held_after(sent).size() == 2, "a release that fails is reported (Ctrl and Shift may be down)");
+    std::vector<KeyEvent> text;
+    Step s{STEP_TEXT, {0, 0, 0}, 0, "AB", 0};
+    step_keys(s, &text);
+    sent.clear();
+    calls = 0;
+    send_key_batch(text, [&](const KeyEvent& k) { if (++calls == 6) return false; sent.push_back(k); return true; }, &err, &released);
+    CHECK(released && held_after(sent).empty(), "Shift held for a capital is released");
+    // the link reconnects before it takes another batch
+    KeyQueue q;
+    uint64_t t = 0;
+    std::vector<KeyEvent> got;
+    CHECK(q.submit(ev, &t, &err) && q.take(&got), "queued and taken");
+    q.done(false, "key event 3 of 6 could not be sent", false);
+    CHECK(q.status(t, &err) == KeyQueue::FAILED, "failed");
+    CHECK(!q.submit(ev, &t, &err) && err == "a key may still be held down; the link reconnects first",
+          "no batch while a key may be held: %s", err.c_str());
+    q.fail("the connection ended");
+    CHECK(q.submit(ev, &t, &err), "a new connection takes batches again");
+    std::string rdp = source_text("rdp.cpp");
+    std::string drain = function_body(rdp, "bool RdpLink::drain_keys(");
+    std::string att = function_body(rdp, "std::string RdpLink::attempt(");
+    CHECK(count(drain, "send_key_batch(batch,") == 1 && count(drain, "keyq_.done(ok, err, released);") == 1 &&
+              count(drain, "return released;") == 1 && count(att, "if (!drain_keys(ctx)) {") == 1,
+          "drain_keys reports an unreleased key and the connection ends for a reconnect");
   }
 
   // ---- reconnecting
