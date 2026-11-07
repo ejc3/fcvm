@@ -110,6 +110,20 @@ async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether something holds a snapshot's memory file in use, as a release pass sees it: its
+/// exclusive lock is refused (`uffd::release`).
+fn memory_file_in_use(snapshot: &str) -> Result<bool> {
+    let path = fcvm::paths::snapshot_dir()
+        .join(snapshot)
+        .join("memory.bin");
+    let pass = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    match fs2::FileExt::try_lock_exclusive(&pass) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("locking {}", path.display())),
+    }
+}
+
 /// Write a marker into the container's writable layer and verify it.
 /// The exec helper already wraps argv in `sh -c "<joined>"`, so pass the redirect
 /// as plain tokens (a nested `sh -c` would double-wrap).
@@ -338,17 +352,25 @@ async fn test_restored_clone_reboot_comes_back_healthy() -> Result<()> {
         "restored clone missing the marker file: {restored}"
     );
 
+    // The File-backed VMM maps the snapshot's memory file and no memory server runs, so
+    // its VM manager holds the mark a release pass looks for (#1068).
+    assert!(
+        memory_file_in_use(&snap)?,
+        "a File-backed clone's snapshot memory file is not marked in use"
+    );
+
     reboot_and_assert_relaunch(clone_pid, &token).await?;
+
+    // The relaunch is a cold boot from the clone's disk and maps no snapshot: the mark
+    // went with the restored VMM, though the same fcvm process runs on.
+    assert!(
+        !memory_file_in_use(&snap)?,
+        "the restored VMM's memory mark outlived it across a reboot relaunch"
+    );
 
     common::kill_process(clone_pid).await;
     let _ = clone_child.kill().await;
-    let _ = std::fs::remove_dir_all(
-        std::env::var("FCVM_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs/root"))
-            .join("snapshots")
-            .join(&snap),
-    );
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
     Ok(())
 }
 

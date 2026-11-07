@@ -31,14 +31,19 @@
 //! and a snapshot that a running VM was only created from, or is the diff base of, has no
 //! server and is released.
 //!
-//! A restore whose VMM maps the memory file itself (the File backend) starts no server and
-//! holds no mark. A pass can drop the cached pages of that snapshot that the VMM has not
-//! touched yet, and that VM then reads them from disk. Pages the VMM has mapped stay.
+//! A restore whose VMM maps the memory file itself (the File backend) starts no server. Its
+//! VM manager holds the mark instead, for as long as that VMM process runs
+//! (`firecracker::vm::VmManager::mark_memory_in_use`), so a relaunch after a guest reboot or
+//! a cold boot after a rejected load does not keep it.
 //!
-//! A directory a snapshot create is still writing (`<tag>.creating`), or has just replaced
-//! (`<tag>.old`), is not an installed snapshot and is never touched: its creator holds the
-//! tag's lock, not a lock on that file, and a drop there would make the create read its own
-//! output back from disk.
+//! A snapshot create works in two directories beside the snapshot it writes: `<tag>.creating`
+//! holds the next generation and `<tag>.old` the one it replaces. Its creator holds the tag's
+//! lock (`<tag>.lock`) exclusively, not a lock on their memory files, and a drop there would
+//! make the create read its own output back from disk. A tag can also end in `.creating` or
+//! `.old` and be a complete snapshot of its own, so the name does not tell them apart and the
+//! lock does: a pass holds `<tag>.lock` shared, without waiting, while it works on such a
+//! directory, and leaves the directory alone when a create holds that lock. A directory a
+//! crashed create left behind holds no lock, nothing reads it, and it is released.
 //!
 //! `POSIX_FADV_DONTNEED` drops the clean pages of a file that no process has mapped. A
 //! snapshot in use is skipped whole all the same: the pages its server has read ahead and
@@ -56,9 +61,37 @@ use tracing::{info, warn};
 
 use crate::storage::snapshot::SNAPSHOT_MEMORY_FILE as MEMORY_FILE;
 
-/// The endings of the directories a snapshot create works in beside the installed
-/// snapshots (`commands::common::snapshot_sibling`).
-const NOT_INSTALLED: [&str; 2] = [".creating", ".old"];
+/// The suffixes `commands::common::snapshot_sibling` gives the directories a snapshot create
+/// works in beside the snapshot it writes.
+const STAGING_SUFFIXES: [&str; 2] = ["creating", "old"];
+
+/// The tag a directory named `name` would be the staging directory of, if any.
+fn staging_tag(name: &str) -> Option<&str> {
+    STAGING_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix)?.strip_suffix('.'))
+        .filter(|tag| !tag.is_empty())
+}
+
+/// Hold `tag`'s snapshot lock shared, without waiting, so no create of `tag` can start while
+/// a pass works on a directory that would be its staging directory. `None` when a create
+/// holds it. The lock file is created when it is missing, as every holder of it does: a
+/// create makes it before its staging directory, so a pass that found none and went on
+/// without it could miss a create that starts meanwhile.
+fn hold_unless_created(snapshot_dir: &Path, tag: &str) -> std::io::Result<Option<File>> {
+    let lock = crate::commands::common::snapshot_sibling(&snapshot_dir.join(tag), "lock");
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock)?;
+    match fs2::FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// How long a server waits between attempts while a pass holds its memory file.
 const IN_USE_RETRY: Duration = Duration::from_millis(10);
@@ -88,6 +121,9 @@ pub struct Released {
     pub released: u64,
     /// Memory files left alone because a reader holds them in use.
     pub in_use: u64,
+    /// Directories left alone because a snapshot create holds the lock of the tag they
+    /// would be the staging directory of.
+    pub staging: u64,
     /// Memory files the kernel refused the lock or the request for.
     pub failed: u64,
 }
@@ -130,7 +166,7 @@ fn release_with(
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if name == serving || NOT_INSTALLED.iter().any(|ending| name.ends_with(ending)) {
+        if name == serving {
             continue;
         }
         // Anything without a memory file is not one: a lock file beside the snapshots, a
@@ -138,19 +174,33 @@ fn release_with(
         let Ok(file) = File::open(entry.path().join(MEMORY_FILE)) else {
             continue;
         };
-        // Exclusive and without waiting: a reader's shared lock refuses it, and while this
-        // pass holds it a reader that starts waits in `mark_in_use`.
-        let outcome = match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => {
-                let outcome = advise(&file);
-                let _ = fs2::FileExt::unlock(&file);
-                outcome
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                done.in_use += 1;
+        // A directory that would be a staging directory of another tag: held until the drop
+        // below is done, so a create of that tag waits for it.
+        let no_create = match staging_tag(&name).map(|tag| hold_unless_created(snapshot_dir, tag)) {
+            None => Ok(None),
+            Some(Ok(Some(lock))) => Ok(Some(lock)),
+            Some(Ok(None)) => {
+                done.staging += 1;
                 continue;
             }
+            Some(Err(error)) => Err(error),
+        };
+        let outcome = match no_create {
             Err(error) => Err(error),
+            // Exclusive and without waiting: a reader's shared lock refuses it, and while
+            // this pass holds it a reader that starts waits in `mark_in_use`.
+            Ok(_no_create) => match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {
+                    let outcome = advise(&file);
+                    let _ = fs2::FileExt::unlock(&file);
+                    outcome
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    done.in_use += 1;
+                    continue;
+                }
+                Err(error) => Err(error),
+            },
         };
         match outcome {
             Ok(()) => done.released += 1,
@@ -173,6 +223,7 @@ fn release_with(
         serving,
         released = done.released,
         in_use = done.in_use,
+        staging = done.staging,
         failed = done.failed,
         "released the memory files of idle snapshots from the page cache"
     );
@@ -237,6 +288,7 @@ mod tests {
             Released {
                 released: 1,
                 in_use: 1,
+                staging: 0,
                 failed: 0
             }
         );
@@ -297,14 +349,25 @@ mod tests {
             .expect("the pass kept the file locked after it had moved on");
     }
 
+    /// The lock a snapshot create of `tag` holds exclusively for as long as it works in
+    /// `<tag>.creating` and `<tag>.old`.
+    fn creating(root: &Path, tag: &str) -> File {
+        let lock = File::create(root.join(format!("{tag}.lock"))).unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        lock
+    }
+
     /// A snapshot that is still being written, and the one a create has just replaced, sit
-    /// beside the installed snapshots under other names. A pass leaves both alone (#1067).
+    /// beside the installed snapshots under the names a tag could also have. While their
+    /// create holds the tag's lock a pass leaves both alone (#1067), and once it has gone,
+    /// what it left behind is released (#1068).
     #[test]
-    fn a_snapshot_that_is_being_written_or_was_just_replaced_is_left_alone() {
+    fn a_staging_directory_is_left_alone_while_its_create_holds_the_tag_lock() {
         let root = tempfile::tempdir_in(disk_dir()).unwrap();
         let writing = cached_snapshot(root.path(), "next.creating");
         let replaced = cached_snapshot(root.path(), "next.old");
         let idle = cached_snapshot(root.path(), "idle");
+        let create = creating(root.path(), "next");
         let before = (
             resident_pages(&writing, 0, LEN),
             resident_pages(&replaced, 0, LEN),
@@ -317,6 +380,7 @@ mod tests {
             Released {
                 released: 1,
                 in_use: 0,
+                staging: 2,
                 failed: 0
             }
         );
@@ -329,6 +393,78 @@ mod tests {
             before,
             "a pass dropped pages of a snapshot that a create is writing or has just replaced"
         );
+
+        drop(create);
+        let done = release_idle_snapshots(root.path(), "served");
+        assert_eq!((done.released, done.staging), (3, 0));
+        assert_eq!(
+            (
+                resident_pages(&writing, 0, LEN),
+                resident_pages(&replaced, 0, LEN)
+            ),
+            (0, 0),
+            "what a finished or crashed create left behind stayed in the page cache"
+        );
+    }
+
+    /// A tag may end in `.old` or `.creating` (#1068): with no create of `daily` running,
+    /// `daily.old` and `daily.creating` are snapshots of their own and are released like any.
+    #[test]
+    fn a_tag_that_ends_like_a_staging_directory_is_released() {
+        let root = tempfile::tempdir_in(disk_dir()).unwrap();
+        let old = cached_snapshot(root.path(), "daily.old");
+        let creating = cached_snapshot(root.path(), "daily.creating");
+
+        let done = release_idle_snapshots(root.path(), "served");
+
+        assert_eq!(
+            done,
+            Released {
+                released: 2,
+                in_use: 0,
+                staging: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(
+            (
+                resident_pages(&old, 0, LEN),
+                resident_pages(&creating, 0, LEN)
+            ),
+            (0, 0),
+            "a snapshot whose tag ends in .old or .creating stayed in the page cache"
+        );
+    }
+
+    /// A pass that found no create of `daily` running holds `daily.lock` while it drops
+    /// `daily.old`, so a create that starts meanwhile waits, instead of moving the snapshot
+    /// it replaces into `daily.old` while its pages are being dropped.
+    #[test]
+    fn a_create_cannot_start_while_a_pass_drops_a_directory_it_could_stage() {
+        let root = tempfile::tempdir_in(disk_dir()).unwrap();
+        let _old = cached_snapshot(root.path(), "daily.old");
+        let lock = root.path().join("daily.lock");
+        let mut refused_during_the_drop = None;
+
+        let done = release_with(root.path(), "served", |_file| {
+            let create = File::open(&lock).unwrap();
+            refused_during_the_drop = Some(
+                fs2::FileExt::try_lock_exclusive(&create)
+                    .err()
+                    .map(|error| error.kind()),
+            );
+            Ok(())
+        });
+
+        assert_eq!(done.released, 1);
+        assert_eq!(
+            refused_during_the_drop,
+            Some(Some(ErrorKind::WouldBlock)),
+            "a create could start while a pass was dropping a directory it could stage"
+        );
+        let create = File::open(&lock).unwrap();
+        fs2::FileExt::try_lock_exclusive(&create)
+            .expect("the pass kept the tag's lock after it had moved on");
     }
 
     #[test]
@@ -361,6 +497,7 @@ mod tests {
             Released {
                 released: 2,
                 in_use: 0,
+                staging: 0,
                 failed: 1
             }
         );

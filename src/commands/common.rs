@@ -3905,6 +3905,21 @@ pub async fn restore_from_snapshot(
             .await
             .context("post-start network setup")?;
 
+        // A File-backed restore maps the memory file in this VMM and starts no memory server,
+        // so this VMM's manager marks the file in use (`uffd::release`) for as long as the
+        // process runs. A memory server that starts for another snapshot then leaves its
+        // page cache alone. Best effort, like a server's mark: without it the restore works
+        // and may read pages from disk.
+        if let MemoryBackend::File { memory_path } = &restore_config.memory_backend {
+            if let Err(error) = vm_manager.mark_memory_in_use(memory_path).await {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "could not mark the memory file in use: a server that starts for another \
+                     snapshot may drop its cached pages"
+                );
+            }
+        }
+
         let client = vm_manager.client()?;
 
         // Load snapshot with configured memory backend and network override
@@ -7749,6 +7764,45 @@ mod tests {
             ".balloon_device()",
             "failpoint::hit_async(\"restore.post_network_pre_resume\")",
             "state: \"Resumed\".to_string()",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("the Firecracker restore has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "the Firecracker restore does not run {steps:?} in that order: offsets {offsets:?}"
+        );
+    }
+
+    /// A File-backed restore maps the memory file in its VMM and starts no memory server, so
+    /// its VM manager marks the file in use (`uffd::release`, #1068): after the VMM starts,
+    /// because a start ends the previous process's mark, and before the load, which is the
+    /// first read. A load Firecracker rejects ends in the kill below, which ends the mark
+    /// and closes the file before the cache path deletes the snapshot and cold-boots.
+    /// `the_memory_mark_ends_when_the_vmm_is_killed` and its siblings in
+    /// `firecracker::vm` pin the manager's side. No fake VMM can drive the restore, so the
+    /// order is pinned by its source.
+    #[test]
+    fn a_file_backed_restore_marks_its_memory_file_on_the_vmm_manager() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn restore_from_snapshot(")
+            .expect("no Firecracker restore");
+        let end = source[start..]
+            .find("pub async fn restore_from_snapshot_ch(")
+            .expect("no Cloud Hypervisor restore after the Firecracker one");
+        let body = &source[start..start + end];
+        let steps = [
+            ".start(&firecracker_bin, None, firecracker_args.as_deref())",
+            "MemoryBackend::File { memory_path } = &restore_config.memory_backend",
+            "vm_manager.mark_memory_in_use(memory_path)",
+            ".load_snapshot(",
+            "if let Err(e) = post_start {",
+            "Err(kill_err) = vm_manager.kill().await",
         ];
         let offsets: Vec<usize> = steps
             .iter()

@@ -2985,10 +2985,17 @@ separately.
   exclusively, without waiting, around each drop, so two servers that start together cannot
   drop each other's file, and the lock goes when its holder dies. fcvm's state is not asked:
   a server writes its state after it has started reading, and a running VM also names the
-  snapshots it was created from. A directory a create is still writing (`<tag>.creating`) or
-  has just replaced (`<tag>.old`) is never touched. A `snapshot run --snapshot` restore
-  through Firecracker's File backend starts no server, releases nothing and holds no mark, so
-  a pass can drop the cached pages of its snapshot that its VMM has not touched yet.
+  snapshots it was created from. A `snapshot run --snapshot` restore through Firecracker's
+  File backend starts no server and releases nothing; its VM manager holds the mark, on a
+  descriptor it owns, for as long as that VMM process runs (`VmManager::mark_memory_in_use`),
+  so it ends when the VMM exits, is killed, or is replaced by a relaunch after a guest reboot,
+  and a rejected load that the cache path follows with a delete and a cold boot keeps neither
+  the mark nor the file open. A memory server keeps the descriptor it marked for its whole
+  life, so its mark depends on no duplicate. A create works in `<tag>.creating` (the next
+  generation) and `<tag>.old` (the one it replaces) while it holds `<tag>.lock` exclusively,
+  and a tag may itself end in `.creating` or `.old`, so a pass tells them apart by the lock,
+  not the name: it holds `<tag>.lock` shared, without waiting, while it works on such a
+  directory, and leaves the directory alone when a create holds it.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len`, nanosecond `mtime`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would

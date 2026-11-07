@@ -123,6 +123,11 @@ pub struct VmManager {
     /// console (snapshot captured the UART mid-transmit).
     console_lines: Arc<std::sync::atomic::AtomicU64>,
     client: Option<FirecrackerClient>,
+    /// The snapshot memory file the running VMM maps itself (a File-backed restore), marked
+    /// in use (`uffd::release`) so that a memory server starting for another snapshot leaves
+    /// its page cache alone. It belongs to the VMM process, not to fcvm: it is dropped when
+    /// that process exits or is reaped, and when [`Self::start`] launches another one.
+    memory_in_use: Option<std::fs::File>,
 }
 
 impl VmManager {
@@ -143,7 +148,31 @@ impl VmManager {
             stderr_reader: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
+            memory_in_use: None,
         }
+    }
+
+    /// Mark the snapshot memory file this VMM maps in use for as long as this VMM process
+    /// runs (`uffd::release`).
+    ///
+    /// A File-backed restore maps `memory.bin` in the VMM and starts no memory server, so
+    /// nothing else holds the mark a release pass looks for. The mark is a shared `flock` on
+    /// a descriptor this manager owns; it ends when the process exits, is killed and reaped,
+    /// or is replaced by [`Self::start`], so neither a relaunch after a guest reboot nor a
+    /// cold boot after a rejected load keeps it, or keeps the file open.
+    pub async fn mark_memory_in_use(&mut self, memory_path: &Path) -> Result<()> {
+        anyhow::ensure!(
+            self.process.is_some(),
+            "no VMM process to mark {} in use for",
+            memory_path.display()
+        );
+        let file = std::fs::File::open(memory_path)
+            .with_context(|| format!("opening {} to mark it in use", memory_path.display()))?;
+        crate::uffd::mark_in_use(&file)
+            .await
+            .with_context(|| format!("marking {} in use", memory_path.display()))?;
+        self.memory_in_use = Some(file);
+        Ok(())
     }
 
     /// Counter of guest serial console lines seen since the Firecracker child
@@ -232,6 +261,8 @@ impl VmManager {
         config_override: Option<&Path>,
         firecracker_args: Option<&str>,
     ) -> Result<()> {
+        // A relaunch is another VMM process, and it maps no snapshot the previous one did.
+        self.memory_in_use = None;
         let log_level = firecracker_log_level(self.firecracker_log_level.as_deref())?;
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
@@ -558,6 +589,7 @@ impl VmManager {
             {
                 Some(status) => {
                     self.process = None;
+                    self.memory_in_use = None;
                     Ok(Some(status))
                 }
                 None => Ok(None),
@@ -579,6 +611,7 @@ impl VmManager {
                 .context("waiting for Firecracker process")?;
             // Process exited naturally, clear the handle
             self.process = None;
+            self.memory_in_use = None;
             Ok(status)
         } else {
             bail!("VM process not running")
@@ -607,6 +640,7 @@ impl VmManager {
         if let Some(mut process) = self.process.take() {
             let _ = process.wait().await;
         }
+        self.memory_in_use = None;
     }
 
     /// SIGKILL the Firecracker process and reap it. For callers that have nothing else to
@@ -1089,5 +1123,131 @@ mod tests {
             !console_target.contains("Kernel panic"),
             "the panic line was also logged under the console's target: {console_target:?}"
         );
+    }
+
+    /// A snapshot memory file for the mark tests.
+    fn memory_file(dir: &Path) -> PathBuf {
+        let path = dir.join("memory.bin");
+        std::fs::write(&path, vec![0xA5u8; 64 * 1024]).expect("write memory file");
+        path
+    }
+
+    /// Whether something holds `path` in use: a release pass's exclusive lock is refused.
+    fn marked(path: &Path) -> bool {
+        let pass = std::fs::File::open(path).expect("open as a release pass does");
+        match fs2::FileExt::try_lock_exclusive(&pass) {
+            Ok(()) => {
+                fs2::FileExt::unlock(&pass).expect("unlock");
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(error) => panic!("locking {}: {error}", path.display()),
+        }
+    }
+
+    /// Whether this process has `path` open: a deleted snapshot's memory file stays on
+    /// disk for as long as a descriptor of it does.
+    fn open_here(path: &Path) -> bool {
+        let path = path.canonicalize().expect("canonical memory file path");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("list this process's descriptors")
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+    }
+
+    /// Close a live `cat` child's stdin, so it exits on its own.
+    fn let_child_exit(vm: &mut VmManager) {
+        drop(
+            vm.process
+                .as_mut()
+                .expect("a live child")
+                .stdin
+                .take()
+                .expect("piped stdin"),
+        );
+    }
+
+    /// A guest reboot ends the VMM process and the relaunch is a cold boot in the same fcvm
+    /// process (#1068): the run loop's `wait` sees the exit. The mark ends with the process.
+    #[tokio::test]
+    async fn the_memory_mark_ends_when_the_vmm_exits() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let memory = memory_file(dir.path());
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        assert!(!marked(&memory), "control: nothing holds the file yet");
+
+        vm.mark_memory_in_use(&memory).await.expect("mark");
+        assert!(marked(&memory), "a running VMM's memory file is not marked");
+
+        let_child_exit(&mut vm);
+        vm.wait().await.expect("wait for the exit");
+        assert!(!marked(&memory), "the mark outlived the VMM process");
+        assert!(!open_here(&memory), "the memory file is still open");
+    }
+
+    /// The same through `try_wait`, which the restore and the clone run loop poll.
+    #[tokio::test]
+    async fn the_memory_mark_ends_when_try_wait_sees_the_exit() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let memory = memory_file(dir.path());
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        vm.mark_memory_in_use(&memory).await.expect("mark");
+
+        let_child_exit(&mut vm);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while vm.try_wait().expect("try_wait").is_none() {
+            assert!(std::time::Instant::now() < deadline, "cat did not exit");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!marked(&memory), "the mark outlived the VMM process");
+        assert!(!open_here(&memory), "the memory file is still open");
+    }
+
+    /// A snapshot load that Firecracker rejects ends with the restore killing the VMM, and
+    /// the cache path then deletes the snapshot and cold-boots in the same process (#1068).
+    /// The kill ends the mark and closes the file, so the deleted file does not stay open.
+    #[tokio::test]
+    async fn the_memory_mark_ends_when_the_vmm_is_killed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let memory = memory_file(dir.path());
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        vm.mark_memory_in_use(&memory).await.expect("mark");
+
+        vm.kill().await.expect("kill");
+        assert!(!marked(&memory), "the mark outlived the killed VMM");
+        assert!(!open_here(&memory), "the memory file is still open");
+    }
+
+    /// A relaunch starts another VMM process, which maps no snapshot: it does not inherit
+    /// the mark of the one before it, whether or not the start succeeds.
+    #[tokio::test]
+    async fn a_relaunch_does_not_inherit_the_memory_mark() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let memory = memory_file(dir.path());
+        let fake_fc = dir.path().join("fake-firecracker.sh");
+        std::fs::write(&fake_fc, "#!/bin/sh\nexit 2\n").expect("write fake firecracker");
+        std::fs::set_permissions(&fake_fc, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake firecracker");
+        let mut vm = manager_with_live_child(dir.path().join("api.sock"));
+        vm.mark_memory_in_use(&memory).await.expect("mark");
+        let mut previous = vm.process.take().expect("the live child");
+
+        let _ = vm.start(&fake_fc, None, None).await;
+        assert!(!marked(&memory), "the relaunched VMM inherited the mark");
+        assert!(!open_here(&memory), "the memory file is still open");
+        previous.kill().await.expect("stop the previous child");
+    }
+
+    /// A manager with no VMM process has nothing to give the mark a lifetime.
+    #[tokio::test]
+    async fn a_memory_mark_needs_a_running_vmm() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let memory = memory_file(dir.path());
+        let mut vm = VmManager::new("mark-test".to_string(), dir.path().join("api.sock"), None);
+        vm.mark_memory_in_use(&memory)
+            .await
+            .expect_err("a mark without a VMM process");
+        assert!(!marked(&memory));
+        assert!(!open_here(&memory));
     }
 }

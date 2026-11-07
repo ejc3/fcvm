@@ -994,8 +994,9 @@ pub struct UffdServer {
     /// prefetch on: minor mode reads the whole image into its memfd at startup, and prefetch
     /// off loads no recorded set. Cancelling or dropping the server stops a running one.
     warmer: Option<Warmer>,
-    /// The memory file, marked in use (`uffd::release`) until this server is dropped.
-    _in_use: Option<File>,
+    /// The memory file, marked in use (`uffd::release`) until this server is dropped: the
+    /// descriptor the mark was taken on, so the mark depends on no duplicate.
+    _in_use: Arc<File>,
     /// A COPY server's memory file, opened again for the walk that maps its holes, which
     /// [`UffdServer::run`] starts once the socket is bound. Taken by that start.
     hole_walk: std::sync::Mutex<Option<File>>,
@@ -1086,31 +1087,22 @@ impl UffdServer {
         let socket_path = &socket_path;
 
         // Open the memory snapshot file (shared across all VMs)
-        let mem_file = File::open(mem_file_path).context("opening memory file")?;
+        let mem_file = Arc::new(File::open(mem_file_path).context("opening memory file")?);
         let mem_size = mem_file.metadata()?.len() as usize;
 
         // Mark the memory file in use before any of it is read: a server that starts for
         // another snapshot drops from the page cache every memory file nothing holds
-        // (`uffd::release`). The duplicate shares the open file description and with it the
-        // lock, so the mark lasts as long as this server, whichever mode keeps `mem_file`.
-        let in_use = async {
-            super::release::mark_in_use(&mem_file).await?;
-            mem_file.try_clone()
+        // (`uffd::release`). The server keeps this descriptor until it is dropped and lends
+        // it to whichever mode reads the file, so the mark lasts as long as the server.
+        if let Err(error) = super::release::mark_in_use(&mem_file).await {
+            warn!(
+                target: "uffd",
+                snapshot = %snapshot_id,
+                error = %error,
+                "could not mark the memory file in use: a server that starts for another \
+                 snapshot may drop its cached pages"
+            );
         }
-        .await;
-        let in_use = match in_use {
-            Ok(file) => Some(file),
-            Err(error) => {
-                warn!(
-                    target: "uffd",
-                    snapshot = %snapshot_id,
-                    error = %error,
-                    "could not mark the memory file in use: a server that starts for another \
-                     snapshot may drop its cached pages"
-                );
-                None
-            }
-        };
 
         info!(
             target: "uffd",
@@ -1127,7 +1119,7 @@ impl UffdServer {
                 let mmap = unsafe {
                     MmapOptions::new()
                         .len(mem_size)
-                        .map(&mem_file)
+                        .map(&*mem_file)
                         .context("mmapping memory file")?
                 };
                 // The holes are mapped once `run` has bound the socket, from a description
@@ -1155,14 +1147,15 @@ impl UffdServer {
                         holes,
                         nv2,
                     },
-                    Some(mem_file),
+                    Some(Arc::clone(&mem_file)),
                     hole_walk,
                 )
             }
             UffdBacking::Minor { hugepages } => {
                 let (backing_file, holes) = tokio::task::spawn_blocking({
                     let id = snapshot_id.clone();
-                    move || create_backing_memfd(&id, mem_file, mem_size, hugepages)
+                    let mem_file = Arc::clone(&mem_file);
+                    move || create_backing_memfd(&id, &mem_file, mem_size, hugepages)
                 })
                 .await
                 .context("joining memfd population task")??;
@@ -1253,7 +1246,7 @@ impl UffdServer {
             record_window,
             replay_limit,
             warmer,
-            _in_use: in_use,
+            _in_use: mem_file,
             hole_walk: std::sync::Mutex::new(hole_walk),
         };
         // Copy mode reads every page it serves through the mapping, so with a cold page
@@ -5517,7 +5510,7 @@ async fn send_backing_fd(
 ///   holes there would silently destroy the sharing this whole path exists for.
 fn create_backing_memfd(
     snapshot_id: &str,
-    mut mem_file: File,
+    mut mem_file: &File,
     mem_size: usize,
     hugepages: bool,
 ) -> Result<(File, HoleMap)> {
@@ -6542,6 +6535,63 @@ mod tests {
             .expect("a dropped server still holds its memory file in use");
     }
 
+    /// A minor-mode server reads its memory file into a memfd and keeps no use of the file
+    /// after that, and it holds the mark until it is dropped all the same.
+    #[tokio::test]
+    async fn a_minor_server_holds_its_memory_file_in_use_until_it_is_dropped() {
+        let snapshot = RecordedSnapshot::new();
+        let pass = File::open(&snapshot.image).unwrap();
+
+        let server = snapshot
+            .serve(UffdBacking::Minor { hugepages: false }, Prefetch::Off)
+            .await;
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&pass)
+                .err()
+                .map(|error| error.kind()),
+            Some(std::io::ErrorKind::WouldBlock),
+            "a pass could take a running minor server's memory file to drop it"
+        );
+
+        drop(server);
+        fs2::FileExt::try_lock_exclusive(&pass)
+            .expect("a dropped server still holds its memory file in use");
+    }
+
+    /// The mark is on the descriptor the server keeps for its whole life (#1068). It was on
+    /// a duplicate made after the mark, and a server that could not make one served with no
+    /// mark. No test can make one `try_clone` fail, so the shape is pinned by the source:
+    /// `new` marks `mem_file`, makes no duplicate, and keeps `mem_file` itself.
+    #[test]
+    fn a_server_marks_the_descriptor_it_keeps() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("    pub async fn new(\n        snapshot_id: String,")
+            .expect("no UffdServer::new");
+        let end = start
+            + source[start..]
+                .find("        let server = Self {")
+                .expect("new builds no server");
+        let new = &source[start..end + 2000];
+        let field = source
+            .find("    _in_use: ")
+            .map(|at| &source[at..at + source[at..].find('\n').unwrap()])
+            .expect("the server has no `_in_use` field");
+        assert_eq!(field, "    _in_use: Arc<File>,");
+        assert!(
+            new.contains("mark_in_use(&mem_file)"),
+            "new marks no memory file"
+        );
+        assert!(
+            !source[start..end].contains("try_clone()"),
+            "new marks a descriptor and then duplicates one"
+        );
+        assert!(
+            new.contains("            _in_use: mem_file,"),
+            "the server does not keep the descriptor it marked"
+        );
+    }
+
     /// `--uffd-prefetch off` stays inert: with a recorded set sitting beside the image, the
     /// server builds no warmer and reads nothing.
     #[tokio::test]
@@ -6886,7 +6936,7 @@ mod tests {
     fn test_backing_memfd_is_sealed_and_read_only() {
         let (path, mem_size) = write_test_snapshot();
         let mem_file = File::open(&path).unwrap();
-        let (backing, _) = create_backing_memfd("seal-test", mem_file, mem_size, false).unwrap();
+        let (backing, _) = create_backing_memfd("seal-test", &mem_file, mem_size, false).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         // All four seals present.
@@ -6923,7 +6973,7 @@ mod tests {
         let (path, mem_size) = write_test_snapshot();
         let mem_file = File::open(&path).unwrap();
         let (backing, _) =
-            create_backing_memfd("seal-minor-test", mem_file, mem_size, false).unwrap();
+            create_backing_memfd("seal-minor-test", &mem_file, mem_size, false).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         // --- receive the fd exactly the way a clone's Firecracker does ---
@@ -7110,7 +7160,7 @@ mod tests {
         fn new(pages: &[u8]) -> (Self, Uffd) {
             let mem_size = pages.len() * Self::PAGE;
             let (backing, holes) =
-                create_backing_memfd("minor-clone", image_file(pages), mem_size, false)
+                create_backing_memfd("minor-clone", &image_file(pages), mem_size, false)
                     .expect("building the backing memfd");
             // SAFETY: a private mapping of a sealed memfd this test owns.
             let guest = unsafe { MmapOptions::new().map_copy(&backing) }
@@ -7232,7 +7282,7 @@ mod tests {
         image.rewind().expect("rewinding the image");
         let mem_size = 5 * PAGE + 100;
 
-        let (backing, holes) = create_backing_memfd("hole-map", image, mem_size, false)
+        let (backing, holes) = create_backing_memfd("hole-map", &image, mem_size, false)
             .expect("building the backing memfd");
 
         let marked: Vec<usize> = (0..8)
