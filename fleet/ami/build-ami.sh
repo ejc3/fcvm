@@ -53,18 +53,26 @@ ssm_sh() { # id, command: wait and print stdout and stderr; exit with its status
   A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query '[StandardOutputContent,StandardErrorContent]' --output text
   [ "$st" = Success ]
 }
+# within END ARGS...: aws in REGION, killed at END (epoch seconds); fails once END has passed.
+within() { local t=$(($1 - $(now))); shift; [ "$t" -gt 0 ] || return 1; timeout "$t" aws --region "$REGION" "$@"; }
 # ssm_try ID COMMAND SECONDS: ssm_sh that gives up after SECONDS. A command the agent never
 # picks up (an instance that did not come back from a reboot) stays Pending until its delivery
-# timeout, and ssm_sh waits all of it.
+# timeout, and ssm_sh waits all of it. Every AWS call is bounded by the time left, and output
+# that arrives after it is refused.
 ssm_try() {
-  local cid st=Pending end=$(($(now) + $3))
-  cid=$(ssm_send "$1" "$2" 30) || return 1
-  while [ "$(now)" -lt "$end" ]; do
-    st=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>/dev/null || echo Pending)
-    case "$st" in Pending|InProgress|Delayed) sleep 3 ;; *) break ;; esac
+  local cid st out params end=$(($(now) + $3))
+  params=$(jq -nc --arg c "$2" '{commands: [$c], executionTimeout: ["7200"]}')
+  cid=$(within "$end" ssm send-command --instance-ids "$1" --document-name AWS-RunShellScript \
+    --parameters "$params" --timeout-seconds 30 --query Command.CommandId --output text) || return 1
+  while :; do
+    st=$(within "$end" ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>/dev/null) || st=Pending
+    case "$st" in Pending|InProgress|Delayed) [ "$(now)" -lt "$end" ] || return 1; sleep 1 ;; *) break ;; esac
   done
   [ "$st" = Success ] || return 1
-  A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query StandardOutputContent --output text
+  out=$(within "$end" ssm get-command-invocation --command-id "$cid" --instance-id "$1" \
+    --query StandardOutputContent --output text) || return 1
+  [ "$(now)" -lt "$end" ] || return 1
+  printf '%s\n' "$out"
 }
 wait_ssm() {
   for _ in $(seq 1 120); do
@@ -151,7 +159,7 @@ reboot)
   sleep "${REBOOT_SETTLE:-60}"
   end=$(($(now) + ${REBOOT_WAIT:-900}))
   while [ "$(now)" -lt "$end" ]; do
-    sys=$(A ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
+    sys=$(within "$(($(now) + 30))" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
       --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null || true)
     [ "$sys" = impaired ] && { say "$2's system status check failed after the reboot (its EC2 host, not the instance): stop and start it, which moves it to other hardware and boots it"; exit 1; }
     left=$((end - $(now))); [ "$left" -le 60 ] || left=60

@@ -261,8 +261,9 @@ case "$args" in
   *" ec2 describe-instance-status "*) echo "${FAKE_SYSTEM_STATUS:-ok}" ;;
   *" ssm send-command "*) [ -n "${FAKE_SSM:-}" ] || { echo "fake aws: unexpected $*" >&2; exit 1; }; if [ -e "$FAKE_LOG.rebooted" ]; then echo cmd-after; else echo cmd-before; fi ;;
   *" ssm get-command-invocation "*"--query Status "*)
+    [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"
     case "$args" in *cmd-after*) [ -z "${FAKE_SSM_STUCK:-}" ] || { echo Pending; exit 0; } ;; esac; echo Success ;;
-  *" ssm get-command-invocation "*) case "$args" in *cmd-after*) echo boot-2 ;; *) echo boot-1 ;; esac ;;
+  *" ssm get-command-invocation "*) [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"; case "$args" in *cmd-after*) echo boot-2 ;; *) echo boot-1 ;; esac ;;
   *" ssm describe-instance-information "*) echo Online ;;
   # S3 in $FAKE_S3: a key is a file, its ETag beside it; put-object --if-none-match * creates
   # it only if absent, delete-object --if-match deletes it only at that ETag.
@@ -462,6 +463,11 @@ class GpuboxWallReserve(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertIn("no new boot on i-builder within 5 s", r.stderr)
         self.assertLess(time.time() - start, 120)
+        # A probe whose answer arrives after its budget does not count: a 3 s wait with
+        # 2 s API calls gets the new boot id only after 4 s.
+        r, _, _ = self.up(cmd=cmd, **{**fast, "REBOOT_WAIT": "3", "FAKE_SSM_SLOW": "2"})
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no new boot on i-builder within 3 s", r.stderr)
 
     def test_a_boot_measurement_goes_through_the_wall_reserve(self):
         # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave
