@@ -230,6 +230,16 @@ pub struct SnapshotMetadata {
     /// mode cannot be asked of such a snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guest_thp_restore: bool,
+    /// The source VM's `--dns`, which names the guest's resolver whatever host runs
+    /// it: `Some(None)` when it had none, and a restore gives the guest the restoring
+    /// host's resolvers. `None` is a snapshot made before this was recorded; read it
+    /// through [`SnapshotMetadata::source_dns_override`].
+    #[serde(
+        default,
+        deserialize_with = "crate::state::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dns_override: Option<Option<String>>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -335,6 +345,34 @@ fn is_zero(value: &usize) -> bool {
 }
 
 impl SnapshotMetadata {
+    /// The source VM's `--dns`, or `None` when this snapshot cannot say.
+    ///
+    /// A snapshot made before `dns_override` was recorded names its resolver only in
+    /// `network_config.dns_server`. In rootless mode that field is set by --dns and
+    /// nothing else (pasta reports no resolver of its own), so it is the override. In
+    /// bridged and routed mode it may be --dns or the resolver the host chose.
+    pub fn known_dns_override(&self) -> Option<Option<&str>> {
+        match &self.dns_override {
+            Some(recorded) => Some(recorded.as_deref()),
+            None if matches!(
+                self.network_mode,
+                crate::firecracker::FcNetworkMode::Rootless
+            ) =>
+            {
+                Some(self.network_config.dns_server.as_deref())
+            }
+            None => None,
+        }
+    }
+
+    /// The resolver a restore of this snapshot is given as its source's --dns. A
+    /// bridged or routed snapshot that cannot say keeps the resolver it recorded, as
+    /// every restore did when it was made.
+    pub fn source_dns_override(&self) -> Option<&str> {
+        self.known_dns_override()
+            .unwrap_or(self.network_config.dns_server.as_deref())
+    }
+
     /// The balloon device a cold boot from this snapshot attaches, or None when the
     /// source had no device: the recorded target and free page reporting switch.
     pub fn balloon_device(&self) -> Option<crate::firecracker::BalloonDevice> {
@@ -860,6 +898,7 @@ mod tests {
                 restore_hook: None,
                 guest_thp: None,
                 guest_thp_restore: false,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1067,6 +1106,7 @@ mod tests {
                 restore_hook: None,
                 guest_thp: None,
                 guest_thp_restore: false,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1157,6 +1197,7 @@ mod tests {
                     restore_hook: None,
                     guest_thp: None,
                     guest_thp_restore: false,
+                    dns_override: None,
                     hugepages: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
@@ -1234,6 +1275,7 @@ mod tests {
                 restore_hook: None,
                 guest_thp: None,
                 guest_thp_restore: false,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1436,6 +1478,7 @@ mod tests {
                 restore_hook: None,
                 guest_thp: None,
                 guest_thp_restore: false,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1594,6 +1637,7 @@ mod tests {
             restore_hook: None,
             guest_thp: None,
             guest_thp_restore: false,
+            dns_override: None,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],

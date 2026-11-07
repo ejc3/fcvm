@@ -297,6 +297,8 @@ pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
 /// The kernel FUSE session stays alive — processes see a brief hang, not errors.
 ///
+/// `metadata` is the restore document. Its fields, unpacked below:
+///
 /// `clone_ipv6`: For routed mode, the unique per-clone IPv6 that replaces the
 /// snapshot's shared guest IPv6 on eth0. Without this, all clones share the same
 /// IPv6 and return traffic gets ECMP-routed to the wrong clone.
@@ -308,15 +310,20 @@ pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// and that start is not counted: a restore that pages in from a cold memory file
 /// stalled long enough there to leave a clone 130 ms behind the host for 9 minutes
 /// (issue 1375).
+///
+/// `identity`: the restoring host's identity address and resolvers, which replace
+/// the preparing host's before egress opens.
 pub async fn handle_clone_restore(
     signals: &RestoreSignals,
-    clone_ipv6: Option<&str>,
+    metadata: &crate::types::LatestMetadata,
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
-    host_time: &str,
-    restore_hook: Option<&str>,
-    gpus: &[String],
 ) -> anyhow::Result<RestorePhases> {
+    let clone_ipv6 = metadata.clone_ipv6.as_deref();
+    let host_time = metadata.host_time_ns.as_str();
+    let restore_hook = metadata.restore_hook.as_deref();
+    let gpus = metadata.gpus.as_slice();
+    let identity = &metadata.identity;
     let restore_started = std::time::Instant::now();
     let mut phases = RestorePhases::default();
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
@@ -384,6 +391,25 @@ pub async fn handle_clone_restore(
         network::reconfigure_ipv6(new_ipv6).await;
     }
     phases.ipv6_ms = elapsed_ms(ipv6_started);
+
+    // Take the restoring host's identity: its host identity address on lo, and
+    // its resolvers. The guest booted with the preparing host's, and on another
+    // host both are wrong. Done here, before the boundary opens the gate's egress
+    // half and before the clock step: every daemon that reconnects once egress
+    // opens, and the restore hook that reloads daemons, must find the new
+    // identity, never the old. The new address is added before the old one is
+    // deleted, so lo always holds one. A failure keeps the clone unpublished.
+    let identity_started = std::time::Instant::now();
+    network::apply_host_identity(identity.host_ipv6.as_deref())
+        .await
+        .context("restore phase host-identity")?;
+    if let Some(ref dns) = identity.dns {
+        network::apply_restore_dns(dns).context("restore phase host-identity resolvers")?;
+    }
+    eprintln!(
+        "[fc-agent] restore phase=host-identity epoch={restore_epoch} elapsed_ms={:.3}",
+        elapsed_ms(identity_started)
+    );
     // ANNOUNCE, as early as possible. The host cannot forward a packet to this
     // clone until its namespace has learned the guest's MAC, and it only learns
     // that when the guest transmits. The old boundary got this for free: taking
@@ -1138,6 +1164,44 @@ mod tests {
              half and before it publishes: a step taken while egress is gated makes every daemon \
              whose lease ran out in the jump reconnect into the gate, whose reset ServiceRouter \
              takes as a definitive refusal. boundary={boundary} clock={clock} publish={publish}"
+        );
+    }
+
+    /// The restoring host's identity is in place before the boundary opens the
+    /// gate's egress half, before the clock step and before the restore hook:
+    /// the daemons that reconnect once egress opens, and the hook that reloads
+    /// daemons, must find the new identity, never the preparing host's.
+    #[test]
+    fn the_host_identity_is_replaced_before_egress_opens_and_before_the_hook() {
+        let body = handle_clone_restore_source();
+        let identity = body
+            .find("network::apply_host_identity(identity.host_ipv6.as_deref())")
+            .expect("the restore path no longer replaces the host identity address");
+        let fail_closed = body
+            .find(".context(\"restore phase host-identity\")?")
+            .expect("the restore path no longer fails closed on a host identity error");
+        let dns = body
+            .find("network::apply_restore_dns(dns).context(\"restore phase host-identity resolvers\")?")
+            .expect("the restore path no longer gives the guest the restoring host's resolvers, or no longer fails closed when it cannot");
+        let boundary = body
+            .find("crate::snapshot_network::restore_snapshot_network(")
+            .expect("the restore path no longer runs the snapshot boundary");
+        let clock = body
+            .find("crate::bootplan::sync_clock_from_host()")
+            .expect("the restore path no longer steps the clock");
+        let publish = body
+            .find(".publish(restore_hook)")
+            .expect("the restore path no longer publishes");
+        assert!(
+            identity < fail_closed
+                && fail_closed < boundary
+                && dns < boundary
+                && boundary < clock
+                && clock < publish,
+            "the host identity and resolvers must be replaced before the boundary opens \
+             egress, the clock steps and the hook runs: identity={identity} \
+             fail_closed={fail_closed} dns={dns} boundary={boundary} clock={clock} \
+             publish={publish}"
         );
     }
 

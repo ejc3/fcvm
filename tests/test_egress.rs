@@ -605,7 +605,7 @@ async fn test_routed_run_under_a_new_prefix_reuses_its_snapshot() -> Result<()> 
     test_server.stop().await;
     for key in keys {
         for snapshot in [
-            fcvm::commands::podman::startup_snapshot_key(&key, None),
+            fcvm::commands::podman::startup_snapshot_key(&key, None, None),
             key.clone(),
         ] {
             if common::snapshot_exists(&snapshot) {

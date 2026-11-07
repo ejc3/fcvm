@@ -192,8 +192,10 @@ function RestartIcon() {
   );
 }
 
-export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: string }) {
-  const client = useMemo(() => new WallClient(coordUrl), [coordUrl]);
+export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; directUrl: string | null; mediaUrl: string }) {
+  // The poster stays on coordUrl: a fetch from the frame worker to the coordinator's own host
+  // carries no Access cookie.
+  const client = useMemo(() => new WallClient(coordUrl, undefined, directUrl), [coordUrl, directUrl]);
   const poster = useMemo(() => posterUrl(coordUrl), [coordUrl]);
   // A coordinator with no poster yet (just restarted) answers 404: show no image rather than
   // the browser's broken-image icon.

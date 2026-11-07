@@ -3,7 +3,11 @@
 // events in and view models out.
 
 import {
+  afterLiveFailure,
   cameraTargets,
+  FIRST_LIVE_TRY,
+  LIVE_OPEN_DEADLINE_MS,
+  type LiveTry,
   FAMILY_PROBE_ATTEMPTS,
   FAMILY_PROBE_MS,
   FAMILY_PROBE_RETRY_MS,
@@ -113,7 +117,10 @@ export class WallClient {
   /** Failed probes so far, and the timer for the next one. */
   private probeFailures = 0;
   private probeRetry: ReturnType<typeof setTimeout> | null = null;
-  readonly url: string;
+  /** The /live URLs, fastest first (core/net.ts, LiveTry); the last is the page's own origin when it has two. */
+  readonly urls: readonly string[];
+  private live: LiveTry = FIRST_LIVE_TRY;
+  private openDeadline: ReturnType<typeof setTimeout> | null = null;
   /** In broadcast mode, the frame the player presented last (set by the player, read each draw). */
   shown: ShownFrame | null = null;
   /** The snapshot the overlay drew for that frame, kept while the picture is frozen. */
@@ -121,8 +128,13 @@ export class WallClient {
   /** The tiles whose renderers the address-family probe tries: the wall's, or the phones' in phones mode. */
   private probeTiles: (st: FleetState) => readonly Tile[];
 
-  constructor(url: string, probeTiles: (st: FleetState) => readonly Tile[] = (st) => st.tiles) {
-    this.url = url;
+  /** The /live URL in use, or to be tried next. */
+  get url(): string {
+    return this.urls[this.live.index]!;
+  }
+
+  constructor(url: string, probeTiles: (st: FleetState) => readonly Tile[] = (st) => st.tiles, directUrl: string | null = null) {
+    this.urls = directUrl === null ? [url] : [directUrl, url];
     this.probeTiles = probeTiles;
   }
 
@@ -269,6 +281,7 @@ export class WallClient {
     if (this.probeRetry) clearTimeout(this.probeRetry);
     if (this.pingTimer) clearTimeout(this.pingTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.clearOpenDeadline();
     if (this.noticeTimer) clearInterval(this.noticeTimer);
     this.ws?.close();
     this.ws = null;
@@ -290,8 +303,46 @@ export class WallClient {
     this.dispatch({ type: "socket", status: "connecting", at: now() });
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    let opened = false;
+    let ended = false;
+    // The socket's end, once: a close, or before it opened an error or the deadline. Not every
+    // WebSocket implementation fires close after a refused handshake (Node's fires only error).
+    const end = () => {
+      if (ended || this.ws !== ws) return;
+      ended = true;
+      this.ws = null;
+      this.clearOpenDeadline();
+      if (this.pingTimer) clearTimeout(this.pingTimer);
+      this.dispatch({ type: "socket", status: "closed", at: now() });
+      if (this.stopped) return;
+      if (!opened) {
+        try {
+          ws.close();
+        } catch {
+          // Already closed.
+        }
+        const { next, now: atOnce } = afterLiveFailure(this.live, this.urls.length);
+        this.live = next;
+        if (atOnce) {
+          this.connect();
+          return;
+        }
+      }
+      this.reconnectTimer = setTimeout(() => this.connect(), reconnectDelayMs(this.attempt++));
+    };
+    // A URL that is not the last gets a deadline: the next one is tried rather than waited on.
+    if (this.live.index < this.urls.length - 1) {
+      this.openDeadline = setTimeout(() => {
+        this.openDeadline = null;
+        if (!opened) end();
+      }, LIVE_OPEN_DEADLINE_MS);
+    }
     ws.onopen = () => {
+      if (ended) return;
+      opened = true;
+      this.clearOpenDeadline();
       this.attempt = 0;
+      this.live = { index: this.live.index, failedInRow: 0 };
       this.dispatch({ type: "socket", status: "open", at: now() });
       ws.send(seatMessage(savedSeat(), this.opened));
       this.opened = true;
@@ -302,14 +353,15 @@ export class WallClient {
     ws.onmessage = (e) => {
       if (typeof e.data === "string") this.dispatch({ type: "message", text: e.data, at: now() });
     };
-    ws.onclose = () => {
-      if (this.ws !== ws) return;
-      this.ws = null;
-      if (this.pingTimer) clearTimeout(this.pingTimer);
-      this.dispatch({ type: "socket", status: "closed", at: now() });
-      if (!this.stopped) this.reconnectTimer = setTimeout(() => this.connect(), reconnectDelayMs(this.attempt++));
+    ws.onclose = end;
+    ws.onerror = () => {
+      if (!opened) end();
     };
-    ws.onerror = () => {};
+  }
+
+  private clearOpenDeadline(): void {
+    if (this.openDeadline) clearTimeout(this.openDeadline);
+    this.openDeadline = null;
   }
 
   private ping(): void {

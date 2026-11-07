@@ -2053,25 +2053,88 @@ pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotR
 }
 
 /// The routed network a clone restores into, before its preflight and loopback
-/// allocation: in restore mode, with the resolver the snapshot recorded, its
-/// forwarded localhost ports, and the prefix this run was given.
+/// allocation: in restore mode, with this host's IPv6 resolver (`restore_resolvers`),
+/// the snapshot's forwarded localhost ports, and the prefix this run was given.
 fn routed_network_for_restore(
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<crate::network::PortMapping>,
     meta: &crate::storage::SnapshotMetadata,
+    ipv6_dns: Option<String>,
     restore_prefix: Option<String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
 ) -> RoutedNetwork {
     let mut net = RoutedNetwork::new(vm_id, tap_device, port_mappings)
         .with_restore_mode()
         .with_ipv6_address(ipv6_address)
-        .with_ipv6_dns(meta.network_config.dns_server.clone())
+        .with_ipv6_dns(ipv6_dns)
         .with_forward_localhost(meta.forward_localhost.clone());
     if let Some(prefix) = restore_prefix {
         net = net.with_ipv6_prefix(prefix);
     }
     net
+}
+
+/// The resolvers a restore on this host gives its guest, chosen as a boot on this
+/// host chooses them (`podman run`'s network setup and `build_runtime_boot_args`).
+struct RestoreResolvers {
+    /// The network mode's resolver: the source's --dns, else bridged mode's first
+    /// host resolver or routed mode's first IPv6 one; rootless makes no choice.
+    mode_server: Option<String>,
+    /// This host's resolv.conf, narrowed for the mode (`GuestBootInputs::for_launch`).
+    inputs: super::podman::GuestBootInputs,
+}
+
+/// `inputs` is this host's `GuestBootInputs`, resolved with the source's --dns and
+/// narrowed for `mode`.
+fn restore_resolvers(
+    mode: FcNetworkMode,
+    dns_override: Option<&str>,
+    inputs: super::podman::GuestBootInputs,
+) -> RestoreResolvers {
+    let chosen = match mode {
+        FcNetworkMode::Bridged => inputs.host_dns().into_iter().next(),
+        FcNetworkMode::Routed => crate::network::first_ipv6_nameserver(&inputs.dns),
+        FcNetworkMode::Rootless => None,
+    };
+    RestoreResolvers {
+        mode_server: dns_override.map(str::to_string).or(chosen),
+        inputs,
+    }
+}
+
+impl RestoreResolvers {
+    /// The resolvers the restore document gives the guest, or None to leave its
+    /// resolv.conf as it is. None when a bridged or routed host has no resolver
+    /// for the mode: a bridged boot would refuse to start, and a routed boot
+    /// would probe the AWS VPC resolver, a 2 s timeout a restore does not pay.
+    fn guest_dns(&self, mode: FcNetworkMode) -> Option<super::podman::GuestDns> {
+        if !matches!(mode, FcNetworkMode::Rootless) && self.mode_server.is_none() {
+            return None;
+        }
+        Some(super::podman::guest_dns(
+            self.mode_server.as_deref(),
+            &self.inputs.host_dns(),
+            &self.inputs.dns_search(),
+        ))
+    }
+}
+
+/// The resolvers the restore document gives the guest.
+///
+/// A snapshot that cannot say what its source's --dns was (a bridged or routed one
+/// made before `dns_override` was recorded) gives none, which leaves the guest's
+/// resolv.conf as it is, as every restore did when it was made: its recorded
+/// resolver may be the source's --dns or the one its host chose, and rewriting
+/// resolv.conf from it as an override would drop the search domains the guest
+/// booted with.
+fn restore_document_dns(
+    meta: &crate::storage::SnapshotMetadata,
+    resolvers: &RestoreResolvers,
+    mode: FcNetworkMode,
+) -> Option<super::podman::GuestDns> {
+    meta.known_dns_override()?;
+    resolvers.guest_dns(mode)
 }
 
 /// The prefix a routed clone's address is derived from: the one this run was given
@@ -2616,16 +2679,25 @@ async fn cmd_snapshot_run_inner(
     }
 
     let restore_prefix = restore_ipv6_prefix(network_mode, args.ipv6_prefix.as_ref());
+    // The resolvers a boot on this host would give the guest. The network is given
+    // the mode's resolver, and the restore document gives the guest all of them
+    // (`RestoreIdentity::dns`): the snapshot's are the preparing host's, which
+    // another host's network may not reach.
+    let resolvers = restore_resolvers(
+        network_mode,
+        snapshot_config.metadata.source_dns_override(),
+        super::podman::GuestBootInputs::resolve(
+            snapshot_config.metadata.source_dns_override(),
+            &runtime_config,
+        )
+        .for_launch(network_mode, &[]),
+    );
     // Setup networking based on mode - reuse guest_ip from snapshot if available
     let network: Box<dyn NetworkManager> = match network_mode {
         FcNetworkMode::Bridged => {
-            // The clone reports the resolver the snapshot captured, not the
-            // restore host's current one: the guest's resolv.conf is already
-            // baked into the restored memory, and the reboot plan deliberately
-            // re-bakes the captured value (see run_args_from_snapshot_metadata).
             let mut net =
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_dns_server(saved_network.dns_server.clone());
+                    .with_dns_server(resolvers.mode_server.clone());
             // If snapshot has saved network config with guest_ip, use it
             if let Some(ref guest_ip) = saved_network.guest_ip {
                 net = net.with_guest_ip(guest_ip.clone());
@@ -2642,6 +2714,7 @@ async fn cmd_snapshot_run_inner(
                 tap_device.clone(),
                 port_mappings.clone(),
                 &snapshot_config.metadata,
+                resolvers.mode_server.clone(),
                 restore_prefix.clone(),
                 args.ipv6_address,
             );
@@ -2668,14 +2741,14 @@ async fn cmd_snapshot_run_inner(
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict.
             //
-            // The clone's pasta is wired for the resolver the snapshot baked,
-            // the same value the reboot plan re-bakes into the guest's
-            // resolv.conf. A golden made with --dns 10.0.2.2 restores with
-            // pasta's DNS special case off, so its guests keep reaching the
-            // host loopback service the golden was recorded against.
+            // The clone's pasta is wired for the source's --dns, which the reboot
+            // plan also re-bakes into the guest's resolv.conf. A golden made with
+            // --dns 10.0.2.2 restores with pasta's DNS special case off, so its
+            // guests keep reaching the host loopback service the golden was
+            // recorded against.
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip)
-                .with_dns_server(saved_network.dns_server.clone())
+                .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode();
             Box::new(net)
         }
@@ -2735,6 +2808,13 @@ async fn cmd_snapshot_run_inner(
     );
     vm_state.config.guest_thp_restore = snapshot_config.metadata.guest_thp_restore;
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
+    // The source's --dns goes with the guest, so a snapshot of this clone keeps it.
+    // When the snapshot cannot say, neither does the clone, and its network reports
+    // the recorded resolver for a snapshot of it to fall back to.
+    vm_state.config.dns_override = snapshot_config
+        .metadata
+        .known_dns_override()
+        .map(|known| known.map(str::to_string));
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
@@ -3084,6 +3164,13 @@ async fn cmd_snapshot_run_inner(
     // a clone that asked for none gets the kernel's own back.
     restore_latest["transparent-hugepage"] =
         serde_json::Value::String(restore_thp_mode(&vm_state.config.guest_thp));
+    // This host's identity, which the guest takes before its restore hook runs: the
+    // host identity address it was given and the resolvers chosen above.
+    let restore_identity = super::common::RestoreIdentity {
+        host_ipv6: args.host_ipv6,
+        dns: restore_document_dns(&snapshot_config.metadata, &resolvers, network_mode),
+    };
+    restore_identity.write_into(&mut restore_latest);
     let bootplan_socket = format!(
         "{}_{}",
         clone_vsock_base.display(),
@@ -3121,6 +3208,7 @@ async fn cmd_snapshot_run_inner(
         firecracker_choice,
         balloon_target_mib: args.balloon,
         gpus: &gpus,
+        identity: &restore_identity,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
@@ -3765,6 +3853,7 @@ async fn cmd_snapshot_run_inner(
                                 args.non_blocking_output,
                                 vm_state.config.ipv6_prefix.as_ref(),
                                 args.ipv6_address,
+                                args.host_ipv6,
                                 &network_config,
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
@@ -3925,7 +4014,7 @@ async fn cmd_snapshot_run_inner(
                     startup_rx = None;
 
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
-                        let startup_key = startup_snapshot_key(base_key, args.balloon);
+                        let startup_key = startup_snapshot_key(base_key, args.balloon, args.host_ipv6);
 
                         // Skip if startup snapshot already exists. The startup-snapshot cache
                         // path is Firecracker-specific (diff snapshots via create_snapshot_core)
@@ -4184,6 +4273,7 @@ async fn build_clone_reboot_plan(
     non_blocking_output: bool,
     ipv6_prefix: Option<&String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
+    host_ipv6: Option<std::net::Ipv6Addr>,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
@@ -4217,6 +4307,7 @@ async fn build_clone_reboot_plan(
         ipv6_address,
         meta.restore_hook.clone(),
         guest_thp,
+        host_ipv6,
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -4296,6 +4387,10 @@ async fn build_clone_reboot_plan(
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
 /// line inherits (`per_restore_setting`); for the reboot plan the clone's own.
+///
+/// `host_ipv6` is the restoring host's identity address (`snapshot run --host-ipv6`),
+/// given to the cold boot as its `HOST_IPV6`, which fc-agent adds to the guest's lo
+/// (and eth0 outside routed mode), as a restore gives it to a memory-restored clone.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -4310,6 +4405,7 @@ fn run_args_from_snapshot_metadata(
     ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
     guest_thp: Option<String>,
+    host_ipv6: Option<std::net::Ipv6Addr>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -4347,10 +4443,10 @@ fn run_args_from_snapshot_metadata(
         .collect();
 
     RunArgs {
-        // The captured resolver, not None: fc-agent rewrites resolv.conf on a
-        // cold boot from this synthesized config, and falling back to the
-        // current host DNS would silently replace what the snapshot baked in.
-        dns: meta.network_config.dns_server.clone(),
+        // The source's --dns, which names the guest's resolver on any host.
+        // Without one the cold boot gives the guest this host's resolvers, as
+        // a restore does (`RestoreIdentity::dns`).
+        dns: meta.source_dns_override().map(str::to_string),
         name,
         cpu,
         mem,
@@ -4368,7 +4464,10 @@ fn run_args_from_snapshot_metadata(
         env: match (&meta.user, &meta.username) {
             (Some(_), Some(username)) => vec![format!("USER={username}")],
             _ => vec![],
-        },
+        }
+        .into_iter()
+        .chain(host_ipv6.map(|address| format!("HOST_IPV6={address}")))
+        .collect(),
         cmd: None,
         publish,
         balloon: balloon.map(|device| device.target_mib),
@@ -4555,6 +4654,7 @@ async fn cmd_snapshot_run_disk_only(
             args.inherit_recorded_hook,
             meta.guest_thp.as_deref(),
         ),
+        args.host_ipv6,
     );
 
     info!(
@@ -5131,21 +5231,22 @@ mod tests {
         );
     }
 
-    /// A routed clone's network is in restore mode and carries what the
-    /// snapshot recorded (its resolver and forwarded localhost ports) and the
-    /// prefix this run was given. Without the mode, `RoutedNetwork::setup`
-    /// probes the AWS VPC resolver, a 2 s timeout on every host outside such a
-    /// VPC, whenever the snapshot recorded no resolver.
+    /// A routed clone's network is in restore mode and carries this host's
+    /// resolver, the snapshot's forwarded localhost ports and the prefix this run
+    /// was given. Without the mode, `RoutedNetwork::setup` probes the AWS VPC
+    /// resolver, a 2 s timeout on every host outside such a VPC, whenever the
+    /// host names no IPv6 resolver.
     #[test]
-    fn a_routed_restore_carries_the_snapshots_resolver() {
+    fn a_routed_restore_carries_this_hosts_resolver() {
         let mut meta = metadata_fixture();
-        meta.network_config.dns_server = Some("2001:db8::53".to_string());
+        meta.network_config.dns_server = Some("2001:db8:a::53".to_string());
         meta.forward_localhost = vec![3300, 4026];
         let net = routed_network_for_restore(
             "vm-restore".to_string(),
             "tap-vm-resto".to_string(),
             Vec::new(),
             &meta,
+            Some("2001:db8::53".to_string()),
             Some("2001:db8:1::/64".to_string()),
             Some("2001:db8:1::7".parse().unwrap()),
         );
@@ -5156,7 +5257,7 @@ mod tests {
         assert_eq!(
             net.ipv6_dns(),
             Some("2001:db8::53"),
-            "the restore's network must carry the snapshot's resolver"
+            "the restore's network must carry this host's resolver, not the snapshot's"
         );
         assert_eq!(net.forward_localhost(), &[3300, 4026]);
         assert_eq!(net.ipv6_prefix(), Some("2001:db8:1::/64"));
@@ -5196,6 +5297,7 @@ mod tests {
                 false,
                 None,
                 given,
+                None,
                 None,
                 None,
                 None,
@@ -5267,6 +5369,7 @@ mod tests {
             restore_hook: None,
             guest_thp: None,
             guest_thp_restore: false,
+            dns_override: Some(None),
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],
@@ -5312,6 +5415,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -5339,30 +5443,35 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
-        // The captured resolver must survive into a cold boot: fc-agent
-        // rewrites resolv.conf from these synthesized args, and dns: None
-        // means "current host DNS", silently replacing what the snapshot
-        // baked in.
+        // The source's --dns survives into a cold boot; a resolver the source
+        // took from its host does not, so the cold boot gives the guest this
+        // host's, as a restore does.
         let mut meta_dns = meta.clone();
         meta_dns.network_config.dns_server = Some("192.0.2.53".to_string());
-        let args_dns = run_args_from_snapshot_metadata(
-            &meta_dns,
-            &[],
-            "c".to_string(),
-            1,
-            512,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
+        let synth = |meta: &crate::storage::SnapshotMetadata| {
+            run_args_from_snapshot_metadata(
+                meta,
+                &[],
+                "c".to_string(),
+                1,
+                512,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(synth(&meta_dns).dns, None);
+        meta_dns.dns_override = Some(Some("192.0.2.53".to_string()));
+        assert_eq!(synth(&meta_dns).dns.as_deref(), Some("192.0.2.53"));
 
         // The clone's own port mappings come back out of the specs written here,
         // host address included: a disk-only clone sets its network up from them.
@@ -5378,6 +5487,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5415,6 +5525,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5458,6 +5569,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -5474,6 +5586,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5518,6 +5631,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5864,6 +5978,7 @@ mod tests {
             map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,
+            host_ipv6: None,
             gpu: vec![],
         };
 
@@ -5917,6 +6032,249 @@ mod tests {
         );
     }
 
+    /// Both restore transports carry the restoring host's identity: the restore-only
+    /// vsock document, written before the listener that serves it starts, and the
+    /// Firecracker MMDS mirror, written before it is put.
+    #[test]
+    fn both_restore_documents_carry_the_restoring_hosts_identity() {
+        let snapshot = include_str!("snapshot.rs");
+        let written = snapshot
+            .find("restore_identity.write_into(&mut restore_latest);")
+            .expect("the vsock restore document no longer carries the host identity");
+        let served = snapshot
+            .find("super::podman::spawn_bootplan_listener(\n        &bootplan_socket,\n        &restore_latest")
+            .expect("the restore boot-plan listener is no longer spawned");
+        assert!(written < served, "written={written} served={served}");
+
+        let common = include_str!("common.rs");
+        let mirrored = common
+            .find("identity.write_into(&mut mmds_latest);")
+            .expect("the MMDS mirror no longer carries the host identity");
+        let put = common[mirrored..]
+            .contains(".put_mmds(serde_json::json!({ \"latest\": mmds_latest }))");
+        assert!(
+            put,
+            "the MMDS mirror must be put after the identity is written"
+        );
+    }
+
+    fn host_inputs(groups: &[(&[&str], &[&str])]) -> crate::commands::podman::GuestBootInputs {
+        crate::commands::podman::GuestBootInputs {
+            dns: groups
+                .iter()
+                .map(|(servers, search)| crate::network::ResolverGroup {
+                    servers: servers.iter().map(|s| s.to_string()).collect(),
+                    search_domains: search.iter().map(|s| s.to_string()).collect(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn dns(servers: &[&str], search: &[&str]) -> crate::commands::podman::GuestDns {
+        crate::commands::podman::GuestDns {
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+            search: search.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A restore gives the guest the resolvers a boot on the restoring host would:
+    /// bridged mode's first host resolver with its search domains, routed mode's
+    /// first IPv6 one, and in rootless mode every one. The snapshot's resolvers
+    /// are the preparing host's and appear nowhere.
+    #[test]
+    fn a_restore_gives_the_guest_this_hosts_resolvers() {
+        let inputs = || {
+            host_inputs(&[
+                (&["10.9.0.2"], &["restore.example"]),
+                (&["2001:db8:9::53"], &["v6.example"]),
+            ])
+        };
+        let guest_dns = |mode: FcNetworkMode| {
+            restore_resolvers(mode, None, inputs().for_launch(mode, &[])).guest_dns(mode)
+        };
+        assert_eq!(
+            guest_dns(FcNetworkMode::Bridged),
+            Some(dns(&["10.9.0.2"], &["restore.example"]))
+        );
+        assert_eq!(
+            guest_dns(FcNetworkMode::Routed),
+            Some(dns(&["2001:db8:9::53"], &["v6.example"]))
+        );
+        assert_eq!(
+            guest_dns(FcNetworkMode::Rootless),
+            Some(dns(
+                &["10.9.0.2", "2001:db8:9::53"],
+                &["restore.example", "v6.example"]
+            ))
+        );
+    }
+
+    /// A cold boot of a snapshot (a disk-only clone, and the relaunch of a
+    /// memory-restored clone whose guest rebooted) gives the guest the restoring
+    /// host's identity address as its `HOST_IPV6`, as a memory restore does, and
+    /// none when the run names none.
+    #[test]
+    fn cold_boot_plans_carry_the_restoring_hosts_identity() {
+        let mut meta = metadata_fixture();
+        meta.user = Some("1000:1000".to_string());
+        meta.username = Some("builder".to_string());
+        let synth = |host_ipv6: Option<std::net::Ipv6Addr>| {
+            run_args_from_snapshot_metadata(
+                &meta,
+                &[],
+                "c".to_string(),
+                1,
+                512,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                host_ipv6,
+            )
+            .env
+        };
+        assert_eq!(
+            synth(Some("2001:db8:b::1".parse().unwrap())),
+            ["USER=builder", "HOST_IPV6=2001:db8:b::1"]
+        );
+        assert_eq!(synth(None), ["USER=builder"]);
+
+        let code: String = {
+            let source = include_str!("snapshot.rs");
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        let body = |start: &str, end: &str| -> String {
+            let at = code
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} is gone"));
+            code[at..at + code[at..].find(end).unwrap()].to_string()
+        };
+        assert!(
+            body("letrun_args=run_args_from_snapshot_metadata(", ");").ends_with("args.host_ipv6,"),
+            "a disk-only clone no longer cold-boots with this run's host identity"
+        );
+        assert!(
+            body("matchbuild_clone_reboot_plan(", "&network_config,")
+                .ends_with("args.ipv6_address,args.host_ipv6,"),
+            "a clone's reboot plan no longer carries this run's host identity"
+        );
+        assert!(
+            body("letsynth_args=run_args_from_snapshot_metadata(", ");").ends_with("host_ipv6,"),
+            "build_clone_reboot_plan no longer passes its host identity on"
+        );
+    }
+
+    /// The source's --dns names the guest's resolver on every host, and a routed
+    /// host with no IPv6 resolver leaves resolv.conf alone rather than probe.
+    #[test]
+    fn a_restore_keeps_the_sources_dns_override_and_never_probes() {
+        let overridden = restore_resolvers(
+            FcNetworkMode::Bridged,
+            Some("192.0.2.53"),
+            crate::commands::podman::GuestBootInputs::default(),
+        );
+        assert_eq!(overridden.mode_server.as_deref(), Some("192.0.2.53"));
+        assert_eq!(
+            overridden.guest_dns(FcNetworkMode::Bridged),
+            Some(dns(&["192.0.2.53"], &[]))
+        );
+        let v4_only = host_inputs(&[(&["10.9.0.2"], &["restore.example"])])
+            .for_launch(FcNetworkMode::Routed, &[]);
+        let routed = restore_resolvers(FcNetworkMode::Routed, None, v4_only);
+        assert_eq!(routed.mode_server, None);
+        assert_eq!(routed.guest_dns(FcNetworkMode::Routed), None);
+    }
+
+    /// A snapshot made before `dns_override` was recorded names its resolver only in
+    /// `network_config.dns_server`, which held the source's --dns when it had one (a
+    /// rootless golden made with `--dns 10.0.2.2` among them). It keeps that
+    /// resolver, as every restore did before, so its pasta still turns off the DNS
+    /// special case and its guest's resolv.conf is left alone. A snapshot that
+    /// records the field, null included, is read as recorded.
+    #[test]
+    fn a_snapshot_made_before_dns_override_was_recorded_keeps_its_resolver() {
+        let mut fixture = metadata_fixture();
+        fixture.network_mode = FcNetworkMode::Rootless;
+        fixture.network_config.dns_server = Some("10.0.2.2".to_string());
+        let mut document = serde_json::to_value(&fixture).unwrap();
+        let read = |document: &serde_json::Value| -> crate::storage::SnapshotMetadata {
+            serde_json::from_value(document.clone()).unwrap()
+        };
+
+        document.as_object_mut().unwrap().remove("dns_override");
+        let legacy = read(&document);
+        assert_eq!(legacy.source_dns_override(), Some("10.0.2.2"));
+        // A legacy rootless snapshot's recorded resolver is its --dns: pasta reports
+        // none of its own. A clone of it records that, so a snapshot of the clone,
+        // whose pasta reports no resolver either, keeps it.
+        assert_eq!(legacy.known_dns_override(), Some(Some("10.0.2.2")));
+        let code: String = {
+            let source = include_str!("snapshot.rs");
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        assert!(
+            code.contains(
+                "vm_state.config.dns_override=snapshot_config.metadata.known_dns_override()"
+            ),
+            "a clone no longer records what its snapshot knows of the source's --dns"
+        );
+        let resolvers = restore_resolvers(
+            FcNetworkMode::Rootless,
+            legacy.source_dns_override(),
+            crate::commands::podman::GuestBootInputs::default(),
+        );
+        assert_eq!(resolvers.mode_server.as_deref(), Some("10.0.2.2"));
+
+        document["dns_override"] = serde_json::Value::Null;
+        assert_eq!(read(&document).source_dns_override(), None);
+        document["dns_override"] = serde_json::json!("192.0.2.53");
+        assert_eq!(read(&document).source_dns_override(), Some("192.0.2.53"));
+
+        // The restore leaves a legacy snapshot's resolv.conf alone, as restores did
+        // when it was made, even on a bridged host whose resolver would differ.
+        let host = || {
+            host_inputs(&[(&["10.9.0.2"], &["restore.example"])])
+                .for_launch(FcNetworkMode::Bridged, &[])
+        };
+        let mut bridged = legacy.clone();
+        bridged.network_mode = FcNetworkMode::Bridged;
+        assert_eq!(bridged.known_dns_override(), None);
+        assert_eq!(bridged.source_dns_override(), Some("10.0.2.2"));
+        let given = |meta: &crate::storage::SnapshotMetadata| {
+            let resolvers = restore_resolvers(
+                FcNetworkMode::Bridged,
+                meta.source_dns_override(),
+                if meta.source_dns_override().is_some() {
+                    crate::commands::podman::GuestBootInputs::default()
+                } else {
+                    host()
+                },
+            );
+            restore_document_dns(meta, &resolvers, FcNetworkMode::Bridged)
+        };
+        assert_eq!(given(&bridged), None);
+        bridged.dns_override = Some(None);
+        assert_eq!(
+            given(&bridged),
+            Some(dns(&["10.9.0.2"], &["restore.example"])),
+            "a snapshot that records no --dns takes this host's resolvers"
+        );
+
+        // Written back, a recorded none stays recorded.
+        fixture.dns_override = Some(None);
+        let written = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(written["dns_override"], serde_json::Value::Null);
+        assert_eq!(read(&written).dns_override, Some(None));
+    }
+
     fn snapshot_runtime_args_without_overrides() -> SnapshotRunArgs {
         SnapshotRunArgs {
             pid: None,
@@ -5942,6 +6300,7 @@ mod tests {
             map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,
+            host_ipv6: None,
             gpu: vec![],
         }
     }

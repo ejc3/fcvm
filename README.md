@@ -156,6 +156,18 @@ routable /64 of its own, set the variable. Other network modes ignore it.
 under the rules `podman run --ipv6-address` follows; fc-agent swaps it in for the
 snapshot's address on restore. The address is in no snapshot key.
 
+A clone also takes the restoring host's identity before its `--on-restore` hook runs.
+`snapshot run --host-ipv6 <ADDR>` (also read from `FCVM_HOST_IPV6`) replaces the host
+identity address the guest was booted with (`podman run --env HOST_IPV6=<ADDR>`) on lo,
+and on eth0 outside routed mode; without it the guest holds none. A disk-only snapshot's
+cold boot, and the relaunch of a clone whose guest reboots, get the same address as their
+`HOST_IPV6`. A `podman run` cache hit passes its own `HOST_IPV6`, which is not in the
+pre-start snapshot key, and the container the clone launches is given that value too. A
+startup snapshot's container already runs with one, so the startup snapshot's name
+carries it. The guest's resolv.conf is rewritten with the resolvers and search domains a
+boot on the restoring host would give it, unless the snapshot was made with `--dns`; a
+restore that cannot write it fails.
+
 ### Building a Snapshot Without Leaving a VM Behind
 
 `podman prepare` takes the same arguments as `podman run`, boots one disposable VM,

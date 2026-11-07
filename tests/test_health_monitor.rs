@@ -78,6 +78,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             restore_hook: None,
             guest_thp: None,
             guest_thp_restore: false,
+            dns_override: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,

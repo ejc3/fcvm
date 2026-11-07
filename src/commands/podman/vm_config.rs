@@ -184,6 +184,33 @@ fn rebuild_proxy_url(parsed: &Url, host: String, port: u16) -> String {
     rebuilt
 }
 
+/// The resolvers and search domains a guest is given, as `fcvm_dns=` and
+/// `fcvm_dns_search=` carry them at boot and a restore carries them in its
+/// document (`commands::common::RestoreIdentity`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestDns {
+    pub servers: Vec<String>,
+    pub search: Vec<String>,
+}
+
+/// The guest's resolvers: the mode's DNS choice (`NetworkConfig::dns_server`)
+/// when it made one, else every host resolver the launch keeps, with the search
+/// domains that belong to them. One function for the boot and the restore, so a
+/// clone restored on a host is given what a boot on that host would give it.
+pub(crate) fn guest_dns(
+    dns_server: Option<&str>,
+    host_dns: &[String],
+    dns_search: &[String],
+) -> GuestDns {
+    GuestDns {
+        servers: match dns_server {
+            Some(dns) => vec![dns.to_string()],
+            None => host_dns.to_vec(),
+        },
+        search: dns_search.to_vec(),
+    }
+}
+
 /// Build runtime boot arguments for the kernel command line.
 ///
 /// Per-instance network values (`ip=` and `ipv6=` addresses) are excluded
@@ -239,29 +266,26 @@ pub(crate) fn build_runtime_boot_args(
     // --dns override), else the hashed host fallback resolved at config
     // construction (#821).
     {
-        let dns_servers = if let Some(ref dns) = network_config.dns_server {
-            vec![dns.clone()]
-        } else {
-            launch_config.host_dns.clone()
-        };
+        let dns = guest_dns(
+            network_config.dns_server.as_deref(),
+            &launch_config.host_dns,
+            &launch_config.dns_search,
+        );
 
-        if !dns_servers.is_empty() {
+        if !dns.servers.is_empty() {
             if !boot_args.is_empty() {
                 boot_args.push(' ');
             }
             // Use | delimiter since : is part of IPv6 addresses
-            boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
+            boot_args.push_str(&format!("fcvm_dns={}", dns.servers.join("|")));
         }
 
         // Pass search domains for short hostname resolution
-        if !launch_config.dns_search.is_empty() {
+        if !dns.search.is_empty() {
             if !boot_args.is_empty() {
                 boot_args.push(' ');
             }
-            boot_args.push_str(&format!(
-                "fcvm_dns_search={}",
-                launch_config.dns_search.join("|")
-            ));
+            boot_args.push_str(&format!("fcvm_dns_search={}", dns.search.join("|")));
         }
     }
 

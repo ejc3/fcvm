@@ -679,18 +679,36 @@ fn resolv_conf_from_cmdline(cmdline: &str) -> Result<String, String> {
             .find_map(|s| s.strip_prefix(prefix))
             .map(str::to_string)
     };
+    let list = |prefix: &str| -> Vec<String> {
+        token(prefix)
+            .map(|v| {
+                v.split('|')
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    resolv_conf_for(&list("fcvm_dns="), &list("fcvm_dns_search="), cmdline)
+}
 
-    let mut nameservers: Vec<String> = token("fcvm_dns=")
-        .map(|v| {
-            v.split('|')
-                .filter(|ns| !ns.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-
+/// The resolv.conf body for these nameservers and search domains.
+///
+/// With no nameserver the `ip=` parameter of `cmdline` is the fallback: field 7
+/// is the DNS server the kernel's own configurator would use, and field 2 is the
+/// gateway, which in every fcvm network mode also forwards DNS.
+///
+/// `Err` names why no resolver could be derived.
+fn resolv_conf_for(
+    nameservers: &[String],
+    search: &[String],
+    cmdline: &str,
+) -> Result<String, String> {
+    let mut nameservers = nameservers.to_vec();
     if nameservers.is_empty() {
-        let ip_param = token("ip=")
+        let ip_param = cmdline
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("ip="))
             .ok_or_else(|| "no fcvm_dns= or ip= on the kernel command line".to_string())?;
         let fields: Vec<&str> = ip_param.split(':').collect();
         let dns = fields.get(7).copied().unwrap_or("");
@@ -703,13 +721,58 @@ fn resolv_conf_from_cmdline(cmdline: &str) -> Result<String, String> {
     }
 
     let mut body = String::new();
-    if let Some(search) = token("fcvm_dns_search=") {
-        body.push_str(&format!("search {}\n", search.replace('|', " ")));
+    if !search.is_empty() {
+        body.push_str(&format!("search {}\n", search.join(" ")));
     }
     for ns in &nameservers {
         body.push_str(&format!("nameserver {ns}\n"));
     }
     Ok(body)
+}
+
+/// Give a restored guest the restoring host's resolvers.
+///
+/// The guest's resolv.conf was written at boot from the preparing host's
+/// resolvers and search domains. The restore document carries the ones the
+/// restoring host would boot this guest with, and the file is rewritten when its
+/// body differs, so a clone on another host does not ask the preparing host's
+/// resolvers, which that network may not reach. The `ip=` fallback reads the
+/// snapshot's own command line, which names no host.
+///
+/// Fails when the file cannot be written: a clone published with the preparing
+/// host's resolvers asks servers the restoring host's network may not reach.
+pub fn apply_restore_dns(dns: &crate::types::RestoreDns) -> anyhow::Result<()> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
+    apply_restore_dns_at(std::path::Path::new("/etc/resolv.conf"), dns, &cmdline)
+}
+
+fn apply_restore_dns_at(
+    path: &std::path::Path,
+    dns: &crate::types::RestoreDns,
+    cmdline: &str,
+) -> anyhow::Result<()> {
+    let current = std::fs::read_to_string(path).ok();
+    if let Some(body) = restore_resolv_conf(current.as_deref(), dns, cmdline) {
+        std::fs::write(path, &body).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!(
+            "[fc-agent] wrote {}: {}",
+            path.display(),
+            body.trim().replace('\n', " ; ")
+        );
+    }
+    Ok(())
+}
+
+/// The resolv.conf body a restore writes, or None when the current file already
+/// holds it.
+fn restore_resolv_conf(
+    current: Option<&str>,
+    dns: &crate::types::RestoreDns,
+    cmdline: &str,
+) -> Option<String> {
+    let body = resolv_conf_for(&dns.servers, &dns.search, cmdline)
+        .unwrap_or_else(|reason| unconfigured_resolv_conf(&reason));
+    (current != Some(body.as_str())).then_some(body)
 }
 
 /// The body written when the command line named no resolver: the reason, and
@@ -975,6 +1038,226 @@ where
     if let Err(error) = swapped {
         eprintln!("[fc-agent] WARNING: cannot reconfigure IPv6: {error:#}");
     }
+}
+
+/// The host identity address this guest holds, and whether a restore set it.
+///
+/// It is the `HOST_IPV6` the boot plan named until a restore moves it to the
+/// restoring host's (`apply_host_identity`). It is remembered here rather than
+/// re-read from the boot plan, which still names the preparing host.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HostIdentity {
+    address: Option<Ipv6Addr>,
+    restored: bool,
+}
+
+static HOST_IDENTITY: std::sync::Mutex<HostIdentity> = std::sync::Mutex::new(HostIdentity {
+    address: None,
+    restored: false,
+});
+
+/// Add the boot's host identity address to every interface that carries it,
+/// given the boot plan's `HOST_IPV6`.
+///
+/// The decision and the adds run under one hold of `HOST_IDENTITY`, the hold a
+/// restore swaps the address under (`apply_host_identity`): a restore of a snapshot
+/// taken before this step can run beside it.
+pub fn add_boot_host_identity(plan_address: &str) {
+    let mut identity = HOST_IDENTITY.lock().unwrap();
+    let Some(address) = boot_host_identity_in(&mut identity, plan_address) else {
+        return;
+    };
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    for dev in host_identity_devices(&cmdline) {
+        let result = std::process::Command::new("ip")
+            .args(["addr", "add", &format!("{address}/128"), "dev", dev])
+            .output();
+        match result {
+            Ok(o) if o.status.success() => {
+                eprintln!("[fc-agent] added {address} to {dev} for host identity");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if stderr.contains("File exists") {
+                    eprintln!("[fc-agent] {address} already on {dev}");
+                }
+            }
+            Err(e) => eprintln!("[fc-agent] ip addr add failed: {e}"),
+        }
+    }
+}
+
+/// The host identity address the boot adds (`add_boot_host_identity`), given the
+/// boot plan's `HOST_IPV6`.
+///
+/// A clone of a snapshot taken before the container launched restores before
+/// the boot reaches this step, and its restore has already set the restoring
+/// host's address; the boot plan's, which names the preparing host, must not
+/// replace it. Otherwise the plan's address is recorded so a later restore can
+/// replace it.
+fn boot_host_identity_in(identity: &mut HostIdentity, plan_address: &str) -> Option<String> {
+    if identity.restored {
+        return identity.address.map(|address| address.to_string());
+    }
+    match plan_address.parse::<Ipv6Addr>() {
+        Ok(address) => identity.address = Some(address),
+        Err(_) => eprintln!(
+            "[fc-agent] WARNING: HOST_IPV6 {plan_address:?} is not an IPv6 address; a \
+             restore cannot replace it"
+        ),
+    }
+    Some(plan_address.to_string())
+}
+
+/// The boot plan's environment with `HOST_IPV6` naming the identity this guest
+/// holds, for the container the boot launches.
+///
+/// The plan was captured by the preparing host, so after a restore of a snapshot
+/// taken before the container launched its `HOST_IPV6` names the preparing host.
+/// The restore moved the guest to the restoring host's address, or to none, and
+/// the container must be given the same.
+pub fn reconcile_host_ipv6_env(env: &mut std::collections::HashMap<String, String>) {
+    let identity = *HOST_IDENTITY.lock().unwrap();
+    reconcile_host_ipv6_env_in(env, identity);
+}
+
+fn reconcile_host_ipv6_env_in(
+    env: &mut std::collections::HashMap<String, String>,
+    identity: HostIdentity,
+) {
+    if !identity.restored {
+        return;
+    }
+    match identity.address {
+        Some(address) => {
+            env.insert("HOST_IPV6".to_string(), address.to_string());
+        }
+        None => {
+            env.remove("HOST_IPV6");
+        }
+    }
+}
+
+/// The interfaces that carry the host identity address under this kernel
+/// command line. A routed guest holds it on lo only: on eth0 the kernel would
+/// pick it as the source of outbound IPv6, and the namespace answers no NDP for
+/// it. The other modes hold it on lo and eth0.
+pub fn host_identity_devices(cmdline: &str) -> &'static [&'static str] {
+    let routed = cmdline
+        .split_whitespace()
+        .any(|p| p.starts_with("ipv6=") && p.contains("/128"));
+    if routed {
+        &["lo"]
+    } else {
+        &["lo", "eth0"]
+    }
+}
+
+/// Move the guest's host identity address to `new`, the restoring host's.
+///
+/// The restore document names the address the restoring host was given, or none.
+/// Every interface that carries the identity gets the new address before the old
+/// one is deleted from any of them, so a service looking its host up on lo always
+/// finds an address. `None` removes the old address: a restore on a host that names
+/// no identity must not keep the preparing host's.
+///
+/// Fails when an add or delete fails, which keeps the clone unpublished: a clone
+/// that answers as the preparing host, or as two hosts, is the state this step
+/// exists to prevent.
+pub async fn apply_host_identity(new: Option<&str>) -> anyhow::Result<()> {
+    let new = new
+        .map(|address| {
+            address
+                .parse::<Ipv6Addr>()
+                .with_context(|| format!("host-ipv6 {address:?} is not an IPv6 address"))
+        })
+        .transpose()?;
+    let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
+    let devices = host_identity_devices(&cmdline);
+    // One hold covers the read of the old address, the swap and the record of the
+    // new one, so the boot's step (`add_boot_host_identity`) runs wholly before or
+    // wholly after it.
+    off_the_runtime("the host identity swap", move || {
+        let mut identity = HOST_IDENTITY.lock().unwrap();
+        let old = identity.address;
+        if old == new {
+            identity.restored = true;
+            return Ok(());
+        }
+        eprintln!("[fc-agent] moving the host identity from {old:?} to {new:?} on {devices:?}");
+        let mut channel = KernelChannel::open(NETLINK_ROUTE, "NETLINK_ROUTE")?;
+        let mut indices = Vec::with_capacity(devices.len());
+        for device in devices {
+            let name = std::ffi::CString::new(*device).expect("interface names hold no NUL");
+            // SAFETY: the argument is a NUL-terminated string.
+            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if index == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("{device} has no interface index"));
+            }
+            indices.push((*device, index));
+        }
+        swap_host_identity(&mut channel, &indices, old, new)?;
+        *identity = HostIdentity {
+            address: new,
+            restored: true,
+        };
+        Ok(())
+    })
+    .await
+}
+
+/// Add `new` as a /128 on every interface in `indices`, then delete `old` from
+/// every one of them. An interface that already holds `new`, or no longer holds
+/// `old`, is the end state already and not an error.
+fn swap_host_identity<C: NetlinkChannel>(
+    channel: &mut C,
+    indices: &[(&str, u32)],
+    old: Option<Ipv6Addr>,
+    new: Option<Ipv6Addr>,
+) -> anyhow::Result<()> {
+    let errno = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+    };
+    if let Some(address) = new {
+        for (device, index) in indices {
+            let prefix = Ipv6Prefix {
+                address,
+                prefix_len: 128,
+            };
+            let flags = NLM_F_CREATE | NLM_F_EXCL;
+            match change_address(channel, RTM_NEWADDR, flags, *index, prefix, IFA_F_NODAD) {
+                Ok(()) => eprintln!("[fc-agent] added host identity {address} to {device}"),
+                Err(error) if errno(&error) == Some(libc::EEXIST) => {
+                    eprintln!("[fc-agent] host identity {address} already on {device}")
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("adding host identity {address} to {device}"))
+                }
+            }
+        }
+    }
+    if let Some(address) = old {
+        for (device, index) in indices {
+            let prefix = Ipv6Prefix {
+                address,
+                prefix_len: 128,
+            };
+            match change_address(channel, RTM_DELADDR, 0, *index, prefix, 0) {
+                Ok(()) => eprintln!("[fc-agent] removed old host identity {address} from {device}"),
+                Err(error) if errno(&error) == Some(libc::EADDRNOTAVAIL) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("removing old host identity {address} from {device}")
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run blocking netlink work on tokio's blocking pool and wait for it.
@@ -1804,6 +2087,84 @@ mod loopback_publish_tests {
 mod resolv_conf_tests {
     use super::*;
 
+    fn restore_dns(servers: &[&str], search: &[&str]) -> crate::types::RestoreDns {
+        crate::types::RestoreDns {
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+            search: search.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A clone restored on another host is given that host's resolvers and
+    /// search domains, and the file the boot wrote from the preparing host's is
+    /// replaced with them.
+    #[test]
+    fn a_restore_rewrites_resolv_conf_with_the_restoring_hosts_resolvers() {
+        let cmdline = "ip=172.30.1.2::172.30.1.1:255.255.255.0::eth0:off \
+                       fcvm_dns=10.1.0.2 fcvm_dns_search=prep.example";
+        let booted = resolv_conf_from_cmdline(cmdline).unwrap();
+        assert_eq!(
+            restore_resolv_conf(
+                Some(&booted),
+                &restore_dns(&["10.9.0.2", "10.9.0.3"], &["restore.example"]),
+                cmdline
+            )
+            .as_deref(),
+            Some("search restore.example\nnameserver 10.9.0.2\nnameserver 10.9.0.3\n")
+        );
+    }
+
+    /// A resolv.conf the restore cannot write fails the restore, so the clone is
+    /// never published asking the preparing host's resolvers.
+    #[test]
+    fn a_refused_resolv_conf_write_fails_the_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let dns = restore_dns(&["10.9.0.2"], &["restore.example"]);
+        let missing = dir.path().join("no-such-dir").join("resolv.conf");
+        assert!(
+            apply_restore_dns_at(&missing, &dns, "").is_err(),
+            "a resolv.conf write that failed must fail the restore"
+        );
+
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 10.1.0.2\n").unwrap();
+        apply_restore_dns_at(&path, &dns, "").expect("a writable resolv.conf is rewritten");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "search restore.example\nnameserver 10.9.0.2\n"
+        );
+    }
+
+    /// The same resolvers leave the file alone.
+    #[test]
+    fn a_restore_with_the_same_resolvers_writes_nothing() {
+        let cmdline = "fcvm_dns=10.1.0.2|10.1.0.3 fcvm_dns_search=corp.example";
+        let booted = resolv_conf_from_cmdline(cmdline).unwrap();
+        assert_eq!(
+            restore_resolv_conf(
+                Some(&booted),
+                &restore_dns(&["10.1.0.2", "10.1.0.3"], &["corp.example"]),
+                cmdline
+            ),
+            None
+        );
+    }
+
+    /// A restoring host with no resolver of its own gives the guest what a boot
+    /// on it would: the `ip=` gateway of the snapshot's own command line.
+    #[test]
+    fn a_restore_with_no_resolvers_falls_back_to_the_gateway() {
+        let cmdline = "ip=10.0.2.100::10.0.2.2:255.255.255.0::eth0:off fcvm_dns=10.1.0.2";
+        assert_eq!(
+            restore_resolv_conf(
+                Some("nameserver 10.1.0.2\n"),
+                &restore_dns(&[], &[]),
+                cmdline
+            )
+            .as_deref(),
+            Some("nameserver 10.0.2.2\n")
+        );
+    }
+
     #[test]
     fn fcvm_dns_names_every_server_in_order() {
         let body = resolv_conf_from_cmdline(
@@ -2216,6 +2577,228 @@ mod ipv6_swap_tests {
             assert_eq!(message_types(&route.sent), requests, "{refuse:?}");
             assert_eq!(route.table, expected, "{refuse:?}");
         }
+    }
+
+    fn identity(index: u32, address: &str) -> Entry {
+        Entry {
+            flags: IFA_F_NODAD,
+            ..entry(index, address, 128, RT_SCOPE_UNIVERSE)
+        }
+    }
+
+    /// A restore on another host adds the restoring host's identity to every
+    /// interface before it deletes the preparing host's from any, so lo holds an
+    /// identity at every moment.
+    #[test]
+    fn the_new_host_identity_is_added_everywhere_before_the_old_one_is_deleted() {
+        let mut route = ModelRoute {
+            table: vec![identity(1, "2001:db8:a::1"), identity(2, "2001:db8:a::1")],
+            ..Default::default()
+        };
+        swap_host_identity(
+            &mut route,
+            &[("lo", 1), ("eth0", 2)],
+            Some("2001:db8:a::1".parse().unwrap()),
+            Some("2001:db8:b::1".parse().unwrap()),
+        )
+        .expect("the swap succeeds");
+        assert_eq!(
+            message_types(&route.sent),
+            vec![RTM_NEWADDR, RTM_NEWADDR, RTM_DELADDR, RTM_DELADDR]
+        );
+        assert_eq!(
+            route.table,
+            vec![identity(1, "2001:db8:b::1"), identity(2, "2001:db8:b::1")]
+        );
+    }
+
+    /// An add the kernel refuses fails the restore and deletes nothing: the
+    /// guest keeps the identity it had rather than none.
+    #[test]
+    fn a_refused_add_keeps_the_old_identity_and_fails() {
+        let mut route = ModelRoute {
+            table: vec![identity(1, "2001:db8:a::1")],
+            refuse: Some((RTM_NEWADDR, libc::EPERM)),
+            ..Default::default()
+        };
+        let swapped = swap_host_identity(
+            &mut route,
+            &[("lo", 1)],
+            Some("2001:db8:a::1".parse().unwrap()),
+            Some("2001:db8:b::1".parse().unwrap()),
+        );
+        assert!(swapped.is_err(), "a refused add must fail the restore");
+        assert_eq!(message_types(&route.sent), vec![RTM_NEWADDR]);
+        assert_eq!(route.table, vec![identity(1, "2001:db8:a::1")]);
+    }
+
+    /// A restoring host that names no identity removes the preparing host's.
+    #[test]
+    fn no_new_identity_removes_the_old_one() {
+        let mut route = ModelRoute {
+            table: vec![identity(1, "2001:db8:a::1")],
+            ..Default::default()
+        };
+        swap_host_identity(
+            &mut route,
+            &[("lo", 1)],
+            Some("2001:db8:a::1".parse().unwrap()),
+            None,
+        )
+        .expect("the removal succeeds");
+        assert_eq!(message_types(&route.sent), vec![RTM_DELADDR]);
+        assert!(route.table.is_empty());
+    }
+
+    /// A clone of a snapshot taken before the container launched restores
+    /// before the boot adds the plan's address. The restore's address wins.
+    #[test]
+    fn the_boot_keeps_an_identity_a_restore_already_set() {
+        let mut restored = HostIdentity {
+            address: Some("2001:db8:b::1".parse().unwrap()),
+            restored: true,
+        };
+        assert_eq!(
+            boot_host_identity_in(&mut restored, "2001:db8:a::1").as_deref(),
+            Some("2001:db8:b::1")
+        );
+        let mut fresh = HostIdentity::default();
+        assert_eq!(
+            boot_host_identity_in(&mut fresh, "2001:db8:a::1").as_deref(),
+            Some("2001:db8:a::1")
+        );
+        assert_eq!(fresh.address, Some("2001:db8:a::1".parse().unwrap()));
+        assert!(!fresh.restored);
+    }
+
+    /// The container a restored guest launches is given the identity the restore
+    /// set, not the preparing host's that the captured plan names, and none when
+    /// the restoring host named none. Without a restore the plan's value stands.
+    #[test]
+    fn a_restored_host_identity_replaces_host_ipv6_in_the_container_env() {
+        let plan_env = || {
+            std::collections::HashMap::from([
+                ("HOST_IPV6".to_string(), "2001:db8:a::1".to_string()),
+                ("OTHER".to_string(), "x".to_string()),
+            ])
+        };
+        let mut moved = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut moved,
+            HostIdentity {
+                address: Some("2001:db8:b::1".parse().unwrap()),
+                restored: true,
+            },
+        );
+        assert_eq!(
+            moved.get("HOST_IPV6").map(String::as_str),
+            Some("2001:db8:b::1")
+        );
+        assert_eq!(moved.get("OTHER").map(String::as_str), Some("x"));
+
+        let mut removed = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut removed,
+            HostIdentity {
+                address: None,
+                restored: true,
+            },
+        );
+        assert_eq!(removed.get("HOST_IPV6"), None);
+
+        let mut added = std::collections::HashMap::new();
+        reconcile_host_ipv6_env_in(
+            &mut added,
+            HostIdentity {
+                address: Some("2001:db8:b::1".parse().unwrap()),
+                restored: true,
+            },
+        );
+        assert_eq!(
+            added.get("HOST_IPV6").map(String::as_str),
+            Some("2001:db8:b::1")
+        );
+
+        let mut booted = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut booted,
+            HostIdentity {
+                address: Some("2001:db8:a::1".parse().unwrap()),
+                restored: false,
+            },
+        );
+        assert_eq!(booted, plan_env());
+
+        // The boot reconciles the plan after a pre-start restore can have run and
+        // before it builds the container's arguments from the plan.
+        let agent = include_str!("agent.rs");
+        let handshake = agent
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("fc-agent no longer offers the pre-start snapshot");
+        let reconciled = agent
+            .find("crate::network::reconcile_host_ipv6_env(&mut plan.env);")
+            .expect("the boot no longer gives the container the restored host identity");
+        let launched = agent
+            .find("let podman_args = ")
+            .expect("the boot no longer builds the container's arguments");
+        assert!(
+            handshake < reconciled && reconciled < launched,
+            "handshake={handshake} reconciled={reconciled} launched={launched}"
+        );
+    }
+
+    /// A snapshot can capture a guest between its cache-ready handshake and the
+    /// boot's host identity step, and its restore then runs beside that step. The
+    /// restore reads the old address, swaps it and records the new one under one
+    /// hold of `HOST_IDENTITY`, and the boot decides and adds its address under the
+    /// same hold, so neither can add or record an address between the other's read
+    /// and write and leave the guest holding one nothing tracks.
+    #[test]
+    fn the_host_identity_is_read_swapped_and_recorded_under_one_lock() {
+        let source = include_str!("network.rs");
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        let body = |start: &str| {
+            let at = code
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} is gone"));
+            &code[at..at + code[at..].find("\n}\n").unwrap()]
+        };
+        let apply = body("pub async fn apply_host_identity(");
+        let blocking = apply
+            .find("off_the_runtime(")
+            .expect("the swap no longer runs off the runtime");
+        assert_eq!(
+            apply.matches("HOST_IDENTITY.lock()").count(),
+            1,
+            "the restore takes the identity lock more than once, so the boot can run between"
+        );
+        assert!(
+            apply.find("HOST_IDENTITY.lock()").unwrap() > blocking,
+            "the restore reads the old address outside the hold that covers the swap"
+        );
+        let boot = body("pub fn add_boot_host_identity(");
+        let locked = boot
+            .find("HOST_IDENTITY.lock()")
+            .expect("the boot no longer takes the identity lock");
+        let decided = boot.find("boot_host_identity_in(").unwrap();
+        let added = boot.find("Command::new(\"ip\")").unwrap();
+        assert!(locked < decided && decided < added);
+        let agent = include_str!("agent.rs");
+        assert!(agent.contains("crate::network::add_boot_host_identity("));
+        assert!(!agent.contains("\"addr\", \"add\""));
+    }
+
+    #[test]
+    fn a_routed_guest_holds_its_host_identity_on_lo_only() {
+        assert_eq!(
+            host_identity_devices("console=ttyS0 ipv6=2001:db8::5/128|fd00::1"),
+            &["lo"]
+        );
+        assert_eq!(
+            host_identity_devices("console=ttyS0 ipv6=fd00::100|fd00::1"),
+            &["lo", "eth0"]
+        );
+        assert_eq!(host_identity_devices("console=ttyS0"), &["lo", "eth0"]);
     }
 }
 

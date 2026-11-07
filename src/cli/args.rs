@@ -1408,6 +1408,13 @@ pub struct SnapshotRunArgs {
     #[arg(long, value_name = "ADDR")]
     pub ipv6_address: Option<std::net::Ipv6Addr>,
 
+    /// This host's identity IPv6 address. The restored guest holds it on lo (and on
+    /// eth0 outside routed mode) in place of the address it was booted with, the
+    /// `HOST_IPV6` of `podman run --env`, before its restore hook runs. Without it
+    /// the guest holds no host identity address. Also read from FCVM_HOST_IPV6.
+    #[arg(long, value_name = "ADDR", env = "FCVM_HOST_IPV6")]
+    pub host_ipv6: Option<std::net::Ipv6Addr>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================

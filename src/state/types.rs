@@ -140,6 +140,17 @@ fn default_health_check_timeout() -> u64 {
     5
 }
 
+/// Deserialize a field that is present in the file, null included, as `Some`, so a
+/// field missing from a file written before it existed stays `None` (the serde
+/// `default`).
+pub fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub image: String,
@@ -174,6 +185,16 @@ pub struct VmConfig {
     /// inherited by a clone from its snapshot.
     #[serde(default)]
     pub guest_thp_restore: bool,
+    /// The `--dns` this VM's guest was booted with (`Some(None)`: none), recorded in
+    /// its snapshots so a restore keeps it rather than giving the guest the restoring
+    /// host's resolvers. `None` is a state written before this was recorded, and its
+    /// snapshots say so too (`SnapshotMetadata::source_dns_override`).
+    #[serde(
+        default,
+        deserialize_with = "crate::state::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dns_override: Option<Option<String>>,
     /// Which snapshot this process is serving or was cloned from
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
@@ -355,6 +376,7 @@ impl VmState {
                 restore_hook: None,
                 guest_thp: None,
                 guest_thp_restore: false,
+                dns_override: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,

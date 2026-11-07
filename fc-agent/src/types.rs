@@ -147,11 +147,61 @@ pub struct LatestMetadata {
     /// the restore is acknowledged; `default` is the kernel's boot-time mode.
     #[serde(rename = "transparent-hugepage", default)]
     pub transparent_hugepage: Option<String>,
+    /// The restoring host's identity, which replaces the preparing host's.
+    #[serde(flatten)]
+    pub identity: RestoreIdentity,
+}
+
+/// What a restored guest takes from the host that restores it rather than the
+/// one that prepared the snapshot. Applied before the restore hook runs
+/// (`restore::handle_clone_restore`).
+#[derive(Debug, Default, Deserialize)]
+pub struct RestoreIdentity {
+    /// The host identity IPv6 the guest holds on lo (and on eth0 outside routed
+    /// mode), the boot plan's `HOST_IPV6` on a cold boot. None removes it.
+    #[serde(rename = "host-ipv6", default)]
+    pub host_ipv6: Option<String>,
+    /// The resolvers and search domains this host would boot the guest with.
+    /// None leaves resolv.conf as it is.
+    #[serde(default)]
+    pub dns: Option<RestoreDns>,
+}
+
+/// The guest's resolvers, as `fcvm_dns=` and `fcvm_dns_search=` carry them at boot.
+#[derive(Debug, Default, Deserialize)]
+pub struct RestoreDns {
+    #[serde(default)]
+    pub servers: Vec<String>,
+    #[serde(default)]
+    pub search: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restore document's identity fields, in the shape fcvm's
+    /// `RestoreIdentity::write_into` writes them.
+    #[test]
+    fn the_restore_document_names_the_restoring_hosts_identity() {
+        let metadata: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "restore-epoch": "e",
+                "host-ipv6": "2001:db8:b::1",
+                "dns": {"servers": ["10.9.0.2"], "search": ["restore.example"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.identity.host_ipv6.as_deref(),
+            Some("2001:db8:b::1")
+        );
+        let dns = metadata.identity.dns.expect("the document names resolvers");
+        assert_eq!(dns.servers, ["10.9.0.2"]);
+        assert_eq!(dns.search, ["restore.example"]);
+
+        let bare: LatestMetadata =
+            serde_json::from_str(r#"{"host-time-ns": "1", "host-ipv6": null}"#).unwrap();
+        assert!(bare.identity.host_ipv6.is_none() && bare.identity.dns.is_none());
+    }
 
     #[test]
     fn test_plan_minimal() {

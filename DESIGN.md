@@ -1626,6 +1626,8 @@ fcvm snapshot run --snapshot <NAME> [OPTIONS]
                           (Either --pid or --snapshot is required; mutually exclusive)
 --name <NAME>             Clone VM name (auto-generated if not provided; unique among running VMs)
 --ipv6-address <ADDR>     Routed snapshots only: the clone's address, swapped in on restore
+--host-ipv6 <ADDR>        This host's identity address, replacing HOST_IPV6 on the guest's lo
+                          before the restore hook (also FCVM_HOST_IPV6; without it, none)
 --exec <CMD>              Execute command in container after clone is healthy
 --publish <SPEC>          [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated.
                           The clone publishes these mappings instead of the snapshot's

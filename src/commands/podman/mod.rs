@@ -42,7 +42,7 @@ pub use snapshot::{
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
-    setup_nfs_exports, GuestBootInputs,
+    guest_dns, setup_nfs_exports, GuestBootInputs, GuestDns,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
 
@@ -899,6 +899,25 @@ pub(crate) fn parse_labels(labels: &[String]) -> std::collections::HashMap<Strin
         .collect()
 }
 
+/// The host identity address a run names with `--env HOST_IPV6=<addr>`, which
+/// fc-agent adds to the guest's lo. The last one wins, as in the boot plan's env
+/// map. A value that is not an IPv6 address names none.
+fn run_host_ipv6(env: &[String]) -> Option<std::net::Ipv6Addr> {
+    let value = env
+        .iter()
+        .rev()
+        .find_map(|entry| entry.strip_prefix("HOST_IPV6="))?;
+    match value.parse() {
+        Ok(address) => Some(address),
+        Err(_) => {
+            if !value.is_empty() {
+                warn!("HOST_IPV6={value} is not an IPv6 address; the restored guest gets none");
+            }
+            None
+        }
+    }
+}
+
 fn snapshot_restore_args(
     args: &RunArgs,
     snapshot_key: &str,
@@ -917,6 +936,9 @@ fn snapshot_restore_args(
         map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
+        // This run's HOST_IPV6, which the snapshot key leaves out: the restored guest
+        // takes it in place of the one its snapshot was booted with.
+        host_ipv6: run_host_ipv6(&args.env),
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
         // no startup snapshot.
         startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
@@ -1644,7 +1666,7 @@ async fn prepare_vm_for_lifecycle(
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
         // The startup snapshot is this run's balloon target's own; the pre-start one is
         // shared between targets.
-        let startup_key = startup_snapshot_key(&key, args.balloon);
+        let startup_key = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -1805,6 +1827,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.guest_thp = args.guest_thp.clone();
     // This boot's fc-agent is the one that ships with this fcvm, which applies the mode.
     vm_state.config.guest_thp_restore = true;
+    vm_state.config.dns_override = Some(args.dns.clone());
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
@@ -2971,7 +2994,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 settle_balloon_check(ctx).await?;
 
                 if let Some(ref key) = ctx.snapshot_key {
-                    let startup_key = startup_snapshot_key(key, ctx.args.balloon);
+                    let startup_key =
+                        startup_snapshot_key(key, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3688,6 +3712,44 @@ mod tests {
         );
     }
 
+    /// A snapshot is portable across hosts: two runs that differ only in the host
+    /// identity address they name share its key, and a cache hit hands the restored
+    /// guest this run's address, not the one the snapshot was booted with.
+    #[test]
+    fn host_ipv6_is_given_at_restore_and_not_keyed() {
+        use std::path::Path;
+        let key = |args: &RunArgs| {
+            build_firecracker_config(
+                args,
+                "sha256:test",
+                Path::new("/kernel"),
+                Path::new("/rootfs"),
+                Path::new("/initrd"),
+                None,
+                ImageMode::Overlay,
+                None,
+                None,
+                None,
+                None,
+                GuestBootInputs::default(),
+                &[],
+            )
+            .snapshot_key()
+        };
+        let mut prepare = test_args();
+        prepare.env = vec!["HOST_IPV6=2001:db8:a::1".to_string()];
+        let mut restore = test_args();
+        restore.env = vec!["HOST_IPV6=2001:db8:b::1".to_string()];
+        assert_eq!(key(&prepare), key(&restore));
+
+        let args = snapshot_restore_args(&restore, "key", None, (None, None));
+        assert_eq!(args.host_ipv6, Some("2001:db8:b::1".parse().unwrap()));
+        assert_eq!(
+            snapshot_restore_args(&test_args(), "key", None, (None, None)).host_ipv6,
+            None
+        );
+    }
+
     /// #1079: a cache hit restores under this run's prefix; a run in another network mode
     /// passes none.
     #[test]
@@ -3909,7 +3971,7 @@ mod tests {
             let mut args = test_args();
             args.balloon = balloon;
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon);
+            let startup = startup_snapshot_key(&key, args.balloon, None);
             (key, startup)
         };
         let (key_64, startup_64) = names(Some(64));
@@ -3935,8 +3997,65 @@ mod tests {
             "a run without --balloon keeps the startup name it had"
         );
         assert_eq!(
-            startup_snapshot_key("abc123def456", None),
+            startup_snapshot_key("abc123def456", None, None),
             "abc123def456-startup"
+        );
+    }
+
+    /// A startup snapshot holds a container that runs with the host identity
+    /// address in its environment, which a restore cannot change, so runs with
+    /// different addresses share the pre-start snapshot and have a startup
+    /// snapshot each. A run without one keeps the startup name it had.
+    #[test]
+    fn two_host_identities_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let names = |address: Option<&str>| {
+            let mut args = test_args();
+            args.env = address
+                .map(|a| vec![format!("HOST_IPV6={a}")])
+                .unwrap_or_default();
+            let key = key_for(&args, GuestBootInputs::default());
+            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
+            (key, startup)
+        };
+        let (key_a, startup_a) = names(Some("2001:db8:a::1"));
+        let (key_b, startup_b) = names(Some("2001:db8:b::1"));
+        let (key_none, startup_none) = names(None);
+        assert_eq!(
+            key_a, key_b,
+            "the pre-start snapshot is shared between hosts"
+        );
+        assert_eq!(key_a, key_none);
+        assert_ne!(
+            startup_a, startup_b,
+            "a run on host B must not find the startup snapshot whose container runs as host A"
+        );
+        assert_ne!(startup_a, startup_none);
+        assert_eq!(startup_none, format!("{key_none}-startup"));
+        crate::storage::validate_snapshot_name(&startup_snapshot_key(
+            &key_a,
+            Some(u32::MAX),
+            Some("2001:db8:a::1".parse().unwrap()),
+        ))
+        .expect("the longest startup name is a valid snapshot name");
+
+        // Every caller names the startup snapshot for the run's own address.
+        let code = |source: &str| -> String {
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        let podman = code(include_str!("mod.rs"));
+        for call in [
+            "startup_snapshot_key(&key,args.balloon,run_host_ipv6(&args.env))",
+            "startup_snapshot_key(key,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
+        ] {
+            assert!(podman.contains(call), "podman run no longer calls {call}");
+        }
+        assert_eq!(podman.matches("startup_snapshot_key(").count(), 2);
+        assert!(
+            code(include_str!("../snapshot.rs"))
+                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6)"),
+            "a clone saves the startup snapshot under the address it restored with"
         );
     }
 
