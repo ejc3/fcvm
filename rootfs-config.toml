@@ -428,7 +428,7 @@ cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474
 description = "Nested virtualization support for running VMs inside VMs"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "f968bd641cb6"
+kernel_sha = "daca0ac45346"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -482,7 +482,7 @@ build_inputs = [
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "7f07a2f29b2e"
+kernel_sha = "087963bba9eb"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
