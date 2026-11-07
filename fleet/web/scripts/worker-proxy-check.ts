@@ -7,7 +7,7 @@
 // else gets a 302 to a login page.
 //
 //   node scripts/worker-proxy-check.ts serve <port>          the stand-in coordinator
-//   node scripts/worker-proxy-check.ts check <worker port> <stand-in port>   the checks; exit 1 on a failure
+//   node scripts/worker-proxy-check.ts check <worker port> <stand-in port> <direct URL>
 
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import { WebSocket as NodeWebSocket, WebSocketServer } from "ws";
@@ -77,6 +77,8 @@ if (mode === "serve") {
   server.listen(port, "127.0.0.1", () => console.log(`stand-in coordinator on ${port}`));
 } else if (mode === "check") {
   const coordPort = Number(process.argv[4]);
+  const directUrl = process.argv[5];
+  if (!(coordPort > 0) || !directUrl) throw new Error("usage: worker-proxy-check.ts check <worker port> <stand-in port> <direct URL>");
   const base = `127.0.0.1:${port}`;
   const failures: string[] = [];
   const expect = (what: string, ok: boolean, detail: string) => {
@@ -107,7 +109,8 @@ if (mode === "serve") {
 
   const page = await fetch(`http://${base}/?mode=potato`, { signal: AbortSignal.timeout(30000) }).then((r) => r.text());
   expect("the page falls back to its own origin", page.includes(`ws://${base}/live`), "no same-origin /live URL in the page");
-  expect("the page tries the coordinator's own host first", page.includes(`ws://127.0.0.1:${coordPort}/live`), "no direct /live URL in the page");
+  expect("the page renders the separate browser socket", page.includes(directUrl), "no direct /live URL in the page");
+  expect("the page does not use the Worker's upstream socket", !page.includes(`ws://127.0.0.1:${coordPort}/live`), "the upstream was rendered as a browser socket");
 
   await poster("poster");
 

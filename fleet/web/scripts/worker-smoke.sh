@@ -6,10 +6,9 @@
 # preview-props.json) while the deploy's Access check passed.
 #
 # Then it serves the Worker again with a test service token in front of a stand-in
-# coordinator (scripts/worker-proxy-check.ts) and requires the page to connect to its own
-# origin, and /live and /poster.jpg to reach the coordinator with the token and without the
-# viewer's Access cookie (core/live-proxy.ts), and without leaking coordinator Access
-# credentials back to the viewer on either the HTTP or the WebSocket response.
+# coordinator (scripts/worker-proxy-check.ts). The page must render the direct browser URL
+# and its own fallback, while /live and /poster.jpg must forward to the coordinator with the
+# token, without forwarding the viewer's Access cookie or returning the upstream credential.
 #
 # Usage: scripts/worker-smoke.sh <port>   (run from fleet/web; uses <port> to <port>+2)
 set -euo pipefail
@@ -69,10 +68,12 @@ worker_port=$((port + 1))
 node scripts/worker-proxy-check.ts serve "$coord_port" >"$work/coord.log" 2>&1 &
 pids+=("$!")
 log="$work/wrangler-proxy.log"
+direct_url="wss://viewer.example.test/live"
 pnpm exec wrangler dev --local --ip 127.0.0.1 --port "$worker_port" \
   --var "FLEET_COORD_URL:ws://127.0.0.1:$coord_port/live" \
+  --var "FLEET_DIRECT_COORD_URL:$direct_url" \
   --var FLEET_ACCESS_CLIENT_ID:smoke-id --var FLEET_ACCESS_CLIENT_SECRET:smoke-secret >"$log" 2>&1 &
 pid=$!
 pids+=("$pid")
 wait_ready
-node scripts/worker-proxy-check.ts check "$worker_port" "$coord_port" || fail "the Worker does not forward the coordinator's paths ($(cat "$work/coord.log"))"
+node scripts/worker-proxy-check.ts check "$worker_port" "$coord_port" "$direct_url" || fail "the Worker proxy checks failed ($(cat "$work/coord.log"))"

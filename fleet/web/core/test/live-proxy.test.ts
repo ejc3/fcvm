@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { forwardedRequest, isProxiedPath, liveProxy, pageLiveUrl, VIEWER_ADDRESS_HEADER } from "../live-proxy.ts";
+import { forwardedRequest, isProxiedPath, liveProxy, pageDirectLiveUrl, pageLiveUrl, VIEWER_ADDRESS_HEADER } from "../live-proxy.ts";
 
 const env = { FLEET_COORD_URL: "wss://coord.example.test/live", FLEET_ACCESS_CLIENT_ID: "id-1", FLEET_ACCESS_CLIENT_SECRET: "secret-1" };
 
@@ -72,5 +72,27 @@ describe("pageLiveUrl", () => {
     expect(pageLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL }, "stage.example.test", "https")).toBe(env.FLEET_COORD_URL);
     expect(pageLiveUrl(env, null, "https")).toBe(env.FLEET_COORD_URL);
     expect(pageLiveUrl({}, "stage.example.test", "https")).toBe("");
+  });
+});
+
+describe("pageDirectLiveUrl", () => {
+  it("splits browser direct access from the token-bearing Worker fallback", () => {
+    const separate = { ...env, FLEET_DIRECT_COORD_URL: "wss://viewer.example.test/live" };
+    expect(pageDirectLiveUrl(separate)).toBe(separate.FLEET_DIRECT_COORD_URL);
+    expect(pageLiveUrl(separate, "stage.example.test", "https")).toBe("wss://stage.example.test/live");
+    const upstream = forwardedRequest(liveProxy(separate)!, "/live", "", []);
+    expect(upstream.url).toBe("https://coord.example.test/live");
+    expect(upstream.headers).toContainEqual(["cf-access-client-secret", "secret-1"]);
+  });
+
+  it("keeps the old direct path if unconfigured and never creates a fallback without the Worker token", () => {
+    expect(pageDirectLiveUrl(env)).toBe(env.FLEET_COORD_URL);
+    expect(pageDirectLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL, FLEET_DIRECT_COORD_URL: "wss://viewer.example.test/live" })).toBeNull();
+  });
+
+  it("uses only an exact secure viewer socket for the optional override", () => {
+    for (const bad of ["not a URL", "https://viewer.example.test/live", "ws://viewer.example.test/live",
+      "wss://viewer.example.test/agent", "wss://viewer.example.test/live?token=test", "wss://user@viewer.example.test/live"])
+      expect(pageDirectLiveUrl({ ...env, FLEET_DIRECT_COORD_URL: bad })).toBeNull();
   });
 });

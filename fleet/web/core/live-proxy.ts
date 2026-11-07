@@ -1,10 +1,7 @@
-// The coordinator under the page's own origin. On staging, Cloudflare Access gates the page
-// host and the coordinator host as two applications, and an Access session cookie belongs
-// to one host. A new browser session signs in to the page host only, so the page's
-// cross-origin /live upgrade to the coordinator host is answered with Access's 302 to its
-// login page, which a WebSocket cannot follow. The Worker that serves the page therefore
-// forwards /live and /poster.jpg to the coordinator with a service token the coordinator's
-// application admits, and the page connects to its own origin: one Access session.
+// Staging can give the browser a direct /live socket on a hostname that shares the page's
+// Access application. If the browser has no cookie for it, the page falls back to its own
+// origin. The Worker forwards /live and /poster.jpg from there to the separate coordinator
+// API application, which admits its service token.
 //
 // Without the token (local runs, the mock, a deploy before the token exists) nothing is
 // forwarded and the page connects to FLEET_COORD_URL directly, as before.
@@ -19,10 +16,11 @@ export interface LiveProxy {
   clientSecret: string;
 }
 
-/** The Worker's bindings, or process.env: only these three strings are read. */
+/** The Worker's bindings, or process.env. Only FLEET_COORD_URL selects the proxy upstream. */
 export interface ProxyEnv {
   [binding: string]: unknown;
   FLEET_COORD_URL?: string;
+  FLEET_DIRECT_COORD_URL?: string;
   FLEET_ACCESS_CLIENT_ID?: string;
   FLEET_ACCESS_CLIENT_SECRET?: string;
 }
@@ -78,11 +76,14 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
 }
 
 /**
- * The /live URL the page tries before its own origin: the coordinator's host, when the
- * Worker forwards (the browser may hold an Access session there too), else null.
+ * The browser's optional direct /live URL. The Worker's service token always goes to
+ * FLEET_COORD_URL's origin, even when a separate viewer hostname is configured.
  */
 export function pageDirectLiveUrl(env: ProxyEnv): string | null {
-  return liveProxy(env) === null ? null : (env.FLEET_COORD_URL as string);
+  if (liveProxy(env) === null) return null;
+  if (env.FLEET_DIRECT_COORD_URL === undefined) return env.FLEET_COORD_URL as string;
+  const direct = env.FLEET_DIRECT_COORD_URL;
+  return /^wss:\/\/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\/live$/.test(direct) ? direct : null;
 }
 
 /**
