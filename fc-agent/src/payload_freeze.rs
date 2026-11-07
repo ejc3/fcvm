@@ -233,7 +233,14 @@ pub(crate) fn freeze_in(env: &Env) -> Vec<PathBuf> {
     // A record still here belongs to a boundary nothing thawed: its cgroups are ours.
     let previous = Record::read(env.record);
     let previous_id = previous.as_ref().map(|record| record.id);
-    let inherited = previous.map(|record| record.cgroups).unwrap_or_default();
+    // One that no longer exists (its container is gone) is dropped, as a thaw drops it: it
+    // would never report frozen and hold the settle wait for its whole FREEZE_SETTLE.
+    let inherited: Vec<PathBuf> = previous
+        .map(|record| record.cgroups)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|cgroup| cgroup.join("cgroup.freeze").exists())
+        .collect();
     let mut ours = inherited.clone();
     for cgroup in payload_cgroups(env.parent) {
         if !ours.contains(&cgroup) && !freeze_requested(&cgroup) {
@@ -644,6 +651,27 @@ mod tests {
         std::fs::write(&freeze, "1").unwrap();
         assert_eq!(tree.run(thaw_in), 1);
         after(&tree, &running, &paused);
+    }
+
+    /// A retry after the container was recreated under another cgroup: the old one is gone,
+    /// so it leaves the record and does not hold the freeze for FREEZE_SETTLE.
+    #[test]
+    fn a_retry_drops_an_inherited_cgroup_that_is_gone() {
+        let tree = Tree::new();
+        let old = tree.cgroup("libpod-payload-a", false);
+        tree.run(freeze_in);
+        std::fs::remove_dir_all(&old).unwrap();
+        let new = tree.cgroup("libpod-payload-b", false);
+        let started = Instant::now();
+        assert_eq!(tree.run(freeze_in), vec![new.clone()]);
+        assert!(
+            started.elapsed() < FREEZE_SETTLE,
+            "the freeze waited {:?} for a cgroup that is gone",
+            started.elapsed()
+        );
+        assert_eq!(tree.run(thaw_in), 1);
+        assert!(!frozen(&new));
+        assert!(!tree.record_exists());
     }
 
     #[test]
