@@ -14,6 +14,7 @@ use crate::cli::{
     SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
 };
 use crate::firecracker::FcNetworkMode;
+use crate::network::tcp_proxy::PortListeners;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, RoutedNetwork};
 use crate::paths;
 use crate::state::{
@@ -2318,12 +2319,32 @@ pub(crate) struct SnapshotRunAttempt {
 pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotRunAttempt {
     let mut generation = None;
     let mut prepared = None;
-    let result = cmd_snapshot_run_inner(args, &mut generation, &mut prepared).await;
+    let result = cmd_snapshot_run_inner(
+        args,
+        &mut generation,
+        &mut prepared,
+        PortListeners::default(),
+    )
+    .await;
     SnapshotRunAttempt {
         result,
         generation,
         prepared,
     }
+}
+
+/// [`cmd_snapshot_run`] for a VM this process has just torn down to restore it:
+/// `listeners` are the torn-down VM's published host listeners
+/// (`NetworkManager::take_port_listeners`), which a routed clone listens on instead of
+/// binding their addresses again, so those ports are never closed in between (#1025).
+pub(crate) async fn cmd_snapshot_run_with_listeners(
+    args: SnapshotRunArgs,
+    listeners: PortListeners,
+) -> Result<()> {
+    crate::cgroup::require_swap_disabled(args.no_swap)?;
+    let mut generation = None;
+    let mut prepared = None;
+    cmd_snapshot_run_inner(args, &mut generation, &mut prepared, listeners).await
 }
 
 /// The routed network a clone restores into, before its preflight and loopback
@@ -2442,6 +2463,7 @@ async fn cmd_snapshot_run_inner(
     args: SnapshotRunArgs,
     attempted_generation: &mut Option<SnapshotGeneration>,
     prepared_out: &mut Option<super::podman::PreparedSnapshot>,
+    port_listeners: PortListeners,
 ) -> Result<()> {
     // Determine mode and get snapshot name
     let (snapshot_name, serve_pid, uffd_socket, serve_uffd_mode) = match (&args.pid, &args.snapshot)
@@ -3017,6 +3039,8 @@ async fn cmd_snapshot_run_inner(
         )
         .for_launch(network_mode, &[]),
     );
+    // Handed-over listeners are routed's only; another mode closes them below.
+    let mut port_listeners = Some(port_listeners);
     // Setup networking based on mode - reuse guest_ip from snapshot if available
     let network: Box<dyn NetworkManager> = match network_mode {
         FcNetworkMode::Bridged => {
@@ -3043,7 +3067,8 @@ async fn cmd_snapshot_run_inner(
                 resolvers.mode_server.clone(),
                 restore_prefix.clone(),
                 args.ipv6_address,
-            );
+            )
+            .with_port_listeners(port_listeners.take().unwrap_or_default());
             setup_try!(net
                 .preflight_check()
                 .context("routed mode preflight check failed"));
@@ -3079,6 +3104,7 @@ async fn cmd_snapshot_run_inner(
             Box::new(net)
         }
     };
+    drop(port_listeners);
 
     // network.setup() may fail partway through (it tears nothing down itself),
     // so any error from here until the restore_from_snapshot error handler below

@@ -460,8 +460,11 @@ pub struct RoutedNetwork {
     /// that names it.
     address_lease: Option<AddressLease>,
     default_iface: Option<String>,
-    /// The published ports' host listeners, bound first in `setup` and handed to their
-    /// relays by its step 14.
+    /// Listeners a VM torn down in this process handed over (`with_port_listeners`);
+    /// `setup` listens on them instead of binding their addresses again.
+    handed_listeners: tcp_proxy::PortListeners,
+    /// The published ports' host listeners, bound first in `setup` and closed by
+    /// `cleanup`, unless `take_port_listeners` took them.
     port_listeners: tcp_proxy::PortListeners,
     proxy_handles: Vec<tcp_proxy::Relay>,
 }
@@ -486,6 +489,7 @@ impl RoutedNetwork {
             vm_ipv6: None,
             address_lease: None,
             default_iface: None,
+            handed_listeners: tcp_proxy::PortListeners::default(),
             port_listeners: tcp_proxy::PortListeners::default(),
             proxy_handles: Vec::new(),
         }
@@ -520,6 +524,14 @@ impl RoutedNetwork {
     /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
     pub fn with_forward_localhost(mut self, ports: Vec<u16>) -> Self {
         self.forward_localhost = ports;
+        self
+    }
+
+    /// Listen on these, the host listeners a VM torn down in this process published
+    /// (`NetworkManager::take_port_listeners`), for the mappings bound to their
+    /// addresses. `setup` closes the others.
+    pub fn with_port_listeners(mut self, listeners: tcp_proxy::PortListeners) -> Self {
+        self.handed_listeners = listeners;
         self
     }
 
@@ -860,8 +872,12 @@ impl NetworkManager for RoutedNetwork {
             .loopback_ip
             .clone()
             .unwrap_or_else(|| "127.0.0.2".to_string());
-        self.port_listeners = tcp_proxy::bind_port_forwards(&loopback_ip, &self.port_mappings)
-            .context("binding the published ports' host listeners")?;
+        self.port_listeners = tcp_proxy::bind_port_forwards(
+            &loopback_ip,
+            &self.port_mappings,
+            std::mem::take(&mut self.handed_listeners),
+        )
+        .context("binding the published ports' host listeners")?;
 
         // Resolve the IPv6 subnet: explicit --ipv6-prefix or auto-detect a /64
         // from host interfaces.
@@ -1309,7 +1325,7 @@ impl NetworkManager for RoutedNetwork {
         //     must run inside the namespace where the bridge is directly reachable.
         if !self.port_mappings.is_empty() {
             let handles = tcp_proxy::start_port_forwards(
-                std::mem::take(&mut self.port_listeners),
+                &self.port_listeners,
                 &self.port_mappings,
                 &ns_name,
                 GUEST_IP,
@@ -1411,7 +1427,7 @@ impl NetworkManager for RoutedNetwork {
         // When this returns their listeners are closed and their connection tasks have
         // finished.
         tcp_proxy::stop_relays(self.proxy_handles.drain(..)).await;
-        // Listeners a setup that failed before step 14 bound.
+        // The relays accepted on duplicates: this closes the published ports.
         self.port_listeners = tcp_proxy::PortListeners::default();
 
         // Remove IPv6 MASQUERADE and proxy NDP
@@ -1496,6 +1512,16 @@ impl NetworkManager for RoutedNetwork {
         }
 
         Ok(())
+    }
+
+    /// The listeners of the mappings that name a host address. Those on this VM's
+    /// loopback IP are closed: that address goes back to the pool when this VM's state
+    /// is deleted, and another VM given it must be able to bind it.
+    fn take_port_listeners(&mut self) -> tcp_proxy::PortListeners {
+        let mut listeners = std::mem::take(&mut self.port_listeners);
+        let mappings = &self.port_mappings;
+        listeners.retain(|index| mappings.get(index).is_some_and(|m| m.host_ip.is_some()));
+        listeners
     }
 
     fn tap_device(&self) -> &str {
@@ -2052,6 +2078,33 @@ mod tests {
             lease_address(dir.path(), "2001:db8::12".parse().unwrap(), "vm-e").unwrap()
         )
         .is_none());
+    }
+
+    /// A VM torn down to be restored in this process hands over the listeners of the
+    /// mappings that name a host address, and closes those on its own loopback IP: that
+    /// address returns to the pool with the VM's state, and a listener kept on it would
+    /// refuse the bind of another VM given it before the restore binds (#1025).
+    #[tokio::test]
+    async fn a_handover_keeps_host_address_listeners_and_closes_loopback_ones() {
+        let mapping = |host_ip: Option<&str>| PortMapping {
+            host_ip: host_ip.map(str::to_string),
+            host_port: 0,
+            guest_port: 80,
+            proto: Protocol::Tcp,
+        };
+        let mappings = vec![mapping(Some("127.0.0.1")), mapping(None)];
+        let mut net = RoutedNetwork::new("vm-test".into(), "tap-test".into(), mappings.clone());
+        net.port_listeners =
+            tcp_proxy::bind_port_forwards("127.0.0.1", &mappings, Default::default()).unwrap();
+        let named = net.port_listeners[0].local_addr().unwrap();
+        let on_loopback = net.port_listeners[1].local_addr().unwrap();
+
+        let handed = net.take_port_listeners();
+        assert_eq!(handed[0].local_addr().unwrap(), named);
+        let refused = std::net::TcpStream::connect(on_loopback)
+            .expect_err("the listener on the VM's loopback IP must be closed");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        std::net::TcpStream::connect(named).expect("the handed listener still listens");
     }
 
     /// A published host address that is in use fails setup before setup creates

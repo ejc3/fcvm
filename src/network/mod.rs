@@ -89,6 +89,17 @@ pub trait NetworkManager: Send + Sync {
     /// Default: no-op (bridged and routed have no helper process).
     fn start_kill_processes(&mut self) {}
 
+    /// Take the host listeners of the published ports, so `cleanup` leaves them open for
+    /// a restore in this process to listen on (`RoutedNetwork::with_port_listeners`).
+    /// Until that restore binds, a client is queued in their backlogs instead of being
+    /// refused, and no other process can take the ports.
+    ///
+    /// Default: none. Bridged publishes ports through DNAT rules and rootless through
+    /// pasta, neither of which is a listener this process holds.
+    fn take_port_listeners(&mut self) -> tcp_proxy::PortListeners {
+        tcp_proxy::PortListeners::default()
+    }
+
     /// Cleanup network after VM stop
     async fn cleanup(&mut self) -> Result<()>;
 
