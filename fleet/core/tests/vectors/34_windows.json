@@ -499,6 +499,50 @@
       "at": 47000,
       "host": "h1",
       "type": "agent_gone"
+    },
+    {
+      "at": 48000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 48500,
+      "host": "h1",
+      "msg": {
+        "age_days": 150,
+        "build": "26100.1742",
+        "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+        "eval_expires": "2027-05-06T10:00:00+00:00",
+        "gold": "ready",
+        "gold_error": null,
+        "id": "3f9c0a1b2c4d",
+        "installed_at": "2026-11-07T10:00:00Z",
+        "refused": null,
+        "type": "windows_image",
+        "warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media"
+      },
+      "type": "agent"
     }
   ],
   "expect": [
@@ -790,6 +834,21 @@
         "/view/windows": null
       },
       "note": "no sandboxes, no windows in the state"
+    },
+    {
+      "after": 38,
+      "checks": {
+        "/view/windows/image": null,
+        "/view/windows/tiles/0/slot": "win-1",
+        "/view/windows/tiles/1/phase": "pending"
+      },
+      "note": "a host that comes back gets its sandboxes again, with no image until it reports one"
+    },
+    {
+      "after": 39,
+      "checks": {
+        "/view/windows/image/warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media"
+      }
     }
   ],
   "final_view": {
@@ -1020,9 +1079,26 @@
         "viewer": "v1"
       }
     ],
-    "aggregates": [],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "frame_url_v4": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1"
+        ]
+      }
+    ],
     "borrow": {
-      "cap": 0,
+      "cap": 1,
       "lent": 0,
       "next_return_at": null
     },
@@ -1036,23 +1112,28 @@
       "scrub_failures": 0,
       "scrubs": 0
     },
-    "failures": [
-      {
-        "host": "h1",
-        "kind": "host_reclaimed",
-        "retiling": true,
-        "since": 47000
-      }
-    ],
+    "failures": [],
     "fleet": {
       "ec2_instances": 0,
       "ec2_n": 0,
       "ec2_waiting": 0,
-      "fcvm_gpus": 0,
-      "gpus": 0,
-      "hosts": [],
+      "fcvm_gpus": 1,
+      "gpus": 1,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
       "max_tiles": 2,
-      "n": 0,
+      "n": 1,
       "power": {
         "asleep_since": null,
         "hosts": [],
@@ -1071,10 +1152,15 @@
     "image_aspect": 1.7777777777777777,
     "layout": {
       "ec2": null,
-      "fcvm": null,
-      "from_frame": 1455,
-      "from_t": 48.5,
-      "generation": 2
+      "fcvm": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "from_frame": 1485,
+      "from_t": 49.5,
+      "generation": 3
     },
     "next_race_at": null,
     "nudges": {
@@ -1355,10 +1441,139 @@
       "ec2": null,
       "fcvm": null
     },
-    "tiles": [],
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "frame_url_v4": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:1",
+        "last_relaunch": null,
+        "phase": "pending",
+        "place": null,
+        "previous_rect": null,
+        "rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": null
+      }
+    ],
     "viewers": {
       "active": 1,
       "count": 1
+    },
+    "windows": {
+      "borrow": {
+        "cap": 1,
+        "lent": 0,
+        "next_return_at": null
+      },
+      "claim_secs": 30,
+      "image": {
+        "age_days": 150,
+        "build": "26100.1742",
+        "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+        "eval_expires": "2027-05-06T10:00:00+00:00",
+        "gold": "ready",
+        "gold_error": null,
+        "id": "3f9c0a1b2c4d",
+        "installed_at": "2026-11-07T10:00:00Z",
+        "refused": null,
+        "warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media"
+      },
+      "image_aspect": 3.5555555555555554,
+      "label": "Windows Server 2025 evaluation, for demonstration only",
+      "last_reset_all": {
+        "by": "viewer:v2",
+        "clicked_at": 11000,
+        "sandboxes": 2
+      },
+      "tiles": [
+        {
+          "actions": [
+            "start_menu",
+            "notepad",
+            "explorer",
+            "task_manager",
+            "about",
+            "close_all",
+            "reset"
+          ],
+          "borrowed": null,
+          "error": null,
+          "failure": null,
+          "fps": null,
+          "frame_url": null,
+          "frame_url_v4": null,
+          "generation": 1,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h1",
+          "id": "win:1",
+          "last_relaunch": null,
+          "phase": "pending",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "slot": "win-1",
+          "vm": null
+        },
+        {
+          "actions": [
+            "start_menu",
+            "notepad",
+            "explorer",
+            "task_manager",
+            "about",
+            "close_all",
+            "reset"
+          ],
+          "borrowed": null,
+          "error": null,
+          "failure": null,
+          "fps": null,
+          "frame_url": null,
+          "frame_url_v4": null,
+          "generation": 1,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h1",
+          "id": "win:2",
+          "last_relaunch": null,
+          "phase": "pending",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.5,
+            "y": 0.0
+          },
+          "slot": "win-2",
+          "vm": null
+        }
+      ]
     }
   }
 }
