@@ -234,6 +234,12 @@ pub struct FirecrackerConfig {
     /// unchanged.
     #[serde(skip_serializing_if = "crate::hypervisor::Backend::is_firecracker")]
     pub hypervisor: crate::hypervisor::Backend,
+    /// The Cloud Hypervisor binary a Cloud Hypervisor run boots and snapshots with, which
+    /// is part of the key as `firecracker_bin` is for Firecracker: a snapshot is restored by
+    /// the binary that wrote it. Content-addressed installs change path with every build.
+    /// None (every Firecracker run) is skip-serialized so existing keys are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_hypervisor_bin: Option<PathBuf>,
 }
 
 impl Default for FirecrackerConfig {
@@ -279,6 +285,7 @@ impl Default for FirecrackerConfig {
             fuse_max_write: None,
             no_writeback_cache: false,
             hypervisor: crate::hypervisor::Backend::Firecracker,
+            cloud_hypervisor_bin: None,
         }
     }
 }
@@ -760,6 +767,15 @@ mod tests {
         assert!(!serde_json::to_string(&firecracker)
             .unwrap()
             .contains("hypervisor"));
+        // A different Cloud Hypervisor build writes its own snapshots.
+        cloud_hypervisor.cloud_hypervisor_bin = Some(PathBuf::from(
+            "/mnt/fcvm-btrfs/cloud-hypervisor/cloud-hypervisor-aaaa.bin",
+        ));
+        let mut rebuilt = cloud_hypervisor.clone();
+        rebuilt.cloud_hypervisor_bin = Some(PathBuf::from(
+            "/mnt/fcvm-btrfs/cloud-hypervisor/cloud-hypervisor-bbbb.bin",
+        ));
+        assert_ne!(cloud_hypervisor.snapshot_key(), rebuilt.snapshot_key());
     }
 
     /// The key hashes this JSON. A config with no balloon has no `balloon` member,
