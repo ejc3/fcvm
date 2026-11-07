@@ -2212,7 +2212,7 @@ pub(crate) async fn publish_log(
     dest: &std::path::Path,
     keep: Option<u64>,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
@@ -2229,11 +2229,17 @@ pub(crate) async fn publish_log(
         let len = input.metadata().await?.len();
         match keep {
             Some(keep) if len > keep => {
-                input.seek(std::io::SeekFrom::Start(len - keep)).await?;
+                // The byte before the cut says whether the cut lands inside a line: when it is
+                // a newline the kept bytes start with a whole line, and nothing more is skipped.
+                input.seek(std::io::SeekFrom::Start(len - keep - 1)).await?;
+                let mut before = [0u8; 1];
+                input.read_exact(&mut before).await?;
                 let mut input = tokio::io::BufReader::new(input);
-                // The cut lands in a line; the copy starts at the next one.
-                let mut partial = Vec::new();
-                let skipped = input.read_until(b'\n', &mut partial).await? as u64;
+                let mut skipped = 0;
+                if before[0] != b'\n' {
+                    let mut partial = Vec::new();
+                    skipped = input.read_until(b'\n', &mut partial).await? as u64;
+                }
                 out.write_all(
                     format!(
                         "fcvm: the first {} of this log's {len} bytes were not kept\n",
@@ -10253,6 +10259,15 @@ mod publish_log_tests {
             )
         );
         assert!(kept.ends_with(b"\nthe line before the exit\n"));
+
+        // A cut that falls on a line's start keeps that line.
+        std::fs::write(&log, "older\nkept\n").unwrap();
+        let dest = out.join("aligned.log");
+        super::publish_log(&log, &dest, Some(5)).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "fcvm: the first 6 of this log's 11 bytes were not kept\nkept\n"
+        );
 
         // A log under the bound is copied whole, with no note.
         std::fs::write(&log, "short\n").unwrap();

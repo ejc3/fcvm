@@ -799,12 +799,7 @@ setup-passt:
 	./scripts/build-passt.sh
 
 setup-pjdfstest:
-	@if [ ! -x /tmp/pjdfstest-check/pjdfstest ]; then \
-		echo '==> Building pjdfstest...'; \
-		rm -rf /tmp/pjdfstest-check && \
-		git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check && \
-		cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make; \
-	fi
+	@./scripts/setup-pjdfstest.sh
 
 # Hugepage pool for privileged tests (512 pages = 1GB, enough for 512MB test VMs)
 HUGEPAGE_POOL_TESTS := 512

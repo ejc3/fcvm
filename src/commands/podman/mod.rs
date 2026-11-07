@@ -3148,10 +3148,11 @@ fn with_container_output(
             .ok()
             .filter(|file| file.metadata().is_ok_and(|m| m.is_file()))
     };
-    let Some(mut file) = open_regular(saved) else {
+    let Some(file) = open_regular(saved) else {
         return error;
     };
-    let kept = if open_regular(rotated).is_some() {
+    let rotated_file = open_regular(rotated);
+    let kept = if rotated_file.is_some() {
         format!(
             "{}, and the lines before them in {}",
             saved.display(),
@@ -3159,6 +3160,12 @@ fn with_container_output(
         )
     } else {
         saved.display().to_string()
+    };
+    // An empty current copy with a rotated one beside it (the rotation's note failed to write)
+    // is not "printed nothing": the last lines are in the rotated copy.
+    let mut file = match rotated_file {
+        Some(rotated) if file.metadata().is_ok_and(|m| m.len() == 0) => rotated,
+        _ => file,
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(PREPARE_ERROR_TAIL_BYTES);
@@ -5386,6 +5393,14 @@ mod tests {
             )),
             "{message}"
         );
+
+        // An empty current copy beside a rotated one shows the rotated copy's last lines.
+        std::fs::write(&saved, "").unwrap();
+        let message = format!(
+            "{:#}",
+            with_container_output(anyhow::anyhow!("x"), &saved, &rotated)
+        );
+        assert!(message.ends_with("stdout: line -1"), "{message}");
         std::fs::remove_file(&rotated).unwrap();
 
         std::fs::write(&saved, "").unwrap();
