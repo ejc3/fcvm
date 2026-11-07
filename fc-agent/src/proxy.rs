@@ -510,6 +510,28 @@ async fn bind_with_backlog(
     socket.listen(LISTEN_BACKLOG)
 }
 
+/// Keep a connection to an address the guest itself holds out of the proxy, in either
+/// family. Besides loopback, the guest holds the host's identity address (fc-agent adds
+/// HOST_IPV6 to lo and eth0), and a service in the guest that dials its own host name
+/// (testpilot's sanity check names the sandbox's host name) reaches that address. Sent
+/// through the proxy, the connection left the guest and reached the host instead of the
+/// guest's own listener. `addrtype` is matched per packet, so an address added later, or
+/// swapped in by a restore, is covered too.
+const LOCAL_DESTINATION_RETURN: &[&str] = &[
+    "-t",
+    "nat",
+    "-A",
+    "OUTPUT",
+    "-p",
+    "tcp",
+    "-m",
+    "addrtype",
+    "--dst-type",
+    "LOCAL",
+    "-j",
+    "RETURN",
+];
+
 /// Set up iptables (IPv4) NAT OUTPUT REDIRECT rules.
 fn setup_iptables_redirect_v4() -> bool {
     let port_str = PROXY_LISTEN_PORT.to_string();
@@ -555,6 +577,7 @@ fn setup_iptables_redirect_v4() -> bool {
             "-j",
             "RETURN",
         ],
+        LOCAL_DESTINATION_RETURN,
         // Redirect all other outbound TCP to proxy
         &[
             "-t",
@@ -629,6 +652,7 @@ fn setup_ip6tables_redirect() -> bool {
             "-j",
             "RETURN",
         ],
+        LOCAL_DESTINATION_RETURN,
         // Redirect all other outbound IPv6 TCP to proxy
         &[
             "-t",
@@ -722,6 +746,33 @@ fn get_original_dst_v6(fd: std::os::fd::RawFd) -> anyhow::Result<(Ipv6Addr, u16)
 
 #[cfg(test)]
 mod tests {
+    /// Both families return a connection to a guest-local address before the catch-all
+    /// REDIRECT, so the guest's own listeners stay reachable at every address it holds.
+    #[test]
+    fn local_destinations_return_before_the_redirect_in_both_families() {
+        let source = include_str!("proxy.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for setup in [
+            "fn setup_iptables_redirect_v4(",
+            "fn setup_ip6tables_redirect(",
+        ] {
+            let body = &code[code.find(setup).unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let local = body
+                .find("LOCAL_DESTINATION_RETURN")
+                .unwrap_or_else(|| panic!("{setup} has no local-destination rule"));
+            let redirect = body.find("\"REDIRECT\"").expect("a REDIRECT rule");
+            assert!(
+                local < redirect,
+                "{setup}: the local-destination rule comes after REDIRECT"
+            );
+        }
+        assert!(LOCAL_DESTINATION_RETURN
+            .windows(2)
+            .any(|w| w == ["--dst-type", "LOCAL"]));
+        assert_eq!(LOCAL_DESTINATION_RETURN.last(), Some(&"RETURN"));
+    }
+
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
