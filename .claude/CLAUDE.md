@@ -2923,12 +2923,53 @@ separately.
   flag the thread reads before every request, so at most one further request starts after
   the stop returns. Every warm-up logs one line: `asked the kernel to read the recorded
   working set into the page cache` with `trigger`, `runs`, `pages`, `failures` and
-  `elapsed_ms`, or, for a fresh snapshot, that no working set is recorded yet. Minor mode
+  `elapsed_ms`, and `file`, or, for a fresh snapshot, that no working set is recorded yet.
+  When the snapshot has a pack of the recorded set (below) and the serve replays on workers,
+  the warm-up loads it and reads the pack file front to back instead of the recorded runs
+  (`file="pack"`). Minor mode
   reads the whole image into its memfd at startup, so it has nothing to warm, and
   `--uffd-prefetch off` starts no warm-up. Known limits, with numbers, are in the module doc:
   the warm-up is not paced, so on a cold cache another running clone's major fault waits
   behind its readahead, it can outrun replay when free page cache is smaller than the
   recorded set, and a minor-mode server starting on the same image drops what it loaded.
+- **Packed working set**: replay's reads of the recorded runs from the memory file are
+  scattered (a 128 GiB www guest: 72 GiB in 2.55 M runs). From a cold page cache those reads
+  took 40.0 s with 8 threads, and 65.7 s when btrfs had compressed the memory file; the same
+  bytes packed as zstd frames, read and decompressed by 32 threads, took 4.1 s (2026-11-04).
+  A pack (`<memory.bin>.working-set.pack`, `src/uffd/pack.rs`) holds every recorded run's
+  bytes in first-touch order as independent zstd level-1 frames of 4 MiB, with a content
+  checksum each, keyed by the memory file's image key and the set's order digest (the
+  granules and the tier of each).
+  - *When it is built.* After the serve's persistence worker publishes the sidecar, a
+    detached builder thread (`fcvm-ws-pack`, 4 threads) packs exactly the published set; the
+    first publication pass of a serve also asks, so a snapshot whose pack is missing or
+    stale gets one; after that only a changed sidecar asks. A newer set cancels a running
+    build at its next frame. `snapshot create --inherit-working-set` builds the inherited
+    set's pack after it gives the generation lock back, and waits for it: reading and
+    compressing a large set adds minutes to that create. The build reads an open memory file whose identity it checks first, with no lock,
+    into a uuid temporary recorded in `reclaim` before it is created. Installing it is a
+    rename under the shared generation lock and the sidecar's lock, only if the image and
+    generation are still the store's and the sidecar holds that set, so a pack is never
+    installed beside a replaced image or another set (`pack_installation_cannot_race_image_replacement`,
+    `a_pack_is_not_installed_beside_another_set`). A build that fails logs a warning.
+  - *When it is used.* Copy mode with replay workers (`--uffd-replay-threads` above 1), NV2
+    and hugetlb clones included, when the loaded pack's key and digest match the set being
+    replayed and its run table is that set's runs. The page cache warm-up loads it; a clone's
+    replay only asks for it, without waiting, so a clone that connects before the warm-up
+    loaded it replays from the memory file. Packs fail closed: a store replays one only after
+    its server binds it to the memory file it mapped (`bind_served_image`), so a server whose
+    memory file is not the image its store describes (the snapshot was replaced between the
+    two opens) replays none. The
+    handler still plans every run, steps over given-back pages and maps holes; workers copy a
+    plain run out of decompressed frames instead of the mapping, as many read-ahead threads
+    as workers decompress frames in order a window ahead (2 per worker, at most 64) and drop
+    them behind it, and a run whose frame is gone or failed reads the memory file. A frame
+    that fails to decompress to its table length makes the rest of that replay read the
+    memory file. Minor mode, and a handler replaying alone, keep the memory file: a minor
+    clone's memfd already holds the image and `UFFDIO_CONTINUE` moves no bytes.
+  - *What it logs.* The replay line gains `pack_used`, `pack_frames`, `pack_compressed_mib`,
+    `pack_decompress_ms` (summed over threads), `pack_mib` and `pack_failed`; the warm-up
+    line's `file` says whether it read the `pack` or the `memory` file's recorded runs.
 - **Idle snapshots leave the page cache when a server starts** (`src/uffd/release.rs`, #1066):
   a server that starts asks the kernel to drop the memory file of every other snapshot that
   nothing is reading (`posix_fadvise(POSIX_FADV_DONTNEED)`, on a detached thread).
