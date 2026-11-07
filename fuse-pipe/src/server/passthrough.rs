@@ -103,6 +103,11 @@ impl MountPointState {
     }
 }
 
+/// Whether `entry` is a directory.
+fn is_dir(entry: &Entry) -> bool {
+    entry.attr.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
 impl PassthroughFs {
     /// Create the server of a volume that is `read_only` or not.
     ///
@@ -313,11 +318,52 @@ impl PassthroughFs {
             }
             match self.inner.lookup(&ctx, inode, c".") {
                 Ok(held) => self.inner.forget(&ctx, held.inode, 1),
+                // Held, but not reopened: keep it.
+                Err(error) if error.raw_os_error() != Some(libc::EBADF) => {}
                 Err(_) => {
                     state.first.retain(|_, kept| *kept != inode);
                     state.below.remove(&inode);
                 }
             }
+        }
+    }
+
+    /// Whether `name` in `parent` is a kept directory (`with_mount_points`) that the host has
+    /// replaced or removed. The guest sees the kept directory there, the backend the host's,
+    /// so a request that changes the entry by name (RMDIR, UNLINK, RENAME, LINK onto it) would
+    /// act on a directory the guest does not see. Those are refused with EBUSY, as the guest's
+    /// own kernel refuses to remove a mount point.
+    fn kept_and_replaced(&self, parent: u64, name: &[u8]) -> bool {
+        let Some(mount_points) = &self.mount_points else {
+            return false;
+        };
+        let state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&kept) = state.first.get(&(parent, name.to_vec())) else {
+            return false;
+        };
+        let Ok(cname) = CString::new(name.to_vec()) else {
+            return false;
+        };
+        let ctx = Context::new();
+        match self.inner.lookup(&ctx, parent, &cname) {
+            Ok(entry) => {
+                self.inner.forget(&ctx, entry.inode, 1);
+                entry.inode != kept
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// The guest removed `name` in `parent` itself. What was kept there is let go at once, even
+    /// while the guest still holds the removed directory open, so the guest can put another
+    /// directory at that name.
+    fn removed_by_guest(&self, parent: u64, name: &[u8]) {
+        let Some(mount_points) = &self.mount_points else {
+            return;
+        };
+        let mut state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = state.first.remove(&(parent, name.to_vec())) {
+            state.below.remove(&kept);
         }
     }
 
@@ -342,7 +388,9 @@ impl PassthroughFs {
         let first = state.first.get(&(parent, name.to_vec())).copied();
         match (first, &found) {
             (Some(first), Ok(entry)) if entry.inode == first => found,
-            (Some(first), _) => match self.inner.lookup(ctx, first, c".") {
+            // The probe runs as the server, not as the caller: the caller may have no search
+            // permission on the covered directory it reaches the mount through.
+            (Some(first), _) => match self.inner.lookup(&Context::new(), first, c".") {
                 Ok(kept) => {
                     if let Ok(entry) = &found {
                         self.inner.forget(ctx, entry.inode, 1);
@@ -357,21 +405,42 @@ impl PassthroughFs {
                     );
                     Ok(kept)
                 }
-                // The guest forgot the directory, and the server with it: nothing is mounted
-                // on it any more, so the host's directory is the answer.
+                // The backend still holds the directory but could not reopen it (the host took
+                // its search permission away): keep the pin, and answer the error rather than
+                // the host's replacement, so the guest is never shown, and never acts by name
+                // on, a directory other than the one it kept.
+                Err(error) if error.raw_os_error() != Some(libc::EBADF) => {
+                    tracing::warn!(
+                        target: "passthrough",
+                        root = %self.root_path.display(),
+                        parent,
+                        name = %String::from_utf8_lossy(name),
+                        %error,
+                        "a directory the guest has a mount on could not be reopened"
+                    );
+                    if let Ok(entry) = &found {
+                        self.inner.forget(&Context::new(), entry.inode, 1);
+                    }
+                    Err(error)
+                }
+                // EBADF: the guest forgot the directory, and the server with it. Nothing is
+                // mounted on it any more, so the host's directory is the answer.
                 Err(_) => {
                     state.first.remove(&(parent, name.to_vec()));
                     state.below.remove(&first);
-                    if let Ok(entry) = &found {
+                    if let Some(entry) = found.as_ref().ok().filter(|entry| is_dir(entry)) {
                         state.keep(parent, name, entry.inode, tree);
                     }
                     found
                 }
             },
-            (None, Ok(entry)) => {
+            // Only a directory can have a mount on it or lead to one (a symlink on the way is
+            // the guest's to follow), so only a directory is kept.
+            (None, Ok(entry)) if is_dir(entry) => {
                 state.keep(parent, name, entry.inode, tree);
                 found
             }
+            (None, Ok(_)) => found,
             (None, Err(_)) => found,
         }
     }
@@ -842,6 +911,9 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn rmdir(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+        if self.kept_and_replaced(parent, name) {
+            return VolumeResponse::error(libc::EBUSY);
+        }
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -852,7 +924,10 @@ impl FilesystemHandler for PassthroughFs {
         };
 
         match self.inner.rmdir(&ctx, parent, &cname) {
-            Ok(()) => VolumeResponse::Ok,
+            Ok(()) => {
+                self.removed_by_guest(parent, name);
+                VolumeResponse::Ok
+            }
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -1054,6 +1129,9 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn unlink(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+        if self.kept_and_replaced(parent, name) {
+            return VolumeResponse::error(libc::EBUSY);
+        }
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -1064,7 +1142,10 @@ impl FilesystemHandler for PassthroughFs {
         };
 
         match self.inner.unlink(&ctx, parent, &cname) {
-            Ok(()) => VolumeResponse::Ok,
+            Ok(()) => {
+                self.removed_by_guest(parent, name);
+                VolumeResponse::Ok
+            }
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -1080,6 +1161,9 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
+        if self.kept_and_replaced(parent, name) || self.kept_and_replaced(newparent, newname) {
+            return VolumeResponse::error(libc::EBUSY);
+        }
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -1163,6 +1247,9 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
+        if self.kept_and_replaced(newparent, newname) {
+            return VolumeResponse::error(libc::EBUSY);
+        }
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -1466,24 +1553,23 @@ impl FilesystemHandler for PassthroughFs {
         // for it, as a lookup does (`fuse_direntplus_link`), so a listing keeps mount points too.
         let entries = entries
             .into_iter()
-            .map(|(name, entry)| {
+            .filter_map(|(name, entry)| {
                 let entry = if name == b"." || name == b".." {
                     entry
                 } else {
-                    // A kept mount point never fails: an error leaves the backend's entry.
-                    match self.keep_mount_point(&ctx, ino, &name, Ok(entry)) {
-                        Ok(entry) => entry,
-                        Err(_) => unreachable!("keep_mount_point fails only when the backend did"),
-                    }
+                    // A kept directory that cannot be reopened is left out of the listing, as the
+                    // host's replacement must not be named for it; keep_mount_point has
+                    // forgotten the replacement's lookup.
+                    self.keep_mount_point(&ctx, ino, &name, Ok(entry)).ok()?
                 };
-                DirEntryPlus {
+                Some(DirEntryPlus {
                     ino: entry.inode,
                     attr: Self::entry_to_attr(&entry),
                     generation: entry.generation,
                     name,
                     attr_ttl_secs: self.attr_ttl_secs,
                     entry_ttl_secs: self.attr_ttl_secs,
-                }
+                })
             })
             .collect::<Vec<_>>();
         tracing::debug!(target: "passthrough", ino, offset, count = entries.len(), "readdirplus succeeded");
@@ -2135,6 +2221,124 @@ mod tests {
             seen,
             "a subdirectory of a forgotten directory is still kept"
         );
+    }
+
+    /// A kept directory the host replaced is the one the guest sees at its name, so RMDIR,
+    /// UNLINK, RENAME and LINK of that name are refused with EBUSY instead of acting on the
+    /// host's replacement, which the guest does not see.
+    #[test]
+    fn a_kept_name_the_host_replaced_is_not_changed_by_name() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        let fs =
+            PassthroughFs::for_volume(root, false).with_mount_points(&[PathBuf::from("a/inner")]);
+        let looked_up = fs.lookup(1, b"a", uid, gid, 0);
+        assert!(looked_up.errno().is_none(), "lookup: {looked_up:?}");
+        std::fs::rename(root.join("a"), root.join("a.old")).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        for (what, response) in [
+            ("rmdir", fs.rmdir(1, b"a", uid, gid, 0)),
+            ("rename", fs.rename(1, b"a", 1, b"b", 0, uid, gid, 0)),
+        ] {
+            assert_eq!(response.errno(), Some(libc::EBUSY), "{what}: {response:?}");
+        }
+        assert!(
+            root.join("a").is_dir(),
+            "the host's replacement was removed or moved"
+        );
+        assert!(root.join("a.old/inner").is_dir());
+    }
+
+    /// A kept directory the server cannot reopen for a moment (here: no search permission, for
+    /// a server that is not root) stays kept; only one the backend no longer holds is let go.
+    #[test]
+    fn a_kept_directory_that_cannot_be_reopened_stays_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        let fs =
+            PassthroughFs::for_volume(root, false).with_mount_points(&[PathBuf::from("inner")]);
+        let lookup = |name: &[u8]| match fs.lookup(1, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup: {other:?}"),
+        };
+        let inner = lookup(b"inner");
+        std::fs::rename(root.join("inner"), root.join("inner.old")).unwrap();
+        std::fs::create_dir(root.join("inner")).unwrap();
+        let mode = |m| {
+            std::fs::set_permissions(root.join("inner.old"), std::fs::Permissions::from_mode(m))
+                .unwrap()
+        };
+        mode(0o000);
+        let refused = fs.lookup(1, b"inner", uid, gid, 0);
+        mode(0o755);
+        if uid != 0 {
+            // Root searches a directory whatever its mode, so only a server that is not root
+            // fails to reopen it, and then the guest gets the error, not the host's replacement.
+            assert_eq!(refused.errno(), Some(libc::EACCES), "lookup: {refused:?}");
+        }
+        assert_eq!(
+            lookup(b"inner"),
+            inner,
+            "a kept directory that could not be reopened once was let go"
+        );
+    }
+
+    /// A kept name the guest removed itself is free for the guest to use again at once, even
+    /// while it still holds the removed directory, before its FORGET.
+    #[test]
+    fn a_kept_name_the_guest_removed_can_be_used_again() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let fs =
+            PassthroughFs::for_volume(root, false).with_mount_points(&[PathBuf::from("inner")]);
+        let looked_up = fs.lookup(1, b"inner", uid, gid, 0);
+        assert!(looked_up.errno().is_none(), "lookup: {looked_up:?}");
+        let removed = fs.rmdir(1, b"inner", uid, gid, 0);
+        assert!(removed.errno().is_none(), "rmdir: {removed:?}");
+        let renamed = fs.rename(1, b"other", 1, b"inner", 0, uid, gid, 0);
+        assert!(
+            renamed.errno().is_none(),
+            "rename onto the removed name: {renamed:?}"
+        );
+    }
+
+    /// A symlink on the way to a mount point is the guest's to follow, not a directory anything
+    /// is mounted on, so it is not kept: the host may replace it and the guest may remove it.
+    #[test]
+    fn a_symlink_on_the_way_to_a_mount_point_is_not_kept() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+        let fs = PassthroughFs::for_volume(root, false)
+            .with_mount_points(&[PathBuf::from("link/inner")]);
+        let lookup = |name: &[u8]| match fs.lookup(1, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup: {other:?}"),
+        };
+        let link = lookup(b"link");
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+        assert_ne!(
+            lookup(b"link"),
+            link,
+            "a replaced symlink on the way to a mount point was kept"
+        );
+        let removed = fs.unlink(1, b"link", uid, gid, 0);
+        assert!(removed.errno().is_none(), "unlink: {removed:?}");
     }
 
     /// A mount point with a `..` names no directory the server can tell before the guest
