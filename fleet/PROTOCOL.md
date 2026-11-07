@@ -185,7 +185,11 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
-(only behind Cloudflare, which sets it), else the peer address. Reconnecting does not
+(only behind Cloudflare, which sets it), else the peer address. With that flag, a request
+that Cloudflare Access admitted with a service token (its `Cf-Access-Jwt-Assertion` names a
+`common_name` and no `email`) is counted by its `x-fleet-viewer-ip` header instead: the
+staging page's Worker forwards every viewer's `/live` with one service token, and its
+subrequests all arrive with the Worker's own `CF-Connecting-IP`. Reconnecting does not
 reset a limit.
 
 **Races.** A race relaunches every tile at once and times both halves by the

@@ -154,19 +154,64 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
         .into_response()
 }
 
-/// The address the per-client limits use.
+/// The viewer's address as the staging page's Worker forwards it (fleet/web/worker.ts). A
+/// Worker's subrequest reaches Cloudflare's front door as a request of its own, so its
+/// `CF-Connecting-IP` is the Worker's address, the same for every viewer.
+pub const VIEWER_ADDRESS_HEADER: &str = "x-fleet-viewer-ip";
+
+/// The address the per-client limits use. Behind Cloudflare (`trust_cf`) that is
+/// `CF-Connecting-IP`, or [`VIEWER_ADDRESS_HEADER`] on a request Access admitted with a
+/// service token: only the fleet's own Worker and CI hold one, and a viewer's browser
+/// cannot present one, so it cannot set the address it is limited by.
 pub fn client_address(headers: &HeaderMap, peer: SocketAddr, trust_cf: bool) -> String {
-    if trust_cf {
-        if let Some(ip) = headers
-            .get("cf-connecting-ip")
+    let ip = |name: &str| {
+        headers
+            .get(name)
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
-        {
-            return ip.to_string();
+            .map(str::to_string)
+    };
+    if trust_cf {
+        if access_service_token(headers) {
+            if let Some(viewer) = ip(VIEWER_ADDRESS_HEADER) {
+                return viewer;
+            }
+        }
+        if let Some(cf) = ip("cf-connecting-ip") {
+            return cf;
         }
     }
     peer.ip().to_string()
+}
+
+/// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
+/// it forwards names one (`common_name`, the token's client id) and no person (`email`).
+/// The signature is not checked here: the tunnel's connector refuses a request whose token
+/// does not verify for the coordinator's applications (`access.required`, ejc3/aws
+/// fcvm-dev.tf), so a request without a valid one never arrives.
+fn access_service_token(headers: &HeaderMap) -> bool {
+    let Some(jwt) = headers
+        .get("cf-access-jwt-assertion")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(payload) = jwt.split('.').nth(1) else {
+        return false;
+    };
+    let Some(claims) = super::admission::b64url_decode(payload)
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    else {
+        return false;
+    };
+    let named = |k: &str| {
+        claims
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+    };
+    named("common_name") && !named("email")
 }
 
 async fn live(

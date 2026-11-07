@@ -102,7 +102,7 @@ pub fn direct_token_valid(keys: &[AdmitKey], token: &str, now: u64) -> bool {
     })
 }
 
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+pub(super) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc = 0u32;
     let mut bits = 0;

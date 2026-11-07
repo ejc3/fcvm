@@ -278,7 +278,9 @@ pub struct FleetCoordArgs {
     pub camera_seed: u64,
 
     /// Key per-client limits by the CF-Connecting-IP header (set by Cloudflare in front of
-    /// the coordinator); without this flag, by the connection's peer address
+    /// the coordinator), or by x-fleet-viewer-ip on a request Access admitted with a service
+    /// token (the staging page's Worker forwarding a viewer); without this flag, by the
+    /// connection's peer address
     #[arg(long)]
     pub trust_cf_connecting_ip: bool,
 
