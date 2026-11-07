@@ -45,6 +45,10 @@ const CLOCK_ACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 /// The longest acknowledgement line read (`ack <vm id> <ms>` is about 60 bytes).
 const CLOCK_ACK_MAX_LINE: u64 = 256;
 
+/// How long the RDP relay keeps forwarding the guest's bytes to a client that has finished
+/// sending, before it ends both connections.
+const RDP_RELAY_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long the RDP relay waits for the guest to accept a connection.
 const RDP_RELAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -166,7 +170,7 @@ pub async fn serve_rdp_relay(
     target: std::net::SocketAddr,
 ) -> Result<()> {
     loop {
-        let (mut client, _) = listener.accept().await.context("accepting on rdp.sock")?;
+        let (client, _) = listener.accept().await.context("accepting on rdp.sock")?;
         tokio::spawn(async move {
             let guest = tokio::time::timeout(
                 RDP_RELAY_CONNECT_TIMEOUT,
@@ -174,13 +178,43 @@ pub async fn serve_rdp_relay(
             )
             .await;
             match guest {
-                Ok(Ok(mut guest)) => {
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut guest).await;
-                }
+                Ok(Ok(guest)) => relay_until_one_side_ends(client, guest, RDP_RELAY_DRAIN).await,
                 Ok(Err(error)) => eprintln!("rdp relay: connecting to {target}: {error}"),
                 Err(_) => eprintln!("rdp relay: {target} did not accept within 5 s"),
             }
         });
+    }
+}
+
+/// Relay `client` and `guest` both ways until one side ends, then give the other direction
+/// `drain` to finish and drop both. When a side ends, the other peer's write half is shut
+/// down so it sees the end. Without the bound, a guest that accepted and never answers (a
+/// health probe that timed out while Windows starts) would keep this task and both sockets
+/// for ever: `copy_bidirectional` waits for both directions.
+async fn relay_until_one_side_ends(
+    client: tokio::net::UnixStream,
+    guest: tokio::net::TcpStream,
+    drain: std::time::Duration,
+) {
+    use tokio::io::AsyncWriteExt;
+    let (mut client_rx, mut client_tx) = client.into_split();
+    let (mut guest_rx, mut guest_tx) = guest.into_split();
+    let to_guest = async {
+        let _ = tokio::io::copy(&mut client_rx, &mut guest_tx).await;
+        let _ = guest_tx.shutdown().await;
+    };
+    let to_client = async {
+        let _ = tokio::io::copy(&mut guest_rx, &mut client_tx).await;
+        let _ = client_tx.shutdown().await;
+    };
+    tokio::pin!(to_guest, to_client);
+    tokio::select! {
+        () = &mut to_guest => {
+            let _ = tokio::time::timeout(drain, &mut to_client).await;
+        }
+        () = &mut to_client => {
+            let _ = tokio::time::timeout(drain, &mut to_guest).await;
+        }
     }
 }
 
@@ -913,6 +947,65 @@ mod tests {
         assert_eq!(&reply, b"HELLO");
         echo.await.unwrap();
         relay.abort();
+    }
+
+    /// The sockets this process holds open, from /proc/self/fd.
+    fn open_sockets() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target.to_string_lossy().starts_with("socket:"))
+            .count()
+    }
+
+    /// A guest that accepts the relay's connection and never answers (a health probe's
+    /// timeout, while Windows is still starting) does not keep the relay's sockets: once the
+    /// client has gone, the relay ends the guest connection after a bounded drain. N probes
+    /// that time out leave N held guest sockets in the fake guest and nothing in the relay.
+    #[tokio::test]
+    async fn a_guest_that_never_answers_does_not_keep_the_relay() {
+        use tokio::io::AsyncWriteExt;
+        const PROBES: usize = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = guest.local_addr().unwrap();
+        let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+        let holder = tokio::spawn(async move {
+            loop {
+                let (socket, _) = guest.accept().await.unwrap();
+                held_tx.send(socket).unwrap();
+            }
+        });
+        let socket = rdp_socket_path(dir.path());
+        let relay = tokio::spawn(serve_rdp_relay(
+            tokio::net::UnixListener::bind(&socket).unwrap(),
+            target,
+        ));
+        let baseline = open_sockets();
+        let mut held = Vec::new();
+        for _ in 0..PROBES {
+            let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            client
+                .write_all(&crate::health::RDP_CONNECTION_REQUEST)
+                .await
+                .unwrap();
+            held.push(held_rx.recv().await.unwrap());
+            drop(client);
+        }
+        // Each probe left one socket in the fake guest; anything above that is the relay's.
+        let deadline =
+            std::time::Instant::now() + RDP_RELAY_DRAIN + std::time::Duration::from_secs(3);
+        let mut leaked = open_sockets() - baseline - PROBES;
+        while leaked > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            leaked = open_sockets() - baseline - PROBES;
+        }
+        relay.abort();
+        holder.abort();
+        assert_eq!(
+            leaked, 0,
+            "the relay still holds {leaked} sockets for {PROBES} ended probes"
+        );
     }
 
     /// The helper child is this fcvm's `vm ns-helper`, whose arguments parse as the hidden
