@@ -2957,11 +2957,19 @@ Not yet checked:
 
 **Read-only maps (`--map HOST:GUEST:ro`)** are mounted read-only in the guest and without `FUSE_WRITEBACK_CACHE`. `/proc/self/mountinfo` in the guest shows the mount as `ro`, and a write from the guest OS or from the container fails with EROFS. Without the writeback cache the guest takes the size and mtime the server reports and drops its cached pages when either changed. A file the host rewrites in place, longer or shorter, or replaces by rename is read whole, with its new size and mtime, after the attribute timeout. That holds in a running VM and in a clone restored from a snapshot taken before the host changed the file.
 
+A rewrite in place that keeps both the size and the mtime (a tool that puts the mtime back) changes neither value the kernel compares, but it moves the host file's ctime, which nobody can set back. fc-agent's FUSE client keeps, for each regular file the guest's kernel holds, the size, mtime and ctime the server last reported. When a refresh (GETATTR, LOOKUP, READDIRPLUS) brings a new ctime with the same size and mtime, it sends `FUSE_NOTIFY_INVAL_INODE` for the file before the reply, and the kernel drops the file's pages (`fuse-pipe/src/client/host_change.rs`). The refreshes are the ones the attribute timeout already causes, so a file nobody changed costs no extra request; a change costs the notification and one more GETATTR. For such a rewrite, once the attribute timeout has passed:
+
+- a read through a descriptor held open across it reads the new bytes, and so does a new open;
+- a mapping held across it shows the old bytes until something in the guest asks for the file's attributes (a read, a stat, an open after the entry timeout), and the new bytes from then on. Touching mapped memory asks for nothing;
+- a clone restored from a snapshot reads it too: the client's record is in the guest's memory with the pages it describes.
+
+The host's ctime has to move. On a filesystem with multigrain timestamps (ext4, xfs, btrfs and tmpfs, from Linux 6.13) a change made after the server's last stat of the file always gets a new ctime. On other filesystems a change in the same clock tick as the previous change to the file can keep it, and is then not seen. `test_read_only_map_reads_a_rewrite_that_keeps_size_and_mtime` (tests/test_read_only_map.rs) and `fuse-pipe/tests/test_host_rewrite.rs` cover it.
+
 A read-only map's VolumeServer answers OPEN and FLUSH with ENOSYS, fuse-backend-rs's zero-message open (`PassthroughFs::for_volume`). After the mount's first OPEN and FLUSH, which those replies switch off, the guest kernel sends no OPEN, FLUSH or RELEASE for it and keeps a file's pages from one open to the next. A read carries file handle 0, and the server opens the inode for it: about 7 us on a local btrfs, more where the host directory is itself on FUSE or NFS. A file read on every request (a credential, a config file) then costs a LOOKUP per path component and a GETATTR, each at most once a second, as the entry and attribute timeouts pass. A read-write map opens and closes through the server.
 
 What that changes for a read-only map:
 
-- A host change shows when the attribute timeout passes and the size or mtime differs, or, for a file replaced by rename, when the entry timeout passes. Before, every open dropped the cached pages. A rewrite in place that keeps both the size and the mtime is not seen while the pages stay cached.
+- A host change shows when the attribute timeout passes and the size, mtime or ctime differs, or, for a file replaced by rename, when the entry timeout passes. Before, every open dropped the cached pages.
 - The host no longer checks permissions as the guest's caller when a file is opened, because nothing is opened. The guest kernel checks the mode bits (`default_permissions`), so host POSIX ACL entries and LSM rules that deny one uid no longer apply. The server's own open for each READ is checked instead, so a host change that takes the server's access away fails the next READ, also in a file the guest already has open.
 - LSEEK answers ENOSYS, because fuse-backend-rs seeks only through a handle. The kernel then seeks by itself and takes every file on the mount for all data: SEEK_DATA and SEEK_HOLE stay correct, and a copy that skips holes reads a sparse file's holes as zeros.
 
@@ -2979,11 +2987,11 @@ fc-agent mounts an outer map before a map inside it, whatever order the argument
 
 **Read-write maps** keep `FUSE_WRITEBACK_CACHE` unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`. With that cache the guest's kernel owns the size and mtime of a regular file it has cached and ignores the server's, because it may hold writes the server has not seen yet. The host must not change a file under a read-write map while a guest has it cached, unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`: a file the host rewrites longer is read cut off at the old length and keeps its old mtime, in the running VM and in clones restored from its snapshots (#1041).
 
+A rewrite that keeps the size and the mtime is handled by the client as on a read-only map, with the writeback cache or without it: the client compares the server's values, not the kernel's, and sends `FUSE_NOTIFY_INVAL_INODE` when only the ctime moved. A held descriptor, a mapping and a new open then see it as listed above. A change of the size or the mtime is left to the kernel, which with the writeback cache ignores it as just described. With that cache the mount's own changes can move the host's ctime alone (the kernel writes a file's times back with a SETATTR that sets the mtime it holds), so its writes, setattrs, xattr changes, links, fallocates and copies into a file are counted from when they are sent until a refresh asked after they finished, and a new ctime in that window is taken as the mount's own. A host change made while the guest itself is changing the same file can be taken for the guest's and is then not seen. With `FCVM_NO_WRITEBACK_CACHE=1` a read-write map behaves as a read-only one does above.
+
 Directory changes (new files, deletions) are subject to the kernel's directory entry cache TTL. A new file created on the host may not appear in guest `readdir()` until the cache expires.
 
-There are no push notifications from host to guest. The guest discovers changes only on access. inotify/fanotify in the guest watches the FUSE mount, not the host filesystem, so host-side changes don't trigger guest notifications.
-
-**Potential fix**: Use `FUSE_NOTIFY_INVAL_INODE` and `FUSE_NOTIFY_INVAL_ENTRY` — server-initiated invalidation notifications. The host VolumeServer would watch directories with inotify and push invalidations through the FUSE connection when files change. This is how production network filesystems (NFS, CIFS) handle it.
+Nothing watches the host's trees. The guest discovers changes only on access, after the timeouts above, and the client's invalidations answer refreshes the guest asked for. inotify/fanotify in the guest watches the FUSE mount, not the host filesystem, so host-side changes don't trigger guest notifications.
 
 ### Nested VM Performance (NV2)
 

@@ -606,8 +606,11 @@ fn mount_fuse_session<P: AsRef<Path>>(
             max_write,
             settings,
         );
+        let notifier = fs.notifier_slot();
         match fuser::Session::new(fs, mount_point.as_ref(), &config) {
             Ok(s) => {
+                // Before spawn(): the session reads no request before it runs.
+                let _ = notifier.set(s.notifier());
                 if attempt > 0 {
                     info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
                 }

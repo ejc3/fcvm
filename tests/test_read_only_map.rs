@@ -296,6 +296,229 @@ async fn test_read_only_map_follows_host_in_vm_and_clone() -> Result<()> {
     result
 }
 
+/// A guest process that holds each named file open, with a pread and a mapping,
+/// across one host change. It reads both once, says so in `ready`, waits for
+/// `go`, waits past the attribute timeout, and prints what the mappings showed
+/// before any read, what the held descriptors read, and what the mappings
+/// showed after those reads.
+const HOLD_SCRIPT: &str = r#"
+import json, mmap, os, sys, time
+control, paths = sys.argv[1], sys.argv[2:]
+fds = [os.open(p, os.O_RDONLY) for p in paths]
+maps = [mmap.mmap(fd, 64, prot=mmap.PROT_READ) for fd in fds]
+seen = {"first": [os.pread(fd, 64, 0).decode() for fd in fds],
+        "first_mapped": [m[:].decode() for m in maps]}
+open(os.path.join(control, "ready"), "w").close()
+while not os.path.exists(os.path.join(control, "go")):
+    time.sleep(0.05)
+time.sleep(2.5)
+seen["mapped_before_read"] = [m[:].decode() for m in maps]
+seen["held"] = [os.pread(fd, 64, 0).decode() for fd in fds]
+seen["mapped_after_read"] = [m[:].decode() for m in maps]
+print(json.dumps(seen))
+"#;
+
+/// What [`HOLD_SCRIPT`] printed, one entry per file in the order given.
+#[derive(Debug, serde::Deserialize)]
+struct Held {
+    first: Vec<String>,
+    first_mapped: Vec<String>,
+    mapped_before_read: Vec<String>,
+    held: Vec<String>,
+    mapped_after_read: Vec<String>,
+}
+
+/// Rewrite a file in place at its own length, without truncating it, and put
+/// its mtime back. The host file's ctime moves, which nobody can set back.
+fn rewrite_keeping_size_and_mtime(path: &Path, content: &str) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let before = std::fs::metadata(path)?;
+    anyhow::ensure!(
+        before.len() == content.len() as u64,
+        "{content:?} is not {} bytes",
+        before.len()
+    );
+    let file = std::fs::File::options().write(true).open(path)?;
+    file.write_all_at(content.as_bytes(), 0)?;
+    file.set_modified(before.modified()?)?;
+    drop(file);
+    let after = std::fs::metadata(path)?;
+    anyhow::ensure!(
+        after.ino() == before.ino()
+            && after.len() == before.len()
+            && (after.mtime(), after.mtime_nsec()) == (before.mtime(), before.mtime_nsec())
+            && (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec()),
+        "{} was not rewritten in place with its size and mtime kept and its ctime moved: \
+         before ino {} size {} mtime {}.{:09} ctime {}.{:09}, after ino {} size {} mtime {}.{:09} ctime {}.{:09}",
+        path.display(),
+        before.ino(), before.len(), before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec(),
+        after.ino(), after.len(), after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec()
+    );
+    Ok(())
+}
+
+/// The host rewrites a file of a read-only map and a file of a read-write map
+/// in place, at the same length, and puts each mtime back.
+///
+/// - A guest process that held each file open across the rewrite reads the new
+///   bytes through its descriptor once the attribute timeout has passed.
+/// - Its shared mapping of the file shows the old bytes until something asks
+///   for the file's attributes, here that read, and the new bytes after it.
+/// - A new open (stat, then cat) reads the new bytes, with the host's size and
+///   mtime.
+/// - A clone restored from a snapshot of the VM, taken after the guest read the
+///   files and before the host rewrote them once more, reads that last version.
+///
+/// RED BEFORE THE FIX: both held descriptors, and both mappings after those
+/// reads, read "v1" 2.5 s after the rewrite. The kernel drops a file's pages
+/// only when the size or mtime it is given changed, and on the read-write map
+/// (writeback cache) it ignores both. On the read-only map a new open read
+/// "v1" too, and the clone read "v1" where the host held "v3": that map sends
+/// no OPEN, so an open does not drop the pages. The read-write map's new open
+/// and clone read the new bytes, because its OPEN drops them.
+#[tokio::test]
+async fn test_read_only_map_reads_a_rewrite_that_keeps_size_and_mtime() -> Result<()> {
+    const RO: &str = "/mnt/ro";
+    const RW: &str = "/mnt/rw";
+    const CONTROL: &str = "/tmp/held";
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("ro-keep-mtime");
+    let ro_dir = fresh_dir("ro-keep-mtime-ro")?;
+    let rw_dir = fresh_dir("ro-keep-mtime-rw")?;
+    let files = [(ro_dir.join("same.txt"), RO), (rw_dir.join("same.txt"), RW)];
+    // A fixed mtime with a nanosecond part, so putting it back has to be exact.
+    let mtime = std::time::SystemTime::UNIX_EPOCH + Duration::new(1_790_911_026, 257_640_420);
+    for (path, _) in &files {
+        std::fs::write(path, body("v1", 64))?;
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(mtime)?;
+    }
+    std::fs::write(rw_dir.join("hold.py"), HOLD_SCRIPT)?;
+
+    let mut started: Vec<u32> = Vec::new();
+    let result = async {
+        let maps = [
+            format!("{}:{RO}:ro", ro_dir.display()),
+            format!("{}:{RW}", rw_dir.display()),
+        ];
+        let (_child, pid) = start_vm(&vm_name, &maps, &mut started).await?;
+
+        common::exec_in_vm(pid, &[&format!("rm -rf {CONTROL} && mkdir -p {CONTROL}")]).await?;
+        let hold = tokio::spawn(async move {
+            common::exec_in_vm(
+                pid,
+                &[&format!(
+                    "python3 {RW}/hold.py {CONTROL} {RO}/same.txt {RW}/same.txt"
+                )],
+            )
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let ready = common::exec_in_vm(
+                pid,
+                &[&format!("test -e {CONTROL}/ready && echo ready || true")],
+            )
+            .await?;
+            if ready.trim() == "ready" {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline && !hold.is_finished(),
+                "the guest's holding process never read the files"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        for (path, _) in &files {
+            rewrite_keeping_size_and_mtime(path, &body("v2", 64))?;
+        }
+        common::exec_in_vm(pid, &[&format!("touch {CONTROL}/go")]).await?;
+        let out = hold.await.context("joining the holding exec")??;
+        let held: Held = serde_json::from_str(out.trim())
+            .with_context(|| format!("the holding process printed {out:?}"))?;
+
+        let mut wrong: Vec<String> = Vec::new();
+        let (v1, v2) = (body("v1", 64), body("v2", 64));
+        for (i, (_, guest_dir)) in files.iter().enumerate() {
+            for (what, got, want) in [
+                (
+                    "first read through the held descriptor",
+                    &held.first[i],
+                    &v1,
+                ),
+                ("mapping before the rewrite", &held.first_mapped[i], &v1),
+                (
+                    "mapping 2.5 s after the rewrite, before any read",
+                    &held.mapped_before_read[i],
+                    &v1,
+                ),
+                (
+                    "held descriptor 2.5 s after the rewrite",
+                    &held.held[i],
+                    &v2,
+                ),
+                (
+                    "mapping after the held descriptor's read",
+                    &held.mapped_after_read[i],
+                    &v2,
+                ),
+            ] {
+                if got != want {
+                    wrong.push(format!(
+                        "{guest_dir}: {what}: read {got:?}, expected {want:?}"
+                    ));
+                }
+            }
+        }
+        let opened = files_not_following(pid, &ro_dir, RO, &["same.txt"]).await;
+        let opened_rw = files_not_following(pid, &rw_dir, RW, &["same.txt"]).await;
+        wrong.extend(opened.into_iter().map(|d| format!("{RO} new open: {d}")));
+        wrong.extend(opened_rw.into_iter().map(|d| format!("{RW} new open: {d}")));
+
+        // The snapshot holds the guest's pages of v2 and what the guest last
+        // saw of each file. The host writes v3 the same way before the clone runs.
+        common::create_snapshot_by_pid(pid, &snap_name).await?;
+        common::kill_process(pid).await;
+        started.retain(|p| *p != pid);
+        for (path, _) in &files {
+            rewrite_keeping_size_and_mtime(path, &body("v3", 64))?;
+        }
+        let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+        started.push(serve_pid);
+        let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+        started.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 180).await?;
+        let in_clone = files_not_following(clone_pid, &ro_dir, RO, &["same.txt"]).await;
+        let in_clone_rw = files_not_following(clone_pid, &rw_dir, RW, &["same.txt"]).await;
+        wrong.extend(
+            in_clone
+                .into_iter()
+                .map(|d| format!("{RO} in the clone: {d}")),
+        );
+        wrong.extend(
+            in_clone_rw
+                .into_iter()
+                .map(|d| format!("{RW} in the clone: {d}")),
+        );
+
+        anyhow::ensure!(
+            wrong.is_empty(),
+            "a rewrite that keeps the size and the mtime is not read:\n{}",
+            wrong.join("\n")
+        );
+        Ok(())
+    }
+    .await;
+
+    stop_all(&started).await;
+    common::delete_snapshot(&snap_name).await.ok();
+    std::fs::remove_dir_all(&ro_dir).ok();
+    std::fs::remove_dir_all(&rw_dir).ok();
+    result
+}
+
 /// The per-mount options and the superblock options of the mount at
 /// `mount_point`, from the text of /proc/self/mountinfo.
 fn mount_options_of(mountinfo: &str, mount_point: &str) -> Result<(Vec<String>, Vec<String>)> {

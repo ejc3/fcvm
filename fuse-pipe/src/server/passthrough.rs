@@ -78,7 +78,8 @@ impl PassthroughFs {
     /// trips and drops the file's cached pages. The guest mounts a read-only volume read-only and
     /// without the writeback cache (`MountSettings::for_volume`), so the kernel takes each file's size
     /// and mtime from this server once the attribute timeout passes, and FUSE_AUTO_INVAL_DATA drops
-    /// pages whose file the host changed. A read-write volume opens and closes through the server,
+    /// pages whose size or mtime the host changed. The client drops those of a file whose ctime
+    /// alone moved (`client/host_change.rs`). A read-write volume opens and closes through the server,
     /// as its writes need.
     ///
     /// # Errors
