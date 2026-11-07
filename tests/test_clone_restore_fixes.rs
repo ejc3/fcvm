@@ -412,7 +412,7 @@ async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
     let snapshot_daemon = chronyd_pid(fixture.baseline_pid).await;
 
     let (_, clone_name, _, _) = common::unique_names("chronydpid-c");
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
         &[
             "snapshot",
             "run",
@@ -426,15 +426,33 @@ async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
     .await?;
     let clone_daemon: Result<String> = async {
         common::poll_health_by_pid(clone_pid, 120).await?;
-        // The fresh daemon is started off the readiness path, after the restore ACK.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // The fresh daemon is started off the readiness path, after the restore ACK, and
+        // chronyd daemonizes: its foreground process waits until the daemon it forked is
+        // initialized, so for a moment two chronyd processes exist. Counting then read two
+        // (CI run 42386251347: "1279 1283", 0.3 s after healthy, with no restart line from
+        // fc-agent yet). fc-agent logs one of the lines below once the foreground process
+        // has exited, so the count waits for it.
+        const STARTED: [&str; 2] = [
+            "[fc-agent] chronyd restarted after restore",
+            "[fc-agent] ERROR: chronyd is not usable after restore",
+        ];
+        // fc-agent gives up on the new daemon's sources after 30 s (CHRONYD_READY_TIMEOUT).
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
         loop {
-            let daemon = chronyd_pid(clone_pid).await?;
-            if !daemon.is_empty() || std::time::Instant::now() > deadline {
-                return Ok(daemon);
+            let log = std::fs::read_to_string(&clone_log)
+                .with_context(|| format!("reading {}", clone_log.display()))?;
+            if STARTED.iter().any(|line| log.contains(line)) {
+                break;
             }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "fc-agent did not finish starting the clone's chronyd within 45 s of healthy; \
+                 log at {}",
+                clone_log.display()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        chronyd_pid(clone_pid).await
     }
     .await;
     common::kill_process(clone_pid).await;
@@ -449,7 +467,7 @@ async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
     );
     assert!(
         !clone_daemon.is_empty() && !clone_daemon.contains(' '),
-        "the clone should run exactly one chronyd within 10 s of healthy, got {clone_daemon:?}"
+        "the clone should run exactly one chronyd once fc-agent has started it, got {clone_daemon:?}"
     );
     assert_ne!(
         clone_daemon, snapshot_daemon,
