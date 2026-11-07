@@ -227,7 +227,8 @@ class Worker:
                     value = {"image_id": "sha256:" + "5" * 64 if self.bad_renderer else IMAGE}
                 elif action == "verify":
                     value = {"boot_id": identity, "guard": True, "frames": True, "tls_rotation": True,
-                        "sanitized": True, "phone_clone": slot.startswith("host-")}
+                        "sanitized": True, "phone_clone": slot.startswith("host-"),
+                        "windows_sandbox": slot.startswith("host-")}
                     value.update(self.tls)
                     if self.bad_proof:
                         value[self.bad_proof] = False
@@ -806,7 +807,7 @@ print("warm-log-permissions-pass")
                 self.assertEqual(output.getvalue(), "")
 
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
-        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone"):
+        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox"):
             with self.subTest(proof=proof):
                 self.setUp()
                 self.worker.bad_proof = proof

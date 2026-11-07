@@ -423,6 +423,33 @@ def host_proof(new, old):
                 process.wait(timeout=60)
 
 
+def windows_proof():
+    """A Windows sandbox from the image this build installed boots to a healthy desktop: Remote
+    Desktop answers and the guest agent acknowledged its clock (docs/fleet/windows-sandboxes.md)."""
+    found = re.search(r"--windows-image (/\S+)", Path("/etc/fcvm-fleet/windows.env").read_text())
+    need(found is not None, "windows.env names no Windows image")
+    image = Path(found.group(1))
+    need(json.loads((image / "manifest.json").read_text()).get("eval_expires"), "the Windows image has no expiry")
+    argv = ["fcvm", "vm", "run", "--name", "factory-windows-proof", "--firmware", str(image / "CLOUDHV.fd"),
+        "--disk", str(image / "disk.raw"), "--guest", "windows"]
+
+    def healthy():
+        out = subprocess.run(["fcvm", "ls", "--json"], capture_output=True, timeout=30, check=True).stdout
+        return any(vm.get("name") == "factory-windows-proof" and vm.get("health_status") == "healthy"
+                   for vm in json.loads(out))
+    with tempfile.TemporaryFile() as log:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        try:
+            wait(healthy, seconds=600)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("Windows validator did not stop") from None
+
+
 def verify(kind, expected_image, build_arn, test_arn, region):
     need(kind in {"host", "tile"}, "invalid validator kind")
     sanitized()
@@ -435,11 +462,13 @@ def verify(kind, expected_image, build_arn, test_arn, region):
     if kind == "host":
         store_parts()
         host_proof(new, old)
+        windows_proof()
     else:
         wait(lambda: (request(8080, "/health")[1] or {}).get("ready") is True)
         tls_proof(443, new)
         scene_proof(8080, new, old)
     return {**boot(), "guard": True, "frames": True, "phone_clone": kind == "host",
+            "windows_sandbox": kind == "host",
             "tls_rotation": True, "sanitized": True,
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 

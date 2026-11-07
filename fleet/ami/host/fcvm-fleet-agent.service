@@ -20,10 +20,13 @@ ConditionPathExists=/etc/fcvm-fleet/agent.env
 # /etc/fcvm-fleet/phone.env (written at build by warm-phone.sh) holds the phones' arguments
 # (PHONE_AGENT_ARGS: the phone image, the AOSP build, the emulator, the app and the warm
 # snapshot); the host's own arguments choose how many GPUs run phones (--phones N).
+# /etc/fcvm-fleet/windows.env (written at build) names the Windows image and the bridge image
+# (WINDOWS_AGENT_ARGS); the host's own arguments choose how many sandboxes run (--windows N).
 [Service]
 EnvironmentFile=/etc/fcvm-fleet/agent.env
 EnvironmentFile=-/etc/fcvm-fleet/phone.env
-ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $PHONE_AGENT_ARGS
+EnvironmentFile=-/etc/fcvm-fleet/windows.env
+ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $PHONE_AGENT_ARGS $WINDOWS_AGENT_ARGS
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
 Restart=on-failure
