@@ -35,6 +35,13 @@ pub const RDP_SOCKET_DIR: &str = "rdp";
 /// The Unix socket that reaches a raw VM's Remote Desktop port, in [`RDP_SOCKET_DIR`].
 pub const RDP_SOCKET: &str = "rdp.sock";
 
+/// The file in a raw VM's data directory naming its current generation, `<vm id>.<boot>`:
+/// the helper serves it on every clock line connection and health requires an
+/// acknowledgement of it. fcvm writes it whole before the first boot and before every
+/// relaunch, so each boot of one VM has its own generation and no acknowledgement from an
+/// earlier boot can stand for a later one.
+pub const GENERATION_FILE: &str = "generation";
+
 /// The file in a raw VM's data directory holding the guest agent's last acknowledgement:
 /// `<generation> <guest unix ms> <host unix ms when it arrived>`.
 pub const CLOCK_ACK_FILE: &str = "clock-ack";
@@ -107,6 +114,33 @@ pub fn rdp_peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
     peer_uid == own_uid
 }
 
+/// A raw VM's generation file ([`GENERATION_FILE`]).
+pub fn generation_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(GENERATION_FILE)
+}
+
+/// The generation of boot `boot` of the VM `vm_id`.
+pub fn boot_generation(vm_id: &str, boot: u64) -> String {
+    format!("{vm_id}.{boot}")
+}
+
+/// Make boot `boot` of `vm_id` the raw VM's current generation, written whole, and return it.
+pub fn write_generation(data_dir: &Path, vm_id: &str, boot: u64) -> Result<String> {
+    let generation = boot_generation(vm_id, boot);
+    write_atomically(&generation_path(data_dir), &format!("{generation}\n"))?;
+    Ok(generation)
+}
+
+/// The raw VM's current generation, from its generation file.
+pub fn read_generation(data_dir: &Path) -> Result<String> {
+    let path = generation_path(data_dir);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let generation = text.trim();
+    anyhow::ensure!(!generation.is_empty(), "{} is empty", path.display());
+    Ok(generation.to_string())
+}
+
 /// A raw VM's acknowledgement file.
 pub fn clock_ack_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CLOCK_ACK_FILE)
@@ -141,9 +175,13 @@ pub fn parse_clock_ack(line: &str, generation: &str) -> Option<u64> {
     }
 }
 
-/// Write the acknowledgement file whole: to a temporary file beside it, then renamed over it,
-/// so the health monitor never reads a partial record.
+/// Write the acknowledgement file whole, so the health monitor never reads a partial record.
 fn write_clock_ack(path: &Path, generation: &str, guest_ms: u64, host_ms: u64) -> Result<()> {
+    write_atomically(path, &format!("{generation} {guest_ms} {host_ms}\n"))
+}
+
+/// Write `contents` to `path` whole: to a temporary file beside it, then renamed over it.
+fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("ack");
     let tmp = path.with_file_name(format!(
@@ -151,22 +189,29 @@ fn write_clock_ack(path: &Path, generation: &str, guest_ms: u64, host_ms: u64) -
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, format!("{generation} {guest_ms} {host_ms}\n"))
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| {
         let _ = std::fs::remove_file(&tmp);
         format!("renaming {} to {}", tmp.display(), path.display())
     })
 }
 
-/// Serve one clock line connection: write the line, then read one acknowledgement within
-/// [`CLOCK_ACK_READ_TIMEOUT`] and record it when it names this generation.
+/// Serve one clock line connection: read the current generation from `generation_file`,
+/// write the line, then read one acknowledgement within [`CLOCK_ACK_READ_TIMEOUT`] and record
+/// it when it names the generation this connection served. An acknowledgement that arrives
+/// after the generation changed is recorded with the old generation, which health refuses.
 async fn clock_line_connection(
     stream: tokio::net::TcpStream,
-    generation: &str,
+    generation_file: &Path,
     ack_file: &Path,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let generation = read_generation(
+        generation_file
+            .parent()
+            .context("a generation file with no directory")?,
+    )?;
+    let generation = generation.as_str();
     let (reader, mut writer) = stream.into_split();
     writer
         .write_all(clock_line(generation, std::time::SystemTime::now()).as_bytes())
@@ -191,16 +236,16 @@ async fn clock_line_connection(
 /// listener fails.
 pub async fn serve_clock_line(
     listener: tokio::net::TcpListener,
-    generation: String,
+    generation_file: PathBuf,
     ack_file: PathBuf,
 ) -> Result<()> {
-    let generation = std::sync::Arc::<str>::from(generation);
+    let generation_file = std::sync::Arc::<Path>::from(generation_file);
     let ack_file = std::sync::Arc::<Path>::from(ack_file);
     loop {
         let (stream, peer) = listener.accept().await.context("accepting a clock line")?;
-        let (generation, ack_file) = (generation.clone(), ack_file.clone());
+        let (generation_file, ack_file) = (generation_file.clone(), ack_file.clone());
         tokio::spawn(async move {
-            if let Err(error) = clock_line_connection(stream, &generation, &ack_file).await {
+            if let Err(error) = clock_line_connection(stream, &generation_file, &ack_file).await {
                 eprintln!("clock line: {peer}: {error:#}");
             }
         });
@@ -351,7 +396,7 @@ async fn cmd_ns_helper(args: NsHelperArgs) -> Result<()> {
     tokio::try_join!(
         // SAFETY: geteuid has no preconditions.
         serve_rdp_relay(rdp, target, unsafe { libc::geteuid() }),
-        serve_clock_line(clock, args.generation, args.ack_file),
+        serve_clock_line(clock, args.generation_file, args.ack_file),
     )?;
     Ok(())
 }
@@ -364,14 +409,15 @@ pub struct NsHelper {
 }
 
 impl NsHelper {
-    /// Start the helper for `generation` in the namespaces at `user_ns` and `net_ns`, relaying
-    /// `<data_dir>/rdp.sock` to the guest's `rdp_port` and writing acknowledgements to
-    /// `<data_dir>/clock-ack`, and return once both listeners are bound. The clock line's
+    /// Start the helper of VM `vm_id` in the namespaces at `user_ns` and `net_ns`, relaying
+    /// `<data_dir>/rdp/rdp.sock` to the guest's `rdp_port`, serving the generation in
+    /// `<data_dir>/generation` and writing acknowledgements to `<data_dir>/clock-ack`, and
+    /// return once both listeners are bound. The clock line's
     /// address is on the namespace bridge, so this runs after the network's `post_start`.
     pub async fn start(
         user_ns: &Path,
         net_ns: &Path,
-        generation: &str,
+        vm_id: &str,
         data_dir: &Path,
         rdp_port: u16,
     ) -> Result<NsHelper> {
@@ -379,13 +425,9 @@ impl NsHelper {
         let exe = std::env::current_exe().context("finding this fcvm binary")?;
         let mut command = tokio::process::Command::new(exe);
         command
-            .args([
-                "vm",
-                "ns-helper",
-                "--generation",
-                generation,
-                "--rdp-socket",
-            ])
+            .args(["vm", "ns-helper", "--generation-file"])
+            .arg(generation_path(data_dir))
+            .arg("--rdp-socket")
             .arg(rdp_socket_path(data_dir))
             .args(["--rdp-port", &rdp_port.to_string(), "--ack-file"])
             .arg(clock_ack_path(data_dir))
@@ -398,7 +440,7 @@ impl NsHelper {
         crate::utils::install_namespace_pre_exec(
             &mut command,
             &crate::utils::NamespaceParams {
-                vm_id: generation.to_string(),
+                vm_id: vm_id.to_string(),
                 user_namespace_path: Some(user_ns.to_path_buf()),
                 net_namespace_path: Some(net_ns.to_path_buf()),
                 ..Default::default()
@@ -436,7 +478,7 @@ impl NsHelper {
             );
         }
         info!(
-            generation,
+            vm_id,
             clock_line = CLOCK_LINE_ADDR,
             rdp_port,
             "namespace helper listening"
@@ -636,6 +678,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
             network: Box::new(network),
             ns_helper: helper_slot,
             boot: boot_slot.expect("boot_raw_vm records the boot on success"),
+            boot_number: 0,
             state_manager,
             vm_state,
             reclaim_owner,
@@ -709,6 +752,7 @@ async fn boot_raw_vm(
         .as_deref()
         .zip(process_spec.net_namespace_path.as_deref())
         .context("the rootless namespace has no namespace paths")?;
+    write_generation(data_dir, &vm_id, 0)?;
     *helper_slot =
         Some(NsHelper::start(user_ns, net_ns, &vm_id, data_dir, args.health_port).await?);
 
@@ -819,11 +863,9 @@ fn vmm_guest_reset(vm_manager: &dyn Hypervisor) -> bool {
 /// helper keeps serving, and the old acknowledgement goes, so the VM is healthy again only
 /// once the restarted guest has set its clock and Remote Desktop answers.
 async fn relaunch(vm: &mut RawVm) -> Result<()> {
-    match std::fs::remove_file(clock_ack_path(&vm.data_dir)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("removing the old clock acknowledgement"),
-    }
+    vm.boot_number += 1;
+    write_generation(&vm.data_dir, &vm.vm_id, vm.boot_number)
+        .context("giving the relaunched boot its own generation")?;
     vm.vm_manager
         .spawn(&ProcessSpec {
             binary: vm.boot.ch_bin.clone(),
@@ -844,6 +886,9 @@ pub(crate) struct RawVm {
     pub network: Box<dyn NetworkManager>,
     pub ns_helper: Option<NsHelper>,
     pub boot: RawBoot,
+    /// Which boot of this VM is running: 0 at the cold boot or restore, one more at every
+    /// relaunch. The current generation is `<vm id>.<boot number>`.
+    pub boot_number: u64,
     pub state_manager: StateManager,
     pub vm_state: VmState,
     pub reclaim_owner: crate::reclaim::Owner,
@@ -1155,11 +1200,12 @@ mod tests {
     async fn the_clock_line_serves_the_generation_and_records_its_ack() {
         let dir = tempfile::tempdir().unwrap();
         let ack = clock_ack_path(dir.path());
+        std::fs::write(generation_path(dir.path()), "vm-abc123\n").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_clock_line(
             listener,
-            "vm-abc123".to_string(),
+            generation_path(dir.path()),
             ack.clone(),
         ));
 
@@ -1203,6 +1249,73 @@ mod tests {
         assert_eq!(parse_clock_ack("ack vm-1 5\n", "vm-1"), Some(5));
         assert_eq!(parse_clock_ack("ack vm-1 5 6\n", "vm-1"), None);
         assert_eq!(parse_clock_ack("ack vm-2 5\n", "vm-1"), None);
+    }
+
+    /// Every boot of a raw VM has its own generation, and an acknowledgement for a boot that
+    /// has ended cannot make the next one healthy: a clock line connection served before a
+    /// relaunch, whose guest acknowledges after the relaunch wrote the new generation, records
+    /// the old generation, and health refuses it until the new boot acknowledges its own.
+    #[tokio::test]
+    async fn a_previous_boots_ack_does_not_make_the_relaunch_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_generation(dir.path(), "vm-raw", 0).unwrap();
+        assert_eq!(first, "vm-raw.0");
+        assert_eq!(read_generation(dir.path()).unwrap(), "vm-raw.0");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_clock_line(
+            listener,
+            generation_path(dir.path()),
+            clock_ack_path(dir.path()),
+        ));
+        // A connection of the first boot reads its line, and the relaunch's invalidation
+        // lands before its guest acknowledges.
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut line = String::new();
+        tokio::io::BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert!(line.starts_with("vm-raw.0 "), "{line}");
+        let relaunched = write_generation(dir.path(), "vm-raw", 1).unwrap();
+        assert_ne!(
+            relaunched, first,
+            "a relaunch reuses the earlier boot's generation"
+        );
+        let now = unix_ms(std::time::SystemTime::now());
+        writer
+            .write_all(format!("ack {first} {now}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(writer);
+        let recorded = read_when_written(&clock_ack_path(dir.path())).await;
+        assert!(recorded.is_some_and(|r| r.starts_with("vm-raw.0 ")));
+        let current = read_generation(dir.path()).unwrap();
+        assert!(
+            crate::health::check_clock_ack(
+                std::fs::read_to_string(clock_ack_path(dir.path()))
+                    .ok()
+                    .as_deref(),
+                &current
+            )
+            .is_err(),
+            "the first boot's acknowledgement stands for the relaunched boot"
+        );
+        // The relaunched boot's own acknowledgement is recorded and accepted.
+        let line = clock_exchange(addr, &format!("ack {relaunched} {now}\n")).await;
+        assert!(line.starts_with("vm-raw.1 "), "{line}");
+        for _ in 0..100 {
+            let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
+            if text.starts_with("vm-raw.1 ") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
+        assert!(text.starts_with("vm-raw.1 "), "{text}");
+        server.abort();
     }
 
     /// Every connection to rdp.sock is relayed to the guest's port, both ways.
@@ -1316,7 +1429,8 @@ mod tests {
 
     /// A raw VM whose guest reset itself is booted again in place, and one whose guest
     /// powered off is torn down. The relaunch keeps the namespace helper, the disk and the
-    /// data directory (no teardown before it), and drops the old clock acknowledgement.
+    /// data directory (no teardown before it), and gives the new boot its own generation
+    /// before it starts it.
     #[test]
     fn a_guest_reboot_relaunches_and_a_power_off_ends_the_vm() {
         assert_eq!(after_vmm_exit(true), AfterVmmExit::Relaunch);
@@ -1333,10 +1447,10 @@ mod tests {
         ] {
             assert!(!relaunch.contains(absent), "the relaunch calls {absent}");
         }
-        let removed = relaunch.find("clock_ack_path(").unwrap();
+        let invalidated = relaunch.find("write_generation(").unwrap();
         let spawned = relaunch.find(".spawn(").unwrap();
         let booted = relaunch.find("boot_firmware(").unwrap();
-        assert!(removed < spawned && spawned < booted);
+        assert!(invalidated < spawned && spawned < booted);
         let run = &code[code.find("pub(crate) async fn run_until_exit(").unwrap()..];
         let waited = run.find("vm.vm_manager.wait()").unwrap();
         let decided = run.find("after_vmm_exit(vmm_guest_reset(").unwrap();
@@ -1465,8 +1579,8 @@ mod tests {
         let cli = parse(&[
             "vm",
             "ns-helper",
-            "--generation",
-            "vm-1",
+            "--generation-file",
+            "/vm/generation",
             "--rdp-socket",
             "/vm/rdp.sock",
             "--rdp-port",

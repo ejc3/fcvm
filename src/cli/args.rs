@@ -129,10 +129,10 @@ pub struct VmRunArgs {
 
 #[derive(Args, Debug)]
 pub struct NsHelperArgs {
-    /// The VM's generation (its id), served on the clock line and expected in the
-    /// guest's acknowledgement
-    #[arg(long)]
-    pub generation: String,
+    /// The file naming the VM's current generation (`<vm id>.<boot>`), read for every
+    /// clock line connection and expected in the guest's acknowledgement
+    #[arg(long, value_name = "PATH")]
+    pub generation_file: std::path::PathBuf,
 
     /// Unix socket to listen on; each connection is relayed to the guest's RDP port
     #[arg(long, value_name = "PATH")]

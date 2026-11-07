@@ -1011,7 +1011,7 @@ async fn rdp_health(
 ) -> HealthStatus {
     let timeout = Duration::from_secs(state.config.health_check_timeout.max(1));
     let data_dir = paths::vm_runtime_dir(&state.vm_id);
-    match raw_guest_health(&data_dir, &state.vm_id, timeout).await {
+    match raw_guest_health(&data_dir, timeout).await {
         Ok(()) => {
             debug!(target: "health-monitor", "clock acknowledged and RDP connection confirmed");
             *last_failure_log = None;
@@ -1027,13 +1027,11 @@ async fn rdp_health(
     }
 }
 
-/// The health of the raw VM whose data directory is `data_dir` and whose current
-/// generation is `generation`: Ok when the clock is acknowledged and RDP confirms.
-pub async fn raw_guest_health(
-    data_dir: &std::path::Path,
-    generation: &str,
-    timeout: Duration,
-) -> Result<()> {
+/// The health of the raw VM whose data directory is `data_dir`: Ok when the guest has
+/// acknowledged the current generation (the generation file, one per boot) and RDP confirms.
+pub async fn raw_guest_health(data_dir: &std::path::Path, timeout: Duration) -> Result<()> {
+    let generation = crate::commands::vm::read_generation(data_dir)?;
+    let generation = generation.as_str();
     let ack_path = crate::commands::vm::clock_ack_path(data_dir);
     let ack = match std::fs::read_to_string(&ack_path) {
         Ok(text) => Some(text),
@@ -1676,6 +1674,16 @@ mod tests {
         std::fs::write(crate::commands::vm::clock_ack_path(dir), record).unwrap();
     }
 
+    /// The health of the raw VM in `dir` whose current generation is `generation`.
+    async fn health_with(dir: &std::path::Path, generation: &str, timeout: Duration) -> Result<()> {
+        std::fs::write(
+            crate::commands::vm::generation_path(dir),
+            format!("{generation}\n"),
+        )
+        .unwrap();
+        raw_guest_health(dir, timeout).await
+    }
+
     /// With the clock acknowledged, a raw VM is healthy only when Remote Desktop confirms
     /// the connection request through rdp.sock: a peer that accepts and closes, one that
     /// answers with anything else, one that never answers within the deadline and a socket
@@ -1687,7 +1695,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
         let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-        raw_guest_health(dir.path(), "vm-raw", timeout)
+        health_with(dir.path(), "vm-raw", timeout)
             .await
             .expect("an acknowledged clock and a connection confirm are healthy");
         assert_eq!(
@@ -1707,18 +1715,14 @@ mod tests {
             write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
             let server = fake_rdp_sock(dir.path(), fake);
             assert!(
-                raw_guest_health(dir.path(), "vm-raw", timeout)
-                    .await
-                    .is_err(),
+                health_with(dir.path(), "vm-raw", timeout).await.is_err(),
                 "{name} was reported healthy"
             );
             server.abort();
         }
         let dir = tempfile::tempdir().unwrap();
         write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
-        assert!(raw_guest_health(dir.path(), "vm-raw", timeout)
-            .await
-            .is_err());
+        assert!(health_with(dir.path(), "vm-raw", timeout).await.is_err());
     }
 
     /// Only a whole, well-formed X.224 Connection Confirm is healthy: the reply's full TPKT is
@@ -1741,7 +1745,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             write_ack(dir.path(), "vm-raw 1700000000000 1700000000300\n");
             let server = fake_rdp_sock(dir.path(), fake);
-            let verdict = raw_guest_health(dir.path(), "vm-raw", timeout).await;
+            let verdict = health_with(dir.path(), "vm-raw", timeout).await;
             assert_eq!(verdict.is_ok(), healthy, "{name}: {verdict:?}");
             server.abort();
         }
@@ -1775,7 +1779,7 @@ mod tests {
                 write_ack(dir.path(), record);
             }
             let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-            let verdict = raw_guest_health(dir.path(), "vm-clone", timeout).await;
+            let verdict = health_with(dir.path(), "vm-clone", timeout).await;
             assert!(verdict.is_err(), "{why} was reported healthy");
             server.abort();
         }
@@ -1786,7 +1790,7 @@ mod tests {
                 &format!("vm-clone 1700000000000 {}\n", 1_700_000_000_000 + skew_ms),
             );
             let server = fake_rdp_sock(dir.path(), FakeRdp::Confirm);
-            raw_guest_health(dir.path(), "vm-clone", timeout)
+            health_with(dir.path(), "vm-clone", timeout)
                 .await
                 .unwrap_or_else(|e| panic!("an ack {skew_ms} ms off and a confirm: {e:#}"));
             server.await.unwrap();

@@ -5502,6 +5502,14 @@ async fn cmd_snapshot_run_raw(
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
     };
+    // The clone's first boot is generation 0 of its own id, served from before it resumes.
+    if let Err(e) = super::vm::write_generation(&data_dir, &vm_id, 0) {
+        if let Err(error) = network.cleanup().await {
+            warn!(%error, "failed to clean up the network after a setup error");
+        }
+        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        return Err(e);
+    }
     let mut ns_helper = None;
     let restore_started = std::time::Instant::now();
     let restored = super::common::restore_from_snapshot_ch(
@@ -5558,6 +5566,7 @@ async fn cmd_snapshot_run_raw(
             network: Box::new(network),
             ns_helper,
             boot,
+            boot_number: 0,
             state_manager,
             vm_state,
             reclaim_owner,
