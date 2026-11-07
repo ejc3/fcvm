@@ -556,6 +556,12 @@ pub(super) fn build_firecracker_config(
         fuse_max_write: boot_inputs.fuse_max_write,
         no_writeback_cache: boot_inputs.no_writeback_cache,
         hypervisor: args.hypervisor.into(),
+        cloud_hypervisor_bin: match crate::hypervisor::Backend::from(args.hypervisor) {
+            crate::hypervisor::Backend::CloudHypervisor => {
+                crate::commands::common::find_cloud_hypervisor().ok()
+            }
+            _ => None,
+        },
     }
 }
 

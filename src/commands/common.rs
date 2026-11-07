@@ -4444,6 +4444,10 @@ pub async fn restore_from_snapshot_ch(
         // sets it on the loaded VM: a pre-start snapshot is shared between targets.
         if let Some(target_mib) = balloon_target_mib {
             backend.set_balloon_target(target_mib).await?;
+            // A Cloud Hypervisor clone's state is its balloon record (a Firecracker restore
+            // reads its VMM's instead), and a snapshot of this clone copies it, so it must
+            // name the target the clone runs at, not the one the snapshot recorded.
+            vm_state.config.balloon_mib = Some(target_mib);
         }
 
         backend
@@ -8292,6 +8296,12 @@ mod tests {
             .find(".resume()")
             .expect("the Cloud Hypervisor restore does not resume after setting the target");
         assert!(resumed > 0);
+        // The clone's state is its balloon record, which a snapshot of it copies: it must name
+        // the target the run set, not the one the restored snapshot recorded.
+        assert!(
+            body[set..set + resumed].contains("vm_state.config.balloon_mib = Some(target_mib);"),
+            "the Cloud Hypervisor restore leaves the snapshot's balloon target in the clone's state"
+        );
     }
 
     #[test]

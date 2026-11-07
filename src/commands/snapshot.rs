@@ -4262,12 +4262,12 @@ async fn cmd_snapshot_run_inner(
                         // a full cold boot, so plan assembly here is noise; a build
                         // failure has the same outcome as the old eager path (the reboot
                         // terminates the clone), just diagnosed at reboot time.
-                        // build_clone_reboot_plan is FC-specific; Cloud Hypervisor clones
-                        // don't support reboot-in-place yet — a guest reboot terminates
-                        // them (same as TTY clones). Tracked for a future increment.
-                        // A --gpu clone neither: a cold boot would come back without
-                        // the devices the restore attached.
-                        let reboot_plan = if is_ch || !gpus.is_empty() {
+                        // A Cloud Hypervisor clone relaunches under Cloud Hypervisor, as a
+                        // cold Cloud Hypervisor run does, so a cached `podman run` keeps
+                        // the reboot support its cold boot has. A --gpu clone does not: a
+                        // cold boot would come back without the devices the restore
+                        // attached.
+                        let reboot_plan = if !gpus.is_empty() {
                             None
                         } else {
                             match build_clone_reboot_plan(
@@ -4376,7 +4376,7 @@ async fn cmd_snapshot_run_inner(
                                 vm_manager
                                     .spawn(&relaunch_spec)
                                     .await
-                                    .context("relaunching Firecracker after guest reboot")?;
+                                    .context("relaunching the VMM after guest reboot")?;
                                 super::podman::configure_and_boot_vm(
                                     vm_manager.as_mut(),
                                     plan,
@@ -4870,8 +4870,21 @@ async fn build_clone_reboot_plan(
         .await
         .context("resolving fc-agent initrd for reboot plan")?;
 
-    let firecracker_bin = crate::commands::common::find_firecracker(runtime_config)?;
-    let fc_args = runtime_config.effective_firecracker_args();
+    // The relaunch boots under the VMM that made the snapshot. Cloud Hypervisor has no
+    // metadata service, so its plan goes over vsock, as a cold Cloud Hypervisor run's does,
+    // and Firecracker's extra arguments are not its.
+    let (vmm_bin, vmm_args, bootplan_over_vsock) = match meta.hypervisor {
+        crate::hypervisor::Backend::Firecracker => (
+            crate::commands::common::find_firecracker(runtime_config)?,
+            runtime_config.effective_firecracker_args(),
+            false,
+        ),
+        crate::hypervisor::Backend::CloudHypervisor => (
+            crate::commands::common::find_cloud_hypervisor()?,
+            None,
+            true,
+        ),
+    };
 
     let launch_config = super::podman::build_launch_config(
         &synth_args,
@@ -4883,11 +4896,14 @@ async fn build_clone_reboot_plan(
         super::podman::GuestBootInputs::resolve(synth_args.dns.as_deref(), runtime_config),
         &volume_mappings,
     );
-    let boot_args = super::podman::build_runtime_boot_args(network_config, &launch_config);
+    let mut boot_args = super::podman::build_runtime_boot_args(network_config, &launch_config);
+    if bootplan_over_vsock {
+        boot_args.push_str(" fcvm_bootplan=vsock");
+    }
 
     let plan = super::podman::RebootSpec {
-        firecracker_bin,
-        fc_args,
+        firecracker_bin: vmm_bin,
+        fc_args: vmm_args,
         launch_config,
         boot_args,
         track_dirty_pages: false,
@@ -4898,8 +4914,7 @@ async fn build_clone_reboot_plan(
         // verifies it is still the same file.
         image_disk_identity: meta.image_disk_identity.clone(),
         vsock_socket_path: vsock_socket_path.to_path_buf(),
-        // Clones restore from Firecracker snapshots and use MMDS; CH clone/restore is P2.
-        bootplan_over_vsock: false,
+        bootplan_over_vsock,
     };
     Ok((plan, synth_args, volume_mappings))
 }
