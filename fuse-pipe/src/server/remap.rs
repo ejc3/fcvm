@@ -1019,15 +1019,19 @@ mod tests {
         );
     }
 
-    /// A restored server of a read-only volume gives the guest handle 0 for a file CREATE made (its
-    /// inner server opens nothing), and a WRITE through handle 0 then reaches the file. A guest that
-    /// remounts the volume read-write can create files (#1042); handle 0 is no handle there either.
+    /// On a restored server of a read-only volume, handle 0 (what its inner server hands out, as it
+    /// opens nothing) still passes the handle remapping as "no handle", not as a handle from before
+    /// the restore: a WRITE through it reaches the inner server and is refused there with EROFS,
+    /// like the CREATE before it, and the host directory is unchanged (#1042). A guest that remounts
+    /// the volume read-write can no longer create or write files.
     ///
     /// RED BEFORE THE FIX: the restored server added its handle base to the 0, so the guest held a
-    /// number the server took for a handle from before the restore, and the WRITE got EBADF.
+    /// number the server took for a handle from before the restore, and the WRITE got EBADF from
+    /// the remapping instead of reaching the server.
     #[test]
-    fn a_restored_read_only_volume_hands_out_handle_zero_from_create() {
+    fn a_restored_read_only_volume_passes_handle_zero_to_its_server() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"A").unwrap();
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
         let source = Real {
@@ -1044,7 +1048,7 @@ mod tests {
             uid,
             gid,
         };
-        let (ino, fh) = match clone.call(VolumeRequest::Create {
+        let created = clone.call(VolumeRequest::Create {
             parent: 1,
             name: b"made".to_vec(),
             mode: 0o644,
@@ -1052,28 +1056,112 @@ mod tests {
             uid,
             gid,
             pid: 0,
-        }) {
-            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
-            other => panic!("create on the restored server: {other:?}"),
-        };
+        });
         assert_eq!(
-            fh, 0,
-            "the handle the restored server gave the guest for a file it did not open"
+            created.errno(),
+            Some(libc::EROFS),
+            "create on the restored read-only server: {created:?}"
         );
+        let ino = clone.lookup("kept.txt");
         let written = clone.call(VolumeRequest::Write {
             ino,
-            fh,
+            fh: 0,
             offset: 0,
             data: b"Z".to_vec(),
             uid,
             gid,
             pid: 0,
         });
+        assert_eq!(
+            written.errno(),
+            Some(libc::EROFS),
+            "write through handle 0 on the restored read-only server: {written:?}"
+        );
+        assert!(!dir.path().join("made").exists());
+        assert_eq!(std::fs::read(dir.path().join("kept.txt")).unwrap(), b"A");
+    }
+
+    /// A restored server whose inner server answers a CREATE with handle 0 (it opened nothing)
+    /// gives the guest handle 0, and passes 0 back to the inner server for a WRITE through it.
+    /// A handle base added to the 0 would have the guest hold a number the server takes for a
+    /// handle from before the restore. The inner server here is a stand-in, because a read-only
+    /// volume's real one now refuses the CREATE.
+    #[test]
+    fn a_restored_server_keeps_handle_zero_both_ways() {
+        struct Recorder {
+            write_fh: Mutex<Option<u64>>,
+        }
+        impl FilesystemHandler for Recorder {
+            fn handle_request_with_groups(
+                &self,
+                request: &VolumeRequest,
+                _groups: &[u32],
+            ) -> VolumeResponse {
+                match request {
+                    VolumeRequest::Create { .. } => VolumeResponse::Created {
+                        attr: make_attr(77),
+                        generation: 0,
+                        ttl_secs: 1,
+                        fh: 0,
+                        flags: 0,
+                    },
+                    VolumeRequest::Write { fh, data, .. } => {
+                        *self.write_fh.lock().unwrap() = Some(*fh);
+                        VolumeResponse::Written {
+                            size: data.len() as u64,
+                        }
+                    }
+                    _ => VolumeResponse::Ok,
+                }
+            }
+        }
+        let fs = RemapFs::restore_from_table(
+            Recorder {
+                write_fh: Mutex::new(None),
+            },
+            r#"{"handle_base":1000,"paths":{"1":""}}"#,
+        );
+        let created = fs.handle_request_with_groups(
+            &VolumeRequest::Create {
+                parent: 1,
+                name: b"made".to_vec(),
+                mode: 0o644,
+                flags: (libc::O_RDWR | libc::O_CREAT) as u32,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            &[],
+        );
+        let (ino, fh) = match created {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            other => panic!("create: {other:?}"),
+        };
+        assert_eq!(
+            fh, 0,
+            "the handle the guest got for a file the inner server did not open"
+        );
+        let written = fs.handle_request_with_groups(
+            &VolumeRequest::Write {
+                ino,
+                fh,
+                offset: 0,
+                data: b"Z".to_vec(),
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            &[],
+        );
         assert!(
             matches!(written, VolumeResponse::Written { size: 1 }),
-            "write through handle {fh} on the restored server: {written:?}"
+            "write: {written:?}"
         );
-        assert_eq!(std::fs::read(dir.path().join("made")).unwrap(), b"Z");
+        assert_eq!(
+            *fs.inner.write_fh.lock().unwrap(),
+            Some(0),
+            "the handle the inner server got"
+        );
     }
 
     /// A table written before the handle base was recorded, a bare map of paths, still restores its
