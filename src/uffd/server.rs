@@ -2445,12 +2445,16 @@ impl RemovedPages {
 /// Fault workers per copy-mode clone, unless [`FAULT_WORKERS_ENV`] says otherwise.
 const DEFAULT_FAULT_WORKERS: usize = 16;
 
+/// The most fault workers one clone gets, whatever [`FAULT_WORKERS_ENV`] asks for. Each is a
+/// thread per clone, and `fcvm-fault-63` is the longest name that fits /proc's comm.
+const MAX_FAULT_WORKERS: usize = 64;
+
 /// Overrides [`DEFAULT_FAULT_WORKERS`]: a whole number of threads, 0 to answer every fault on
 /// the handler as before.
 pub const FAULT_WORKERS_ENV: &str = "FCVM_UFFD_FAULT_WORKERS";
 
 fn fault_worker_count(raw: Option<&str>) -> usize {
-    match raw.map(str::trim) {
+    let count = match raw.map(str::trim) {
         None => DEFAULT_FAULT_WORKERS,
         Some(raw) => raw.parse().unwrap_or_else(|_| {
             warn!(
@@ -2460,7 +2464,15 @@ fn fault_worker_count(raw: Option<&str>) -> usize {
             );
             DEFAULT_FAULT_WORKERS
         }),
+    };
+    if count > MAX_FAULT_WORKERS {
+        warn!(
+            target: "uffd",
+            asked = count,
+            "{FAULT_WORKERS_ENV} asks for more than {MAX_FAULT_WORKERS} fault workers; using {MAX_FAULT_WORKERS}"
+        );
     }
+    count.min(MAX_FAULT_WORKERS)
 }
 
 /// How a fault worker answers a fault.
@@ -2997,6 +3009,16 @@ struct VmState {
 }
 
 impl VmState {
+    /// Faults answered from a hole in the memory file, by the handler and by the fault
+    /// workers: the `hole_zero_filled` field of the exit line.
+    fn hole_zero_filled_total(&self) -> u64 {
+        self.hole_zero_filled
+            + self
+                .fault_workers
+                .as_ref()
+                .map_or(0, |workers| workers.holes.load(Ordering::Relaxed))
+    }
+
     /// Count a fault answered with zeros, under its reason, when this handler's ioctl
     /// installed the page (`installed`). A page another populator installed first is not
     /// counted.
@@ -4753,7 +4775,7 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
         target: "uffd",
         vm_id = %ctx.vm_id,
         fault_count = state.fault_count,
-        hole_zero_filled = state.hole_zero_filled,
+        hole_zero_filled = state.hole_zero_filled_total(),
         elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
         pages_per_sec = format!("{:.0}", rate),
         reason,
@@ -10277,6 +10299,35 @@ mod tests {
         assert_eq!(state.fault_count, 2);
     }
 
+    /// The exit line's `hole_zero_filled` counts the holes the fault workers answered as well
+    /// as the handler's. It counted the handler's alone, so a clone whose hole faults all went
+    /// to the workers reported none (test_snapshot_clone_serves_snapshot_holes_as_zeros failed
+    /// on main with "the memory server answered no fault from a hole").
+    #[test]
+    fn the_exit_line_counts_the_holes_the_fault_workers_answered() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::empty());
+        let mut state = clone.state();
+        state.hole_zero_filled = 2;
+        state
+            .fault_workers
+            .as_ref()
+            .expect("a copy-mode clone has fault workers")
+            .holes
+            .store(3, Ordering::Relaxed);
+        assert_eq!(state.hole_zero_filled_total(), 5);
+        state.fault_workers = None;
+        assert_eq!(state.hole_zero_filled_total(), 2);
+        let source = include_str!("server.rs");
+        let exit = &source[..source
+            .find(concat!("        reason,\n        \"VM ", "exited\""))
+            .unwrap()];
+        let exit = &exit[exit.rfind("info!(").unwrap()..];
+        assert!(
+            exit.contains("hole_zero_filled = state.hole_zero_filled_total(),"),
+            "the exit line counts the handler's holes alone"
+        );
+    }
+
     /// Dropping the fault workers stops them before the jobs still queued are read: a clone
     /// that is gone does not pay one source read per queued fault before its handler can
     /// return. Without the stop the one worker went on to read page 4 after page 2.
@@ -10391,6 +10442,7 @@ mod tests {
         assert_eq!(fault_worker_count(Some(" 4\n")), 4);
         assert_eq!(fault_worker_count(Some("0")), 0);
         assert_eq!(fault_worker_count(Some("many")), DEFAULT_FAULT_WORKERS);
+        assert_eq!(fault_worker_count(Some("100000")), MAX_FAULT_WORKERS);
     }
 
     /// The region maps file pages 2..10, so with 4-page granules both of its ends fall inside

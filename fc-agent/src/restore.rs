@@ -371,6 +371,12 @@ pub async fn handle_clone_restore(
     let mut phases = RestorePhases::default();
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
 
+    // The kernel's attributes of the --map volumes' files are the source's, with the rest of
+    // their timeout to run here. Dropped now, the first access asks the server, and a file
+    // the host rewrote since the snapshot keeping its size and mtime is read afresh (#1049).
+    let expired = fuse_pipe::client::expire_cached_attributes();
+    eprintln!("[fc-agent] restore: dropped the cached attributes of {expired} mapped files");
+
     // The chronyd inherited from the snapshot must be gone before the clock step
     // below, which it would not notice (`agent::retire_chronyd_for_restore`).
     // Started now so the kill overlaps the network phases; awaited at the step.
@@ -822,6 +828,26 @@ pub(crate) fn handle_clone_restore_source() -> &'static str {
         .expect("handle_clone_restore has a closing brace")
         + 2;
     &source[start..start + len]
+}
+
+#[cfg(test)]
+mod restore_map_attribute_tests {
+    /// A restore drops the attributes the kernel holds for the mapped files before anything
+    /// else, so a clone reads a file the host rewrote since the snapshot (#1049). Without it
+    /// test_read_only_map_reads_a_rewrite_that_keeps_size_and_mtime read the old bytes in a
+    /// clone that looked within the attribute timeout it inherited.
+    #[test]
+    fn a_restore_drops_the_mapped_files_cached_attributes() {
+        let restore = super::handle_clone_restore_source();
+        let expire = restore
+            .find("fuse_pipe::client::expire_cached_attributes()")
+            .expect("handle_clone_restore keeps the source's attributes of the mapped files");
+        let first_await = restore.find(".await").unwrap();
+        assert!(
+            expire < first_await,
+            "it runs before the restore's first await"
+        );
+    }
 }
 
 #[cfg(test)]
