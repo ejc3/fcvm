@@ -537,7 +537,14 @@ mod tests {
     #[test]
     fn only_podman_run_checks_the_gpu_against_the_profiles_driver() {
         let call = "crate::gpu::check_driver_supports_device(";
-        let code = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
+        // Everything before the test module, not before the first `#[cfg(test)]`: a test hook
+        // inside a function (`sync_hooks::before_open` in podman/mod.rs) is not the end of the
+        // code, and cutting there hid podman run's check from this test.
+        let code = |source: &'static str| {
+            &source[..source
+                .find("\n#[cfg(test)]\nmod tests {")
+                .expect("the file has a test module")]
+        };
         assert!(
             code(include_str!("../commands/podman/mod.rs")).contains(call),
             "podman run does not check that the driver image supports the GPU"
