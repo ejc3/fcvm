@@ -481,9 +481,8 @@ pub async fn handle_clone_restore(
     // gate holds new inbound connections off until publication.
     // What the retired-address step carried, for the reconcile after the hook and the
     // watch after publication.
-    let carried_listeners: std::sync::Mutex<
-        Option<(std::net::Ipv6Addr, crate::retired_address::Plan)>,
-    > = std::sync::Mutex::new(None);
+    let carried_listeners: std::sync::Mutex<Option<crate::retired_address::Carried>> =
+        std::sync::Mutex::new(None);
     let move_to_clone_address = || async {
         let Some(new_ipv6) = clone_ipv6 else {
             return Ok(());
@@ -502,13 +501,13 @@ pub async fn handle_clone_restore(
         .await
         .context("joining the retired-address step")?
         .context("keeping listeners on a retired IPv6 address reachable")?;
-        if !carried.translate.is_empty() {
+        if !carried.plan.translate.is_empty() {
             eprintln!(
                 "[fc-agent] listeners on retired IPv6 address(es) {:?} answer on {current}: {:?}",
-                carried.keep, carried.translate
+                carried.plan.keep, carried.plan.translate
             );
         }
-        *carried_listeners.lock().unwrap() = Some((current, carried));
+        *carried_listeners.lock().unwrap() = Some(carried);
         Ok(())
     };
     let restored = crate::snapshot_network::restore_snapshot_network(move_to_clone_address)
@@ -689,9 +688,9 @@ pub async fn handle_clone_restore(
     // left: a service it restarted on the clone's own address is reached there.
     let reconcile_after_hook = || {
         let mut carried = carried_listeners.lock().unwrap();
-        if let Some((current, plan)) = carried.as_mut() {
-            if !plan.translate.is_empty() {
-                *plan = crate::retired_address::reconcile(*current, plan)
+        if let Some(carried) = carried.as_mut() {
+            if !carried.plan.translate.is_empty() {
+                crate::retired_address::reconcile(carried)
                     .context("keeping listeners on a retired IPv6 address reachable")?;
             }
         }
@@ -703,8 +702,8 @@ pub async fn handle_clone_restore(
         .context("restore phase publish")?;
     phases.record_boundary(&boundary);
     // And after publication, for as long as any translation remains.
-    if let Some((current, plan)) = carried_listeners.lock().unwrap().take() {
-        crate::retired_address::watch(current, plan);
+    if let Some(carried) = carried_listeners.lock().unwrap().take() {
+        crate::retired_address::watch(carried);
     }
 
     phases.total_ms = elapsed_ms(restore_started);
