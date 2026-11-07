@@ -68,30 +68,37 @@ RUN=${PHONE_RUN:-/tmp}
 export PHONE_GO_FILE=${PHONE_GO_FILE:-/run/phone-verified}
 AVD=$ANDROID_AVD_HOME/phone.avd
 ms() { date +%s%3N; }
-# The activity in front as the activity manager has it (package/class), or nothing.
+# Milliseconds as seconds for timeout(1).
+secs() { printf '%d.%03d' $(( $1 / 1000 )) $(( $1 % 1000 )); }
+# The activity in front as the activity manager has it (package/class), or nothing; the adb
+# call is cut off after $1 ms (2000).
 resumed_activity() {
-  "$ADB" shell dumpsys activity activities 2> /dev/null | tr -d '\r' \
+  timeout "$(secs "${1:-2000}")" "$ADB" shell dumpsys activity activities 2> /dev/null | tr -d '\r' \
     | sed -n 's/.*topResumedActivity=ActivityRecord{[^ ]* [^ ]* \([^ }]*\).*/\1/p' | head -1
 }
 # `am start -W ARGS...`, judged by the activity manager's top resumed activity afterwards, not
 # by am's output: in a clone restored from a snapshot, am's output can end after its Starting
-# line, with no Status line (#1691). The activity wanted is the -n component exactly, else any
-# activity of the package an implicit start names last. Waits FRONT_WAIT_MS (4000) for it on
-# top, then starts it once more (an activity already on top takes the intent again), so two
-# tries fit in a take-over action's 20 s (src/fleet/agent/slot.rs). Prints am's output and
-# FrontTime, the milliseconds from the start to the activity on top; fails at once on am's
-# Error line.
+# line, with no Status line (#1691). The Starting line says am took the intent; a try without
+# it (adb did not reach am) counts for nothing. The activity wanted is the -n component
+# exactly, else any activity of the package an implicit start names last. Each try has
+# FRONT_WAIT_MS (8000) for am and the checks together, every adb call cut off at what is left,
+# then the start is sent once more (an activity already on top takes the intent again), so
+# two tries fit in a take-over action's 20 s (src/fleet/agent/slot.rs). Prints am's output and
+# FrontTime, the milliseconds from the first start to the activity on top; fails at once on
+# am's Error line.
 am_front() { # am-args...
-  local want out t0 top deadline _try
+  local want out t0 top deadline left _try
   want=$(sed -n 's/.*-n \([^ ]*\).*/\1/p' <<< "$*")
   [ -n "$want" ] || want="${*: -1}/"
   t0=$(ms)
   for _try in 1 2; do
-    out=$("$ADB" shell am start -W "$@" 2>&1 | tr -d '\r') || true
+    deadline=$(( $(ms) + ${FRONT_WAIT_MS:-8000} ))
+    out=$(timeout "$(secs "${FRONT_WAIT_MS:-8000}")" "$ADB" shell am start -W "$@" 2>&1 | tr -d '\r') || true
     grep -q '^Error' <<< "$out" && break
-    deadline=$(( $(ms) + ${FRONT_WAIT_MS:-4000} ))
+    grep -q '^Starting: ' <<< "$out" || continue
     while :; do
-      top=$(resumed_activity)
+      left=$(( deadline - $(ms) ))
+      top=$(resumed_activity "$(( left > 2000 ? 2000 : left < 200 ? 200 : left ))")
       if [[ "$want" == */ && "$top" == "$want"* ]] || [ "$top" = "$want" ]; then
         printf '%s\nFrontTime: %s\n' "$out" "$(( $(ms) - t0 ))"
         return 0
@@ -176,7 +183,8 @@ start_app() {
   # the app hides the system bars; without this Android covers the scene with a one-time hint
   "$ADB" shell settings put secure immersive_mode_confirmations confirmed > /dev/null 2>&1 || true
   "$ADB" logcat -c > /dev/null 2>&1 || true
-  out=$(am_front -n dev.fcvm.robotpark/.MainActivity) \
+  # a first launch at boot is a cold start, outside any take-over action's 20 s
+  out=$(FRONT_WAIT_MS=${BOOT_FRONT_WAIT_MS:-30000} am_front -n dev.fcvm.robotpark/.MainActivity) \
     || { echo "am start: Robot Park is not in front ($(resumed_activity)): $(grep -m2 -E 'Error|Status|Starting' <<< "$out" | tr '\n' ' ')"; return 1; }
   "$ADB" forward tcp:"$CTL_PORT" localabstract:dev.fcvm.robotpark > /dev/null || { echo "adb forward failed"; return 1; }
   for _ in $(seq 1 100); do
@@ -227,7 +235,7 @@ start_browser() {
   "$ADB" install -r -g "$1" > /dev/null 2>&1 || { echo "adb could not install $1"; return 1; }
   # a userdebug image reads Chromium's command line from this file
   "$ADB" shell "echo '_ $BROWSER_FLAGS' > /data/local/tmp/chrome-command-line" || { echo "could not write the browser's command line"; return 1; }
-  open_page || return 1
+  FRONT_WAIT_MS=${BOOT_FRONT_WAIT_MS:-30000} open_page || return 1
   wait_browser_page "${PHONE_BROWSER_WAIT:-60}"
 }
 # The browser started on www.nvidia.com in a tab of its own: the other tabs are closed first,

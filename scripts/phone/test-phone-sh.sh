@@ -49,7 +49,7 @@ case "$*" in
     [ -e "$D/go" ] && echo "SurfaceFlinger checked with the go file present" >> "$D/log"
     echo "GLES: Google (NVIDIA Corporation), Android Emulator OpenGL ES Translator (${FAKE_RENDERER:-Tesla T4/PCIe/SSE2}), OpenGL ES 3.1" ;;
   # the started activity comes to the top (am's -n component, else the package last named)
-  "shell am start"*) if [ "${FAKE_AM:-ok}" = ok ]; then echo "Status: ok"; c=$(sed -n 's/.* -n \([^ ]*\).*/\1/p' <<< "$*"); echo "${c:-${*: -1}/.Main}" > "$D/top"; else echo "Error: Activity class does not exist."; fi ;;
+  "shell am start"*) if [ "${FAKE_AM:-ok}" = ok ]; then c=$(sed -n 's/.* -n \([^ ]*\).*/\1/p' <<< "$*"); c=${c:-${*: -1}/.Main}; printf 'Starting: Intent { cmp=%s }\nStatus: ok\n' "$c"; echo "$c" > "$D/top"; else echo "Error: Activity class does not exist."; fi ;;
   "shell dumpsys activity activities") [ -s "$D/top" ] && echo "  topResumedActivity=ActivityRecord{1 u0 $(cat "$D/top") t9}" ;;
   "logcat -d -s ROBOTPARK:I") echo "I ROBOTPARK: renderer=Android Emulator OpenGL ES Translator (${FAKE_APP_RENDERER:-Tesla T4/PCIe/SSE2})" ;;
   "emu kill") kill "$(cat "$D/run/emulator.pid")" ;;
@@ -341,10 +341,14 @@ case "\$*" in
   "shell am start"*)
     c=\$(sed -n 's/.* -n \([^ ]*\).*/\1/p' <<< "\$*"); [ -n "\$c" ] || c="\${@: -1}/.Main"
     cut=\$(cat "$B/cut" 2> /dev/null)
+    # adb did not reach am: nothing starts, and am prints nothing
+    if [ "\$cut" = noconn ]; then echo "adb: error: closed" >&2; exit 1; fi
     [ "\$cut" = never ] || echo "\$c" > "$B/top"
+    # am takes the intent and then never answers
+    if [ -e "$B/amhang" ]; then printf 'Starting: Intent { cmp=%s }\r\n' "\$c"; sleep 30; exit 0; fi
     if [ -n "\$cut" ]; then printf 'Starting: Intent { cmp=%s }\r\n' "\$c"; exit 255; fi
-    printf 'Status: ok\r\nTotalTime: 123\r\n' ;;
-  "shell dumpsys activity activities") [ -e "$B/slow" ] && sleep 1; [ -s "$B/top" ] && printf '  topResumedActivity=ActivityRecord{44375846 u0 %s t9}\r\n' "\$(cat "$B/top")" ;;
+    printf 'Starting: Intent { cmp=%s }\r\nStatus: ok\r\nTotalTime: 123\r\n' "\$c" ;;
+  "shell dumpsys activity activities") [ -e "$B/slow" ] && sleep 1; [ -e "$B/hang" ] && sleep 30; [ -s "$B/top" ] && printf '  topResumedActivity=ActivityRecord{44375846 u0 %s t9}\r\n' "\$(cat "$B/top")" ;;
 esac
 exit 0
 STUB
@@ -403,6 +407,19 @@ FRONT_WAIT_MS=1000 bact open_browser || true; t=$(( $(date +%s%3N) - t0 ))
 rm -f "$B/slow"
 [ "$t" -lt 8000 ] && ok "two starts with a slow activity manager end within their deadline ($t ms)" \
   || bad "open_browser with a slow activity manager took $t ms"
+# an activity manager that never answers, and an am that takes the intent and never returns:
+# every adb call is cut off within the try's budget
+echo dev.fcvm.robotpark/.MainActivity > "$B/top"; rm -f "$B/cut"; touch "$B/hang" "$B/amhang"; t0=$(date +%s%3N)
+FRONT_WAIT_MS=1000 bact open_browser || true; t=$(( $(date +%s%3N) - t0 ))
+rm -f "$B/hang" "$B/amhang"
+[ "$t" -lt 10000 ] && ok "two starts with am and the activity manager hung end within their budget ($t ms)" \
+  || bad "open_browser with am and the activity manager hung took $t ms"
+# a start that adb never delivered (no Starting line) does not count, though the tab it asked
+# for happens to be in front already
+echo org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity > "$B/top"; echo noconn > "$B/cut"
+if FRONT_WAIT_MS=1000 bact open_browser; then bad "open_browser succeeded with no start delivered"
+elif [ "$(grep -c "shell am start -W -n org.cromite.cromite" "$B/adb.log")" = 2 ]; then ok "a start adb never delivered is sent again and then fails"
+else bad "open_browser with no start delivered ran: $(cat "$B/adb.log")"; fi
 rm -f "$B/cut"; echo browser > "$B/front"; echo org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity > "$B/top"
 bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"
 adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}
