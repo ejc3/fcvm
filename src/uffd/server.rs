@@ -10368,6 +10368,13 @@ mod tests {
             "the exit line is logged before the workers are joined"
         );
         assert!(log[..exit].contains("hole_zero_filled = state.hole_zero_filled,"));
+        // The counters are read after the join: `retire` drops (joins) the workers first.
+        let retire_fn = &source[source.find(concat!("fn re", "tire(self)")).unwrap()..];
+        let retire_fn = &retire_fn[..retire_fn.find("\n    }\n").unwrap()];
+        assert!(
+            retire_fn.find("drop(self);").unwrap() < retire_fn.find(".load(").unwrap(),
+            "the workers' counters are read before they are joined"
+        );
         // A worker counts a hole only when its fill installed the page.
         let worker = &source[source.find(concat!("impl Fault", "Worker {")).unwrap()..];
         let counted = &worker[..worker.find("holes.fetch_add(1").unwrap()];
