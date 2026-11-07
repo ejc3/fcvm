@@ -108,6 +108,59 @@ pub async fn exec_in_namespace(ns_name: &str, command: &[&str]) -> Result<std::p
     Ok(output)
 }
 
+/// Runs `commands` (each the arguments of one `ip` command) in network namespace `ns_name`
+/// as one `ip -n <ns> -batch -`, and fails on the first that fails, naming it. One process
+/// instead of one per command: a routed restore configured its namespace's links with 12
+/// `ip netns exec <ns> ip ...` processes in a row, which ran 4 to 9 ms each.
+pub async fn ip_batch_in_namespace(ns_name: &str, commands: &[Vec<&str>]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let script = ip_batch_script(commands);
+    let mut child = Command::new("ip")
+        .args(["-n", ns_name, "-batch", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting ip -batch in namespace {ns_name}"))?;
+    let mut stdin = child.stdin.take().context("ip -batch stdin")?;
+    stdin
+        .write_all(script.as_bytes())
+        .await
+        .context("writing ip -batch commands")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("waiting for ip -batch")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ip -batch in namespace {} failed ({}): {}\ncommands:\n{}",
+            ns_name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            script.trim_end()
+        );
+    }
+    Ok(())
+}
+
+/// The `ip -batch` input for `commands`: one line per command. No argument may hold
+/// whitespace, which batch mode would split.
+fn ip_batch_script(commands: &[Vec<&str>]) -> String {
+    let mut script = String::new();
+    for command in commands {
+        assert!(
+            command
+                .iter()
+                .all(|a| !a.is_empty() && !a.contains(char::is_whitespace)),
+            "an ip -batch argument holds whitespace: {command:?}"
+        );
+        script.push_str(&command.join(" "));
+        script.push('\n');
+    }
+    script
+}
+
 /// Executes a command inside a network namespace and fails on non-zero exit.
 ///
 /// Like [`exec_in_namespace`], but bails with the command, exit status, and
@@ -187,6 +240,17 @@ mod tests {
 
         // Deleting again should be idempotent
         delete_namespace(ns_name).await.unwrap();
+    }
+
+    #[test]
+    fn an_ip_batch_script_has_one_line_per_command() {
+        assert_eq!(
+            ip_batch_script(&[
+                vec!["link", "set", "lo", "up"],
+                vec!["addr", "add", "10.0.2.1/24", "dev", "br0"]
+            ]),
+            "link set lo up\naddr add 10.0.2.1/24 dev br0\n"
+        );
     }
 
     // Requires CAP_SYS_ADMIN to remount /sys in new namespace (doesn't work in containers)
