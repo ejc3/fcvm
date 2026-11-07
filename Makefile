@@ -103,8 +103,9 @@ endif
 #   - test_vsock_integrity_nested     : 2.5 GB of L2 vsock traffic checked byte for byte (arm64)
 # Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
 # test_nested_l2_network_fuse / _network_nfs (iperf throughput — the slowest AND flakiest under
-# any contention), and test_utimensat_pjdfstest_nested_kernel. The L3/L4, benchmark, and
-# podman-load nested tests are already #[ignore]'d (run manually, tracked in #630-B).
+# any contention), test_utimensat_pjdfstest_nested_kernel, the three L3 tests (669 to 741 s
+# each, #660) and test_podman_load_over_fuse. test_nested_l4 and the benchmark test are
+# #[ignore]'d.
 # Gated on CI=true (set by GitHub Actions). Override anytime with an explicit FILTER=...
 # Scoped to package(fcvm) so fuse-pipe's fast test_nested_file unit test is NOT excluded.
 # Mutually exclusive with IPV6_FILTER in practice — CI runners have an IPv4 route, so
