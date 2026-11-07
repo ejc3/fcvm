@@ -235,8 +235,10 @@ That is acceptable for disposable sandboxes and is stated here so nobody builds 
 
 - no sandbox joins a domain or talks to another sandbox (each is alone in a namespace with no
   route out), so no peer can see two machines with one SID or name;
-- the RDP certificate is the bridge's to trust, and the bridge pins it by fingerprint from the
-  gold image; nobody else connects;
+- the RDP certificate is the bridge's to trust, and the bridge accepts it without a check:
+  it reaches the guest only through the sandbox's `rdp/rdp.sock`, a socket in a 0700
+  directory that serves only its owner's uid, and the guest has no other network peer, so
+  there is no one in between to impersonate it; nobody else connects;
 - the password never leaves the host: the bridge reads it from the image's directory.
 
 A per-clone identity (sysprep generalize, a new SID and name at first start) costs a reboot
