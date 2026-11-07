@@ -4308,12 +4308,18 @@ async fn cmd_snapshot_run_inner(
                 }
                 // The namespace holder or pasta died: the clone has lost its network for
                 // good. Report the companion's own name, status and stderr (#852).
-                message = crate::companion::registered_death("namespace holder", &mut holder_child) => {
+                (pid, status) = crate::companion::registered_exit(&mut holder_child) => {
+                    let message =
+                        crate::companion::describe_registered("namespace holder", pid, status)
+                            .await;
                     clone_failure = Some(format!("a process it depends on died: {message}"));
                     vm_exit = None;
                     break;
                 }
-                message = network.companion_death() => {
+                status = network.companion_exited() => {
+                    let message = network.describe_companion_exit(status).await;
+                    let message =
+                        crate::companion::network_death_report(message, &mut holder_child).await;
                     clone_failure = Some(format!("a process it depends on died: {message}"));
                     vm_exit = None;
                     break;
