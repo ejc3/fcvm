@@ -8474,7 +8474,92 @@ mod tests {
             cpus.len() >= 2,
             "this test needs two CPUs to put the handler and the balloon on; allowed: {cpus:?}"
         );
-        (cpus[0], cpus[1])
+        let busy = cpu_busy_over(Duration::from_millis(50));
+        let pair = idle_pair(&cpus, &busy, std::process::id() as usize);
+        eprintln!("pinned to CPUs {pair:?} of {} allowed", cpus.len());
+        pair
+    }
+
+    /// Ticks each CPU spent busy (not idle, not waiting on I/O) over `window`, from
+    /// /proc/stat. A CPU missing from the file reads as busy.
+    fn cpu_busy_over(window: Duration) -> std::collections::HashMap<usize, u64> {
+        fn sample() -> std::collections::HashMap<usize, u64> {
+            let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+            stat.lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let cpu = fields.next()?.strip_prefix("cpu")?.parse().ok()?;
+                    let ticks: Vec<u64> = fields.filter_map(|f| f.parse().ok()).collect();
+                    let total: u64 = ticks.iter().sum();
+                    let idle =
+                        ticks.get(3).copied().unwrap_or(0) + ticks.get(4).copied().unwrap_or(0);
+                    Some((cpu, total - idle))
+                })
+                .collect()
+        }
+        let before = sample();
+        std::thread::sleep(window);
+        let after = sample();
+        after
+            .into_iter()
+            .map(|(cpu, busy)| {
+                (
+                    cpu,
+                    busy.saturating_sub(before.get(&cpu).copied().unwrap_or(0)),
+                )
+            })
+            .collect()
+    }
+
+    /// Two of `cpus` for a test to pin its handler and balloon to: two of the least busy,
+    /// picked by `spread` among those, so the tests of one suite that pin at the same moment
+    /// do not all land on the same pair.
+    ///
+    /// The first two CPUs were always the pair once (#1035, #1092). A pinned thread cannot
+    /// move away from other work on its CPU, so every pinned test of a parallel suite, and
+    /// whatever else the host ran there, shared CPUs 0 and 1, and one fault in 200 waited out
+    /// that work: hundreds of milliseconds against a median of under one.
+    fn idle_pair(
+        cpus: &[usize],
+        busy: &std::collections::HashMap<usize, u64>,
+        spread: usize,
+    ) -> (usize, usize) {
+        let mut ranked: Vec<usize> = cpus.to_vec();
+        ranked.sort_by_key(|cpu| (busy.get(cpu).copied().unwrap_or(u64::MAX), *cpu));
+        let least = busy.get(&ranked[0]).copied().unwrap_or(u64::MAX);
+        // Every CPU within one tick of the least busy is as good a choice as any other.
+        let idle = ranked
+            .iter()
+            .take_while(|cpu| busy.get(cpu).copied().unwrap_or(u64::MAX) <= least.saturating_add(1))
+            .count()
+            .max(2);
+        let first = spread % idle;
+        (ranked[first], ranked[(first + 1) % idle])
+    }
+
+    /// The pinned pair is two of the least busy CPUs, never one that is busy while an idle one
+    /// is left, and different tests pick different pairs among equally idle CPUs (#1092).
+    #[test]
+    fn balloon_tests_pin_to_idle_cpus_and_spread_out() {
+        let cpus = [0, 1, 2, 3, 4, 5];
+        let busy: std::collections::HashMap<usize, u64> =
+            [(0, 5), (1, 5), (2, 0), (3, 0), (4, 1), (5, 0)].into();
+        let mut seen = std::collections::BTreeSet::new();
+        for spread in 0..6 {
+            let (a, b) = idle_pair(&cpus, &busy, spread);
+            assert_ne!(a, b);
+            for cpu in [a, b] {
+                assert!(
+                    ![0, 1].contains(&cpu),
+                    "spread {spread} pinned to busy CPU {cpu}"
+                );
+            }
+            seen.insert((a, b));
+        }
+        assert!(seen.len() > 1, "every test got the same pair: {seen:?}");
+        // With only two CPUs allowed, those two.
+        let (a, b) = idle_pair(&[7, 9], &busy, 3);
+        assert_eq!([a.min(b), a.max(b)], [7, 9]);
     }
 
     /// The calling thread pinned to one CPU until dropped, when its old affinity comes back.
@@ -8783,7 +8868,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing()
     {
-        let cpu = allowed_cpus()[0];
+        let cpu = two_cpus().0;
         let _pinned = PinnedThread::to(cpu);
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
