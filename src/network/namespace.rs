@@ -87,17 +87,36 @@ pub async fn namespace_exists(ns_name: &str) -> bool {
     namespace_path(ns_name).exists()
 }
 
-/// Executes a command inside a network namespace
-///
-/// Wrapper around `ip netns exec` for running commands in an isolated namespace.
-/// Returns the command output.
+/// The `ip` arguments that run `command` in network namespace `ns_name`. An `ip` command
+/// runs as `ip -n <ns> ...`, which only enters the namespace for its netlink socket. Any
+/// other command runs under `ip netns exec`, which also unshares a mount namespace and
+/// mounts the namespace's sysfs, so that `/sys/class/net` shows its devices: two mount
+/// operations per call, which every namespace operation on the host serializes on. A routed
+/// restore ran 14 `ip` commands this way, and its network step took 150 to 170 ms with 8
+/// restores at once.
+fn namespace_exec_args<'a>(ns_name: &'a str, command: &[&'a str]) -> Vec<&'a str> {
+    match command.split_first() {
+        Some((&"ip", rest)) => {
+            let mut args = vec!["-n", ns_name];
+            args.extend_from_slice(rest);
+            args
+        }
+        _ => {
+            let mut args = vec!["netns", "exec", ns_name];
+            args.extend_from_slice(command);
+            args
+        }
+    }
+}
+
+/// Executes a command inside a network namespace (`namespace_exec_args`), and returns its
+/// output.
 pub async fn exec_in_namespace(ns_name: &str, command: &[&str]) -> Result<std::process::Output> {
     if command.is_empty() {
         anyhow::bail!("command cannot be empty");
     }
 
-    let mut args = vec!["netns", "exec", ns_name];
-    args.extend_from_slice(command);
+    let args = namespace_exec_args(ns_name, command);
 
     let output = Command::new("ip")
         .args(&args)
@@ -187,6 +206,25 @@ mod tests {
 
         // Deleting again should be idempotent
         delete_namespace(ns_name).await.unwrap();
+    }
+
+    /// An `ip` command enters the namespace with `ip -n`, not with `ip netns exec`, whose
+    /// mount namespace and sysfs mount serialize with every other namespace operation;
+    /// anything else still gets `ip netns exec`, so it sees the namespace's sysfs.
+    #[test]
+    fn ip_commands_enter_the_namespace_without_a_mount_namespace() {
+        assert_eq!(
+            namespace_exec_args("ns", &["ip", "link", "set", "lo", "up"]),
+            ["-n", "ns", "link", "set", "lo", "up"]
+        );
+        assert_eq!(
+            namespace_exec_args("ns", &["sysctl", "-w", "x=1"]),
+            ["netns", "exec", "ns", "sysctl", "-w", "x=1"]
+        );
+        assert_eq!(
+            namespace_exec_args("ns", &["cat", "/sys/class/net/lo/address"]),
+            ["netns", "exec", "ns", "cat", "/sys/class/net/lo/address"]
+        );
     }
 
     // Requires CAP_SYS_ADMIN to remount /sys in new namespace (doesn't work in containers)
