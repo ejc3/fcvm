@@ -304,15 +304,29 @@ fn apply(plan: &Plan, current: Ipv6Addr, on_lo: &[Ipv6Addr], had_rules: bool) ->
     Ok(())
 }
 
-/// The restore whose plan the retired-address rules follow, counted from 1. Every
-/// change to the rules and to the addresses on `lo` is made holding it, and a change
-/// made for an earlier restore is refused (`reconcile`). A snapshot of a clone holds
-/// that clone's watch (`watch`), which resumes in the next clone with the previous
-/// clone's address: once the next restore has counted itself, nothing the inherited
-/// watch does reaches the rules.
-static RESTORE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+/// The retired-address state of this guest, kept in fc-agent's memory and so carried by
+/// a snapshot with the netfilter rules it describes.
+#[derive(Debug, Default)]
+struct RestoreState {
+    /// The restore whose plan the rules follow, counted from 1. Every change to the
+    /// rules and to the addresses on `lo` is made holding this state, and a change made
+    /// for an earlier restore is refused (`reconcile`). A snapshot of a clone holds that
+    /// clone's watch (`watch`), which resumes in the next clone with the previous clone's
+    /// address: once the next restore has counted itself, nothing the inherited watch
+    /// does reaches the rules.
+    generation: u64,
+    /// Whether the chain holds translations. A restore of a clone whose snapshot had
+    /// them, and that has none of its own, empties the chain rather than leaving rules
+    /// that send its own address's ports to addresses it has just removed.
+    rules: bool,
+}
 
-fn lock_restore() -> std::sync::MutexGuard<'static, u64> {
+static RESTORE: std::sync::Mutex<RestoreState> = std::sync::Mutex::new(RestoreState {
+    generation: 0,
+    rules: false,
+});
+
+fn lock_restore() -> std::sync::MutexGuard<'static, RestoreState> {
     RESTORE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -325,6 +339,29 @@ pub struct Carried {
     pub generation: u64,
     pub current: Ipv6Addr,
     pub plan: Plan,
+    /// The retired addresses left on `lo`. A listener on one can close and bind again
+    /// (a service restart), so the watch keeps looking while any remain.
+    pub retained: Vec<Ipv6Addr>,
+}
+
+impl Carried {
+    /// Whether the watch has anything left to follow.
+    pub fn keeps_watching(&self) -> bool {
+        !self.plan.translate.is_empty() || !self.retained.is_empty()
+    }
+}
+
+/// The addresses on `lo` once `plan` is applied over `on_lo`.
+fn retained_after(plan: &Plan, on_lo: &[Ipv6Addr]) -> Vec<Ipv6Addr> {
+    let mut retained: Vec<Ipv6Addr> = on_lo
+        .iter()
+        .chain(&plan.keep)
+        .copied()
+        .filter(|address| !plan.remove.contains(address))
+        .collect();
+    retained.sort_unstable();
+    retained.dedup();
+    retained
 }
 
 /// The listener sockets and the retired addresses on `lo`, as the kernel lists them now.
@@ -337,20 +374,45 @@ fn read_tables() -> Result<(Vec<Ipv6Addr>, Vec<Listener>)> {
     Ok((on_lo, listeners))
 }
 
+/// The signature of [`apply`]: plan, the clone's address, the retired addresses on
+/// `lo`, and whether the chain holds translations now.
+type ApplyFn<'a> = dyn FnMut(&Plan, Ipv6Addr, &[Ipv6Addr], bool) -> Result<()> + 'a;
+
+/// [`carry_listeners`] over tables already read, with `apply` in place of [`apply`].
+fn carry_in(
+    state: &mut RestoreState,
+    retired_now: Option<Ipv6Addr>,
+    current: Ipv6Addr,
+    on_lo: &[Ipv6Addr],
+    listeners: &[Listener],
+    apply: &mut ApplyFn<'_>,
+) -> Result<Carried> {
+    state.generation += 1;
+    let plan = plan(retired_now, on_lo, listeners, current);
+    apply(&plan, current, on_lo, state.rules)?;
+    state.rules = !plan.translate.is_empty();
+    Ok(Carried {
+        generation: state.generation,
+        current,
+        retained: retained_after(&plan, on_lo),
+        plan,
+    })
+}
+
 /// After a routed restore moved the guest to `current` (and removed `retired_now`
 /// from eth0), keep every listener on a retired address reachable at `current`.
 /// Counts this restore, so an inherited watch can no longer change the rules.
 pub fn carry_listeners(retired_now: Option<Ipv6Addr>, current: Ipv6Addr) -> Result<Carried> {
-    let mut generation = lock_restore();
-    *generation += 1;
+    let mut state = lock_restore();
     let (on_lo, listeners) = read_tables()?;
-    let plan = plan(retired_now, &on_lo, &listeners, current);
-    apply(&plan, current, &on_lo, false)?;
-    Ok(Carried {
-        generation: *generation,
+    carry_in(
+        &mut state,
+        retired_now,
         current,
-        plan,
-    })
+        &on_lo,
+        &listeners,
+        &mut apply,
+    )
 }
 
 /// The plan a reconcile applies: the translations the listeners call for now, and no
@@ -367,24 +429,22 @@ fn replan(on_lo: &[Ipv6Addr], listeners: &[Listener], current: Ipv6Addr) -> Plan
 
 /// Plan again from the listeners as they are now and apply what changed since
 /// `carried.plan`: a retired listener that closed, or a service now listening on the
-/// clone's own address, loses its translation. Returns false, changing nothing, when
-/// a later restore than `carried`'s has counted itself. Reads three `/proc` files and
-/// starts no process when nothing changed.
+/// clone's own address, loses its translation, and one that listens again on a retained
+/// address gets it back. Returns false, changing nothing, when a later restore than
+/// `carried`'s has counted itself. Reads three `/proc` files and starts no process when
+/// nothing changed.
 pub fn reconcile(carried: &mut Carried) -> Result<bool> {
-    let generation = lock_restore();
-    if *generation != carried.generation {
+    let mut state = lock_restore();
+    if state.generation != carried.generation {
         return Ok(false);
     }
     let (on_lo, listeners) = read_tables()?;
     let next = replan(&on_lo, &listeners, carried.current);
     if next.translate != carried.plan.translate {
-        apply(
-            &next,
-            carried.current,
-            &on_lo,
-            !carried.plan.translate.is_empty(),
-        )?;
+        apply(&next, carried.current, &on_lo, state.rules)?;
+        state.rules = !next.translate.is_empty();
     }
+    carried.retained = retained_after(&next, &on_lo);
     carried.plan = next;
     Ok(true)
 }
@@ -393,17 +453,18 @@ pub fn reconcile(carried: &mut Carried) -> Result<bool> {
 const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Keep `carried`'s translations in step with the listeners after the restore
-/// published: every second while any remain, reconcile. A service that closes its
-/// listener on the retired address and binds the clone's own loses the translation
-/// within a second. Ends when no translation remains or a later restore has counted
+/// published: every second while a retired address remains on `lo`, reconcile. A
+/// service that closes its listener on the retired address and binds the clone's own
+/// loses the translation within a second, and one that binds the retired address again
+/// gets it back. Ends when no retired address remains or a later restore has counted
 /// itself.
 pub fn watch(carried: Carried) {
-    if carried.plan.translate.is_empty() {
+    if !carried.keeps_watching() {
         return;
     }
     tokio::spawn(async move {
         let mut carried = carried;
-        while !carried.plan.translate.is_empty() {
+        while carried.keeps_watching() {
             tokio::time::sleep(WATCH_EVERY).await;
             let previous = carried.clone();
             carried = match tokio::task::spawn_blocking(move || {
@@ -602,9 +663,9 @@ fe800000000000000000000000000001 01 40 20 a0 lo
     #[test]
     fn a_watch_from_an_earlier_restore_changes_nothing() {
         let generation = {
-            let mut generation = lock_restore();
-            *generation += 1;
-            *generation
+            let mut state = lock_restore();
+            state.generation += 1;
+            state.generation
         };
         let mut inherited = Carried {
             generation,
@@ -612,13 +673,66 @@ fe800000000000000000000000000001 01 40 20 a0 lo
             // No translation, so a reconcile that went ahead would find nothing to
             // apply on the machine running the test.
             plan: Plan::default(),
+            retained: Vec::new(),
         };
-        *lock_restore() += 1;
+        lock_restore().generation += 1;
         let before = inherited.plan.clone();
         assert!(
             !reconcile(&mut inherited).unwrap(),
             "a stale watch reconciled"
         );
         assert_eq!(inherited.plan, before);
+    }
+
+    /// A restore with nothing to translate empties a chain its snapshot carried
+    /// translations in, rather than leaving rules that send its own address's ports to
+    /// addresses it has just removed.
+    #[test]
+    fn a_restore_with_nothing_to_translate_empties_inherited_rules() {
+        let mut state = RestoreState {
+            generation: 1,
+            rules: true,
+        };
+        let mut had_rules = None;
+        let mut record = |plan: &Plan, _: Ipv6Addr, _: &[Ipv6Addr], rules: bool| {
+            assert!(plan.translate.is_empty());
+            had_rules = Some(rules);
+            Ok(())
+        };
+        let carried = carry_in(
+            &mut state,
+            Some(addr(OLD)),
+            addr(NEW),
+            &[addr(OLDER)],
+            &[],
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(
+            had_rules,
+            Some(true),
+            "the apply was not told the chain holds rules"
+        );
+        assert!(!state.rules);
+        assert!(carried.retained.is_empty(), "{carried:?}");
+    }
+
+    /// The watch keeps looking while a retired address remains on `lo`, so a service
+    /// that closes its listener there and binds it again (a restart) gets its
+    /// translation back.
+    #[test]
+    fn the_watch_follows_a_listener_through_a_restart() {
+        let carried = Carried {
+            generation: 1,
+            current: addr(NEW),
+            plan: Plan::default(),
+            retained: vec![addr(OLD)],
+        };
+        assert!(carried.keeps_watching());
+        assert!(!Carried {
+            retained: Vec::new(),
+            ..carried
+        }
+        .keeps_watching());
     }
 }

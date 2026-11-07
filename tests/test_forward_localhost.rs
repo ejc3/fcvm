@@ -11,15 +11,58 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::net::TcpListener;
 
+/// A host service for one test: its port, the greeting only it sends, the accept
+/// thread, and, for a service on ::1, the IPv4 loopback socket that holds the same
+/// port.
+struct HostServer {
+    port: u16,
+    greeting: String,
+    accept: std::thread::JoinHandle<bool>,
+    /// Bound and not listening, so a connection to 127.0.0.1 on the port is refused
+    /// for as long as the test runs: the relay, which tries 127.0.0.1 first, must reach
+    /// the ::1 service and nothing another test or the host runs on that port.
+    _ipv4_reservation: Option<std::os::fd::OwnedFd>,
+}
+
+/// Bind `host` on a port nobody uses on 127.0.0.1 either, when `host` is ::1.
+fn bind_host_listener(
+    host: std::net::IpAddr,
+) -> Result<(TcpListener, Option<std::os::fd::OwnedFd>)> {
+    use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, SockaddrIn};
+    if !host.is_ipv6() {
+        return Ok((TcpListener::bind((host, 0))?, None));
+    }
+    for _ in 0..100 {
+        let listener = TcpListener::bind((host, 0))?;
+        let port = listener.local_addr()?.port();
+        let reservation = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        let ipv4 = SockaddrIn::from(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        ));
+        if bind(std::os::fd::AsRawFd::as_raw_fd(&reservation), &ipv4).is_ok() {
+            return Ok((listener, Some(reservation)));
+        }
+    }
+    anyhow::bail!("no port free on both ::1 and 127.0.0.1")
+}
+
 /// Start a TCP server on host loopback address `host` that accepts one connection and
-/// replies with a greeting. Returns the bound port and the accept thread handle.
-fn spawn_host_server(host: std::net::IpAddr) -> Result<(u16, std::thread::JoinHandle<bool>)> {
+/// replies with a greeting no other server sends.
+fn spawn_host_server(host: std::net::IpAddr) -> Result<HostServer> {
     // Only reachable via loopback.
-    let listener = TcpListener::bind((host, 0))?;
+    let (listener, reservation) = bind_host_listener(host)?;
     let port = listener.local_addr()?.port();
+    let greeting = format!("HELLO_FROM_HOST_{}_{port}", std::process::id());
     println!("  Host server on {}", listener.local_addr()?);
 
     // Accept one connection in background (with timeout)
+    let reply = format!("{greeting}\n");
     let accept_handle = std::thread::spawn(move || -> bool {
         listener.set_nonblocking(false).expect("set_nonblocking");
         // Accept timeout must cover a full cold VM boot plus image export under
@@ -42,14 +85,33 @@ fn spawn_host_server(host: std::net::IpAddr) -> Result<(u16, std::thread::JoinHa
         }
         match listener.accept() {
             Ok((mut conn, _)) => {
-                let _ = conn.write_all(b"HELLO_FROM_HOST\n");
+                let _ = conn.write_all(reply.as_bytes());
                 true
             }
             Err(_) => false,
         }
     });
 
-    Ok((port, accept_handle))
+    Ok(HostServer {
+        port,
+        greeting,
+        accept: accept_handle,
+        _ipv4_reservation: reservation,
+    })
+}
+
+/// A service on ::1 holds its port on 127.0.0.1 too, so the relay's first try there is
+/// refused rather than reaching whatever else listens on that port.
+#[test]
+fn an_ipv6_loopback_service_holds_its_port_on_ipv4_loopback() {
+    let server = spawn_host_server(std::net::Ipv6Addr::LOCALHOST.into()).unwrap();
+    assert!(
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, server.port)).is_err(),
+        "127.0.0.1:{} is free beside the ::1 service",
+        server.port
+    );
+    let _ = std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, server.port));
+    let _ = server.accept.join();
 }
 
 /// Run a VM with --forward-localhost that connects to localhost:port from the
@@ -68,7 +130,8 @@ async fn run_forward_localhost_case_to(
     extra_args: &[&str],
     name_prefix: &str,
 ) -> Result<()> {
-    let (port, accept_handle) = spawn_host_server(host)?;
+    let server = spawn_host_server(host)?;
+    let port = server.port;
 
     let port_str = port.to_string();
     let (vm_name, _, _, _) = common::unique_names(name_prefix);
@@ -99,21 +162,21 @@ async fn run_forward_localhost_case_to(
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("  stdout: {}", stdout.trim());
 
-    let accepted = if accept_handle.is_finished() {
-        accept_handle.join().unwrap_or(false)
+    let accepted = if server.accept.is_finished() {
+        server.accept.join().unwrap_or(false)
     } else {
         // fcvm exited without the container ever connecting (boot failure or a
         // forwarding regression). Unblock the accept thread with a local
         // connection so the test reports promptly instead of waiting out the
         // accept timeout.
         let _ = std::net::TcpStream::connect((host, port));
-        let _ = accept_handle.join();
+        let _ = server.accept.join();
         false
     };
     println!("  server accepted: {}", accepted);
 
     assert!(
-        stdout.contains("HELLO_FROM_HOST"),
+        stdout.contains(&server.greeting),
         "VM localhost should reach host (got stdout={}, stderr={})",
         stdout.trim(),
         &stderr[..std::cmp::min(200, stderr.len())]

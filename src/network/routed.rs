@@ -77,6 +77,19 @@ pub(crate) enum LeaseAttempt {
     },
 }
 
+/// Lock `dir`'s lease table: the directory itself, exclusively, waiting for it. A sweep
+/// (`remove_abandoned_leases`) and a lease's open and lock of its file each hold it, so a
+/// sweep never locks a file a VM has created and not yet locked, and that VM never
+/// mistakes the sweep for a holder. Held for a few file operations, never for a lease's
+/// lifetime.
+fn lock_lease_table(dir: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    let table = std::fs::File::open(dir)
+        .with_context(|| format!("opening the IPv6 address lease directory {}", dir.display()))?;
+    nix::fcntl::Flock::lock(table, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, error)| error)
+        .with_context(|| format!("locking the IPv6 address lease directory {}", dir.display()))
+}
+
 /// Take the lease on `address` in `dir` for VM `vm_id` of this process, or report who
 /// holds it.
 ///
@@ -102,6 +115,9 @@ pub(crate) fn lease_address(
     // Ipv6Addr's Display is the canonical (RFC 5952) form, so every spelling of one
     // address names one file.
     let path = dir.join(format!("{address}.lock"));
+    // Held until this attempt has locked its file or found it held, and across the
+    // sweep, which therefore never locks a file another VM has opened and not locked.
+    let _table = lock_lease_table(dir)?;
     remove_abandoned_leases(dir, &path);
     // A retry needs a holder that unlinked the file between this open and this lock,
     // which takes a release and a new lease each time.
@@ -162,9 +178,9 @@ pub(crate) fn lease_address(
 /// addresses differ on every launch, so nothing else would remove it before a reboot
 /// (#1147). Each file is removed the way a holder removes its own (`AddressLease`'s
 /// Drop): under an exclusive lock, and only while the path still names the locked inode.
-/// A file another process holds refuses the lock and is kept. A file a process has just
-/// created but not yet locked may be removed; that process then finds the path no longer
-/// names the file it locked, and opens it again (`lease_address`).
+/// A file another process holds refuses the lock and is kept. The caller holds the lease
+/// table (`lock_lease_table`), so no other process is between its open and its lock of a
+/// lease file, where the sweep's lock would make it report the address held.
 ///
 /// Every error here is logged and skipped: a leftover file costs an inode, never a lease.
 fn remove_abandoned_leases(dir: &std::path::Path, keep: &std::path::Path) {
@@ -2027,6 +2043,45 @@ mod tests {
                 LeaseAttempt::Leased(_) => panic!("a held address was leased again"),
             }
         }
+    }
+
+    /// A lease taken while another VM's sweep holds the lease file is not refused. The
+    /// sweep (`remove_abandoned_leases`) locks every file it may remove, including one a
+    /// VM has just created and not yet locked; that VM's lock then failed and it reported
+    /// the address held by nobody. Here the sweep is played by a thread that holds the
+    /// table the way a sweep does, locks the file, removes it and lets go.
+    #[test]
+    fn a_lease_taken_during_another_vms_sweep_is_not_refused() {
+        use nix::fcntl::{Flock, FlockArg};
+        let dir = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::9".parse().unwrap();
+        let path = dir.path().join(format!("{address}.lock"));
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let sweep = {
+            let (dir, path) = (dir.path().to_path_buf(), path.clone());
+            std::thread::spawn(move || {
+                let table = lock_lease_table(&dir).unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::remove_file(&path).unwrap();
+                drop(lock);
+                drop(table);
+            })
+        };
+        wait_locked.recv().unwrap();
+        let attempt = lease_address(dir.path(), address, "vm-new").unwrap();
+        sweep.join().unwrap();
+        assert!(
+            leased(attempt).is_some(),
+            "a lease taken while a sweep held the file was refused"
+        );
     }
 
     /// A lease is held by the process, so a process that dies releases it with no
