@@ -693,7 +693,13 @@ cmd_golden() {
     fi
     local dns_flag=()
     [ -n "$GUEST_DNS" ] && dns_flag=(--dns "$GUEST_DNS")
-    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag "${dns_flag[@]}" \
+    local thp_flag=()
+    case "$GUEST_THP" in
+        "") ;;
+        always|madvise|never) thp_flag=(--guest-thp "$GUEST_THP") ;;
+        *) log "golden: GUEST_THP must be always, madvise, never or empty, not '$GUEST_THP'"; return 1 ;;
+    esac
+    $SUDO env RUST_LOG="$FCVM_LOG" "$FCVM" podman prepare --tag "$TAG" --force $huge_flag "${dns_flag[@]}" "${thp_flag[@]}" \
         "${guest_env_flags[@]}" \
         --name "$name" --cpu "$CPU" --mem "$MEM" --network "$NETMODE" \
         --publish "$CDP_PORT:$CDP_PORT" "$IMAGE" 2>"$lf" >"$prepared_json" \
@@ -731,17 +737,17 @@ cmd_golden() {
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
         "${REQBENCH_SOURCE_REVISION:-}" "$browser_version" "$firecracker_config" \
         "$HERE" \
-        "$GUEST_DNS" "${guest_env_entries[@]}" <<'PY'
+        "$GUEST_DNS" "$GUEST_THP" "${guest_env_entries[@]}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, built_image_id, prepared_generation, prepared_digest,
     fcvm_sha256, runtime_bundle_sha256, source_revision, browser_version,
-    firecracker_config, harness_dir, guest_dns,
-) = sys.argv[1:18]
+    firecracker_config, harness_dir, guest_dns, guest_thp,
+) = sys.argv[1:19]
 # The GUEST_ENV entries that became `--env` flags, in order; empty when the
 # knob was unset.
-guest_env = sys.argv[18:]
+guest_env = sys.argv[19:]
 sys.path.insert(0, harness_dir)
 from reqbench import firecracker_identity
 lock = open(lock_path, "a+")
@@ -797,8 +803,15 @@ if guest_dns and baked_dns != guest_dns:
         f"metadata.network_config.dns_server is {baked_dns!r}; the guest did not "
         "bake the resolver this golden claims"
     )
+# The huge page mode the snapshot records is the one its clones inherit.
+if (metadata.get("guest_thp") or "") != guest_thp:
+    raise SystemExit(
+        f"GUEST_THP={guest_thp!r} was requested but the snapshot records "
+        f"guest_thp {metadata.get('guest_thp')!r}"
+    )
 record = {
     "guest_dns": guest_dns or None,
+    "guest_thp": guest_thp or None,
     "guest_env": guest_env,
     "snapshot_generation_id": generation_id,
     "snapshot_config_sha256": config_sha256,
@@ -1310,6 +1323,12 @@ HUGEPAGES="${HUGEPAGES:-0}"
 # corpus replay arm sets GUEST_DNS=10.0.2.2 so every corpus hostname
 # resolves through the host-loopback replay server via the pasta gateway.
 GUEST_DNS="${GUEST_DNS:-}"
+# The guest's transparent huge page mode for the golden and, through its
+# metadata, every clone of it (`fcvm podman prepare --guest-thp`). A clone's
+# private memory is what it writes, and under `always` one write makes a whole
+# 2 MiB page private, so the pool runs with `never`. Empty keeps the guest
+# kernel's own mode. Recorded as guest_thp in reqbench-provenance.json.
+GUEST_THP="${GUEST_THP-never}"
 # Extra container environment baked into the golden: comma-separated KEY=VALUE
 # entries, one `fcvm podman prepare --env` each (a value cannot hold a comma).
 # GUEST_ENV=BENCH_RESOLVE_ALL_TO=<ip> is the resolver-rule arm of the corpus

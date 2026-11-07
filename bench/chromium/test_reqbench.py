@@ -5978,6 +5978,7 @@ exit 1
         env, binx = self._env(d, DATA_ROOT=d)
         # The developer's shell must not decide what the golden bakes.
         env.pop("GUEST_ENV", None)
+        env.pop("GUEST_THP", None)
         env.update(env_extra or {})
         if built_image_id is not None:
             os.makedirs(os.path.join(d, "reqbench-locks"), exist_ok=True)
@@ -5995,8 +5996,12 @@ case "$1 $2" in
   "podman prepare")
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
-      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<'EOF'
-{{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"}}}}
+      # Record --guest-thp the way fcvm's snapshot metadata does.
+      thp=""; prev=""
+      for arg in "$@"; do [ "$prev" = --guest-thp ] && thp="$arg"; prev="$arg"; done
+      thp_field=""; [ -n "$thp" ] && thp_field=",\\"guest_thp\\":\\"$thp\\""
+      cat > "$DATA_ROOT/snapshots/$TAG/config.json" <<EOF
+{{"generation_id":"12345678-1234-4234-8234-123456789abc","created_at":"2026-08-09T00:00:00Z","vm_id":"vm-11111111111111111111111111111111","metadata":{{"image":"localhost/chromium-bench-req","image_disk_path":"/image-cache/{snapshot_cache_key}.storage-v2.img"$thp_field}}}}
 EOF
       # Real prepare reports the generation it installed on stdout; the harness
       # binds its provenance record to exactly that generation.
@@ -6254,6 +6259,28 @@ exit 1
             d, "snapshots", "cb-req-golden", "reqbench-provenance.json",
         )) as source:
             return json.load(source)
+
+    def test_golden_runs_the_pool_without_transparent_huge_pages(self):
+        """The golden asks prepare for `--guest-thp never` unless GUEST_THP says
+        otherwise, and records the mode its snapshot carries; an empty GUEST_THP
+        passes no flag and records none."""
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(d, "a" * 64)
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            self.assertIn(" --guest-thp never ", argv)
+            self.assertEqual(self._golden_provenance(d)["guest_thp"], "never")
+        with tempfile.TemporaryDirectory() as d:
+            result, argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_THP": ""},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-1600:])
+            self.assertNotIn("--guest-thp", argv)
+            self.assertIsNone(self._golden_provenance(d)["guest_thp"])
+        with tempfile.TemporaryDirectory() as d:
+            result, _argv, _digest, _image_id = self._golden_image_identity_fixture(
+                d, "a" * 64, env_extra={"GUEST_THP": "sometimes"},
+            )
+            self.assertNotEqual(result.returncode, 0)
 
     def test_golden_forwards_guest_env_to_prepare_and_records_it(self):
         """GUEST_ENV=A=1,B=2 is one `--env` per entry on prepare, and the

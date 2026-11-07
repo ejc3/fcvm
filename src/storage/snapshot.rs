@@ -220,6 +220,16 @@ pub struct SnapshotMetadata {
     /// the clone is published; see `--on-restore`.
     #[serde(default)]
     pub restore_hook: Option<String>,
+    /// The guest's transparent huge page mode when the snapshot was taken
+    /// (`--guest-thp`); none is the kernel's own. Not part of the cache key: a
+    /// restore applies its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_thp: Option<String>,
+    /// Whether the snapshot's fc-agent applies the huge page mode a restore sends. An
+    /// fc-agent from before `--guest-thp` ignores it and reports the restore done, so a
+    /// mode cannot be asked of such a snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guest_thp_restore: bool,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -848,6 +858,8 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
+                guest_thp_restore: false,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1053,6 +1065,8 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
+                guest_thp_restore: false,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1141,6 +1155,8 @@ mod tests {
                     health_check_url: None,
                     health_check_timeout: 5,
                     restore_hook: None,
+                    guest_thp: None,
+                    guest_thp_restore: false,
                     hugepages: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
@@ -1216,6 +1232,8 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
+                guest_thp_restore: false,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1416,6 +1434,8 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
+                guest_thp_restore: false,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1572,6 +1592,8 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
+            guest_thp: None,
+            guest_thp_restore: false,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],

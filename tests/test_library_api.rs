@@ -56,6 +56,7 @@ fn test_run_args(name: &str) -> RunArgs {
         non_blocking_output: false,
         health_check_timeout: 5,
         on_restore: None,
+        guest_thp: None,
         ipv6_prefix: None,
         ipv6_address: None,
         dns: None,

@@ -320,6 +320,7 @@ pub async fn watch_restore_epoch(
                         &metadata.host_time_ns,
                         metadata.restore_hook.as_deref(),
                         &metadata.gpus,
+                        metadata.transparent_hugepage.as_deref(),
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -344,6 +345,7 @@ pub async fn watch_restore_epoch(
                         &metadata.host_time_ns,
                         metadata.restore_hook.as_deref(),
                         &metadata.gpus,
+                        metadata.transparent_hugepage.as_deref(),
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -379,6 +381,7 @@ pub async fn watch_restore_epoch(
 ///    does not go through `RestoreStatus`, so ACKing first costs nothing:
 ///    there is no container output to miss, because there is no container yet.
 /// 5. `succeed()` — with the boundary acknowledged, the workload may start.
+#[allow(clippy::too_many_arguments)]
 async fn apply_restore_epoch(
     current: &str,
     signals: &crate::restore::RestoreSignals,
@@ -387,6 +390,7 @@ async fn apply_restore_epoch(
     host_time: &str,
     restore_hook: Option<&str>,
     gpus: &[String],
+    transparent_hugepage: Option<&str>,
 ) {
     // A snapshot of a running VM was taken with the agent's console held quiet
     // (`--prepare-snapshot-network`), and this clone inherits that hold. Release it
@@ -408,6 +412,19 @@ async fn apply_restore_epoch(
     signals
         .restore_flag
         .store(true, std::sync::atomic::Ordering::Release);
+    // Before the workload's next allocation, so a clone never runs in the mode
+    // its snapshot's source had when it asked for another.
+    if let Some(mode) = transparent_hugepage {
+        if let Err(error) = crate::thp::apply(mode) {
+            signals.restore_status.fail();
+            eprintln!(
+                "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}; \
+                 shutting down clone",
+                current, error
+            );
+            crate::system::shutdown_vm(1).await;
+        }
+    }
     let phases = match crate::restore::handle_clone_restore(
         signals,
         clone_ipv6,

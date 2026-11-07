@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use tokio::time::{sleep, Duration};
 
-use crate::{bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, system};
+use crate::{
+    bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, system, thp,
+};
 
 /// Deadline for a warm start's restore-readiness publication. Generous: the
 /// watcher's own work (exec rebind, egress reconnect) is sub-second, so this
@@ -84,6 +86,15 @@ pub async fn run() -> Result<()> {
     };
 
     system::save_proxy_settings(&plan);
+
+    // The kernel's own mode first, so a later restore can ask for it back.
+    thp::record_boot_default();
+    if let Some(mode) = plan.transparent_hugepage.as_deref() {
+        if let Err(error) = thp::apply(mode) {
+            eprintln!("[fc-agent] FATAL: {error:#}; the container will not start");
+            system::shutdown_vm(1).await;
+        }
+    }
 
     // For each eligible published TCP port, make a loopback-only guest service
     // reachable. The caller cannot tell which address the service will bind —

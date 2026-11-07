@@ -1033,6 +1033,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub on_restore: Option<String>,
 
+    /// The guest kernel's transparent huge page mode (`always`, `madvise` or `never`);
+    /// without it the guest keeps its kernel's own. A clone's memory is a copy-on-write
+    /// view of its snapshot, and under `always` one write into a large anonymous mapping
+    /// makes a whole 2 MiB page private to that clone. Applied at boot and at every
+    /// restore of this VM's snapshots, not part of the snapshot cache key; recorded in
+    /// the snapshot's metadata, which `snapshot run` inherits.
+    #[arg(long, value_name = "MODE", value_parser = ["always", "madvise", "never"])]
+    pub guest_thp: Option<String>,
+
     /// Run container as USER:GROUP (e.g., --user 1000:1000)
     /// Equivalent to podman run --userns=keep-id on the host
     #[arg(long)]
@@ -1464,6 +1473,12 @@ pub struct SnapshotRunArgs {
     /// this run did not, and a hook the caller never named must not run in its clone.
     #[arg(skip = true)]
     pub inherit_recorded_hook: bool,
+
+    /// The guest's transparent huge page mode for this clone, instead of the one the
+    /// snapshot recorded (see `podman run --guest-thp`). Without either, the guest
+    /// kernel's own mode.
+    #[arg(long, value_name = "MODE", value_parser = ["always", "madvise", "never"])]
+    pub guest_thp: Option<String>,
 }
 
 // ============================================================================
