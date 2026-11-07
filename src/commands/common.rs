@@ -907,6 +907,47 @@ fn memory_file_refuses_in_place_diff(
     )
 }
 
+/// Create the empty file a Full snapshot's memory is written to, nodatacow where the store
+/// has the flag. btrfs compresses only copy-on-write data, so on a store mounted with
+/// `compress-force` the memory file is otherwise zstd-compressed in 128 KiB extents: a
+/// restore that faults or replays scattered 4 KiB pages then reads and decompresses a whole
+/// extent for each, which made replaying a 72 GiB working set 64 to 83 s against 32 s
+/// uncompressed (128 GiB www guest, 2026-11-04). The price is disk: that memory file took
+/// 47 GiB compressed and takes 128 GiB uncompressed. Firecracker opens the file without
+/// truncating it, so the empty inode it finds keeps the flag. A file that already exists is
+/// left as it is.
+fn create_memory_file_nodatacow(path: &Path, snapshot: &str) -> Result<()> {
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+    };
+    let nodatacow = crate::storage::inode_flags::make_nodatacow(&file);
+    debug!(snapshot = %snapshot, nodatacow, path = %path.display(), "created the memory file");
+    Ok(())
+}
+
+/// Create the empty file a diff is merged into, with the base's nodatacow flag. btrfs shares
+/// extents only between files whose flags agree, so a copy into a file of the other kind writes
+/// every byte of the base again, which needs the base's size in free space. With the flags
+/// matched the copy shares the base's extents, and a nodatacow base gives a nodatacow (so
+/// uncompressed) merged file.
+fn create_merge_target(base: &Path, dst: &Path) -> Result<()> {
+    let base_file =
+        std::fs::File::open(base).with_context(|| format!("opening {}", base.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("creating {}", dst.display()))?;
+    crate::storage::inode_flags::match_nodatacow(&base_file, &file);
+    Ok(())
+}
+
 /// Clone the parent's memory file to `dst` for an in-place diff snapshot, with FICLONE.
 ///
 /// Returns false, leaving no `dst`, when the snapshot has to be written as a sparse diff and
@@ -941,7 +982,15 @@ async fn clone_base_for_in_place_diff(
                 .create_new(true)
                 .open(&dst)
                 .with_context(|| format!("creating {}", dst.display()))?;
-            let refused = match crate::storage::pmem_store::ficlone(&base_file, &dst_file) {
+            // btrfs refuses a clone between a nodatacow file and a copy-on-write one; the new
+            // file is empty, so it can take the parent's flag and the clone run again.
+            let mut cloned = crate::storage::pmem_store::ficlone(&base_file, &dst_file);
+            if matches!(&cloned, Err(e) if e.raw_os_error() == Some(libc::EINVAL))
+                && crate::storage::inode_flags::match_nodatacow(&base_file, &dst_file)
+            {
+                cloned = crate::storage::pmem_store::ficlone(&base_file, &dst_file);
+            }
+            let refused = match cloned {
                 Ok(()) => memory_file_refuses_in_place_diff(&dst_file, memory_bytes)
                     .context("checking the cloned memory file")?,
                 Err(e) => match e.raw_os_error() {
@@ -5822,6 +5871,12 @@ pub async fn create_snapshot_core(
         temp_snapshot_dir.join("memory.bin")
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
+    if !has_base {
+        if let Err(e) = create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name) {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(e);
+        }
+    }
 
     // Pause timeout: should be fast (just pauses vCPU threads). 30s is generous.
     // Snapshot timeout: scales with memory size for large VMs.
@@ -6005,6 +6060,12 @@ pub async fn create_snapshot_core(
                         .context("setting the diff aside before the Full retry")),
                     Ok(aside) => {
                         set_aside_diff = aside;
+                        if let Err(e) =
+                            create_memory_file_nodatacow(&full_memory_path, &snapshot_config.name)
+                        {
+                            warn!(snapshot = %snapshot_config.name, error = %e,
+                                "the Full retry's memory file is left to Firecracker to create");
+                        }
                         snapshot_client
                             .create_snapshot(SnapshotCreate {
                                 snapshot_type: Some("Full".to_string()),
@@ -6202,7 +6263,13 @@ pub async fn create_snapshot_core(
             "merging diff snapshot onto base copy"
         );
 
-        // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
+        // Copy base memory to temp dir as memory.bin (will merge diff into this copy). The copy
+        // takes the base's nodatacow flag, so it can share the base's extents instead of
+        // writing a second full image the space check above did not reserve.
+        if let Err(e) = create_merge_target(base_source, &final_memory_path) {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(e);
+        }
         if let Err(e) = tokio::fs::copy(base_source, &final_memory_path).await {
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("copying base memory to temp for merge");
@@ -9262,6 +9329,86 @@ mod tests {
         })
         .unwrap();
         dst.sync_all().unwrap();
+    }
+
+    /// A Full snapshot's memory file is created nodatacow, and keeps the flag through the
+    /// way Firecracker opens it (create, no truncate, set_len to 0 and back), so a store
+    /// mounted with compress-force stores the memory uncompressed.
+    #[test]
+    fn a_full_snapshots_memory_file_is_created_nodatacow() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let path = dir.path().join("memory.bin");
+        create_memory_file_nodatacow(&path, "t").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        file.set_len(0).unwrap();
+        file.set_len(1 << 20).unwrap();
+        file.write_all_at(&vec![0x5Au8; 1 << 20], 0).unwrap();
+        assert!(
+            crate::storage::inode_flags::is_nodatacow(&file),
+            "the memory file Firecracker wrote is copy-on-write, so btrfs may compress it"
+        );
+        // A second call leaves an existing file alone.
+        create_memory_file_nodatacow(&path, "t").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0x5Au8; 1 << 20]);
+    }
+
+    /// The file a diff is merged into takes its base's nodatacow flag, so the copy of the base
+    /// can share its extents (btrfs shares extents only between files whose flags agree).
+    #[test]
+    fn a_merge_target_takes_its_bases_nodatacow_flag() {
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let nocow_base = dir.path().join("nocow-base.bin");
+        create_memory_file_nodatacow(&nocow_base, "t").unwrap();
+        let cow_base = dir.path().join("cow-base.bin");
+        std::fs::write(&cow_base, [1u8; 4096]).unwrap();
+        for (base, want) in [(&nocow_base, true), (&cow_base, false)] {
+            let dst = dir.path().join(format!("merge-{want}.bin"));
+            create_merge_target(base, &dst).unwrap();
+            assert_eq!(
+                crate::storage::inode_flags::is_nodatacow(&std::fs::File::open(&dst).unwrap()),
+                want,
+                "the merge target's nodatacow flag differs from its base's ({})",
+                base.display()
+            );
+        }
+    }
+
+    /// An in-place diff over a nodatacow parent still clones it: the empty clone takes the
+    /// parent's flag after btrfs refuses the first clone, instead of falling back to a sparse
+    /// diff and a merge.
+    #[tokio::test]
+    async fn an_in_place_diff_clones_a_nodatacow_parent() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let base = dir.path().join("parent.bin");
+        let len = 64 * GRANULE;
+        create_memory_file_nodatacow(&base, "t").unwrap();
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&base).unwrap();
+            assert!(
+                crate::storage::inode_flags::is_nodatacow(&file),
+                "control: {} has the nodatacow flag",
+                snapshot_fs_dir().display()
+            );
+            file.write_all_at(&vec![0xAAu8; len as usize], 0).unwrap();
+            file.sync_all().unwrap();
+        }
+        let dst = dir.path().join("memory.bin");
+        assert!(
+            clone_base_for_in_place_diff(&base, &dst, len, "t")
+                .await
+                .unwrap(),
+            "a nodatacow parent fell back to a sparse diff and a merge"
+        );
+        let clone = std::fs::File::open(&dst).unwrap();
+        assert!(crate::storage::inode_flags::is_nodatacow(&clone));
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![0xAAu8; len as usize]);
     }
 
     #[tokio::test]
