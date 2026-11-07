@@ -262,9 +262,11 @@ would be a half-open connection in every clone, which Windows holds until it tim
 
 ## Memory
 
-Today a Cloud Hypervisor restore reads the whole memory file into anonymous memory
-(`memory_restore_mode=copy`): every clone pays a read of the full guest size before it runs,
-and holds a private copy of every page, including the zeros. The measurement section gives
+Before stack PR 5 a Cloud Hypervisor restore read the whole memory file into anonymous
+memory (`memory_restore_mode=copy`): every clone paid a read of the full guest size before it
+ran, and held a private copy of every page, including the zeros. Every Cloud Hypervisor
+clone now restores with `map` from a hard link to the snapshot's memory file
+(`prepare_ch_restore_files` in `src/commands/common.rs`). The measurement section gives
 both numbers for 1, 4 and 8 clones.
 
 The target is the sharing Firecracker's File backend already gives: map the snapshot's

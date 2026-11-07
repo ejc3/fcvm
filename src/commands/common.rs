@@ -4282,19 +4282,72 @@ pub async fn restore_from_snapshot(
     ))
 }
 
+/// Cloud Hypervisor's memory file in its snapshot directory (`memory-ranges`).
+pub const CH_MEMORY_FILE: &str = "memory-ranges";
+
+/// Fill a clone's Cloud Hypervisor restore directory from the snapshot's `ch/`, all but
+/// `config.json`, which the caller rewrites.
+///
+/// The memory file is hard-linked, not copied: the restore maps it `MAP_PRIVATE`
+/// (`memory_restore_mode=map`), and clones share its clean pages only when they map the same
+/// inode. A reflink is a new inode with a page cache of its own, so every clone would read
+/// every page from disk again (measured: a reflinked memory file answered RDP 1.0 to 1.2 s
+/// after launch for one Windows clone, a linked one in 74 to 76 ms; docs/fleet/
+/// windows-sandboxes.md, "Measurements"). The snapshot's files never change once
+/// published, and the caller holds the snapshot's generation lock shared while it links. A
+/// link that crosses filesystems or btrfs subvolumes is refused (`EXDEV`); the file is then
+/// reflinked, with a warning, and the clone is correct but shares nothing. The other files
+/// (`state.json`) are small and reflinked.
+async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(ch_dir)
+        .await
+        .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let (src, dst) = (ch_dir.join(&name), clone_ch_dir.join(&name));
+        if name == std::ffi::OsStr::new("config.json") {
+            continue;
+        }
+        if name == std::ffi::OsStr::new(CH_MEMORY_FILE) {
+            match tokio::fs::hard_link(&src, &dst).await {
+                Ok(()) => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    "the clone's restore directory is on another filesystem or subvolume than \
+                     the snapshot: copying its memory file, so this clone shares no pages"
+                ),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("linking {} to {}", src.display(), dst.display())
+                    })
+                }
+            }
+        }
+        reflink_copy(&src, &dst)
+            .await
+            .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
+    }
+    Ok(())
+}
+
 /// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
 ///
 /// The Cloud Hypervisor analogue of [`restore_from_snapshot`]. It reuses the shared clone
 /// substrate (network/namespace/CoW disk/mount-redirect via [`prepare_clone_substrate`]),
 /// then — instead of Firecracker's `LoadSnapshot` + `patch_drive` — launches
-/// `cloud-hypervisor --restore source_url=file://{snapshot}/ch,memory_restore_mode=copy`.
+/// `cloud-hypervisor --restore source_url=file://{clone dir}/ch-restore,memory_restore_mode=map`.
 /// CH reads its own `config.json`/`state.json`/memory ranges from that subdir; the disk
 /// paths it embeds are redirected to the clone's CoW disk by the mount namespace (CH has no
 /// `patch_drive`). The VM restores PAUSED (`resume=false`) so the network post-start runs
 /// before [`Hypervisor::resume`], mirroring Firecracker.
 ///
-/// `copy` mode is eager read-copy (simplest, proven); in-process on-demand UFFD
-/// (`memory_restore_mode=ondemand`) is a follow-on (P2.5). The restored guest reconnects its
+/// `map` (our fork, ejc3/cloud-hypervisor#1) maps the snapshot's memory file `MAP_PRIVATE`
+/// over guest RAM, so nothing is read before the guest resumes and clones of one snapshot
+/// share its clean pages through the page cache, as Firecracker's File backend does.
+/// Measured against `copy` (eager read-copy) on 4 GiB Windows clones: first desktop frame
+/// 2.2 to 2.6 s against 4.2 to 4.6 s for one, 3.0 s against 8.7 s for eight at once, 845 MiB
+/// PSS each against 4,097 MiB. The restored guest reconnects its
 /// vsock channels and syncs its clock when the CALLER serves a restore-epoch over the
 /// boot-plan vsock port (its restore-epoch watcher triggers `handle_clone_restore`).
 pub async fn restore_from_snapshot_ch(
@@ -4389,19 +4442,7 @@ pub async fn restore_from_snapshot_ch(
         tokio::fs::create_dir_all(&clone_ch_dir)
             .await
             .context("creating CH restore directory")?;
-        let mut entries = tokio::fs::read_dir(&ch_dir)
-            .await
-            .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            // config.json is rewritten below; reflink the rest (state.json, memory ranges).
-            if name == std::ffi::OsStr::new("config.json") {
-                continue;
-            }
-            reflink_copy(&ch_dir.join(&name), &clone_ch_dir.join(&name))
-                .await
-                .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
-        }
+        prepare_ch_restore_files(&ch_dir, &clone_ch_dir).await?;
         // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
         if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
             for net in nets.iter_mut() {
@@ -4440,7 +4481,7 @@ pub async fn restore_from_snapshot_ch(
 
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
     let restore_args = format!(
-        "--restore source_url=file://{},memory_restore_mode=copy,resume=false",
+        "--restore source_url=file://{},memory_restore_mode=map,resume=false",
         clone_ch_dir.display()
     );
     let spec = ProcessSpec {
@@ -8043,6 +8084,48 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=map`),
+    /// and clones share its pages only through one inode: the clone's restore directory gets
+    /// a hard link to the memory file, never a copy, while every other snapshot file is the
+    /// clone's own and config.json is left to the caller to rewrite.
+    #[tokio::test]
+    async fn a_ch_clone_links_the_snapshot_memory_file_and_copies_the_rest() {
+        use std::os::unix::fs::MetadataExt;
+        // The snapshot's other files are reflinked, which needs btrfs: the build's target
+        // directory is on the btrfs store wherever fcvm's tests run (the Makefile links it
+        // there).
+        let root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let (snap, clone) = (root.path().join("ch"), root.path().join("ch-restore"));
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(snap.join(CH_MEMORY_FILE), vec![7u8; 8192]).unwrap();
+        std::fs::write(snap.join("state.json"), b"{}").unwrap();
+        std::fs::write(snap.join("config.json"), b"{}").unwrap();
+
+        prepare_ch_restore_files(&snap, &clone).await.unwrap();
+
+        let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(
+            ino(&clone.join(CH_MEMORY_FILE)),
+            ino(&snap.join(CH_MEMORY_FILE)),
+            "the clone's memory file is not the snapshot's inode"
+        );
+        assert_ne!(ino(&clone.join("state.json")), ino(&snap.join("state.json")));
+        assert_eq!(std::fs::read(clone.join("state.json")).unwrap(), b"{}");
+        assert!(!clone.join("config.json").exists());
+    }
+
+    /// Every Cloud Hypervisor restore maps the memory file; `copy` read the whole guest
+    /// into each clone before it ran (8.7 s to the first desktop frame for eight Windows
+    /// clones at once, against 3.0 s mapped).
+    #[test]
+    fn a_ch_restore_maps_the_memory_file() {
+        let body = body_of(include_str!("common.rs"), "pub async fn restore_from_snapshot_ch(");
+        assert!(body.contains("memory_restore_mode=map,"), "restore_from_snapshot_ch does not restore with map");
+        assert!(!body.contains("memory_restore_mode=copy"), "restore_from_snapshot_ch still copies");
+        assert!(body.contains("prepare_ch_restore_files(&ch_dir, &clone_ch_dir)"));
     }
 
     /// A function's source, from its signature to the first closing brace in
