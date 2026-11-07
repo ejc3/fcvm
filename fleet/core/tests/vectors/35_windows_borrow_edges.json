@@ -129,6 +129,12 @@
       "type": "agent_gone"
     },
     {
+      "at": 38500,
+      "client": "198.51.100.22",
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
       "at": 39000,
       "host": "h1",
       "msg": {
@@ -167,6 +173,60 @@
       "type": "agent"
     },
     {
+      "at": 39600,
+      "host": "h1",
+      "type": "agent_gone"
+    },
+    {
+      "at": 39700,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 39800,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 39400,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 39900,
+      "client": "198.51.100.22",
+      "id": "c3a",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
       "args": {},
       "at": 40000,
       "client": "198.51.100.21",
@@ -174,12 +234,6 @@
       "name": "claim_windows",
       "type": "intent",
       "viewer": "v2"
-    },
-    {
-      "at": 40050,
-      "client": "198.51.100.22",
-      "type": "viewer_joined",
-      "viewer": "v3"
     },
     {
       "args": {
@@ -279,14 +333,14 @@
       }
     },
     {
-      "after": 10,
+      "after": 11,
       "checks": {
         "/view/windows/borrow/lent": 0,
         "/view/windows/tiles/1/phase": "pending"
       }
     },
     {
-      "after": 11,
+      "after": 12,
       "checks": {
         "/assign/h1/1/generation": 3,
         "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-2",
@@ -296,20 +350,42 @@
       "note": "the host comes back still running the lent desktop: it is reset before anyone can borrow it"
     },
     {
-      "after": 12,
+      "after": 13,
+      "checks": {
+        "/view/windows": null
+      },
+      "note": "the host leaves again before it ran the reset"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-2",
+        "/view/windows/tiles/1/phase": "relaunching"
+      },
+      "note": "it comes back still on the lent launch: the reset is asked for again, until the fresh launch runs"
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/receipts/c3a/reason": "win-2 is not running"
+      }
+    },
+    {
+      "after": 17,
       "checks": {
         "/receipts/c3/reason": "your last sandbox was returned 2 s ago; borrow again in 58 s"
       },
       "note": "the borrow that ended with the host keeps its cooldown"
     },
     {
-      "after": 14,
+      "after": 18,
       "checks": {
         "/receipts/c4/reason": "win-2 is not running"
       }
     },
     {
-      "after": 16,
+      "after": 20,
       "checks": {
         "/assign/h1/1/generation": 3,
         "/receipts/c5/outcome": "committed"
@@ -317,7 +393,7 @@
       "note": "once reset it is lent again, and the mark is gone: a later report does not reset it twice"
     },
     {
-      "after": 17,
+      "after": 21,
       "checks": {
         "/assign/h1/1/generation": 3
       }
@@ -357,6 +433,17 @@
         "outcome": "committed",
         "summary": "windows-claim-2 on win-2",
         "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 39900,
+        "id": "c3a",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "win-2 is not running",
+        "viewer": "v3"
       },
       {
         "args": {},
@@ -401,8 +488,8 @@
     "claims": [],
     "cooldown_until": null,
     "counters": {
-      "restores": 3,
-      "restores_last_hour": 3,
+      "restores": 4,
+      "restores_last_hour": 4,
       "scrub_failures": 0,
       "scrubs": 0
     },
@@ -427,7 +514,7 @@
         "asleep_since": null,
         "hosts": [],
         "idle_since": null,
-        "last_arrival_at": 40050,
+        "last_arrival_at": 38500,
         "last_wake": null,
         "sleep_without_arrival_at": null,
         "state": "awake",
@@ -750,7 +837,7 @@
           "id": "win:2",
           "last_relaunch": {
             "by": "return:windows-claim-2",
-            "clicked_at": 39500,
+            "clicked_at": 39800,
             "first_frame_at": 41900,
             "phases": {
               "total_ms": 2000

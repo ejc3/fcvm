@@ -2277,10 +2277,22 @@ fn observe_windows(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
     if r.generation > slot.generation {
         slot.generation = r.generation;
     }
-    // The host came back running a desktop that was lent: reset it before anyone borrows it.
-    let key = windows_index(slot).map(|i| crate::windows::key(host, i));
-    if let Some(session) = key.and_then(|k| f.windows_to_reset.remove(&k)) {
-        bump(slot, &format!("return:{session}"), at);
+    // The host came back running a desktop that was lent: reset it before anyone borrows it,
+    // and keep owing the reset until the fresh launch reports running.
+    if let Some(key) = windows_index(slot).map(|i| crate::windows::key(host, i)) {
+        if let Some(owed) = f.windows_to_reset.get_mut(&key) {
+            match owed.generation {
+                Some(g) if r.phase == "running" && r.generation >= g => {
+                    f.windows_to_reset.remove(&key);
+                }
+                Some(g) if slot.generation >= g => {}
+                _ => {
+                    slot.generation = slot.generation.max(owed.generation.unwrap_or(0).saturating_sub(1));
+                    bump(slot, &format!("return:{}", owed.session), at);
+                    owed.generation = Some(slot.generation);
+                }
+            }
+        }
     }
     let timed = slot
         .last_relaunch
@@ -2330,8 +2342,13 @@ pub fn forget_windows(f: &mut Fleet, gone: impl Fn(&Slot) -> bool, at: u64) {
     for s in f.windows.values().filter(|s| gone(s)) {
         if let (Some(c), Some(host), Some(i)) = (windows_claim(s), &s.host, windows_index(s)) {
             f.last_windows_claim_end.insert(c.client.clone(), at);
-            f.windows_to_reset
-                .insert(crate::windows::key(host, i), c.session.clone());
+            f.windows_to_reset.insert(
+                crate::windows::key(host, i),
+                crate::windows::ResetOwed {
+                    session: c.session.clone(),
+                    generation: None,
+                },
+            );
         }
     }
     f.windows.retain(|_, s| !gone(s));

@@ -161,6 +161,16 @@ pub struct ResetAll {
     pub sandboxes: usize,
 }
 
+/// A reset a sandbox is owed because it was lent when its host left: the borrow's session, and
+/// once asked for, the generation whose running report settles it. A host that leaves again
+/// before it runs that generation comes back on the lent launch, and is asked again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResetOwed {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
 /// A sandbox's name across connections and coordinator restarts: its host and its index there.
 pub fn key(host: &str, index: u32) -> String {
     format!("{host}/{index}")

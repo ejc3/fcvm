@@ -694,10 +694,10 @@ pub struct Fleet {
     #[serde(default)]
     pub last_reset_all: Option<crate::windows::ResetAll>,
     /// Sandboxes that were lent when their host left or the coordinator restarted, by
-    /// `windows::key` (host and index), with the borrow's session: the host may still run the
-    /// borrower's desktop, so the sandbox is reset on its first report.
+    /// `windows::key` (host and index): the host may still run the borrower's desktop, so the
+    /// sandbox is reset, and stays owed a reset until its host reports the fresh launch running.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub windows_to_reset: BTreeMap<String, String>,
+    pub windows_to_reset: BTreeMap<String, crate::windows::ResetOwed>,
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
