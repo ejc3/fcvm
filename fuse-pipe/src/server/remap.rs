@@ -9,7 +9,7 @@
 //! numbers regardless of which host they run on.
 
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::{VolumeRequest, VolumeResponse};
 
@@ -40,6 +40,15 @@ pub struct RemapFs<T: FilesystemHandler> {
     handle_base: u64,
     /// Highest handle given to the guest, recorded in the table for the next restore.
     max_guest_handle: std::sync::atomic::AtomicU64,
+    /// Stable inodes of the restored table whose paths no longer resolved: the host
+    /// renamed or removed them while no server ran. A request on one is refused like
+    /// an unknown inode, but logged as what it is.
+    gone: DashMap<u64, String>,
+}
+
+std::thread_local! {
+    /// The stable inode the last failed `to_inner` on this thread asked for.
+    static LAST_UNKNOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Handle base for a table written before tables recorded one. A server numbers its handles from 1,
@@ -74,6 +83,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             rename_lock: std::sync::RwLock::new(()),
             handle_base: 0,
             max_guest_handle: std::sync::atomic::AtomicU64::new(0),
+            gone: DashMap::new(),
         }
     }
 
@@ -105,7 +115,17 @@ impl<T: FilesystemHandler> RemapFs<T> {
 
     /// Look up the inner inode for a stable inode.
     fn to_inner(&self, stable: u64) -> Option<u64> {
-        self.stable_to_inner.get(&stable).map(|r| *r)
+        let inner = self.stable_to_inner.get(&stable).map(|r| *r);
+        if inner.is_none() {
+            LAST_UNKNOWN.with(|c| c.set(stable));
+        }
+        inner
+    }
+
+    /// The path a restored table recorded for `stable` when that path no longer
+    /// resolved at the restore.
+    pub fn gone_path(&self, stable: u64) -> Option<String> {
+        self.gone.get(&stable).map(|p| p.value().clone())
     }
 
     /// Look up the stable inode for an inner inode.
@@ -546,9 +566,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// Used for portable snapshot restore.
     pub fn serialize_table(&self) -> String {
         let _no_rename_in_flight = self.rename_lock.read().unwrap_or_else(|e| e.into_inner());
+        // Paths that were gone at this server's restore stay in the table, so a
+        // restore of a snapshot of this clone knows those inodes too: the guest still
+        // holds them.
         let paths: std::collections::BTreeMap<u64, String> = self
-            .paths
+            .gone
             .iter()
+            .chain(self.paths.iter())
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
         let handle_base = self
@@ -613,6 +637,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
         let inner_to_stable = DashMap::new();
         let stable_to_inner = DashMap::new();
         let paths = DashMap::new();
+        let gone = DashMap::new();
 
         // Root is always mapped
         inner_to_stable.insert(1, 1);
@@ -644,7 +669,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
                         current_inner = attr.ino;
                     }
                     None => {
-                        debug!(
+                        info!(
+                            stable_ino,
                             path = %path,
                             component = %component,
                             "restore: path no longer exists, skipping"
@@ -659,6 +685,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 inner_to_stable.insert(current_inner, *stable_ino);
                 stable_to_inner.insert(*stable_ino, current_inner);
                 paths.insert(*stable_ino, path.clone());
+            } else {
+                gone.insert(*stable_ino, path.clone());
             }
         }
 
@@ -679,6 +707,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             // At least 1, so a restored server always treats the guest's earlier handles as stale.
             handle_base: handle_base.max(1),
             max_guest_handle: std::sync::atomic::AtomicU64::new(0),
+            gone,
         }
     }
 
@@ -840,7 +869,20 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
         // Clone and remap request inodes (stable → inner)
         let mut remapped = request.clone();
         if self.remap_request_inodes(&mut remapped).is_none() {
-            error!(op = request.op_name(), "unknown inode in request");
+            let stable = LAST_UNKNOWN.with(|c| c.get());
+            match self.gone_path(stable) {
+                Some(path) => warn!(
+                    op = request.op_name(),
+                    stable_ino = stable,
+                    path = %path,
+                    "request on an inode whose path was gone at the restore"
+                ),
+                None => error!(
+                    op = request.op_name(),
+                    stable_ino = stable,
+                    "unknown inode in request"
+                ),
+            }
             return VolumeResponse::io_error();
         }
 
@@ -1246,6 +1288,59 @@ mod tests {
             gid,
         };
         assert_eq!(clone.first_byte(ino, fh), Ok(b'R'));
+    }
+
+    /// A path the host renamed or removed while no server ran is recorded as gone at the
+    /// restore, and a request on its inode is refused (#1009: the fuzz gym needs to tell
+    /// these from inodes the table never had, which are bug 1's signature).
+    #[test]
+    fn a_path_gone_at_the_restore_is_recorded_and_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("moved"), b"M").unwrap();
+        std::fs::write(dir.path().join("kept"), b"K").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false)),
+            uid,
+            gid,
+        };
+        let moved = source.lookup("moved");
+        let kept = source.lookup("kept");
+        let table = source.fs.serialize_table();
+        std::fs::rename(dir.path().join("moved"), dir.path().join("elsewhere")).unwrap();
+        let clone = Real {
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), false),
+                &table,
+            ),
+            uid,
+            gid,
+        };
+        assert_eq!(clone.fs.gone_path(moved).as_deref(), Some("moved"));
+        assert_eq!(clone.fs.gone_path(kept), None);
+        let open = |ino| {
+            clone.call(VolumeRequest::Open {
+                ino,
+                flags: libc::O_RDONLY as u32,
+                uid,
+                gid,
+                pid: 0,
+            })
+        };
+        assert!(open(moved).is_error());
+        let fh = match open(kept) {
+            VolumeResponse::Opened { fh, .. } => fh,
+            other => panic!("open kept: {other:?}"),
+        };
+        assert_eq!(clone.first_byte(kept, fh), Ok(b'K'));
+        // A snapshot of the clone still knows the gone inode (the gym's clone of a clone
+        // logged `unknown inode in request` for it).
+        let again = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &clone.fs.serialize_table(),
+        );
+        assert_eq!(again.gone_path(moved).as_deref(), Some("moved"));
     }
 
     /// Handles the guest held before a restore and handles the clone opens after it never share a

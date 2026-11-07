@@ -134,6 +134,10 @@ pub struct LatestMetadata {
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
     #[serde(rename = "clone-ipv6", default)]
     pub clone_ipv6: Option<String>,
+    /// For bridged clones with NFS shares: this clone's own host address, at which the
+    /// shares are remounted (`restore::nfs_remounts`).
+    #[serde(rename = "nfs-host-ip", default)]
+    pub nfs_host_ip: Option<String>,
     /// The command to run inside the container before this restore is published
     /// (`--on-restore`). See `snapshot_network::RestoreHook`.
     #[serde(rename = "restore-hook", default)]
