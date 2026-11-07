@@ -28,7 +28,10 @@ MOCK_PS_SCRIPT = (
     "esac\n"
     "if [ \"${MOCK_PS_HANG:-0}\" = 1 ]; then exec sleep 30; fi\n"
     "call_count=$(wc -l <\"$MOCK_PS_CALLS\")\n"
-    "if [ -n \"${MOCK_PS_OUTPUT_FINAL+set}\" ] && [ \"$call_count\" -ge \"${MOCK_PS_FINAL_FROM:-4}\" ]; then\n"
+    "call_var=MOCK_PS_OUTPUT_CALL_$call_count\n"
+    "if [ -n \"${!call_var+set}\" ]; then\n"
+    "  printf '%s' \"${!call_var}\"\n"
+    "elif [ -n \"${MOCK_PS_OUTPUT_FINAL+set}\" ] && [ \"$call_count\" -ge \"${MOCK_PS_FINAL_FROM:-4}\" ]; then\n"
     "  printf '%s' \"$MOCK_PS_OUTPUT_FINAL\"\n"
     "elif [ \"$call_count\" -gt 2 ] && [ -n \"${MOCK_PS_OUTPUT_LATER+set}\" ]; then\n"
     "  printf '%s' \"$MOCK_PS_OUTPUT_LATER\"\n"
@@ -45,7 +48,11 @@ MOCK_PGREP_SCRIPT = (
     "fi\n"
 )
 MOCK_DMESG_SCRIPT = "#!/usr/bin/env bash\n" 'printf \'%s\' "${MOCK_DMESG_OUTPUT:-}"\n'
-MOCK_SUDO_SCRIPT = "#!/usr/bin/env bash\n" "printf '%s\\n' \"$*\" >>\"$MOCK_SUDO_CALLS\"\n"
+MOCK_SUDO_SCRIPT = (
+    "#!/usr/bin/env bash\n"
+    "printf '%s\\n' \"$*\" >>\"$MOCK_SUDO_CALLS\"\n"
+    "if [ -n \"${MOCK_SUDO_DELAY:-}\" ]; then sleep \"$MOCK_SUDO_DELAY\"; fi\n"
+)
 
 
 def write_mock_tool(bin_dir: Path, name: str, script: str) -> None:
@@ -343,6 +350,8 @@ class StrayVmGuardTests(unittest.TestCase):
         final_from: int = 4,
         exit_grace: str = "0",
         late_kill: str | None = None,
+        sudo_delay: str | None = None,
+        ps_output_by_call: dict[int, str] | None = None,
         hang_ps: bool = False,
         dry_run: bool = True,
         outer_timeout: float = 5,
@@ -403,6 +412,10 @@ class StrayVmGuardTests(unittest.TestCase):
             env["MOCK_PS_FINAL_FROM"] = str(final_from)
         if late_kill is not None:
             env["FCVM_GUARD_LATE_KILL_SECONDS"] = late_kill
+        if sudo_delay is not None:
+            env["MOCK_SUDO_DELAY"] = sudo_delay
+        for call, output in (ps_output_by_call or {}).items():
+            env[f"MOCK_PS_OUTPUT_CALL_{call}"] = output
         command = [str(STRAY_GUARD), "post"]
         if dry_run:
             command.append("--dry-run")
@@ -662,26 +675,28 @@ class StrayVmGuardTests(unittest.TestCase):
         self.assertIn(["kill", "-9", "--", "300"], commands)
 
     def test_a_late_group_gets_the_whole_grace_from_its_own_kill(self) -> None:
-        """A group killed late in the window has as long to finish exiting as one
-        killed first: one that is gone 3 s after its kill is not a survivor of a
-        3 s grace, however late it was killed."""
-        before = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        """A group killed late has as long to finish exiting as one killed first.
+        With a 4 s grace the first group exits by the second scan; a late group
+        killed at the third scan (about 2 s) is still exiting at the fifth (about
+        4 s, the first kill's deadline) and gone at the sixth, so it is not a
+        survivor."""
+        pre = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        exiting = "100 100 1 Z firecracker\n100 101 1 D fc_vcpu 0\n"
         late = "300 300 1 Z firecracker\n300 301 1 D fc_vcpu 0\n"
         result, _log_dir, _ps_calls, _sudo_calls, _elapsed = self.run_guard(
-            before,
-            ps_output_after=late,
-            ps_output_later=late,
+            pre,
+            ps_output_by_call={2: exiting, 3: late, 4: late, 5: late},
             ps_output_final="",
-            final_from=5,
-            exit_grace="3",
+            final_from=6,
+            exit_grace="4",
             dry_run=False,
-            outer_timeout=20,
+            outer_timeout=30,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Unkillable microVMs", result.stdout)
         self.assertIn(
-            "killed 1 process group(s) and 1 started after the kill, still live after SIGKILL and 3s: 0",
+            "killed 1 process group(s) and 1 started after the kill, still live after SIGKILL and 4s: 0",
             result.stdout,
         )
 
@@ -704,6 +719,32 @@ class StrayVmGuardTests(unittest.TestCase):
         self.assertIn("tgids 300", result.stdout)
         commands = [shlex.split(line) for line in sudo_calls.splitlines()]
         self.assertEqual(commands, [["kill", "-9", "--", "100"]])
+
+    def test_every_group_one_scan_sees_inside_the_late_window_is_killed(self) -> None:
+        """A scan that sees two new groups just inside the window kills both,
+        however long the first kill takes (here 1.8 s, past the window's end:
+        the scan comes about 1 s into a 3 s window that the pre-kill kill, also
+        1.8 s, started)."""
+        before = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        late = (
+            "300 300 1 S firecracker\n300 301 1 S fc_vcpu 0\n"
+            "400 400 1 S firecracker\n400 401 1 S fc_vcpu 0\n"
+        )
+        result, _log_dir, _ps_calls, sudo_calls, _elapsed = self.run_guard(
+            before,
+            ps_output_after=late,
+            ps_output_later="",
+            late_kill="3",
+            sudo_delay="1.8",
+            dry_run=False,
+            outer_timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Stray microVMs left running", result.stdout)
+        commands = [shlex.split(line) for line in sudo_calls.splitlines()]
+        self.assertIn(["kill", "-9", "--", "300"], commands)
+        self.assertIn(["kill", "-9", "--", "400"], commands)
 
     def test_a_group_that_finishes_exiting_within_the_grace_is_not_unkillable(self) -> None:
         """A killed firecracker's last thread unmaps the guest's memory before the
