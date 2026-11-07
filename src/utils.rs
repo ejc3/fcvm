@@ -2222,7 +2222,7 @@ pub fn is_overlay_storage_image(path: &std::path::Path) -> bool {
 /// PATH — a delete-and-rebuild between the two would pair old provisioning
 /// with new layer link IDs. Callers run this AFTER the VMM has the file (drive
 /// attach / snapshot load), so a mismatch proves the pairing is wrong. The
-/// error text is matched by `is_snapshot_load_failure` so a restore-time
+/// error text is one of `UNUSABLE_SNAPSHOT_MARKERS` (`commands::podman`) so a restore-time
 /// mismatch invalidates the snapshot and falls back to a fresh boot.
 pub fn verify_image_disk_identity(path: &std::path::Path, expected: &str) -> anyhow::Result<()> {
     // Recorded before image identities were digests (#1219). Not the rebuild marker: the
