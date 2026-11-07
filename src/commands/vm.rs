@@ -53,6 +53,11 @@ const CLOCK_ACK_MAX_LINE: u64 = 256;
 /// sending, before it ends both connections.
 const RDP_RELAY_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long one write of the RDP relay may make no progress before that direction fails: a
+/// peer that stops reading, while the other side has gone, would otherwise keep the
+/// connection for ever.
+const RDP_RELAY_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long the RDP relay waits for the guest to accept a connection.
 const RDP_RELAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -233,7 +238,10 @@ pub async fn serve_rdp_relay(
             )
             .await;
             match guest {
-                Ok(Ok(guest)) => relay_until_one_side_ends(client, guest, RDP_RELAY_DRAIN).await,
+                Ok(Ok(guest)) => {
+                    relay_until_one_side_ends(client, guest, RDP_RELAY_WRITE_STALL, RDP_RELAY_DRAIN)
+                        .await
+                }
                 Ok(Err(error)) => eprintln!("rdp relay: connecting to {target}: {error}"),
                 Err(_) => eprintln!("rdp relay: {target} did not accept within 5 s"),
             }
@@ -241,25 +249,68 @@ pub async fn serve_rdp_relay(
     }
 }
 
-/// Relay `client` and `guest` both ways until one side ends, then give the other direction
-/// `drain` to finish and drop both. When a side ends, the other peer's write half is shut
-/// down so it sees the end. Without the bound, a guest that accepted and never answers (a
-/// health probe that timed out while Windows starts) would keep this task and both sockets
-/// for ever: `copy_bidirectional` waits for both directions.
+/// Copy `reader` to `writer` until `reader` ends. A write that makes no progress for `stall`
+/// fails the copy: the peer stopped reading. Reads have no bound, since an idle session sends
+/// nothing for as long as it is idle.
+async fn copy_with_write_stall<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    stall: std::time::Duration,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let mut written = 0;
+        while written < n {
+            match tokio::time::timeout(stall, writer.write(&buf[written..n])).await {
+                Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(Ok(k)) => written += k,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the peer stopped reading",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Relay `client` and `guest` both ways until one direction ends or fails, then give what is
+/// left of the connection, both directions with their writes, `drain` to finish, and drop
+/// both. When a direction ends, its writer is shut down so the peer sees the end. A write that
+/// makes no progress for `stall` fails its direction, which starts the drain.
+///
+/// Both bounds are needed. Without the drain, a guest that accepted and never answers (a
+/// health probe that timed out while Windows starts) keeps this task and both sockets for
+/// ever, since `copy_bidirectional` waits for both directions. Without the write bound, a
+/// guest that stops reading while the client goes away leaves neither direction to end: the
+/// copy to the guest is stuck in a write and never reads the client's end, and the copy to the
+/// client waits for a guest that sends nothing.
 async fn relay_until_one_side_ends(
     client: tokio::net::UnixStream,
     guest: tokio::net::TcpStream,
+    stall: std::time::Duration,
     drain: std::time::Duration,
 ) {
     use tokio::io::AsyncWriteExt;
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut guest_rx, mut guest_tx) = guest.into_split();
     let to_guest = async {
-        let _ = tokio::io::copy(&mut client_rx, &mut guest_tx).await;
+        let _ = copy_with_write_stall(&mut client_rx, &mut guest_tx, stall).await;
         let _ = guest_tx.shutdown().await;
     };
     let to_client = async {
-        let _ = tokio::io::copy(&mut guest_rx, &mut client_tx).await;
+        let _ = copy_with_write_stall(&mut guest_rx, &mut client_tx, stall).await;
         let _ = client_tx.shutdown().await;
     };
     tokio::pin!(to_guest, to_client);
@@ -1267,6 +1318,58 @@ mod tests {
         assert_eq!(
             leaked, 0,
             "the relay still holds {leaked} sockets for {PROBES} ended probes"
+        );
+    }
+
+    /// A guest that stops reading once its receive window is full, while the client goes
+    /// away mid-write, does not keep the relay: neither direction ends on its own (the copy to
+    /// the guest is stuck in a write and the copy to the client waits for a guest that sends
+    /// nothing), so the relay bounds every write and then drains as for an ended side.
+    #[tokio::test]
+    async fn a_guest_that_stops_reading_does_not_keep_the_relay() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = guest.local_addr().unwrap();
+        let socket = rdp_socket_path(dir.path());
+        let relay = tokio::spawn(serve_rdp_relay(
+            bind_private_unix(&socket).unwrap(),
+            target,
+            unsafe { libc::geteuid() },
+        ));
+        let baseline = open_sockets();
+        let client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        // The guest accepts and never reads.
+        let (held, _) = tokio::time::timeout(std::time::Duration::from_secs(5), guest.accept())
+            .await
+            .expect("the relay connects to the guest")
+            .unwrap();
+        // More than every buffer between the client and the guest can hold, so the relay's
+        // write to the guest blocks and so does this one.
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            let _ = client.write_all(&vec![0u8; 64 << 20]).await;
+            client
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!writer.is_finished(), "the guest's window never filled");
+        writer.abort();
+        let _ = writer.await;
+        // The guest holds its one socket; anything above that is the relay's.
+        let deadline = std::time::Instant::now()
+            + RDP_RELAY_WRITE_STALL
+            + RDP_RELAY_DRAIN
+            + std::time::Duration::from_secs(3);
+        let mut leaked = open_sockets() - baseline - 1;
+        while leaked > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            leaked = open_sockets() - baseline - 1;
+        }
+        relay.abort();
+        drop(held);
+        assert_eq!(
+            leaked, 0,
+            "the relay still holds {leaked} sockets after its client left"
         );
     }
 
