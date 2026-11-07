@@ -961,13 +961,14 @@ impl NetworkManager for RoutedNetwork {
         //     Fresh boots hid this: DAD ran in the shadow of the multi-second guest
         //     boot. Restored clones are ready in ~700ms, so it landed on the critical
         //     path and cost every routed clone ~1s of egress downtime.
-        run_host_command(
+        write_host_sysctls(
             "disabling kernel IPv6 address autogeneration on host veth",
-            "sysctl",
             &[
-                "-w",
-                &format!("net.ipv6.conf.{}.addr_gen_mode=1", host_veth),
-                &format!("net.ipv6.conf.{}.keep_addr_on_down=1", host_veth),
+                (&format!("net/ipv6/conf/{}/addr_gen_mode", host_veth), "1"),
+                (
+                    &format!("net/ipv6/conf/{}/keep_addr_on_down", host_veth),
+                    "1",
+                ),
             ],
         )
         .await;
@@ -1046,10 +1047,9 @@ impl NetworkManager for RoutedNetwork {
         }
         // 7. Enable IPv6 forwarding on the host veth only (not all.forwarding —
         //    that prevents link-local auto-assignment on future interfaces).
-        run_host_command(
+        write_host_sysctls(
             "enabling IPv6 forwarding on host veth",
-            "sysctl",
-            &["-w", &format!("net.ipv6.conf.{}.forwarding=1", host_veth)],
+            &[(&format!("net/ipv6/conf/{}/forwarding", host_veth), "1")],
         )
         .await;
 
@@ -1160,13 +1160,9 @@ impl NetworkManager for RoutedNetwork {
         )?;
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
-        run_host_command(
+        write_host_sysctls(
             "enabling proxy NDP on default interface",
-            "sysctl",
-            &[
-                "-w",
-                &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
-            ],
+            &[(&format!("net/ipv6/conf/{}/proxy_ndp", default_iface), "1")],
         )
         .await;
         if run_host_command(
@@ -1432,6 +1428,21 @@ impl NetworkManager for RoutedNetwork {
 /// these commands legitimately fail on re-runs (e.g. a stale proxy-NDP entry
 /// left by a previous VM). Callers should only log success messages when this
 /// returns true.
+/// Write host sysctls (paths under /proc/sys, values) in this process: no `sysctl`
+/// process per value on a restore's network step. Logs and goes on when one fails, as a
+/// failed `sysctl` did.
+async fn write_host_sysctls(what: &str, values: &[(&str, &str)]) -> bool {
+    let mut ok = true;
+    for (path, value) in values {
+        let path = std::path::Path::new("/proc/sys").join(path);
+        if let Err(e) = tokio::fs::write(&path, value).await {
+            warn!(path = %path.display(), error = %e, "{} failed", what);
+            ok = false;
+        }
+    }
+    ok
+}
+
 async fn run_host_command(what: &str, program: &str, args: &[&str]) -> bool {
     match tokio::process::Command::new(program)
         .args(args)
