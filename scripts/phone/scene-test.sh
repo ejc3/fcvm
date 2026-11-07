@@ -11,7 +11,10 @@
 #      EGL_CONTEXT_LOST path), and the rebuilt context draws the same pixels as before;
 #   4. the fixed actions, by socket and by intent, and nothing else: an unknown action is refused;
 #   5. a GPU release and retake (the GPU hook, what a warm snapshot runs) keeps the app drawing:
-#      the retake restores its GL state, every vertex array's index buffer included.
+#      the retake restores its GL state, every vertex array's index buffer included;
+#   6. held: the bars lift above the stamp band, whose held bit says so, look as they do
+#      unheld, and come down when the phone is given back (held-check.py); holding costs no
+#      frame time.
 # Screenshots and the stitched seam images go to OUT/shots and OUT/seam.
 #
 #   scene-test.sh FCVM PID APK_IN_CONTAINER OUT GPU_NAME
@@ -192,4 +195,28 @@ if r=$(X /usr/local/bin/gpu-hook release 2>&1) && r=$(X /usr/local/bin/gpu-hook 
 else
   bad "the GPU hook failed: $r"
 fi
+
+# 6. Held: the bars shown, the scene stamped, held and not (the streamer's scene line).
+held_scene() {
+  # ten minutes back: the guest clock can trail the host by tens of seconds, and before the
+  # chrome key (t 0) the scene shows no bars
+  jq -nc --argjson e "$(( $(date +%s%3N) - 600000 ))" --argjson h "$1" \
+    '{type:"scene", epoch_unix_ms:$e, rect:{x:0,y:0,w:1,h:1}, image_aspect:0.5625, chrome:[{t:0,on:true}], stamp:true, held:$h}'
+}
+frame_ms() {  # the median of 9 of the app's frame times, half a second apart
+  for _ in $(seq 1 9); do field .frame_ms "$(status)"; sleep 0.5; done | sort -g | sed -n 5p
+}
+C "$(held_scene false)" > /dev/null; sleep 3
+X /usr/local/bin/phone.sh shot $IN/shots/chrome.png
+unheld_ms=$(frame_ms)
+C "$(held_scene true)" > /dev/null; sleep 3
+X /usr/local/bin/phone.sh shot $IN/shots/held.png
+held_ms=$(frame_ms)
+C "$(held_scene false)" > /dev/null; sleep 2
+X /usr/local/bin/phone.sh shot $IN/shots/given-back.png
+python3 "$HERE/held-check.py" "$OUT/shots/chrome.png" "$OUT/shots/held.png" "$OUT/shots/given-back.png" || fail=1
+python3 -c 'import sys; a, b = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if b <= a + 1.0 else 1)' "${unheld_ms:-0}" "${held_ms:-99}" \
+  && ok "holding costs no frame time: median frame ${held_ms} ms held, ${unheld_ms} ms not" \
+  || bad "held, a frame takes ${held_ms:-?} ms against ${unheld_ms:-?} ms not held"
+C "$SCENE" > /dev/null
 exit $fail

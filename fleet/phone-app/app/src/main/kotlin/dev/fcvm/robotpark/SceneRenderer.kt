@@ -538,7 +538,7 @@ class SceneRenderer(private val assets: AssetManager) {
 
     companion object {
         const val MAX_ROBOTS = Crowd.ROBOTS * 16
-        const val STAMP_ROWS = 8
+        const val STAMP_ROWS = dev.fcvm.robotpark.scene.Stamp.ROWS
 
         fun floats(a: FloatArray): FloatBuffer =
             ByteBuffer.allocateDirect(a.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(a); position(0) }
