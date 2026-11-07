@@ -428,10 +428,9 @@ async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
         common::poll_health_by_pid(clone_pid, 120).await?;
         // The fresh daemon is started off the readiness path, after the restore ACK, and
         // chronyd daemonizes: its foreground process waits until the daemon it forked is
-        // initialized, so for a moment two chronyd processes exist. Counting then read two
-        // (CI run 42386251347: "1279 1283", 0.3 s after healthy, with no restart line from
-        // fc-agent yet). fc-agent logs one of the lines below once the foreground process
-        // has exited, so the count waits for it.
+        // initialized, so for a moment two chronyd processes exist, and a count taken then
+        // reads two. fc-agent logs one of the lines below once the foreground process has
+        // exited, so the count waits for it.
         const STARTED: [&str; 2] = [
             "[fc-agent] chronyd restarted after restore",
             "[fc-agent] ERROR: chronyd is not usable after restore",
