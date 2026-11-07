@@ -841,7 +841,9 @@ fn restored_record(
 /// This is the single correctness gate shared by ordinary, TTY, and `--exec`
 /// restores. Output/TTY connectivity only proves a workload transport exists;
 /// this one-shot proves guest cleanup, exec/egress rebind, and the shared
-/// Succeeded transition all happened for `expected_epoch`.
+/// Succeeded transition all happened for `expected_epoch`. `vmm_pid`, when known, is the
+/// VMM whose threads are logged while the ACK is late.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_restore_completion<F>(
     vm_id: &str,
     expected_epoch: &str,
