@@ -2,8 +2,9 @@
 # Build the fcvm fleet GPU host AMI's contents on a g4dn.metal launched from Ubuntu 24.04
 # (fleet/ami/build-ami.sh launches it and drives these phases through SSM). Run as root:
 #
-#   build.sh prep    packages, host settings, IOMMU on the kernel command line, boot units;
-#                    the caller reboots the instance afterwards
+#   build.sh prep    packages, host settings, IOMMU on the kernel command line, boot units,
+#                    and fcvm's host kernel as the default; the caller reboots the instance
+#                    afterwards
 #   build.sh build   fcvm at $FCVM_COMMIT (make build, make setup-gpu), the renderer image,
 #                    one GPU VM to first frame (warms the image export and snapshot cache),
 #                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst;
@@ -99,8 +100,25 @@ X
     dpkg-db-backup.timer)
   mapfile -t unused < <(systemctl list-unit-files --no-legend --plain "${unused[@]}" | awk '{print $1}')
   [ "${#unused[@]}" = 0 ] || systemctl disable "${unused[@]}"
+  # The host runs fcvm's host kernel ([kernel_profiles.nested.amd64.host_kernel]: the pinned
+  # release with kernel/patches-x86, configured from Ubuntu's own), not Ubuntu's. Ubuntu's 7.0
+  # kernel lacks Linux 25ae123db10b, so tearing down many VMs at once held RTNL for seconds
+  # and stalled every namespace creation (#1563, kernel/README.md). It is built on the instance
+  # store (store.sh mounts it empty), installed to /boot as GRUB's default, and booted by the
+  # reboot after prep, so the build phase builds and warms everything on it.
+  $APT install -y libdw-dev debhelper rsync kmod cpio patch
+  /usr/local/lib/fcvm-fleet/store.sh
+  [ -x "$UH/.cargo/bin/cargo" ] || as_user 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+  [ -d "$SRC/.git" ] || as_user "git clone -q https://github.com/ejc3/fcvm.git $SRC"
+  as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
+  as_user "cd $SRC && make install-host-kernel"
   ;;
 build)
+  # prep installed fcvm's host kernel; a build on any other kernel would bake the wrong one
+  case "$(uname -r)" in
+    *-fcvm-*) echo "host kernel $(uname -r)" ;;
+    *) echo "the build phase runs on $(uname -r), not fcvm's host kernel (prep installs it)"; exit 1 ;;
+  esac
   loginctl enable-linger "$U"
   for _ in $(seq 1 30); do [ -S "/run/user/$(id -u "$U")/bus" ] && break; sleep 1; done
   /usr/local/lib/fcvm-fleet/bind-vfio.sh
