@@ -2264,12 +2264,13 @@ mod tests {
         sparse
             .write_all_at(&bytes[around..around + 12 * 4096], around as u64)
             .unwrap();
-        let shm = tempfile::tempdir_in("/dev/shm").unwrap();
+        // Written in full beside the sparse one. Not in /dev/shm: a container's is 64 MiB by
+        // default, less than this image, and the write failed with ENOSPC there.
         let full = File::options()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(shm.path().join("full"))
+            .open(disk.path().join("full"))
             .unwrap();
         full.write_all_at(&bytes, 0).unwrap();
         assert_eq!(
@@ -2697,7 +2698,9 @@ mod tests {
         );
         let data = tempfile::tempdir().unwrap();
         assert_ne!(dev(shm.path()), dev(data.path()));
-        const LEN: u64 = 32 * MIB;
+        // Written in full into /dev/shm, which is 64 MiB in a container by default and shared
+        // with the tests that run beside this one: 32 MiB failed with ENOSPC there.
+        const LEN: u64 = 8 * MIB;
         let mut expected = vec![0u8; LEN as usize];
         for (index, block) in expected[..MIB as usize].chunks_mut(ZERO_BLOCK).enumerate() {
             if index % 3 != 1 {

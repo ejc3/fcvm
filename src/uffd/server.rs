@@ -2445,12 +2445,16 @@ impl RemovedPages {
 /// Fault workers per copy-mode clone, unless [`FAULT_WORKERS_ENV`] says otherwise.
 const DEFAULT_FAULT_WORKERS: usize = 16;
 
+/// The most fault workers one clone gets, whatever [`FAULT_WORKERS_ENV`] asks for. Each is a
+/// thread per clone, and `fcvm-fault-63` is the longest name that fits /proc's comm.
+const MAX_FAULT_WORKERS: usize = 64;
+
 /// Overrides [`DEFAULT_FAULT_WORKERS`]: a whole number of threads, 0 to answer every fault on
 /// the handler as before.
 pub const FAULT_WORKERS_ENV: &str = "FCVM_UFFD_FAULT_WORKERS";
 
 fn fault_worker_count(raw: Option<&str>) -> usize {
-    match raw.map(str::trim) {
+    let count = match raw.map(str::trim) {
         None => DEFAULT_FAULT_WORKERS,
         Some(raw) => raw.parse().unwrap_or_else(|_| {
             warn!(
@@ -2460,7 +2464,15 @@ fn fault_worker_count(raw: Option<&str>) -> usize {
             );
             DEFAULT_FAULT_WORKERS
         }),
+    };
+    if count > MAX_FAULT_WORKERS {
+        warn!(
+            target: "uffd",
+            asked = count,
+            "{FAULT_WORKERS_ENV} asks for more than {MAX_FAULT_WORKERS} fault workers; using {MAX_FAULT_WORKERS}"
+        );
     }
+    count.min(MAX_FAULT_WORKERS)
 }
 
 /// How a fault worker answers a fault.
@@ -2629,6 +2641,32 @@ impl FaultWorkers {
     }
 }
 
+/// What a clone's fault workers did, read after they were joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredWorkers {
+    count: usize,
+    handed: u64,
+    answered: u64,
+    holes: u64,
+    stale: u64,
+}
+
+impl FaultWorkers {
+    /// Stop and join the workers (`Drop`), then read their counters.
+    fn retire(self) -> RetiredWorkers {
+        let (count, handed, stale) = (self.handles.len(), self.handed, self.stale);
+        let (answered, holes) = (Arc::clone(&self.answered), Arc::clone(&self.holes));
+        drop(self);
+        RetiredWorkers {
+            count,
+            handed,
+            answered: answered.load(Ordering::Relaxed),
+            holes: holes.load(Ordering::Relaxed),
+            stale,
+        }
+    }
+}
+
 impl Drop for FaultWorkers {
     /// Stop the workers, close the queue and join them. A worker finishes the fault it
     /// holds, if any: one source read and one fill, which with the clone gone fails at once.
@@ -2700,9 +2738,16 @@ impl FaultWorker {
             };
             let reply = match filled {
                 None => Some(WorkerReturn::Stale(job)),
-                Some(Ok((FaultOutcome::Resolved | FaultOutcome::AlreadyPresent, refused))) => {
+                Some(Ok((
+                    outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent),
+                    refused,
+                ))) => {
                     answered.fetch_add(1, Ordering::Relaxed);
-                    if matches!(job.answer, WorkerAnswer::Hole(_)) {
+                    // Counted as the handler counts its own: only a fill that installed the
+                    // page. One another populator got to first installed nothing.
+                    if matches!(job.answer, WorkerAnswer::Hole(_))
+                        && matches!(outcome, FaultOutcome::Resolved)
+                    {
                         holes.fetch_add(1, Ordering::Relaxed);
                     }
                     if refused {
@@ -2997,6 +3042,16 @@ struct VmState {
 }
 
 impl VmState {
+    /// Stop and join the fault workers, and add the holes they filled to
+    /// `hole_zero_filled`, so the exit line counts the handler's and the workers' fills. The
+    /// join comes first: a worker can fill a page, wake the guest and only then count it,
+    /// and the clone can exit in between.
+    fn retire_fault_workers(&mut self) -> Option<RetiredWorkers> {
+        let retired = self.fault_workers.take()?.retire();
+        self.hole_zero_filled += retired.holes;
+        Some(retired)
+    }
+
     /// Count a fault answered with zeros, under its reason, when this handler's ioctl
     /// installed the page (`installed`). A page another populator installed first is not
     /// counted.
@@ -4703,7 +4758,8 @@ async fn serve_faults(
     }
 }
 
-fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
+fn log_clone_finished(ctx: &VmContext<'_>, state: &mut VmState, reason: &str) {
+    let retired = state.retire_fault_workers();
     let elapsed = state.started.elapsed();
     let rate = if elapsed.as_secs_f64() > 0.0 {
         state.fault_count as f64 / elapsed.as_secs_f64()
@@ -4725,14 +4781,14 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             "fault-around populated pages beyond the demanded ones"
         );
     }
-    if let Some(workers) = state.fault_workers.as_ref().filter(|w| w.handed > 0) {
+    if let Some(workers) = retired.filter(|w| w.handed > 0) {
         info!(
             target: "uffd",
             vm_id = %ctx.vm_id,
-            fault_workers = workers.handles.len(),
+            fault_workers = workers.count,
             handed = workers.handed,
-            answered = workers.answered.load(Ordering::Relaxed),
-            holes = workers.holes.load(Ordering::Relaxed),
+            answered = workers.answered,
+            holes = workers.holes,
             stale = workers.stale,
             "faults answered by the fault workers"
         );
@@ -10277,6 +10333,58 @@ mod tests {
         assert_eq!(state.fault_count, 2);
     }
 
+    /// The exit line's `hole_zero_filled` counts the holes the fault workers answered as well
+    /// as the handler's. It counted the handler's alone, so a clone whose hole faults all went
+    /// to the workers reported none (test_snapshot_clone_serves_snapshot_holes_as_zeros failed
+    /// on main with "the memory server answered no fault from a hole").
+    #[test]
+    fn the_exit_line_counts_the_holes_the_fault_workers_answered() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::empty());
+        let mut state = clone.state();
+        state.hole_zero_filled = 2;
+        state
+            .fault_workers
+            .as_ref()
+            .expect("a copy-mode clone has fault workers")
+            .holes
+            .store(3, Ordering::Relaxed);
+        let retired = state
+            .retire_fault_workers()
+            .expect("the workers were running");
+        assert_eq!(retired.holes, 3);
+        assert_eq!(state.hole_zero_filled, 5);
+        assert!(state.fault_workers.is_none(), "the workers are joined");
+        assert_eq!(state.retire_fault_workers(), None);
+        let source = include_str!("server.rs");
+        let log = &source[source.find(concat!("fn log_clone_", "finished(")).unwrap()..];
+        let retire = log
+            .find("state.retire_fault_workers()")
+            .expect("the exit retires the workers");
+        let exit = log
+            .find(concat!("        reason,\n        \"VM ", "exited\""))
+            .unwrap();
+        assert!(
+            retire < exit,
+            "the exit line is logged before the workers are joined"
+        );
+        assert!(log[..exit].contains("hole_zero_filled = state.hole_zero_filled,"));
+        // The counters are read after the join: `retire` drops (joins) the workers first.
+        let retire_fn = &source[source.find(concat!("fn re", "tire(self)")).unwrap()..];
+        let retire_fn = &retire_fn[..retire_fn.find("\n    }\n").unwrap()];
+        assert!(
+            retire_fn.find("drop(self);").unwrap() < retire_fn.find(".load(").unwrap(),
+            "the workers' counters are read before they are joined"
+        );
+        // A worker counts a hole only when its fill installed the page.
+        let worker = &source[source.find(concat!("impl Fault", "Worker {")).unwrap()..];
+        let counted = &worker[..worker.find("holes.fetch_add(1").unwrap()];
+        let condition = &counted[counted.rfind("if matches!(job.answer").unwrap()..];
+        assert!(
+            condition.contains("matches!(outcome, FaultOutcome::Resolved)"),
+            "a worker counts a hole another populator filled"
+        );
+    }
+
     /// Dropping the fault workers stops them before the jobs still queued are read: a clone
     /// that is gone does not pay one source read per queued fault before its handler can
     /// return. Without the stop the one worker went on to read page 4 after page 2.
@@ -10391,6 +10499,7 @@ mod tests {
         assert_eq!(fault_worker_count(Some(" 4\n")), 4);
         assert_eq!(fault_worker_count(Some("0")), 0);
         assert_eq!(fault_worker_count(Some("many")), DEFAULT_FAULT_WORKERS);
+        assert_eq!(fault_worker_count(Some("100000")), MAX_FAULT_WORKERS);
     }
 
     /// The region maps file pages 2..10, so with 4-page granules both of its ends fall inside

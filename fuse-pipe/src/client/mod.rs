@@ -58,7 +58,7 @@ mod mount;
 mod multiplexer;
 
 pub use fuse::FuseClient;
-pub use host_change::NotifierSlot;
+pub use host_change::{expire_cached_attributes, NotifierSlot};
 pub use mount::{mount, mount_spawn, MountConfig, MountHandle, MountSettings};
 #[cfg(target_os = "linux")]
 pub use mount::{
