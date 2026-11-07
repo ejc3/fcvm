@@ -265,6 +265,12 @@ so nothing is built or booted twice when it doesn't have to be.
   loaded, paused VM before the guest resumes, so runs at different targets share the
   pre-start snapshot. The startup snapshot holds a workload that initialised under one
   target, which a restore cannot replay, so its name carries the target.
+- **The proxy settings are a restore-time value, and a snapshot records none.** Every
+  restore gives the guest its own run's `http_proxy`, `https_proxy` and `no_proxy`, or
+  none (`RestoreIdentity::proxy`), so runs with and without a proxy share the pre-start
+  snapshot and a clone never holds another caller's proxy URL. A startup snapshot holds
+  a container already running with one, so its name carries a digest of the run's proxy
+  variables, never the URLs (`startup_snapshot_key`, #1727).
 - **Never add per-caller data to the content key when restore can reconcile it.**
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this

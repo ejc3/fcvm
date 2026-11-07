@@ -169,6 +169,21 @@ pub struct RestoreIdentity {
     /// None leaves resolv.conf as it is.
     #[serde(default)]
     pub dns: Option<RestoreDns>,
+    /// The restoring run's proxies. Each absent field means none: the guest drops the
+    /// proxy of the run that made the snapshot (`system::apply_proxy_settings`).
+    #[serde(default)]
+    pub proxy: RestoreProxy,
+}
+
+/// The proxy settings a guest is given, at boot (the plan's fields) or at a restore.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct RestoreProxy {
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    #[serde(default)]
+    pub https_proxy: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
 }
 
 /// The guest's resolvers, as `fcvm_dns=` and `fcvm_dns_search=` carry them at boot.
@@ -205,6 +220,26 @@ mod tests {
         let bare: LatestMetadata =
             serde_json::from_str(r#"{"host-time-ns": "1", "host-ipv6": null}"#).unwrap();
         assert!(bare.identity.host_ipv6.is_none() && bare.identity.dns.is_none());
+        assert_eq!(
+            bare.identity.proxy,
+            RestoreProxy::default(),
+            "no proxy named is none"
+        );
+
+        let proxied: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "host-ipv6": null,
+                "proxy": {"http_proxy": "http://10.0.2.2:3128", "https_proxy": null,
+                          "no_proxy": "localhost"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proxied.identity.proxy,
+            RestoreProxy {
+                http_proxy: Some("http://10.0.2.2:3128".to_string()),
+                https_proxy: None,
+                no_proxy: Some("localhost".to_string()),
+            }
+        );
     }
 
     #[test]
