@@ -2514,7 +2514,8 @@ enum WorkerReturn {
 /// about 280,000 faults a second at one core.
 ///
 /// What stays on the handler: reading events, REMOVEs and every fault on a page the balloon
-/// gave back, parked faults, fault-around, and minor mode. A worker holds the [`ReplayGate`]
+/// gave back, parked faults, fault-around, minor mode, and every fault while working-set
+/// replay runs (#1694). A worker holds the [`ReplayGate`]
 /// from its generation check through one fill, as a replay worker does, so a REMOVE the
 /// handler reads after deciding a fault's answer makes the job stale and it comes back.
 /// The source read happens before the gate is taken, so the handler never waits on the disk
@@ -5263,6 +5264,13 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         (Some(ZeroReason::Hole), Some(fill)) => Some(WorkerAnswer::Hole(fill)),
                         _ => None,
                     };
+                    // While replay runs every fault stays here (#1694). Replay copies from
+                    // this task between drains, so a fault answered here goes ahead of it;
+                    // handed to a worker it waited behind the replay workers' copies and
+                    // reads. Measured: a restore under page cache pressure reached healthy in
+                    // 7.5 to 8.0 s against 91.8 s, and an allocation during replay took 8.4 to
+                    // 8.5 s against 9.8 to 10.0 s. Once replay is over the workers take them.
+                    let answer = answer.filter(|_| !state.replaying);
                     if let (Some(answer), Some(workers)) = (answer, state.fault_workers.as_mut()) {
                         let job = FaultJob {
                             page: fault_page,
@@ -10243,6 +10251,42 @@ mod tests {
             in_time,
             "the dropped workers read the queued page 4 before they stopped"
         );
+    }
+
+    /// While replay runs the handler answers every fault itself, ahead of replay; once replay
+    /// is over the fault workers take them (#1694). Handed to the workers during replay, a
+    /// restore under page cache pressure reached healthy in 91.8 s against 7.5 s.
+    #[test]
+    fn the_handler_answers_the_faults_that_arrive_while_replay_runs() {
+        let clone = HeldSourceClone::new(userfaultfd::FeatureFlags::empty());
+        clone.serve_source(2);
+        clone.serve_source(4);
+        let mut state = clone.state();
+        state.replaying = true;
+        let vcpu = FaultingReader::spawn(clone.guest_addr(2));
+        vcpu.wait_until_asleep();
+        assert_eq!(
+            drain_events(&clone.uffd, &clone.ctx(), &mut state).unwrap(),
+            DrainOutcome::QueueDrained
+        );
+        assert_eq!(
+            state.fault_workers.as_ref().unwrap().handed,
+            0,
+            "a fault during replay went to a worker"
+        );
+        let (got, _) = vcpu.finish("the handler answered the fault during replay");
+        assert_eq!(got, 3);
+
+        state.replaying = false;
+        let vcpu = FaultingReader::spawn(clone.guest_addr(4));
+        vcpu.wait_until_asleep();
+        assert_eq!(
+            drain_events(&clone.uffd, &clone.ctx(), &mut state).unwrap(),
+            DrainOutcome::QueueDrained
+        );
+        assert_eq!(state.fault_workers.as_ref().unwrap().handed, 1);
+        let (got, _) = clone.finish_reads_until(&mut state, vcpu);
+        assert_eq!(got, 5);
     }
 
     /// A REMOVE that is read while a fault's source page is being read leaves what it leaves
