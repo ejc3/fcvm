@@ -8,6 +8,15 @@ mod common;
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
+/// The guest kernel's own THP mode, which a VM run without `--guest-thp` keeps. The guest
+/// kernels set no `CONFIG_TRANSPARENT_HUGEPAGE_*` default of their own (kernel/*.conf), so it
+/// is the Firecracker base config's: `always` on aarch64 and `madvise` on x86_64, where CI
+/// read `madvise` (c228fb7a, Host-x64).
+#[cfg(target_arch = "aarch64")]
+const KERNEL_DEFAULT_THP: &str = "always";
+#[cfg(target_arch = "x86_64")]
+const KERNEL_DEFAULT_THP: &str = "madvise";
+
 /// The selected mode, as the guest's sysfs file shows it (`always [madvise] never`).
 async fn guest_thp(pid: u32) -> Result<String> {
     let out =
@@ -158,7 +167,7 @@ async fn test_a_cache_hit_without_guest_thp_runs_in_the_kernel_mode() -> Result<
         "the second run did not restore the first run's snapshot; its log is {}",
         hit_log.display()
     );
-    assert_eq!(guest_thp(hit_pid).await?, "always");
+    assert_eq!(guest_thp(hit_pid).await?, KERNEL_DEFAULT_THP);
     common::kill_process(hit_pid).await;
     let _ = hit.wait().await;
     Ok(())
