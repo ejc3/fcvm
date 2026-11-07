@@ -159,7 +159,8 @@ reboot)
   sleep "${REBOOT_SETTLE:-60}"
   end=$(($(now) + ${REBOOT_WAIT:-900}))
   while [ "$(now)" -lt "$end" ]; do
-    sys=$(within "$end" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
+    cap=$(($(now) + 30)); [ "$cap" -le "$end" ] || cap=$end
+    sys=$(within "$cap" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
       --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null || true)
     [ "$sys" = impaired ] && { say "$2's system status check failed after the reboot (its EC2 host, not the instance): stop and start it, which moves it to other hardware and boots it"; exit 1; }
     left=$((end - $(now))); [ "$left" -le 60 ] || left=60

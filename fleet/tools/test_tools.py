@@ -474,6 +474,10 @@ class GpuboxWallReserve(unittest.TestCase):
         r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", FAKE_STATUS_SLOW="20", **fast)
         self.assertIn("no new boot on i-builder within 5 s", r.stderr)
         self.assertLess(time.time() - start, 12)
+        # A stalled status read takes at most 30 s of a longer wait, and the probe after it
+        # still finds the new boot.
+        r, _, _ = self.up(cmd=cmd, FAKE_STATUS_SLOW="40", **{**fast, "REBOOT_WAIT": "36"})
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "rebooted"), r.stderr)
 
     def test_a_boot_measurement_goes_through_the_wall_reserve(self):
         # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave
