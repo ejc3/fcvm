@@ -1,0 +1,12 @@
+# The EC2 lanes' AMI: start the workload as early as the network allows.
+[Unit]
+Description=boot-race workload
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/boot-race-workload
+Restart=always
+RestartSec=0
+
+[Install]
+WantedBy=multi-user.target

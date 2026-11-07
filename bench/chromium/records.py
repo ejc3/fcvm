@@ -44,7 +44,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.realpath(os.path.dirname(os.path.dirname(HERE)))
 RESULTS = os.path.join(HERE, "results")
-MANIFEST_GLOB = os.path.join(RESULTS, "records-*.json")
+# bench/boot-race keeps its campaigns' raw files the same way, with its manifests beside its runs.
+BOOT_RACE_RESULTS = os.path.join(REPO, "bench", "boot-race", "results")
+MANIFEST_DIRS = (RESULTS, BOOT_RACE_RESULTS)
+MANIFEST_GLOB = " or ".join(os.path.join(d, "records-*.json") for d in MANIFEST_DIRS)
 RECORDS_ENV = "FCVM_BENCH_RECORDS"
 RECORDS_REPOSITORY = "ejc3/fcvm-bench-records"
 # The largest file a records directory may commit. The largest summary that
@@ -52,7 +55,7 @@ RECORDS_REPOSITORY = "ejc3/fcvm-bench-records"
 # twice that, rounded up to a power of two.
 CAP_BYTES = 512 * 1024
 # The directories that hold benchmark records, relative to the repository.
-RECORD_DIRS = ("bench/chromium/results", "bench/chromium/report/evidence")
+RECORD_DIRS = ("bench/chromium/results", "bench/chromium/report/evidence", "bench/boot-race/results")
 # The raw files of a run, by path inside the run directory. Everything else a
 # run commits (its indexes, evidence, provenance and summaries) stays.
 RAW = (
@@ -75,6 +78,13 @@ RAW = (
     "scale-*/host-samples.jsonl",
     "scale-*/host-control.jsonl",
 )
+# The raw files of a bench/boot-race campaign: every sample with the workload's identities, and the Lambda REPORT
+# lines. render.py writes both with addresses and resource ids scrubbed; the driver's own configuration never
+# leaves the campaign box. Its setup.json stays.
+BOOT_RACE_RAW = (
+    "samples.jsonl",
+    "lambda-reports.json",
+)
 
 
 class MissingRecord(FileNotFoundError):
@@ -89,14 +99,14 @@ def repo_relative(path):
     return os.path.relpath(os.path.join(os.path.realpath(head or "."), leaf), REPO).replace(os.sep, "/")
 
 
-def is_raw(relative_in_run):
-    return any(fnmatch.fnmatchcase(relative_in_run, pattern) for pattern in RAW)
+def is_raw(relative_in_run, patterns=RAW):
+    return any(fnmatch.fnmatchcase(relative_in_run, pattern) for pattern in patterns)
 
 
 @functools.lru_cache(maxsize=None)
 def _manifests():
     entries = {}
-    for manifest_path in sorted(glob.glob(MANIFEST_GLOB)):
+    for manifest_path in sorted(p for d in MANIFEST_DIRS for p in glob.glob(os.path.join(d, "records-*.json"))):
         with open(manifest_path) as handle:
             manifest = json.load(handle)
         for entry in manifest["files"]:
@@ -244,7 +254,18 @@ def committed_files(prefix):
 def run_raw_files(run_dir):
     """The committed raw files of one run directory, repository-relative."""
     prefix = os.path.relpath(os.path.realpath(run_dir), REPO).replace(os.sep, "/") + "/"
-    return [p for p in committed_files(prefix) if is_raw(p[len(prefix):])]
+    boot_race = os.path.relpath(BOOT_RACE_RESULTS, REPO).replace(os.sep, "/") + "/"
+    patterns = BOOT_RACE_RAW if prefix.startswith(boot_race) else RAW
+    return [p for p in committed_files(prefix) if is_raw(p[len(prefix):], patterns)]
+
+
+def results_dir(run_dirs):
+    """The results directory the runs belong to, where their manifest goes."""
+    found = {BOOT_RACE_RESULTS if os.path.realpath(d).startswith(os.path.realpath(BOOT_RACE_RESULTS) + os.sep)
+             else RESULTS for d in run_dirs}
+    if len(found) != 1:
+        raise SystemExit("one manifest covers runs of one results directory")
+    return found.pop()
 
 
 def cmd_commits(_args):
@@ -311,7 +332,7 @@ def cmd_manifest(args):
     if not files:
         raise SystemExit("no raw file to list")
     in_fcvm = {f.pop("in_fcvm") for f in files}
-    out = os.path.join(RESULTS, f"records-{args.campaign}.json")
+    out = os.path.join(results_dir(args.run_dirs), f"records-{args.campaign}.json")
     if os.path.exists(out):
         raise SystemExit(f"{out} exists; one manifest per campaign")
     manifest = {

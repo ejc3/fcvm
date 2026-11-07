@@ -1,0 +1,6 @@
+# The boot-race workload image: the static binary and nothing else. The fcvm lanes run it with
+# `fcvm podman run`; the ECS lanes pull it from ECR.
+FROM scratch
+COPY boot-race-workload /boot-race-workload
+EXPOSE 8080
+ENTRYPOINT ["/boot-race-workload"]
