@@ -22,6 +22,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import dev.fcvm.robotpark.scene.Action
+import dev.fcvm.robotpark.scene.LiftedBars
 import dev.fcvm.robotpark.scene.Stamp
 
 /**
@@ -43,6 +44,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var tabInfo: TextView
     private var chromeFromScene = false
     private var heldFromScene = false
+    private val bars = LiftedBars()
     private val hideBanner = Runnable { banner.visibility = View.GONE }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -178,7 +180,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // where the scene's stamp band shows (the stamp carries the held bit while they do)
         val lift = if (heldFromScene) Stamp.ROWS else 0
         // lifted: the stamp keeps its held bit (GlThread.barsLifted) until they are lowered
-        if (lift > 0 && ::gl.isInitialized) gl.barsLifted = true
+        if (lift > 0) bars.lift()
+        if (::gl.isInitialized) gl.barsLifted = bars.lifted
         for (v in listOf(tabBar, info)) {
             val lp = v.layoutParams as FrameLayout.LayoutParams
             if (lp.bottomMargin != lift) {
@@ -186,7 +189,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 v.layoutParams = lp
             }
         }
-        if (lift == 0 && ::gl.isInitialized && gl.barsLifted) lowered()
+        if (lift == 0) bars.lowerRequested()?.let { lowered(it) }
         val night = night()
         val on = if (night) 0xFFD0BCFF.toInt() else 0xFF6750A4.toInt()
         val off = if (night) 0xFFCAC4D0.toInt() else 0xFF49454F.toInt()
@@ -195,17 +198,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /**
-     * Clears GlThread.barsLifted once the lowered layout has been drawn, not when it is asked
+     * Reports the lowering [token] once the lowered layout has been drawn, not when it is asked
      * for: a layout change waits for the next traversal, and the stamp keeps its held bit until
-     * the bars are down. A hold again meanwhile keeps it set.
+     * the bars are down. A hold again meanwhile makes the token stale (LiftedBars).
      */
-    private fun lowered() {
-        val obs = root.viewTreeObserver
-        obs.addOnDrawListener(object : ViewTreeObserver.OnDrawListener {
+    private fun lowered(token: Long) {
+        root.viewTreeObserver.addOnDrawListener(object : ViewTreeObserver.OnDrawListener {
             override fun onDraw() {
                 root.post {
                     root.viewTreeObserver.removeOnDrawListener(this)
-                    if (!heldFromScene) gl.barsLifted = false
+                    bars.lowerDrawn(token)
+                    if (::gl.isInitialized) gl.barsLifted = bars.lifted
                 }
             }
         })

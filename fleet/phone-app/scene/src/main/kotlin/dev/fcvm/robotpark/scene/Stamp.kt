@@ -40,3 +40,36 @@ class HeldLayout {
         return false
     }
 }
+
+/**
+ * The UI side of the held layout: whether the bars can still be lifted on screen. [lift] sets
+ * it at once. Lowering is asked for with [lowerRequested], and the UI hands its token back to
+ * [lowerDrawn] from a draw callback once the lowered layout has been drawn. A lift in between
+ * makes the token stale, so the callback of an earlier lowering cannot clear a later one before
+ * the later one's layout is drawn.
+ */
+class LiftedBars {
+    var lifted = false
+        private set
+    private var generation = 0L
+    private var pending = false
+
+    fun lift() {
+        lifted = true
+        generation++
+        pending = false
+    }
+
+    /** A token to hand to [lowerDrawn], or null while nothing is lifted or a lowering since the last lift is pending. */
+    fun lowerRequested(): Long? {
+        if (!lifted || pending) return null
+        pending = true
+        return generation
+    }
+
+    fun lowerDrawn(token: Long) {
+        if (token != generation || !pending) return
+        lifted = false
+        pending = false
+    }
+}
