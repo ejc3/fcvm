@@ -1392,7 +1392,12 @@ impl PastaNetwork {
                 // address and the connection was reset. A rule with a target address is
                 // never spliced, so the connection reaches the guest over pasta's link,
                 // from the IPv6 gateway (pasta maps the host's loopback to it).
-                let spec = if bind_addr.parse::<std::net::Ipv6Addr>().is_ok() {
+                // An IPv4-mapped address is an IPv4 bind to pasta, which refuses an
+                // IPv6 target for it, and is spliced over the namespace's IPv4.
+                let spec = if bind_addr
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok_and(|address| address.to_ipv4_mapped().is_none())
+                {
                     format!(
                         "{}/{}:{}/{}",
                         bind_addr, mapping.host_port, self.guest_ipv6, mapping.guest_port
@@ -1914,10 +1919,7 @@ impl PastaNetwork {
                 Some(ip) => ip.as_str(),
                 None => loopback,
             };
-            let ip: IpAddr = bind_addr
-                .parse()
-                .with_context(|| format!("port forward host address {bind_addr}"))?;
-            let sock_addr = SocketAddr::new(ip, mapping.host_port);
+            let sock_addr = readiness_address(bind_addr, mapping.host_port)?;
             let addr = sock_addr.to_string();
 
             loop {
@@ -1977,6 +1979,15 @@ async fn port_forward_listener_ready(addr: SocketAddr) -> bool {
 
 /// True when a TCP socket in this network namespace listens on exactly `addr`:
 /// state 0A in /proc/net/tcp or /proc/net/tcp6, with that local address.
+/// Where pasta listens for a mapping bound to `bind_addr`. pasta binds an IPv4-mapped
+/// IPv6 address as its IPv4 address, so its listener is in /proc/net/tcp under that.
+fn readiness_address(bind_addr: &str, port: u16) -> Result<SocketAddr> {
+    let ip: IpAddr = bind_addr
+        .parse()
+        .with_context(|| format!("port forward host address {bind_addr}"))?;
+    Ok(SocketAddr::new(ip.to_canonical(), port))
+}
+
 fn listening_on_exactly(addr: SocketAddr) -> bool {
     let table = if addr.is_ipv4() {
         "/proc/net/tcp"
@@ -2532,6 +2543,21 @@ mod tests {
         );
     }
 
+    /// The readiness check looks for an IPv4-mapped mapping's listener under its IPv4
+    /// address, where pasta binds it; under the mapped IPv6 address it was never found
+    /// and the launch failed after its readiness budget.
+    #[test]
+    fn an_ipv4_mapped_mapping_is_awaited_on_its_ipv4_address() {
+        assert_eq!(
+            readiness_address("::ffff:127.0.0.1", 8080).unwrap(),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            readiness_address("::1", 8080).unwrap(),
+            "[::1]:8080".parse::<SocketAddr>().unwrap()
+        );
+    }
+
     /// An IPv6 mapping names the guest's IPv6 address as its target, so pasta does not
     /// splice a loopback client's connection into the namespace, which has no IPv6
     /// address to connect from: that connection was reset.
@@ -2571,6 +2597,33 @@ mod tests {
             contains_run(&args, &["-u", "::/5300:fd00::100/53"]),
             "{args:?}"
         );
+
+        // An IPv4-mapped address is an IPv4 bind to pasta, which refuses an IPv6
+        // target for it.
+        for proto in [Protocol::Tcp, Protocol::Udp] {
+            let network = PastaNetwork::new(
+                "args-ports-mapped".into(),
+                "tap0".into(),
+                vec![PortMapping {
+                    host_ip: Some("::ffff:127.0.0.1".into()),
+                    host_port: 8080,
+                    guest_port: 80,
+                    proto,
+                    loopback_client: false,
+                }],
+            );
+            let args = arg_strings(&network.build_pasta_args(
+                Path::new("/run/pasta-args-ports-mapped.pid"),
+                9,
+                None,
+                false,
+            ));
+            let flag = if proto == Protocol::Tcp { "-t" } else { "-u" };
+            assert!(
+                contains_run(&args, &[flag, "::ffff:127.0.0.1/8080:80"]),
+                "{args:?}"
+            );
+        }
     }
 
     /// pasta reads the HOST's /etc/resolv.conf, and when its first nameserver
