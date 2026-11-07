@@ -365,8 +365,16 @@ impl PeerVmm {
                 .await
                 .context("listing VM states")?;
             let vm_id = super::failure::clone_of_parent(&states, parent, parent_start)
-                .with_context(|| format!("no VM state names fcvm PID {parent} as its process"))?;
-            super::failure::write_failure(&crate::paths::vm_runtime_dir(&vm_id), reason)
+                .with_context(|| {
+                    format!("no single VM state names fcvm PID {parent} as its process")
+                })?;
+            // A blocking write on a thread of its own, so a filesystem that stops answering
+            // cannot hold this task past the timeout and keep the kill below from running.
+            let dir = crate::paths::vm_runtime_dir(&vm_id);
+            let reason = reason.to_string();
+            tokio::task::spawn_blocking(move || super::failure::write_failure(&dir, &reason))
+                .await
+                .context("joining the failure write")?
         })
         .await;
         match recorded {
@@ -5813,6 +5821,20 @@ mod tests {
         assert!(
             recorded < killed,
             "the VMM is killed before the failure is recorded"
+        );
+        // The record's timeout bounds it only if the blocking write runs off this task: a
+        // write the filesystem never answers would otherwise hold the kill forever.
+        let start = code
+            .find("async fn record_failure(")
+            .expect("no record_failure");
+        let body = &code[start..start + code[start..].find("\n    }\n").unwrap()];
+        assert!(
+            body.contains("spawn_blocking(move || super::failure::write_failure("),
+            "record_failure writes the failure file on the async task: {body}"
+        );
+        assert!(
+            !body.contains("\n            super::failure::write_failure("),
+            "record_failure still writes the failure file inline"
         );
     }
 
