@@ -3073,12 +3073,20 @@ impl VmState {
         }
     }
 
-    /// The recorder for a demand fault observed at `now`, or `None` once the recording
-    /// window has closed.
-    fn fault_recorder(&mut self, now: std::time::Instant) -> Option<&mut PageSet> {
+    /// The recorder for a demand fault observed at `now`, with the fault's first-touch time,
+    /// or `None` once the recording window has closed.
+    fn fault_recorder(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<(&mut PageSet, super::working_set::FirstTouch)> {
         match self.record_until {
             Some(deadline) if now >= deadline => None,
-            _ => self.recorded.as_mut(),
+            _ => {
+                let stamp = super::working_set::first_touch_stamp(
+                    now.saturating_duration_since(self.started),
+                );
+                self.recorded.as_mut().map(|set| (set, stamp))
+            }
         }
     }
 }
@@ -3327,9 +3335,9 @@ async fn replay_then_serve(
     working_set: Option<&WorkingSetStore>,
 ) -> Result<()> {
     if let Some(store) = working_set {
-        let recorded = store.to_prefetch();
-        if !recorded.is_empty()
-            && replay_working_set(ctx, async_uffd, &recorded, state).await? == Replay::Exited
+        let recorded = store.to_prefetch_ordered();
+        if recorded.iter().any(|tier| !tier.is_empty())
+            && replay_working_set(ctx, async_uffd, recorded, state).await? == Replay::Exited
         {
             log_clone_finished(ctx, state, "clone exited during working-set replay");
             return Ok(());
@@ -4061,7 +4069,7 @@ enum Replay {
 async fn replay_working_set(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    recorded: &PageSet,
+    recorded: std::sync::Arc<Vec<PageSet>>,
     state: &mut VmState,
 ) -> Result<Replay> {
     // The copies of plain runs go to the worker threads when the clone has them. A pool that
@@ -4310,13 +4318,13 @@ fn drain_if_readable(
     drain_events(uffd, ctx, state)
 }
 
-/// The replay loop: plan the recorded set, step over what must not be copied, hand plain
-/// runs to `workers` when there are any, copy the rest here, and drain demand faults before
-/// every populate call.
+/// The replay loop: plan the recorded set (split by first-touch tier), step over what must not
+/// be copied, hand plain runs to `workers` when there are any, copy the rest here, and drain
+/// demand faults before every populate call.
 async fn replay_segments(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    recorded: &PageSet,
+    recorded: std::sync::Arc<Vec<PageSet>>,
     state: &mut VmState,
     workers: &mut Option<ReplayWorkers>,
 ) -> Result<ReplayedSegments> {
@@ -4355,7 +4363,8 @@ async fn replay_segments(
     let mut pacer = ReplayPacer::default();
     let mut passed = 0u64;
     let mut limited = false;
-    'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
+    'segments: for segment in
+        prefetch::plan_ordered(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
     {
         let mut segment = segment;
         // The limit bounds the bytes replayed, so a segment that would cross it is cut at
@@ -5331,8 +5340,14 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     // hole is recorded like any other, and replay fills it with zeros. A
                     // fault parked before its REMOVE was read has been recorded already.
                     if zero != Some(ZeroReason::GivenBack) {
-                        if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
-                            recorder.insert_range(offset_in_file as u64, page_size as u64);
+                        if let Some((recorder, stamp)) =
+                            state.fault_recorder(std::time::Instant::now())
+                        {
+                            recorder.insert_range_at(
+                                offset_in_file as u64,
+                                page_size as u64,
+                                stamp,
+                            );
                         }
                     }
 
@@ -6252,8 +6267,8 @@ mod tests {
             trace: None,
         };
         let fault_time = started + Duration::from_secs(1);
-        if let Some(recorder) = past_window.fault_recorder(fault_time) {
-            recorder.insert_range(0, 4096);
+        if let Some((recorder, stamp)) = past_window.fault_recorder(fault_time) {
+            recorder.insert_range_at(0, 4096, stamp);
         }
         assert!(
             past_window.recorded.as_ref().unwrap().is_empty(),
@@ -6280,8 +6295,8 @@ mod tests {
             started,
             trace: None,
         };
-        if let Some(recorder) = in_window.fault_recorder(fault_time) {
-            recorder.insert_range(0, 4096);
+        if let Some((recorder, stamp)) = in_window.fault_recorder(fault_time) {
+            recorder.insert_range_at(0, 4096, stamp);
         }
         assert_eq!(
             in_window.recorded.as_ref().unwrap().len(),
@@ -6331,8 +6346,8 @@ mod tests {
         // Every fault of this clone lands after its (zero-length) window.
         let mut late = clone_state(Duration::ZERO);
         for offset in [0u64, 4096, 8192] {
-            if let Some(recorder) = late.fault_recorder(fault_time) {
-                recorder.insert_range(offset, 4096);
+            if let Some((recorder, stamp)) = late.fault_recorder(fault_time) {
+                recorder.insert_range_at(offset, 4096, stamp);
             }
         }
         let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
@@ -6345,8 +6360,8 @@ mod tests {
         // The same faults inside the window are learned, proving the merge path works.
         let mut timely = clone_state(DEFAULT_PREFETCH_RECORD_WINDOW);
         for offset in [0u64, 4096, 8192] {
-            if let Some(recorder) = timely.fault_recorder(fault_time) {
-                recorder.insert_range(offset, 4096);
+            if let Some((recorder, stamp)) = timely.fault_recorder(fault_time) {
+                recorder.insert_range_at(offset, 4096, stamp);
             }
         }
         persist_observed_working_set("vm-timely", Some(persistence), timely.recorded.take());
@@ -7615,9 +7630,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (4 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -7654,9 +7674,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (4 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -7698,10 +7723,16 @@ mod tests {
         assert_eq!(state.fault_count, 2, "both touches faulted");
         let mut faulted = PageSet::empty(clone.mem_size as u64);
         faulted.insert_range(MinorClone::PAGE as u64, (2 * MinorClone::PAGE) as u64);
+        let recorded = state.recorded.as_ref().expect("the clone records");
         assert_eq!(
-            state.recorded,
-            Some(faulted),
+            recorded.runs().collect::<Vec<_>>(),
+            faulted.runs().collect::<Vec<_>>(),
             "the filled hole is recorded with the data page"
+        );
+        let page = MinorClone::PAGE as u64 / super::super::working_set::GRANULE;
+        assert!(
+            recorded.first_touch(page) > 0 && recorded.first_touch(2 * page) > 0,
+            "the faults are recorded with their first-touch times"
         );
     }
 
@@ -7727,9 +7758,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (8 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -9227,7 +9263,13 @@ mod tests {
             wait_for_uffd_event(async_uffd.get_ref(), "a REMOVE event");
             let vcpu = FaultingReader::spawn(clone.page(40 + round));
             vcpu.wait_until_asleep();
-            let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state).await;
+            let replayed = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await;
             let failed = replayed.is_err();
             rounds.push((vcpu, replayed));
             if failed {
@@ -10713,9 +10755,14 @@ mod tests {
             let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
             recorded.insert_range((5 * PAGE) as u64, PAGE as u64);
             recorded.insert_range((9 * PAGE) as u64, PAGE as u64);
-            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay")
+            let exited = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay")
                 == Replay::Exited;
             assert!(!exited, "the clone is alive");
             assert_eq!(
@@ -10748,9 +10795,14 @@ mod tests {
             }
             let mut state = clone.state();
             state.replay_limit = ReplayLimit::mib(0);
-            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            replay_working_set(
+                &ctx,
+                &async_uffd,
+                Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 clone.resident_region_pages(),
                 Vec::<usize>::new(),
@@ -10759,9 +10811,14 @@ mod tests {
 
             let mut state = clone.state();
             state.replay_limit = ReplayLimit(Some(2 * PAGE as u64));
-            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            replay_working_set(
+                &ctx,
+                &async_uffd,
+                Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 clone.resident_region_pages(),
                 vec![0, 2],
@@ -10780,9 +10837,14 @@ mod tests {
             recorded.insert_range(0, (6 * PAGE) as u64);
             let mut state = clone.state();
             state.replay_limit = ReplayLimit(Some(2 * PAGE as u64 + 1));
-            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            replay_working_set(
+                &ctx,
+                &async_uffd,
+                Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 clone.resident_region_pages(),
                 vec![0, 1],
@@ -10820,9 +10882,14 @@ mod tests {
             recorded.insert_range(0, (6 * PAGE) as u64);
             let mut state = clone.state();
             state.replay_progress = Some(Arc::clone(&progress));
-            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            replay_working_set(
+                &ctx,
+                &async_uffd,
+                Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(clone.resident_region_pages(), vec![0, 1, 2, 3, 4, 5]);
         }
         assert_eq!(
@@ -10855,9 +10922,14 @@ mod tests {
             recorded.insert_range(0, (PAGES * PAGE) as u64);
             let mut state = clone.state();
             state.replay_progress = Some(Arc::clone(&progress));
-            replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            replay_working_set(
+                &ctx,
+                &async_uffd,
+                Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 clone.resident_region_pages(),
                 (0..PAGES).collect::<Vec<_>>()
@@ -11777,9 +11849,14 @@ mod tests {
                 recorded.insert_range((page * PAGE) as u64, PAGE as u64);
             }
             prefetch::populate_threads_seen().clear();
-            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay")
+            let exited = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay")
                 == Replay::Exited;
             assert!(!exited, "the clone is alive");
             assert_eq!(
@@ -12266,9 +12343,14 @@ mod tests {
         recorded.insert_range((4 * PAGE) as u64, (4 * PAGE) as u64);
         recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
 
-        let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay")
+        let exited = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay")
             == Replay::Exited;
         assert!(!exited, "no clone exit was reported");
         assert_eq!(
@@ -12951,9 +13033,14 @@ mod tests {
             recorded.insert_range((4 * PAGE) as u64, (5 * PAGE) as u64);
             recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
 
-            let outcome = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            let outcome = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 outcome,
                 Replay::Finished {
