@@ -793,7 +793,7 @@ container-clean:
 # Setup targets
 setup-cloud-hypervisor: private SHELL := $(TARGET_LEASE_SHELL)
 setup-cloud-hypervisor: build setup-btrfs
-	./target/release/fcvm setup --cloud-hypervisor
+	./target/release/fcvm setup --cloud-hypervisor --config "$(CURDIR)/rootfs-config.toml"
 
 setup-passt:
 	./scripts/build-passt.sh
@@ -871,7 +871,7 @@ setup-default: build setup-btrfs
 	@# user and root configs or a rootfs-config.toml change silently boots the
 	@# previous rootfs under sudo (root keeps the stale SHA).
 	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
-	./target/release/fcvm setup --kernel-profile default --build-kernels
+	./target/release/fcvm setup --kernel-profile default --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
 # The default kernel as a publishable release artifact.
 #
@@ -903,9 +903,9 @@ release-default-kernel: build setup-btrfs
 setup-fcvm: private SHELL := $(TARGET_LEASE_SHELL)
 setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile nested..."
-	./target/release/fcvm setup --kernel-profile nested --build-kernels
+	./target/release/fcvm setup --kernel-profile nested --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 	@echo "==> Running fcvm setup --kernel-profile btrfs..."
-	./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+	./target/release/fcvm setup --kernel-profile btrfs --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
 # GPU passthrough guest: the gpu profile's kernel, its Firecracker build, and
 # the NVIDIA driver image built against that kernel (src/setup/nvidia.rs). Not
@@ -983,7 +983,7 @@ gpu-residue-test: setup-gpu
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 install-host-kernel: check-host-kernel-build build setup-btrfs
 	dir=$$($(MAKEFILE_DIR)scripts/check-host-kernel-build.sh) || exit 2; \
-	$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR="$$dir" ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+	$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR="$$dir" ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel --config "$(CURDIR)/rootfs-config.toml"
 
 # Under make -j a prerequisite's position orders nothing, so when the goal is
 # install-host-kernel the check is an order-only prerequisite of the build steps.
@@ -1014,9 +1014,9 @@ _setup-fcvm:
 		exit 1; \
 	fi
 	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
-	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --build-kernels
-	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile nested --build-kernels
-	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --build-kernels --config "$(CURDIR)/rootfs-config.toml"
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile nested --build-kernels --config "$(CURDIR)/rootfs-config.toml"
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile btrfs --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
 # SDK E2E test — requires computesdk package as sibling repo and Node.js
 test-serve-sdk: build
