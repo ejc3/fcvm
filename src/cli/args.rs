@@ -813,6 +813,13 @@ pub struct PrepareArgs {
     #[arg(long, default_value_t = 600)]
     pub ready_timeout: u64,
 
+    /// Do not record a working set for the snapshot. By default a prepare whose snapshot
+    /// has none restores it once through a memory server and tears the clone down, so
+    /// the first restore that follows replays a recorded set instead of faulting every
+    /// page in on demand.
+    #[arg(long)]
+    pub no_record_working_set: bool,
+
     #[command(flatten)]
     pub run: RunArgs,
 }
