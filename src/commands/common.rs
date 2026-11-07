@@ -4288,15 +4288,17 @@ pub const CH_MEMORY_FILE: &str = "memory-ranges";
 /// Fill a clone's Cloud Hypervisor restore directory from the snapshot's `ch/`, all but
 /// `config.json`, which the caller rewrites.
 ///
-/// The memory file is hard-linked, not copied: the restore maps it `MAP_PRIVATE`
-/// (`memory_restore_mode=map`), and clones share its clean pages only when they map the same
-/// inode. A reflink is a new inode with a page cache of its own, so every clone would read
-/// every page from disk again (measured: a reflinked memory file answered RDP 1.0 to 1.2 s
-/// after launch for one Windows clone, a linked one in 74 to 76 ms; docs/fleet/
-/// windows-sandboxes.md, "Measurements"). The snapshot's files never change once
-/// published, and the caller holds the snapshot's generation lock shared while it links. A
-/// link that crosses filesystems or btrfs subvolumes is refused (`EXDEV`); the file is then
-/// reflinked, with a warning, and the clone is correct but shares nothing. The other files
+/// The memory file is a symbolic link to the snapshot's, not a copy: the restore maps it
+/// `MAP_PRIVATE` (`memory_restore_mode=map`), and clones share its clean pages only when
+/// they map the same inode. A reflink is a new inode with a page cache of its own, so every
+/// clone would read every page from disk again (measured: a reflinked memory file answered
+/// RDP 1.0 to 1.2 s after launch for one Windows clone, a shared one in 74 to 76 ms;
+/// docs/fleet/windows-sandboxes.md, "Measurements"). A hard link cannot be used: the
+/// snapshot directory is a btrfs subvolume and the clone's directory is not, and a link
+/// across subvolumes is refused. The link is resolved once, when Cloud Hypervisor opens the
+/// file during the restore, while the caller holds the snapshot's generation lock shared,
+/// so it names the generation whose config and state were copied beside it; the mapping
+/// then keeps that inode for the clone's life, whatever happens to the tag. The other files
 /// (`state.json`) are small and reflinked.
 async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<()> {
     let mut entries = tokio::fs::read_dir(ch_dir)
@@ -4309,20 +4311,12 @@ async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<
             continue;
         }
         if name == std::ffi::OsStr::new(CH_MEMORY_FILE) {
-            match tokio::fs::hard_link(&src, &dst).await {
-                Ok(()) => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => warn!(
-                    src = %src.display(),
-                    dst = %dst.display(),
-                    "the clone's restore directory is on another filesystem or subvolume than \
-                     the snapshot: copying its memory file, so this clone shares no pages"
-                ),
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("linking {} to {}", src.display(), dst.display())
-                    })
-                }
-            }
+            let src = std::path::absolute(&src)
+                .with_context(|| format!("resolving {}", src.display()))?;
+            tokio::fs::symlink(&src, &dst)
+                .await
+                .with_context(|| format!("linking {} to {}", dst.display(), src.display()))?;
+            continue;
         }
         reflink_copy(&src, &dst)
             .await
@@ -8088,16 +8082,21 @@ mod tests {
 
     /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=map`),
     /// and clones share its pages only through one inode: the clone's restore directory gets
-    /// a hard link to the memory file, never a copy, while every other snapshot file is the
+    /// a link to the snapshot's memory file, never a copy, while every other snapshot file is the
     /// clone's own and config.json is left to the caller to rewrite.
     #[tokio::test]
     async fn a_ch_clone_links_the_snapshot_memory_file_and_copies_the_rest() {
         use std::os::unix::fs::MetadataExt;
         // The snapshot's other files are reflinked, which needs btrfs: the build's target
         // directory is on the btrfs store wherever fcvm's tests run (the Makefile links it
-        // there).
+        // there). As in production, the snapshot is a btrfs subvolume and the clone's
+        // directory is not, so a hard link would be refused.
         let root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
-        let (snap, clone) = (root.path().join("ch"), root.path().join("ch-restore"));
+        let snapshot_root = root.path().join("snapshot");
+        crate::storage::disk::create_dir_or_subvolume(&snapshot_root)
+            .await
+            .unwrap();
+        let (snap, clone) = (snapshot_root.join("ch"), root.path().join("ch-restore"));
         std::fs::create_dir_all(&snap).unwrap();
         std::fs::create_dir_all(&clone).unwrap();
         std::fs::write(snap.join(CH_MEMORY_FILE), vec![7u8; 8192]).unwrap();
@@ -8112,7 +8111,10 @@ mod tests {
             ino(&snap.join(CH_MEMORY_FILE)),
             "the clone's memory file is not the snapshot's inode"
         );
-        assert_ne!(ino(&clone.join("state.json")), ino(&snap.join("state.json")));
+        assert_ne!(
+            ino(&clone.join("state.json")),
+            ino(&snap.join("state.json"))
+        );
         assert_eq!(std::fs::read(clone.join("state.json")).unwrap(), b"{}");
         assert!(!clone.join("config.json").exists());
     }
@@ -8122,9 +8124,18 @@ mod tests {
     /// clones at once, against 3.0 s mapped).
     #[test]
     fn a_ch_restore_maps_the_memory_file() {
-        let body = body_of(include_str!("common.rs"), "pub async fn restore_from_snapshot_ch(");
-        assert!(body.contains("memory_restore_mode=map,"), "restore_from_snapshot_ch does not restore with map");
-        assert!(!body.contains("memory_restore_mode=copy"), "restore_from_snapshot_ch still copies");
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn restore_from_snapshot_ch(",
+        );
+        assert!(
+            body.contains("memory_restore_mode=map,"),
+            "restore_from_snapshot_ch does not restore with map"
+        );
+        assert!(
+            !body.contains("memory_restore_mode=copy"),
+            "restore_from_snapshot_ch still copies"
+        );
         assert!(body.contains("prepare_ch_restore_files(&ch_dir, &clone_ch_dir)"));
     }
 
