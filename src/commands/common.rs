@@ -1037,6 +1037,58 @@ async fn staged_memory_takes_in_place_diff(
     }
 }
 
+/// Free space a memory snapshot of a `memory_mib` guest needs. A full snapshot writes at
+/// most all guest memory (the default Firecracker build leaves all-zero pages as holes), so
+/// that is an upper bound and the check errs toward refusing. A diff snapshot needs a tenth
+/// of it as a buffer.
+pub(crate) fn snapshot_space_required(memory_mib: u32, diff: bool) -> u64 {
+    let memory_bytes = u64::from(memory_mib) * 1024 * 1024;
+    if diff {
+        memory_bytes / 10
+    } else {
+        memory_bytes
+    }
+}
+
+/// The free bytes on the filesystem that will hold the snapshot directory `snapshot_dir`
+/// (its parent when it does not exist yet), as `available_after_deletes` reads them.
+pub(crate) async fn snapshot_space_available(snapshot_dir: &Path, required: u64) -> Option<u64> {
+    let statvfs_path = if snapshot_dir.exists() {
+        snapshot_dir
+    } else {
+        snapshot_dir.parent().unwrap_or(snapshot_dir)
+    };
+    available_after_deletes(statvfs_path, required).await
+}
+
+/// A memory snapshot refused because its filesystem has less free space than it needs
+/// (`snapshot_space_required`). Callers that know more, such as how much space there was
+/// when they started, find it in the error chain and add it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSpaceShortfall {
+    /// "full" or "diff".
+    pub kind: &'static str,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for SnapshotSpaceShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Not enough disk space for {} snapshot: need {} MiB, have {} MiB free on {}. \
+             Use --mem to limit VM memory, or increase btrfs_size in rootfs-config.toml.",
+            self.kind,
+            self.required_bytes / (1024 * 1024),
+            self.available_bytes / (1024 * 1024),
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for SnapshotSpaceShortfall {}
+
 /// The free bytes on the filesystem holding `path`, or None when statvfs fails. When fewer
 /// than `required` are free, it first waits for btrfs to free the space of deleted
 /// subvolumes: a replaced or pruned snapshot directory is deleted as a subvolume, and its
@@ -5656,33 +5708,19 @@ pub async fn create_snapshot_core(
     let snapshot_type = if has_base { "Diff" } else { "Full" };
 
     // Check available disk space before attempting snapshot.
-    // A full snapshot writes at most all VM memory (the default Firecracker build leaves
-    // all-zero pages as holes), so memory_mib is an upper bound and the check errs toward
-    // refusing. A diff snapshot is smaller but still needs space.
     // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
     {
-        // For full snapshots, need at most memory_mib. For diff, need ~10% as buffer.
-        let required_bytes = if has_base {
-            memory_bytes / 10
-        } else {
-            memory_bytes
-        };
-        // Use parent directory for statvfs if snapshot_dir was cleaned up
-        let statvfs_path = if snapshot_dir.exists() {
-            snapshot_dir
-        } else {
-            snapshot_dir.parent().unwrap_or(snapshot_dir)
-        };
-        if let Some(available_bytes) = available_after_deletes(statvfs_path, required_bytes).await {
+        let required_bytes = snapshot_space_required(snapshot_config.metadata.memory_mib, has_base);
+        if let Some(available_bytes) = snapshot_space_available(snapshot_dir, required_bytes).await
+        {
             if available_bytes < required_bytes {
-                anyhow::bail!(
-                    "Not enough disk space for {} snapshot: need {} MiB, have {} MiB free on {}. \
-                     Use --mem to limit VM memory, or increase btrfs_size in rootfs-config.toml.",
-                    snapshot_type.to_lowercase(),
-                    required_bytes / (1024 * 1024),
-                    available_bytes / (1024 * 1024),
-                    snapshot_dir.display()
-                );
+                return Err(SnapshotSpaceShortfall {
+                    kind: if has_base { "diff" } else { "full" },
+                    required_bytes,
+                    available_bytes,
+                    path: snapshot_dir.to_path_buf(),
+                }
+                .into());
             }
         }
     }

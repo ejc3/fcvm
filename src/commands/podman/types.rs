@@ -65,6 +65,9 @@ pub struct PreparedTarget {
     /// the content key (a restore sets it), but an installed generation records the mode
     /// `snapshot run` inherits, so a generation recording another mode does not answer.
     pub guest_thp: Option<String>,
+    /// Free bytes on the snapshot filesystem when the prepare checked, before its VM
+    /// existed (#968). A refusal at snapshot time says how far it fell since.
+    pub free_at_start: Option<u64>,
 }
 
 /// A `podman prepare` that restores its pre-start snapshot: `snapshot run` waits for the
