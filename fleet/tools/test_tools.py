@@ -209,18 +209,27 @@ case "$args" in
   *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
   *" ec2 describe-instances "*)
     [ -z "${FAKE_USAGE_FAIL:-}" ] || { echo "An error occurred (RequestLimitExceeded)" >&2; exit 254; }
-    case "$args" in *"InstanceLifecycle==\`spot\`"*) m=spot; printf '%b' "$FAKE_SPOT_IN_USE" ;; *) m=on-demand; printf '%b' "$FAKE_OD_IN_USE" ;; esac
-    if [ -s "$FAKE_LOG.launched" ]; then
-      # Another box launched at the same time, listed only now.
-      case $m in spot) printf '%b' "${FAKE_SPOT_IN_USE_AFTER:-}" ;; *) printf '%b' "${FAKE_OD_IN_USE_AFTER:-}" ;; esac
-      [ "$(cat "$FAKE_LOG.launched")" != "$m" ] || printf '%s\ti-fakebox\tfcvm-fleet-gpubox\t48\t2\n' "$FAKE_MY_TIME"
-    fi ;;
+    # Rows are "<time> <id> <purpose> <type> <cores> <threads>"; the reply has the columns
+    # the query names, and VT rows only when the query asks for VT.
+    rows=$(case "$args" in *"InstanceLifecycle==\`spot\`"*) m=spot; printf '%b' "$FAKE_SPOT_IN_USE" ;; *) m=on-demand; printf '%b' "$FAKE_OD_IN_USE" ;; esac
+      if [ -s "$FAKE_LOG.launched" ]; then
+        # Another box launched at the same time, listed only now.
+        case $m in spot) printf '%b' "${FAKE_SPOT_IN_USE_AFTER:-}" ;; *) printf '%b' "${FAKE_OD_IN_USE_AFTER:-}" ;; esac
+        [ "$(cat "$FAKE_LOG.launched")" != "$m" ] || printf '%s\ti-fakebox\tfcvm-fleet-gpubox\tg4dn.metal\t48\t2\n' "$FAKE_MY_TIME"
+      fi)
+    vt=0; case "$args" in *"\`vt\`"*) vt=1 ;; esac
+    cpu=0; case "$args" in *CpuOptions.CoreCount*) cpu=1 ;; esac
+    awk -v vt=$vt -v cpu=$cpu 'BEGIN {OFS = "\t"} NF {if (!vt && $4 ~ /^vt/) next; if (cpu) print $1, $2, $3, $5, $6; else print $1, $2, $3, $4}' <<<"$rows" ;;
   *" ec2 run-instances "*)
+    [ -z "${FAKE_RUN_FAIL:-}" ] || { echo launched > "$FAKE_LOG.launched"; echo "An error occurred (InternalError)" >&2; exit 254; }
     case "$args" in *MarketType=spot*) echo spot ;; *) echo on-demand ;; esac > "$FAKE_LOG.launched"
     echo i-fakebox ;;
-  *" ec2 terminate-instances "*) : ;;
-  *" ec2 describe-instance-types "*g4dn.metal*) echo 96 ;;
-  *" ec2 describe-instance-types "*g4dn.xlarge*) echo 4 ;;
+  *" ec2 terminate-instances "*) [ -z "${FAKE_TERMINATE_FAIL:-}" ] || exit 254 ;;
+  *" ec2 describe-instance-types "*)
+    for t in g4dn.metal:96 g4dn.xlarge:4 g5.16xlarge:64 vt1.24xlarge:96; do
+      case "$args" in *" ${t%:*} "*)
+        case "$args" in *"InstanceTypes[].["*) printf '%s\t%s\n' "${t%:*}" "${t#*:}" ;; *) echo "${t#*:}" ;; esac ;; esac
+    done ;;
   *" ssm get-parameter "*) echo ami-ubuntu ;;
   *" ec2 wait "*) : ;;
   *" ssm describe-instance-information "*) echo Online ;;
@@ -245,15 +254,15 @@ case "$args" in
     key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); want=$(sed -n 's/.*--if-match \([^ ]*\).*/\1/p' <<<"$*")
     [ "$(cat "$FAKE_S3/$key.etag" 2>/dev/null)" = "$want" ] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
     rm -f "$FAKE_S3/$key" "$FAKE_S3/$key.etag" ;;
-  *" s3 cp "*"- s3://"*) key=$(sed -n 's|.*- s3://[^/]*/\([^ ]*\).*|\1|p' <<<"$args"); mkdir -p "$FAKE_S3/$(dirname "$key")"; cat > "$FAKE_S3/$key" ;;
+  *" s3 cp "*"- s3://"*) [ -z "${FAKE_LEDGER_WRITE_FAIL:-}" ] || exit 1; key=$(sed -n 's|.*- s3://[^/]*/\([^ ]*\).*|\1|p' <<<"$args"); mkdir -p "$FAKE_S3/$(dirname "$key")"; cat > "$FAKE_S3/$key" ;;
   *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
 esac
 """
 
 
-def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00"):
-    """describe-instances --output text lines for n g4dn.metal instances."""
-    return "".join(f"{at}\\ti-other{k}\\t{purpose}\\t48\\t2\\n" for k in range(n))
+def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00", type="g4dn.metal", cpu="48\\t2"):
+    """The fake's rows for n instances: launch time, id, purpose, type, cores, threads."""
+    return "".join(f"{at}\\ti-{type}-{k}\\t{purpose}\\t{type}\\t{cpu}\\n" for k in range(n))
 
 
 class GpuboxWallReserve(unittest.TestCase):
@@ -275,6 +284,7 @@ class GpuboxWallReserve(unittest.TestCase):
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
+        self.calls = calls
         def named(word):
             return [c for c in calls if f" {word} " in f" {c} "]
         return r, named("run-instances"), named("terminate-instances")
@@ -399,7 +409,48 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertIn("room_for ", src)
                 self.assertIn("admit_held", src)
                 self.assertIn("ledger_add ", src)
+                self.assertIn("admit_abandon", src)
                 self.assertIn("$ADMISSION_TAG]", src)
+
+    def test_usage_counts_each_type_s_default_vcpus(self):
+        # The quota charges a type's default vCPUs whatever the CPU options: one g4dn.metal and
+        # two g5.16xlarge at 16 CPUs each hold 96 + 64 + 64 = 224, and 96 more + 128 is 448.
+        # Counted from CpuOptions they were 128, and a box was admitted.
+        r, launches, _ = self.up(spot_in_use=boxes(1),
+                                 od_in_use=boxes(1) + boxes(2, type="g5.16xlarge", cpu="8\\t2"))
+        self.assertEqual(launches, [], r.stderr)
+
+    def test_vt_instances_count_against_the_g_quota(self):
+        # VT shares the G quotas: two vt1.24xlarge hold 192 of 384 on demand.
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(2, type="vt1.24xlarge"))
+        self.assertEqual(launches, [], r.stderr)
+
+    def test_an_ami_builder_resolves_its_ami_before_taking_the_lock(self):
+        # Every call that can stall runs before the lock: none between admit_held and the launch.
+        r, launches, _ = self.ami_launch("tile")
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        at = lambda word: next(i for i, c in enumerate(self.calls) if word in c)
+        self.assertLess(at("ssm get-parameter"), at("s3api put-object"))
+        self.assertEqual(at("s3api head-object") + 1, at("ec2 run-instances"), self.calls)
+
+    def test_a_launch_in_no_ledger_keeps_the_lock(self):
+        # A launch that may exist and is in no ledger leaves the lock to go stale, so the next
+        # launcher waits until describe-instances lists it; one that was terminated releases it.
+        import tempfile
+        cases = [("gpubox", dict(FAKE_RUN_FAIL="1"), True),
+                 ("gpubox", dict(FAKE_LEDGER_WRITE_FAIL="1", FAKE_TERMINATE_FAIL="1"), True),
+                 ("gpubox", dict(FAKE_LEDGER_WRITE_FAIL="1"), False),
+                 ("builder", dict(FAKE_RUN_FAIL="1"), True),
+                 ("builder", dict(FAKE_LEDGER_WRITE_FAIL="1", FAKE_TERMINATE_FAIL="1"), True)]
+        for who, knobs, kept in cases:
+            with self.subTest(who=who, knobs=knobs):
+                s3 = tempfile.mkdtemp()
+                if who == "gpubox":
+                    r, _, _ = self.up(od_in_use=boxes(1), s3=s3, **knobs)
+                else:
+                    r, _, _ = self.ami_launch("tile", s3=s3, **knobs)
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(os.path.exists(os.path.join(s3, "gpubox", "admission.lock")), kept, r.stderr)
 
     def test_a_ledger_entry_counts_its_own_vcpus(self):
         # An admission a moment ago, not listed yet. 96 listed + 4 + this box's 96 + the wall's

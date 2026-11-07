@@ -52,14 +52,15 @@ for az in ${AZS:-a b c d f}; do
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build},$ADMISSION_TAG]" \
     --query 'Instances[0].InstanceId' --output text 2>/tmp/measure-boot.err.$$) && break
-  grep -q -E 'InsufficientInstanceCapacity|capacity' /tmp/measure-boot.err.$$ || { cat /tmp/measure-boot.err.$$ >&2; exit 1; }
+  grep -q -E 'InsufficientInstanceCapacity|capacity' /tmp/measure-boot.err.$$ ||
+    { cat /tmp/measure-boot.err.$$ >&2; admit_abandon; say "run-instances failed; the admission lock is kept until stale in case it launched"; exit 1; }
   echo "no $type capacity in ${REGION}${az}"
 done
 rm -f /tmp/measure-boot.err.$$
 [ -n "$id" ] || { echo "no capacity in any AZ"; exit 1; }
 echo "capacity wait $((t0 - tw)) ms (not counted below), AZ ${REGION}${az}"
 t_accepted=$(now_ms)
-ledger_add "$id" "$mkt" "$vcpus" || { A ec2 terminate-instances --instance-ids "$id" >/dev/null; say "terminated $id: its admission could not be recorded"; exit 1; }
+ledger_add "$id" "$mkt" "$vcpus" || { A ec2 terminate-instances --instance-ids "$id" >/dev/null || admit_abandon; say "$id's admission could not be recorded: terminated it, or kept the lock until stale if that failed"; exit 1; }
 admit_unlock
 trap 'A ec2 terminate-instances --instance-ids "$id" >/dev/null; echo "terminated $id"' EXIT
 echo "launched $id: accepted after $((t_accepted - t0)) ms"

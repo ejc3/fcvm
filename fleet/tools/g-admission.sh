@@ -22,15 +22,23 @@ WALL_RESERVE_spot=96
 WALL_RESERVE_ondemand=128
 QUOTA_CODE_spot=L-3819A6DF
 QUOTA_CODE_ondemand=L-DB2E81BA
-# g_usage MARKET: one line per G instance counting against that market's quota (pending,
-# running, stopping, shutting down): "<launch time> <instance id> <purpose> <vCPUs>".
+# g_usage MARKET: one line per G or VT instance (both draw on the G quotas) counting against
+# that market's quota (pending, running, stopping, shutting down): "<launch time> <instance id>
+# <purpose> <vCPUs>". The vCPUs are the type's default, which is what the quota charges
+# whatever CPU options an instance was launched with.
 g_usage() {
-  local lc out
+  local lc out types vc
   if [ "$1" = spot ]; then lc='InstanceLifecycle==`spot`'; else lc='InstanceLifecycle!=`spot`'; fi
   out=$(A ec2 describe-instances --filters Name=instance-state-name,Values=pending,running,stopping,shutting-down \
-    --query "Reservations[].Instances[?starts_with(InstanceType, \`g\`) && $lc].[LaunchTime, InstanceId, Tags[?Key=='Purpose']|[0].Value, CpuOptions.CoreCount, CpuOptions.ThreadsPerCore]" \
+    --query "Reservations[].Instances[?(starts_with(InstanceType, \`g\`) || starts_with(InstanceType, \`vt\`)) && $lc].[LaunchTime, InstanceId, Tags[?Key=='Purpose']|[0].Value, InstanceType]" \
     --output text) || return 1
-  awk 'NF == 5 && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {print $1, $2, $3, $4 * $5; next} NF {bad = 1} END {exit bad}' <<<"$out"
+  awk 'NF && NF != 4 {bad = 1} END {exit bad}' <<<"$out" || return 1
+  types=$(awk 'NF {print $4}' <<<"$out" | sort -u)
+  [ -n "$types" ] || return 0
+  # shellcheck disable=SC2086  # one argument per type
+  vc=$(A ec2 describe-instance-types --instance-types $types --query 'InstanceTypes[].[InstanceType, VCpuInfo.DefaultVCpus]' --output text) || return 1
+  awk 'NR == FNR {if (NF == 2 && $2 ~ /^[0-9]+$/) v[$1] = $2; next}
+       NF {if (!($4 in v)) {bad = 1; next} print $1, $2, $3, v[$4]} END {exit bad}' <(echo "$vc") <(echo "$out")
 }
 # quota_of MARKET: the market's G vCPU quota, a whole number.
 quota_of() {
@@ -99,6 +107,10 @@ admit_held() {
   e=$(S3A s3api head-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --query ETag --output text 2>/dev/null) || return 1
   [ -n "$ADMIT_ETAG" ] && [ "$e" = "$ADMIT_ETAG" ]
 }
+# A launch that may have happened and is in no ledger (run-instances failed with an unknown
+# error, or the ledger could not be written and the instance could not be terminated): keep the
+# lock until it is stale, by when describe-instances lists the instance, instead of releasing it.
+admit_abandon() { ADMIT_ETAG=""; }
 admit_unlock() {
   [ -z "$ADMIT_ETAG" ] || S3A s3api delete-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --if-match "$ADMIT_ETAG" >/dev/null 2>&1 || true
   ADMIT_ETAG=""

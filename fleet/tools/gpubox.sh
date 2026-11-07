@@ -178,14 +178,14 @@ up)
         break 2
       fi
       grep -q -E 'InsufficientInstanceCapacity|MaxSpotInstanceCountExceeded|VcpuLimitExceeded|SpotMaxPriceTooLow|Unsupported' /tmp/gpubox.err.$$ \
-        || { cat /tmp/gpubox.err.$$ >&2; rm -f /tmp/gpubox.err.$$; exit 1; }
+        || { cat /tmp/gpubox.err.$$ >&2; rm -f /tmp/gpubox.err.$$; admit_abandon; die "run-instances failed; the admission lock is kept until stale in case it launched"; }
       say "no $market $TYPE in ${REGION}${az}: $(grep -o -E '\(([A-Za-z]+)\)' /tmp/gpubox.err.$$ | head -1)"
       id=""
     done
   done
   rm -f /tmp/gpubox.err.$$
   [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
-  ledger_add "$id" "$market" 96 || { A ec2 terminate-instances --instance-ids "$id" >/dev/null; die "terminated $id: its admission could not be recorded"; }
+  ledger_add "$id" "$market" 96 || { A ec2 terminate-instances --instance-ids "$id" >/dev/null || admit_abandon; die "$id's admission could not be recorded: terminated it, or kept the lock until stale if that failed"; }
   admit_unlock; trap - EXIT
   say "launched $id ($market, ${REGION}${az}, $ami), lease until $lease UTC"
   [ "$wait" = 0 ] || wait_ready "$t0" "$id"
