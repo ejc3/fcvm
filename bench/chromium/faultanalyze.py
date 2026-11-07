@@ -44,6 +44,23 @@ def read_fault_trace(path: Path):
     return out
 
 
+def interfault_gaps_ns(tr):
+    """Per fault after the first, the time from the end of every earlier fault's service to its
+    arrival, or 0 when one was still in service. With fault workers the service intervals
+    overlap and finish out of order, so the previous record's end is not the last one."""
+    gaps, done = [], None
+    for _, t0, t1 in tr:
+        if done is not None:
+            gaps.append(max(0, t0 - done))
+        done = t1 if done is None else max(done, t1)
+    return gaps
+
+
+def fault_span_ns(tr):
+    """From the first fault's arrival to the last service's end, whichever fault that is."""
+    return max(t1 for _, _, t1 in tr) - min(t0 for _, t0, _ in tr) if tr else 0
+
+
 # firecracker names its vCPU threads "fc_vcpu 0" -- with a space -- so the comm field
 # must be matched non-greedily, not as \S+, or every vCPU fault line is silently dropped.
 KVM_RE = re.compile(
@@ -306,15 +323,13 @@ def main():
                 # The gap between one fault's resolution and the next fault's arrival
                 # bounds the part the ioctl time does not see, and span/count is the
                 # end-to-end mean while the guest is fault-bound.
-                # With fault workers the service intervals overlap; an overlap is no
-                # unseen round trip, so it counts as no gap.
-                gaps = [max(0, tr[i + 1][1] - tr[i][2]) / 1000.0 for i in range(len(tr) - 1)]
+                gaps = [gap / 1000.0 for gap in interfault_gaps_ns(tr)]
                 if gaps:
                     item["uffd_interfault_us_p50"] = pct(gaps, 50)
                     item["uffd_interfault_us_mean"] = sum(gaps) / len(gaps)
                 offs = [o for o, _, _ in tr]
                 item["locality"] = locality(offs, granule)
-                item["fault_span_ms"] = (tr[-1][2] - tr[0][1]) / 1e6 if tr else 0.0
+                item["fault_span_ms"] = fault_span_ns(tr) / 1e6
                 if tr:
                     item["uffd_wall_us_per_fault"] = item["fault_span_ms"] * 1000.0 / len(tr)
                 sets_uffd.append(set(offs))

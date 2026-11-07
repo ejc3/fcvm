@@ -82,6 +82,16 @@ class TraceOrder(unittest.TestCase):
                 [off for off, _, _ in faultanalyze.read_fault_trace(path)], [0, 4096, 8192]
             )
 
+    def test_an_earlier_demand_that_finishes_last_bounds_the_span_and_the_gaps(self):
+        # In demand order: A [10, 20], B [20, 90], C [30, 35] (ms, as ns), B finishing last.
+        tr = [(0, 10_000_000, 20_000_000), (4096, 20_000_000, 90_000_000),
+              (8192, 30_000_000, 35_000_000)]
+        self.assertEqual(faultanalyze.fault_span_ns(tr), 80_000_000)
+        self.assertEqual(faultanalyze.interfault_gaps_ns(tr), [0, 0])
+        later = tr + [(12288, 95_000_000, 96_000_000)]
+        self.assertEqual(faultanalyze.interfault_gaps_ns(later), [0, 0, 5_000_000])
+        self.assertEqual(faultanalyze.fault_span_ns([]), 0)
+
 
 class SerialIsolation(unittest.TestCase):
     """A request may only be measured with no clone left over from the previous one."""
