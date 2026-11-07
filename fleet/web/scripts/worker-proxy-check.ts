@@ -3,8 +3,8 @@
 // built Worker that forwards to it (worker.ts, core/live-proxy.ts).
 //
 // The stand-in plays Access's part as the Worker meets it: the service token is admitted
-// and answered with a CF_Authorization JWT, which is admitted in cf-access-token until
-// /stand-in/revoke; anything else gets a 302 to a login page.
+// and answered with a CF_Authorization cookie (which must not reach the viewer); anything
+// else gets a 302 to a login page.
 //
 //   node scripts/worker-proxy-check.ts serve <port>          the stand-in coordinator
 //   node scripts/worker-proxy-check.ts check <worker port>   the checks; exit 1 on a failure
@@ -34,25 +34,16 @@ function seen(path: string, h: IncomingHttpHeaders, admittedBy: string): string 
 }
 
 if (mode === "serve") {
-  let issued: string | null = null;
-  let serial = 0;
   /** Access, as far as the Worker meets it: the admitting credential, or null for a 302. */
-  const admit = (h: IncomingHttpHeaders): { by: string; cookie: string | null } | null => {
-    const token = h["cf-access-token"];
-    if (typeof token === "string") return token === issued ? { by: "kept-token", cookie: null } : null;
+  const admit = (h: IncomingHttpHeaders): { by: string; cookie: string } | null => {
     if (h["cf-access-client-id"] === "smoke-id" && h["cf-access-client-secret"] === "smoke-secret") {
-      issued = `${b64url('{"alg":"RS256"}')}.${b64url(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, n: ++serial }))}.sig`;
-      return { by: "service-token", cookie: `CF_Authorization=${issued}; Path=/; Secure; HttpOnly` };
+      const jwt = `${b64url('{"alg":"RS256"}')}.${b64url(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 }))}.sig`;
+      return { by: "service-token", cookie: `CF_Authorization=${jwt}; Path=/; Secure; HttpOnly` };
     }
     return null;
   };
   const login = { location: "https://team.example.test/cdn-cgi/access/login" };
   const server = createServer((req, res) => {
-    if (req.url === "/stand-in/revoke") {
-      issued = null;
-      res.writeHead(200).end("revoked");
-      return;
-    }
     if (!req.url?.startsWith("/poster.jpg")) {
       res.writeHead(404).end("stand-in coordinator: not a coordinator path");
       return;
@@ -64,7 +55,7 @@ if (mode === "serve") {
     }
     res.writeHead(200, {
       "content-type": "application/json",
-      ...(a.cookie ? { "set-cookie": a.cookie } : {}),
+      "set-cookie": a.cookie,
       "cf-access-jwt-assertion": backendJwtHeader,
       "x-coordinator-test": backendMarker,
     }).end(seen("/poster.jpg", req.headers, a.by));
@@ -77,7 +68,7 @@ if (mode === "serve") {
       return;
     }
     wss.once("headers", (headers) => headers.push(
-      ...(a.cookie ? [`Set-Cookie: ${a.cookie}`] : []),
+      `Set-Cookie: ${a.cookie}`,
       `CF-Access-Jwt-Assertion: ${backendJwtHeader}`,
       `X-Coordinator-Test: ${backendMarker}`,
     ));
@@ -85,7 +76,6 @@ if (mode === "serve") {
   });
   server.listen(port, "127.0.0.1", () => console.log(`stand-in coordinator on ${port}`));
 } else if (mode === "check") {
-  const coordPort = Number(process.argv[4]);
   const base = `127.0.0.1:${port}`;
   const failures: string[] = [];
   const expect = (what: string, ok: boolean, detail: string) => {
@@ -101,13 +91,13 @@ if (mode === "serve") {
   };
   // The viewer's own Access credentials and a viewer address it tries to set itself.
   const viewer = { Cookie: "CF_Authorization=viewer-session", "cf-access-jwt-assertion": "viewer-jwt", "cf-connecting-ip": "203.0.113.7", "x-fleet-viewer-ip": "198.51.100.66" };
-  const poster = async (label: string, wantBy: string, wantTiming: string) => {
+  const poster = async (label: string) => {
     const r = await fetch(`http://${base}/poster.jpg`, { headers: viewer, signal: AbortSignal.timeout(10000) });
     const raw = await r.text();
     const s = parse(raw);
     expect(`${label}: /poster.jpg reached the coordinator`, r.status === 200 && s.path === "/poster.jpg", `${r.status} ${raw.slice(0, 200)}`);
-    expect(`${label}: admitted by the ${wantBy}`, s.admitted_by === wantBy, raw.slice(0, 200));
-    expect(`${label}: Server-Timing says ${wantTiming}`, (r.headers.get("server-timing") ?? "").includes(`desc="${wantTiming}"`), r.headers.get("server-timing") ?? "none");
+    expect(`${label}: admitted by the Worker's service token`, s.admitted_by === "service-token", raw.slice(0, 200));
+    expect(`${label}: Server-Timing gives the coordinator leg`, /upstream;dur=\d+/.test(r.headers.get("server-timing") ?? ""), r.headers.get("server-timing") ?? "none");
     expect(`${label}: drops the viewer's Access credentials`, s.cookie === null && s.jwt === null, raw.slice(0, 200));
     expect(`${label}: carries the viewer's own address, not one it sent`, s.viewer_ip === "203.0.113.7", raw.slice(0, 200));
     expect(`${label}: strips the coordinator's Access response credentials`, !r.headers.has("set-cookie") && !r.headers.has("cf-access-jwt-assertion"), "unexpected authentication header");
@@ -117,8 +107,7 @@ if (mode === "serve") {
   const page = await fetch(`http://${base}/?mode=potato`, { signal: AbortSignal.timeout(30000) }).then((r) => r.text());
   expect("the page connects to its own origin", page.includes(`ws://${base}/live`), "no same-origin /live URL in the page");
 
-  await poster("first request", "service-token", "service-token");
-  await poster("second request", "kept-token", "kept-token");
+  await poster("poster");
 
   // ws exposes the upgrade headers; a message afterwards proves the actual socket survives.
   const live = await new Promise<string>((resolve) => {
@@ -131,7 +120,7 @@ if (mode === "serve") {
       expect("/live strips the coordinator's Access response credentials",
         !response.headers["set-cookie"] && !response.headers["cf-access-jwt-assertion"], "unexpected authentication header");
       expect("/live keeps safe upgrade headers", response.headers["x-coordinator-test"] === backendMarker, "missing test header");
-      expect("/live carries Server-Timing", String(response.headers["server-timing"] ?? "").includes('desc="kept-token"'), String(response.headers["server-timing"] ?? "none"));
+      expect("/live carries Server-Timing", /upstream;dur=\d+/.test(String(response.headers["server-timing"] ?? "")), String(response.headers["server-timing"] ?? "none"));
     });
     ws.once("message", (data) => {
       clearTimeout(timer);
@@ -145,12 +134,7 @@ if (mode === "serve") {
   });
   const s = parse(live);
   expect("/live upgrade is relayed to the coordinator", s.path === "/live", live.slice(0, 200));
-  expect("/live is admitted by the kept token", s.admitted_by === "kept-token", live.slice(0, 200));
-
-  // Access stops admitting the kept token: the Worker goes back to the service token at once.
-  await fetch(`http://127.0.0.1:${coordPort}/stand-in/revoke`, { signal: AbortSignal.timeout(5000) });
-  await poster("after the kept token is refused", "service-token", "kept-token-refused");
-  await poster("after a new token is kept", "kept-token", "kept-token");
+  expect("/live is admitted by the Worker's service token", s.admitted_by === "service-token", live.slice(0, 200));
 
   const agent = await fetch(`http://${base}/agent`, { signal: AbortSignal.timeout(10000) });
   const agentBody = await agent.text();

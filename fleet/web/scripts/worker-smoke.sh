@@ -75,4 +75,4 @@ pnpm exec wrangler dev --local --ip 127.0.0.1 --port "$worker_port" \
 pid=$!
 pids+=("$pid")
 wait_ready
-node scripts/worker-proxy-check.ts check "$worker_port" "$coord_port" || fail "the Worker does not forward the coordinator's paths ($(cat "$work/coord.log"))"
+node scripts/worker-proxy-check.ts check "$worker_port" || fail "the Worker does not forward the coordinator's paths ($(cat "$work/coord.log"))"
