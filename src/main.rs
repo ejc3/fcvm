@@ -118,6 +118,21 @@ async fn run() -> Result<()> {
     // This must be done AFTER setting up the tracing subscriber
     let _ = LogTracer::init();
 
+    // A command that starts a VMM or a memory server moves this process into the VM's own
+    // cgroup before it starts anything, so what its children allocate is charged there and
+    // not to the caller's session (#1028, `fcvm::cgroup`).
+    let scope = match fcvm::cgroup::scope_request(&cli.cmd) {
+        Some(no_swap) => fcvm::cgroup::enter_this_process(no_swap),
+        None => Ok(None),
+    };
+    let scope = match scope {
+        Ok(scope) => scope,
+        Err(e) => {
+            error!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
         Commands::Ls(args) => commands::cmd_ls(args).await,
@@ -135,6 +150,10 @@ async fn run() -> Result<()> {
         }
         Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
     };
+
+    if let Some(scope) = scope {
+        scope.leave();
+    }
 
     // Handle errors
     if let Err(e) = &result {

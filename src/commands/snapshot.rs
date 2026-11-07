@@ -1743,9 +1743,6 @@ fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
     if args.exec.is_some() {
         bail!("--exec is not supported for disk-only clones yet (cold boot has no one-shot exec mode)");
     }
-    if args.no_swap {
-        bail!("--no-swap is not supported for disk-only clones yet");
-    }
     if args.firecracker_bin.is_some() {
         bail!(
             "--firecracker-bin does not apply to disk-only snapshots: they cold-boot on the \
@@ -3520,13 +3517,6 @@ async fn cmd_snapshot_run_inner(
         .take()
         .expect("restored VM owns its restore-completion receiver");
 
-    // Disable swap for Firecracker if requested via --no-swap
-    if args.no_swap {
-        if let Ok(pid) = vm_manager.pid() {
-            super::common::disable_cgroup_swap(pid);
-        }
-    }
-
     // One transport-independent generation gate before any lifecycle branch.
     // Output may already have reconnected and TTY may already carry bytes, but
     // neither can publish lifecycle readiness (and --exec cannot run) until the
@@ -4743,6 +4733,9 @@ fn run_args_from_snapshot_metadata(
         image_disk_override: meta.image_disk_path.clone(),
         pmem_devices: meta.pmem_devices.clone(),
         resolved_extra_disks: None,
+        // The VM's cgroup, and its swap setting, were entered from the snapshot run's own
+        // --no-swap before this runs (`crate::cgroup`).
+        no_swap: false,
     }
 }
 
@@ -6111,12 +6104,13 @@ mod tests {
         assert!(ensure_not_disk_only(SnapshotKind::Full, "snapshot serve").is_ok());
     }
 
+    /// `--no-swap` is applied to the VM's cgroup before any VMM starts (`crate::cgroup`),
+    /// so a disk-only clone's cold boot honours it like a restore does.
     #[test]
-    fn a_disk_only_run_still_refuses_no_swap() {
+    fn a_disk_only_run_accepts_no_swap() {
         let mut args = snapshot_runtime_args_without_overrides();
-        assert!(ensure_disk_only_run_supports(&args).is_ok());
         args.no_swap = true;
-        assert!(ensure_disk_only_run_supports(&args).is_err());
+        assert!(ensure_disk_only_run_supports(&args).is_ok());
     }
 
     /// A disk-only snapshot has no memory image to restore: it cold-boots on its

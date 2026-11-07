@@ -600,9 +600,10 @@ def spawn_in_cgroup(cg_path, argv, log_path, env=None):
     """
     script = f'sudo -n sh -c "echo $BASHPID > {cg_path}/cgroup.procs" || exit 90; exec "$0" "$@"'
     handle = open(log_path, "wb")
+    # fcvm run as root would otherwise move itself out of cg_path into a cgroup of its own.
+    env = dict(env or os.environ, FCVM_CGROUP_PARENT="none")
     return subprocess.Popen(["bash", "-c", script] + list(argv),
-                            stdout=handle, stderr=subprocess.STDOUT,
-                            env=env or os.environ.copy())
+                            stdout=handle, stderr=subprocess.STDOUT, env=env)
 
 
 def state_files(state_dir):
@@ -816,7 +817,7 @@ class FcvmSide:
             name = f"mem-{self.run_id}-{cell_tag}-{i}"
             log_path = os.path.join(self.args.results, "logs", f"{name}.log")
             argv = [self.args.fcvm, "snapshot", "run", "--pid", str(self.serve_pid),
-                    "--name", name, "--no-dirty-tracking", "--no-swap"]
+                    "--name", name, "--no-dirty-tracking"]
             env = dict(os.environ, RUST_LOG="fcvm=debug")
             proc = spawn_in_cgroup(cgp, argv, log_path, env)
             clone = {"i": i, "leaf": leaf, "name": name,

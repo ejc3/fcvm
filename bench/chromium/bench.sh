@@ -492,14 +492,17 @@ req() {
         (
             cg_join "$leaf"
             echo BENCH_T0
+            # FCVM_CGROUP_PARENT=none keeps fcvm in the leaf: as root it would
+            # otherwise move into a cgroup of its own. --no-swap needs that
+            # cgroup, so the leaf runs go without it.
             if [ -n "$sudoflag" ]; then
                 exec timeout -k 10 "$REQ_TIMEOUT" \
-                    sudo env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run "${src[@]}" --name "$name" \
-                    --no-dirty-tracking --no-swap --exec "$execcmd" 2>&1
+                    sudo env RUST_LOG=$FCVM_LOG FCVM_CGROUP_PARENT=none "$FCVM" snapshot run \
+                    "${src[@]}" --name "$name" --no-dirty-tracking --exec "$execcmd" 2>&1
             else
                 exec timeout -k 10 "$REQ_TIMEOUT" \
-                    env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run "${src[@]}" --name "$name" \
-                    --no-dirty-tracking --no-swap --exec "$execcmd" 2>&1
+                    env RUST_LOG=$FCVM_LOG FCVM_CGROUP_PARENT=none "$FCVM" snapshot run \
+                    "${src[@]}" --name "$name" --no-dirty-tracking --exec "$execcmd" 2>&1
             fi
         ) | python3 -c "$TSPY" >> "$lf" || rc=$?
     else
@@ -510,9 +513,10 @@ req() {
                 --no-dirty-tracking --no-swap --exec "$execcmd" 2>&1 \
                 | python3 -c "$TSPY" >> "$lf" || rc=$?
         else
+            # Unprivileged, fcvm cannot make the VM's cgroup and refuses --no-swap.
             timeout -k 10 "$REQ_TIMEOUT" \
                 env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run "${src[@]}" --name "$name" \
-                --no-dirty-tracking --no-swap --exec "$execcmd" 2>&1 \
+                --no-dirty-tracking --exec "$execcmd" 2>&1 \
                 | python3 -c "$TSPY" >> "$lf" || rc=$?
         fi
     fi

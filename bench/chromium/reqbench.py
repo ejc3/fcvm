@@ -4328,16 +4328,20 @@ def clone_run_cmd(args, name: str) -> list:
     """The `fcvm snapshot run` command line of one clone.
 
     reqscale puts each clone in its backend's cgroup through a guard that execs
-    fcvm (`spawn_prefix`), and accounts and checks the clone's processes there.
-    `--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope
-    (`disable_cgroup_swap`), out of that cgroup, so a reqscale clone does not
-    pass it: in one scale run all 7,560 clones logged the move, and reqscale's
-    membership check failed 3 requests that sampled Firecracker after it.
+    fcvm (`spawn_prefix`) with FCVM_CGROUP_PARENT=none, and accounts and checks
+    the clone's processes there. `--no-swap` needs the VM's own cgroup, which
+    fcvm refuses to run without, so a reqscale clone does not pass it. Before
+    fcvm made that cgroup itself, `--no-swap` moved Firecracker out of the
+    backend cgroup: in one scale run all 7,560 clones logged the move, and
+    reqscale's membership check failed 3 requests that sampled Firecracker
+    after it. A serial clone passes it only as root: unprivileged, fcvm cannot
+    make the cgroup and refuses the flag.
     """
     prefix = list(getattr(args, "spawn_prefix", ()))
+    no_swap = [] if prefix or os.geteuid() != 0 else ["--no-swap"]
     return prefix + [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking",
-    ] + ([] if prefix else ["--no-swap"])
+    ] + no_swap
 
 
 def clone_backend_args(args) -> list:

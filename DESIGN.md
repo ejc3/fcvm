@@ -1167,6 +1167,25 @@ async fn main() -> Result<()> {
 5. Clean up network resources
 6. Remove temporary files
 
+### The VM's Own Cgroup
+
+cgroup v2 charges a page to the cgroup of the process that instantiated it and does not
+move the charge when the process moves. `podman run`, `podman prepare`, `snapshot run` and
+`snapshot serve` therefore move the fcvm process into its scope in `main`, before the
+command runs, and every child (Firecracker, holder, pasta) and every in-process server
+(UFFD, FUSE) starts there. Implementation and the reasons for each choice: `src/cgroup.rs`.
+
+| | |
+|---|---|
+| where | `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the cgroup2 root, written to cgroupfs directly (`FCVM_CGROUP_PARENT` names another parent, `none` disables it) |
+| why not systemd | `systemd-run --scope` cannot place a running process; `StartTransientUnit` needs a bus client and a running systemd, which containers and nested guests do not all have. A caller that wants a systemd unit starts fcvm in one (`systemd-run --scope ... env FCVM_CGROUP_PARENT=none fcvm ...`) |
+| oomd | outside the user slice, so a rule that kills a session scope does not kill the VM; a slice oomd watches is one `FCVM_CGROUP_PARENT` away |
+| confined callers | a cgroup namespace still confines (the root is the namespace's); a root caller in a sandbox slice leaves it unless `FCVM_CGROUP_PARENT` names that slice |
+| unprivileged | stays in its own cgroup, one log line |
+| `--no-swap` | `memory.swap.max=0` on the scope before the VMM starts; refused when there is no scope with a memory controller |
+| lifetime | pdeathsig is per process and survives the move: a VM dies with its launcher where the launcher armed it; a foreground fcvm dies with its terminal's SIGHUP; a detached one outlives the session |
+| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; each entry sweeps scopes whose (pid, start time) is gone, and empty `fcvm-<pid>.scope`s of earlier releases, under an `flock` on the parent that covers the empty window between a scope's `mkdir` and its owner's entry. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
+
 ---
 
 ## Guest Agent

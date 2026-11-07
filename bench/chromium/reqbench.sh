@@ -883,8 +883,12 @@ start_clone() {
     # same) instead of from a UFFD serve.
     local -a source_args=(--pid "$spid")
     [ -n "$spid" ] || source_args=(--snapshot "$TAG")
+    # --no-swap needs the VM's own cgroup, which fcvm makes only as root and
+    # otherwise refuses the flag.
+    local -a swap_args=()
+    if [ -n "$SUDO" ] || [ "$(id -u)" = 0 ]; then swap_args=(--no-swap); fi
     $SUDO env RUST_LOG=$FCVM_LOG "$FCVM" snapshot run "${source_args[@]}" --name "$cname" \
-        --no-dirty-tracking --no-swap >"$cl" 2>&1 &
+        --no-dirty-tracking "${swap_args[@]}" >"$cl" 2>&1 &
     CLONE_BG=$!
     track "$CLONE_BG"
     local t0=$SECONDS cpid=""

@@ -1165,6 +1165,14 @@ pub struct RunArgs {
     /// `--disk-dir` is built from the private copy named here, not from HOST_DIR.
     #[arg(skip)]
     pub resolved_extra_disks: Option<crate::storage::disk_dir::ResolvedExtraDisks>,
+
+    /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
+    /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
+    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
+    /// refuses to start without it. Not part of any snapshot key.
+    #[arg(long)]
+    pub no_swap: bool,
 }
 
 // ============================================================================
@@ -1334,6 +1342,14 @@ pub struct SnapshotServeArgs {
     /// memory; the pages past it fault on demand. Default: no bound.
     #[arg(long, value_name = "MiB", env = "FCVM_UFFD_PREFETCH_MAX_MIB")]
     pub uffd_prefetch_max_mib: Option<u64>,
+
+    /// Disable swap for the memory server: memory.swap.max=0 on its own cgroup, which
+    /// fcvm enters before it maps the snapshot (see `FCVM_CGROUP_PARENT`). In minor mode
+    /// this keeps the shared memfd every clone maps out of swap. Needs root on a cgroup2
+    /// host where the memory controller can be enabled for the server's cgroup; fcvm
+    /// refuses to start without it.
+    #[arg(long)]
+    pub no_swap: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1364,10 +1380,11 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub no_dirty_tracking: bool,
 
-    /// Disable swap for the Firecracker process (sets memory.swap.max=0 on its
-    /// cgroup). Prevents the kernel from swapping guest memory pages, forcing it
-    /// to evict file cache instead. Useful for large VMs where swap I/O would
-    /// degrade performance.
+    /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
+    /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
+    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
+    /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
 

@@ -524,6 +524,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so the guest takes a file's size and mtime from the host. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
+| `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
@@ -537,6 +538,25 @@ cached in `assets_dir/firecracker/<profile>.resolved.json` and reused for
 that file, so rebuilding the fork takes effect for launches immediately rather
 than after the TTL. `<binary> --version` probes are cached the same way, keyed by
 the binary's path + mtime + size, so a rebuilt binary is always re-checked.
+
+### A VM's own cgroup
+
+Run as root, `podman run`, `podman prepare`, `snapshot run` and `snapshot serve` move the
+fcvm process into `/sys/fs/cgroup/fcvm.slice/fcvm-<pid>-<starttime>.scope` before they
+start anything. Firecracker, the namespace holder, pasta, the memory server and the FUSE
+servers start inside it, so guest memory and the memory server's page cache are charged to
+the VM's cgroup and not to the session that ran fcvm, and a session that is killed for
+memory does not take the VM with it. `FCVM_CGROUP_PARENT` moves the scopes under another
+parent (for instance a slice your oomd watches), or `none` keeps fcvm where it was started;
+to run a VM in a systemd unit instead, start fcvm in one with
+`systemd-run --scope [-p MemorySwapMax=0] env FCVM_CGROUP_PARENT=none fcvm ...`.
+fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the next
+fcvm that starts. An unprivileged fcvm stays in its own cgroup.
+
+`--no-swap` (on all four commands) sets `memory.swap.max` to 0 on that cgroup before the
+VMM starts. It needs the cgroup, so fcvm refuses the flag when it cannot create one with a
+memory controller: unprivileged, with `FCVM_CGROUP_PARENT=none`, or on a host without
+cgroup2.
 
 ### Image Delivery Modes
 

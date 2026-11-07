@@ -409,6 +409,11 @@ class Sampler(threading.Thread):
             time.sleep(0.002)
 
 
+def no_swap_args():
+    """`--no-swap` as root; unprivileged, fcvm cannot make the VM's cgroup and refuses it."""
+    return ["--no-swap"] if os.geteuid() == 0 else []
+
+
 def run_request(*, cell, tag, memarm, umode, serve_pid, url, name, out_dir, hold,
                 fmt="jpeg", qual=80, guest_bytes=2 << 30, req_timeout=120, ftrace=False):
     log_path = out_dir / "requests" / f"{name}.log"
@@ -419,7 +424,7 @@ def run_request(*, cell, tag, memarm, umode, serve_pid, url, name, out_dir, hold
     cmd = [
         "timeout", "-k", "10", str(req_timeout),
         str(FCVM), "snapshot", "run", *src, "--name", name,
-        "--no-dirty-tracking", "--no-swap", "--exec", execcmd,
+        "--no-dirty-tracking", *no_swap_args(), "--exec", execcmd,
     ]
     env = dict(os.environ, RUST_LOG="fcvm=debug")
 

@@ -161,7 +161,10 @@ def main():
             name = f"tdp-{os.getpid()}-{i}"
             log = f"/tmp/{name}.log"
             cmd = [a.fcvm, "snapshot", "run", "--pid", str(a.serve_pid), "--name", name,
-                   "--no-dirty-tracking", "--no-swap"]
+                   "--no-dirty-tracking"]
+            # Unprivileged, fcvm cannot make the VM's cgroup and refuses --no-swap.
+            if os.geteuid() == 0:
+                cmd.append("--no-swap")
             watch = DirWatch(state_dir)  # registered BEFORE the spawn
             with open(log, "wb") as lf:
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
