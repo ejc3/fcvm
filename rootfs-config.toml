@@ -251,7 +251,7 @@ remove_dirs = [
 # deployable-profile rule above.
 [kernel_profiles.default.arm64]
 description = "Default fcvm guest kernel"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e157927b9f8f"
 build_inputs = [
@@ -268,19 +268,18 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 
 [kernel_profiles.default.amd64]
 description = "Default fcvm guest kernel (x86_64)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "2bf67c4be6a7"
+kernel_sha = "cb9d7ff723d3"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
     "kernel/patches-default-x86/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
-    "kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch",
     "kernel/patches-default-x86/0003-fuse-trust-server-attributes-without-writers.patch",
 ]
 kernel_config = "kernel/default-x86.conf"
-# Applies every patch in kernel/patches-default-x86 (the arm64 patches plus
-# x86-only ones), and build_inputs above names each one. Keep this line: an omitted value applies kernel/patches.
+# Applies every patch in kernel/patches-default-x86 (today the same patch set as
+# arm64), and build_inputs above names each one. Keep this line: an omitted value applies kernel/patches.
 patches_dir = "kernel/patches-default-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
@@ -298,7 +297,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # profile yet, so setup builds the kernel locally (--build-kernels).
 [kernel_profiles.gpu.arm64]
 description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
@@ -352,7 +351,7 @@ cuda_checkpoint_sha256 = "4636b2615135b87e5ff524d2e80ecc0d4a4e599f1e61fab0737474
 
 [kernel_profiles.gpu.amd64]
 description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules) (x86_64)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
@@ -396,7 +395,7 @@ cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474
 # instruction. The host's kvm_intel needs nested=1.
 [kernel_profiles.phone.amd64]
 description = "GPU passthrough guest kernel with KVM for an Android Emulator (x86_64)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
@@ -428,9 +427,9 @@ cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
 [kernel_profiles.nested.arm64]
 description = "Nested virtualization support for running VMs inside VMs"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "c637ad6e491c"
+kernel_sha = "9b96d0b1b4d7"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -467,7 +466,7 @@ fuse_readers = 64
 # which includes all EC2/AWS modules (ENA networking, NVMe, etc.)
 # Then applies fcvm patches for NV2 cache coherency (DSB barriers)
 [kernel_profiles.nested.arm64.host_kernel]
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 patches_dir = "kernel/patches-arm64"
 
 # Build inputs for SHA calculation (patches only, skip *.vm.patch for host)
@@ -482,9 +481,9 @@ build_inputs = [
 # Requires CONFIG_PCI=y for GENERIC_MSI_IRQ (virtio-mmio IRQ infrastructure).
 [kernel_profiles.nested.amd64]
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "e87d150d1a82"
+kernel_sha = "021234ca22e2"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -507,7 +506,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
 # then applies FUSE remap_file_range patch for reflink support in nested VMs
 [kernel_profiles.nested.amd64.host_kernel]
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 patches_dir = "kernel/patches-x86"
 
 # Build inputs for SHA calculation
@@ -522,9 +521,9 @@ build_inputs = [
 [kernel_profiles.btrfs.arm64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "aa276ba49bab"
+kernel_sha = "81a23c24a0a4"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -547,9 +546,9 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 [kernel_profiles.btrfs.amd64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
-kernel_version = "6.18.50"
+kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "7bf42fe9216d"
+kernel_sha = "fd5dea90d206"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -560,9 +559,8 @@ build_inputs = [
 ]
 
 kernel_config = "kernel/btrfs-x86.conf"
-# kernel/patches (the FUSE patches and the virtio_ring fix) plus x86-only
-# patches, linked. Keep this line: the build applies kernel/patches when it is
-# omitted.
+# kernel/patches (the FUSE patches and the virtio_ring fix), linked. Keep
+# this line: the build applies kernel/patches when it is omitted.
 patches_dir = "kernel/patches-btrfs-x86"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

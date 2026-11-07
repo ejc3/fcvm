@@ -1,1 +1,0 @@
-../patches-arm64/0004-net-bridge-remove-stale-rcu_barrier-in-br_multicast_dev_del.patch

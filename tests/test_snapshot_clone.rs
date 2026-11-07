@@ -6881,11 +6881,10 @@ const ASYNC_PF_NMI_SOURCE: &str = include_str!("data/async_pf_nmi.c");
 
 /// ASYNC #PF INSIDE AN NMI. A clone restored through a copy-mode serve with prefetch off takes a KVM
 /// async page fault for every page it touches. If a perf sampling NMI lands after one is delivered and
-/// before its handler reads the reason flags, and the NMI's user call-chain walk faults, the pinned
-/// 6.18.50 kernel lets that nested fault take the flags and panics with "Host injected async #PF in
-/// interrupt disabled region".
-/// kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch
-/// fixes it. The guest program fills memory before the snapshot and reads it back in the clone while
+/// before its handler reads the reason flags, and the NMI's user call-chain walk faults, 6.18.58 and
+/// earlier let that nested fault take the flags and panic with "Host injected async #PF in interrupt
+/// disabled region". Upstream 81d99abe2bd8, in 6.18.59 and later, fixes it; fcvm carried the same fix
+/// as a patch until the pin moved past it. The guest program fills memory before the snapshot and reads it back in the clone while
 /// sampling hardware cycles with call chains and with its frame pointer aimed at an unmapped page.
 /// Without the fix the clone panicked within seconds in every run, after about 19,000 of the 262,144
 /// page faults 1 GiB takes.

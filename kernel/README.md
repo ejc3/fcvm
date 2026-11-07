@@ -48,29 +48,26 @@ at the old size (#1041). The patch keeps them only while the file is open for wr
 Every guest patch directory links it; the nested ones link it as a `.vm.patch`, so the
 host kernel built from the same directory does not apply it.
 
-x86-only patches live in `kernel/patches-default-x86`, which the x86 default
-profile applies in place of `kernel/patches-default` and which also links the
-shared patches. `kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for
-the btrfs and nested x86 kernels, so the arm64 kernels and their release
-identities do not change. Today that is a fix for a race Linux has not fixed: a
-page fault taken inside an NMI could consume the reason flags of an async page
-fault delivered just before the NMI, and the guest then panics with "Host
-injected async #PF in interrupt disabled region". A restored clone takes an
-async page fault for every page it touches that the host has not paged in yet,
-so perf sampling with call chains in a clone hits it within seconds. The nested
-link is a `.vm.patch` so the x86 host kernel does not apply it.
+x86 patches live in `kernel/patches-default-x86`, which the x86 default profile
+applies in place of `kernel/patches-default` and which links the shared patches.
+`kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for the btrfs and
+nested x86 kernels. The directory held an x86-only fix for an async page fault
+taken inside an NMI ("Host injected async #PF in interrupt disabled region")
+until upstream took it as 81d99abe2bd8, which 6.18.59 carries; it holds no
+x86-only patch today.
 
 The nested profiles' `kernel/patches-arm64` and `kernel/patches-x86` also feed
-the host kernels (`make install-host-kernel`), minus the `.vm.patch` files. Both
-carry Linux commit 25ae123db10b (6.18 stable 39679927fa7a, first in 6.18.60),
-which removes an `rcu_barrier()` from `br_multicast_dev_del()`. Each fcvm VM has
-a bridge in its own network namespace, and the kernel tears dying namespaces
-down in batches under one RTNL hold, so the barrier ran once per bridge inside
-that hold: with 100 VMs stopping together on 6.18.50, `cleanup_net` held RTNL
-for 1.9 s and a namespace creation waited up to 1.86 s; with the patch no hold
-passed 50 ms and the longest creation took 180 ms (#1563).
-`every_host_kernel_applies_the_bridge_rcu_barrier_removal` fails if a host
-kernel's patch set loses it.
+the host kernels (`make install-host-kernel`), minus the `.vm.patch` files. The
+host kernels pin 6.18.60 or later, the first 6.18 release with Linux commit
+25ae123db10b (6.18 stable 39679927fa7a), which removes an `rcu_barrier()` from
+`br_multicast_dev_del()`. Each fcvm VM has a bridge in its own network
+namespace, and the kernel tears dying namespaces down in batches under one RTNL
+hold, so the barrier ran once per bridge inside that hold: with 100 VMs stopping
+together on 6.18.50, `cleanup_net` held RTNL for 1.9 s and a namespace creation
+waited up to 1.86 s; without the barrier no hold passed 50 ms and the longest
+creation took 180 ms (#1563). fcvm carried the commit as a patch until the pin
+reached 6.18.60. `every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier`
+fails if a host kernel pins an earlier release.
 
 The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
 x86_64): the default patches, linked, plus one Kconfig patch that gives
