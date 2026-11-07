@@ -4,10 +4,12 @@ use tracing::{debug, info, warn};
 
 use super::namespace::exec_in_namespace;
 
-/// The second NFS port a restored guest mounts its shares at, forwarded to the host's
-/// nfsd in every clone namespace. fc-agent's `types::NFS_RESTORE_PORT` must match
+/// The ports a restored guest mounts its NFS shares at, from `NFS_RESTORE_PORT`, each
+/// forwarded to the host's nfsd in every clone namespace. fc-agent's
+/// `types::NFS_RESTORE_PORT` and `NFS_RESTORE_PORTS` must match
 /// (`nfs_restore_port_matches_fc_agent`).
 pub const NFS_RESTORE_PORT: u16 = 20049;
+pub const NFS_RESTORE_PORTS: u16 = 16;
 
 /// In-Namespace NAT configuration for clone egress
 ///
@@ -799,13 +801,17 @@ pub async fn setup_in_namespace_nat(
     // the guest IP; without the masquerade, replies would depend on the
     // shared guest-IP /32 host route, which only one clone can hold.)
     //
-    // A restored guest remounts its NFS shares at the gateway's other NFS port
+    // A restored guest remounts its NFS shares at the next port of the restore range
     // (`NFS_RESTORE_PORT`), so that the remount gets an NFS client of its own; this
-    // namespace forwards that port to the host's nfsd too, ahead of the rule that keeps
-    // every other port as it is. A clone of a clone remounts back at 2049, so the
-    // snapshot's mounts reach the host at either port.
+    // namespace forwards the whole range to the host's nfsd, ahead of the rule that keeps
+    // every other port as it is, so the mounts of every earlier generation of a chain
+    // still reach the host.
     let nfs_restore_target = format!("{host_ip}:2049");
-    let nfs_restore_port = NFS_RESTORE_PORT.to_string();
+    let nfs_restore_port = format!(
+        "{}:{}",
+        NFS_RESTORE_PORT,
+        NFS_RESTORE_PORT + NFS_RESTORE_PORTS - 1
+    );
     let output = exec_in_namespace(
         ns_name,
         &[
@@ -1260,6 +1266,12 @@ mod tests {
                 "pub const NFS_RESTORE_PORT: u16 = {NFS_RESTORE_PORT};"
             )),
             "fc-agent/src/types.rs NFS_RESTORE_PORT differs from src/network/veth.rs"
+        );
+        assert!(
+            agent.contains(&format!(
+                "pub const NFS_RESTORE_PORTS: u16 = {NFS_RESTORE_PORTS};"
+            )),
+            "fc-agent/src/types.rs NFS_RESTORE_PORTS differs from src/network/veth.rs"
         );
     }
 

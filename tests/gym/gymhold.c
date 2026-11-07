@@ -192,6 +192,23 @@ int main(int argc, char **argv)
 			else
 				line(n, "ok");
 		} else if (!strcmp(kind, "rw")) {
+			/* The block holds the file's own pattern until a hold first writes it, and
+			 * a hold's letter (upper case) after; another twin or clone may write the
+			 * same host file, so any hold's letter is right. Anything else, such as
+			 * another file's lower-case pattern, is another file behind this handle,
+			 * which a write followed by a read of the same block cannot see. */
+			ssize_t had = pread(fd, buf, BLOCK, b * BLOCK);
+			if (had != BLOCK) {
+				line(n, "BAD pread returned %zd: %s", had, strerror(errno));
+				usleep(200000);
+				continue;
+			}
+			if (!(buf[0] == want(b) || (buf[0] >= 'A' && buf[0] <= 'Z')) || buf[BLOCK - 1] != buf[0]) {
+				line(n, "WRONG block %ld held '%c' before the write, want '%c' or a hold's letter",
+				     b, buf[0], want(b));
+				usleep(200000);
+				continue;
+			}
 			char c = (char)('A' + n % 26);
 			memset(buf, c, BLOCK);
 			if (pwrite(fd, buf, BLOCK, b * BLOCK) != BLOCK) {

@@ -680,12 +680,25 @@ pub fn mount_nfs_shares(
 }
 
 /// The mount namespaces other than fc-agent's own that hold an NFS mount at one of
-/// `paths`, as (a process in the namespace, the path). The container's namespace is
-/// one: podman bound each share into it when the container started. Reads each
-/// process's mountinfo, which names mounts without touching the filesystems in them.
-pub fn nfs_mounts_in_other_namespaces(paths: &[String]) -> Result<Vec<(i32, String)>> {
+/// `paths`, each as its namespace (opened while a process in it was found, so the
+/// namespace outlives that process) and the paths to rebind there. The container's
+/// namespace is one: podman bound each share into it when the container started. A
+/// path under another of `paths` is left out, because the rebind of the outer share
+/// copies the mounts under it ([`rebind_into_namespace`]). Reads each process's
+/// mountinfo, which names mounts without touching the filesystems in them.
+pub fn nfs_mounts_in_other_namespaces(
+    paths: &[String],
+) -> Result<Vec<(std::fs::File, Vec<String>)>> {
     let own =
         std::fs::read_link("/proc/self/ns/mnt").context("reading fc-agent's mount namespace")?;
+    let outermost: Vec<&String> = paths
+        .iter()
+        .filter(|path| {
+            !paths
+                .iter()
+                .any(|other| other != *path && is_under(path, other))
+        })
+        .collect();
     let mut seen = std::collections::HashSet::new();
     seen.insert(own);
     let mut found = Vec::new();
@@ -698,35 +711,50 @@ pub fn nfs_mounts_in_other_namespaces(paths: &[String]) -> Result<Vec<(i32, Stri
         else {
             continue;
         };
-        // A process that exits between the listing and these reads has no namespace to fix.
-        let Ok(ns) = std::fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
+        // A process that exits between these reads has no namespace to fix through it;
+        // its namespace stays unseen, so another process in it can still be found.
+        let Ok(ns) = std::fs::File::open(format!("/proc/{pid}/ns/mnt")) else {
             continue;
         };
-        if !seen.insert(ns) {
+        let Ok(ns_id) = std::fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
+            continue;
+        };
+        if seen.contains(&ns_id) {
             continue;
         }
         let Ok(mountinfo) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
             continue;
         };
-        for path in paths {
-            if nfs_mounted_at(&mountinfo, path) {
-                found.push((pid, path.clone()));
-            }
+        seen.insert(ns_id);
+        let here: Vec<String> = outermost
+            .iter()
+            .filter(|path| nfs_mounted_at(&mountinfo, path))
+            .map(|path| path.to_string())
+            .collect();
+        if !here.is_empty() {
+            found.push((ns, here));
         }
     }
     Ok(found)
 }
 
-/// Whether `mountinfo` (proc_pid_mountinfo(5)) has an NFS mount at `path`.
+/// Whether `path` is strictly below `parent`.
+fn is_under(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/') || parent.ends_with('/') && !rest.is_empty())
+}
+
+/// Whether `mountinfo` (proc_pid_mountinfo(5)) has an NFS mount at `path`. The mount
+/// point field escapes spaces, tabs, newlines and backslashes as octal.
 fn nfs_mounted_at(mountinfo: &str, path: &str) -> bool {
     mountinfo.lines().any(|line| {
         let mut fields = line.split(' ');
-        let mount_point = fields.nth(4);
+        let mount_point = fields.nth(4).map(unescape_mount_field);
         let fstype = line
             .split(" - ")
             .nth(1)
             .and_then(|rest| rest.split(' ').next());
-        mount_point == Some(path) && matches!(fstype, Some("nfs" | "nfs4"))
+        mount_point.as_deref() == Some(path) && matches!(fstype, Some("nfs" | "nfs4"))
     })
 }
 
@@ -741,8 +769,9 @@ fn nfs_mounted_at(mountinfo: &str, path: &str) -> bool {
 /// bare directory for a moment, and a program run from the share in that moment
 /// failed with ENOENT. It runs on a thread of its own that enters that namespace and
 /// ends with it.
-pub fn rebind_into_namespace(pid: i32, path: &str) -> Result<()> {
+pub fn rebind_into_namespace(ns: &std::fs::File, path: &str) -> Result<()> {
     const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
     const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
     const MOVE_MOUNT_BENEATH: libc::c_uint = 0x200;
     let c_path = std::ffi::CString::new(path).context("NFS share path")?;
@@ -752,7 +781,8 @@ pub fn rebind_into_namespace(pid: i32, path: &str) -> Result<()> {
             libc::SYS_open_tree,
             libc::AT_FDCWD,
             c_path.as_ptr(),
-            (OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint) as libc::c_ulong,
+            // Recursive: the shares mounted under this one come with it.
+            (OPEN_TREE_CLONE | AT_RECURSIVE | libc::O_CLOEXEC as libc::c_uint) as libc::c_ulong,
         )
     };
     if tree < 0 {
@@ -761,8 +791,9 @@ pub fn rebind_into_namespace(pid: i32, path: &str) -> Result<()> {
     // SAFETY: the syscall returned a new descriptor this function now owns.
     let tree =
         unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(tree as i32) };
-    let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
-        .with_context(|| format!("opening the mount namespace of {pid}"))?;
+    let ns = ns
+        .try_clone()
+        .context("duplicating the mount namespace descriptor")?;
     let path = path.to_string();
     thread::spawn(move || -> Result<()> {
         use std::os::fd::AsRawFd;
@@ -775,7 +806,7 @@ pub fn rebind_into_namespace(pid: i32, path: &str) -> Result<()> {
             }
             if libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNS) != 0 {
                 return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("entering the mount namespace of {pid}"));
+                    .context("entering the container's mount namespace");
             }
         }
         let c_path = std::ffi::CString::new(path.as_str()).context("NFS share path")?;
@@ -793,20 +824,20 @@ pub fn rebind_into_namespace(pid: i32, path: &str) -> Result<()> {
         };
         if moved != 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!("attaching the remounted share at {path} in {pid}'s namespace")
+                format!("attaching the remounted share at {path} in the container's namespace")
             });
         }
         // The old copy may be held open; detaching it leaves those holders their files.
         // SAFETY: c_path is a valid NUL-terminated string.
         if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } != 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!("detaching the snapshot's mount at {path} in {pid}'s namespace")
+                format!("detaching the snapshot's mount at {path} in the container's namespace")
             });
         }
         Ok(())
     })
     .join()
-    .map_err(|_| anyhow::anyhow!("the thread that rebinds the NFS share at {pid} panicked"))?
+    .map_err(|_| anyhow::anyhow!("the thread that rebinds the NFS share panicked"))?
 }
 
 /// Unmount a list of paths with lazy unmount.
@@ -893,6 +924,20 @@ mod tests {
         assert!(!nfs_mounted_at(mountinfo, "/other"));
         assert!(!nfs_mounted_at(mountinfo, "/plain"));
         assert!(!nfs_mounted_at("", "/mydata"));
+        // The mount point field escapes a space as \040.
+        let spaced = "620 590 0:62 / /data\\040files rw - nfs4 10.0.0.1:/srv rw\n";
+        assert!(nfs_mounted_at(spaced, "/data files"));
+        assert!(!nfs_mounted_at(spaced, "/data\\040files"));
+    }
+
+    /// A share under another share is rebound with it (open_tree is recursive), so only
+    /// the outer one is listed for a namespace.
+    #[test]
+    fn a_nested_share_is_left_to_its_outer_share() {
+        assert!(is_under("/data/inner", "/data"));
+        assert!(is_under("/data/inner", "/data/"));
+        assert!(!is_under("/database", "/data"));
+        assert!(!is_under("/data", "/data"));
     }
 
     /// fc-agent has one block-device wait, so a change to it (a longer timeout, say) reaches

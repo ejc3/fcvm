@@ -319,16 +319,22 @@ pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// The shares a restore remounts: the snapshot's, at the other of the two server ports
-/// (2049 and `NFS_RESTORE_PORT`), so the remount gets an NFS client of its own.
+/// The shares a restore remounts: the snapshot's, at the next server port of the restore
+/// range (`NFS_RESTORE_PORT`), so the remount gets an NFS client of its own.
 pub(crate) fn nfs_remounts(shares: &[crate::types::NfsMount]) -> Vec<crate::types::NfsMount> {
+    use crate::types::{NFS_RESTORE_PORT, NFS_RESTORE_PORTS};
     shares
         .iter()
         .map(|share| crate::types::NfsMount {
-            port: match share.port {
-                Some(crate::types::NFS_RESTORE_PORT) => None,
-                _ => Some(crate::types::NFS_RESTORE_PORT),
-            },
+            port: Some(match share.port {
+                Some(port)
+                    if (NFS_RESTORE_PORT..NFS_RESTORE_PORT + NFS_RESTORE_PORTS - 1)
+                        .contains(&port) =>
+                {
+                    port + 1
+                }
+                _ => NFS_RESTORE_PORT,
+            }),
             ..share.clone()
         })
         .collect()
@@ -656,11 +662,19 @@ pub async fn handle_clone_restore(
             .context("recording the NFS shares remounted after restore")?;
         *signals.nfs_mounts.lock().unwrap_or_else(|e| e.into_inner()) = Some(remounted);
         // The container bound the snapshot's mounts when it started; give it these.
-        for (pid, path) in crate::mounts::nfs_mounts_in_other_namespaces(&remounted_paths)? {
-            crate::mounts::rebind_into_namespace(pid, &path).context(
-                "giving the container the remounted NFS share, so the clone stays unpublished",
-            )?;
-            eprintln!("[fc-agent] NFS share {path} remounted in the mount namespace of {pid}");
+        let namespaces = crate::mounts::nfs_mounts_in_other_namespaces(&remounted_paths)?;
+        for (ns, paths) in &namespaces {
+            for path in paths {
+                crate::mounts::rebind_into_namespace(ns, path).context(
+                    "giving the container the remounted NFS share, so the clone stays unpublished",
+                )?;
+            }
+        }
+        if !namespaces.is_empty() {
+            eprintln!(
+                "[fc-agent] NFS shares remounted in {} other mount namespace(s)",
+                namespaces.len()
+            );
         }
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
@@ -979,10 +993,10 @@ mod restore_side_job_tests {
 mod tests {
     use super::*;
 
-    /// #1009: a restore remounts its NFS shares at the other server port, and a
-    /// restore of a clone of a clone goes back to the first.
+    /// #1009: each restore remounts its NFS shares at a server port no earlier generation
+    /// of the chain used, for as many restores as the range has ports.
     #[test]
-    fn nfs_shares_are_remounted_at_the_other_server_port() {
+    fn nfs_shares_are_remounted_at_a_port_no_earlier_generation_used() {
         let shares = vec![crate::types::NfsMount {
             host_ip: "172.30.0.1".to_string(),
             host_path: "/srv/share".to_string(),
@@ -996,7 +1010,22 @@ mod tests {
         assert_eq!(moved[0].host_path, "/srv/share");
         assert_eq!(moved[0].mount_path, "/mnt/share");
         assert!(moved[0].read_only);
-        assert_eq!(nfs_remounts(&moved)[0].port, None);
+        let mut seen = vec![2049];
+        let mut chain = shares.clone();
+        for _ in 0..crate::types::NFS_RESTORE_PORTS {
+            chain = nfs_remounts(&chain);
+            let port = chain[0].port.unwrap();
+            assert!(
+                !seen.contains(&port),
+                "port {port} came round within the range: {seen:?}"
+            );
+            seen.push(port);
+        }
+        assert_eq!(
+            nfs_remounts(&chain)[0].port,
+            Some(crate::types::NFS_RESTORE_PORT),
+            "the range wraps"
+        );
     }
 
     /// The ACK telemetry, with every phase at a large value and the ACK connect time, still

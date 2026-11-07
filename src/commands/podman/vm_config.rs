@@ -1102,6 +1102,12 @@ pub(crate) async fn setup_nfs_exports(
 /// no host registration remains.
 pub(crate) async fn cleanup_nfs_exports(vm_id: &str) -> Result<()> {
     let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
+    // Every VM's cleanup comes here, and only this VM writes its export: a VM without
+    // one (every rootless VM) has nothing to remove and must not need the root-owned
+    // lock, which an unprivileged process cannot open.
+    if !std::path::Path::new(&exports_path).exists() {
+        return Ok(());
+    }
     let _exports = lock_nfs_exports().await?;
     match tokio::fs::remove_file(&exports_path).await {
         Ok(()) => {}
@@ -2188,6 +2194,17 @@ mod tests {
             }
         }
         assert_eq!(calls, 2, "setup_nfs_exports and cleanup_nfs_exports");
+        let cleanup = &source[source
+            .find("pub(crate) async fn cleanup_nfs_exports(")
+            .expect("cleanup_nfs_exports")..];
+        let absent = cleanup
+            .find(".exists()")
+            .expect("cleanup checks for the export first");
+        let locked = cleanup.find("lock_nfs_exports().await?").unwrap();
+        assert!(
+            absent < locked,
+            "a VM without an NFS export takes the exports lock in its cleanup"
+        );
     }
 
     /// The cold-boot writer: a VM's state records the Firecracker it launches.

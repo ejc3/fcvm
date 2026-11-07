@@ -638,6 +638,8 @@ async fn ext4_image(dir: &Path, image: &Path) -> Result<()> {
 #[derive(Default)]
 struct Started {
     pids: Vec<u32>,
+    /// The log of every fcvm started, serves included, which name no VM.
+    logs: Vec<PathBuf>,
     names: Vec<String>,
     children: Vec<tokio::process::Child>,
     /// (pid, start time, what) of every firecracker, cloud-hypervisor, pasta and
@@ -1002,24 +1004,14 @@ async fn tcp_after_restore(
 
 /// No fcvm log of this scenario says `unknown inode in request`, and no guest kernel
 /// line of it reports a crash.
-fn scan_logs(vm_name: &str) -> Result<()> {
-    // unique_names gives the base, clones and serves one `<pid>-<n>` id.
-    let stem = format!("-{}-", vm_name.trim_start_matches("gym-base-"));
-    for entry in std::fs::read_dir("/tmp/fcvm-test-logs")
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if !name.starts_with("gym") || !name.contains(&stem) {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+async fn scan_logs(logs: &[PathBuf]) -> Result<()> {
+    for path in logs {
+        // The log consumers are detached tasks: the last lines of a process that just
+        // exited can still be on their way to the file.
+        common::wait_for_log_eof(path, Duration::from_secs(10))
+            .await
+            .with_context(|| format!("{} never reached its end", path.display()))?;
+        let text = std::fs::read_to_string(path).unwrap_or_default();
         for needle in [
             "unknown inode in request",
             "Unexpected exit reason on vcpu run",
@@ -1126,6 +1118,7 @@ async fn spawn(
         common::spawn_fcvm_with_env_and_log_path(&args, &[("FCVM_NO_SNAPSHOT", "1")]).await?
     };
     started.keep((child, pid), name);
+    started.logs.push(log.clone());
     Ok((pid, log))
 }
 
@@ -1238,12 +1231,37 @@ async fn run_scenario(s: Scenario) -> Result<()> {
     let result = scenario_body(&s, &mut started, &layout, &vm_name, &clone_name, &tag).await;
     started.kill_all().await;
     let teardown = started.check_teardown().await;
-    let scanned = scan_logs(&vm_name);
+    let scanned = scan_logs(&started.logs).await;
     let _ = tokio::fs::remove_dir_all(&root).await;
+    remove_snapshots(&tag).await;
     result
         .and(scanned)
         .and(teardown)
         .with_context(|| format!("gym scenario {s:?}"))
+}
+
+/// Remove the snapshots a scenario made, all named after its tag, once nothing that
+/// used them runs.
+async fn remove_snapshots(tag: &str) {
+    let dir = fcvm::paths::data_dir().join("snapshots");
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ours = name == tag
+            || name.starts_with(&format!("{tag}-"))
+            || name.starts_with(&format!("{tag}."));
+        if !ours {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+        } else {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
 }
 
 async fn scenario_body(
@@ -1396,6 +1414,9 @@ async fn scenario_body(
         );
     }
 
+    // Every check from here to the end counts, the ones made during the changes below
+    // included: a hold that failed during them and then recovered is still a failure.
+    let before_afters = log_marks(clone, active).await?;
     common_afters(clone, s, layout).await?;
 
     match s.after {
@@ -1425,25 +1446,9 @@ async fn scenario_body(
             if s.origin == Origin::DiskOnly {
                 start_holds(twin, s.storage, active).await?;
             }
-            // Two clones of one NFS snapshot hold the snapshot's open files under the one
-            // NFSv4 client identity they both inherited, and the server keeps one copy of
-            // that client's open and lock state. Whichever twin it does not follow gets an
-            // error on those files (EBADF on a write), never another file's data.
-            let twin_holds: Vec<Hold> = active
-                .iter()
-                .cloned()
-                .map(|mut h| {
-                    if s.storage == Storage::Nfs
-                        && !matches!(h.kind, "listen" | "swperf" | "hwperf")
-                    {
-                        h.expect = Expect::CorrectOrError;
-                    }
-                    h
-                })
-                .collect();
             holds_keep_working(
                 twin,
-                &twin_holds,
+                &twin_holds(s, active),
                 &marks,
                 10,
                 "a second clone of the snapshot",
@@ -1452,18 +1457,41 @@ async fn scenario_body(
             .await?;
         }
     }
-    // The holds kept working through everything after the restore.
-    let at = log_marks(clone, active).await?;
+    // The holds kept working through everything after the restore. With a twin on NFS
+    // either clone can be the one the server's state does not follow.
+    let final_holds = if s.after == After::TwoClones {
+        twin_holds(s, active)
+    } else {
+        active.to_vec()
+    };
     holds_keep_working(
         clone,
-        active,
-        &at,
+        &final_holds,
+        &before_afters,
         5,
         "the clone after the post-restore changes",
         true,
     )
     .await?;
     Ok(())
+}
+
+/// The holds of a scenario with two clones of one snapshot. Two clones of one NFS
+/// snapshot hold the snapshot's open files under the one NFSv4 client identity they
+/// both inherited, and the server keeps one copy of that client's open and lock state:
+/// whichever clone it does not follow gets an error on those files (EBADF on a write),
+/// never another file's data.
+fn twin_holds(s: &Scenario, active: &[Hold]) -> Vec<Hold> {
+    active
+        .iter()
+        .cloned()
+        .map(|mut h| {
+            if s.storage == Storage::Nfs && !matches!(h.kind, "listen" | "swperf" | "hwperf") {
+                h.expect = Expect::CorrectOrError;
+            }
+            h
+        })
+        .collect()
 }
 
 async fn create_snapshot(pid: u32, tag: &str, disk_only: bool) -> Result<()> {
@@ -1505,7 +1533,12 @@ async fn wait_for_startup_snapshot(log: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let text = tokio::fs::read_to_string(log).await.unwrap_or_default();
-        if text.contains("Startup snapshot created") || text.contains("startup snapshot created") {
+        // A first run whose key an earlier scenario or run already cached restores that
+        // startup snapshot and creates none; the second run then hits it the same way.
+        if text.contains("Startup snapshot created")
+            || text.contains("startup snapshot created")
+            || text.contains("Startup snapshot hit!")
+        {
             return Ok(());
         }
         ensure!(

@@ -566,21 +566,28 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// Used for portable snapshot restore.
     pub fn serialize_table(&self) -> String {
         let _no_rename_in_flight = self.rename_lock.read().unwrap_or_else(|e| e.into_inner());
-        // Paths that were gone at this server's restore stay in the table, so a
-        // restore of a snapshot of this clone knows those inodes too: the guest still
-        // holds them.
         let paths: std::collections::BTreeMap<u64, String> = self
+            .paths
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        // Paths that were gone at this server's restore stay in the table, apart from
+        // the live ones, so a restore of a snapshot of this clone knows those inodes too
+        // (the guest still holds them) and never resolves them again: a file the host
+        // later creates at the same path is another file.
+        let gone: std::collections::BTreeMap<u64, String> = self
             .gone
             .iter()
-            .chain(self.paths.iter())
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
         let handle_base = self
             .max_guest_handle
             .load(std::sync::atomic::Ordering::SeqCst)
             .max(self.handle_base);
-        serde_json::to_string(&serde_json::json!({ "handle_base": handle_base, "paths": paths }))
-            .unwrap_or_default()
+        serde_json::to_string(
+            &serde_json::json!({ "handle_base": handle_base, "paths": paths, "gone": gone }),
+        )
+        .unwrap_or_default()
     }
 
     /// Parse a serialized table into its handle base and paths. A table from before the handle base
@@ -625,6 +632,16 @@ impl<T: FilesystemHandler> RemapFs<T> {
         }
     }
 
+    /// The inodes a serialized table records as gone at an earlier restore. None in a
+    /// table that has no `gone` field.
+    fn parse_gone(json: &str) -> std::collections::BTreeMap<u64, String> {
+        serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|value| value.get("gone").cloned())
+            .and_then(|gone| serde_json::from_value(gone).ok())
+            .unwrap_or_default()
+    }
+
     /// Restore a RemapFs from a serialized inode table.
     ///
     /// Walks each path in the table through the inner handler's lookup
@@ -638,6 +655,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
         let stable_to_inner = DashMap::new();
         let paths = DashMap::new();
         let gone = DashMap::new();
+        // Inodes already gone at an earlier restore stay gone, unresolved.
+        for (stable_ino, path) in Self::parse_gone(json) {
+            gone.insert(stable_ino, path);
+        }
 
         // Root is always mapped
         inner_to_stable.insert(1, 1);
@@ -1341,6 +1362,51 @@ mod tests {
             &clone.fs.serialize_table(),
         );
         assert_eq!(again.gone_path(moved).as_deref(), Some("moved"));
+    }
+
+    /// A path gone at one restore and recreated by the host before the next stays gone
+    /// for its old inode: the new file is another file, and a handle the guest held on
+    /// the old one must not read or write it.
+    #[test]
+    fn a_recreated_path_does_not_revive_an_inode_gone_at_an_earlier_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("moved"), b"M").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false)),
+            uid,
+            gid,
+        };
+        let moved = source.lookup("moved");
+        let table = source.fs.serialize_table();
+        std::fs::remove_file(dir.path().join("moved")).unwrap();
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &table,
+        );
+        let table = clone.serialize_table();
+        std::fs::write(dir.path().join("moved"), b"N").unwrap();
+        let again = Real {
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), false),
+                &table,
+            ),
+            uid,
+            gid,
+        };
+        assert_eq!(again.fs.gone_path(moved).as_deref(), Some("moved"));
+        let opened = again.call(VolumeRequest::Open {
+            ino: moved,
+            flags: libc::O_RDONLY as u32,
+            uid,
+            gid,
+            pid: 0,
+        });
+        assert!(
+            opened.is_error(),
+            "the old inode reached the new file: {opened:?}"
+        );
     }
 
     /// Handles the guest held before a restore and handles the clone opens after it never share a

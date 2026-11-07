@@ -132,12 +132,16 @@ pub struct NfsMount {
     pub port: Option<u16>,
 }
 
-/// The second port a restored clone mounts its NFS shares at. The kernel reuses an NFS
-/// client for a server address and port it already holds, so a remount at the snapshot's
-/// own port would keep the snapshot's client and its identity; the restore alternates
-/// between 2049 and this one. Every clone namespace forwards both to the host's nfsd
-/// (`NFS_RESTORE_PORT` in src/network/veth.rs, which must match).
+/// The first of the ports a restored clone mounts its NFS shares at. The kernel reuses an
+/// NFS client for a server address and port it already holds, and a file held open keeps
+/// a client alive, so a remount at a port any earlier generation's mount used would take
+/// that generation's client and its identity. Each restore takes the next port of
+/// `NFS_RESTORE_PORT .. NFS_RESTORE_PORT + NFS_RESTORE_PORTS`, after 2049 for the boot,
+/// so a port comes round again only after that many restores in one chain. Every clone
+/// namespace forwards the range to the host's nfsd (src/network/veth.rs, which must
+/// match).
 pub const NFS_RESTORE_PORT: u16 = 20049;
+pub const NFS_RESTORE_PORTS: u16 = 16;
 
 #[derive(Debug, Deserialize)]
 pub struct LatestMetadata {

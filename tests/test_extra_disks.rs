@@ -470,12 +470,27 @@ async fn test_nfs_two_clones_of_one_snapshot_both_mount() -> Result<()> {
     .await
     .context("spawning NFS baseline")?;
     common::poll_health_by_pid(pid, 180).await?;
-    // State at the server under the baseline's identity: a file held open.
+    // State at the server under the baseline's identity: a file held open. The holder
+    // says so once its open succeeded, so the snapshot below is sure to capture it.
     common::exec_in_container(
         pid,
-        &["sh -c 'exec 3< /mydata/shared.txt; sleep 600' >/dev/null 2>&1 &"],
+        &["sh -c 'exec 3< /mydata/shared.txt && touch /tmp/held; sleep 600' >/dev/null 2>&1 &"],
     )
     .await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let held =
+            common::exec_in_container(pid, &["test -e /tmp/held && echo held || echo waiting"])
+                .await?;
+        if held.trim() == "held" {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the baseline's holder never opened /mydata/shared.txt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     common::create_snapshot_by_pid(pid, &snap)
         .await
         .context("creating snapshot of NFS baseline")?;
