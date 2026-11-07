@@ -567,6 +567,9 @@ class GoldenGuestDns(unittest.TestCase):
                 "image": "localhost/chromium-bench-req",
                 "image_disk_path": "/image-cache/%s.storage-v2.img" % ("a" * 64),
                 "network_config": network,
+                # What `podman prepare --guest-thp never` records, the mode
+                # reqbench.sh's golden asks for by default (#1621).
+                "guest_thp": "never",
             },
         })
         fcvm = os.path.join(d, "fcvm")
