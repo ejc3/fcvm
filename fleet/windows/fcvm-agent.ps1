@@ -25,7 +25,6 @@ function Net {
 }
 Net
 $gen = $null
-$buf = New-Object byte[] 128
 $ascii = [Text.Encoding]::ASCII
 while ($true) {
   $c = New-Object Net.Sockets.TcpClient
@@ -33,15 +32,17 @@ while ($true) {
     if ($c.ConnectAsync('10.0.2.1', 4600).Wait(200)) {
       $s = $c.GetStream(); $s.ReadTimeout = 200
       $sent = [DateTime]::UtcNow
-      $n = $s.Read($buf, 0, $buf.Length)
-      $f = $ascii.GetString($buf, 0, $n).Trim().Split(' ')
-      if ($f.Length -ge 2) {
-        if ($f[0] -ne $gen) {
+      # One whole line, or nothing: a read can return part of it.
+      $r = New-Object IO.StreamReader($s, $ascii)
+      $line = $r.ReadLine()
+      if ($line -match '^([A-Za-z0-9_-]{1,64}) ([0-9]{13})$') {
+        $g = $Matches[1]; $hostMs = [int64]$Matches[2]
+        if ($g -ne $gen) {
           $rtt = ([DateTime]::UtcNow - $sent).TotalMilliseconds
-          $now = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$f[1] + [int64]($rtt / 2)).UtcDateTime
+          $now = [DateTimeOffset]::FromUnixTimeMilliseconds($hostMs + [int64]($rtt / 2)).UtcDateTime
           Set-Date -Date $now.ToLocalTime() | Out-Null
           if ($gen -ne $null) { Net }
-          $gen = $f[0]
+          $gen = $g
         }
         $ack = $ascii.GetBytes("ack $gen $([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())`n")
         $s.Write($ack, 0, $ack.Length)

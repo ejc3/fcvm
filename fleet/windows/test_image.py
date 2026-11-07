@@ -78,6 +78,21 @@ class SetupLog(unittest.TestCase):
             image_tool.expiry("License Status: Licensed")
 
 
+class Build(unittest.TestCase):
+    def test_setup_complete_never_reboots_the_machine_itself(self):
+        setup = read(HERE, "fcvm-setup.ps1")
+        body = setup.split("@'")[0]  # SetupComplete's own steps, before the finish script
+        self.assertNotRegex(body, r"(?m)^\s*(shutdown|Restart-Computer)\b")
+        self.assertIn("New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)", setup)
+
+    def test_the_build_is_private_and_caches_inputs_by_checksum(self):
+        s = read(HERE, "build-image.sh")
+        self.assertRegex(s, r"\numask 077\n")
+        self.assertNotIn("umask 022", s)
+        self.assertIn('f=$SRC/$2-$3', s)
+        self.assertIn('OUT_ROOT=$(realpath -m', s)
+
+
 class Pins(unittest.TestCase):
     def test_every_download_is_pinned_by_sha256(self):
         s = read(HERE, "build-image.sh")
@@ -116,8 +131,20 @@ class AgentAddresses(unittest.TestCase):
         self.assertIn("ConnectAsync('10.0.2.1', 4600)", agent)
         self.assertIn('"ack $gen $([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())`n"', agent)
 
+    def test_the_agent_parses_only_a_whole_line_with_a_plausible_time(self):
+        agent = read(HERE, "fcvm-agent.ps1")
+        self.assertIn("$r.ReadLine()", agent)
+        m = re.search(r"-match '([^']+)'", agent)
+        self.assertIsNotNone(m)
+        line = re.compile(m.group(1))
+        self.assertTrue(line.match("vm-1a2b 1794074699656"))
+        # a partial read, a short time, trailing junk: none may set the clock
+        for bad in ("vm-1a2b 1794", "vm-1a2b", "vm-1a2b 1794074699656 x", "a b 1794074699656", ""):
+            self.assertFalse(line.match(bad), bad)
+
     def test_the_guest_firewall_lets_the_agent_reach_the_namespace(self):
         setup = read(HERE, "fcvm-setup.ps1")
+        self.assertIn("Get-NetFirewallRule -Direction Outbound -Action Allow -Enabled True | Disable-NetFirewallRule", setup)
         self.assertIn(f"-Direction Outbound -RemoteAddress {self.rust_const('NAMESPACE_IP')} -Action Allow", setup)
         self.assertIn("-DefaultOutboundAction Block", setup)
 

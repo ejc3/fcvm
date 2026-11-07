@@ -23,7 +23,10 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT_ROOT=${1:-/mnt/fcvm-btrfs/windows}
+OUT_ROOT=$(realpath -m "${1:-/mnt/fcvm-btrfs/windows}")
+# Everything the build writes is the builder's alone: the config ISO and the image hold the
+# generated passwords, and the image is read only by the fcvm user that builds it.
+umask 077
 
 ISO_URL='https://go.microsoft.com/fwlink/?linkid=2293312&clcid=0x409&culture=en-us&country=us'
 ISO_NAME=26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso
@@ -60,17 +63,20 @@ fi
 
 SRC=$OUT_ROOT/src
 mkdir -p "$SRC"
-fetch() { # url sha256 file
-  local url=$1 sum=$2 f=$SRC/$3
-  if [ -s "$f" ] && echo "$sum  $f" | sha256sum -c --quiet 2>/dev/null; then return; fi
+# Inputs are cached under their checksum, so a build of another revision never replaces a
+# file this build verified.
+fetch() { # url sha256 name: prints the cached path
+  local url=$1 sum=$2 f=$SRC/$2-$3
+  if [ -s "$f" ] && echo "$sum  $f" | sha256sum -c --quiet 2>/dev/null; then echo "$f"; return; fi
   say "downloading $3"
   curl -fsSL --retry 3 -o "$f.part.$$" "$url"
   echo "$sum  $f.part.$$" | sha256sum -c --quiet || { rm -f "$f.part.$$"; die "$3: SHA-256 mismatch"; }
   mv "$f.part.$$" "$f"
+  echo "$f"
 }
-fetch "$ISO_URL" "$ISO_SHA256" "$ISO_NAME"
-fetch "$VIRTIO_URL" "$VIRTIO_SHA256" virtio-win.iso
-fetch "$FW_URL" "$FW_SHA256" CLOUDHV.fd
+ISO=$(fetch "$ISO_URL" "$ISO_SHA256" "$ISO_NAME")
+VIRTIO=$(fetch "$VIRTIO_URL" "$VIRTIO_SHA256" virtio-win.iso)
+FW=$(fetch "$FW_URL" "$FW_SHA256" CLOUDHV.fd)
 
 WORK=$OUT_ROOT/build-$id.$$
 rm -rf "$WORK"
@@ -78,10 +84,8 @@ mkdir -p "$WORK/cfg"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
-umask 077
 printf 'Fc%s!9' "$(openssl rand -hex 12)" > admin-password
 printf 'Sb%s!7' "$(openssl rand -hex 12)" > sandbox-password
-umask 022
 python3 "$HERE/image_tool.py" render "$HERE/autounattend.xml.in" cfg/autounattend.xml "$IMAGE_INDEX" admin-password sandbox-password
 cp "$HERE/SetupComplete.cmd" "$HERE/fcvm-setup.ps1" "$HERE/fcvm-agent.ps1" cfg/
 genisoimage -quiet -J -r -V FCVMCFG -o config.iso cfg
@@ -94,8 +98,8 @@ t0=$(date +%s)
 qemu-system-x86_64 -name fcvm-windows-image -machine q35,accel=kvm -cpu host -smp 8 -m 8G \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=vars.fd \
-  -drive file="$SRC/$ISO_NAME",media=cdrom,if=none,id=cd0,readonly=on -device ide-cd,drive=cd0,bus=ide.0,bootindex=0 \
-  -drive file="$SRC/virtio-win.iso",media=cdrom,if=none,id=cd1,readonly=on -device ide-cd,drive=cd1,bus=ide.1 \
+  -drive file="$ISO",media=cdrom,if=none,id=cd0,readonly=on -device ide-cd,drive=cd0,bus=ide.0,bootindex=0 \
+  -drive file="$VIRTIO",media=cdrom,if=none,id=cd1,readonly=on -device ide-cd,drive=cd1,bus=ide.1 \
   -drive file=config.iso,media=cdrom,if=none,id=cd2,readonly=on -device ide-cd,drive=cd2,bus=ide.2 \
   -drive file=disk.raw,format=raw,if=none,id=root,cache=unsafe -device virtio-blk-pci,drive=root,disable-legacy=on,bootindex=1 \
   -device virtio-net-pci,netdev=n0,disable-legacy=on -netdev user,id=n0 \
@@ -135,7 +139,7 @@ expiry=$(python3 "$HERE/image_tool.py" expiry setup.log)
 tmp=$IMG.tmp.$$
 mkdir -p "$tmp"
 mv disk.raw admin-password sandbox-password setup.log "$tmp/"
-cp "$SRC/CLOUDHV.fd" "$tmp/"
+cp "$FW" "$tmp/CLOUDHV.fd"
 jq -n --arg id "$id" --arg edition "Windows Server 2025 Datacenter Evaluation (Desktop Experience)" \
   --arg build "26100.1742" --arg iso "$ISO_NAME" --arg iso_sha256 "$ISO_SHA256" \
   --arg virtio_sha256 "$VIRTIO_SHA256" --arg firmware_sha256 "$FW_SHA256" \

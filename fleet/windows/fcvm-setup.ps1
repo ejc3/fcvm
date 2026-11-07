@@ -1,6 +1,6 @@
 # Runs once as SYSTEM at the end of Windows Setup (SetupComplete.cmd). Configures the image
-# for a disposable sandbox desktop reached over RDP, then reboots once so the feature
-# removal finishes, and powers off on the next boot.
+# for a disposable sandbox desktop reached over RDP, schedules one restart so the feature
+# removal finishes, and powers off at the end of the next boot.
 $ErrorActionPreference = 'Continue'
 & {
 function Step($m) { Write-Output ("{0:o} {1}" -f (Get-Date), $m) }
@@ -78,9 +78,12 @@ cscript //nologo C:\Windows\System32\slmgr.vbs /dli
 cscript //nologo C:\Windows\System32\slmgr.vbs /xpr
 Get-WindowsFeature Windows-Defender | Format-List Name, InstallState
 Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block
+# An enabled allow rule overrides the default block: keep only ours.
+Get-NetFirewallRule -Direction Outbound -Action Allow -Enabled True | Disable-NetFirewallRule
 New-NetFirewallRule -DisplayName 'fcvm namespace' -Direction Outbound -RemoteAddress 10.0.2.1 -Action Allow | Out-Null
 Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction, DefaultOutboundAction
 Unregister-ScheduledTask -TaskName fcvm-finish -Confirm:$false
+Unregister-ScheduledTask -TaskName fcvm-restart -Confirm:$false
 Get-Date -Format o
 } *>&1 | Out-File -Encoding utf8 -Append C:\fcvm\setup.log
 # The image build reads this from COM2 (COM1 is EMS's).
@@ -92,6 +95,9 @@ Stop-Computer -Force
 '@ | Set-Content C:\fcvm\finish.ps1
 $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\fcvm\finish.ps1'
 Register-ScheduledTask -Force -TaskName fcvm-finish -Action $a -Trigger (New-ScheduledTaskTrigger -AtStartup) -User SYSTEM -RunLevel Highest | Out-Null
-Step 'reboot'
+# Setup has not finished while SetupComplete.cmd runs, and must not be rebooted from it: a
+# task two minutes later restarts the machine so the feature removal completes.
+$a = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument '/r /t 0 /f'
+Register-ScheduledTask -Force -TaskName fcvm-restart -Action $a -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)) -User SYSTEM -RunLevel Highest | Out-Null
+Step 'restart scheduled'
 } *>&1 | Out-File -Encoding utf8 -Append C:\fcvm\setup.log
-shutdown /r /t 5 /f
