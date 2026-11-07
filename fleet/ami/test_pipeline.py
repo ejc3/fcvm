@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shlex
 import socket
 import struct
@@ -442,6 +443,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
         self.assertEqual(self.broker.slots["host-build"]["state"], "terminated")
         self.no_manifest()
+
+    def test_host_prep_installs_fcvms_host_kernel_and_build_refuses_another(self):
+        # Ubuntu's kernel lacks the bridge rcu_barrier removal (#1563): prep installs fcvm's
+        # host kernel as GRUB's default before the reboot, and the build phase, which warms
+        # every snapshot the image carries, runs only on it.
+        source = (HERE / "host/build.sh").read_text()
+        phases = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+        prep, build = phases["prep"], phases["build"]
+        self.assertIn('as_user "cd $SRC && make install-host-kernel"', prep)
+        self.assertLess(prep.index("store.sh"), prep.index("make install-host-kernel"))
+        self.assertLess(prep.index("update-grub"), prep.index("make install-host-kernel"))
+        guard = build.split("\n")[1:6]
+        self.assertTrue(any('case "$(uname -r)" in' in line for line in guard), guard)
+        self.assertIn("*-fcvm-*)", build.split("make build")[0])
 
     def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
         source = (HERE / "host/build.sh").read_text()
