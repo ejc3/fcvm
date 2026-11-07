@@ -947,6 +947,49 @@ fn review_gate_orders_timestamps_as_instants_not_as_strings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Codex's review summary in its 2026-11 shape covers the head it names.
+///
+/// Since 2026-11 Codex posts its summary table inside a `<details>` block whose `<summary>`
+/// reads "Codex Review Summary: ✅ Completed", after a `codex-review-state` HTML comment, in
+/// place of the "## Codex Review Summary" heading. The gate matched only the heading, so on
+/// #1584 and #1586, whose only Codex result was this comment, it reported the comment
+/// UNANSWERED and the head UNREVIEWED. The body below is #1584's comment as posted, with the
+/// commit renamed and the row dated after the fixture's head. The shell harness carries the
+/// in-progress, older-commit and appended-finding cases.
+#[test]
+fn review_gate_reads_the_codex_summary_in_a_details_block() {
+    require_jq();
+    const SUMMARY: &str = r#""<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"deadbeef\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n<details>\n<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-01-02T01:00:00.232589Z\">2026-01-02T01:00:00.232589Z</relative-time> | `deadbee` | Draft marked ready |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>\n\n</details>""#;
+    let comments = format!(
+        r#"[{{"author":{{"login":"chatgpt-codex-connector","__typename":"Bot"}},"createdAt":"2026-01-02T00:20:00Z","updatedAt":"2026-01-02T01:00:05Z","body":{SUMMARY}}}]"#
+    );
+    let payload = format!(
+        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"prcommits":{{"totalCount":1,"nodes":[{{"commit":{{"oid":"deadbeef"}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+    );
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-summary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("details-summary.json");
+    std::fs::write(&f, payload).unwrap();
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&f)
+        .output()
+        .expect("check-review-threads.sh must be runnable");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Completed summary row at the head, in the details-block shape, covers it.\n{combined}"
+    );
+    assert!(combined.contains("HEAD COVERED"), "{combined}");
+}
+
 /// Codex's "Breezy!" sign-off is a no-findings verdict.
 ///
 /// The gate matches Codex's no-findings comment against the sign-offs Codex has posted on
