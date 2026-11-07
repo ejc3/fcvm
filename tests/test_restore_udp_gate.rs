@@ -296,3 +296,164 @@ async fn closed_until_the_restore_ack(network: &str) -> Result<()> {
     common::kill_process(clone_pid).await;
     result
 }
+
+/// A routed clone's own IPv6 address takes no datagram before the clone's UDP rule is in.
+///
+/// The network reaches a routed clone at its own address, which the guest takes during
+/// the restore. Taken before the UDP rule went in, it let a datagram reach the restored
+/// workload ahead of its restore hook (#1114). A guest process listening on `[::]:5000`
+/// stamps each datagram with the guest's boot clock, the restore hook stamps its own
+/// run, and datagrams are sent to the clone's address every millisecond from before it
+/// resumes until it acknowledges.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_restored_routed_clone_takes_no_datagram_before_its_udp_rule() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("udp-gate-routed");
+    let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
+    let _ = std::fs::remove_file(&go_file);
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            "--no-snapshot",
+            "--health-check",
+            "http://localhost:80",
+            "--on-restore",
+            "cat /proc/uptime > /tmp/hook-uptime",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 180).await?;
+    let listener = "nohup setsid python3 -c \"import socket, time\n\
+         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)\n\
+         s.bind(('::', 5000))\n\
+         f = open('/tmp/udp-arrivals', 'a')\n\
+         while True:\n    d, _ = s.recvfrom(100)\n    f.write('%.3f %s\\n' % (time.clock_gettime(time.CLOCK_BOOTTIME), d.decode().strip()))\n    f.flush()\n\" \
+         >/dev/null 2>&1 &";
+    common::exec_in_vm(baseline_pid, &[listener])
+        .await
+        .context("starting the guest's UDP listener")?;
+    // The listener is up before the snapshot.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let bound = common::exec_in_vm(baseline_pid, &["ss -Hlun 'sport = :5000'"]).await?;
+        if bound.contains(":5000") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the guest's UDP listener never bound"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+    common::kill_process(baseline_pid).await;
+
+    let failpoint = format!(
+        "restore.post_network_pre_resume:block_until_file:{}",
+        go_file.display()
+    );
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint)],
+    )
+    .await
+    .context("spawning clone held before VMM resume")?;
+    let result: Result<()> = async {
+        wait_for_log(
+            &clone_log,
+            "FAILPOINT restore.post_network_pre_resume reached",
+        )
+        .await?;
+        let log = std::fs::read_to_string(&clone_log).context("reading the clone log")?;
+        let address: std::net::Ipv6Addr = log
+            .split("vm_ipv6=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .context("the clone did not log its vm_ipv6")?
+            .parse()
+            .context("vm_ipv6 is not an IPv6 address")?;
+
+        let socket = tokio::net::UdpSocket::bind("[::]:0").await?;
+        let target = std::net::SocketAddr::new(address.into(), 5000);
+        std::fs::write(&go_file, b"go").context("releasing the held clone")?;
+        let mut sent = 0u32;
+        while !std::fs::read_to_string(&clone_log)
+            .unwrap_or_default()
+            .contains("acknowledged exact restore generation")
+        {
+            socket
+                .send_to(format!("pre-{sent}\n").as_bytes(), target)
+                .await?;
+            sent += 1;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The listener works: a datagram after the ACK arrives.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            socket.send_to(b"post\n", target).await?;
+            let arrivals = common::exec_in_vm(clone_pid, &["cat /tmp/udp-arrivals 2>/dev/null"])
+                .await
+                .unwrap_or_default();
+            if arrivals.contains(" post") {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "no datagram reached the routed clone after its ACK; arrivals:\n{arrivals}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let hook: f64 = common::exec_in_container(clone_pid, &["cat", "/tmp/hook-uptime"])
+            .await?
+            .split_whitespace()
+            .next()
+            .context("the restore hook left no uptime")?
+            .parse()
+            .context("the hook's uptime is not a number")?;
+        let arrivals = common::exec_in_vm(clone_pid, &["cat /tmp/udp-arrivals 2>/dev/null"])
+            .await
+            .unwrap_or_default();
+        let before_hook: Vec<&str> = arrivals
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .and_then(|t| t.parse::<f64>().ok())
+                    .is_some_and(|t| t < hook)
+            })
+            .collect();
+        println!(
+            "sent {sent} datagrams between the release and the ACK; {} arrived in all, {} \
+             before the hook",
+            arrivals.lines().count(),
+            before_hook.len()
+        );
+        anyhow::ensure!(
+            before_hook.is_empty(),
+            "{} datagram(s) reached the routed clone's workload before its restore hook ran \
+             (hook at {hook}): {before_hook:?}",
+            before_hook.len()
+        );
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_file(&go_file);
+    common::kill_process(clone_pid).await;
+    result
+}

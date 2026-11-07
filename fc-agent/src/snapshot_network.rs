@@ -1606,6 +1606,9 @@ pub struct RestoreNetworkReport {
     /// Milliseconds writing the cleanup-complete line to the guest console, a
     /// serial device whose write can block.
     pub complete_console_ms: f64,
+    /// Milliseconds of the step the restore runs inside the boundary before
+    /// egress opens: a routed clone's move to its own IPv6 address.
+    pub before_egress_ms: f64,
     /// Milliseconds closing the gate when verification failed, plus adding the
     /// clone's client-direction UDP rule. The close is part of `reassert_ms`
     /// and the UDP rule is part of it too, but only on that path.
@@ -2111,25 +2114,38 @@ async fn restore_with<
     hook: &H,
     budget: std::time::Duration,
 ) -> Result<RestoreNetworkReport> {
-    let report = restore_boundary_with(gate, receive_barrier, diagnostic, store, budget).await?;
+    let report =
+        restore_boundary_with(gate, receive_barrier, diagnostic, store, budget, || async {
+            Ok(())
+        })
+        .await?;
     publish_with(gate, report, hook).await
 }
 
 /// The restore boundary: verify the inherited gate, drain receive processing,
-/// open the gate's egress half, retire the snapshot-time sockets and the
-/// manifest. The clone can reach out from the moment the barrier has drained,
-/// and nothing reaches it until `publish_with` opens the ingress half.
+/// run `before_egress`, open the gate's egress half, retire the snapshot-time
+/// sockets and the manifest. The clone can reach out from the moment the
+/// barrier has drained, and nothing reaches it until `publish_with` opens the
+/// ingress half.
+///
+/// `before_egress` is where a routed clone moves to its own IPv6 address. It
+/// runs once the UDP rule is in, because the new address is what lets the
+/// network reach the clone, and before egress opens, so that no connection
+/// leaves from the snapshot's address.
 async fn restore_boundary_with<
     G: FirewallGate,
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
     S: ManifestStore,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
 >(
     gate: &G,
     receive_barrier: &B,
     diagnostic: &mut D,
     store: &S,
     budget: std::time::Duration,
+    before_egress: F,
 ) -> Result<RestoreNetworkReport> {
     // The gate chains are VERIFIED rather than reinstalled; the link-down and
     // the receive barrier are always re-asserted.
@@ -2201,6 +2217,11 @@ async fn restore_boundary_with<
     } else {
         reassert_started.elapsed().as_secs_f64() * 1000.0
     };
+    let before_egress_started = std::time::Instant::now();
+    before_egress()
+        .await
+        .context("the restore step before egress opens")?;
+    let before_egress_ms = before_egress_started.elapsed().as_secs_f64() * 1000.0;
     // Egress opens here, before the first socket is retired. Every daemon whose
     // connection the retirement kills reconnects at once; with this half still
     // closed those connects were answered with a reset (the gate rejects with
@@ -2271,6 +2292,7 @@ async fn restore_boundary_with<
         construct_ms: 0.0,
         complete_console_ms: 0.0,
         gate_arm_ms,
+        before_egress_ms,
         verify_ms,
         reassert_ms,
         barrier_ms,
@@ -2288,10 +2310,11 @@ async fn restore_boundary_with<
 /// console. Each of those steps lies inside the restore orchestrator's
 /// `tcp_cleanup_ms` and outside the boundary's own sub-timers, so each is timed
 /// into the report (#1090). The lock is returned still held.
-async fn restore_locked_boundary_with<G, B, D, S>(
+async fn restore_locked_boundary_with<G, B, D, S, F, Fut>(
     acquire_lock: impl FnOnce() -> Result<std::fs::File>,
     construct: impl FnOnce() -> (G, B, D, S),
     budget: std::time::Duration,
+    before_egress: F,
     announce: impl FnOnce(&RestoreNetworkReport),
 ) -> Result<(std::fs::File, G, RestoreNetworkReport)>
 where
@@ -2299,6 +2322,8 @@ where
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
     S: ManifestStore,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
 {
     let lock_started = std::time::Instant::now();
     let lock = acquire_lock()?;
@@ -2306,8 +2331,15 @@ where
     let construct_started = std::time::Instant::now();
     let (gate, receive_barrier, mut diagnostic, store) = construct();
     let construct_ms = construct_started.elapsed().as_secs_f64() * 1000.0;
-    let mut report =
-        restore_boundary_with(&gate, &receive_barrier, &mut diagnostic, &store, budget).await?;
+    let mut report = restore_boundary_with(
+        &gate,
+        &receive_barrier,
+        &mut diagnostic,
+        &store,
+        budget,
+        before_egress,
+    )
+    .await?;
     let console_started = std::time::Instant::now();
     announce(&report);
     report.complete_console_ms = console_started.elapsed().as_secs_f64() * 1000.0;
@@ -2818,7 +2850,13 @@ impl RestoredNetwork {
     }
 }
 
-pub async fn restore_snapshot_network() -> Result<RestoredNetwork> {
+/// `before_egress` runs inside the boundary, after the clone's UDP rule and
+/// before egress opens (`restore_boundary_with`).
+pub async fn restore_snapshot_network<F, Fut>(before_egress: F) -> Result<RestoredNetwork>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let (transaction_lock, gate, report) = restore_locked_boundary_with(
         acquire_boundary_lock,
         || {
@@ -2830,6 +2868,7 @@ pub async fn restore_snapshot_network() -> Result<RestoredNetwork> {
             )
         },
         CLEANUP_BUDGET,
+        before_egress,
         |report| {
             eprintln!(
                 "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
@@ -4591,6 +4630,60 @@ mod tests {
         assert!(!state.link_down);
     }
 
+    /// The step before egress (a routed clone's move to its own IPv6 address)
+    /// runs with the clone's UDP rule in and egress still closed (#1114). The new
+    /// address is what lets the network reach a routed clone, so before the UDP
+    /// rule a datagram to it reached the restored workload; after egress opened,
+    /// a connection could leave from the snapshot's address.
+    #[tokio::test]
+    async fn the_step_before_egress_runs_with_udp_gated_and_egress_closed() {
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: Vec::new(),
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        let mut diag = ModelDiag(state.clone());
+        let seen = state.clone();
+        restore_boundary_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            CLEANUP_BUDGET,
+            || async move {
+                let mut state = seen.lock().unwrap();
+                assert!(
+                    state.udp_gated,
+                    "the clone's address came before its UDP rule"
+                );
+                assert!(
+                    state.egress_closed,
+                    "the clone's address came after egress opened"
+                );
+                state.events.push("ipv6-swap");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let events = state.lock().unwrap().events.clone();
+        let at = |event: &str| events.iter().position(|e| *e == event).unwrap();
+        assert!(
+            at("gate-udp-ingress") < at("ipv6-swap") && at("ipv6-swap") < at("gate-open-egress"),
+            "{events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn cookie_bound_restore_never_kills_tuple_aba_replacement() {
         let stale = socket(21, [198, 51, 100, 8]);
@@ -5731,6 +5824,7 @@ mod tests {
                 )
             },
             CLEANUP_BUDGET,
+            || async { Ok(()) },
             |_| std::thread::sleep(std::time::Duration::from_millis(CONSOLE_MS)),
         )
         .await

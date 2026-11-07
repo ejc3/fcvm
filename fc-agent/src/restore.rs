@@ -241,6 +241,8 @@ impl RestorePhases {
         self.tcp_lock_wait_ms = boundary.lock_wait_ms;
         self.tcp_construct_ms = boundary.construct_ms;
         self.tcp_gate_arm_ms = boundary.gate_arm_ms;
+        // A routed clone's move to its own address runs inside the boundary.
+        self.ipv6_ms = boundary.before_egress_ms;
         self.tcp_complete_console_ms = boundary.complete_console_ms;
         self.tcp_verified = boundary.verified_armed;
         self.tcp_verify_ms = boundary.verify_ms;
@@ -279,6 +281,7 @@ impl RestorePhases {
             + self.tcp_verify_ms
             + self.tcp_gate_arm_ms
             + self.tcp_barrier_ms
+            + self.ipv6_ms
             + self.tcp_egress_open_ms
             + self.tcp_destroy_ms
             + self.tcp_complete_console_ms
@@ -422,35 +425,6 @@ pub async fn handle_clone_restore(
     }
     phases.neighbour_pin_ms = elapsed_ms(neighbour_pin_started);
 
-    // Reconfigure IPv6, then announce it: before any network traffic can use
-    // the old address. The link is UP throughout (the boundary no longer takes
-    // it down), so the gate is what holds inbound traffic off until the
-    // cleanup below finishes.
-    let ipv6_started = std::time::Instant::now();
-    if let Some(new_ipv6) = clone_ipv6 {
-        let retired = network::reconfigure_ipv6(new_ipv6).await;
-        // A listener bound to the address just retired, or to an earlier clone
-        // generation's, stays reachable at the new one (#1083). Before the
-        // publication below, so no client finds it refused; a failure keeps the
-        // clone unpublished rather than publishing one whose service is gone.
-        let current: std::net::Ipv6Addr = new_ipv6
-            .parse()
-            .with_context(|| format!("the clone's IPv6 address {new_ipv6:?}"))?;
-        let carried = tokio::task::spawn_blocking(move || {
-            crate::retired_address::carry_listeners(retired, current)
-        })
-        .await
-        .context("joining the retired-address step")?
-        .context("keeping listeners on a retired IPv6 address reachable")?;
-        if !carried.translate.is_empty() {
-            eprintln!(
-                "[fc-agent] listeners on retired IPv6 address(es) {:?} answer on {current}: {:?}",
-                carried.keep, carried.translate
-            );
-        }
-    }
-    phases.ipv6_ms = elapsed_ms(ipv6_started);
-
     // Take the restoring host's identity: its host identity address on lo, and
     // its resolvers. The guest booted with the preparing host's, and on another
     // host both are wrong. Done here, before the boundary opens the gate's egress
@@ -498,7 +472,40 @@ pub async fn handle_clone_restore(
     // The boundary retires the snapshot-time sockets and opens the gate's
     // egress half; ingress stays gated until the publication below. The
     // boundary lock is held across everything in between.
-    let restored = crate::snapshot_network::restore_snapshot_network()
+    //
+    // A routed clone moves to its own IPv6 address inside the boundary, once the
+    // clone's UDP rule is in and before egress opens (#1114). The new address is
+    // what lets the network reach a routed clone, so taken before the UDP rule it
+    // let datagrams reach the restored workload, and nothing may leave from the
+    // snapshot's address once egress is open. The link is UP throughout, and the
+    // gate holds new inbound connections off until publication.
+    let move_to_clone_address = || async move {
+        let Some(new_ipv6) = clone_ipv6 else {
+            return Ok(());
+        };
+        let retired = network::reconfigure_ipv6(new_ipv6).await;
+        // A listener bound to the address just retired, or to an earlier clone
+        // generation's, stays reachable at the new one (#1083). Before the
+        // publication below, so no client finds it refused; a failure keeps the
+        // clone unpublished rather than publishing one whose service is gone.
+        let current: std::net::Ipv6Addr = new_ipv6
+            .parse()
+            .with_context(|| format!("the clone's IPv6 address {new_ipv6:?}"))?;
+        let carried = tokio::task::spawn_blocking(move || {
+            crate::retired_address::carry_listeners(retired, current)
+        })
+        .await
+        .context("joining the retired-address step")?
+        .context("keeping listeners on a retired IPv6 address reachable")?;
+        if !carried.translate.is_empty() {
+            eprintln!(
+                "[fc-agent] listeners on retired IPv6 address(es) {:?} answer on {current}: {:?}",
+                carried.keep, carried.translate
+            );
+        }
+        Ok(())
+    };
+    let restored = crate::snapshot_network::restore_snapshot_network(move_to_clone_address)
         .await
         .context("restore phase tcp-cleanup")?;
     phases.tcp_cleanup_ms = elapsed_ms(tcp_cleanup_started);
@@ -1002,6 +1009,7 @@ mod tests {
             construct_ms,
             complete_console_ms,
             gate_arm_ms: 4.0,
+            before_egress_ms: 5.0,
             verify_ms: 50.0,
             reassert_ms: 0.0,
             barrier_ms: 20.0,
@@ -1025,17 +1033,18 @@ mod tests {
         phases.tcp_cleanup_ms = 1000.0;
         phases.tcp_begin_console_ms = 1.0;
         phases.record_boundary(&boundary_report(200.0, 3.0, 2.0));
-        // 1 + 200 + 3 + 50 (verify) + 4 (gate arm) + 20 (barrier) + 30 (egress)
-        // + 600 (destroy) + 2 = 910.
-        assert_eq!(phases.tcp_cleanup_accounted_ms(), 910.0);
-        assert_eq!(phases.tcp_cleanup_untimed_ms, 90.0);
+        // 1 + 200 + 3 + 50 (verify) + 4 (gate arm) + 20 (barrier) + 5 (the move
+        // to the clone's IPv6 address) + 30 (egress) + 600 (destroy) + 2 = 915.
+        assert_eq!(phases.tcp_cleanup_accounted_ms(), 915.0);
+        assert_eq!(phases.tcp_cleanup_untimed_ms, 85.0);
+        assert_eq!(phases.ipv6_ms, 5.0);
 
         let mut reasserted = boundary_report(200.0, 3.0, 2.0);
         reasserted.verified_armed = false;
         reasserted.reassert_ms = 24.0;
         phases.record_boundary(&reasserted);
         assert_eq!(
-            phases.tcp_cleanup_untimed_ms, 90.0,
+            phases.tcp_cleanup_untimed_ms, 85.0,
             "the reassert contains the gate arm and the barrier and adds nothing"
         );
 
