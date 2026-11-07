@@ -430,18 +430,30 @@ async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
         // chronyd daemonizes: its foreground process waits until the daemon it forked is
         // initialized, so for a moment two chronyd processes exist, and a count taken then
         // reads two. fc-agent logs one of the lines below once the foreground process has
-        // exited, so the count waits for it.
-        const STARTED: [&str; 2] = [
-            "[fc-agent] chronyd restarted after restore",
-            "[fc-agent] ERROR: chronyd is not usable after restore",
-        ];
+        // exited, so the count waits for it. Both name the restore's epoch: a restart task
+        // the snapshot caught still waiting for sources finishes in the clone and logs for
+        // the restore that started it.
         // fc-agent gives up on the new daemon's sources after 30 s (CHRONYD_READY_TIMEOUT).
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
         loop {
             let log = std::fs::read_to_string(&clone_log)
                 .with_context(|| format!("reading {}", clone_log.display()))?;
-            if STARTED.iter().any(|line| log.contains(line)) {
-                break;
+            let epoch = log.lines().rev().find_map(|line| {
+                line.split("[fc-agent] handling restore (epoch=")
+                    .nth(1)?
+                    .split(')')
+                    .next()
+            });
+            if let Some(epoch) = epoch {
+                let started = [
+                    format!("[fc-agent] chronyd restarted after restore (epoch={epoch})"),
+                    format!(
+                        "[fc-agent] ERROR: chronyd is not usable after restore (epoch={epoch})"
+                    ),
+                ];
+                if started.iter().any(|line| log.contains(line.as_str())) {
+                    break;
+                }
             }
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,

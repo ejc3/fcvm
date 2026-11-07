@@ -560,7 +560,10 @@ pub async fn handle_clone_restore(
     // clock. Its convergence is not part of the readiness contract (the clock
     // is already stepped), so it must not hold the host's ACK.
     match chronyd_retired {
-        Ok(retired) => spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(retired)),
+        Ok(retired) => spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(
+            retired,
+            restore_epoch.to_string(),
+        )),
         Err(e) => eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}"),
     }
     phases.clock_ms = elapsed_ms(clock_started);
@@ -1372,8 +1375,11 @@ mod tests {
             .find("crate::bootplan::sync_clock_from_host()")
             .expect("the restore path no longer steps the clock");
         let restart = body
-            .find("crate::agent::restart_chronyd_after_restore(retired)")
-            .expect("the restore no longer starts a fresh chronyd");
+            .find(
+                "crate::agent::restart_chronyd_after_restore(\n            retired,\n            \
+                 restore_epoch.to_string(),",
+            )
+            .expect("the restore no longer starts a fresh chronyd that names its restore");
         assert!(
             retire < retired && retired < clock && clock < restart,
             "retire={retire} retired={retired} clock={clock} restart={restart}"
