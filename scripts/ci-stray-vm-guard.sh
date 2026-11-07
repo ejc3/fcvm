@@ -136,21 +136,24 @@ for tgid in "${STRAY_TGIDS[@]}"; do
 done
 
 # A killed group can take seconds to finish exiting (a large guest's memory is
-# unmapped by its last thread), and nothing it does then is a wedge. Re-scan until
-# every group killed so far is gone or the grace window ends. A group that appears
-# only after the kill was started by something still running: it is reported with
-# its parent, killed once, and from then on checked like the others, so a late group
-# that does not die is a survivor too (#871: both "unkillable" reports of 2026-11-05
-# were zombies, exiting threads and such latecomers, none of them in D state). A
-# group killed in a scan is always scanned again, for at most 5 s past the window
-# if groups keep appearing.
+# unmapped by its last thread), and nothing it does then is a wedge. Every group
+# gets the same grace from its own kill: it is a survivor only if it is still live
+# FCVM_GUARD_EXIT_GRACE_SECONDS after its SIGKILL. A group that appears only after
+# the kill was started by something still running. It is reported with its parent,
+# and while FCVM_GUARD_LATE_KILL_SECONDS (default: the grace plus 5 s) have not
+# passed it is killed and then checked like the others; after that it is reported
+# as left running, since something keeps starting VMs (#871: both "unkillable"
+# reports of 2026-11-05 were zombies, exiting threads and such latecomers, none of
+# them in D state). The scans end when no killed group is still inside its grace.
 EXIT_GRACE_SECONDS="${FCVM_GUARD_EXIT_GRACE_SECONDS:-20}"
-grace_deadline=$((SECONDS + EXIT_GRACE_SECONDS))
+LATE_KILL_SECONDS="${FCVM_GUARD_LATE_KILL_SECONDS:-$((EXIT_GRACE_SECONDS + 5))}"
+late_kill_deadline=$((SECONDS + LATE_KILL_SECONDS))
 LIVE_AFTER=$(new_temporary_file)
 ZOMBIE_AFTER=$(new_temporary_file)
 THREADS_AFTER_ALL=$(new_temporary_file)
-declare -A KILLED=()
-for tgid in "${STRAY_TGIDS[@]}"; do KILLED[$tgid]=1; done
+declare -A KILLED_AT=()
+declare -A LEFT=()
+for tgid in "${STRAY_TGIDS[@]}"; do KILLED_AT[$tgid]=$SECONDS; done
 LATE_TGIDS=()
 while :; do
 	sleep 1
@@ -163,11 +166,16 @@ while :; do
 	fi
 	SURVIVOR_TGIDS=()
 	NEW_LATE=()
+	pending=0
 	while IFS= read -r tgid; do
 		[ -n "$tgid" ] || continue
-		if [ -n "${KILLED[$tgid]:-}" ]; then
-			SURVIVOR_TGIDS+=("$tgid")
-		else
+		if [ -n "${KILLED_AT[$tgid]:-}" ]; then
+			if [ $((SECONDS - KILLED_AT[$tgid])) -ge "$EXIT_GRACE_SECONDS" ]; then
+				SURVIVOR_TGIDS+=("$tgid")
+			else
+				pending=1
+			fi
+		elif [ -z "${LEFT[$tgid]:-}" ]; then
 			NEW_LATE+=("$tgid")
 		fi
 	done <"$LIVE_AFTER"
@@ -182,18 +190,24 @@ while :; do
 			done
 		done <"$THREADS_AFTER"
 		for tgid in "${NEW_LATE[@]}"; do
-			timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
-			KILLED[$tgid]=1
-			LATE_TGIDS+=("$tgid")
+			if [ "$SECONDS" -lt "$late_kill_deadline" ]; then
+				timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
+				KILLED_AT[$tgid]=$SECONDS
+				LATE_TGIDS+=("$tgid")
+				pending=1
+			else
+				LEFT[$tgid]=1
+			fi
 		done
-		[ "$SECONDS" -lt $((grace_deadline + 5)) ] && continue
 	fi
-	[ "${#SURVIVOR_TGIDS[@]}" -eq 0 ] && break
-	[ "$SECONDS" -ge "$grace_deadline" ] && break
+	[ "$pending" -eq 0 ] && break
 done
 
 if [ "${#LATE_TGIDS[@]}" -gt 0 ]; then
 	echo "::warning title=Stray microVMs started during cleanup (${PHASE})::${#LATE_TGIDS[@]} process group(s) were started after the guard's kill, so something that launches VMs is still running; each was killed once."
+fi
+if [ "${#LEFT[@]}" -gt 0 ]; then
+	echo "::warning title=Stray microVMs left running (${PHASE})::${#LEFT[@]} process group(s) appeared more than ${LATE_KILL_SECONDS}s after the guard's kill and were not killed: something keeps starting VMs (tgids ${!LEFT[*]})."
 fi
 
 echo "killed ${COUNT} process group(s) and ${#LATE_TGIDS[@]} started after the kill, still live after SIGKILL and ${EXIT_GRACE_SECONDS}s: ${#SURVIVOR_TGIDS[@]}"
