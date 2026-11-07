@@ -233,6 +233,13 @@ pub struct VmConfig {
     /// Published port mappings (host:guest)
     #[serde(default)]
     pub port_mappings: Vec<PortMapping>,
+    /// The guest ports the guest was set up to publish when it booted (fc-agent DNATs
+    /// each TCP one to its loopback). `port_mappings` are the host listeners, and a
+    /// clone restored from memory keeps its snapshot's guest set whatever it publishes
+    /// on the host. None when written before this field existed: `guest_ports()` then
+    /// reads the set from `port_mappings`.
+    #[serde(default)]
+    pub published_guest_ports: Option<Vec<crate::network::GuestPort>>,
     /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     /// Routed mode needs these to set up the host-side relay; clones inherit them
     /// from snapshots so forwarding is re-established after restore.
@@ -327,6 +334,14 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
+    /// The guest ports this VM's guest was set up to publish: the recorded set, or the guest
+    /// side of `port_mappings` when none is recorded.
+    pub fn guest_ports(&self) -> Vec<crate::network::GuestPort> {
+        self.published_guest_ports
+            .clone()
+            .unwrap_or_else(|| crate::network::GuestPort::of(&self.port_mappings))
+    }
+
     /// The balloon device a cold boot of this VM attaches, or None for a VM with
     /// no device: the recorded target and free page reporting switch.
     pub fn balloon_device(&self) -> Option<crate::firecracker::BalloonDevice> {
@@ -385,6 +400,7 @@ impl VmState {
                 vsock_socket_path: None,
                 source_vsock_socket_path: None,
                 port_mappings: Vec::new(),
+                published_guest_ports: None,
                 forward_localhost: Vec::new(),
                 network_mode: crate::firecracker::FcNetworkMode::default(),
                 tty: false,

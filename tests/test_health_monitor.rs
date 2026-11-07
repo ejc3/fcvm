@@ -60,6 +60,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             vsock_socket_path: None,
             source_vsock_socket_path: None,
             port_mappings: vec![],
+            published_guest_ports: None,
             forward_localhost: vec![],
             network_mode: Default::default(),
             ipv6_prefix: None,

@@ -1572,15 +1572,18 @@ pub(crate) const PUBLISH_NONE: &str = "none";
 /// Without `--publish` they are the snapshot's. `--publish none` is none of them, so a
 /// clone of a snapshot that publishes a fixed host address can run beside another
 /// (#1024); it cannot be combined with another spec. Otherwise they are exactly the
-/// requested ones: a clone chooses the host side of a mapping, its address and port, but the guest
-/// port and protocol must be among the snapshot's. A guest restored from memory set its
-/// published ports up when it booted (fc-agent's DNAT to loopback, the
-/// --forward-localhost collision check) and the restore does not run that again. A
-/// disk-only clone boots, and a UDP mapping has no guest-side setup, so the rule is wider
-/// than those two need: it is one rule for every clone.
+/// requested ones, and a clone chooses the host side of each, its address and port.
+///
+/// A TCP guest port must be one the snapshot's guest set up to publish
+/// (`SnapshotMetadata::guest_ports`): a guest restored from memory set those up when it
+/// booted (fc-agent's DNAT to loopback, the --forward-localhost collision check) and the
+/// restore does not run that again. Two cases need no such setup, and add a guest port
+/// freely: a UDP mapping, which has no guest-side setup, and a clone of a disk-only
+/// snapshot (`cold_boot`), which boots and sets up the ports of its own list.
 fn clone_port_mappings(
     meta: &crate::storage::SnapshotMetadata,
     requested: &[String],
+    cold_boot: bool,
 ) -> Result<Vec<crate::network::PortMapping>> {
     let snapshot = &meta.port_mappings;
     if requested.is_empty() {
@@ -1597,32 +1600,26 @@ fn clone_port_mappings(
         }
         return Ok(Vec::new());
     }
+    let guest_ports = meta.guest_ports();
     let mut mappings = Vec::with_capacity(requested.len());
     for spec in requested {
         let mapping = crate::network::PortMapping::parse(spec)?;
-        let published_by_snapshot = snapshot
-            .iter()
-            .any(|m| m.guest_port == mapping.guest_port && m.proto == mapping.proto);
-        if !published_by_snapshot {
-            let published: std::collections::BTreeSet<(u16, String)> = snapshot
-                .iter()
-                .map(|m| (m.guest_port, m.proto.to_string()))
-                .collect();
-            let published = if published.is_empty() {
+        let guest_port = crate::network::GuestPort {
+            port: mapping.guest_port,
+            proto: mapping.proto,
+        };
+        let needs_no_setup = cold_boot || mapping.proto == crate::network::Protocol::Udp;
+        if !needs_no_setup && !guest_ports.contains(&guest_port) {
+            let published = if guest_ports.is_empty() {
                 "it published no ports".to_string()
             } else {
-                let ports: Vec<String> = published
-                    .iter()
-                    .map(|(port, proto)| format!("{port}/{proto}"))
-                    .collect();
+                let ports: Vec<String> = guest_ports.iter().map(ToString::to_string).collect();
                 format!("it published {}", ports.join(", "))
             };
             bail!(
-                "--publish {spec}: the snapshot did not publish guest port {}/{} ({published}). \
-                 --publish moves where a port the snapshot published listens on the host. \
-                 It cannot add a guest port.",
-                mapping.guest_port,
-                mapping.proto
+                "--publish {spec}: the snapshot did not publish guest port {guest_port} \
+                 ({published}). --publish moves where a TCP port the snapshot published \
+                 listens on the host. It cannot add one to a clone restored from memory."
             );
         }
         mappings.push(mapping);
@@ -2590,7 +2587,11 @@ async fn cmd_snapshot_run_inner(
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
-    let port_mappings = clone_port_mappings(&snapshot_config.metadata, &args.publish)?;
+    let port_mappings = clone_port_mappings(
+        &snapshot_config.metadata,
+        &args.publish,
+        snapshot_config.kind == crate::storage::SnapshotKind::DiskOnly,
+    )?;
     crate::network::require_routed_for_address(
         snapshot_config.metadata.network_mode,
         args.ipv6_address,
@@ -3194,6 +3195,9 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
     vm_state.config.port_mappings = port_mappings.clone();
+    // The guest set up its snapshot's published ports when it booted and keeps them
+    // whatever this clone listens on, so a snapshot of the clone records those.
+    vm_state.config.published_guest_ports = Some(snapshot_config.metadata.guest_ports());
     vm_state.config.forward_localhost = snapshot_config.metadata.forward_localhost.clone();
     vm_state.config.network_mode = network_mode;
     vm_state.config.ipv6_prefix = restore_prefix;
@@ -4455,9 +4459,16 @@ async fn cmd_snapshot_run_inner(
                                     // The relaunch booted this fcvm's fc-agent, which
                                     // applies a restore's huge page mode.
                                     vm_state.config.guest_thp_restore = true;
+                                    // The rebooted guest set up the ports of the
+                                    // clone's own mappings when it booted.
+                                    let rebooted_ports =
+                                        crate::network::GuestPort::of(&vm_state.config.port_mappings);
+                                    vm_state.config.published_guest_ports =
+                                        Some(rebooted_ports.clone());
                                     let _ = state_manager
                                         .update_state(&vm_id, |state| {
                                             state.config.guest_thp_restore = true;
+                                            state.config.published_guest_ports = Some(rebooted_ports.clone());
                                         })
                                         .await;
                                     startup_rx = None;
@@ -5992,6 +6003,7 @@ mod tests {
             username: Some("ubuntu".to_string()),
             user: Some("1000:1000".to_string()),
             port_mappings: vec![],
+            published_guest_ports: None,
             forward_localhost: vec![],
             network_mode: crate::firecracker::FcNetworkMode::Rootless,
             ipv6_prefix: None,
@@ -6370,10 +6382,10 @@ mod tests {
     fn a_clone_inherits_the_snapshots_mappings_or_uses_exactly_the_requested_ones() {
         let snapshot = publishing(&["127.0.0.1:8080:80", "8443:443", "5300:53/udp"]);
         assert_eq!(
-            clone_port_mappings(&snapshot, &[]).unwrap(),
+            clone_port_mappings(&snapshot, &[], false).unwrap(),
             snapshot.port_mappings
         );
-        assert!(clone_port_mappings(&publishing(&[]), &[])
+        assert!(clone_port_mappings(&publishing(&[]), &[], false)
             .unwrap()
             .is_empty());
 
@@ -6381,6 +6393,7 @@ mod tests {
         let chosen = clone_port_mappings(
             &snapshot,
             &requested(&["[::]:80:80", "127.0.0.1:8081:80/tcp", "53:53/udp"]),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -6389,13 +6402,13 @@ mod tests {
         );
     }
 
-    /// The guest only has what was published when it booted, so a clone cannot publish
-    /// another guest port or the same port under another protocol.
+    /// A guest restored from memory has the TCP ports published when it booted, so its
+    /// clone cannot publish another TCP guest port, the same port under TCP included.
     #[test]
     fn a_clone_cannot_publish_a_guest_port_the_snapshot_did_not() {
         let snapshot = publishing(&["8080:80", "8443:443", "5300:53/udp"]);
         let refusal = |specs: &[&str]| {
-            clone_port_mappings(&snapshot, &requested(specs))
+            clone_port_mappings(&snapshot, &requested(specs), false)
                 .expect_err("must be refused")
                 .to_string()
         };
@@ -6407,9 +6420,7 @@ mod tests {
         );
         assert!(error.contains("53/udp, 80/tcp, 443/tcp"), "{error}");
 
-        // The same port number under the other protocol.
-        let error = refusal(&["8080:80/udp"]);
-        assert!(error.contains("guest port 80/udp"), "{error}");
+        // The same port number as a UDP port the snapshot published, under TCP.
         let error = refusal(&["5300:53"]);
         assert!(error.contains("guest port 53/tcp"), "{error}");
 
@@ -6425,10 +6436,27 @@ mod tests {
         );
 
         // A snapshot that published nothing has nothing a clone could publish.
-        let error = clone_port_mappings(&publishing(&[]), &requested(&["8080:80"]))
+        let error = clone_port_mappings(&publishing(&[]), &requested(&["8080:80"]), false)
             .expect_err("must be refused")
             .to_string();
         assert!(error.contains("published no ports"), "{error}");
+    }
+
+    /// Two cases need no guest-side setup and may add a guest port (#1025): a UDP
+    /// mapping, and any mapping of a clone of a disk-only snapshot, which cold-boots and
+    /// sets up its own list. A TCP port of a memory clone still must be the snapshot's.
+    #[test]
+    fn a_udp_port_or_a_cold_booted_clone_may_add_a_guest_port() {
+        let snapshot = publishing(&["8080:80"]);
+        assert_eq!(
+            clone_port_mappings(&snapshot, &requested(&["8080:80", "5300:53/udp"]), false).unwrap(),
+            published(&["8080:80", "5300:53/udp"])
+        );
+        assert_eq!(
+            clone_port_mappings(&snapshot, &requested(&["9090:81", "8080:80/udp"]), true).unwrap(),
+            published(&["9090:81", "8080:80/udp"])
+        );
+        assert!(clone_port_mappings(&snapshot, &requested(&["9090:81"]), false).is_err());
     }
 
     /// `--publish none` publishes nothing, whatever the snapshot published, and is
@@ -6436,18 +6464,20 @@ mod tests {
     #[test]
     fn publish_none_publishes_nothing_and_stands_alone() {
         let snapshot = publishing(&["[::]:80:80", "5300:53/udp"]);
-        assert!(clone_port_mappings(&snapshot, &requested(&["none"]))
+        assert!(clone_port_mappings(&snapshot, &requested(&["none"]), false)
             .unwrap()
             .is_empty());
-        assert!(clone_port_mappings(&publishing(&[]), &requested(&["none"]))
-            .unwrap()
-            .is_empty());
+        assert!(
+            clone_port_mappings(&publishing(&[]), &requested(&["none"]), false)
+                .unwrap()
+                .is_empty()
+        );
         for specs in [
             &["none", "8080:80"][..],
             &["8080:80", "none"][..],
             &["none", "none"][..],
         ] {
-            let error = clone_port_mappings(&snapshot, &requested(specs))
+            let error = clone_port_mappings(&snapshot, &requested(specs), false)
                 .expect_err("none stands alone")
                 .to_string();
             assert!(
@@ -6455,6 +6485,117 @@ mod tests {
                 "{specs:?}: {error}"
             );
         }
+    }
+
+    /// A snapshot of a clone records the guest's published ports, not the clone's host
+    /// mappings (#1025): a clone that publishes nothing, snapshotted, still lets that
+    /// snapshot's clones publish the guest ports the guest set up at boot.
+    #[test]
+    fn a_snapshot_of_a_clone_that_publishes_none_keeps_the_guests_ports() {
+        let snapshot = publishing(&["8080:80", "8443:443"]);
+        // The clone's state as cmd_snapshot_run records it.
+        let mut clone = crate::state::VmState::new("vm-clone".into(), "img".into(), 2, 1024);
+        clone.config.port_mappings =
+            clone_port_mappings(&snapshot, &requested(&["none"]), false).unwrap();
+        clone.config.published_guest_ports = Some(snapshot.guest_ports());
+        clone.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/runtime/vm-clone/vsock.sock"));
+        let next = super::super::common::build_snapshot_config(
+            &clone,
+            "next",
+            crate::storage::SnapshotType::User,
+            Path::new("/snapshots/next"),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert!(next.metadata.port_mappings.is_empty());
+        assert_eq!(
+            next.metadata.guest_ports(),
+            crate::network::GuestPort::of(&published(&["1:80", "1:443"]))
+        );
+        assert_eq!(
+            clone_port_mappings(&next.metadata, &requested(&["9090:80"]), false).unwrap(),
+            published(&["9090:80"])
+        );
+        // The recorded set survives the round trip through config.json.
+        let reread: crate::storage::SnapshotMetadata =
+            serde_json::from_value(serde_json::to_value(&next.metadata).unwrap()).unwrap();
+        assert_eq!(reread.guest_ports(), next.metadata.guest_ports());
+    }
+
+    /// A snapshot or a VM state written before the guest ports were recorded reads them
+    /// from its port mappings.
+    #[test]
+    fn a_record_without_guest_ports_reads_them_from_its_mappings() {
+        let meta = publishing(&["8080:80", "[::]:80:80", "5300:53/udp"]);
+        let mut json = serde_json::to_value(&meta).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("published_guest_ports");
+        let old: crate::storage::SnapshotMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(old.published_guest_ports, None);
+        assert_eq!(
+            old.guest_ports()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["53/udp", "80/tcp"]
+        );
+
+        let mut state = crate::state::VmState::new("vm-old".into(), "img".into(), 2, 1024);
+        state.config.port_mappings = published(&["8443:443"]);
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("published_guest_ports");
+        let old: crate::state::VmState = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            old.config.guest_ports(),
+            crate::network::GuestPort::of(&published(&["8443:443"]))
+        );
+    }
+
+    /// Where each VM's guest set comes from: a cold boot's and a rebooted clone's own
+    /// mappings, a memory clone's snapshot, and a snapshot's VM state.
+    #[test]
+    fn every_vm_records_the_guest_ports_its_guest_set_up() {
+        // Compared without whitespace, so formatting does not decide the result.
+        let flat = |source: &str| -> String { source.split_whitespace().collect() };
+        let snapshot_rs = include_str!("snapshot.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let run = &snapshot_rs[snapshot_rs
+            .find("async fn cmd_snapshot_run_inner(")
+            .unwrap()..];
+        let run = flat(&run[..run.find("\n}\n").unwrap()]);
+        for (needle, what) in [
+            (
+                "vm_state.config.published_guest_ports = Some(snapshot_config.metadata.guest_ports());",
+                "a memory clone does not record its snapshot's guest ports",
+            ),
+            (
+                "state.config.published_guest_ports = Some(rebooted_ports.clone());",
+                "a rebooted clone does not record the guest ports of its own mappings",
+            ),
+        ] {
+            assert!(run.contains(&flat(needle)), "{what}");
+        }
+        assert!(
+            flat(include_str!("podman/mod.rs")).contains(&flat(
+                "vm_state.config.published_guest_ports = Some(crate::network::GuestPort::of(&port_mappings));"
+            )),
+            "a cold boot does not record the guest ports of its mappings"
+        );
+        assert!(
+            flat(include_str!("common.rs")).contains(&flat(
+                "published_guest_ports: Some(vm_state.config.guest_ports()),"
+            )),
+            "a snapshot does not record its VM's guest ports"
+        );
     }
 
     /// A clone's --publish is checked under the snapshot's network mode, before anything
@@ -6467,9 +6608,9 @@ mod tests {
         meta.port_mappings = published(&["8080:80", "8443:443"]);
         let overlapping = requested(&["[::]:8080:80", "127.0.0.1:8080:443"]);
         meta.network_mode = FcNetworkMode::Rootless;
-        clone_port_mappings(&meta, &overlapping).unwrap();
+        clone_port_mappings(&meta, &overlapping, false).unwrap();
         meta.network_mode = FcNetworkMode::Routed;
-        let error = clone_port_mappings(&meta, &overlapping)
+        let error = clone_port_mappings(&meta, &overlapping, false)
             .expect_err("routed's [::] holds the IPv4 port")
             .to_string();
         assert!(
@@ -6481,6 +6622,7 @@ mod tests {
         let error = clone_port_mappings(
             &meta,
             &requested(&["127.0.0.1:8080:80", "127.0.0.2:8080:443"]),
+            false,
         )
         .expect_err("one veth address and port")
         .to_string();
@@ -6488,7 +6630,7 @@ mod tests {
         // A snapshot whose own mappings collide is refused for a clone that inherits them.
         meta.network_mode = FcNetworkMode::Rootless;
         meta.port_mappings = published(&["0.0.0.0:8080:80", "8080:443"]);
-        let error = clone_port_mappings(&meta, &[])
+        let error = clone_port_mappings(&meta, &[], false)
             .expect_err("0.0.0.0 holds the clone's loopback address")
             .to_string();
         assert!(
