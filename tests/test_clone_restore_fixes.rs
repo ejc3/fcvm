@@ -665,9 +665,16 @@ async fn test_restore_reinstalls_a_tampered_snapshot_gate() -> Result<()> {
         );
         common::poll_health_by_pid(clone_pid, 120).await?;
         let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+        // The restore's ACK record, one JSON object on its own line.
+        let record: serde_json::Value = log
+            .lines()
+            .filter_map(|line| line.find('{').map(|at| &line[at..]))
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .find(|record| record.get("ack_ms").is_some())
+            .with_context(|| format!("no restore ACK record in {}", clone_log.display()))?;
         anyhow::ensure!(
-            log.contains("\"tcp_verified\":false"),
-            "the restore trusted a gate that was not the snapshot's ({})",
+            record["guest_phases"]["tcp_verified"] == serde_json::Value::Bool(false),
+            "the restore trusted a gate that was not the snapshot's: {record} ({})",
             clone_log.display()
         );
         let rules = common::exec_in_vm(clone_pid, &["/usr/sbin/iptables -w -S"]).await?;
