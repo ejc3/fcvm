@@ -21,6 +21,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import dev.fcvm.robotpark.scene.Action
+import dev.fcvm.robotpark.scene.Stamp
 
 /**
  * The app's one window: the scene on a SurfaceView, full screen with the system bars hidden;
@@ -40,6 +41,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var tabScene: TextView
     private lateinit var tabInfo: TextView
     private var chromeFromScene = false
+    private var heldFromScene = false
     private val hideBanner = Runnable { banner.visibility = View.GONE }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -79,6 +81,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         gl = GlThread(applicationContext)
         gl.onChrome = { on -> root.post { chromeFromScene = on; layoutChrome() } }
+        gl.onHeld = { held -> root.post { heldFromScene = held; layoutChrome() } }
         gl.start()
         GlThread.current = gl
         // published with the tab a request kept while there was no activity (PhoneApp.act)
@@ -170,6 +173,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val visible = chromeFromScene || Store.screen == "info"
         topBar.visibility = if (visible) View.VISIBLE else View.GONE
         tabBar.visibility = if (visible) View.VISIBLE else View.GONE
+        // held, the bottom bar and the info screen end Stamp.ROWS above the screen's bottom,
+        // where the scene's stamp band shows (the stamp carries the held bit while they do)
+        val lift = if (heldFromScene) Stamp.ROWS else 0
+        for (v in listOf(tabBar, info)) {
+            val lp = v.layoutParams as FrameLayout.LayoutParams
+            if (lp.bottomMargin != lift) {
+                lp.bottomMargin = lift
+                v.layoutParams = lp
+            }
+        }
         val night = night()
         val on = if (night) 0xFFD0BCFF.toInt() else 0xFF6750A4.toInt()
         val off = if (night) 0xFFCAC4D0.toInt() else 0xFF49454F.toInt()
