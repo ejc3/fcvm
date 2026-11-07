@@ -2287,7 +2287,9 @@ fn observe_windows(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
                 }
                 Some(g) if slot.generation >= g => {}
                 _ => {
-                    slot.generation = slot.generation.max(owed.generation.unwrap_or(0).saturating_sub(1));
+                    slot.generation = slot
+                        .generation
+                        .max(owed.generation.unwrap_or(0).saturating_sub(1));
                     bump(slot, &format!("return:{}", owed.session), at);
                     owed.generation = Some(slot.generation);
                 }
