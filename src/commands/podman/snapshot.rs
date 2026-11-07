@@ -373,39 +373,43 @@ pub async fn create_podman_snapshot(
     let parent_dir = parent_snapshot_key
         .as_deref()
         .map(|key| paths::snapshot_dir().join(key));
-    let Some(client) = client else {
-        // Cloud Hypervisor: always a full snapshot, and the source resumes.
-        let ch_client = crate::hypervisor::cloud_hypervisor::api::ChClient::new(
-            paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
-        );
-        crate::commands::common::create_snapshot_ch(
-            &ch_client,
-            snapshot_config,
-            disk_path,
-            &vsock_socket_path,
-            Some(&extra_files),
-        )
-        .await?;
-        drop(_vm_lock);
-        drop(_generation_locks);
-        return Ok(SnapshotInstall::Created);
+    let published_memory = match client {
+        Some(client) => Some(
+            crate::commands::common::create_snapshot_core(
+                client,
+                snapshot_config,
+                disk_path,
+                &vsock_socket_path,
+                parent_dir.as_deref(),
+                Some(&extra_files),
+                source_disposition,
+            )
+            .await?,
+        ),
+        None => {
+            // Cloud Hypervisor: always a full snapshot, and the source resumes.
+            let ch_client = crate::hypervisor::cloud_hypervisor::api::ChClient::new(
+                paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
+            );
+            crate::commands::common::create_snapshot_ch(
+                &ch_client,
+                snapshot_config,
+                disk_path,
+                &vsock_socket_path,
+                Some(&extra_files),
+            )
+            .await?;
+            None
+        }
     };
-    let published_memory = crate::commands::common::create_snapshot_core(
-        client,
-        snapshot_config,
-        disk_path,
-        &vsock_socket_path,
-        parent_dir.as_deref(),
-        Some(&extra_files),
-        source_disposition,
-    )
-    .await?;
 
     // The VM is saved and the snapshot published. Give the locks back before the memory
     // file is measured, so no clone, create or balloon change waits on the walk.
     drop(_vm_lock);
     drop(_generation_locks);
-    published_memory.log_data_runs().await;
+    if let Some(published_memory) = published_memory {
+        published_memory.log_data_runs().await;
+    }
 
     Ok(SnapshotInstall::Created)
 }
