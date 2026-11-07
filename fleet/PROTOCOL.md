@@ -1511,8 +1511,8 @@ reference in `--windows-state-dir/<key>/desktop-ref.ppm` are both there. Otherwi
 2. the bridge in logon mode (`logon`, below, with `DESKTOP_REF_OUT`), which logs
    on, saves the desktop it reached as the reference, disconnects and exits 0 (300 s);
 3. until the gold VM's processes (its fcvm and every process below it, from `/proc`) use
-   under `--windows-idle-cpu` of one core (0.15) over every second of 10 s in a row (300 s; an
-   idle disconnected desktop measured 0.12 to 0.13 of a core);
+   under `--windows-idle-cpu` of one core (0.25) on average over 20 s (300 s; the settled gold
+   desktop measured 0.14 to 0.17 of a core);
 4. `fcvm snapshot create --pid <pid> --tag win-gold-<key> --stop`.
 
 A step that fails reports the gold snapshot `failed` (`windows_image`) and every sandbox

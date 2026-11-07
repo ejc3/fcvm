@@ -310,7 +310,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 snapshot_dir: args.windows_snapshot_dir.clone(),
                 proc_root: "/proc".into(),
                 idle_cpu: args.windows_idle_cpu,
-                idle_for: Duration::from_secs(10),
+                idle_for: windows::IDLE_WINDOW,
                 gold_healthy_deadline: Duration::from_secs(600),
                 logon_deadline: Duration::from_secs(300),
                 idle_deadline: Duration::from_secs(300),

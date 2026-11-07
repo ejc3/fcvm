@@ -9,8 +9,8 @@
 //! desktop reference it leaves are already there: cold boot `win-gold`, wait until fcvm reports
 //! it healthy (Remote Desktop answers and the guest agent acknowledged its clock), log on with
 //! the bridge (its `logon` mode, which saves the desktop it reached as the reference and
-//! disconnects), wait until the VM's processes use under `--windows-idle-cpu` of one core for
-//! 10 s in a row, `fcvm snapshot create --stop`. Every sandbox then restores from it at once.
+//! disconnects), wait until the VM's processes use under `--windows-idle-cpu` of one core on
+//! average over 20 s, `fcvm snapshot create --stop`. Every sandbox then restores from it at once.
 //!
 //! One task per sandbox ([`supervise`]) alone starts, watches and stops its VM and bridge. A
 //! sandbox relaunches when its desired generation moves (a reset, a borrow ending), and after a
@@ -359,15 +359,25 @@ pub fn listed(ls_json: &str, name: &str, pid: u32) -> Option<Listed> {
     })
 }
 
-/// Whether a VM has gone idle: it used under `threshold` of one core over every second of the
-/// last `window`. Fed cumulative CPU seconds; pure, so it is tested on synthetic samples.
+/// The default `--windows-idle-cpu`: over the measured gold desktop's floor of 0.14 to 0.17 of
+/// a core, well under the 2 cores of its logon.
+pub const DEFAULT_IDLE_CPU: f64 = 0.25;
+/// The window the gold VM's average share is taken over.
+pub const IDLE_WINDOW: Duration = Duration::from_secs(20);
+
+/// Whether a VM has gone idle: over the last `window` it used under `threshold` of one core on
+/// average. An average, not every second: the measured gold desktop sits at 0.14 to 0.17 of a
+/// core (its fcvm, the namespace helper and Cloud Hypervisor) with a busy second every half
+/// minute or so, which a per-second test never lets through. Fed cumulative CPU seconds; pure,
+/// so it is tested on synthetic and measured samples.
 #[derive(Debug, Clone)]
 pub struct IdleDetector {
     threshold: f64,
     window: f64,
-    last: Option<(f64, f64)>,
-    quiet_since: Option<f64>,
-    /// The share of a core over the last interval, for the failure message.
+    /// Samples (t, cpu) from the newest one at or before `t - window` on.
+    samples: std::collections::VecDeque<(f64, f64)>,
+    /// The share of a core over the last window, or since the first sample before one has
+    /// passed, for the failure message.
     pub last_share: Option<f64>,
 }
 
@@ -376,30 +386,27 @@ impl IdleDetector {
         IdleDetector {
             threshold,
             window: window.as_secs_f64(),
-            last: None,
-            quiet_since: None,
+            samples: std::collections::VecDeque::new(),
             last_share: None,
         }
     }
 
     /// One sample at `t` seconds of `cpu` seconds used so far. Returns whether the VM is idle.
     pub fn sample(&mut self, t: f64, cpu: f64) -> bool {
-        let Some((t0, c0)) = self.last.replace((t, cpu)) else {
-            return false;
-        };
-        let dt = t - t0;
-        if dt <= 0.0 {
+        if self.samples.back().is_some_and(|&(t1, _)| t <= t1) {
             return false;
         }
-        let share = ((cpu - c0) / dt).max(0.0);
+        self.samples.push_back((t, cpu));
+        while self.samples.len() > 2 && self.samples[1].0 <= t - self.window {
+            self.samples.pop_front();
+        }
+        let (t0, c0) = self.samples[0];
+        if t0 == t {
+            return false;
+        }
+        let share = ((cpu - c0) / (t - t0)).max(0.0);
         self.last_share = Some(share);
-        if share < self.threshold {
-            let since = *self.quiet_since.get_or_insert(t0);
-            t - since >= self.window
-        } else {
-            self.quiet_since = None;
-            false
-        }
+        t - t0 >= self.window && share < self.threshold
     }
 }
 
@@ -990,9 +997,10 @@ async fn gold_steps(
         }
         if started.elapsed() >= cfg.idle_deadline {
             bail!(
-                "the gold desktop did not go idle in {} s: its VM used {} of a core over the last second (idle is under {})",
+                "the gold desktop did not go idle in {} s: its VM used {} of a core over the last {} s (idle is under {})",
                 cfg.idle_deadline.as_secs(),
                 idle.last_share.map_or("an unknown share".into(), |s| format!("{s:.2}")),
+                cfg.idle_for.as_secs(),
                 cfg.idle_cpu
             );
         }
@@ -1915,29 +1923,67 @@ mod tests {
         assert_eq!(listed("not json", "win-1", 200), None);
     }
 
-    /// The prototype measured an idle disconnected desktop at 12 to 13% of a core, so the
-    /// default 15% settles where 2% never would; a busy second starts the 10 s again.
+    /// Idle is the average over the window: a busy logon keeps it busy until the window has
+    /// passed beyond it, a lone busy second on the floor does not, and a desktop that stays
+    /// over the threshold never settles.
     #[test]
-    fn the_desktop_is_idle_after_ten_quiet_seconds_in_a_row() {
-        let mut d = IdleDetector::new(0.15, Duration::from_secs(10));
+    fn the_desktop_is_idle_once_its_average_over_the_window_is_low() {
+        let run = |shares: &dyn Fn(usize) -> f64, secs: usize| {
+            let mut d = IdleDetector::new(DEFAULT_IDLE_CPU, IDLE_WINDOW);
+            let mut cpu = 0.0;
+            for s in 0..secs {
+                if d.sample(s as f64, cpu) {
+                    return (Some(s), d.last_share);
+                }
+                cpu += shares(s);
+            }
+            (None, d.last_share)
+        };
+        // Two cores for seconds 0 to 9 (the logon), then the floor with one busy second, 25.
+        // The window [t-20, t) holds two busy seconds at t = 29 (2 x 2 + 18 x 0.15 = 6.7 / 20 =
+        // 0.335) and one at t = 30 (2 + 19 x 0.15 = 4.85 / 20 = 0.2425): idle at 30 with the
+        // busy second inside the window.
+        let (at, share) = run(&|s| if s < 10 || s == 25 { 2.0 } else { 0.15 }, 60);
+        assert_eq!(at, Some(30), "{share:?}");
+        // A desktop at 0.3 of a core never settles, and says so.
+        let (at, share) = run(&|_| 0.3, 120);
+        assert_eq!(at, None);
+        assert!((share.unwrap() - 0.3).abs() < 1e-9);
+        // Nothing is idle before a whole window has been seen.
+        let (at, _) = run(&|_| 0.0, 20);
+        assert_eq!(at, None);
+        assert_eq!(run(&|_| 0.0, 21).0, Some(20));
+    }
+
+    /// The gold VM of the fleet's image on the x86 host, per second from the end of the bridge's
+    /// logon: a floor of 0.14 to 0.17 of a core (its fcvm, the namespace helper and Cloud
+    /// Hypervisor) with a busy second every half minute or so. Requiring every second under
+    /// 0.15 never settled on it (the gold flow failed at its 300 s deadline).
+    const MEASURED_GOLD_IDLE: &[f64] = &[
+        1.42, 0.48, 0.27, 0.26, 0.17, 0.17, 0.22, 0.23, 0.17, 0.18, 0.23, 0.32, 0.17, 0.17, 0.17,
+        0.26, 0.17, 0.17, 0.17, 0.18, 0.17, 0.33, 0.18, 0.18, 0.17, 0.23, 0.17, 0.17, 0.39, 0.20,
+        0.33, 0.18, 0.17, 0.19, 0.17, 0.17, 0.18, 0.17, 0.17, 0.25, 0.17, 0.19, 0.18, 0.18, 0.32,
+        0.17, 0.30, 0.15, 0.17, 0.15, 0.17, 0.17, 0.17, 0.19, 0.86, 0.81, 0.17, 0.25, 0.20, 0.15,
+        0.17, 0.17, 0.14, 0.17, 0.14, 0.15, 0.15, 0.15, 0.19, 0.14, 0.15, 0.15, 0.17, 0.19, 0.17,
+        0.14, 0.18, 0.17, 0.15, 0.14, 0.15, 0.17, 0.23, 0.14, 0.17, 0.17, 0.17, 0.23, 1.12, 0.76,
+        0.54, 0.25, 0.17, 0.17, 0.15, 0.17, 0.18, 0.17, 0.17, 0.17, 0.19, 0.19, 0.15, 0.17, 0.15,
+        0.17, 0.17, 0.15, 0.15, 0.17, 0.17, 0.33, 0.23, 0.15, 0.15, 0.28, 0.18, 0.17, 0.17, 0.15,
+        0.14, 0.17, 0.15, 0.17, 0.15,
+    ];
+
+    #[test]
+    fn the_measured_gold_desktop_goes_idle() {
+        let mut d = IdleDetector::new(DEFAULT_IDLE_CPU, IDLE_WINDOW);
         let mut cpu = 0.0;
         let mut idle_at = None;
-        for s in 0..40 {
-            // busy for the first 5 s (the logon's shell start), then 12.5% of a core, but one
-            // busy second at 12 s
-            let share = if s < 5 || s == 12 { 0.9 } else { 0.125 };
+        for (s, share) in MEASURED_GOLD_IDLE.iter().enumerate() {
             if d.sample(s as f64, cpu) && idle_at.is_none() {
                 idle_at = Some(s);
             }
             cpu += share;
         }
-        // quiet from 13 s, so ten quiet seconds end at 23 s
-        assert_eq!(idle_at, Some(23));
-        // The 2% the design first named never settles on the measured desktop.
-        let mut strict = IdleDetector::new(0.02, Duration::from_secs(10));
-        let settled = (0..60).any(|s| strict.sample(s as f64, s as f64 * 0.125));
-        assert!(!settled);
-        assert_eq!(strict.last_share, Some(0.125));
+        let at = idle_at.expect("the measured desktop never went idle");
+        assert!(at <= 30, "idle only at {at} s");
     }
 
     #[test]

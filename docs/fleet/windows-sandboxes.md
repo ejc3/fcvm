@@ -254,9 +254,11 @@ The gold flow, run by the agent once per host and image (stack PR 6):
 3. The bridge disconnects. The session stays logged on, in the Disconnected state, with the
    desktop and its windows alive.
 4. The agent waits until the desktop is idle: the gold VM's processes (its fcvm and every
-   process below it, read from `/proc` on the host) under 15% of one core for 10 s in a row
-   (`--windows-idle-cpu`). The prototype measured an idle disconnected desktop at 12 to 13% of
-   a core, so the 2% first written here never settles.
+   process below it, read from `/proc` on the host) under 25% of one core on average over 20 s
+   (`--windows-idle-cpu`). On the x86 host the gold VM of the fleet's image used 2 cores
+   through the logon, then settled at 14 to 17% of a core with a busy second (0.3 to 1.1 of a
+   core) every half minute or so. Requiring every second under 15% never settled on it, and
+   the 2% first written here would not either.
 5. `fcvm snapshot create --stop`.
 
 A clone's bridge then connects and reconnects to that session: no logon, no profile load, no

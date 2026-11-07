@@ -677,9 +677,9 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
     pub windows_snapshot_dir: std::path::PathBuf,
 
-    /// The gold desktop is idle once its VM uses under this share of one core for 10 s in a
-    /// row (an idle disconnected desktop measured 0.12 to 0.13)
-    #[arg(long, default_value_t = 0.15)]
+    /// The gold desktop is idle once its VM uses under this share of one core on average over
+    /// 20 s (the gold VM of the fleet's image measured 0.14 to 0.17 once its desktop settled)
+    #[arg(long, default_value_t = 0.25)]
     pub windows_idle_cpu: f64,
 
     /// podman, which runs the bridges (tests)
