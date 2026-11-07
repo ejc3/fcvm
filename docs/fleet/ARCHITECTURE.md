@@ -1997,6 +1997,12 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
    handled only after a catch; the viewer cap set by measuring the wake with 0, 10, 100 and
    1000 viewers reconnecting at once.
 
+## Windows mode
+
+`?mode=windows` shows disposable Windows desktops, each a Cloud Hypervisor VM restored from a
+snapshot of an idle, logged-on desktop, with the time from the click to the first desktop
+frame on each tile. The design is its own document: `docs/fleet/windows-sandboxes.md`.
+
 ## Invariants (each becomes a test)
 
 1. At most one VM runs per slot, and at most one slot holds a GPU.
