@@ -2901,11 +2901,25 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 // The guest's agent is up, so its kernel has probed its devices. A
                 // cold boot with --free-page-reporting is checked here: before the
                 // pre-start snapshot below, and before the guest is told to go on.
-                if let Err(error) = settle_balloon_check(ctx).await {
+                // The check takes the per-VM snapshot lock, which a `fcvm snapshot create`
+                // of this VM can hold for minutes, so it is raced with cancellation (#1075).
+                let settled = tokio::select! {
+                    settled = settle_balloon_check(ctx) => Some(settled),
+                    _ = cancel.cancelled() => None,
+                };
+                match settled {
+                    Some(Ok(())) => {}
                     // The request is dropped unanswered, and that must not read as
                     // "start the container": this VM is about to be torn down.
-                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
-                    return Err(error);
+                    Some(Err(error)) => {
+                        *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
+                        return Err(error);
+                    }
+                    None => {
+                        info!("shutdown requested while checking the VM's balloon device");
+                        *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
+                        return Ok(None);
+                    }
                 }
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
@@ -3047,7 +3061,14 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 // The balloon check normally ran at the agent's first ask. It runs
                 // here if that ask never came (fc-agent skips it when it cannot
                 // quiesce the console), so the startup snapshot is behind it too.
-                settle_balloon_check(ctx).await?;
+                // Raced with cancellation like the one at the ask (#1075).
+                tokio::select! {
+                    settled = settle_balloon_check(ctx) => settled?,
+                    _ = cancel.cancelled() => {
+                        info!("shutdown requested while checking the VM's balloon device");
+                        return Ok(None);
+                    }
+                }
 
                 if let Some(ref key) = ctx.snapshot_key {
                     let startup_key =
@@ -3352,9 +3373,13 @@ async fn run_prepare_loop(
         volume_configs: &ctx.volume_configs,
         remap_refs: &ctx.volume_servers.remap_refs,
     };
-    let install = snapshot::create_podman_snapshot(&snap, snapshot_source_disposition(lifecycle))
-        .await
-        .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
+    let install = snapshot::create_podman_snapshot(
+        &snap,
+        snapshot_source_disposition(lifecycle),
+        Some(cancel),
+    )
+    .await
+    .with_context(|| format!("creating prepared startup snapshot {}", target.name))?;
 
     if cancel.is_cancelled() {
         bail!("interrupted while creating prepared startup snapshot");

@@ -169,9 +169,15 @@ pub enum SnapshotInstall {
 /// lock is held, so a concurrent `fcvm snapshot create` (which resets the KVM
 /// dirty bitmap and updates `snapshot_name`) can never leave us merging a diff
 /// onto a stale base.
+///
+/// `cancel` ends the waits for the snapshot's locks: a `fcvm snapshot create` of the same VM
+/// can hold the per-VM lock for minutes, and a run told to stop meanwhile stops instead of
+/// waiting for it (#1075). Once the locks are held the create is not interruptible (see
+/// [`create_snapshot_interruptible`]).
 pub async fn create_podman_snapshot(
     snap: &CreateSnapshotParams<'_>,
     source_disposition: crate::commands::common::SnapshotSourceDisposition,
+    cancel: Option<&CancellationToken>,
 ) -> Result<SnapshotInstall> {
     let CreateSnapshotParams {
         vm_manager,
@@ -200,9 +206,13 @@ pub async fn create_podman_snapshot(
         let expected_parent_dir = expected_parent_key
             .as_ref()
             .map(|key| paths::snapshot_dir().join(key));
-        let generation_locks = crate::commands::common::acquire_snapshot_create_generation_locks(
-            &snapshot_dir,
-            expected_parent_dir.as_deref(),
+        let generation_locks = crate::commands::common::unless_cancelled(
+            cancel,
+            "the snapshot's generation locks",
+            crate::commands::common::acquire_snapshot_create_generation_locks(
+                &snapshot_dir,
+                expected_parent_dir.as_deref(),
+            ),
         )
         .await?;
         failpoint::hit_async("snapshot.create.locked").await;
@@ -216,7 +226,12 @@ pub async fn create_podman_snapshot(
 
         // Serialize dirty-bitmap resets, then ensure both the owning process identity and
         // lineage still match the observations used to choose generation locks.
-        let vm_lock = crate::commands::common::acquire_vm_snapshot_lock(disk_path).await?;
+        let vm_lock = crate::commands::common::unless_cancelled(
+            cancel,
+            "the per-VM snapshot lock",
+            crate::commands::common::acquire_vm_snapshot_lock(disk_path),
+        )
+        .await?;
         let fresh_state = state_manager
             .load_state(&vm_state.vm_id)
             .await
@@ -354,17 +369,17 @@ pub async fn create_snapshot_interruptible(
     cancel: &CancellationToken,
     source_disposition: crate::commands::common::SnapshotSourceDisposition,
 ) -> SnapshotOutcome {
-    // CRITICAL: Do NOT interrupt the snapshot future after it starts. A normal source must
-    // reach its resume step; a disposable source must finish atomic artifact installation.
-    // Check cancellation before starting and let the snapshot reach its requested terminal
-    // disposition once started.
+    // CRITICAL: Do NOT interrupt the snapshot future after it holds its locks. A normal
+    // source must reach its resume step; a disposable source must finish atomic artifact
+    // installation. The lock waits before the pause are raced with `cancel` inside the
+    // creator, and its error then reads as Interrupted below.
     if cancel.is_cancelled() {
         info!("snapshot creation skipped -- already cancelled");
         return SnapshotOutcome::Interrupted;
     }
 
     // Run snapshot to completion so its source disposition is always honored.
-    match create_podman_snapshot(snap, source_disposition).await {
+    match create_podman_snapshot(snap, source_disposition, Some(cancel)).await {
         Ok(install) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
