@@ -2685,11 +2685,12 @@ async fn cmd_snapshot_run_inner(
     // so any error from here until the restore_from_snapshot error handler below
     // must run network.cleanup() to remove partially-created host network state.
     setup.network = Some(network);
-    let network_config = setup_try!(setup
+    let mut network_config = setup_try!(setup
         .network_mut()
         .setup()
         .await
         .context("setting up network"));
+    keep_baked_resolver(&mut network_config, saved_network);
 
     // For routed mode clones: the snapshot's guest IPv6 (baked into boot params) is shared
     // across all clones. After restore, fc-agent will be told to swap it to the unique
@@ -4691,6 +4692,28 @@ pub(crate) fn per_restore_setting(
     }
 }
 
+/// The clone keeps the resolver its snapshot baked into the guest.
+///
+/// fc-agent wrote resolv.conf at the source's boot, so the restored guest
+/// resolves through the snapshot's `dns_server` and `dns_search` whatever the
+/// clone's network backend reports. Rootless reports none (`PastaNetwork::setup`),
+/// and the clone's recorded network config is what a snapshot of the clone
+/// carries on: without this, that snapshot recorded no resolver, its clones'
+/// pasta kept its DNS special case, and a guest whose resolv.conf names the
+/// gateway reached the host's resolver instead of the service the golden was
+/// recorded against (#1540).
+pub(crate) fn keep_baked_resolver(
+    network: &mut crate::network::NetworkConfig,
+    saved: &crate::network::NetworkConfig,
+) {
+    if network.dns_server.is_none() {
+        network.dns_server = saved.dns_server.clone();
+    }
+    if network.dns_search.is_none() {
+        network.dns_search = saved.dns_search.clone();
+    }
+}
+
 /// Record `parent` as the snapshot the VM's next diff is written over, or none. Returns None when
 /// the VM's state file no longer exists.
 async fn record_diff_parent(
@@ -5195,6 +5218,39 @@ mod tests {
             boot(&rootless, Some(&given)),
             None,
             "a rootless clone has no prefix, whatever the snapshot recorded"
+        );
+    }
+
+    /// #1540: a clone whose backend reports no resolver (rootless) records the one its
+    /// snapshot baked, so a snapshot of the clone carries it on; a resolver the
+    /// backend did report is kept.
+    #[test]
+    fn a_clone_keeps_the_resolver_its_snapshot_baked() {
+        let saved = crate::network::NetworkConfig {
+            dns_server: Some("10.0.2.2".to_string()),
+            dns_search: Some("corp.example".to_string()),
+            ..Default::default()
+        };
+        let mut rootless = crate::network::NetworkConfig::default();
+        keep_baked_resolver(&mut rootless, &saved);
+        assert_eq!(rootless.dns_server.as_deref(), Some("10.0.2.2"));
+        assert_eq!(rootless.dns_search.as_deref(), Some("corp.example"));
+
+        let mut reported = crate::network::NetworkConfig {
+            dns_server: Some("192.0.2.53".to_string()),
+            ..Default::default()
+        };
+        keep_baked_resolver(&mut reported, &saved);
+        assert_eq!(reported.dns_server.as_deref(), Some("192.0.2.53"));
+
+        let source = include_str!("snapshot.rs");
+        let setup = source.find(".context(\"setting up network\"));").unwrap();
+        assert!(
+            source[setup..]
+                .trim_start_matches(|c| c != '\n')
+                .trim_start()
+                .starts_with("keep_baked_resolver(&mut network_config, saved_network);"),
+            "snapshot run must record the baked resolver right after network setup"
         );
     }
 
