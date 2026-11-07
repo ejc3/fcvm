@@ -2182,6 +2182,18 @@ async fn cmd_snapshot_run_inner(
     // Which host directories this clone serves, settled before anything is allocated and
     // applied to the config every later step reads: the volume servers, the clone's own
     // state (so a snapshot of the clone records them), and a reboot plan.
+    // Before anything is set up: a memory restore of an fc-agent that ignores the mode.
+    if snapshot_config.kind != crate::storage::SnapshotKind::DiskOnly {
+        restorable_thp_mode(
+            &per_restore_setting(
+                args.guest_thp.as_deref(),
+                args.inherit_recorded_hook,
+                snapshot_config.metadata.guest_thp.as_deref(),
+            ),
+            snapshot_config.metadata.guest_thp_restore,
+            &snapshot_name,
+        )?;
+    }
     snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
 
     // Where this clone publishes its ports, settled before anything is allocated: a
@@ -2720,6 +2732,7 @@ async fn cmd_snapshot_run_inner(
         args.inherit_recorded_hook,
         snapshot_config.metadata.guest_thp.as_deref(),
     );
+    vm_state.config.guest_thp_restore = snapshot_config.metadata.guest_thp_restore;
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
@@ -4631,16 +4644,34 @@ async fn cmd_snapshot_ls() -> Result<()> {
     Ok(())
 }
 
-/// A per-restore setting (the restore hook, the huge page mode): the caller's own, else
-/// the snapshot's recorded one when the caller inherits (a command-line `snapshot run`),
-/// else none. `podman run` restoring its startup snapshot does not inherit: neither is
-/// in the snapshot cache key, so the snapshot may carry another run's.
 /// The huge page mode a restore document carries: the clone's, or `default` (the
 /// guest kernel's own) when it has none.
 pub(crate) fn restore_thp_mode(guest_thp: &Option<String>) -> String {
     guest_thp.clone().unwrap_or_else(|| "default".to_string())
 }
 
+/// Refuse a huge page mode for a snapshot whose fc-agent would ignore it. Without a mode
+/// the restore keeps the mode the snapshot has, which for such an fc-agent is the
+/// kernel's own, so that restore is still correct.
+pub(crate) fn restorable_thp_mode(
+    guest_thp: &Option<String>,
+    applied_by_guest: bool,
+    snapshot: &str,
+) -> Result<()> {
+    if let (Some(mode), false) = (guest_thp, applied_by_guest) {
+        anyhow::bail!(
+            "snapshot {snapshot} was made with an fc-agent that does not apply \
+             --guest-thp, so its clone would run in the mode it was snapshotted in, not \
+             {mode}; recreate the snapshot with this fcvm to set the mode at restore"
+        );
+    }
+    Ok(())
+}
+
+/// A per-restore setting (the restore hook, the huge page mode): the caller's own, else
+/// the snapshot's recorded one when the caller inherits (a command-line `snapshot run`),
+/// else none. `podman run` restoring its startup snapshot does not inherit: neither is
+/// in the snapshot cache key, so the snapshot may carry another run's.
 pub(crate) fn per_restore_setting(
     given: Option<&str>,
     inherit_recorded: bool,
@@ -4845,6 +4876,46 @@ mod tests {
     }
 
     use super::*;
+
+    /// A snapshot whose fc-agent predates `--guest-thp` ignores the mode a restore sends
+    /// and reports the restore done, so a restore asking it for a mode is refused, and one
+    /// asking for none still runs. A cold boot's snapshot records that its fc-agent applies
+    /// the mode, and a clone carries that on to a snapshot of its own.
+    #[test]
+    fn a_mode_is_refused_for_a_snapshot_whose_agent_ignores_it() {
+        let mut json = serde_json::to_value(metadata_fixture()).unwrap();
+        json.as_object_mut().unwrap().remove("guest_thp_restore");
+        let old: crate::storage::SnapshotMetadata = serde_json::from_value(json).unwrap();
+        assert!(!old.guest_thp_restore, "an older config.json has no marker");
+        let never = Some("never".to_string());
+        let error = restorable_thp_mode(&never, old.guest_thp_restore, "old").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not apply --guest-thp"),
+            "{error:#}"
+        );
+        restorable_thp_mode(&None, old.guest_thp_restore, "old").unwrap();
+
+        let mut vm_state =
+            crate::state::VmState::new("vm-thp".to_string(), "alpine:latest".to_string(), 1, 512);
+        vm_state.config.guest_thp_restore = true;
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
+        let dir = tempfile::tempdir().unwrap();
+        let config = super::super::common::build_snapshot_config(
+            &vm_state,
+            "thp",
+            crate::storage::SnapshotType::User,
+            dir.path(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert!(config.metadata.guest_thp_restore);
+        let round: crate::storage::SnapshotConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        restorable_thp_mode(&never, round.metadata.guest_thp_restore, "new").unwrap();
+    }
 
     /// A snapshot directory holding a `mem_len`-byte memory image and the given config bytes.
     fn working_set_fixture(root: &Path, name: &str, mem_len: u64, config: &[u8]) -> PathBuf {
@@ -5109,6 +5180,7 @@ mod tests {
             health_check_timeout: 5,
             restore_hook: None,
             guest_thp: None,
+            guest_thp_restore: false,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],

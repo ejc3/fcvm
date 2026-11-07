@@ -61,6 +61,10 @@ pub struct PreparedTarget {
     /// What to do with a generation already installed at `name` once the disposable
     /// source is healthy.
     pub existing: super::ExistingGeneration,
+    /// The guest transparent huge page mode this invocation asked for. It is not part of
+    /// the content key (a restore sets it), but an installed generation records the mode
+    /// `snapshot run` inherits, so a generation recording another mode does not answer.
+    pub guest_thp: Option<String>,
 }
 
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
