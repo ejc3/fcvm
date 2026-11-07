@@ -102,7 +102,7 @@ fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, l
 ```bash
 H=$(fleet/ami/build-ami.sh launch host)                  # BASE_AMI=<ami> revises an earlier image, in its own region (REGION=)
 fleet/ami/build-ami.sh push $H
-fleet/ami/build-ami.sh env $H FCVM_COMMIT=<commit>
+fleet/ami/build-ami.sh env $H FCVM_COMMIT=<commit>        # a commit GitHub signed: see below
 fleet/ami/build-ami.sh start $H host/build.sh prep && fleet/ami/build-ami.sh wait $H prep
 fleet/ami/build-ami.sh reboot $H                         # IOMMU on
 fleet/ami/build-ami.sh start $H host/build.sh build && fleet/ami/build-ami.sh wait $H build
@@ -115,6 +115,12 @@ done
 fleet/ami/build-ami.sh image $H fcvm-fleet-host-x86_64-<commit>-<date>
 fleet/ami/measure-boot.sh host <ami>                    # and: measure-boot.sh tile <ami>
 ```
+
+`<commit>` must carry a valid GitHub signature: ejc3/aws's image publisher refuses a reviewed
+host whose source commit is not verified. GitHub signs the merge commits it creates (`gh pr merge
+--merge`); a rebase merge, which is how `gh stack merge --rebase` lands a stack, leaves the
+commits unsigned (`gh api repos/ejc3/fcvm/commits/<commit> --jq .commit.verification.reason` reads
+`unsigned`). Bake from a merge commit on main that contains the change.
 
 Measured from the launch request (`measure-boot.sh`, on demand): a tile serves its first
 frame over HTTPS at 67.7 s and 83.0 s; a host is ready for the agent at 117.9 s, of which
