@@ -218,6 +218,11 @@ impl Marks {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoundNote {
+    /// The round being played stopped with no drop: a viewer's restart, or a new agent
+    /// connection for the host.
+    EndedWithoutDrop {
+        round: u64,
+    },
     Started {
         round: u64,
         size: u32,
@@ -242,8 +247,8 @@ pub enum RoundNote {
     },
 }
 
-/// What an applied event changed about the rounds: a round that ended (with what ended it)
-/// and one that started.
+/// What an applied event changed about the rounds: a round that ended (with what ended it, or
+/// with no drop at all) and one that started.
 pub fn notes(before: &Marks, s: &State) -> Vec<RoundNote> {
     let p = &s.fleet.potato;
     let mut out = Vec::new();
@@ -269,6 +274,17 @@ pub fn notes(before: &Marks, s: &State) -> Vec<RoundNote> {
             detail: d.detail.clone(),
         });
     }
+    // a round that stopped without a drop of its own: restarted, or ended by a new connection
+    if let Some(old) = before.round {
+        let dropped = p
+            .last_drop
+            .as_ref()
+            .is_some_and(|d| d.round == old && before.drop != Some((d.round, d.at)));
+        let going = p.round.as_ref().is_some_and(|r| r.id == old);
+        if !dropped && !going {
+            out.push(RoundNote::EndedWithoutDrop { round: old });
+        }
+    }
     if let Some(r) = p.round.as_ref().filter(|r| before.round != Some(r.id)) {
         out.push(RoundNote::Started {
             round: r.id,
@@ -283,6 +299,11 @@ pub fn notes(before: &Marks, s: &State) -> Vec<RoundNote> {
 pub fn log_rounds(notes: &[RoundNote]) {
     for n in notes {
         match n {
+            RoundNote::EndedWithoutDrop { round } => tracing::info!(
+                target: "fcvm::fleet::potato",
+                round,
+                "potato round ended without a drop (a restart, or a new connection for its host)"
+            ),
             RoundNote::Started {
                 round,
                 size,
@@ -420,6 +441,23 @@ mod tests {
             }]
         );
         // the same drop seen again is not a second end
+        assert_eq!(notes(&Marks::of(&s), &s), vec![]);
+    }
+
+    /// A round that stops without a drop (a viewer's restart, or a new agent connection for
+    /// the host) still gets an end line, before the next round's start line.
+    #[test]
+    fn a_round_that_stops_without_a_drop_gets_an_end_line() {
+        let s = State::new(fleet_core::Config::default(), 0);
+        let before = Marks {
+            round: Some(7),
+            drop: None,
+        };
+        assert_eq!(
+            notes(&before, &s),
+            vec![RoundNote::EndedWithoutDrop { round: 7 }]
+        );
+        // a round still going ends nothing
         assert_eq!(notes(&Marks::of(&s), &s), vec![]);
     }
 
