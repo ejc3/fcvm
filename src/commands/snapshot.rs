@@ -3768,6 +3768,8 @@ async fn cmd_snapshot_run_inner(
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
                                 &clone_vsock_base,
+                                // The clone's own mode, which may be its run's override.
+                                vm_state.config.guest_thp.clone(),
                             )
                             .await
                             {
@@ -3851,6 +3853,9 @@ async fn cmd_snapshot_run_inner(
                                     // belongs to) its serve process — a serve
                                     // shutdown must not SIGTERM it.
                                     vm_state.config.serve_pid = None;
+                                    // The relaunch booted this fcvm's fc-agent, which
+                                    // applies a restore's huge page mode.
+                                    vm_state.config.guest_thp_restore = true;
                                     // The watch on that server ends with the
                                     // dependence. Left armed, the server's exit would
                                     // fail a VM that booted from its disk and has no
@@ -3860,6 +3865,7 @@ async fn cmd_snapshot_run_inner(
                                         .update_state(&vm_id, |state| {
                                             state.config.snapshot_name = None;
                                             state.config.serve_pid = None;
+                                            state.config.guest_thp_restore = true;
                                         })
                                         .await;
                                     startup_rx = None;
@@ -4181,6 +4187,7 @@ async fn build_clone_reboot_plan(
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
     vsock_socket_path: &std::path::Path,
+    guest_thp: Option<String>,
 ) -> Result<(
     super::podman::RebootSpec,
     RunArgs,
@@ -4208,7 +4215,7 @@ async fn build_clone_reboot_plan(
         ipv6_prefix,
         ipv6_address,
         meta.restore_hook.clone(),
-        meta.guest_thp.clone(),
+        guest_thp,
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -4915,6 +4922,29 @@ mod tests {
         let round: crate::storage::SnapshotConfig =
             serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
         restorable_thp_mode(&never, round.metadata.guest_thp_restore, "new").unwrap();
+    }
+
+    /// A clone that reboots in place cold-boots this fcvm's fc-agent in the clone's own
+    /// mode (its run's override, not the snapshot's recorded one), and a snapshot of it
+    /// then records an fc-agent that applies the mode. Pinned at the source: the reboot
+    /// path resolves a kernel and an initrd and launches a VMM.
+    #[test]
+    fn a_rebooted_clone_boots_in_its_own_mode_and_records_a_capable_agent() {
+        let source = include_str!("snapshot.rs");
+        let call = source.find("match build_clone_reboot_plan(").unwrap();
+        let args = &source[call..call + source[call..].find(".await").unwrap()];
+        assert!(
+            args.contains("vm_state.config.guest_thp.clone(),"),
+            "{args}"
+        );
+        let relaunched = source.find("bootplan_handle = relaunch_bootplan;").unwrap();
+        let after =
+            &source[relaunched..relaunched + source[relaunched..].find("continue;").unwrap()];
+        assert_eq!(
+            after.matches("guest_thp_restore = true;").count(),
+            2,
+            "the relaunch must mark the clone, in memory and in its state file: {after}"
+        );
     }
 
     /// A snapshot directory holding a `mem_len`-byte memory image and the given config bytes.
