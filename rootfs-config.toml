@@ -133,6 +133,25 @@ disable = [
     "podman-auto-update.service",
     "podman-auto-update.timer",
     "podman-clean-transient.service",
+    # Periodic maintenance of a long-lived Ubuntu server. Restored clones fire them together
+    # on the wall clock, in guests of a few hundred MiB: fwupd-refresh started fwupd, which
+    # grew to 121 MiB of anonymous memory in a 256 MiB player guest until the guest's OOM
+    # killer took it, 27 times in 75 minutes of a 96-player potato soak, and one snapshot's
+    # guest network preparation waited 45 s for it.
+    "fwupd-refresh.timer",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "motd-news.timer",
+    "man-db.timer",
+    "dpkg-db-backup.timer",
+    "e2scrub_all.timer",
+    "fstrim.timer",
+    "sysstat-collect.timer",
+    "sysstat-summary.timer",
+    "update-notifier-download.timer",
+    "update-notifier-motd.timer",
+    "ua-timer.timer",
+    "apport-autoreport.timer",
 ]
 
 [files]
