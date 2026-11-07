@@ -36,6 +36,11 @@ class FrameSource {
   virtual bool serves_mirror() { return false; }
   virtual bool mirror_admits(const std::string& token) { return false; }
   virtual void mirror(Conn& c, const std::string& token) {}
+  // POST /action, the Windows bridge's fixed input sequences (fleet/PROTOCOL.md, "Windows
+  // bridge"): a source that serves it answers each body with an HTTP status and a JSON reply.
+  // The route needs the scene token as POST /scene does. The renderer serves none.
+  virtual bool serves_action() { return false; }
+  virtual int post_action(const std::string& body, std::string* reply) { return 404; }
 };
 
 // One masked client frame of at most 64 KiB: its opcode and unmasked payload.

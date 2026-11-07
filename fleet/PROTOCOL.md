@@ -2448,3 +2448,156 @@ change between them. With no new copy the last picture is sent again once a seco
 once to a new stream.
 
 Measured numbers are in `docs/fleet/ARCHITECTURE.md`, "Getting the screen to the page".
+
+## Windows bridge
+
+The program that serves a Windows sandbox's desktop (docs/fleet/windows-sandboxes.md) with the
+renderer's routes and frame format, so the page draws a sandbox like a renderer's tile
+(`fleet/windows/bridge/`, built by `fleet/windows/Containerfile`). One runs per sandbox on the
+host. It connects to the sandbox's Remote Desktop with FreeRDP 3, built from source with FFmpeg
+so the graphics pipeline offers AVC444 and AVC420 (Ubuntu's FreeRDP packages have no H.264),
+through the sandbox's `rdp.sock`: FreeRDP takes a server name that starts with `/` as a Unix
+socket path and connects to it directly (`freerdp_tcp_default_connect` in
+`libfreerdp/core/tcp.c`).
+
+FreeRDP's GDI decodes every graphics command into one 32-bit BGRX surface of the desktop
+(1280 x 720 by default). After each frame Windows ends (an rdpgfx EndFrame, or a GDI EndPaint
+outside the graphics pipeline) the bridge keeps the surface, and while at least one stream is
+open it converts the surface to I420 (BT.709 limited range, the renderer's coefficients) and
+encodes it with x264 on the host's CPU. Windows' own H.264 is not passed through: it covers
+only the regions that changed, it is mixed with other codecs, and AVC444 splits a picture in
+two streams, while a frame here is a whole picture. With no stream open nothing is encoded.
+
+The connection: TLS security only (NLA, the RDP security layer, RDSTLS and AAD off; the image
+has NLA off), the user `RDP_USER` (`sandbox`) with the password in the file `RDP_PASSWORD_FILE`
+(read at every attempt; never logged and never on a command line), the certificate accepted for
+the connection and never stored, no proxy (FreeRDP's `ProxyType` is ignore, so `https_proxy`
+in the environment does not apply) and no gateway. The image's FreeRDP is built without the
+client side of the clipboard, device redirection (drives, printers, smart cards, serial and
+parallel ports), USB, audio playback and capture, cameras, RemoteApp, remote assistance,
+multimedia redirection, TCP tunnels and the SSH agent. The bridge loads its channels itself
+(`rdpgfx` and `ainput` over `drdynvc`) instead of with FreeRDP's client loader, which turns
+settings into channels and adds device redirection and a fake audio channel whenever network
+autodetect or the heartbeat is on. Before connecting, and again with the channels in place
+before the channel transport loads, it checks its settings (`settings_violation`,
+`fleet/windows/bridge/logic.cpp`): every setting that redirects or shares something is off,
+UDP, a gateway and FreeRDP's own reconnect are off, TLS and the graphics pipeline with H.264
+are on, no device is redirected, and the channels are only `rdpgfx`, `drdynvc` and `ainput`. A
+connection that fails the check is never made, and the bridge reports `failed` and stops
+connecting.
+
+It connects at once and, when the connection cannot be made or drops, again after 100 ms,
+doubling to 2 s, for ever: it starts before the sandbox restores.
+
+### Routes
+
+- `GET /frames?h=&q=` (WebSocket): the renderer's protocol. `h` is accepted and changes
+  nothing: a sandbox sends its whole desktop, and the header says its size (`width` and
+  `height`, `full_width` and `full_height` the same, `x0` and `y0` 0, no crop). `q` picks the
+  quality as for the renderer. `admit` is checked as the renderer checks it.
+- `POST /scene`: needs the scene token when one is configured ("Access" under "Renderer").
+  The bridge reads `epoch_unix_ms` (required) and `admit_keys` (at most 4) as the phone
+  streamer does, and ignores the rest. `400` names a refused field.
+- `POST /budget`: accepted when well formed and ignored.
+- `POST /action` with `{"name": "<action>"}`: needs the scene token when one is configured,
+  as `POST /scene` does. Runs one of the fixed input sequences below through FreeRDP's
+  keyboard input and answers `200 {"ok":true,"action":..,"ms":..}` once the sequence has been
+  sent. `400` for a name not in the table (the message lists the allowed names, and
+  `actions` lists them as an array), `409` while another action runs, `503` with no
+  connection, `504` when a step that waits for the screen to change saw no change. Nothing a
+  caller sends reaches Windows: the name selects a sequence written in the source
+  (`kActions`, `fleet/windows/bridge/logic.cpp`), other fields are ignored, and no free keys,
+  text or clicks exist. An action never holds up frames.
+- `GET /still`: the surface as last composed, JPEG.
+- `GET /health`: the renderer's first six keys (`fps`, `heights`, `streams`, `gpu` null, `t`,
+  `frame`), `boot_id`, `ready` (connected), `error` when failed, `startup_ms`
+  (`first_frame_sent`, from the process start), `viewers`, and `windows`:
+
+```json
+{"state":"desktop","connects":2,"attempts":8,
+ "times_unix_ms":{"start":1794079324214,"connect_started":1794079324222,"tcp":1794079324231,
+                  "rdp":1794079324380,"first_frame":1794079324532,"desktop":1794079324544},
+ "desktop_by":"settled","surface":[1280,720],"fps":30.3,"encode_ms_p50":2.83,"encode_ms_p90":2.99,
+ "frame_age_ms":33,"last_error":null,"h264":true,"gfx_frames":189,"paint_frames":0,
+ "gfx_codecs":{"avc444v2":189}}
+```
+
+(FreeRDP's shadow server on an Xvfb desktop through a socat Unix-socket relay, on an arm64
+host; not a Windows measurement.)
+
+`state` is `connecting` (no connection), `connected` (connected, no desktop yet), `desktop` (the
+desktop has been seen) or `failed` (the settings check refused the connection; `error` says
+why). `connects` counts connections made and `attempts` attempts started. The times are on the
+host's clock, each the first since the process started: `start` the process, `connect_started`
+the start of the attempt that first reached the socket (the latest attempt before one did),
+`tcp` the socket connected (`rdp.sock` answers), `rdp` FreeRDP's post-connect (TLS, the
+capability exchange and the logon or reconnect done), `first_frame` the first frame composed,
+and `desktop` the first desktop frame. `last_error` is the last attempt's failure while it
+retries, `fps` the frames sent per second, `encode_ms_p50` and `_p90` the conversion and
+encode time per frame over the last 300, `frame_age_ms` now minus the newest sent frame's
+stamp, and `h264` whether FreeRDP has H.264 for the graphics pipeline. `gfx_frames` counts
+frames ended by an rdpgfx EndFrame and `paint_frames` frames composed outside the pipeline, and
+`gfx_codecs` the pipeline's surface commands by codec (`avc420`, `avc444`, `avc444v2`,
+`clearcodec`, `planar`, `progressive`, `remotefx`, `uncompressed`, `alpha`, or the id in hex),
+so a run shows whether Windows sent H.264.
+
+### The desktop
+
+A frame is the desktop when its 160 x 90 downscale (each cell the mean of its area) is within
+an RMSE of 0.05 (channels on 0..1) of the reference picture `DESKTOP_REF` (binary PPM or PNG,
+any size, downscaled the same way). Without a reference (unset, missing or unreadable), the
+desktop is the first frame the surface then stays at for 2 s, where a change of at most 0.01
+RMSE (the taskbar clock turning a minute) does not count and a picture of one flat colour
+(below 0.02 of luma spread) never counts; `desktop_by` is `settled`, and the bridge writes that
+frame's 160 x 90 thumbnail to `DESKTOP_REF_OUT` (binary PPM) when it is set. The gold flow makes
+the reference that way, with `windows-bridge logon`.
+
+### Frames
+
+Each frame is one access unit of H.264 from x264: preset ultrafast with zero-latency tuning,
+the main profile or lower (ultrafast's tools fit the constrained baseline), one slice, no
+B-frames, Annex B, SPS and PPS before every keyframe, BT.709 limited range in the VUI, and a
+VUI `bitstream_restriction` with `max_num_reorder_frames` 0 (the bridge refuses an encoder
+that does not write one). The rate control is constant quality (CRF 28 for `lo`, 21 for `std`,
+16 for `hi`) under a VBV cap of the renderer's rate for that quality at the desktop's size,
+holding half a second; the header's `bitrate` is that cap. A stream starts with a keyframe, a
+reader dropped behind restarts at one, and keyframes follow at least every 2 s.
+
+A new surface is sent at most once per 1/`FPS` s slot. Its `t` is the slot of the frame's
+EndFrame on the scene's clock (`floor((unix_ms - epoch_unix_ms) * FPS / 1000) / FPS`, the
+phone streamer's screen frames' rule, with the epoch 0 before any scene), so the page's frame
+age works as for a phone. Frames that end within one slot go out as one, in the slot after the
+last one sent. A desktop that stands still is sent again once a second, stamped with the slot
+it is sent in, and at once to a new stream.
+
+### Actions
+
+| name | keys sent |
+|---|---|
+| `start_menu` | Win |
+| `notepad` | Win+R, 800 ms, `notepad`, Enter, then waits up to 5 s for the screen to change, 500 ms, then types `fcvm Windows sandbox` |
+| `explorer` | Win+E |
+| `task_manager` | Ctrl+Shift+Esc |
+| `about` | Win+R, 800 ms, `winver`, Enter |
+| `terminal` | Win+R, 800 ms, `powershell -NoExit -Command Get-ComputerInfo -Property OsName,OsVersion,CsProcessors,CsTotalPhysicalMemory`, Enter |
+| `close_all` | Alt+F4, 700 ms apart, until the screen matches the desktop reference (or the settled desktop) or 10 times; the reply carries `presses` |
+
+Text is typed as US-layout scancodes. Every key pressed is released within its step.
+
+### Process
+
+- `windows-bridge serve` (the default) listens at once and connects in the background;
+  `/health` answers while it connects.
+- `windows-bridge logon [--settle-secs N]` connects, waits until the desktop has stood still
+  for N s, 5 by default (the settle rule above, whatever `DESKTOP_REF` says), writes its thumbnail to
+  `DESKTOP_REF_OUT`, prints one JSON line with `desktop_by`, `connects`, `attempts` and
+  `times_unix_ms`, disconnects (Windows keeps the session logged on, Disconnected) and exits
+  0; at `LOGON_DEADLINE_SECS` (300) it prints the same line and exits 1. It serves no routes.
+- `windows-bridge check-build` exits 0 when FreeRDP has H.264 for the graphics pipeline (the
+  image build runs it).
+- Environment: `PORT` (8080), `TLS_CERT_FILE`, `TLS_PORT` (443) and `SCENE_TOKEN_FILE` as for
+  the renderer, `RDP_SOCKET` (required, the absolute path of the sandbox's `rdp.sock`),
+  `RDP_USER` (`sandbox`), `RDP_PASSWORD_FILE` (required), `RDP_WIDTH` (1280), `RDP_HEIGHT`
+  (720), `FPS` (30, the cap), `DESKTOP_REF`, `DESKTOP_REF_OUT`, `LOGON_DEADLINE_SECS` (300),
+  `ENC_BPP` as for the renderer, and `WLOG_LEVEL` (FreeRDP's log level; errors only when
+  unset).
