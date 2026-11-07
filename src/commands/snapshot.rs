@@ -772,25 +772,6 @@ fn inherit_working_set(
     Ok((inherited.len(), inherited.bytes()))
 }
 
-/// Build the pack of the working set just inherited by the snapshot at `snapshot_dir`, with
-/// the temporary recorded in `reclaim_dir`. A pack is optional, so a failure is a warning.
-fn build_inherited_pack(snapshot_dir: &Path, reclaim_dir: &Path) {
-    let started = std::time::Instant::now();
-    let built = open_snapshot_working_set(snapshot_dir).and_then(|(store, _)| {
-        store.build_pack(
-            &store.to_prefetch(),
-            reclaim_dir,
-            crate::uffd::PACK_BUILD_THREADS,
-            &|| false,
-        )
-    });
-    crate::uffd::log_pack_build(
-        &crate::uffd::pack_path_for(&snapshot_dir.join("memory.bin")),
-        &built,
-        started.elapsed(),
-    );
-}
-
 /// How long `snapshot create --stop` waits for the VM's fcvm to exit after SIGTERM before
 /// it sends SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(30);
@@ -1273,22 +1254,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // lock exclusively. A serve loads a snapshot's working set when it starts and reads it
     // again only after a clone exits, so a serve waiting on that lock would otherwise start
     // without the set, and its first clones would replay nothing.
-    let mut inherited = false;
     if let Some((parent, parent_len)) = inherit_from {
         match inherit_working_set(&parent, parent_len, &snapshot_dir) {
             Ok((0, _)) => info!(
                 snapshot = %snapshot_name,
                 "--inherit-working-set: the parent has no recorded working set"
             ),
-            Ok((pages, bytes)) => {
-                inherited = true;
-                info!(
-                    snapshot = %snapshot_name,
-                    pages,
-                    mib = bytes / (1024 * 1024),
-                    "inherited the parent's restore working set"
-                )
-            }
+            Ok((pages, bytes)) => info!(
+                snapshot = %snapshot_name,
+                pages,
+                mib = bytes / (1024 * 1024),
+                "inherited the parent's restore working set"
+            ),
             Err(error) => warn!(
                 snapshot = %snapshot_name,
                 error = %format!("{error:#}"),
@@ -1300,21 +1277,6 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Give the generation lock back before the memory file is measured, so no clone, create
     // or balloon change waits on the walk.
     drop(_generation_locks);
-
-    // The inherited set gets its pack now, after the generation lock is back: reading a large
-    // set takes minutes, and a serve that starts meanwhile replays from the memory file. The
-    // install takes the lock shared and checks the image, as a serve's build does.
-    if inherited {
-        match crate::reclaim::owner_dir() {
-            Ok(reclaim_dir) => build_inherited_pack(&snapshot_dir, &reclaim_dir),
-            Err(error) => warn!(
-                snapshot = %snapshot_name,
-                error = %format!("{error:#}"),
-                "--inherit-working-set: no reclaim directory for the pack's temporary, so the \
-                 snapshot gets no pack and replay reads the memory file"
-            ),
-        }
-    }
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -4928,33 +4890,6 @@ mod tests {
         fs2::FileExt::unlock(&held).unwrap();
         let (served, _) = open_snapshot_working_set(&child_dir).unwrap();
         assert_eq!(served.to_prefetch(), observed);
-    }
-
-    /// `--inherit-working-set` gives the child a pack of the inherited set, built after the
-    /// create gives the generation lock back, which a serve of the child opens.
-    #[test]
-    fn inheriting_a_working_set_builds_the_childs_pack() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mem_len = 2048 * 4096;
-        let parent_dir = working_set_fixture(tmp.path(), "parent", mem_len, b"parent");
-        let child_dir = working_set_fixture(tmp.path(), "child", mem_len, b"child");
-        let (recording, _) = open_snapshot_working_set(&parent_dir).unwrap();
-        let mut observed = recording.recorder();
-        observed.insert_range(3 * 4096, 500 * 4096);
-        observed.insert_range(1200 * 4096, 300 * 4096);
-        recording.merge_and_persist(&observed).unwrap();
-        let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
-        inherit_working_set(&parent, parent_len, &child_dir).unwrap();
-
-        let reclaim = crate::reclaim::owner_dir_in(&tmp.path().join("data")).unwrap();
-        build_inherited_pack(&child_dir, &reclaim);
-        let (child, _) = open_snapshot_working_set(&child_dir).unwrap();
-        let served = std::fs::metadata(child_dir.join("memory.bin")).unwrap();
-        assert!(child.bind_served_image(&served));
-        assert!(
-            child.load_pack().is_some(),
-            "the child has no pack of the set it inherited"
-        );
     }
 
     #[test]

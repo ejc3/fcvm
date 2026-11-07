@@ -7871,9 +7871,6 @@ mod tests {
                 "drop(_vm_lock)",
                 "inherit_working_set(&parent",
                 "drop(_generation_locks)",
-                // The pack build's install takes the generation lock shared through a
-                // descriptor of its own, so it must come after the create releases it.
-                "build_inherited_pack(",
             ],
         );
     }
