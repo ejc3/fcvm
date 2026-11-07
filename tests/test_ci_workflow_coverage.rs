@@ -2969,9 +2969,28 @@ fn host_jobs_upload_the_vmm_logs_teardown_keeps() {
             .unwrap_or_else(|| panic!("job {job} uploads no test logs"));
         let save = position("Save VMM logs")
             .unwrap_or_else(|| panic!("job {job} does not save the VMM logs"));
-        assert!(save < upload, "job {job} saves the VMM logs after uploading");
+        assert!(
+            save < upload,
+            "job {job} saves the VMM logs after uploading"
+        );
+        // Runners are reused, so the job clears earlier jobs' copies before its tests run.
+        let create = position("Create test log directory")
+            .unwrap_or_else(|| panic!("job {job} creates no test log directory"));
+        assert!(create < save, "job {job}");
+        let clear = steps[create]
+            .get("run")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            clear.contains("-name 'fcvm-firecracker-*.log' -delete"),
+            "job {job} uploads VMM logs earlier jobs left: {clear}"
+        );
         let step = &steps[save];
-        assert_eq!(step.get("if").and_then(Value::as_str), Some("always()"), "job {job}");
+        assert_eq!(
+            step.get("if").and_then(Value::as_str),
+            Some("always()"),
+            "job {job}"
+        );
         let run = step.get("run").and_then(Value::as_str).unwrap_or("");
         assert!(
             run.contains("fcvm-firecracker-*.log") && run.contains("/tmp/fcvm-test-logs/"),
