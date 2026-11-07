@@ -96,7 +96,7 @@ const RACES_KEPT = 20;
 /** Why a late viewer's claim_gpu or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
 const LATE_CLAIM = "direct streams are full, so this page watches the broadcast";
 
-const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
+export const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
   { id: "planet", label: "the ringed planet", x: 0.35, y: -0.05, zoom: 1.6 },
   { id: "nebula", label: "the nebula", x: -0.6, y: 0.15, zoom: 1.0 },
   { id: "stars", label: "the star field", x: 1.2, y: -0.4, zoom: 0.7 },
@@ -1636,6 +1636,18 @@ export class MockCoordinator {
           if (typeof b["capacity_wait_ms"] === "number") this.forcedWaitMs = b["capacity_wait_ms"];
           if (typeof b["hold_in_ms"] === "number") this.nudge.nextHoldAt = this.now() + b["hold_in_ms"];
           if (typeof b["gpu_scrub"] === "boolean") this.gpuScrub = b["gpu_scrub"];
+          // The directed camera leaves for this stop now, as if it had every vote (tests that
+          // measure pixels hold it on the stop they were measured at). A no-op when it holds there.
+          if (typeof b["camera_stop"] === "string") {
+            const stop = NUDGE_TARGETS.find((x) => x.id === b["camera_stop"]);
+            if (!stop) throw new Error(`no stop ${b["camera_stop"]}`);
+            const last = this.camera[this.camera.length - 1]!;
+            const atRest = last.t <= this.sceneNow() && last.x === stop.x && last.y === stop.y && last.zoom === stop.zoom;
+            if (!atRest) {
+              this.nudge.votes = new Map([["mock-admin", stop.id]]);
+              this.nextStop(this.now());
+            }
+          }
           // The director sets the time of day per hold; tests set it here.
           if (typeof b["time_of_day"] === "number") this.timeOfDay = b["time_of_day"];
           this.markDirty();
