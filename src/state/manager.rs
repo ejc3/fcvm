@@ -817,6 +817,40 @@ impl StateManager {
         result
     }
 
+    /// Read VM state under the per-VM lock and hand it to `inspect`, still under the lock.
+    ///
+    /// For a decision another process's locked write must not slip between: `inspect` sees
+    /// the state as it is on disk, and no `update_state` of this VM can land until it
+    /// returns. Nothing is written. Returns `Ok(None)` when the state file does not exist.
+    pub async fn with_locked_state<T, F>(&self, vm_id: &str, inspect: F) -> Result<Option<T>>
+    where
+        F: FnOnce(&VmState) -> T,
+    {
+        let state_file = self.state_dir.join(format!("{}.json", vm_id));
+        let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
+        if !state_file.exists() {
+            return Ok(None);
+        }
+        let flock = lock_state_file(&lock_file, FlockArg::LockShared)
+            .context("acquiring shared lock to read VM state")?;
+        let result: Result<Option<T>> = async {
+            let state_json = match fs::read_to_string(&state_file).await {
+                Ok(json) => json,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e).context("reading VM state under its lock"),
+            };
+            let state: VmState =
+                serde_json::from_str(&state_json).context("parsing VM state under its lock")?;
+            Ok(Some(inspect(&state)))
+        }
+        .await;
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing lock after reading VM state")?;
+        result
+    }
+
     /// Update health status atomically by holding lock across read-modify-write.
     ///
     /// This prevents the race condition where concurrent health monitor updates
