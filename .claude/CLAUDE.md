@@ -3011,8 +3011,10 @@ separately.
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
   healthy. They held 23.0 and 23.2 GiB of private memory when replay planned 3.7M of the
   9.4M recorded pages (main's run cap at the time), and 35.8 and 35.9 GiB when it planned
-  all 9.4M. Turn replay off for workloads that spawn many clones which never run. #955
-  tracks bounding the set.
+  all 9.4M. Turn replay off for workloads that spawn many clones which never run, or
+  bound what each clone replays with `--uffd-prefetch-max-mib` (`FCVM_UFFD_PREFETCH_MAX_MIB`
+  for the implicit server): replay stops planning once it has passed that much of the set,
+  and the rest faults on demand (#955). Unbounded by default.
 
 **End of clone (`PeerVmm`)**: a userfaultfd reports nothing when the process that created it
 dies — measured on this kernel, `poll` returns 0/revents=0 forever and `read` returns EAGAIN —

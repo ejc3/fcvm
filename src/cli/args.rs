@@ -1324,6 +1324,13 @@ pub struct SnapshotServeArgs {
     /// Default: 300 (a safety bound pending empirical tuning, see issue #858).
     #[arg(long, value_name = "secs", env = "FCVM_UFFD_PREFETCH_RECORD_WINDOW")]
     pub uffd_prefetch_record_window: Option<u64>,
+
+    /// The most of the recorded working set one clone replays, in MiB. The set is a union
+    /// over clones and grows with the work clones do inside their recording window, and in
+    /// copy mode every replayed page is a private copy in each clone, so this bounds that
+    /// memory; the pages past it fault on demand. Default: no bound.
+    #[arg(long, value_name = "MiB", env = "FCVM_UFFD_PREFETCH_MAX_MIB")]
+    pub uffd_prefetch_max_mib: Option<u64>,
 }
 
 #[derive(Args, Debug)]

@@ -21,8 +21,8 @@ use crate::state::{
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
 use crate::uffd::{
-    record_window_from_env, FaultAround, Prefetch, ReplayThreads, ServeShape, UffdBacking,
-    UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
+    record_window_from_env, FaultAround, Prefetch, ReplayLimit, ReplayThreads, ServeShape,
+    UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
 };
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
@@ -1695,6 +1695,11 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         Some(count) => ReplayThreads::new(count)?,
         None => ReplayThreads::default(),
     };
+    // The most of the recorded set one clone replays (--uffd-prefetch-max-mib /
+    // FCVM_UFFD_PREFETCH_MAX_MIB). Unbounded unless asked for.
+    let replay_limit = args
+        .uffd_prefetch_max_mib
+        .map_or(ReplayLimit::NONE, ReplayLimit::mib);
 
     release_idle_snapshot_memory(&args.snapshot_name);
 
@@ -1715,6 +1720,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             record_window,
             fault_around,
             replay_threads,
+            replay_limit,
             nv2,
         },
     )
@@ -2957,6 +2963,7 @@ async fn cmd_snapshot_run_inner(
             let record_window = setup_try!(record_window_from_env());
             let fault_around = setup_try!(FaultAround::from_env());
             let replay_threads = setup_try!(ReplayThreads::from_env());
+            let replay_limit = setup_try!(ReplayLimit::from_env());
             info!(
                 reason = %reason,
                 mode = backing.name(),
@@ -2996,6 +3003,7 @@ async fn cmd_snapshot_run_inner(
                     record_window,
                     fault_around,
                     replay_threads,
+                    replay_limit,
                     nv2,
                 },
             )
