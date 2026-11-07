@@ -525,8 +525,10 @@ pub fn strip_firecracker_prefix(line: &str) -> &str {
 
     // Strip [anonymous-instance:xxx] prefix if present.
     // Only strip brackets containing ':' (Firecracker format is [instance:thread]).
-    // This preserves guest-originated prefixes like [fc-agent] which have no colon.
-    if result.starts_with('[') {
+    // This preserves guest-originated prefixes like [fc-agent] which have no colon, and
+    // the container's [ctr:out] and [ctr:err], whose marker is what tells container output
+    // from fc-agent's own lines.
+    if result.starts_with('[') && !result.starts_with("[ctr:") {
         if let Some(end_pos) = result.find("] ") {
             if result[1..end_pos].contains(':') {
                 result = &result[end_pos + 2..];
@@ -1916,6 +1918,27 @@ mod tests {
                 "taken for a warning: {line}: {log:?}"
             );
         }
+    }
+
+    /// The container's marker survives the Firecracker prefix strip, so container output that
+    /// echoes fc-agent's words is still container output when it reaches the routing, and
+    /// is not a host warning.
+    #[test]
+    fn the_firecracker_prefix_strip_keeps_the_container_marker() {
+        assert_eq!(
+            strip_firecracker_prefix("[ctr:out] [fc-agent] FATAL: spoofed"),
+            "[ctr:out] [fc-agent] FATAL: spoofed"
+        );
+        assert_eq!(
+            strip_firecracker_prefix("[anonymous-instance:main] [fc-agent] FATAL: real"),
+            "[fc-agent] FATAL: real"
+        );
+        let log = log_capture::logged("warn", || {
+            log_console_line_under_fcvm(strip_firecracker_prefix(
+                "[ctr:err] [fc-agent] WARNING: spoofed",
+            ));
+        });
+        assert!(!log.contains("spoofed"), "{log:?}");
     }
 
     #[test]

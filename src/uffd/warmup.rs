@@ -129,8 +129,10 @@ const REQUEST_BYTES: u64 = 128 * 1024;
 const IN_FLIGHT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long one request may stay not resident before the pacer stops waiting for it: a page
-/// the kernel read and evicted again would otherwise hold the warm-up for ever.
-const RESIDENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// the kernel read and evicted again would otherwise hold the warm-up for ever. Retiring a
+/// request that is still being read lets the next window out early, so this is long: a
+/// request still unread after it means the device moves less than 8 MiB in 30 s.
+const RESIDENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Keeps at most [`IN_FLIGHT_BYTES`] of the warm-up's requests outstanding: before the next
 /// request is issued, the oldest outstanding ones are retired once `resident` reports them
@@ -175,32 +177,30 @@ impl<R: FnMut(Request) -> bool> Pacer<R> {
     }
 }
 
-/// Whether every page of `request` is in `image`'s page cache, asked of `mincore` on a
-/// mapping of the file. `mincore` does not touch the pages, so a truncated image cannot
-/// fault here either.
-fn resident(map: &memmap2::Mmap, request: Request) -> bool {
-    let page = host_page_size();
-    let (Ok(start), Ok(len)) = (
-        usize::try_from(request.offset),
-        usize::try_from(request.len),
-    ) else {
-        return true;
-    };
-    if start.saturating_add(len) > map.len() {
+/// Whether `request`'s last page is in `image`'s page cache: a one-byte `preadv2` with
+/// `RWF_NOWAIT`, which fails with EAGAIN instead of reading a page the cache does not hold.
+/// Readahead fills a request front to back, so its last page arriving means the request has.
+/// Not `mincore`: for a file the process neither owns nor may write, the kernel reports every
+/// page of a mapping resident (`can_do_mincore`), which would retire every request at once
+/// and leave a serve of another user's snapshot unpaced. A filesystem that does not take
+/// `RWF_NOWAIT` answers EOPNOTSUPP, and every other error ends the wait too: the pacer then
+/// lets the warm-up run as it did before it existed.
+fn resident(image: &File, request: Request) -> bool {
+    use std::os::fd::AsRawFd;
+    if request.len == 0 {
         return true;
     }
-    let pages = len.div_ceil(page as usize);
-    let mut vec = vec![0u8; pages];
-    // SAFETY: the range lies inside `map`, which stays mapped for the call, and `vec` has a
-    // byte for each page of it.
-    let rc = unsafe {
-        libc::mincore(
-            map.as_ptr().add(start) as *mut libc::c_void,
-            len,
-            vec.as_mut_ptr().cast(),
-        )
+    let Ok(offset) = libc::off_t::try_from(request.offset + request.len - 1) else {
+        return true;
     };
-    rc != 0 || vec.iter().all(|byte| byte & 1 == 1)
+    let mut byte = 0u8;
+    let iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    // SAFETY: one iovec over a live one-byte buffer, on a descriptor this file owns.
+    let rc = unsafe { libc::preadv2(image.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
+    rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
 }
 
 /// One `WILLNEED` request: `len` bytes of the memory image at `offset`.
@@ -430,14 +430,8 @@ impl Warmer {
     ) -> bool {
         let image = Arc::clone(&self.image);
         let stop = Arc::clone(&self.shared);
-        // The pacer's view of the page cache. A mapping that cannot be made leaves the
-        // warm-up unpaced, as it was before the pacer.
-        // SAFETY: the mapping is only passed to mincore, which never reads the pages, so a
-        // file another process truncates cannot fault through it.
-        let map = unsafe { memmap2::Mmap::map(&*image) }.ok();
-        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| {
-            map.as_ref().is_none_or(|map| resident(map, request))
-        });
+        let probe = Arc::clone(&self.image);
+        let mut pacer = Pacer::new(IN_FLIGHT_BYTES, move |request| resident(&probe, request));
         self.warm_if_idle_with(trigger, recorded, move |request| {
             if !pacer.wait_for_room(request, &stop.stop) {
                 return Ok(());
@@ -761,6 +755,31 @@ mod tests {
     const G: u64 = GRANULE;
     const PAGE: u64 = 4096;
 
+    /// The pacer's residency check reads the page cache, not the mapping's permissions: a
+    /// request is not resident while its file is cold, and is once the file has been read.
+    /// `mincore`, its first form, reports every page of a file the process may not write as
+    /// resident, which turned the pacer off for a serve of another user's snapshot.
+    #[test]
+    fn residency_follows_the_page_cache() {
+        use testing::{evict, image_on_disk, MIB};
+        let file = image_on_disk(4 * MIB);
+        let request = Request {
+            offset: MIB,
+            len: REQUEST_BYTES,
+        };
+        evict(&file);
+        assert!(
+            !resident(&file, request),
+            "a cold request reads as resident"
+        );
+        let mut buf = vec![0u8; REQUEST_BYTES as usize];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf, MIB).unwrap();
+        assert!(
+            resident(&file, request),
+            "a request just read reads as cold"
+        );
+    }
+
     /// The warm-up the server starts goes through the pacer: each request waits for room in
     /// the window before it is issued, and is counted once issued. Unpaced, the warm-up
     /// queued a whole recorded set (#986, #1069).
@@ -783,7 +802,7 @@ mod tests {
             .expect("the warm-up does not count what it issued");
         assert!(wait < read && read < issued, "{body}");
         assert!(
-            source.contains("Pacer::new(IN_FLIGHT_BYTES,"),
+            body.contains("Pacer::new(IN_FLIGHT_BYTES,"),
             "the pacer's window is not IN_FLIGHT_BYTES"
         );
     }
@@ -810,7 +829,9 @@ mod tests {
         }
         assert_eq!(pacer.bytes, 4 * REQUEST_BYTES);
 
-        // Nothing is resident: the fifth request waits until the device reads the first.
+        // Nothing is resident: the fifth request waits until the device reads the first. The
+        // clock starts before the reader does, so the wait measured is at least its sleep.
+        let started = Instant::now();
         let reader = {
             let resident_upto = std::sync::Arc::clone(&resident_upto);
             std::thread::spawn(move || {
@@ -818,7 +839,6 @@ mod tests {
                 resident_upto.store(REQUEST_BYTES, Ordering::Relaxed);
             })
         };
-        let started = Instant::now();
         assert!(pacer.wait_for_room(request(4), &stop));
         assert!(
             started.elapsed() >= Duration::from_millis(90),
