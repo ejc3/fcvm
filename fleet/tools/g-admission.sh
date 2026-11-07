@@ -129,16 +129,19 @@ admit_unlock() {
   [ -z "$ADMIT_ETAG" ] || S3A s3api delete-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --if-match "$ADMIT_ETAG" >/dev/null 2>&1 || true
   ADMIT_ETAG=""
 }
-# The ledger's entries of the last ADMIT_LEDGER_S seconds: "<unix time> <instance id> <market>".
-# Fails when the ledger exists and cannot be read.
+# The ledger's entries of the last ADMIT_LEDGER_S seconds: "<unix time> <instance id> <market>
+# <vCPUs>". Fails when the ledger exists and cannot be read, or holds a line of any other shape.
 ledger_recent() {
   local t f; t=$(now); f=$(mktemp)
   if ! S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err"; then
     grep -q NoSuchKey "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
     : > "$f"
   fi
-  # "<unix time> <instance id> <market> <vCPUs>"; an entry written before the vCPUs were kept is 96.
-  awk -v t="$t" -v keep=$ADMIT_LEDGER_S '(NF == 3 || NF == 4) && t - $1 <= keep {print $1, $2, $3, (NF == 4 ? $4 : 96)}' "$f" || { rm -f "$f" "$f.err"; return 1; }
+  # An expired line is dropped whatever its shape: the ledger is rewritten only by ledger_add,
+  # which reads it first, so a refused expired line would refuse every launch for good.
+  awk -v t="$t" -v keep=$ADMIT_LEDGER_S 'NF == 0 || ($1 ~ /^[0-9]+$/ && t - $1 > keep) {next}
+       NF != 4 || $1 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ {bad = 1; next} {print} END {exit bad}' "$f" \
+    || { say "the admission ledger s3://$BUCKET/$ADMIT_LEDGER holds a line that is not \"<time> <id> <market> <vCPUs>\""; rm -f "$f" "$f.err"; return 1; }
   rm -f "$f" "$f.err"
 }
 ledger_add() { # id market vcpus

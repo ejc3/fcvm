@@ -599,6 +599,25 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertEqual(launches, [], r.stderr)
                 self.assertIn("names no available host image", r.stderr)
                 self.assertFalse(any(" describe-images " in c and "--image-ids" not in c for c in r.calls), r.calls)
+    def test_the_ledger_holds_four_field_lines_only(self):
+        # A recent line of another shape (an admission whose vCPUs are unknown) refuses the launch;
+        # an expired line is dropped whatever its shape, and the rewritten ledger is four-field.
+        import tempfile
+        now = int(time.time())
+        for line, admitted in ((f"{now} i-other on-demand", 0), (f"{now - 7200} i-other on-demand", 1)):
+            with self.subTest(line=line):
+                s3 = tempfile.mkdtemp()
+                os.makedirs(os.path.join(s3, "gpubox"))
+                with open(os.path.join(s3, "gpubox", "admitted"), "w") as f:
+                    f.write(line + "\n")
+                r, launches, _ = self.up(s3=s3)
+                self.assertEqual(len(launches), admitted, r.stderr)
+                with open(os.path.join(s3, "gpubox", "admitted")) as f:
+                    rows = [l.split() for l in f.read().splitlines() if l.strip()]
+                if admitted:
+                    self.assertEqual([len(row) for row in rows], [4], rows)
+                else:
+                    self.assertIn("is not \"<time> <id> <market> <vCPUs>\"", r.stderr)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
