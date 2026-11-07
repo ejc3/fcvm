@@ -203,7 +203,13 @@ echo "$*" | tr '\n' ' ' >> "$FAKE_LOG"; echo >> "$FAKE_LOG"
 args=" $* "
 case "$args" in
   *" sts get-caller-identity "*) echo 123456789012 ;;
-  *" ec2 describe-images "*"--image-ids "*) echo "${FAKE_IMAGE_STATE:-available}" ;;
+  # An image id names one image in one region: with FAKE_IMAGE_REGION set, only there.
+  *" ec2 describe-images "*"--image-ids "*)
+    region=$(sed -n 's/.*--region \([^ ]*\).*/\1/p' <<<"$args")
+    if [ -n "${FAKE_IMAGE_REGION:-}" ] && [ "$region" != "$FAKE_IMAGE_REGION" ]; then
+      echo "An error occurred (InvalidAMIID.NotFound) when calling the DescribeImages operation" >&2; exit 254
+    fi
+    echo "${FAKE_IMAGE_STATE:-available}" ;;
   *" ec2 describe-images "*) case "$args" in *tag:FleetImageValidated,Values=true*) echo ami-fake ;; *) echo ami-unvalidated ;; esac ;;
   *" ec2 describe-security-groups "*) echo sg-fake ;;
   *" ec2 describe-subnets "*) [ -z "${FAKE_SLOW_SUBNETS:-}" ] || sleep 3; echo subnet-fake ;;
@@ -406,6 +412,31 @@ class GpuboxWallReserve(unittest.TestCase):
         self.assertIn("{Key=fcvm-admission,Value=wall-reserve}", launches[0])
         with open(os.path.join(s3, "gpubox", "admitted")) as f:
             self.assertEqual(f.read().split()[2:], ["on-demand", "4"])
+
+    def test_a_launch_refuses_an_image_from_another_region(self):
+        # 2026-11-07: a host bake from a us-east-1 image ran with build-ami.sh's us-west-2 default
+        # and RunInstances said only "The image id '[ami-...]' does not exist". Every launcher
+        # checks the image in its region first, names the region, and takes no admission lock.
+        ami = "ami-" + "e" * 17
+        cases = {
+            "build-ami": dict(cmd=["bash", os.path.join(HERE, "..", "ami", "build-ami.sh"), "launch", "host"],
+                              BASE_AMI=ami, REGION="us-west-2"),
+            "measure-boot": dict(cmd=["bash", os.path.join(HERE, "..", "ami", "measure-boot.sh"), "host", ami],
+                                 REGION="us-west-2"),
+            "gpubox": dict(GPUBOX_AMI=ami, GPUBOX_REGION="us-west-2"),
+        }
+        for name, kw in cases.items():
+            with self.subTest(launcher=name):
+                r, launches, _ = self.up(FAKE_IMAGE_REGION="us-east-1", **kw)
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(launches, [], r.stderr)
+                self.assertIn(f"{ami} is not an available image in us-west-2", r.stderr)
+                self.assertFalse([c for c in r.calls if " s3api put-object " in f" {c} "], r.calls)
+                # The same image in its own region launches.
+                kw = {**kw, **{k: "us-east-1" for k in ("REGION", "GPUBOX_REGION") if k in kw}}
+                r, launches, _ = self.up(FAKE_IMAGE_REGION="us-east-1", **kw)
+                self.assertEqual(len(launches), 1, r.stderr)
+                self.assertIn(f"--image-id {ami} ", launches[0])
 
     def test_a_boot_measurement_goes_through_the_wall_reserve(self):
         # measure-boot.sh host launches a g4dn.metal on demand: at 192 of 384 it would leave
