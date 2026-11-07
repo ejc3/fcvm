@@ -77,13 +77,18 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
 
 /**
  * The browser's optional direct /live URL. The Worker's service token always goes to
- * FLEET_COORD_URL's origin, even when a separate viewer hostname is configured.
+ * FLEET_COORD_URL's origin. The caller supplies its URL parser so this module stays
+ * platform neutral and does not hand the browser an invalid WebSocket URL.
  */
-export function pageDirectLiveUrl(env: ProxyEnv): string | null {
+export function pageDirectLiveUrl(env: ProxyEnv, ParseUrl: new (value: string) => { href: string; host: string }): string | null {
   if (liveProxy(env) === null) return null;
   if (env.FLEET_DIRECT_COORD_URL === undefined) return env.FLEET_COORD_URL as string;
-  const direct = env.FLEET_DIRECT_COORD_URL;
-  return /^wss:\/\/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\/live$/.test(direct) ? direct : null;
+  try {
+    const url = new ParseUrl(env.FLEET_DIRECT_COORD_URL);
+    return url.href === `wss://${url.host}/live` ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

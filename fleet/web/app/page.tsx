@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const h = await headers();
   const coordUrl = pageLiveUrl(process.env, h.get("host"), h.get("x-forwarded-proto"));
-  const directUrl = coordUrl === process.env.FLEET_COORD_URL ? null : pageDirectLiveUrl(process.env);
+  const directUrl = coordUrl === process.env.FLEET_COORD_URL ? null : pageDirectLiveUrl(process.env, URL);
   if (coordUrl === "") {
     return <p style={{ padding: 24 }}>{NO_FLEET}</p>;
   }

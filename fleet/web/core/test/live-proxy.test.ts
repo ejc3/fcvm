@@ -78,7 +78,7 @@ describe("pageLiveUrl", () => {
 describe("pageDirectLiveUrl", () => {
   it("splits browser direct access from the token-bearing Worker fallback", () => {
     const separate = { ...env, FLEET_DIRECT_COORD_URL: "wss://viewer.example.test/live" };
-    expect(pageDirectLiveUrl(separate)).toBe(separate.FLEET_DIRECT_COORD_URL);
+    expect(pageDirectLiveUrl(separate, URL)).toBe(separate.FLEET_DIRECT_COORD_URL);
     expect(pageLiveUrl(separate, "stage.example.test", "https")).toBe("wss://stage.example.test/live");
     const upstream = forwardedRequest(liveProxy(separate)!, "/live", "", []);
     expect(upstream.url).toBe("https://coord.example.test/live");
@@ -86,13 +86,22 @@ describe("pageDirectLiveUrl", () => {
   });
 
   it("keeps the old direct path if unconfigured and never creates a fallback without the Worker token", () => {
-    expect(pageDirectLiveUrl(env)).toBe(env.FLEET_COORD_URL);
-    expect(pageDirectLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL, FLEET_DIRECT_COORD_URL: "wss://viewer.example.test/live" })).toBeNull();
+    expect(pageDirectLiveUrl(env, URL)).toBe(env.FLEET_COORD_URL);
+    expect(pageDirectLiveUrl({ FLEET_COORD_URL: env.FLEET_COORD_URL, FLEET_DIRECT_COORD_URL: "wss://viewer.example.test/live" }, URL)).toBeNull();
   });
 
   it("uses only an exact secure viewer socket for the optional override", () => {
     for (const bad of ["not a URL", "https://viewer.example.test/live", "ws://viewer.example.test/live",
-      "wss://viewer.example.test/agent", "wss://viewer.example.test/live?token=test", "wss://user@viewer.example.test/live"])
-      expect(pageDirectLiveUrl({ ...env, FLEET_DIRECT_COORD_URL: bad })).toBeNull();
+      "wss://viewer.example.test/agent", "wss://viewer.example.test/live?token=test", "wss://viewer.example.test/live#",
+      "wss://user@viewer.example.test/live"])
+      expect(pageDirectLiveUrl({ ...env, FLEET_DIRECT_COORD_URL: bad }, URL)).toBeNull();
+  });
+
+  it("keeps the fallback when the browser would reject a numeric hostname", () => {
+    for (const host of ["256.256.256.256", "viewer.0x100000000"]) {
+      const misconfigured = { ...env, FLEET_DIRECT_COORD_URL: `wss://${host}/live` };
+      expect(pageDirectLiveUrl(misconfigured, URL)).toBeNull();
+      expect(pageLiveUrl(misconfigured, "stage.example.test", "https")).toBe("wss://stage.example.test/live");
+    }
   });
 });
