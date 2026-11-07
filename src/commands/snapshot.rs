@@ -3807,6 +3807,7 @@ async fn cmd_snapshot_run_inner(
                                 args.non_blocking_output,
                                 vm_state.config.ipv6_prefix.as_ref(),
                                 args.ipv6_address,
+                                args.host_ipv6,
                                 &network_config,
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
@@ -3961,7 +3962,7 @@ async fn cmd_snapshot_run_inner(
                     startup_rx = None;
 
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
-                        let startup_key = startup_snapshot_key(base_key, args.balloon);
+                        let startup_key = startup_snapshot_key(base_key, args.balloon, args.host_ipv6);
 
                         // Skip if startup snapshot already exists. The startup-snapshot cache
                         // path is Firecracker-specific (diff snapshots via create_snapshot_core)
@@ -4220,6 +4221,7 @@ async fn build_clone_reboot_plan(
     non_blocking_output: bool,
     ipv6_prefix: Option<&String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
+    host_ipv6: Option<std::net::Ipv6Addr>,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
@@ -4251,6 +4253,7 @@ async fn build_clone_reboot_plan(
         ipv6_prefix,
         ipv6_address,
         meta.restore_hook.clone(),
+        host_ipv6,
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -4330,6 +4333,10 @@ async fn build_clone_reboot_plan(
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
 /// line inherits (`restore_hook_for`); for the reboot plan the clone's own.
+///
+/// `host_ipv6` is the restoring host's identity address (`snapshot run --host-ipv6`),
+/// given to the cold boot as its `HOST_IPV6`, which fc-agent adds to the guest's lo
+/// (and eth0 outside routed mode), as a restore gives it to a memory-restored clone.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -4343,6 +4350,7 @@ fn run_args_from_snapshot_metadata(
     ipv6_prefix: Option<&String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
+    host_ipv6: Option<std::net::Ipv6Addr>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -4401,7 +4409,10 @@ fn run_args_from_snapshot_metadata(
         env: match (&meta.user, &meta.username) {
             (Some(_), Some(username)) => vec![format!("USER={username}")],
             _ => vec![],
-        },
+        }
+        .into_iter()
+        .chain(host_ipv6.map(|address| format!("HOST_IPV6={address}")))
+        .collect(),
         cmd: None,
         publish,
         balloon: balloon.map(|device| device.target_mib),
@@ -4582,6 +4593,7 @@ async fn cmd_snapshot_run_disk_only(
             args.inherit_recorded_hook,
             meta.restore_hook.as_deref(),
         ),
+        args.host_ipv6,
     );
 
     info!(
@@ -5117,6 +5129,7 @@ mod tests {
                 given,
                 None,
                 None,
+                None,
             )
             .ipv6_prefix
         };
@@ -5195,6 +5208,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -5221,6 +5235,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -5238,6 +5253,7 @@ mod tests {
                 512,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5262,6 +5278,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5298,6 +5315,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5339,6 +5357,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -5355,6 +5374,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5398,6 +5418,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5871,6 +5892,65 @@ mod tests {
                 &["10.9.0.2", "2001:db8:9::53"],
                 &["restore.example", "v6.example"]
             ))
+        );
+    }
+
+    /// A cold boot of a snapshot (a disk-only clone, and the relaunch of a
+    /// memory-restored clone whose guest rebooted) gives the guest the restoring
+    /// host's identity address as its `HOST_IPV6`, as a memory restore does, and
+    /// none when the run names none.
+    #[test]
+    fn cold_boot_plans_carry_the_restoring_hosts_identity() {
+        let mut meta = metadata_fixture();
+        meta.user = Some("1000:1000".to_string());
+        meta.username = Some("builder".to_string());
+        let synth = |host_ipv6: Option<std::net::Ipv6Addr>| {
+            run_args_from_snapshot_metadata(
+                &meta,
+                &[],
+                "c".to_string(),
+                1,
+                512,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                host_ipv6,
+            )
+            .env
+        };
+        assert_eq!(
+            synth(Some("2001:db8:b::1".parse().unwrap())),
+            ["USER=builder", "HOST_IPV6=2001:db8:b::1"]
+        );
+        assert_eq!(synth(None), ["USER=builder"]);
+
+        let code: String = {
+            let source = include_str!("snapshot.rs");
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        let body = |start: &str, end: &str| -> String {
+            let at = code
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} is gone"));
+            code[at..at + code[at..].find(end).unwrap()].to_string()
+        };
+        assert!(
+            body("letrun_args=run_args_from_snapshot_metadata(", ");").ends_with("args.host_ipv6,"),
+            "a disk-only clone no longer cold-boots with this run's host identity"
+        );
+        assert!(
+            body("matchbuild_clone_reboot_plan(", "&network_config,")
+                .ends_with("args.ipv6_address,args.host_ipv6,"),
+            "a clone's reboot plan no longer carries this run's host identity"
+        );
+        assert!(
+            body("letsynth_args=run_args_from_snapshot_metadata(", ");").ends_with("host_ipv6,"),
+            "build_clone_reboot_plan no longer passes its host identity on"
         );
     }
 

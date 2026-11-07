@@ -172,7 +172,11 @@ first connections after egress opens would name the wrong host. The restore docu
 restoring host's identity address (`snapshot run --host-ipv6`, `FCVM_HOST_IPV6`; a podman cache hit
 forwards its own `--env HOST_IPV6`) and the resolvers a boot on that host would get; fc-agent adds the new
 address before deleting the old one and rewrites resolv.conf only when it differs, and a refused change
-fails the restore. `HOST_IPV6` is not in the snapshot key, so one snapshot serves every host.
+fails the restore. `HOST_IPV6` is not in the pre-start snapshot key, so one snapshot serves every host,
+and the container a pre-start clone launches is given the restored address
+(`a_restored_host_identity_replaces_host_ipv6_in_the_container_env`). A startup snapshot's container
+already runs with the address in its environment, which a restore cannot change, so its name carries it
+(`two_host_identities_share_the_pre_start_snapshot_and_not_the_startup_one`).
 `the_host_identity_is_replaced_before_egress_opens_and_before_the_hook` pins the order.
 
 ### Opening the gate costs no grace period, and the barrier an expedited one

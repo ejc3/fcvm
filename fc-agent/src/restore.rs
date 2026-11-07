@@ -404,7 +404,7 @@ pub async fn handle_clone_restore(
         .await
         .context("restore phase host-identity")?;
     if let Some(ref dns) = identity.dns {
-        network::apply_restore_dns(dns);
+        network::apply_restore_dns(dns).context("restore phase host-identity resolvers")?;
     }
     eprintln!(
         "[fc-agent] restore phase=host-identity epoch={restore_epoch} elapsed_ms={:.3}",
@@ -1181,8 +1181,8 @@ mod tests {
             .find(".context(\"restore phase host-identity\")?")
             .expect("the restore path no longer fails closed on a host identity error");
         let dns = body
-            .find("network::apply_restore_dns(dns)")
-            .expect("the restore path no longer gives the guest the restoring host's resolvers");
+            .find("network::apply_restore_dns(dns).context(\"restore phase host-identity resolvers\")?")
+            .expect("the restore path no longer gives the guest the restoring host's resolvers, or no longer fails closed when it cannot");
         let boundary = body
             .find("crate::snapshot_network::restore_snapshot_network(")
             .expect("the restore path no longer runs the snapshot boundary");

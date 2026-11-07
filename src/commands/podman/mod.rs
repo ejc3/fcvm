@@ -1643,7 +1643,7 @@ async fn prepare_vm_for_lifecycle(
         // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
         // The startup snapshot is this run's balloon target's own; the pre-start one is
         // shared between targets.
-        let startup_key = startup_snapshot_key(&key, args.balloon);
+        let startup_key = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -2967,7 +2967,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 settle_balloon_check(ctx).await?;
 
                 if let Some(ref key) = ctx.snapshot_key {
-                    let startup_key = startup_snapshot_key(key, ctx.args.balloon);
+                    let startup_key =
+                        startup_snapshot_key(key, ctx.args.balloon, run_host_ipv6(&ctx.args.env));
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3911,7 +3912,7 @@ mod tests {
             let mut args = test_args();
             args.balloon = balloon;
             let key = key_for(&args, GuestBootInputs::default());
-            let startup = startup_snapshot_key(&key, args.balloon);
+            let startup = startup_snapshot_key(&key, args.balloon, None);
             (key, startup)
         };
         let (key_64, startup_64) = names(Some(64));
@@ -3937,8 +3938,65 @@ mod tests {
             "a run without --balloon keeps the startup name it had"
         );
         assert_eq!(
-            startup_snapshot_key("abc123def456", None),
+            startup_snapshot_key("abc123def456", None, None),
             "abc123def456-startup"
+        );
+    }
+
+    /// A startup snapshot holds a container that runs with the host identity
+    /// address in its environment, which a restore cannot change, so runs with
+    /// different addresses share the pre-start snapshot and have a startup
+    /// snapshot each. A run without one keeps the startup name it had.
+    #[test]
+    fn two_host_identities_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let names = |address: Option<&str>| {
+            let mut args = test_args();
+            args.env = address
+                .map(|a| vec![format!("HOST_IPV6={a}")])
+                .unwrap_or_default();
+            let key = key_for(&args, GuestBootInputs::default());
+            let startup = startup_snapshot_key(&key, args.balloon, run_host_ipv6(&args.env));
+            (key, startup)
+        };
+        let (key_a, startup_a) = names(Some("2001:db8:a::1"));
+        let (key_b, startup_b) = names(Some("2001:db8:b::1"));
+        let (key_none, startup_none) = names(None);
+        assert_eq!(
+            key_a, key_b,
+            "the pre-start snapshot is shared between hosts"
+        );
+        assert_eq!(key_a, key_none);
+        assert_ne!(
+            startup_a, startup_b,
+            "a run on host B must not find the startup snapshot whose container runs as host A"
+        );
+        assert_ne!(startup_a, startup_none);
+        assert_eq!(startup_none, format!("{key_none}-startup"));
+        crate::storage::validate_snapshot_name(&startup_snapshot_key(
+            &key_a,
+            Some(u32::MAX),
+            Some("2001:db8:a::1".parse().unwrap()),
+        ))
+        .expect("the longest startup name is a valid snapshot name");
+
+        // Every caller names the startup snapshot for the run's own address.
+        let code = |source: &str| -> String {
+            source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()]
+                .split_whitespace()
+                .collect()
+        };
+        let podman = code(include_str!("mod.rs"));
+        for call in [
+            "startup_snapshot_key(&key,args.balloon,run_host_ipv6(&args.env))",
+            "startup_snapshot_key(key,ctx.args.balloon,run_host_ipv6(&ctx.args.env))",
+        ] {
+            assert!(podman.contains(call), "podman run no longer calls {call}");
+        }
+        assert_eq!(podman.matches("startup_snapshot_key(").count(), 2);
+        assert!(
+            code(include_str!("../snapshot.rs"))
+                .contains("startup_snapshot_key(base_key,args.balloon,args.host_ipv6)"),
+            "a clone saves the startup snapshot under the address it restored with"
         );
     }
 

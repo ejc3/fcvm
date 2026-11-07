@@ -69,7 +69,7 @@ pub async fn run() -> Result<()> {
     let transport = bootplan::detect_transport();
 
     // Fetch the container plan with retry.
-    let plan = loop {
+    let mut plan = loop {
         match bootplan::fetch_plan(transport).await {
             Ok(p) => {
                 eprintln!("[fc-agent] received container plan successfully");
@@ -642,6 +642,10 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+
+    // The container is given the identity the guest holds, which a restore of a
+    // snapshot taken before the launch moved to the restoring host's.
+    crate::network::reconcile_host_ipv6_env(&mut plan.env);
 
     // A clone shares its source's machine-id / SSH host keys via the reflinked
     // disk. Regenerate them so concurrent clones have distinct identities.

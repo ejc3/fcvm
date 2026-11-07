@@ -738,12 +738,29 @@ fn resolv_conf_for(
 /// body differs, so a clone on another host does not ask the preparing host's
 /// resolvers, which that network may not reach. The `ip=` fallback reads the
 /// snapshot's own command line, which names no host.
-pub fn apply_restore_dns(dns: &crate::types::RestoreDns) {
-    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let current = std::fs::read_to_string("/etc/resolv.conf").ok();
-    if let Some(body) = restore_resolv_conf(current.as_deref(), dns, &cmdline) {
-        write_resolv_conf(&body);
+///
+/// Fails when the file cannot be written: a clone published with the preparing
+/// host's resolvers asks servers the restoring host's network may not reach.
+pub fn apply_restore_dns(dns: &crate::types::RestoreDns) -> anyhow::Result<()> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
+    apply_restore_dns_at(std::path::Path::new("/etc/resolv.conf"), dns, &cmdline)
+}
+
+fn apply_restore_dns_at(
+    path: &std::path::Path,
+    dns: &crate::types::RestoreDns,
+    cmdline: &str,
+) -> anyhow::Result<()> {
+    let current = std::fs::read_to_string(path).ok();
+    if let Some(body) = restore_resolv_conf(current.as_deref(), dns, cmdline) {
+        std::fs::write(path, &body).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!(
+            "[fc-agent] wrote {}: {}",
+            path.display(),
+            body.trim().replace('\n', " ; ")
+        );
     }
+    Ok(())
 }
 
 /// The resolv.conf body a restore writes, or None when the current file already
@@ -1064,6 +1081,35 @@ fn boot_host_identity_in(identity: &mut HostIdentity, plan_address: &str) -> Opt
         ),
     }
     Some(plan_address.to_string())
+}
+
+/// The boot plan's environment with `HOST_IPV6` naming the identity this guest
+/// holds, for the container the boot launches.
+///
+/// The plan was captured by the preparing host, so after a restore of a snapshot
+/// taken before the container launched its `HOST_IPV6` names the preparing host.
+/// The restore moved the guest to the restoring host's address, or to none, and
+/// the container must be given the same.
+pub fn reconcile_host_ipv6_env(env: &mut std::collections::HashMap<String, String>) {
+    let identity = *HOST_IDENTITY.lock().unwrap();
+    reconcile_host_ipv6_env_in(env, identity);
+}
+
+fn reconcile_host_ipv6_env_in(
+    env: &mut std::collections::HashMap<String, String>,
+    identity: HostIdentity,
+) {
+    if !identity.restored {
+        return;
+    }
+    match identity.address {
+        Some(address) => {
+            env.insert("HOST_IPV6".to_string(), address.to_string());
+        }
+        None => {
+            env.remove("HOST_IPV6");
+        }
+    }
 }
 
 /// The interfaces that carry the host identity address under this kernel
@@ -2037,6 +2083,27 @@ mod resolv_conf_tests {
         );
     }
 
+    /// A resolv.conf the restore cannot write fails the restore, so the clone is
+    /// never published asking the preparing host's resolvers.
+    #[test]
+    fn a_refused_resolv_conf_write_fails_the_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let dns = restore_dns(&["10.9.0.2"], &["restore.example"]);
+        let missing = dir.path().join("no-such-dir").join("resolv.conf");
+        assert!(
+            apply_restore_dns_at(&missing, &dns, "").is_err(),
+            "a resolv.conf write that failed must fail the restore"
+        );
+
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 10.1.0.2\n").unwrap();
+        apply_restore_dns_at(&path, &dns, "").expect("a writable resolv.conf is rewritten");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "search restore.example\nnameserver 10.9.0.2\n"
+        );
+    }
+
     /// The same resolvers leave the file alone.
     #[test]
     fn a_restore_with_the_same_resolvers_writes_nothing() {
@@ -2572,6 +2639,82 @@ mod ipv6_swap_tests {
         );
         assert_eq!(fresh.address, Some("2001:db8:a::1".parse().unwrap()));
         assert!(!fresh.restored);
+    }
+
+    /// The container a restored guest launches is given the identity the restore
+    /// set, not the preparing host's that the captured plan names, and none when
+    /// the restoring host named none. Without a restore the plan's value stands.
+    #[test]
+    fn a_restored_host_identity_replaces_host_ipv6_in_the_container_env() {
+        let plan_env = || {
+            std::collections::HashMap::from([
+                ("HOST_IPV6".to_string(), "2001:db8:a::1".to_string()),
+                ("OTHER".to_string(), "x".to_string()),
+            ])
+        };
+        let mut moved = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut moved,
+            HostIdentity {
+                address: Some("2001:db8:b::1".parse().unwrap()),
+                restored: true,
+            },
+        );
+        assert_eq!(
+            moved.get("HOST_IPV6").map(String::as_str),
+            Some("2001:db8:b::1")
+        );
+        assert_eq!(moved.get("OTHER").map(String::as_str), Some("x"));
+
+        let mut removed = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut removed,
+            HostIdentity {
+                address: None,
+                restored: true,
+            },
+        );
+        assert_eq!(removed.get("HOST_IPV6"), None);
+
+        let mut added = std::collections::HashMap::new();
+        reconcile_host_ipv6_env_in(
+            &mut added,
+            HostIdentity {
+                address: Some("2001:db8:b::1".parse().unwrap()),
+                restored: true,
+            },
+        );
+        assert_eq!(
+            added.get("HOST_IPV6").map(String::as_str),
+            Some("2001:db8:b::1")
+        );
+
+        let mut booted = plan_env();
+        reconcile_host_ipv6_env_in(
+            &mut booted,
+            HostIdentity {
+                address: Some("2001:db8:a::1".parse().unwrap()),
+                restored: false,
+            },
+        );
+        assert_eq!(booted, plan_env());
+
+        // The boot reconciles the plan after a pre-start restore can have run and
+        // before it builds the container's arguments from the plan.
+        let agent = include_str!("agent.rs");
+        let handshake = agent
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("fc-agent no longer offers the pre-start snapshot");
+        let reconciled = agent
+            .find("crate::network::reconcile_host_ipv6_env(&mut plan.env);")
+            .expect("the boot no longer gives the container the restored host identity");
+        let launched = agent
+            .find("let podman_args = ")
+            .expect("the boot no longer builds the container's arguments");
+        assert!(
+            handshake < reconciled && reconciled < launched,
+            "handshake={handshake} reconciled={reconciled} launched={launched}"
+        );
     }
 
     #[test]

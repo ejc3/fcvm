@@ -553,7 +553,7 @@ fn test_startup_snapshot_key_generation() {
     println!("====================================");
 
     let base_key = "abc123def456";
-    let startup_key = fcvm::commands::podman::startup_snapshot_key(base_key, None);
+    let startup_key = fcvm::commands::podman::startup_snapshot_key(base_key, None, None);
 
     assert_eq!(startup_key, "abc123def456-startup");
     println!("  Base key: {}", base_key);
