@@ -39,6 +39,8 @@ def read_fault_trace(path: Path):
     for i in range(n):
         off, t0, t1 = struct.unpack_from("<QQQ", data, i * 24)
         out.append((off, t0, t1))
+    # Demand order. fcvm writes it so; a trace from before fault workers was already.
+    out.sort(key=lambda record: record[1])
     return out
 
 
@@ -304,7 +306,9 @@ def main():
                 # The gap between one fault's resolution and the next fault's arrival
                 # bounds the part the ioctl time does not see, and span/count is the
                 # end-to-end mean while the guest is fault-bound.
-                gaps = [(tr[i + 1][1] - tr[i][2]) / 1000.0 for i in range(len(tr) - 1)]
+                # With fault workers the service intervals overlap; an overlap is no
+                # unseen round trip, so it counts as no gap.
+                gaps = [max(0, tr[i + 1][1] - tr[i][2]) / 1000.0 for i in range(len(tr) - 1)]
                 if gaps:
                     item["uffd_interfault_us_p50"] = pct(gaps, 50)
                     item["uffd_interfault_us_mean"] = sum(gaps) / len(gaps)

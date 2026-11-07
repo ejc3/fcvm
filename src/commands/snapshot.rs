@@ -4002,20 +4002,28 @@ async fn cmd_snapshot_run_inner(
         }
 
         if let (Some(prepare), None) = (args.prepare.as_ref(), clone_failure.as_ref()) {
-            prepare_result = Some(
-                restored_prepare(
-                    prepare,
-                    startup_rx.take(),
-                    &cancel,
-                    vm_manager.as_mut(),
-                    args.balloon,
-                    &vm_state,
-                    &disk_path,
-                    &volume_configs,
-                    &volume_servers.remap_refs,
+            let restored = restored_prepare(
+                prepare,
+                startup_rx.take(),
+                &cancel,
+                vm_manager.as_mut(),
+                args.balloon,
+                &vm_state,
+                &disk_path,
+                &volume_configs,
+                &volume_servers.remap_refs,
+            )
+            .await;
+            // As a cold prepare does: a source that stopped says what its container exited with.
+            prepare_result = Some(match restored {
+                Err(error) => Err(super::podman::with_container_exit_code(
+                    error,
+                    &container_exit_seen,
+                    &data_dir,
                 )
-                .await,
-            );
+                .await),
+                ok => ok,
+            });
         }
 
         // Bounds the wait for a guest that never powers off after its container exited (#998).
@@ -4495,6 +4503,16 @@ async fn cmd_snapshot_run_inner(
                     "interrupted before the container became healthy"
                 ))
             }),
+        });
+        // Teardown has copied the container's output to /tmp; a failed prepare's error ends
+        // with its last lines and names the file, as a cold prepare's does.
+        let operation = operation.map_err(|error| {
+            let tmp = std::path::Path::new("/tmp");
+            super::podman::with_container_output(
+                error,
+                &super::common::saved_log_path(tmp, "container", &vm_id),
+                &super::common::saved_log_path(tmp, "container.1", &vm_id),
+            )
         });
         *prepared_out = Some(super::podman::finish_prepare(operation, cleanup_result)?);
         return Ok(());

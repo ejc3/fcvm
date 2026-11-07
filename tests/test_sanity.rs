@@ -976,6 +976,18 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
         "a prepare whose container exits 1 must fail, got {status}"
     );
 
+    check_failed_prepare_output(&log, &marker, started).await
+}
+
+/// What a failed prepare must leave: the container's output in a /tmp/fcvm-container-*.log
+/// written after `started`, and an error in `log` that names the container's exit code and
+/// that file and ends with the output.
+async fn check_failed_prepare_output(
+    log: &std::path::Path,
+    marker: &str,
+    started: std::time::SystemTime,
+) -> Result<()> {
+    use std::time::Duration;
     let mut kept = None;
     for entry in std::fs::read_dir("/tmp")? {
         let path = entry?.path();
@@ -987,7 +999,7 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
             continue;
         }
         let text = std::fs::read_to_string(&path)?;
-        if text.contains(&marker) {
+        if text.contains(marker) {
             kept = Some((path, text));
             break;
         }
@@ -1007,8 +1019,8 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
     );
 
     // The error names the container's exit code and that file, and ends with the output.
-    common::wait_for_log_eof(&log, Duration::from_secs(10)).await?;
-    let printed = std::fs::read_to_string(&log)?;
+    common::wait_for_log_eof(log, Duration::from_secs(10)).await?;
+    let printed = std::fs::read_to_string(log)?;
     let names_the_file = format!("(the output fcvm kept is in {})", path.display());
     let after = printed
         .find(&names_the_file)
@@ -1025,6 +1037,78 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
     );
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// A prepare that restores a pre-start snapshot reports a failed container as a cold one
+/// does: the exit code, and the output it kept. Before, the restored path returned the bare
+/// "source stopped" error and the caller saw neither.
+#[tokio::test]
+async fn test_failed_prepare_from_a_pre_start_snapshot_keeps_the_container_output() -> Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let (vm_name, run_name, tag, _) = common::unique_names("prepare-output-hit");
+    let marker = format!("{vm_name}-marker");
+    let script = format!("echo {marker}-out; echo {marker}-err >&2; exit 1");
+    // A run of the same image and command leaves the pre-start snapshot; its container
+    // fails the same way.
+    let (mut run, _pid, _run_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &run_name,
+            common::TEST_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning fcvm podman run")?;
+    tokio::time::timeout(Duration::from_secs(600), run.wait())
+        .await
+        .context("the run did not end within 600 s")??;
+
+    let started = SystemTime::now();
+    let (mut child, _pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "prepare",
+            "--name",
+            &vm_name,
+            "--tag",
+            &tag,
+            "--ready-timeout",
+            "300",
+            common::TEST_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning fcvm podman prepare")?;
+    let status = tokio::time::timeout(Duration::from_secs(600), child.wait())
+        .await
+        .context("the prepare did not end within 600 s")??;
+    assert!(
+        !status.success(),
+        "a prepare whose container exits 1 must fail, got {status}"
+    );
+    let choice = common::cache_choice(&log);
+    // The run's snapshot is named for this test's unique command; remove it either way.
+    if let Some((_, key)) = &choice {
+        let _ = common::delete_snapshot(key).await;
+    }
+    anyhow::ensure!(
+        choice
+            .as_ref()
+            .is_some_and(|(how, _)| *how == "pre-start snapshot"),
+        "the prepare must restore the run's pre-start snapshot; it chose {choice:?}"
+    );
+    check_failed_prepare_output(&log, &marker, started).await
 }
 
 /// A prepare whose snapshot cannot fit on the snapshot filesystem is refused before its VM

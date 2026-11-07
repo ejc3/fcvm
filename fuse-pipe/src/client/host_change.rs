@@ -488,6 +488,33 @@ mod tests {
         assert_eq!(left, 0, "file 5's invalidation was still queued");
     }
 
+    /// Only the invalidation thread sends invalidations. A reader that sent one could wait on
+    /// a page lock held for a READ queued for that same reader, and the mount would hang;
+    /// without the thread nothing is invalidated. The fallback used to send them inline.
+    #[test]
+    fn no_invalidation_is_sent_on_a_reader_thread() {
+        let source = include_str!("host_change.rs");
+        let body = |name: &str| {
+            let at = source.find(name).unwrap();
+            &source[at..at + source[at..].find("\n    }\n").unwrap()]
+        };
+        for function in [
+            "pub(crate) fn reply_after(",
+            "pub(crate) fn refreshed(",
+            "fn queue_invalidation(",
+        ] {
+            assert!(
+                !body(function).contains("send_invalidations("),
+                "{function} sends an invalidation on the calling thread"
+            );
+        }
+        assert_eq!(
+            source.matches(concat!("send_invalidations", "(&")).count(),
+            1,
+            "the thread's call"
+        );
+    }
+
     #[test]
     fn a_reply_with_nothing_to_drop_is_sent_on_the_calling_thread() {
         let c = changes(false);
