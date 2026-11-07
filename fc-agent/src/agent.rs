@@ -623,35 +623,12 @@ pub async fn run() -> Result<()> {
     // because NDP for the fbwhoami address isn't configured on the namespace side.
     //
     // A restore that ran before this point (a snapshot taken before the container
-    // launched) has set the restoring host's address, which wins over the plan's
-    // (`network::boot_host_identity`).
-    let host_ipv6 = plan
-        .env
-        .get("HOST_IPV6")
-        .filter(|ipv6| !ipv6.is_empty())
-        .and_then(|ipv6| crate::network::boot_host_identity(ipv6));
-    if let Some(ipv6) = host_ipv6 {
-        // Routed mode (a /128 guest_ipv6 in the boot param) holds it on lo only,
-        // the other modes on lo and eth0 (`network::host_identity_devices`).
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        let devices = crate::network::host_identity_devices(&cmdline);
-        for dev in devices {
-            let result = std::process::Command::new("ip")
-                .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])
-                .output();
-            match result {
-                Ok(o) if o.status.success() => {
-                    eprintln!("[fc-agent] added {} to {} for host identity", ipv6, dev);
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    if stderr.contains("File exists") {
-                        eprintln!("[fc-agent] {} already on {}", ipv6, dev);
-                    }
-                }
-                Err(e) => eprintln!("[fc-agent] ip addr add failed: {}", e),
-            }
-        }
+    // launched) has set the restoring host's address, which wins over the plan's,
+    // and one that runs beside it waits (`network::add_boot_host_identity`). Routed
+    // mode (a /128 guest_ipv6 in the boot param) holds it on lo only, the other
+    // modes on lo and eth0 (`network::host_identity_devices`).
+    if let Some(ipv6) = plan.env.get("HOST_IPV6").filter(|ipv6| !ipv6.is_empty()) {
+        crate::network::add_boot_host_identity(ipv6);
     }
 
     // The container is given the identity the guest holds, which a restore of a

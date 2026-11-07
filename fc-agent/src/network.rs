@@ -1056,19 +1056,45 @@ static HOST_IDENTITY: std::sync::Mutex<HostIdentity> = std::sync::Mutex::new(Hos
     restored: false,
 });
 
-/// The host identity address the boot adds (`agent::run`), given the boot plan's
-/// `HOST_IPV6`.
+/// Add the boot's host identity address to every interface that carries it,
+/// given the boot plan's `HOST_IPV6`.
+///
+/// The decision and the adds run under one hold of `HOST_IDENTITY`, the hold a
+/// restore swaps the address under (`apply_host_identity`): a restore of a snapshot
+/// taken before this step can run beside it.
+pub fn add_boot_host_identity(plan_address: &str) {
+    let mut identity = HOST_IDENTITY.lock().unwrap();
+    let Some(address) = boot_host_identity_in(&mut identity, plan_address) else {
+        return;
+    };
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    for dev in host_identity_devices(&cmdline) {
+        let result = std::process::Command::new("ip")
+            .args(["addr", "add", &format!("{address}/128"), "dev", dev])
+            .output();
+        match result {
+            Ok(o) if o.status.success() => {
+                eprintln!("[fc-agent] added {address} to {dev} for host identity");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if stderr.contains("File exists") {
+                    eprintln!("[fc-agent] {address} already on {dev}");
+                }
+            }
+            Err(e) => eprintln!("[fc-agent] ip addr add failed: {e}"),
+        }
+    }
+}
+
+/// The host identity address the boot adds (`add_boot_host_identity`), given the
+/// boot plan's `HOST_IPV6`.
 ///
 /// A clone of a snapshot taken before the container launched restores before
 /// the boot reaches this step, and its restore has already set the restoring
 /// host's address; the boot plan's, which names the preparing host, must not
 /// replace it. Otherwise the plan's address is recorded so a later restore can
 /// replace it.
-pub fn boot_host_identity(plan_address: &str) -> Option<String> {
-    let mut identity = HOST_IDENTITY.lock().unwrap();
-    boot_host_identity_in(&mut identity, plan_address)
-}
-
 fn boot_host_identity_in(identity: &mut HostIdentity, plan_address: &str) -> Option<String> {
     if identity.restored {
         return identity.address.map(|address| address.to_string());
@@ -1146,15 +1172,19 @@ pub async fn apply_host_identity(new: Option<&str>) -> anyhow::Result<()> {
                 .with_context(|| format!("host-ipv6 {address:?} is not an IPv6 address"))
         })
         .transpose()?;
-    let old = HOST_IDENTITY.lock().unwrap().address;
-    if old == new {
-        HOST_IDENTITY.lock().unwrap().restored = true;
-        return Ok(());
-    }
     let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
     let devices = host_identity_devices(&cmdline);
-    eprintln!("[fc-agent] moving the host identity from {old:?} to {new:?} on {devices:?}");
+    // One hold covers the read of the old address, the swap and the record of the
+    // new one, so the boot's step (`add_boot_host_identity`) runs wholly before or
+    // wholly after it.
     off_the_runtime("the host identity swap", move || {
+        let mut identity = HOST_IDENTITY.lock().unwrap();
+        let old = identity.address;
+        if old == new {
+            identity.restored = true;
+            return Ok(());
+        }
+        eprintln!("[fc-agent] moving the host identity from {old:?} to {new:?} on {devices:?}");
         let mut channel = KernelChannel::open(NETLINK_ROUTE, "NETLINK_ROUTE")?;
         let mut indices = Vec::with_capacity(devices.len());
         for device in devices {
@@ -1167,14 +1197,14 @@ pub async fn apply_host_identity(new: Option<&str>) -> anyhow::Result<()> {
             }
             indices.push((*device, index));
         }
-        swap_host_identity(&mut channel, &indices, old, new)
+        swap_host_identity(&mut channel, &indices, old, new)?;
+        *identity = HostIdentity {
+            address: new,
+            restored: true,
+        };
+        Ok(())
     })
-    .await?;
-    *HOST_IDENTITY.lock().unwrap() = HostIdentity {
-        address: new,
-        restored: true,
-    };
-    Ok(())
+    .await
 }
 
 /// Add `new` as a /128 on every interface in `indices`, then delete `old` from
@@ -2715,6 +2745,47 @@ mod ipv6_swap_tests {
             handshake < reconciled && reconciled < launched,
             "handshake={handshake} reconciled={reconciled} launched={launched}"
         );
+    }
+
+    /// A snapshot can capture a guest between its cache-ready handshake and the
+    /// boot's host identity step, and its restore then runs beside that step. The
+    /// restore reads the old address, swaps it and records the new one under one
+    /// hold of `HOST_IDENTITY`, and the boot decides and adds its address under the
+    /// same hold, so neither can add or record an address between the other's read
+    /// and write and leave the guest holding one nothing tracks.
+    #[test]
+    fn the_host_identity_is_read_swapped_and_recorded_under_one_lock() {
+        let source = include_str!("network.rs");
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        let body = |start: &str| {
+            let at = code
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} is gone"));
+            &code[at..at + code[at..].find("\n}\n").unwrap()]
+        };
+        let apply = body("pub async fn apply_host_identity(");
+        let blocking = apply
+            .find("off_the_runtime(")
+            .expect("the swap no longer runs off the runtime");
+        assert_eq!(
+            apply.matches("HOST_IDENTITY.lock()").count(),
+            1,
+            "the restore takes the identity lock more than once, so the boot can run between"
+        );
+        assert!(
+            apply.find("HOST_IDENTITY.lock()").unwrap() > blocking,
+            "the restore reads the old address outside the hold that covers the swap"
+        );
+        let boot = body("pub fn add_boot_host_identity(");
+        let locked = boot
+            .find("HOST_IDENTITY.lock()")
+            .expect("the boot no longer takes the identity lock");
+        let decided = boot.find("boot_host_identity_in(").unwrap();
+        let added = boot.find("Command::new(\"ip\")").unwrap();
+        assert!(locked < decided && decided < added);
+        let agent = include_str!("agent.rs");
+        assert!(agent.contains("crate::network::add_boot_host_identity("));
+        assert!(!agent.contains("\"addr\", \"add\""));
     }
 
     #[test]
