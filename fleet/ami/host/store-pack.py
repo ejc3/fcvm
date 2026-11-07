@@ -105,7 +105,7 @@ def split(root, groups, limit):
         full = os.path.join(root, rel)
         st = os.lstat(full)
         if len(g[1]) != 1 or st.st_nlink != 1 or not os.path.isfile(full) or os.path.islink(full) \
-                or g[0] <= limit or any(c in rel for c in "\t\n"):
+                or g[0] <= limit or any(c in rel for c in "\t\n\r"):
             kept.append(g)
             continue
         files.append((rel, st))
