@@ -18,20 +18,23 @@ export default {
     const proxy = isProxiedPath(url.pathname) ? liveProxy(env) : null;
     if (proxy === null) return (openNext as Next).fetch(request, env, ctx);
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: { allow: "GET, HEAD" } });
+    const started = Date.now();
     const fwd = forwardedRequest(proxy, url.pathname, url.search, request.headers.entries());
     const response = await fetch(fwd.url, { method: request.method, headers: fwd.headers, redirect: "manual" });
-    if (response.status !== 101 && response.status >= 300 && response.status < 400) {
+    if (response.status >= 300 && response.status < 400) {
       // Access refused the token: say so in the Worker's log rather than hand the page a login redirect.
       console.error(`coordinator ${url.pathname} answered ${response.status}: the Worker's Access service token was not admitted`);
       return new Response("the coordinator refused the page's service token", { status: 502 });
     }
+    // How long the coordinator leg took (Worker to Cloudflare's front door, Access, the tunnel).
+    const timing = `upstream;dur=${Date.now() - started}`;
     // Access can issue an API session cookie in response to the service token. Returning
     // it under the page's host would overwrite the viewer's different Access session.
     const privateHeaders = [...response.headers.keys()].filter((name) => name === "set-cookie" || name.startsWith("cf-access-"));
-    if (privateHeaders.length === 0) return response;
     // Copy through workerd's Response initializer, which preserves its WebSocket on a 101.
     const clean = new Response(response.body, response);
     for (const name of privateHeaders) clean.headers.delete(name);
+    clean.headers.append("server-timing", timing);
     return clean;
   },
 };

@@ -214,6 +214,20 @@ int main() {
     CHECK(ws >= 0 && needs > ws && first > needs && sub > first,
           "a stream that needs a direct token reads it from the first message before it subscribes (%ld %ld %ld %ld)", ws, needs, first,
           sub);
+    // One deadline per phase (tls_check.h tests the deadline itself): the request head, the
+    // admission message of /frames and /mirror, and none once a stream runs.
+    long handle = find_from(0, "void Server::handle(Conn& c)");
+    long head_deadline = find_from(handle, "c.set_read_deadline_ms(10000)");
+    long head_read = find_from(handle, "c.read(tmp, sizeof tmp)");
+    long admit_deadline = find_from(needs, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long cleared = find_from(first, "c.set_read_deadline_ms(0)");
+    long mirror = find_from(0, "path == \"/mirror\"");
+    long mirror_deadline = find_from(mirror, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long mirror_read = find_from(mirror, "read_ws_message(c, &op, &first)");
+    CHECK(handle >= 0 && head_deadline > handle && head_read > head_deadline && admit_deadline > needs && admit_deadline < first &&
+              cleared > first && cleared < sub && mirror_deadline > mirror && mirror_read > mirror_deadline,
+          "reads run under one deadline per phase (%ld %ld %ld %ld %ld %ld %ld)", head_deadline, head_read, admit_deadline, cleared,
+          mirror, mirror_deadline, mirror_read);
   }
 
   check_autopilot_lap();
@@ -510,6 +524,46 @@ int main() {
     c.add(200, 9e5);
     c.add(200, 5e5);
     CHECK(c.at(210, &x) && x == 5e5, "a later entry for the same slot replaces it");
+    {
+      // every_pixel: a tile whose own fit lets it draw every pixel draws one
+      // sample on each at any drawn size, and nothing more; without it, the
+      // grid's budget as posted.
+      BudgetSchedule e;
+      bool ep = true;
+      e.add(100, 2.1e5);
+      e.add(130, 2.1e5, true);
+      e.add(170, 2.1e5, false);
+      CHECK(e.at(120, &x, &ep) && !ep && e.at(130, &x, &ep) && ep && e.at(169, &x, &ep) && ep && e.at(170, &x, &ep) && !ep,
+            "every_pixel takes effect at its slot and a later entry ends it");
+      bool all = true;
+      for (double px : {300000.0, 550896.0, 571120.0, 645018.0, 1.2e6}) {
+        double b = effective_budget(2.1e5, true, px);
+        all = all && stride_for(b / px) == 1 && samples_for(b, px) == px && b == std::max(2.1e5, every_pixel_budget(px));
+        all = all && effective_budget(2.1e5, false, px) == 2.1e5;
+        all = all && effective_budget(4e6, true, px) == 4e6;  // the grid's already draws every pixel
+      }
+      CHECK(all, "every_pixel draws one sample on every drawn pixel at any size, never fewer than the grid's");
+      BudgetSchedule f;
+      f.add(100, 2.1e5, true);
+      BudgetSchedule g = schedule_after_scene(f, false, false, 140);
+      CHECK(g.at(0, &x, &ep) && x == 2.1e5 && ep, "a new clock keeps every_pixel with the budget in force");
+    }
+    {
+      // Review of #1565: /health's budget_every_pixel came from the cost model's size
+      // checkpoint (fit_px_, moved only past 1%), not the size last drawn, so a tile 0.8%
+      // taller reported a budget under the one that draws its every pixel and was granted
+      // stride 1 its fit did not reach. The Pipeline needs a GPU; pin the field's source.
+      std::string me = __FILE__;
+      std::string dir = me.substr(0, me.find_last_of('/') + 1);
+      std::ifstream pf(dir + "../src/pipeline.cpp");
+      std::stringstream ps;
+      ps << pf.rdbuf();
+      std::string src = ps.str();
+      size_t at = src.find("\\\"budget_every_pixel\\\":");
+      std::string line = at == std::string::npos ? "" : src.substr(at, src.find('\n', at) - at);
+      CHECK(!line.empty() && line.find("every_pixel_budget(used_px_)") != std::string::npos,
+            "budget_every_pixel is reported from the last frame's drawn pixels: %s", line.c_str());
+    }
     CHECK(std::fabs(budget_fit(1e6, 20.0, 1000.0 / 30) - 1e6 * 0.7 * (1000.0 / 30) / 20.0) < 1, "fit at 70%% of a slot");
     CHECK(ladder_floor(250000) == 250000 && ladder_floor(297302) == 297302 && ladder_floor(297300) == 250000 &&
               ladder_floor(1e6) == 1000000 && ladder_floor(10) == 62500,

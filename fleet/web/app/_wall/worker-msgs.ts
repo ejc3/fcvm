@@ -12,7 +12,8 @@ export interface DrawSettings {
 }
 
 export type ToWorker =
-  | { type: "init"; canvas: OffscreenCanvas; width: number; height: number; dpr: number; mainTicks: boolean }
+  /** `cpuCanvas`: a 2D context the browser keeps in memory (`willReadFrequently`), not on the GPU. */
+  | { type: "init"; canvas: OffscreenCanvas; width: number; height: number; dpr: number; mainTicks: boolean; cpuCanvas: boolean }
   | { type: "resize"; width: number; height: number; dpr: number }
   | { type: "plan"; plan: DrawPlan; settings: DrawSettings }
   | { type: "watch"; targets: { id: string; tEff: number }[] }

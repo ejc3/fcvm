@@ -185,8 +185,14 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
-(only behind Cloudflare, which sets it), else the peer address. Reconnecting does not
-reset a limit.
+(only behind Cloudflare, which sets it), else the peer address. With
+`--access-viewer-address`, a request that Cloudflare Access admitted with a service token
+(its `Cf-Access-Jwt-Assertion` names a `common_name` and no `email`) is counted by its
+`x-fleet-viewer-ip` header instead: the staging page's Worker forwards every viewer's `/live`
+with one service token, and its subrequests all arrive with the Worker's own
+`CF-Connecting-IP`. The coordinator does not verify that JWT itself, so the switch belongs
+only behind a tunnel connector that requires Access (`access.required`), which does.
+Reconnecting does not reset a limit.
 
 **Races.** A race relaunches every tile at once and times both halves by the
 coordinator's clock. The owner sets the cadence (`--race-every <secs>`); `race.next_race_at`
@@ -560,7 +566,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
                   [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
-                 [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
+                 [--trust-cf-connecting-ip] [--access-viewer-address] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
@@ -725,10 +731,16 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   are terminated, and a host that is reclaimed or terminated is replaced. The regions are
   listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
   they run; an instance a launch named counts as pending while lists leave it out (60 s at
-  most), and a launch whose answer is lost is asked again with the same idempotency token. The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  most), and a launch whose answer is lost is asked again with the same idempotency token and
+  the same `CreateFleet` parameters, also after the fleet sleeps (an asleep pass terminates
+  what it launched), for 2 minutes. The region then launches nothing new, and an on-demand
+  launch keeps its place under the cap, until 2 minutes after the token's last ask, by when a
+  list names whatever that ask launched. The
+  coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
   `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
   region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
-  `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
+  `on-demand`, or `spot and on-demand`) and `since_wake_ms`; a region still short logs the
+  last refusal (`reason`). A call that fails marks the
   coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
@@ -1220,7 +1232,9 @@ same round goes to the awake players, whose next throws hold no longer than it.
 
 One budget for every tile of the wall, so tiles draw the same samples per pixel, and take
 the same path (fast, or high quality from `HQ_SPP` = 8 samples per drawn pixel), at the same
-frame, and moving frames match across tile edges. Tiles never adapt on their own. The
+frame, and moving frames match across tile edges. The one difference between tiles is the
+checkerboard: a tile whose own fit draws every pixel does (below), where the grid's budget
+would give it a checkerboard. Tiles never adapt on their own. The
 coordinator runs the rule of the renderer's reference controller
 (`fleet/renderer/tools/budgetctl.py` at 55e81ad5 on `fleet-renderer-adapt`) in the pure core
 (`fleet_core::budget`), on its 1 s tick:
@@ -1240,6 +1254,24 @@ coordinator runs the rule of the renderer's reference controller
 - A change takes effect at one scene time for every tile: `t` = the newest frame any tile
   has drawn plus 1 s, rounded up to a frame (k/30). The agents and the EC2 poster post the
   same `{budget, t}` everywhere.
+- **Every pixel where the tile's own fit allows it.** Each renderer reports
+  `budget_every_pixel`, the budget at which it draws every pixel of its drawn size at one
+  sample (stride 1). A tile whose `budget_fit` reaches it while the grid's budget is under
+  it (the grid's budget would give it a checkerboard) is granted `every_pixel` after three
+  rounds in a row allow it, for the renderer process its `/health` names (`boot_id`); the
+  grant ends at once when its fit falls under that budget, it reports no fit, its
+  `boot_id` changes, or its `render_ms_max` passes 90% of a slot (which also steps the grid
+  down, as any tile's overrun does). A grant and its end each take effect at their own `t`,
+  chosen as the grid's is. The coordinator sends the agents the grid's `{budget, t}` with
+  every tile's grant (`every_pixel: {"<tile>": {"on": true, "t": T, "boot": "<boot_id>"}}`),
+  and each tile is posted `{budget, t, every_pixel}` with the later of the two times;
+  `every_pixel` is true only when the grant names the boot id its poster last read from that
+  renderer's `/health`, so a replacement renderer never draws under another's grant. So every
+  tile that can draw every pixel does, and the slowest tiles keep the grid's checkerboard and
+  its samples per pixel. A tile's pixels are the whole image's at its own stride (the seam
+  test holds per stride, and with neighbours at different strides), so its edge with a
+  neighbour at another stride joins two correct images at one `t`; the neighbours differ
+  only in the grain the extra samples remove.
 
 The renderer's fit is a cost model of its frames: a fixed part per frame and a cost per
 sample on each path. The fast path's and the high-quality path's fits differ, and each
@@ -1865,7 +1897,9 @@ The budget for a slot is, in this order (round 8):
 1. **A posted schedule.** `POST /budget` with `{"budget": B, "t": T}`
    (`Content-Type: application/json`; B in 10,000..500,000,000) sets budget B
    from the first slot at or after scene time T, until a later entry takes
-   effect. A later entry for the same slot replaces it. A T at or before the
+   effect. With `"every_pixel": true` the entry draws at least one sample on
+   every pixel of the drawn size (the larger of B and `budget_every_pixel` at
+   that size), so it stays one sample a pixel when the drawn height changes. A later entry for the same slot replaces it. A T at or before the
    current frame applies from the next frame drawn. A new scene with the same
    `epoch_unix_ms` (a re-tile) keeps the schedule; one with a new
    `epoch_unix_ms` keeps only the budget in force at the last frame drawn, from
@@ -1886,7 +1920,9 @@ next hold.
 
 **Adapting a grid.** Each renderer reports in `/health`: `budget` (the last
 frame's), `budget_source` (`schedule`, `scene`, `local` or `default`),
-`budget_fit`, `hq` (below), `trace_ms` (the part of `render_ms` spent drawing
+`budget_fit`, `every_pixel` (the last frame's schedule entry had it),
+`budget_every_pixel` (half the drawn pixels: the budget at which a frame of the
+last drawn size draws every pixel at one sample), `hq` (below), `trace_ms` (the part of `render_ms` spent drawing
 samples) and `frames_2s` (over the last 2 s: `n`, `frame_ms_p50`,
 `frame_ms_p99`, `frame_ms_max` for a whole frame including encoding and
 sending, `render_ms_max`, `encode_ms_max`). `budget_fit` comes from a cost

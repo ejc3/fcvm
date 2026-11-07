@@ -57,6 +57,19 @@ function saveSeat(seat: string | null): void {
   }
 }
 
+/**
+ * Whether this browser was asked (localStorage `fleet-wall.canvas` = `cpu`) to draw the frames
+ * into a canvas kept in memory. The e2e WebKit project asks: Playwright's WebKit for Linux
+ * aborts in Skia's GPU flush for a 2D OffscreenCanvas drawn in a worker (#1523), and a canvas
+ * in memory does not take that path. Nothing else asks.
+ */
+function cpuCanvasAsked(): boolean {
+  try {
+    return window.localStorage.getItem("fleet-wall.canvas") === "cpu";
+  } catch {
+    return false;
+  }
+}
 
 function newId(): string {
   return crypto.randomUUID();
@@ -362,6 +375,9 @@ export class WallClient {
 
   // ---- frame worker -----------------------------------------------------------
 
+  /** The frame worker draws into a canvas in memory (cpuCanvasAsked), not on the GPU. */
+  cpuCanvas = false;
+
   attachCanvas(canvas: HTMLCanvasElement, width: number, height: number, dpr: number): void {
     if (this.worker) return;
     const worker = new Worker(new URL("./frames.worker.ts", import.meta.url), { type: "module" });
@@ -412,7 +428,8 @@ export class WallClient {
       }
     };
     const offscreen = canvas.transferControlToOffscreen();
-    const msg: ToWorker = { type: "init", canvas: offscreen, width, height, dpr, mainTicks: false };
+    this.cpuCanvas = cpuCanvasAsked();
+    const msg: ToWorker = { type: "init", canvas: offscreen, width, height, dpr, mainTicks: false, cpuCanvas: this.cpuCanvas };
     worker.postMessage(msg, [offscreen]);
     this.lastPlan = "";
     this.postWatch();

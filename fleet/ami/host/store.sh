@@ -36,6 +36,12 @@ t1=$(date +%s%N)
 # decompresses on one core, so the store is packed in parts (16 by default), each fetched,
 # decompressed, extracted and copied while the others are: on the same box and store the
 # restore from S3 took 10.2 to 11.8 s, against 30.4 to 30.9 s for one stream through tmpfs.
+# A file of more than 256 MiB of data is packed as pieces spread over the parts
+# (store-pack.py, `.fcvm-segments`), each written into the file at its offset as its part
+# is extracted: one 6.4 GiB phone snapshot image had been a whole part, and its decompress,
+# extract and copy, on one core each, bounded the restore. With the 2026-11-05 store
+# (12.7 GB of parts, 93 GB apparent) restored from local copies on an m5dn.24xlarge, three
+# runs each: 37.1 to 37.6 s whole, 25.1 to 27.5 s in pieces, the trees identical.
 # The staging needs the uncompressed parts in flight in memory; with less than STAGE_MIN_KB
 # free in /dev/shm the parts are extracted into the btrfs directly.
 STAGE_MIN_KB=$((48 * 1024 * 1024))
@@ -45,18 +51,61 @@ if [ "$(df --output=avail -k /dev/shm 2>/dev/null | tail -1)" -ge "$STAGE_MIN_KB
   trap 'rm -rf "$stage"' EXIT
 fi
 # --- restore functions (fleet/ami/check.sh runs these on a fixture) ---
-# untar DIR: a tar stream on stdin into DIR.
-untar() { tar -x --sparse --same-owner --numeric-owner -C "$1"; }
+# untar DIR: a tar stream on stdin into DIR. --ignore-zeros reads on past the end of the
+# part's tar archive into the archive of pieces store-pack.py appends to it.
+# PART names the part whose pieces land in DIR/.fcvm-seg-PART, apart from other parts'.
+untar() { tar -x --ignore-zeros --sparse --same-owner --numeric-owner ${2:+--transform="s|^\./\.fcvm-seg/|./.fcvm-seg-$2/|"} -C "$1"; }
+# SEGS: the list of split files and their pieces (store-pack.py), out of `dirs`.
+SEGS=""
+# pieces DIR PART: write each piece DIR/.fcvm-seg-PART/<n> into its file at its offset
+# (holes stay holes), then remove them.
+pieces() {
+  local n off len rel f d="$1/.fcvm-seg-$2"
+  [ -d "$d" ] || return 0
+  while IFS=$'\t' read -r n _ off len rel; do
+    f="$d/$n"
+    [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$len" ] || return 1
+    dd if="$f" of="$M/$rel" bs=1M seek="$off" oflag=seek_bytes conv=notrunc,sparse status=none || return 1
+    rm -f "$f"
+  done < <(awk -F '\t' -v p="$2" '$1 == "seg" && $3 == p {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' "$SEGS")
+  # Empty now unless the part carried a piece the list does not name for it.
+  rmdir "$d"
+}
 # part FETCH PART: one part into the store: through a staging directory of its own, which
 # is copied into the store and removed once the part is extracted, or straight in without
 # staging. The part's hard links stay links: all names of an inode are in one part.
 part() {
   if [ -n "$stage" ]; then
-    mkdir "$stage/$2" && "$1" "$2" | zstd -q -d | untar "$stage/$2" &&
+    mkdir "$stage/$2" && "$1" "$2" | zstd -q -d | untar "$stage/$2" "$2" && pieces "$stage/$2" "$2" &&
       cp -a --sparse=always "$stage/$2/." "$M/" && rm -rf "${stage:?}/$2"
   else
-    "$1" "$2" | zstd -q -d | untar "$M"
+    "$1" "$2" | zstd -q -d | untar "$M" "$2" && pieces "$M" "$2"
   fi
+}
+# split_files create: each split file at its size before its pieces land (a hole until they
+# do). split_files meta: its mode, owner and mtime (to the nanosecond, whatever its digits
+# or sign) once they have, all in one process.
+split_files() {
+  local kind size rel
+  if [ "$1" = meta ]; then
+    python3 - "$M" "$SEGS" <<'PY'
+import os, sys
+root, segs = sys.argv[1], sys.argv[2]
+for line in open(segs):
+    f = line.rstrip("\n").split("\t", 6)
+    if f[0] != "file":
+        continue
+    path = os.path.join(root, f[6])
+    os.chown(path, int(f[3]), int(f[4]))
+    os.chmod(path, int(f[2], 8))
+    os.utime(path, ns=(os.stat(path).st_atime_ns, int(f[5])))
+PY
+    return
+  fi
+  while IFS=$'\t' read -r kind size _ _ _ _ rel; do
+    [ "$kind" = file ] || continue
+    : > "$M/$rel" && truncate -s "$size" "$M/$rel" || return 1
+  done < "$SEGS"
 }
 # restore FETCH PART...: every PART at once, each one's .tar.zst written to stdout by
 # `FETCH PART`. Fails if any part fails. The part `dirs` holds every directory and is
@@ -69,13 +118,20 @@ restore() {
   local fetch=$1 p rc=0 pids=()
   shift
   "$fetch" dirs | zstd -q -d | untar "$M" || return 1
+  SEGS=$(mktemp)
+  if [ -e "$M/.fcvm-segments" ]; then mv "$M/.fcvm-segments" "$SEGS" || return 1; fi
+  split_files create || return 1
   for p in "$@"; do
     part "$fetch" "$p" &
     pids+=($!)
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
   [ "$rc" = 0 ] || return 1
-  "$fetch" dirs | zstd -q -d | untar "$M"
+  split_files meta || return 1
+  # Without the list this time: removing it would move the store root's time again.
+  "$fetch" dirs | zstd -q -d | tar -x --ignore-zeros --sparse --same-owner --numeric-owner \
+    --exclude=./.fcvm-segments -C "$M" || return 1
+  rm -f "$SEGS"
 }
 # empty: what a failed restore left, before the fallback.
 empty() {

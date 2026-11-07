@@ -279,6 +279,12 @@ pub struct Observed {
     /// The slowest render over the renderer's last 2 s (`frames_2s.render_ms_max`).
     #[serde(default)]
     pub render_ms_max: Option<f64>,
+    /// The budget at which the renderer draws every pixel at its drawn size, and the
+    /// renderer process's `boot_id`.
+    #[serde(default)]
+    pub budget_every_pixel: Option<f64>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,
@@ -645,6 +651,10 @@ pub struct Fleet {
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
+    /// The GPU hosts the launcher keeps, by instance id (`Event::HostsExpected`); `None`
+    /// when it cannot say, or the coordinator launches none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hosts: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -709,6 +719,7 @@ impl State {
                 phones_zoom: Default::default(),
                 last_phones_zoom_at: BTreeMap::new(),
                 potato: Default::default(),
+                expected_hosts: None,
             },
             config,
             receipts: BTreeMap::new(),

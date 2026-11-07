@@ -10,7 +10,7 @@ const PORTABLE_CORE: OxlintOverride = {
   rules: {
     "no-restricted-imports": ["error", { patterns: [
       { group: ["node:*", ...builtinModules, ...builtinModules.map((m) => `${m}/*`)], message: NEUTRAL },
-      { group: ["react", "react-dom", "next", "next/*", "ws"], message: NEUTRAL }] }],
+      { group: ["react", "react/*", "react-dom", "react-dom/*", "next", "next/*", "ws"], message: NEUTRAL }] }],
     "no-restricted-properties": ["error",
       { object: "Math", property: "random", message: "Randomness comes in as an argument." },
       { object: "Date", property: "now", message: CLOCK },
@@ -19,8 +19,9 @@ const PORTABLE_CORE: OxlintOverride = {
     "eslint-js/no-restricted-syntax": ["error",
       { selector: "NewExpression[callee.name='Date']", message: CLOCK },
       { selector: "CallExpression[callee.name='Date']", message: CLOCK }],
+    // `globalThis` itself, not only its members: an alias of it reaches every global.
     "no-restricted-globals": ["error",
-      ...["process", "window", "self", "document", "crypto", "performance", "navigator", "localStorage",
+      ...["globalThis", "process", "window", "self", "document", "crypto", "performance", "navigator", "localStorage",
         "indexedDB", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame",
         "WebSocket", "Worker", "VideoDecoder", "URL"].map((name) => ({ name, message: NEUTRAL })),
       { name: "fetch", message: "core/ does no I/O. The caller fetches." }],

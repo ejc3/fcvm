@@ -93,6 +93,8 @@ const RETILE_LEAD_FRAMES = 15;
 const RECLAIM_KEPT_MS = 60_000;
 /** Races the scoreboard's medians are over. */
 const RACES_KEPT = 20;
+/** Why a late viewer's claim_gpu or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
+const LATE_CLAIM = "direct streams are full, so this page watches the broadcast";
 
 const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
   { id: "planet", label: "the ringed planet", x: 0.35, y: -0.05, zoom: 1.6 },
@@ -343,6 +345,11 @@ export class MockCoordinator {
     const first = NUDGE_TARGETS[0]!;
     this.camera = [{ t: t0, x: first.x, y: first.y, zoom: first.zoom }];
     this.server = http.createServer((req, res) => this.http(req, res));
+    // The client closes an idle connection first: a server that closes one at Node's default
+    // 5 s, against fetch's 4 s, raced a test process whose event loop was busy, which then sent
+    // on the closed socket and got ECONNRESET (#1348).
+    this.server.keepAliveTimeout = 60_000;
+    this.server.headersTimeout = 65_000;
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.server.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", "http://mock");
@@ -621,6 +628,13 @@ export class MockCoordinator {
   // ---- intents ----------------------------------------------------------------
 
   private async intent(client: Client, id: string, name: string, args: Record<string, unknown>): Promise<void> {
+    // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
+    // stream: the coordinator refuses both before anything else, a repeated intent id included
+    // (its receipt is not looked up), and records nothing (src/fleet/coord/live.rs, LATE_CLAIM).
+    if (client.late && (name === "claim_gpu" || name === "claim_phone")) {
+      this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
+      return;
+    }
     const seen = this.receipts.get(id);
     if (seen) {
       this.sendTo(client, await seen);

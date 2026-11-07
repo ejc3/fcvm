@@ -43,18 +43,25 @@ export function isProxiedPath(pathname: string): boolean {
 }
 
 /**
- * Request headers the Worker drops: the viewer's Access credentials for the page host (the
- * coordinator's application has its own, the service token), any service token a caller
- * sent, the hop's own Host, and x-real-ip, which is set from the viewer's address below.
+ * The viewer's address, for the coordinator's per-client limits. The Worker's subrequest
+ * reaches Cloudflare's front door as a request of its own, so the coordinator sees the
+ * Worker's address in CF-Connecting-IP for every viewer; it reads this header instead, and
+ * only on a request Access admitted with a service token (src/fleet/coord/live.rs).
  */
-const DROPPED = new Set(["cookie", "host", "cf-access-jwt-assertion", "cf-access-token", "cf-access-client-id", "cf-access-client-secret", "x-real-ip"]);
+export const VIEWER_ADDRESS_HEADER = "x-fleet-viewer-ip";
+
+/**
+ * Request headers the Worker drops: the viewer's Access credentials for the page host (the
+ * coordinator's application has its own, the service token), any Access token or service
+ * token a caller sent, the hop's own Host, and any viewer address a caller sent, which the
+ * Worker sets itself.
+ */
+const DROPPED = new Set(["cookie", "host", "cf-access-jwt-assertion", "cf-access-token", "cf-access-client-id", "cf-access-client-secret", "x-real-ip", VIEWER_ADDRESS_HEADER]);
 
 /**
  * The upstream URL and headers for a forwarded request. The rest of the headers pass
  * unchanged: Origin (the coordinator checks it against its allowed origins), Upgrade and the
- * Sec-WebSocket ones. x-real-ip carries the viewer's address: on a same-zone Worker
- * subrequest Cloudflare sets CF-Connecting-IP from it, and the coordinator keys its
- * per-client limits on CF-Connecting-IP.
+ * Sec-WebSocket ones. The viewer's CF-Connecting-IP goes in VIEWER_ADDRESS_HEADER.
  */
 export function forwardedRequest(proxy: LiveProxy, path: string, search: string, headers: Iterable<[string, string]>): { url: string; headers: [string, string][] } {
   const out: [string, string][] = [];
@@ -65,7 +72,7 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
     if (DROPPED.has(n)) continue;
     out.push([name, value]);
   }
-  if (viewer !== null) out.push(["x-real-ip", viewer]);
+  if (viewer !== null) out.push([VIEWER_ADDRESS_HEADER, viewer]);
   out.push(["cf-access-client-id", proxy.clientId], ["cf-access-client-secret", proxy.clientSecret]);
   return { url: `${proxy.upstream}${path}${search}`, headers: out };
 }

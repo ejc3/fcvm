@@ -1102,7 +1102,7 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
   switch (m.type) {
     case "init":
       canvas = m.canvas;
-      ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) as OffscreenCanvasRenderingContext2D | null;
+      ctx = canvas.getContext("2d", { alpha: false, desynchronized: true, ...(m.cpuCanvas ? { willReadFrequently: true } : {}) }) as OffscreenCanvasRenderingContext2D | null;
       if (!ctx) {
         post({ type: "error", message: "no 2D context on the offscreen canvas" });
         return;

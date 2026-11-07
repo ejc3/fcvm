@@ -10,8 +10,8 @@
 use super::inventory::{holders, vfio_node};
 use super::vm::{wait_restored, Vm, VmSpec};
 use fleet_core::protocol::{
-    boot_id, AgentMsg, AssignPhone, BudgetBody, HealthReport, RendererScene, SharedScene,
-    SlotReport,
+    boot_id, AgentMsg, AssignPhone, BudgetBody, BudgetPlan, HealthReport, RendererScene,
+    SharedScene, SlotReport,
 };
 use fleet_core::scene::Keyframe;
 use fleet_core::tiling::Rect;
@@ -409,7 +409,7 @@ pub async fn supervise(
     ctx: SlotCtx,
     mut desired: watch::Receiver<Desired>,
     mut scene: watch::Receiver<Option<SharedScene>>,
-    mut budget: watch::Receiver<Option<BudgetBody>>,
+    mut budget: watch::Receiver<Option<BudgetPlan>>,
 ) {
     let _gpu = ctx.gpu_lock.clone().lock_owned().await;
     let mut running: Option<Running> = None;
@@ -583,7 +583,7 @@ async fn post_if_changed(
     r: &mut Running,
     desired: &watch::Receiver<Desired>,
     scene: &mut watch::Receiver<Option<SharedScene>>,
-    budget: &mut watch::Receiver<Option<BudgetBody>>,
+    budget: &mut watch::Receiver<Option<BudgetPlan>>,
 ) {
     let want = desired.borrow().clone();
     if let Some(p) = &want.phone {
@@ -608,7 +608,12 @@ async fn post_if_changed(
     {
         return;
     }
-    let Some(b) = *budget.borrow_and_update() else {
+    // This tile's body: the grid's budget, with its every-pixel grant.
+    let Some(b) = budget
+        .borrow_and_update()
+        .as_ref()
+        .map(|p| p.for_tile(&ctx.id, r.boot.as_deref()))
+    else {
         return;
     };
     if r.budget_posted == Some(b) {

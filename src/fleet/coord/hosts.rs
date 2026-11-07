@@ -133,6 +133,10 @@ pub struct HostConfig {
     pub liveness: Duration,
     /// How long a region that neither market could fill waits before it asks again.
     pub capacity_retry: Duration,
+    /// How long a lost launch's token is asked again. By then a list names whatever it
+    /// launched (`LIST_GRACE`), so dropping it launches nothing twice, and a token whose
+    /// retry never gets an answer stops holding its region's launches.
+    pub lost_launch_ttl: Duration,
 }
 
 /// How long an instance a launch named counts as pending while no list names it.
@@ -201,6 +205,31 @@ pub fn excess(hosts: &[Host], want: u32) -> Vec<String> {
     live.into_iter().take(n).map(|h| h.id.clone()).collect()
 }
 
+/// The hosts the launcher keeps for `want` per region, by instance id, sorted: every
+/// region's pending or running hosts less those over the capacity. `None` while any region
+/// is unlisted or short of `want`, or asleep.
+pub fn expected_hosts(listed: &[Option<Vec<Host>>], want: u32) -> Option<Vec<String>> {
+    if want == 0 {
+        return None;
+    }
+    let mut ids = Vec::new();
+    for hosts in listed {
+        let hosts = hosts.as_ref()?;
+        let over = excess(hosts, want);
+        let kept: Vec<String> = hosts
+            .iter()
+            .filter(|h| h.live() && !over.contains(&h.id))
+            .map(|h| h.id.clone())
+            .collect();
+        if kept.len() < want as usize {
+            return None;
+        }
+        ids.extend(kept);
+    }
+    ids.sort();
+    Some(ids)
+}
+
 /// Which of a wake's running hosts came from which market.
 pub fn path_name(spot: u32, on_demand: u32) -> &'static str {
     match (spot > 0, on_demand > 0) {
@@ -221,8 +250,34 @@ fn lifecycle(state: &str) -> &'static str {
     }
 }
 
-/// Per region and market: the token and count of a launch whose outcome is unknown.
-type Tokens = HashMap<(String, Market), (String, u32)>;
+/// Per region and market: the token and count of a launch whose outcome is unknown, when it
+/// was first asked, and when it was last asked.
+type Tokens = HashMap<(String, Market), (String, u32, Instant, Instant)>;
+
+/// What a lost launch's token does in a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenStep {
+    /// Asked again with its token.
+    Ask,
+    /// Not asked any more, but its region still launches nothing new and its on-demand count
+    /// stays reserved: its last ask may have launched a host no list names yet.
+    Hold,
+    /// Forgotten: every ask was long enough ago for a list to name what it launched.
+    Drop,
+}
+
+/// A token is asked again while younger than `ttl`, then held until `ttl` has passed since its
+/// last ask as well (`ttl` is longer than `LIST_GRACE`), then dropped. A retry that is never
+/// answered so holds its region for at most twice `ttl`.
+fn token_step(first: Instant, last: Instant, now: Instant, ttl: Duration) -> TokenStep {
+    if now.duration_since(first) < ttl {
+        TokenStep::Ask
+    } else if now.duration_since(last) < ttl {
+        TokenStep::Hold
+    } else {
+        TokenStep::Drop
+    }
+}
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -240,6 +295,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     // Per region and market, a launch whose outcome is unknown: its token and count.
     let mut tokens: Tokens = HashMap::new();
     let mut last_want: Option<u32> = None;
+    let mut last_expected: Option<Option<Vec<String>>> = None;
     // A degraded `scale` was reported and not cleared yet.
     let mut reported = false;
     loop {
@@ -260,10 +316,23 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 };
             }
             last_want = Some(want);
-            tokens.clear();
             tracing::info!(power = %state, hosts_per_region = want, "hosts set for the power state");
         }
         let now = Instant::now();
+        // Tokens are kept across power changes (an asleep pass terminates what a lost launch
+        // started), but not for ever.
+        tokens.retain(|(region, market), (_, count, first, last)| {
+            let keep = token_step(*first, *last, now, cfg.lost_launch_ttl) != TokenStep::Drop;
+            if !keep {
+                tracing::warn!(%region, market = market.name(), hosts = *count,
+                    "a lost GPU host launch got no answer in time; the hosts lists name what it launched");
+            }
+            keep
+        });
+        // Whether this pass reports the instances: decided before any region's watch ends, so
+        // the pass that sees a wake's last host running still publishes it, after the EC2 half
+        // alone made the fleet awake too.
+        let watching = state == "waking" || watch.iter().any(|w| w.coming_up);
         let mut errors: Vec<String> = Vec::new();
         // Every region's hosts; `None` for a region that could not be listed.
         let mut listed: Vec<Option<Vec<Host>>> = Vec::new();
@@ -292,7 +361,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
             *n += tokens
                 .iter()
                 .filter(|((_, m), _)| *m == Market::OnDemand)
-                .map(|(_, (_, c))| *c)
+                .map(|(_, (_, c, _, _))| *c)
                 .sum::<u32>();
         }
         let mut report = Vec::new();
@@ -350,6 +419,32 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 }
             }
             if want == 0 {
+                // A launch whose answer was lost may have launched a host that no list names
+                // yet: ask again with its token to learn it, and terminate it now.
+                let lost = reconcile(
+                    &cfg,
+                    region,
+                    hosts,
+                    &mut tokens,
+                    &mut on_demand,
+                    &mut recent,
+                    &mut errors,
+                )
+                .await
+                .unwrap_or_default();
+                let lost: Vec<String> = lost.into_iter().filter(|id| !ids.contains(id)).collect();
+                if !lost.is_empty() {
+                    busy = true;
+                    match cfg.driver.terminate(region, &lost).await {
+                        Ok(()) => {
+                            tracing::info!(%region, instances = ?lost, power = %state, "terminating GPU hosts of lost launches")
+                        }
+                        Err(e) => {
+                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+                            errors.push(format!("{region}: {e:#}"));
+                        }
+                    }
+                }
                 continue;
             }
             let mut live = hosts.iter().filter(|h| h.live()).count() as u32;
@@ -368,6 +463,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 )
                 .await
                 {
+                    let found = found.len() as u32;
                     live += found;
                     busy |= found > 0;
                     if live < want {
@@ -407,7 +503,19 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 busy = true;
             }
         }
-        if state == "waking" || watch.iter().any(|w| w.coming_up) {
+        // The hosts kept for the awake capacity, once every region is listed and holds that
+        // many: the side then needs no place for a GPU no connected host listed (#1517).
+        let expected = expected_hosts(&listed, want);
+        if last_expected.as_ref() != Some(&expected) {
+            handle
+                .send(Event::HostsExpected {
+                    at: 0,
+                    hosts: expected.clone(),
+                })
+                .await;
+            last_expected = Some(expected);
+        }
+        if watching {
             handle
                 .send(Event::ScaleInstances {
                     at: 0,
@@ -425,7 +533,12 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
         let wait = if state == "waking" || busy || !errors.is_empty() {
             cfg.poll
         } else if want == 0 {
-            ASLEEP_CHECK
+            // A lost launch, or a launched host no list has shown going, is followed at `poll`.
+            if tokens.is_empty() && recent.is_empty() {
+                ASLEEP_CHECK
+            } else {
+                cfg.poll
+            }
         } else {
             cfg.liveness
         };
@@ -436,9 +549,9 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     }
 }
 
-/// Ask `region`'s lost launches again with their tokens. Returns how many instances they
-/// launched that `hosts` does not list yet (now followed as pending), or `None` when one
-/// still has no answer (asked again at the next poll, and nothing new is launched).
+/// Ask `region`'s lost launches again with their tokens. Returns the instances they launched
+/// that `hosts` does not list yet (now followed as pending), or `None` when one still has no
+/// answer (asked again at the next poll, and nothing new is launched).
 async fn reconcile(
     cfg: &HostConfig,
     region: &str,
@@ -447,14 +560,22 @@ async fn reconcile(
     on_demand: &mut Option<u32>,
     recent: &mut HashMap<String, Recent>,
     errors: &mut Vec<String>,
-) -> Option<u32> {
-    let mut found = 0;
+) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let mut held = false;
     for market in [Market::Spot, Market::OnDemand] {
         let key = (region.to_string(), market);
-        let Some((token, count)) = tokens.get(&key).cloned() else {
+        let Some((token, count, first, last)) = tokens.get(&key).cloned() else {
             continue;
         };
         let asked = Instant::now();
+        if token_step(first, last, asked, cfg.lost_launch_ttl) != TokenStep::Ask {
+            held = true;
+            continue;
+        }
+        if let Some(t) = tokens.get_mut(&key) {
+            t.3 = asked;
+        }
         match cfg.driver.launch(region, market, count, &token).await {
             Ok(got) => {
                 tokens.remove(&key);
@@ -486,7 +607,7 @@ async fn reconcile(
                         *n = n.saturating_sub(count) + new.len() as u32;
                     }
                 }
-                found += new.len() as u32;
+                found.extend(new.into_iter().cloned());
             }
             Err(e) => {
                 tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
@@ -495,7 +616,8 @@ async fn reconcile(
             }
         }
     }
-    Some(found)
+    // A held token's last ask may have launched what no list names yet: launch nothing new.
+    (!held).then_some(found)
 }
 
 /// Launch `short` hosts in `region`: spot, then what spot refused for capacity on demand
@@ -549,7 +671,7 @@ async fn launch_shortfall(
             Err(e) => {
                 // It may have launched: [`reconcile`] asks again with this token, and an
                 // on-demand count is reserved against the cap until then.
-                tokens.insert((region.to_string(), market), (token, ask));
+                tokens.insert((region.to_string(), market), (token, ask, asked, asked));
                 if market == Market::OnDemand {
                     if let Some(n) = on_demand.as_mut() {
                         *n += ask;
@@ -596,7 +718,9 @@ async fn launch_shortfall(
         refused = got.refused;
     }
     if launched < short {
-        tracing::warn!(%region, launched, short, "GPU hosts still short; asking again after the capacity retry");
+        // `refused` is the last market's: on demand's, when spot fell back to it.
+        tracing::warn!(%region, launched, short, reason = %refused.join("; "),
+            "GPU hosts still short; asking again after the capacity retry");
     }
     (launched, !failed)
 }
@@ -645,14 +769,27 @@ pub struct AwsHosts {
     pub fleet: String,
     /// Per-region API base; default `https://ec2.<region>.amazonaws.com`.
     pub endpoints: BTreeMap<String, String>,
+    /// How long a template's instance type is reused before it is read again.
+    pub template_type_ttl: Duration,
     /// Each template's instance type, as its validated default says, and when it was read.
     types: Mutex<HashMap<(String, String), (String, Instant)>>,
+    /// By ClientToken, the parameters of each CreateFleet that got no decision, and when they
+    /// were sent. A retry with the token sends them again unchanged: EC2 refuses a token with
+    /// other parameters (IdempotentParameterMismatch), and the template's instance type can
+    /// change between the two requests.
+    unanswered: Mutex<HashMap<String, (QueryParams, Instant)>>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
 
-/// How long a template's instance type is reused before it is read again.
+/// How long a template's instance type is reused before it is read again, by default.
 const TEMPLATE_TYPE_TTL: Duration = Duration::from_secs(300);
+
+/// An EC2 query request's parameters, in order.
+type QueryParams = Vec<(String, String)>;
+
+/// How long an unanswered CreateFleet's parameters are kept for a retry with its token.
+const UNANSWERED_TTL: Duration = Duration::from_secs(24 * 3600);
 
 impl AwsHosts {
     pub fn new(templates: &[Regional], subnets: &[Regional], fleet: String) -> Result<Self> {
@@ -681,7 +818,9 @@ impl AwsHosts {
             subnets: s,
             fleet,
             endpoints: BTreeMap::new(),
+            template_type_ttl: TEMPLATE_TYPE_TTL,
             types: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -745,11 +884,11 @@ impl AwsHosts {
     }
 
     /// The instance type of `template`'s validated default in `region`, read at most once per
-    /// `TEMPLATE_TYPE_TTL`.
+    /// `template_type_ttl`.
     async fn template_type(&self, region: &str, template: &str) -> Result<String> {
         let key = (region.to_string(), template.to_string());
         if let Some((ty, at)) = self.types.lock().unwrap().get(&key) {
-            if at.elapsed() < TEMPLATE_TYPE_TTL {
+            if at.elapsed() < self.template_type_ttl {
                 return Ok(ty.clone());
             }
         }
@@ -971,27 +1110,53 @@ impl HostDriver for AwsHosts {
         count: u32,
         token: &str,
     ) -> Result<Launch> {
-        let templates = self
-            .templates
-            .get(region)
-            .with_context(|| format!("no host template in {region}"))?;
-        let subnets = self
-            .subnets
-            .get(region)
-            .with_context(|| format!("no host subnet in {region}"))?;
-        let mut typed = Vec::with_capacity(templates.len());
-        for t in templates {
-            typed.push((t.clone(), self.template_type(region, t).await?));
-        }
-        let params = create_fleet_params(&typed, subnets, market, count, &self.fleet, token);
-        match self.call(region, &params).await {
-            Ok(xml) => Ok(parse_create_fleet(&xml)),
+        let kept = self
+            .unanswered
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|(params, _)| params.clone());
+        let params = match kept {
+            Some(params) => params,
+            None => {
+                let templates = self
+                    .templates
+                    .get(region)
+                    .with_context(|| format!("no host template in {region}"))?;
+                let subnets = self
+                    .subnets
+                    .get(region)
+                    .with_context(|| format!("no host subnet in {region}"))?;
+                let mut typed = Vec::with_capacity(templates.len());
+                for t in templates {
+                    typed.push((t.clone(), self.template_type(region, t).await?));
+                }
+                create_fleet_params(&typed, subnets, market, count, &self.fleet, token)
+            }
+        };
+        let answer = self.call(region, &params).await;
+        let mut unanswered = self.unanswered.lock().unwrap();
+        match answer {
+            Ok(xml) => {
+                unanswered.remove(token);
+                Ok(parse_create_fleet(&xml))
+            }
             // A request refused as a whole for capacity is a refusal like a per-pool one.
-            Err((code, msg)) if CAPACITY_CODES.contains(&code.as_str()) => Ok(Launch {
-                refused: vec![format!("{code}: {msg}")],
-                ..Launch::default()
-            }),
-            Err((code, msg)) => bail!("CreateFleet: {code}: {msg}"),
+            Err((code, msg)) if CAPACITY_CODES.contains(&code.as_str()) => {
+                unanswered.remove(token);
+                Ok(Launch {
+                    refused: vec![format!("{code}: {msg}")],
+                    ..Launch::default()
+                })
+            }
+            // No decision: the caller asks again with this token, and gets these parameters.
+            Err((code, msg)) => {
+                unanswered.retain(|_, (_, at)| at.elapsed() < UNANSWERED_TTL);
+                unanswered
+                    .entry(token.to_string())
+                    .or_insert_with(|| (params, Instant::now()));
+                bail!("CreateFleet: {code}: {msg}")
+            }
         }
     }
 
@@ -1012,7 +1177,9 @@ impl HostDriver for AwsHosts {
 /// A launch is idempotent by its token. `ambiguous` makes that many next launches that launch
 /// something fail after launching, as a request whose answer is lost. `hide_new` (show, hide): each launched
 /// instance is named by its region's next `show` lists, left out of the `hide` after them,
-/// then named again, as an eventually consistent DescribeInstances.
+/// then named again, as an eventually consistent DescribeInstances. `stuck` makes that many
+/// next launches with a new token fail without launching, and every later request with one of
+/// their tokens fail too, as a retry EC2 never answers.
 #[derive(Default)]
 pub struct FakeHosts {
     pub hosts: Mutex<BTreeMap<String, Vec<Host>>>,
@@ -1022,6 +1189,8 @@ pub struct FakeHosts {
     pub fail_lists: Mutex<HashMap<String, u32>>,
     pub ambiguous: Mutex<u32>,
     pub hide_new: Mutex<Option<(u32, u32)>>,
+    pub stuck: Mutex<u32>,
+    stuck_tokens: Mutex<std::collections::HashSet<String>>,
     by_token: Mutex<HashMap<String, Launch>>,
     visibility: Mutex<HashMap<String, (u32, u32)>>,
     next: std::sync::atomic::AtomicU64,
@@ -1100,6 +1269,17 @@ impl HostDriver for FakeHosts {
         if let Some(l) = self.by_token.lock().unwrap().get(token) {
             return Ok(l.clone());
         }
+        {
+            let mut stuck = self.stuck.lock().unwrap();
+            let mut tokens = self.stuck_tokens.lock().unwrap();
+            if *stuck > 0 && !tokens.contains(token) {
+                *stuck -= 1;
+                tokens.insert(token.to_string());
+            }
+            if tokens.contains(token) {
+                bail!("injected: no answer for this token");
+            }
+        }
         let n = {
             let mut cap = self.capacity.lock().unwrap();
             match cap.get_mut(&(region.to_string(), market)) {
@@ -1174,12 +1354,108 @@ impl HostDriver for FakeHosts {
 mod tests {
     use super::*;
 
+    /// A token whose last ask launched a host just before its time ran out is held, not
+    /// dropped: dropping it then would release its on-demand reservation while that host is
+    /// still missing from the lists, and another region could take the place (Codex on #1585).
+    #[test]
+    fn a_token_is_held_after_its_last_ask_until_a_list_can_name_what_it_launched() {
+        let ttl = Duration::from_secs(120);
+        let first = Instant::now();
+        let at = |s: u64| first + Duration::from_secs(s);
+        assert_eq!(token_step(first, first, at(119), ttl), TokenStep::Ask);
+        // Asked last at 118 s: asked no more at 120 s, but held until 238 s.
+        assert_eq!(token_step(first, at(118), at(120), ttl), TokenStep::Hold);
+        assert_eq!(token_step(first, at(118), at(237), ttl), TokenStep::Hold);
+        assert_eq!(token_step(first, at(118), at(238), ttl), TokenStep::Drop);
+        // A token that never got an answer and was last asked at 119 s goes at 239 s.
+        assert_eq!(token_step(first, at(119), at(239), ttl), TokenStep::Drop);
+    }
+
     fn host(id: &str, state: &str, market: Market) -> Host {
         Host {
             id: id.into(),
             state: state.into(),
             market,
         }
+    }
+
+    /// Every region listed and at its capacity: its live hosts less the excess. A region
+    /// unlisted or short, or asleep, says nothing.
+    /// A pass that leaves a region short says why its last market refused: on 2026-11-05
+    /// the wall's host waited 13 minutes and the log named only spot's refusal, while on
+    /// demand was refused with VcpuLimitExceeded (#1257).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_region_still_short_logs_the_on_demand_refusal() {
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        let fake = Arc::new(FakeHosts::default());
+        for m in [Market::Spot, Market::OnDemand] {
+            fake.capacity.lock().unwrap().insert(("r".into(), m), 0);
+        }
+        let cfg = HostConfig {
+            driver: fake.clone(),
+            regions: vec!["r".into()],
+            awake_capacity: 1,
+            on_demand_max: 8,
+            poll: Duration::from_millis(50),
+            liveness: Duration::from_millis(50),
+            capacity_retry: Duration::from_millis(50),
+            lost_launch_ttl: Duration::from_secs(120),
+        };
+        let (mut on_demand, mut recent, mut tokens, mut errors) =
+            (Some(0), HashMap::new(), HashMap::new(), Vec::new());
+        let (launched, _) = launch_shortfall(
+            &cfg,
+            "r",
+            1,
+            &mut on_demand,
+            &mut recent,
+            &mut tokens,
+            &mut errors,
+        )
+        .await;
+        assert_eq!(launched, 0);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("GPU hosts still short"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains("no on-demand capacity"), "{line}");
+    }
+
+    #[test]
+    fn expected_hosts_are_the_kept_hosts_of_full_regions_only() {
+        let a = vec![
+            host("i-2", "running", Market::Spot),
+            host("i-1", "pending", Market::OnDemand),
+            host("i-0", "shutting-down", Market::Spot),
+        ];
+        let b = vec![host("i-3", "running", Market::Spot)];
+        assert_eq!(
+            expected_hosts(&[Some(a.clone()), Some(b.clone())], 1),
+            Some(vec!["i-2".to_string(), "i-3".to_string()]),
+            "the on-demand host over the capacity is not kept"
+        );
+        assert_eq!(expected_hosts(&[Some(a.clone()), Some(b.clone())], 2), None);
+        assert_eq!(expected_hosts(&[Some(a.clone()), None], 1), None);
+        assert_eq!(expected_hosts(&[Some(a), Some(b)], 0), None);
+        assert_eq!(expected_hosts(&[Some(vec![])], 1), None);
     }
 
     #[test]

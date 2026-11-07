@@ -438,6 +438,7 @@ fn prepare_install_target(options: &PrepareOptions, content_key: &str) -> Result
         },
         name,
         content_key: content_key.to_string(),
+        guest_thp: None,
         snapshot_type,
     })
 }
@@ -597,6 +598,26 @@ async fn verify_prepared_snapshot_in(
             snapshot_key = %snapshot_key,
             reason = %reason,
             "installed snapshot does not answer for these arguments; rebuilding"
+        );
+        return Ok(None);
+    }
+    if config.metadata.guest_thp != target.guest_thp {
+        let mode = |m: &Option<String>| m.clone().unwrap_or_else(|| "the kernel's default".into());
+        let (recorded, wanted) = (mode(&config.metadata.guest_thp), mode(&target.guest_thp));
+        // The mode is set at restore, so it is not keyed, and both modes share the
+        // content-addressed entry. Replacing that entry would change the mode another
+        // caller's restores inherit, so only `--force` or a `--tag` of its own does that.
+        anyhow::ensure!(
+            target.name != target.content_key,
+            "prepared snapshot {snapshot_key} restores guest transparent huge pages in {recorded} \
+             and this prepare asks for {wanted}; pass --tag to prepare a snapshot of its own, \
+             or --force to rebuild this one in that mode"
+        );
+        info!(
+            snapshot_key = %snapshot_key,
+            recorded = %recorded,
+            wanted = %wanted,
+            "installed snapshot restores another transparent huge page mode; rebuilding"
         );
         return Ok(None);
     }
@@ -931,9 +952,11 @@ fn snapshot_restore_args(
         hugepages: Some(args.hugepages),
         non_blocking_output: args.non_blocking_output,
         on_restore: args.on_restore.clone(),
-        // This run's own flag or nothing: the snapshot's recorded hook may be another
-        // run's (the hook is not in the cache key).
+        // This run's own flags or nothing: the snapshot's recorded hook and huge page
+        // mode may be another run's (neither is in the cache key). No mode is the
+        // guest kernel's own, which the restore asks for by name.
         inherit_recorded_hook: false,
+        guest_thp: args.guest_thp.clone(),
     }
 }
 
@@ -1647,7 +1670,8 @@ async fn prepare_vm_for_lifecycle(
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
-            let target = prepare_install_target(options, &startup_key)?;
+            let mut target = prepare_install_target(options, &startup_key)?;
+            target.guest_thp = args.guest_thp.clone();
             if !target.publish_installed {
                 info!(
                     snapshot_key = %target.name,
@@ -1800,6 +1824,9 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.restore_hook = args.on_restore.clone();
+    vm_state.config.guest_thp = args.guest_thp.clone();
+    // This boot's fc-agent is the one that ships with this fcvm, which applies the mode.
+    vm_state.config.guest_thp_restore = true;
     vm_state.config.dns_override = Some(args.dns.clone());
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
@@ -3496,6 +3523,7 @@ mod tests {
             startup_snapshot: false,
             health_check_timeout: 5,
             on_restore: None,
+            guest_thp: None,
             privileged: false,
             interactive: false,
             tty: false,
@@ -3737,6 +3765,37 @@ mod tests {
         args.network = NetworkMode::Rootless;
         let restore = snapshot_restore_args(&args, "key", None, (None, None));
         assert_eq!(restore.ipv6_prefix, None);
+    }
+
+    /// A cache hit restores in this run's huge page mode and never inherits the one the
+    /// snapshot recorded, which may be another run's: the mode is not in the cache key.
+    #[test]
+    fn a_cache_hit_restores_in_the_runs_own_huge_page_mode() {
+        let mut args = test_args();
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.guest_thp, None);
+        assert!(!restore.inherit_recorded_hook);
+        args.guest_thp = Some("never".to_string());
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.guest_thp.as_deref(), Some("never"));
+        assert_eq!(
+            crate::commands::snapshot::per_restore_setting(
+                restore.guest_thp.as_deref(),
+                restore.inherit_recorded_hook,
+                Some("madvise"),
+            )
+            .as_deref(),
+            Some("never")
+        );
+        assert_eq!(
+            crate::commands::snapshot::per_restore_setting(None, false, Some("never")),
+            None,
+            "a run without the flag does not inherit the snapshot's mode"
+        );
+        assert_eq!(
+            crate::commands::snapshot::restore_thp_mode(&None),
+            "default"
+        );
     }
 
     /// #1183: a launch records its runtime directory with its owner before anything in
@@ -5530,6 +5589,66 @@ mod tests {
             .unwrap()
             .is_none(),
             "a tag holding other content must be a miss so prepare rebuilds it"
+        );
+    }
+
+    /// A prepared generation records the huge page mode `snapshot run` inherits, so a
+    /// prepare asking for another mode must not report the installed one as its result.
+    #[tokio::test]
+    async fn a_prepared_hit_answers_only_for_the_huge_page_mode_it_records() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, snapshot_type) in [
+            ("cb-req-golden", crate::storage::SnapshotType::User),
+            (CONTENT_KEY, crate::storage::SnapshotType::System),
+        ] {
+            let mut config =
+                install_generation(temp.path(), name, Some(CONTENT_KEY), snapshot_type).await;
+            config.metadata.guest_thp = Some("always".to_string());
+            tokio::fs::write(
+                temp.path().join(name).join("config.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let with_mode = |options: &PrepareOptions, mode: &str| {
+            let mut target = prepare_install_target(options, CONTENT_KEY).unwrap();
+            target.guest_thp = Some(mode.to_string());
+            target
+        };
+
+        let same = with_mode(&tagged("cb-req-golden"), "always");
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &same, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_some(),
+            "a tag recording this mode is a hit"
+        );
+        let other = with_mode(&tagged("cb-req-golden"), "never");
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &other, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_none(),
+            "a tag recording another mode must be a miss so prepare rebuilds it"
+        );
+        let shared = with_mode(&PrepareOptions::default(), "never");
+        let error = match verify_prepared_snapshot_in(
+            temp.path(),
+            temp.path(),
+            &shared,
+            PreparedCache::Hit,
+        )
+        .await
+        {
+            Ok(_) => panic!("the shared entry recording another mode was reported as a hit"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("in always and this prepare asks for never")
+                && error.contains("--force"),
+            "{error}"
         );
     }
 

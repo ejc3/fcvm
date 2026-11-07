@@ -25,6 +25,10 @@ it("keeps the core platform boundary while allowing host APIs in tests", () => {
       'new Date();',
       'Date();',
       'globalThis.Math.random();',
+      'const host = globalThis; export const send = host.fetch;',
+      'export const host = globalThis;',
+      'import { createRoot } from "react-dom/client"; export { createRoot };',
+      'import { jsx } from "react/jsx-runtime"; export { jsx };',
       'export const value = window;',
       'fetch("https://example.com");',
     ]) {

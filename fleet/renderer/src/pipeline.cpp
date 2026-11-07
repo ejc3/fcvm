@@ -302,10 +302,16 @@ bool Pipeline::has_scene() {
 
 bool Pipeline::post_budget(const std::string& body, std::string* err) {
   double b, t;
+  bool every_pixel = false;
   try {
     Json j = Json::parse(body);
     b = j.at("budget").number("budget");
     t = j.at("t").number("t");
+    if (j.has("every_pixel")) {
+      const Json& e = j.at("every_pixel");
+      if (e.type != Json::Bool) throw std::runtime_error("'every_pixel' must be true or false");
+      every_pixel = e.b;
+    }
   } catch (const std::exception& e) {
     *err = e.what();
     return false;
@@ -314,7 +320,7 @@ bool Pipeline::post_budget(const std::string& body, std::string* err) {
   if (!std::isfinite(t)) { *err = "'t' must be a number"; return false; }
   {
     std::lock_guard<std::mutex> l(mu_);
-    sched_.add((long long)std::ceil(t * opt_.fps - 1e-6), b);
+    sched_.add((long long)std::ceil(t * opt_.fps - 1e-6), b, every_pixel);
   }
   return true;
 }
@@ -526,12 +532,16 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   // a grid), then the scene's, then a whole-image renderer's own, then the
   // default.
   bool whole = sc->rect.x == 0 && sc->rect.y == 0 && sc->rect.w == 1 && sc->rect.h == 1;
-  auto budget_at = [&](long long kk, const char** src) {
+  // A schedule entry with every_pixel draws at least one sample a pixel at the
+  // drawn size px (effective_budget, budget.h).
+  bool every_pixel = false;
+  auto budget_at = [&](long long kk, const char** src, double px) {
     double b = opt_.budget;
     *src = "default";
+    every_pixel = false;
     std::lock_guard<std::mutex> l(mu_);
     double v;
-    if (sched_.at(kk, &v)) { b = v; *src = "schedule"; }
+    if (sched_.at(kk, &v, &every_pixel)) { b = effective_budget(v, every_pixel, px); *src = "schedule"; }
     else if (sc->budget > 0) { b = sc->budget; *src = "scene"; }
     else if (opt_.adapt && whole) { b = budget_; *src = "local"; }
     return b;
@@ -549,8 +559,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     };
     // the samples a frame at h traces at this slot's budget
     const char* bsrc;
-    double b_now = budget_at(std::llround(t * opt_.fps), &bsrc);
-    auto samples_at = [&](int h) { return samples_for(b_now, px_at(h)); };
+    auto samples_at = [&](int h) { return samples_for(budget_at(std::llround(t * opt_.fps), &bsrc, px_at(h)), px_at(h)); };
     drawn_h = height_guard_.choose(asked, px_at, samples_at, mono_s());
     render_h = encode_geometry(*sc, drawn_h).h;
     warm_h_ = drawn_h;  // a later scene warms at the height last streamed
@@ -583,7 +592,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     long long jn = k0;
     double took_hist[3] = {0, 0, 0};  // the last three frames' times, newest first
     while (jn < pend_k) {  // never past a pending switch
-      budget = budget_at(jn, &source);
+      budget = budget_at(jn, &source, px);
       r_.set_budget(budget);
       double r0 = mono_s();
       r_.render(*sc, rt, (double)jn / opt_.fps, true);
@@ -611,7 +620,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     fprintf(stderr, "fleet-renderer: %dx%d tile primed with slots %lld..%lld in %.1f ms\n", rt.w, rt.h, k0, jn - 1,
             (mono_s() - p0) * 1000.0);
   } else {
-    budget = budget_at(k0, &source);
+    budget = budget_at(k0, &source, px);
     r_.set_budget(budget);
     r_.render(*sc, rt, t, opt_.accumulate);
   }
@@ -634,6 +643,8 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     fit_now_ = reported_fit(fit_now_samples, px);
     used_budget_ = budget;
     budget_source_ = source;
+    used_every_pixel_ = every_pixel;
+    used_px_ = px;
     // a whole-image renderer alone follows its own fit, on the ladder (the
     // latest frames' until the window is ready)
     if (opt_.adapt && whole) {
@@ -911,6 +922,8 @@ std::string Pipeline::health_json() {
   if (gpend) o << ",\"layout_pending\":{\"generation\":" << gnext << ",\"from_frame\":" << gk << "}";
   o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
     << "\",\"budget_fit\":" << std::round(fit_) << ",\"budget_fit_now\":" << std::round(fit_now_)
+    << ",\"every_pixel\":" << (used_every_pixel_ ? "true" : "false")
+    << ",\"budget_every_pixel\":" << std::ceil(every_pixel_budget(used_px_))
     << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {
     // CPU seconds this process has used (user + system), for cost per stream

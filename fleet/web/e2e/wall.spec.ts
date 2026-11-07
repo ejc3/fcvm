@@ -1,9 +1,9 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { DETAIL_TILE_PX, layoutMosaic, streamHeightFor, zoomTarget } from "../core/layout.ts";
+import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
-import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
+import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -25,6 +25,20 @@ const tileBox = async (page: Page, id: string) => (await view(page)).tiles.find(
 const TILE_ERR_MAX = 3;
 const ACROSS_ERR_MAX = 3;
 
+/**
+ * Every boundary with smooth pixels is judged. One with at least SEAM_MIN_PAIRS pairs must be
+ * under ACROSS_ERR_MAX; one with 1 to 3 (it lies along detail that holds still with the camera,
+ * the planet's rings or text, for minutes) under SPARSE_ACROSS_MAX: a mean over so few is one
+ * pixel's compression noise, which read up to 3.35 on CI (#1348) and 2.31 locally, while a tile
+ * drawn at another t reads 3.8 to 18 at its edges. Every live tile has a well-sampled boundary.
+ */
+const SPARSE_ACROSS_MAX = 6;
+function expectSeams(r: Awaited<ReturnType<typeof seamReport>>): void {
+  const judged = r.boundaries.filter((b) => b.n >= SEAM_MIN_PAIRS);
+  for (const id of r.tiles) expect(judged.some((b) => b.a === id || b.b === id), `a judged boundary of ${id}`).toBe(true);
+  for (const b of r.boundaries) if (b.n > 0) expect(b.err, `${b.a} | ${b.b} over ${b.n} pairs`).toBeLessThan(b.n >= SEAM_MIN_PAIRS ? ACROSS_ERR_MAX : SPARSE_ACROSS_MAX);
+}
+
 /** The t drawn now: a capture forces a draw and reports its t. */
 const drawnT = (page: Page) => page.evaluate(async () => (await window.__fleet!.client.capture([])).T);
 
@@ -32,6 +46,8 @@ test.describe.configure({ mode: "serial" });
 
 test("the mosaic draws every GPU live, 15 tiles at one common t, each side as wide as its GPUs", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
+  // WebKit's frame canvas is in memory: its GPU canvas in a worker aborts in Skia (#1523).
+  expect(await page.evaluate(() => window.__fleet!.client.cpuCanvas)).toBe(test.info().project.name === "webkit");
   const v = await view(page);
   expect(v.tiles).toHaveLength(15);
   expect(v.tiles.filter((t) => t.box !== null)).toHaveLength(15);
@@ -148,7 +164,7 @@ test("no seam: pixels on both sides of every boundary match the picture at the d
   expect(r.samples).toBeGreaterThanOrEqual(60);
   for (const [id, s] of Object.entries(r.shown)) if (s !== "dark") expect(s, id).toBe(`sync@${r.T}`);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
-  for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
+  expectSeams(r);
 });
 
 test("the seam check catches a renderer that draws another t than it stamps", async ({ page }) => {
@@ -458,7 +474,12 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await expect(page.getByTestId("timeline")).toContainText("GPU reset and driver loaded");
   await expect(page.getByTestId("timeline-total")).toHaveText(/^\d\.\d s$/);
   await page.waitForTimeout(1000);
-  const fe = await focusError(page, "fcvm:3");
+  // The opened VM's own stream (its detail height) can be a frame late at the moment of a
+  // capture, which the sync rule draws as behind: CI, 2026-11-04, behind@155.1 at T 155.2, one
+  // frame at 10 fps; twice in local runs at a load of 150 on 64 cores. What must hold is that
+  // it draws at T, so the check takes captures until one is not mid-catch-up.
+  let fe = await focusError(page, "fcvm:3");
+  await expect.poll(async () => (fe = await focusError(page, "fcvm:3")).shown === `sync@${fe.T}`, { timeout: 5_000 }).toBe(true);
   console.log(`opened VM: error ${fe.err.toFixed(2)} shown ${fe.shown} brightness around it ${fe.around.toFixed(2)}`);
   expect(fe.shown).toBe(`sync@${fe.T}`);
   expect(fe.err).toBeLessThan(6);
@@ -857,7 +878,7 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   for (const [id, sh] of Object.entries(r.shown)) if (sh !== "dark") expect(sh, id).toBe(`sync@${r.T}`);
   expect(Object.keys(r.shown).every((k) => k.startsWith("a:") || r.shown[k] === "dark")).toBe(true);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
-  for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
+  expectSeams(r);
   await page.getByTestId("play").click();
   await expect(page.getByTestId("streams-switch")).toHaveAttribute("aria-checked", "false");
   await expect(page.getByTestId("streams-switch")).toHaveText("See every VM's own stream");
@@ -1176,6 +1197,56 @@ test("broadcast mode, a late viewer: Enter on a tile zooms the broadcast, which 
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("focus")).toHaveCount(0);
   } finally {
+    await closeBroadcast();
+  }
+});
+
+test("broadcast mode: after a re-tile the keyboard grid keeps the tiles of the frame on screen, and arrows move among them", async ({ page }) => {
+  type T = { id: string; rect: { x: number; y: number; w: number; h: number } };
+  await openBroadcast(page, false);
+  try {
+    // Hold the picture: the frame on screen stays, and with it the tiling the overlay draws.
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: true }));
+    await page.waitForTimeout(500);
+    const onScreen = () => page.evaluate(() => (window.__fleet!.client.pinned?.state.tiles ?? []).map((t) => ({ id: t.id, rect: t.rect })));
+    const shown: T[] = await onScreen();
+    expect(shown).toHaveLength(15);
+    const gen0 = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation);
+    // Two leave the fcvm side and three the EC2 side: ids go away and the rest move.
+    await admin("/mock/fault", { fcvm_gpus: 6, ec2_gpus: 4 });
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation), { timeout: 15_000 }).toBe(gen0 + 1);
+    const liveTiles: T[] = await page.evaluate(() => window.__fleet!.client.getState().accepted!.tiles.map((t) => ({ id: t.id, rect: t.rect })));
+    expect(await onScreen()).toEqual(shown);
+    expect(liveTiles.map((t) => t.id).sort()).not.toEqual(shown.map((t) => t.id).sort());
+    // A button for every tile on screen, in its reading order.
+    const names = new Map((await view(page)).tiles.map((t) => [t.id, t.name]));
+    const labels = await page.locator(".key-grid button").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label") ?? ""));
+    expect(labels.map((l) => l.split(",")[0])).toEqual(readingOrder(shown as never).map((t) => names.get(t.id)));
+    // An arrow goes to the neighbour on screen: one move whose neighbour among the live tiles is another.
+    const dirs = [["ArrowLeft", "left"], ["ArrowRight", "right"], ["ArrowUp", "up"], ["ArrowDown", "down"]] as const;
+    const moves = shown.flatMap((from) =>
+      dirs.map(([key, dir]) => {
+        const want = neighbour(shown as never, from as never, dir) as T | null;
+        const liveFrom = liveTiles.find((t) => t.id === from.id);
+        const live = liveFrom ? (neighbour(liveTiles as never, liveFrom as never, dir) as T | null) : null;
+        return { from, key, want: want?.id ?? null, live: liveFrom ? (live?.id ?? null) : "gone" };
+      }),
+    );
+    const m = moves.find((x) => x.want !== null && x.want !== x.live)!;
+    expect(m, "a move whose neighbour on screen differs from the live one").toBeDefined();
+    await says(page, names.get(m.from.id)!).focus();
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.keyId)).toBe(m.from.id);
+    await page.keyboard.press(m.key);
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.keyId)).toBe(m.want);
+    // The picture moves on to the new tiling while a tile that left holds the focus: the grid
+    // still has its one tab stop.
+    await says(page, names.get("ec2:7")!).focus();
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: false }));
+    await expect.poll(async () => (await onScreen()).length, { timeout: 15_000 }).toBe(10);
+    await expect(page.locator('.key-grid button[tabindex="0"]')).toHaveCount(1);
+  } finally {
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: false }));
+    await admin("/mock/fault", { fcvm_gpus: 8, ec2_gpus: 7 });
     await closeBroadcast();
   }
 });

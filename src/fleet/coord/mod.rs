@@ -34,7 +34,7 @@ use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
 use fleet_core::protocol::{
-    AgentMsg, AssignSlot, BudgetBody, ClaimMsg, CoordMsg, ServerMsg, SharedScene,
+    AgentMsg, AssignSlot, BudgetPlan, ClaimMsg, CoordMsg, ServerMsg, SharedScene,
 };
 use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
@@ -113,7 +113,7 @@ struct AgentConn {
     tx: mpsc::UnboundedSender<CoordMsg>,
     last_assign: Option<(Vec<AssignSlot>, Option<Rect>)>,
     last_scene: Option<SharedScene>,
-    last_budget: Option<BudgetBody>,
+    last_budget: Option<BudgetPlan>,
     /// Potato mode: the round this host was last told to play (`Some(None)`: told none).
     last_potato: Option<Option<fleet_core::potato::PotatoRound>>,
 }
@@ -131,7 +131,7 @@ pub struct Outputs {
     /// The shared scene, for the EC2 tiles' renderers.
     pub scene: watch::Sender<Option<SharedScene>>,
     /// The grid budget, for the EC2 tiles' renderers.
-    pub budget: watch::Sender<Option<BudgetBody>>,
+    pub budget: watch::Sender<Option<BudgetPlan>>,
     /// The launch names' subzone, when this coordinator serves it: its records follow the
     /// published names.
     pub zone: Option<Names>,
@@ -309,7 +309,7 @@ impl Actor {
         let budget = self.state.fleet.budget.body();
         self.out.budget.send_if_modified(|cur| {
             let changed = *cur != budget;
-            *cur = budget;
+            *cur = budget.clone();
             changed
         });
         for conn in self.agents.values_mut() {
@@ -343,8 +343,11 @@ impl Actor {
                 });
                 conn.last_assign = Some(mine);
             }
-            if let Some(b) = budget.filter(|b| conn.last_budget != Some(*b)) {
-                let _ = conn.tx.send(CoordMsg::Budget(b));
+            if let Some(b) = budget
+                .clone()
+                .filter(|b| conn.last_budget.as_ref() != Some(b))
+            {
+                let _ = conn.tx.send(CoordMsg::Budget(b.clone()));
                 conn.last_budget = Some(b);
             }
             // Potato mode: the potato host's round, and none for a host that runs players
@@ -778,6 +781,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
         | Event::ScaleInstances { at, .. }
+        | Event::HostsExpected { at, .. }
         | Event::Ec2Health { at, .. }
         | Event::Published { at, .. } => *at = t,
     }
@@ -1154,6 +1158,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             // While they run: a reclaimed spot host is replaced within this.
             liveness: Duration::from_secs(15),
             capacity_retry: Duration::from_secs(10),
+            lost_launch_ttl: Duration::from_secs(120),
         })
     };
     let dns_token = match &args.dns_token_secret {
@@ -1369,6 +1374,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         allowed_origins: args.allowed_origins,
         verifier,
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
+        access_viewer_address: args.access_viewer_address,
         turnstile_site_key: args.turnstile_site_key,
         poster,
         gate: Arc::new(gate),

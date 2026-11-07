@@ -46,6 +46,10 @@ pub struct Plan {
     /// Host user's subordinate UID range start (from /etc/subuid).
     /// When set, the VM user is created with the same subuid range so that
     /// the storage image (built by rootless podman on the host) has valid UIDs.
+    /// Transparent huge page mode to apply before the container starts
+    /// (`--guest-thp`), or none to keep the kernel's.
+    #[serde(default)]
+    pub transparent_hugepage: Option<String>,
     #[serde(default)]
     pub subuid_start: Option<u64>,
     #[serde(default)]
@@ -139,6 +143,10 @@ pub struct LatestMetadata {
     /// spec before this restore is acknowledged (`gpu::attach`).
     #[serde(default)]
     pub gpus: Vec<String>,
+    /// Transparent huge page mode for this clone (`--guest-thp`), applied before
+    /// the restore is acknowledged; `default` is the kernel's boot-time mode.
+    #[serde(rename = "transparent-hugepage", default)]
+    pub transparent_hugepage: Option<String>,
     /// The restoring host's identity, which replaces the preparing host's.
     #[serde(flatten)]
     pub identity: RestoreIdentity,
@@ -294,6 +302,21 @@ mod tests {
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.image_device.as_deref(), Some("/dev/vdb"));
         assert_eq!(plan.image_mode.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn the_restore_document_and_the_plan_carry_the_huge_page_mode() {
+        let meta: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "restore-epoch": "e", "transparent-hugepage": "default"}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.transparent_hugepage.as_deref(), Some("default"));
+        let meta: LatestMetadata =
+            serde_json::from_str(r#"{"host-time-ns": "1", "restore-epoch": "e"}"#).unwrap();
+        assert_eq!(meta.transparent_hugepage, None);
+        let plan: Plan =
+            serde_json::from_str(r#"{"image": "a", "transparent_hugepage": "never"}"#).unwrap();
+        assert_eq!(plan.transparent_hugepage.as_deref(), Some("never"));
     }
 
     #[test]

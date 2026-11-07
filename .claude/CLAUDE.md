@@ -988,7 +988,7 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | Target | Deps | Knobs (command-line vars; make exports them) |
 |--------|------|----------------------------------------------|
 | `bench-chromium-request-build` | `build` | container image only |
-| `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=`, `GUEST_ENV=` (own `TAG=`) |
+| `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=`, `GUEST_ENV=` (own `TAG=`), `GUEST_THP=` (default `never`; empty for the guest kernel's mode) |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
 | `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESOLVE_POLL_MS=`, `RESULTS=` |
 | `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `DIAG_URLS=`, `DIAG_REPS=` (default 3), `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=`. The serve always runs with `--uffd-prefetch off`, and `UFFD_PREFETCH=` set to anything but `off` is refused |

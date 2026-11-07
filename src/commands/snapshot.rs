@@ -2245,6 +2245,18 @@ async fn cmd_snapshot_run_inner(
     // Which host directories this clone serves, settled before anything is allocated and
     // applied to the config every later step reads: the volume servers, the clone's own
     // state (so a snapshot of the clone records them), and a reboot plan.
+    // Before anything is set up: a memory restore of an fc-agent that ignores the mode.
+    if snapshot_config.kind != crate::storage::SnapshotKind::DiskOnly {
+        restorable_thp_mode(
+            &per_restore_setting(
+                args.guest_thp.as_deref(),
+                args.inherit_recorded_hook,
+                snapshot_config.metadata.guest_thp.as_deref(),
+            ),
+            snapshot_config.metadata.guest_thp_restore,
+            &snapshot_name,
+        )?;
+    }
     snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
 
     // Where this clone publishes its ports, settled before anything is allocated: a
@@ -2746,11 +2758,12 @@ async fn cmd_snapshot_run_inner(
     // so any error from here until the restore_from_snapshot error handler below
     // must run network.cleanup() to remove partially-created host network state.
     setup.network = Some(network);
-    let network_config = setup_try!(setup
+    let mut network_config = setup_try!(setup
         .network_mut()
         .setup()
         .await
         .context("setting up network"));
+    keep_baked_resolver(&mut network_config, saved_network);
 
     // For routed mode clones: the snapshot's guest IPv6 (baked into boot params) is shared
     // across all clones. After restore, fc-agent will be told to swap it to the unique
@@ -2782,11 +2795,18 @@ async fn cmd_snapshot_run_inner(
     // The restore hook: this invocation's when it gave one, else the snapshot's
     // for a command-line `snapshot run`, else none. The clone's restore runs it,
     // and a snapshot taken from this clone records it.
-    vm_state.config.restore_hook = restore_hook_for(
+    vm_state.config.restore_hook = per_restore_setting(
         args.on_restore.as_deref(),
         args.inherit_recorded_hook,
         snapshot_config.metadata.restore_hook.as_deref(),
     );
+    // The huge page mode the same way. The restore sends it, `default` when none.
+    vm_state.config.guest_thp = per_restore_setting(
+        args.guest_thp.as_deref(),
+        args.inherit_recorded_hook,
+        snapshot_config.metadata.guest_thp.as_deref(),
+    );
+    vm_state.config.guest_thp_restore = snapshot_config.metadata.guest_thp_restore;
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // The source's --dns goes with the guest, so a snapshot of this clone keeps it.
     // When the snapshot cannot say, neither does the clone, and its network reports
@@ -3140,6 +3160,10 @@ async fn cmd_snapshot_run_inner(
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
     }
+    // Always sent: the snapshot's guest runs in whatever mode its source had, and
+    // a clone that asked for none gets the kernel's own back.
+    restore_latest["transparent-hugepage"] =
+        serde_json::Value::String(restore_thp_mode(&vm_state.config.guest_thp));
     // This host's identity, which the guest takes before its restore hook runs: the
     // host identity address it was given and the resolvers chosen above.
     let restore_identity = super::common::RestoreIdentity {
@@ -3834,6 +3858,8 @@ async fn cmd_snapshot_run_inner(
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
                                 &clone_vsock_base,
+                                // The clone's own mode, which may be its run's override.
+                                vm_state.config.guest_thp.clone(),
                             )
                             .await
                             {
@@ -3917,6 +3943,9 @@ async fn cmd_snapshot_run_inner(
                                     // belongs to) its serve process — a serve
                                     // shutdown must not SIGTERM it.
                                     vm_state.config.serve_pid = None;
+                                    // The relaunch booted this fcvm's fc-agent, which
+                                    // applies a restore's huge page mode.
+                                    vm_state.config.guest_thp_restore = true;
                                     // The watch on that server ends with the
                                     // dependence. Left armed, the server's exit would
                                     // fail a VM that booted from its disk and has no
@@ -3926,6 +3955,7 @@ async fn cmd_snapshot_run_inner(
                                         .update_state(&vm_id, |state| {
                                             state.config.snapshot_name = None;
                                             state.config.serve_pid = None;
+                                            state.config.guest_thp_restore = true;
                                         })
                                         .await;
                                     startup_rx = None;
@@ -4248,6 +4278,7 @@ async fn build_clone_reboot_plan(
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
     vsock_socket_path: &std::path::Path,
+    guest_thp: Option<String>,
 ) -> Result<(
     super::podman::RebootSpec,
     RunArgs,
@@ -4275,6 +4306,7 @@ async fn build_clone_reboot_plan(
         ipv6_prefix,
         ipv6_address,
         meta.restore_hook.clone(),
+        guest_thp,
         host_ipv6,
     );
 
@@ -4354,7 +4386,7 @@ async fn build_clone_reboot_plan(
 ///
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
-/// line inherits (`restore_hook_for`); for the reboot plan the clone's own.
+/// line inherits (`per_restore_setting`); for the reboot plan the clone's own.
 ///
 /// `host_ipv6` is the restoring host's identity address (`snapshot run --host-ipv6`),
 /// given to the cold boot as its `HOST_IPV6`, which fc-agent adds to the guest's lo
@@ -4372,6 +4404,7 @@ fn run_args_from_snapshot_metadata(
     ipv6_prefix: Option<&String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
+    guest_thp: Option<String>,
     host_ipv6: Option<std::net::Ipv6Addr>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
@@ -4448,6 +4481,7 @@ fn run_args_from_snapshot_metadata(
         // A cold boot of a captured disk takes no startup snapshot of its own.
         startup_snapshot: false,
         on_restore: restore_hook,
+        guest_thp,
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
         interactive: meta.interactive,
@@ -4610,10 +4644,15 @@ async fn cmd_snapshot_run_disk_only(
         args.ipv6_prefix.as_ref(),
         args.ipv6_address,
         // The caller's hook, the recorded one only for a command line that inherits.
-        restore_hook_for(
+        per_restore_setting(
             args.on_restore.as_deref(),
             args.inherit_recorded_hook,
             meta.restore_hook.as_deref(),
+        ),
+        per_restore_setting(
+            args.guest_thp.as_deref(),
+            args.inherit_recorded_hook,
+            meta.guest_thp.as_deref(),
         ),
         args.host_ipv6,
     );
@@ -4713,11 +4752,35 @@ async fn cmd_snapshot_ls() -> Result<()> {
     Ok(())
 }
 
-/// The hook a restored clone runs: the caller's own, else the snapshot's recorded one
-/// when the caller inherits (a command-line `snapshot run`), else none. `podman run`
-/// restoring its startup snapshot does not inherit: the hook is not in the snapshot
-/// cache key, so the snapshot may carry a hook another run gave.
-pub(crate) fn restore_hook_for(
+/// The huge page mode a restore document carries: the clone's, or `default` (the
+/// guest kernel's own) when it has none.
+pub(crate) fn restore_thp_mode(guest_thp: &Option<String>) -> String {
+    guest_thp.clone().unwrap_or_else(|| "default".to_string())
+}
+
+/// Refuse a huge page mode for a snapshot whose fc-agent would ignore it. Without a mode
+/// the restore keeps the mode the snapshot has, which for such an fc-agent is the
+/// kernel's own, so that restore is still correct.
+pub(crate) fn restorable_thp_mode(
+    guest_thp: &Option<String>,
+    applied_by_guest: bool,
+    snapshot: &str,
+) -> Result<()> {
+    if let (Some(mode), false) = (guest_thp, applied_by_guest) {
+        anyhow::bail!(
+            "snapshot {snapshot} was made with an fc-agent that does not apply \
+             --guest-thp, so its clone would run in the mode it was snapshotted in, not \
+             {mode}; recreate the snapshot with this fcvm to set the mode at restore"
+        );
+    }
+    Ok(())
+}
+
+/// A per-restore setting (the restore hook, the huge page mode): the caller's own, else
+/// the snapshot's recorded one when the caller inherits (a command-line `snapshot run`),
+/// else none. `podman run` restoring its startup snapshot does not inherit: neither is
+/// in the snapshot cache key, so the snapshot may carry another run's.
+pub(crate) fn per_restore_setting(
     given: Option<&str>,
     inherit_recorded: bool,
     recorded: Option<&str>,
@@ -4726,6 +4789,28 @@ pub(crate) fn restore_hook_for(
         (Some(hook), _) => Some(hook.to_string()),
         (None, true) => recorded.map(str::to_string),
         (None, false) => None,
+    }
+}
+
+/// The clone keeps the resolver its snapshot baked into the guest.
+///
+/// fc-agent wrote resolv.conf at the source's boot, so the restored guest
+/// resolves through the snapshot's `dns_server` and `dns_search` whatever the
+/// clone's network backend reports. Rootless reports none (`PastaNetwork::setup`),
+/// and the clone's recorded network config is what a snapshot of the clone
+/// carries on: without this, that snapshot recorded no resolver, its clones'
+/// pasta kept its DNS special case, and a guest whose resolv.conf names the
+/// gateway reached the host's resolver instead of the service the golden was
+/// recorded against (#1540).
+pub(crate) fn keep_baked_resolver(
+    network: &mut crate::network::NetworkConfig,
+    saved: &crate::network::NetworkConfig,
+) {
+    if network.dns_server.is_none() {
+        network.dns_server = saved.dns_server.clone();
+    }
+    if network.dns_search.is_none() {
+        network.dns_search = saved.dns_search.clone();
     }
 }
 
@@ -4882,10 +4967,10 @@ mod tests {
     /// runs the caller's hook, resolved the same way as a memory restore, instead of
     /// copying the snapshot's recorded hook over an accepted flag (a Codex finding on
     /// PR 1112). The builder takes the resolved hook; the disk-only path resolves it
-    /// with `restore_hook_for`, pinned at the source because that path boots a VM.
+    /// with `per_restore_setting`, pinned at the source because that path boots a VM.
     ///
     /// RED BEFORE THE FIX: the builder copied `meta.restore_hook` and the disk-only
-    /// path never called `restore_hook_for`.
+    /// path never called `per_restore_setting`.
     #[test]
     fn a_disk_only_clone_runs_the_callers_hook() {
         let source = include_str!("snapshot.rs");
@@ -4896,7 +4981,7 @@ mod tests {
         let end = body.find("\n}\n").expect("the disk-only path ends");
         let body = &body[..end];
         assert!(
-            body.contains("restore_hook_for(") && body.contains("args.on_restore"),
+            body.contains("per_restore_setting(") && body.contains("args.on_restore"),
             "the disk-only path does not resolve the caller's --on-restore"
         );
     }
@@ -4908,19 +4993,82 @@ mod tests {
     /// RED BEFORE THE FIX: the cache-hit path fell back to the recorded hook.
     #[test]
     fn a_cache_hit_without_a_hook_runs_none_and_the_command_line_inherits() {
-        assert_eq!(restore_hook_for(None, false, Some("recorded")), None);
+        assert_eq!(per_restore_setting(None, false, Some("recorded")), None);
         assert_eq!(
-            restore_hook_for(None, true, Some("recorded")).as_deref(),
+            per_restore_setting(None, true, Some("recorded")).as_deref(),
             Some("recorded")
         );
         assert_eq!(
-            restore_hook_for(Some("mine"), false, Some("recorded")).as_deref(),
+            per_restore_setting(Some("mine"), false, Some("recorded")).as_deref(),
             Some("mine")
         );
-        assert_eq!(restore_hook_for(None, true, None), None);
+        assert_eq!(per_restore_setting(None, true, None), None);
     }
 
     use super::*;
+
+    /// A snapshot whose fc-agent predates `--guest-thp` ignores the mode a restore sends
+    /// and reports the restore done, so a restore asking it for a mode is refused, and one
+    /// asking for none still runs. A cold boot's snapshot records that its fc-agent applies
+    /// the mode, and a clone carries that on to a snapshot of its own.
+    #[test]
+    fn a_mode_is_refused_for_a_snapshot_whose_agent_ignores_it() {
+        let mut json = serde_json::to_value(metadata_fixture()).unwrap();
+        json.as_object_mut().unwrap().remove("guest_thp_restore");
+        let old: crate::storage::SnapshotMetadata = serde_json::from_value(json).unwrap();
+        assert!(!old.guest_thp_restore, "an older config.json has no marker");
+        let never = Some("never".to_string());
+        let error = restorable_thp_mode(&never, old.guest_thp_restore, "old").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not apply --guest-thp"),
+            "{error:#}"
+        );
+        restorable_thp_mode(&None, old.guest_thp_restore, "old").unwrap();
+
+        let mut vm_state =
+            crate::state::VmState::new("vm-thp".to_string(), "alpine:latest".to_string(), 1, 512);
+        vm_state.config.guest_thp_restore = true;
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
+        let dir = tempfile::tempdir().unwrap();
+        let config = super::super::common::build_snapshot_config(
+            &vm_state,
+            "thp",
+            crate::storage::SnapshotType::User,
+            dir.path(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert!(config.metadata.guest_thp_restore);
+        let round: crate::storage::SnapshotConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        restorable_thp_mode(&never, round.metadata.guest_thp_restore, "new").unwrap();
+    }
+
+    /// A clone that reboots in place cold-boots this fcvm's fc-agent in the clone's own
+    /// mode (its run's override, not the snapshot's recorded one), and a snapshot of it
+    /// then records an fc-agent that applies the mode. Pinned at the source: the reboot
+    /// path resolves a kernel and an initrd and launches a VMM.
+    #[test]
+    fn a_rebooted_clone_boots_in_its_own_mode_and_records_a_capable_agent() {
+        let source = include_str!("snapshot.rs");
+        let call = source.find("match build_clone_reboot_plan(").unwrap();
+        let args = &source[call..call + source[call..].find(".await").unwrap()];
+        assert!(
+            args.contains("vm_state.config.guest_thp.clone(),"),
+            "{args}"
+        );
+        let relaunched = source.find("bootplan_handle = relaunch_bootplan;").unwrap();
+        let after =
+            &source[relaunched..relaunched + source[relaunched..].find("continue;").unwrap()];
+        assert_eq!(
+            after.matches("guest_thp_restore = true;").count(),
+            2,
+            "the relaunch must mark the clone, in memory and in its state file: {after}"
+        );
+    }
 
     /// A snapshot directory holding a `mem_len`-byte memory image and the given config bytes.
     fn working_set_fixture(root: &Path, name: &str, mem_len: u64, config: &[u8]) -> PathBuf {
@@ -5152,6 +5300,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .ipv6_prefix
         };
@@ -5174,6 +5323,39 @@ mod tests {
         );
     }
 
+    /// #1540: a clone whose backend reports no resolver (rootless) records the one its
+    /// snapshot baked, so a snapshot of the clone carries it on; a resolver the
+    /// backend did report is kept.
+    #[test]
+    fn a_clone_keeps_the_resolver_its_snapshot_baked() {
+        let saved = crate::network::NetworkConfig {
+            dns_server: Some("10.0.2.2".to_string()),
+            dns_search: Some("corp.example".to_string()),
+            ..Default::default()
+        };
+        let mut rootless = crate::network::NetworkConfig::default();
+        keep_baked_resolver(&mut rootless, &saved);
+        assert_eq!(rootless.dns_server.as_deref(), Some("10.0.2.2"));
+        assert_eq!(rootless.dns_search.as_deref(), Some("corp.example"));
+
+        let mut reported = crate::network::NetworkConfig {
+            dns_server: Some("192.0.2.53".to_string()),
+            ..Default::default()
+        };
+        keep_baked_resolver(&mut reported, &saved);
+        assert_eq!(reported.dns_server.as_deref(), Some("192.0.2.53"));
+
+        let source = include_str!("snapshot.rs");
+        let setup = source.find(".context(\"setting up network\"));").unwrap();
+        assert!(
+            source[setup..]
+                .trim_start_matches(|c| c != '\n')
+                .trim_start()
+                .starts_with("keep_baked_resolver(&mut network_config, saved_network);"),
+            "snapshot run must record the baked resolver right after network setup"
+        );
+    }
+
     /// A snapshot's metadata, for the tests that read it back.
     fn metadata_fixture() -> crate::storage::SnapshotMetadata {
         crate::storage::SnapshotMetadata {
@@ -5185,6 +5367,8 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
+            guest_thp: None,
+            guest_thp_restore: false,
             dns_override: Some(None),
             hugepages: false,
             extra_disks: vec![],
@@ -5231,6 +5415,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -5258,6 +5443,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -5275,6 +5461,7 @@ mod tests {
                 512,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5300,6 +5487,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5337,6 +5525,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5380,6 +5569,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -5396,6 +5586,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5440,6 +5631,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5778,6 +5970,7 @@ mod tests {
             non_blocking_output: false,
             on_restore: None,
             inherit_recorded_hook: true,
+            guest_thp: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
@@ -5935,6 +6128,7 @@ mod tests {
                 512,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -6098,6 +6292,7 @@ mod tests {
             non_blocking_output: false,
             on_restore: None,
             inherit_recorded_hook: true,
+            guest_thp: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,

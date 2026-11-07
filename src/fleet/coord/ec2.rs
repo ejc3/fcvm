@@ -17,7 +17,8 @@ use super::Handle;
 use anyhow::Result;
 use async_trait::async_trait;
 use fleet_core::protocol::{
-    boot_id, AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+    boot_id, AssignSlot, BudgetBody, BudgetPlan, HealthReport, RendererScene, SharedScene,
+    SlotReport,
 };
 use fleet_core::Event;
 use std::collections::{BTreeMap, HashMap};
@@ -271,7 +272,7 @@ async fn post_scenes(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
     mut scene: watch::Receiver<Option<SharedScene>>,
-    mut budget: watch::Receiver<Option<BudgetBody>>,
+    mut budget: watch::Receiver<Option<BudgetPlan>>,
     running: Running,
     handle: Handle,
 ) {
@@ -286,7 +287,7 @@ async fn post_scenes(
     loop {
         let list = assign.borrow_and_update().clone();
         let shared = scene.borrow_and_update().clone();
-        let grid = *budget.borrow_and_update();
+        let grid = budget.borrow_and_update().clone();
         let now: Vec<(AssignSlot, Launched, u64, Option<Given>)> = {
             let r = running.lock().unwrap();
             list.into_iter()
@@ -345,7 +346,14 @@ async fn post_scenes(
                         }
                     }
                 }
-                if let Some(b) = grid {
+                // This tile's body: the grid's budget, with its every-pixel grant.
+                // posted only to the renderer process the grant names: its boot id, last read
+                // from this instance's `/health`
+                let boot = boots
+                    .get(&a.id)
+                    .filter(|(i, _)| *i == l.instance)
+                    .and_then(|(_, b)| b.as_deref());
+                if let Some(b) = grid.as_ref().map(|p| p.for_tile(&a.id, boot)) {
                     if budget_posted.get(&a.id) != Some(&(l.instance.clone(), b)) {
                         match driver.post_budget(&a.id, &l, &b).await {
                             Ok(()) => {
@@ -375,7 +383,7 @@ pub async fn run(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
     scene: watch::Receiver<Option<SharedScene>>,
-    budget: watch::Receiver<Option<BudgetBody>>,
+    budget: watch::Receiver<Option<BudgetPlan>>,
     handle: Handle,
 ) {
     // No tile launches before the instances an earlier coordinator left are gone.

@@ -172,7 +172,9 @@ void Server::accept_loop(int lfd, bool tls) {
 }
 
 void Server::handle(Conn& c) {
-  c.set_read_timeout_ms(10000);
+  // Each phase has one deadline for all its reads: a per-read timeout lets a client that
+  // sends a byte every few seconds hold this thread for as long as it likes.
+  c.set_read_deadline_ms(10000);
   std::string buf;
   char tmp[4096];
   size_t he;
@@ -225,6 +227,7 @@ void Server::handle(Conn& c) {
       return respond(c, 415, "Unsupported Media Type", "{\"error\":\"Content-Type must be application/json\"}");
     long len = hdr.count("content-length") ? atol(hdr["content-length"].c_str()) : -1;
     if (len < 0 || len > (1 << 20)) return respond(c, 411, "Length Required", "{\"error\":\"Content-Length 0..1048576 required\"}");
+    c.set_read_deadline_ms(10000);
     while ((long)body.size() < len) {
       long r = c.read(tmp, sizeof tmp);
       if (r <= 0) return;
@@ -280,7 +283,7 @@ void Server::handle(Conn& c) {
     if (!c.write_all(resp.data(), resp.size())) return;
     // As for /frames, the token is the first message, never in the URL; here it must also
     // name the viewer holding the phone.
-    c.set_read_timeout_ms(ADMIT_WAIT_MS);
+    c.set_read_deadline_ms(ADMIT_WAIT_MS);
     int op = 0;
     std::string first, token;
     if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.mirror_admits(token)) {
@@ -289,7 +292,7 @@ void Server::handle(Conn& c) {
       c.write_all(close.data(), close.size());
       return;
     }
-    c.set_read_timeout_ms(0);
+    c.set_read_deadline_ms(0);
     p_.mirror(c, token);
     return;
   }
@@ -317,7 +320,7 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   // With the coordinator's admission keys, only a client whose first message carries a seated
   // viewer's direct token gets the stream (the URL carries none, so no log holds one).
   if (p_.requires_admit()) {
-    c.set_read_timeout_ms(ADMIT_WAIT_MS);
+    c.set_read_deadline_ms(ADMIT_WAIT_MS);
     int op = 0;
     std::string first, token;
     if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.admits(token)) {
@@ -327,7 +330,7 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
       return;
     }
   }
-  c.set_read_timeout_ms(0);
+  c.set_read_deadline_ms(0);  // the stream's reader waits for as long as the stream lasts
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   // Keep at most 64 KiB written and not yet sent in the kernel (about 26 ms at 20
   // Mbit/s): what a stalled link backs up waits in the subscriber's queue, which

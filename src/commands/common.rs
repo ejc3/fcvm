@@ -4066,6 +4066,10 @@ pub async fn restore_from_snapshot(
         if !gpus.is_empty() {
             mmds_latest["gpus"] = serde_json::json!(gpus);
         }
+        // The same huge page mode the restore-only vsock document carries.
+        mmds_latest["transparent-hugepage"] = serde_json::Value::String(
+            crate::commands::snapshot::restore_thp_mode(&vm_state.config.guest_thp),
+        );
         // The same restoring-host identity the restore-only vsock document carries.
         identity.write_into(&mut mmds_latest);
         client
@@ -4659,6 +4663,8 @@ pub fn build_snapshot_config(
             health_check_url: vm_state.config.health_check_url.clone(),
             health_check_timeout: vm_state.config.health_check_timeout,
             restore_hook: vm_state.config.restore_hook.clone(),
+            guest_thp: vm_state.config.guest_thp.clone(),
+            guest_thp_restore: vm_state.config.guest_thp_restore,
             dns_override: vm_state.config.dns_override.clone(),
             hugepages: vm_state.config.hugepages,
             extra_disks,

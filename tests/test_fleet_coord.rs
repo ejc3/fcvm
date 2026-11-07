@@ -29,6 +29,7 @@ struct Opts {
     checker: Arc<dyn TextChecker>,
     verifier: Arc<dyn Verifier>,
     trust_cf: bool,
+    access_viewer: bool,
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
@@ -48,6 +49,7 @@ impl Default for Opts {
             checker: allow_all(),
             verifier: Arc::new(turnstile::Off),
             trust_cf: true,
+            access_viewer: false,
             ec2_local: None,
             dns: None,
             site_key: None,
@@ -77,6 +79,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         allowed_origins: vec!["https://wall.example".into()],
         verifier: o.verifier,
         trust_cf_connecting_ip: o.trust_cf,
+        access_viewer_address: o.access_viewer,
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
@@ -184,10 +187,25 @@ impl Viewer {
     }
 
     async fn connect_raw(url: &str, ip: Option<&str>) -> Viewer {
+        let headers: Vec<(&str, &str)> =
+            ip.map(|ip| ("cf-connecting-ip", ip)).into_iter().collect();
+        Viewer::connect_with_headers(url, &headers).await
+    }
+
+    /// Connect sending these request headers, then the seat message.
+    async fn connect_seated_with_headers(url: &str, headers: &[(&str, &str)]) -> Viewer {
+        let mut v = Viewer::connect_with_headers(url, headers).await;
+        v.send(json!({"type": "seat", "ticket": null})).await;
+        v
+    }
+
+    async fn connect_with_headers(url: &str, headers: &[(&str, &str)]) -> Viewer {
         let mut req = url.into_client_request().unwrap();
-        if let Some(ip) = ip {
-            req.headers_mut()
-                .insert("cf-connecting-ip", ip.parse().unwrap());
+        for (name, value) in headers {
+            let name =
+                tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                    .unwrap();
+            req.headers_mut().insert(name, value.parse().unwrap());
         }
         let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         Viewer {
@@ -610,6 +628,65 @@ async fn limits_are_keyed_by_the_client_address() {
         b.receipt("w2").await["reason"],
         "one word per 5 s per client"
     );
+}
+
+/// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
+/// a placeholder.
+fn access_jwt(claims: Value) -> String {
+    format!(
+        "{}.{}.sig",
+        admission::b64url(br#"{"alg":"RS256"}"#),
+        admission::b64url(claims.to_string().as_bytes())
+    )
+}
+
+/// Through the staging page's Worker every viewer arrives with the Worker's
+/// `CF-Connecting-IP`; the viewer's own address is in `x-fleet-viewer-ip`, which counts only
+/// with `--access-viewer-address` and only on a request Access admitted with a service token.
+/// Without the switch (a coordinator no connector verifies Access for), a forged service-token
+/// payload must not let a caller choose its address.
+#[tokio::test]
+async fn a_forwarded_viewer_address_counts_only_with_a_service_token() {
+    let worker = "2001:db8::103";
+    let service =
+        access_jwt(json!({"type": "app", "common_name": "example-client.access", "email": ""}));
+    let person = access_jwt(json!({"type": "app", "email": "viewer@example.test"}));
+    for (access_viewer, jwt, separate) in [
+        (true, Some(service.as_str()), true),
+        (true, Some(person.as_str()), false),
+        (true, None, false),
+        (false, Some(service.as_str()), false),
+    ] {
+        let c = coordinator_with(Opts {
+            access_viewer,
+            ..Opts::default()
+        })
+        .await;
+        let headers = |viewer: &'static str| {
+            let mut h = vec![("cf-connecting-ip", worker), ("x-fleet-viewer-ip", viewer)];
+            if let Some(j) = jwt {
+                h.push(("cf-access-jwt-assertion", j));
+            }
+            h
+        };
+        let mut a = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.1")).await;
+        let mut b = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.2")).await;
+        a.intent("w1", "word", json!({"text": "one"})).await;
+        assert_eq!(a.receipt("w1").await["outcome"], "committed");
+        b.intent("w2", "word", json!({"text": "two"})).await;
+        let r = b.receipt("w2").await;
+        if separate {
+            assert_eq!(
+                r["outcome"], "committed",
+                "service token: each viewer has its own limit: {r}"
+            );
+        } else {
+            assert_eq!(
+                r["reason"], "one word per 5 s per client",
+                "switch {access_viewer}, jwt {jwt:?}: the header must not count: {r}"
+            );
+        }
+    }
 }
 
 /// With Turnstile on, a connection's intents are refused (and not recorded) until it has
@@ -1200,6 +1277,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
@@ -1807,7 +1885,7 @@ impl ec2::Ec2Driver for RestartingRendererEc2 {
 
 #[tokio::test]
 async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let boot = Arc::new(std::sync::Mutex::new("boot-1".to_string()));
     let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let budgets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1840,9 +1918,10 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
     let count = |s: &Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().len();
@@ -1928,7 +2007,7 @@ impl ec2::Ec2Driver for SceneGateEc2 {
 
 #[tokio::test]
 async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let gate = Arc::new(tokio::sync::Notify::new());
     let called = Arc::new(tokio::sync::Notify::new());
     let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1961,9 +2040,10 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
     tokio::time::timeout(Duration::from_secs(10), called.notified())
@@ -2045,7 +2125,7 @@ impl ec2::Ec2Driver for RegionNamedEc2 {
 /// A viewer is told the region a tile runs in, never its instance id.
 #[tokio::test]
 async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let (handle, reports) = recording_handle();
     let tile = AssignSlot {
         id: "ec2-1".into(),
@@ -2070,9 +2150,10 @@ async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(
         Arc::new(RegionNamedEc2),
@@ -2940,6 +3021,7 @@ fn host_config(
         poll: Duration::from_millis(50),
         liveness: Duration::from_millis(100),
         capacity_retry: Duration::from_millis(300),
+        lost_launch_ttl: Duration::from_secs(60),
     }
 }
 
@@ -2957,6 +3039,7 @@ async fn page_url(handle: &Handle) -> String {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        access_viewer_address: false,
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),
@@ -3299,6 +3382,146 @@ async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
         "a second host for one shortfall: {:?}",
         fake.calls()
     );
+}
+
+/// A launch whose answer is lost just before the fleet sleeps (#1289): the asleep pass asks
+/// again with its token, learns the instance no list names yet, and terminates it, instead
+/// of leaving it running until the asleep check five minutes later.
+#[tokio::test]
+async fn a_lost_launch_is_terminated_when_the_fleet_sleeps_before_a_list_names_it() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, u32::MAX));
+    let mut hosts = host_config(&fake, &["us-east-1"], 1, 8);
+    // No second pass while awake: the token is asked again only after the sleep.
+    hosts.poll = Duration::from_secs(30);
+    hosts.liveness = Duration::from_secs(30);
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    until_hosts(&fake, "the lost launch", |f| launches(f).len() == 1).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "the lost launch's host terminated", |f| {
+        f.present("us-east-1").is_empty()
+    })
+    .await;
+    assert_eq!(
+        launches(&fake),
+        vec!["launch us-east-1 spot 1", "launch us-east-1 spot 1"],
+        "one launch, then its token asked again"
+    );
+}
+
+/// A lost launch whose token never gets an answer stops holding its region after
+/// `lost_launch_ttl`: tokens are kept across power changes now, so without the limit one such
+/// token would keep the region from launching for as long as the coordinator runs.
+#[tokio::test]
+async fn a_lost_launch_that_never_answers_stops_holding_its_region() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.stuck.lock().unwrap() = 1;
+    let mut hosts = host_config(&fake, &["us-east-1"], 1, 8);
+    hosts.lost_launch_ttl = Duration::from_millis(500);
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    until_hosts(&fake, "a host after the stuck token is dropped", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+}
+
+/// A GPU host that comes up after the EC2 half alone made the fleet awake still gets its
+/// last phase in the wake's record (#1289): the pass that sees it running publishes it
+/// before the region's host watch ends.
+#[tokio::test]
+async fn a_host_running_after_the_ec2_half_woke_the_fleet_records_its_boot() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    use fleet_core::protocol::SlotReport;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ec2_max: 2,
+        fcvm_tiles: 8,
+        light_interval_ms: 0,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    v.until(|s| {
+        s["fleet"]["power"]["state"] == "waking"
+            && s["fleet"]["power"]["hosts"]
+                .as_array()
+                .is_some_and(|h| h.len() == 1)
+    })
+    .await;
+    for id in ["ec2-1", "ec2-2"] {
+        handle
+            .send(Event::Ec2 {
+                at: 0,
+                report: SlotReport {
+                    id: id.into(),
+                    phase: "running".into(),
+                    generation: 1,
+                    vm: Some(format!("i-{id}")),
+                    frame_url: Some(format!("wss://{id}.example/frames")),
+                    timings: Default::default(),
+                    error: None,
+                    retry_in_ms: None,
+                    ipv6: None,
+                    ipv4: None,
+                    v4_port: None,
+                    place: None,
+                },
+            })
+            .await;
+    }
+    v.until(|s| s["fleet"]["power"]["state"] == "awake").await;
+    fake.set_state("us-east-1", "pending", "running");
+    let booted = |s: &Value| {
+        s["fleet"]["power"]["hosts"].as_array().is_some_and(|h| {
+            h.len() == 1
+                && h[0]["phases"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|p| p["phase"] == "booted"))
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), v.until(booted))
+        .await
+        .expect("the host's boot is recorded after the fleet woke");
 }
 
 /// An on-demand launch whose answer is lost counts against the fleet-wide cap until its
@@ -3833,6 +4056,14 @@ struct FakeEc2Api {
     run_delay: Duration,
     /// An unpromoted latest version has a different host type from the default.
     unpublished_template: bool,
+    /// The template's default names g4dn.metal at its first read and g5g.metal after.
+    template_changes: bool,
+    /// How many CreateFleet calls launch and then answer 503, as a request whose answer is lost.
+    lose_fleet_answers: Arc<std::sync::atomic::AtomicU32>,
+    /// Each CreateFleet ClientToken seen, with the request it came with: a later request with
+    /// that token and other parameters is refused with IdempotentParameterMismatch, as EC2 does.
+    fleet_tokens:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3918,7 +4149,14 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     // An instant EC2 Fleet: spot is refused per pool where the region has no spot
                     // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
                     "DescribeLaunchTemplateVersions" => {
-                        let ty = if api.unpublished_template && params["LaunchTemplateVersion.1"] != "$Default" { "g4dn.xlarge" } else { "g4dn.metal" };
+                        let reads = api.calls.lock().unwrap().iter().filter(|(_, p)| p["Action"] == "DescribeLaunchTemplateVersions").count();
+                        let ty = if api.unpublished_template && params["LaunchTemplateVersion.1"] != "$Default" {
+                            "g4dn.xlarge"
+                        } else if api.template_changes && reads > 1 {
+                            "g5g.metal"
+                        } else {
+                            "g4dn.metal"
+                        };
                         (StatusCode::OK, format!("<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>{ty}</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>"))
                     }
                     // IAM's FleetTypesOnly checks ec2:InstanceType on the fleet's instances, and
@@ -3935,6 +4173,26 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                         "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation.</Message></Error></Errors></Response>".into(),
                     ),
                     "CreateFleet" => {
+                        if let Some(token) = params.get("ClientToken") {
+                            let mut seen = api.fleet_tokens.lock().unwrap();
+                            match seen.get(token) {
+                                Some(first) if *first != params => return error("IdempotentParameterMismatch"),
+                                Some(_) => {}
+                                None => {
+                                    seen.insert(token.clone(), params.clone());
+                                }
+                            }
+                        }
+                        let lost = api
+                            .lose_fleet_answers
+                            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                        if lost {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "<Response><Errors><Error><Code>InternalError</Code><Message>An internal error has occurred.</Message></Error></Errors></Response>".into(),
+                            );
+                        }
                         let spot = params["TargetCapacitySpecification.DefaultTargetCapacityType"] == "spot";
                         if spot && !api.spot_capacity.contains(&region) {
                             return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
@@ -4041,6 +4299,66 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     assert_eq!(list["Filter.2.Value.1"], "stage");
     // A template with no subnet in its region is refused at start.
     assert!(AwsHosts::new(&["us-east-1:t".parse().unwrap()], &[], "stage".into()).is_err());
+}
+
+/// A CreateFleet whose answer is lost is asked again with the same ClientToken (#1329). If the
+/// template's instance type changed and the cached type expired in between, the retry must
+/// still send the first request's parameters: EC2 refuses a token with other parameters
+/// (IdempotentParameterMismatch), and the region would launch nothing until a restart.
+#[tokio::test]
+async fn a_lost_create_fleet_is_asked_again_with_the_same_parameters() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        template_changes: true,
+        lose_fleet_answers: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::new(
+        &["us-east-1:fcvm-fleet-host-x86_64".parse().unwrap()],
+        &["us-east-1:subnet-0000000000000000a".parse().unwrap()],
+        "stage".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    // Every launch reads the template again, as one after the cache's five minutes does.
+    d.template_type_ttl = Duration::ZERO;
+    d.launch("us-east-1", Market::OnDemand, 1, "token-lost")
+        .await
+        .expect_err("the first answer is lost");
+    let again = d
+        .launch("us-east-1", Market::OnDemand, 1, "token-lost")
+        .await
+        .expect("the retry with the same token is answered");
+    assert_eq!(again.ids, vec!["i-1234567890abcdef0".to_string()]);
+    let calls = api.calls.lock().unwrap().clone();
+    let fleets: Vec<_> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "CreateFleet")
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert_eq!(fleets.len(), 2, "{calls:?}");
+    assert_eq!(fleets[0], fleets[1], "the retry changed the request");
+    assert_eq!(
+        fleets[1]["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g4dn.metal"
+    );
+    // A new launch reads the changed type.
+    d.launch("us-east-1", Market::OnDemand, 1, "token-new")
+        .await
+        .unwrap();
+    let calls = api.calls.lock().unwrap().clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .unwrap();
+    assert_eq!(
+        last.1["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g5g.metal"
+    );
 }
 
 /// `alive` reads the instance's state and asks its renderer: a running tile whose renderer
@@ -5169,6 +5487,8 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 budget_fit: Some(fit),
                 t: Some(t),
                 render_ms_max: None,
+                budget_every_pixel: None,
+                boot_id: None,
             }))
             .unwrap();
     }
@@ -5191,7 +5511,72 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
         assert!(Instant::now() < deadline, "the EC2 tile got no budget");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(driver.posted.lock().unwrap()[0], got);
+    assert_eq!(
+        driver.posted.lock().unwrap()[0],
+        fleet_core::protocol::BudgetBody {
+            budget: got.budget,
+            t: got.t,
+            every_pixel: false
+        }
+    );
+}
+
+/// A tile whose own fit draws every pixel while the grid's budget gives it a checkerboard
+/// is granted every pixel after three rounds; the slowest tile keeps the grid's budget and
+/// its checkerboard.
+#[tokio::test]
+async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    // slot-1 fits 825,518 (every pixel of its 550,896 at one sample), slot-2 only its
+    // checkerboard (275,173): the grid is under both every-pixel budgets.
+    for (id, fit) in [("slot-1", 825_518.0), ("slot-2", 275_173.0)] {
+        agent
+            .to_coord
+            .send(AgentMsg::Health(fleet_core::protocol::HealthReport {
+                id: id.into(),
+                fps: 30.0,
+                gpu: Value::Null,
+                budget_fit: Some(fit),
+                t: Some(5.0),
+                render_ms_max: None,
+                budget_every_pixel: Some(275_448.0),
+                boot_id: Some(format!("boot-{id}")),
+            }))
+            .unwrap();
+    }
+    let got = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let CoordMsg::Budget(b) = agent.next().await {
+                if b.every_pixel.values().any(|e| e.on) {
+                    return b;
+                }
+            }
+        }
+    })
+    .await
+    .expect("a grant within 30 s");
+    assert!(
+        got.budget < 275_448,
+        "the grid draws a checkerboard: {}",
+        got.budget
+    );
+    assert!(got.for_tile("slot-1", Some("boot-slot-1")).every_pixel);
+    assert!(!got.for_tile("slot-2", Some("boot-slot-2")).every_pixel);
+    assert!(
+        !got.for_tile("slot-1", Some("boot-other")).every_pixel,
+        "the grant is for the renderer process that earned it"
+    );
 }
 
 /// One instance of [`PoolEc2`]: state, tags, image, spot request.
