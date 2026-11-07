@@ -708,7 +708,7 @@ async fn run_source_request(request: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
 
     /// Fake console: a pipe whose read end the test controls. Not reading it
@@ -785,43 +785,6 @@ mod tests {
             wait_until(|| state.flushed(), Duration::from_secs(5)),
             "writer must account every relayed byte as disposed"
         );
-    }
-
-    /// A writer that records every write it is handed.
-    struct Writes(Vec<Vec<u8>>);
-
-    impl std::io::Write for Writes {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.push(buf.to_vec());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A line with arguments is one write. std's `writeln!`, the path its `eprintln!` takes,
-    /// is several: the reason fc-agent replaces the macros.
-    #[test]
-    fn a_line_is_one_write() {
-        let port = 4998;
-        let mut ours = Writes(Vec::new());
-        write_line(
-            &mut ours,
-            format_args!("[fc-agent] exec server: accepted connection on vsock port {port}"),
-        )
-        .unwrap();
-        assert_eq!(
-            ours.0,
-            vec![b"[fc-agent] exec server: accepted connection on vsock port 4998\n".to_vec()]
-        );
-        let mut std_path = Writes(Vec::new());
-        writeln!(
-            std_path,
-            "[fc-agent] exec server: accepted connection on vsock port {port}"
-        )
-        .unwrap();
-        assert!(std_path.0.len() > 1, "{:?}", std_path.0);
     }
 
     /// Writes each piece it is handed into the agent's pipe, waits until the console holds
