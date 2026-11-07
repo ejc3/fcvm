@@ -190,10 +190,12 @@ fcvm vm run --name win-1 --firmware <CLOUDHV.fd> --disk <image.raw> --cpu 2 --me
   by its agent on the virtio NIC) can reach the namespace's address and nothing beyond it, so
   no setting inside Windows can open egress. Every clone of one snapshot has the same address
   inside its own namespace, as Linux clones do.
-- **The host side.** fcvm runs one helper inside the namespace (entered with `nsenter` into the
-  holder's namespaces, killed with the VM by `PR_SET_PDEATHSIG`): it relays each connection to
-  the VM's Unix socket `rdp.sock` in its data directory to 10.0.2.100:3389, and serves the
-  clock line below on 10.0.2.1:4600. The bridge reaches Remote Desktop only through
+- **The host side.** fcvm runs one helper inside the namespace (it enters the holder's
+  namespaces in its own `pre_exec`, then arms `PR_SET_PDEATHSIG`, so it dies with the VM): it
+  relays each connection to the VM's Unix socket `rdp/rdp.sock` in its data directory (the
+  directory 0700, the socket 0600, every peer's uid checked against fcvm's) to
+  10.0.2.100:3389, and serves the clock line below on 10.0.2.1:4600. A guest restart boots the
+  same disk again in place, with the same helper. The bridge reaches Remote Desktop only through
   `rdp.sock` (FreeRDP connects to a Unix socket path directly); no port is published.
 - **The restore generation and the clock.** On each connection to 10.0.2.1:4600 fcvm sends
   `<generation> <host time in ms>`, the generation being the VM's id. The guest agent asks ten
