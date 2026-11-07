@@ -853,11 +853,14 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    kmod, cpio and patch are `make install-host-kernel`'s (bindeb-pkg); that
 #    target checks them, and 40 GiB free in its build directory, before it
 #    compiles anything (scripts/check-host-kernel-build.sh), and builds on
-#    /mnt/fcvm-btrfs when /tmp is on the root disk.
+#    /mnt/fcvm-btrfs when /tmp is on the root disk. iperf3 and nfs-kernel-server
+#    are the nested tests': the network ones start an iperf3 server on the host,
+#    the NFS ones export through the host's NFS server, and without them both
+#    fail in under 2 s with "No such file or directory".
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
     btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    debhelper libdw-dev rsync kmod cpio patch
+    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
