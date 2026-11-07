@@ -263,7 +263,7 @@ case "$args" in
   *" ssm get-command-invocation "*"--query Status "*)
     [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"
     case "$args" in *cmd-after*) [ -z "${FAKE_SSM_STUCK:-}" ] || { echo Pending; exit 0; } ;; esac; echo Success ;;
-  *" ssm get-command-invocation "*) [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"; case "$args" in *cmd-after*) echo boot-2 ;; *) echo boot-1 ;; esac ;;
+  *" ssm get-command-invocation "*) [ -z "${FAKE_SSM_SLOW:-}" ] || sleep "$FAKE_SSM_SLOW"; case "$args" in *cmd-after*) echo 22222222-2222-2222-2222-222222222222 ;; *) echo 11111111-1111-1111-1111-111111111111 ;; esac ;;
   *" ssm describe-instance-information "*) echo Online ;;
   # S3 in $FAKE_S3: a key is a file, its ETag beside it; put-object --if-none-match * creates
   # it only if absent, delete-object --if-match deletes it only at that ETag.
@@ -448,17 +448,21 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertEqual(len(launches), 1, r.stderr)
                 self.assertIn(f"--image-id {ami} ", launches[0])
 
-    def test_a_builder_reboot_ends_on_a_new_boot_an_impaired_host_or_its_deadline(self):
-        # 2026-11-07: a host builder's EC2 host failed its system status check during the
-        # reboot step; every SSM command stayed Pending and the step never returned.
+    def test_a_builder_reboot_ends_on_a_new_boot_or_its_deadline(self):
+        # 2026-11-07: every SSM command stayed Pending during a host builder's reboot and the
+        # step never returned. A g4dn.metal's reboot also reads "impaired" for minutes while
+        # its firmware runs; that is no reason to give up on it (bake from 7ecbe19b).
         cmd = ["bash", os.path.join(HERE, "..", "ami", "build-ami.sh"), "reboot", "i-builder"]
         fast = {"REBOOT_SETTLE": "0", "REBOOT_WAIT": "5", "FAKE_SSM": "1"}
         r, _, _ = self.up(cmd=cmd, **fast)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "rebooted"), r.stderr)
+        r, _, _ = self.up(cmd=cmd, FAKE_SYSTEM_STATUS="impaired", **fast)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "rebooted"), r.stderr)
+        self.assertIn("system status: impaired", r.stderr)
         start = time.time()
         r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", FAKE_SYSTEM_STATUS="impaired", **fast)
         self.assertNotEqual(r.returncode, 0, r.stderr)
-        self.assertIn("system status check failed", r.stderr)
+        self.assertIn("no new boot on i-builder within 5 s of the reboot (system status: impaired)", r.stderr)
         r, _, _ = self.up(cmd=cmd, FAKE_SSM_STUCK="1", **fast)
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertIn("no new boot on i-builder within 5 s", r.stderr)

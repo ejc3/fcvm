@@ -150,26 +150,29 @@ wait)
   ;;
 sh) ssm_sh "$2" "$3" ;;
 reboot)
-  # Each probe is bounded, and a failed system status check ends the wait: on 2026-11-07 a
-  # host builder's EC2 host failed its reachability check during this reboot, every SSM command
-  # stayed Pending, and the step waited without end.
+  # A g4dn.metal's warm reboot runs the machine's firmware again: 15 minutes from the request
+  # to the new boot, measured on 2026-11-07 (15m01s and 15m14s), during which EC2 reports the
+  # system status check "impaired" for several minutes. That is the reboot, not a failure:
+  # the step waits it out, every probe bounded, and fails only at REBOOT_WAIT.
   old=$(ssm_try "$2" "cat /proc/sys/kernel/random/boot_id" 300 | head -1)
-  [ -n "$old" ] || { say "no boot id from $2 before the reboot; nothing rebooted"; exit 1; }
+  [[ "$old" =~ ^[0-9a-f-]{36}$ ]] || { say "no boot id from $2 before the reboot; nothing rebooted"; exit 1; }
   A ec2 reboot-instances --instance-ids "$2"
+  t0=$(now)
   sleep "${REBOOT_SETTLE:-60}"
-  end=$(($(now) + ${REBOOT_WAIT:-900}))
+  end=$((t0 + ${REBOOT_WAIT:-1800}))
+  sys=""
   while [ "$(now)" -lt "$end" ]; do
     cap=$(($(now) + 30)); [ "$cap" -le "$end" ] || cap=$end
-    sys=$(within "$cap" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
+    s=$(within "$cap" ec2 describe-instance-status --instance-ids "$2" --include-all-instances \
       --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null || true)
-    [ "$sys" = impaired ] && { say "$2's system status check failed after the reboot (its EC2 host, not the instance): stop and start it, which moves it to other hardware and boots it"; exit 1; }
+    [ "$s" != "$sys" ] && [ -n "$s" ] && { say "$2's system status: $s after $(($(now) - t0)) s"; sys=$s; }
     left=$((end - $(now))); [ "$left" -le 60 ] || left=60
     new=$(ssm_try "$2" "cat /proc/sys/kernel/random/boot_id" "$left" | head -1 || true)
-    [ -n "$new" ] && [ "$new" != "$old" ] && { echo "rebooted"; exit 0; }
+    [[ "$new" =~ ^[0-9a-f-]{36}$ ]] && [ "$new" != "$old" ] && { say "new boot after $(($(now) - t0)) s"; echo "rebooted"; exit 0; }
     left=$((end - $(now))); [ "$left" -le 15 ] || left=15
     [ "$left" -le 0 ] || sleep "$left"
   done
-  say "no new boot on $2 within ${REBOOT_WAIT:-900} s of the reboot"; exit 1
+  say "no new boot on $2 within ${REBOOT_WAIT:-1800} s of the reboot (system status: ${sys:-unknown})"; exit 1
   ;;
 image)
   # Publish only the guard actually installed on this builder, checked against
