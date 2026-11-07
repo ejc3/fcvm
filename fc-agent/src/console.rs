@@ -113,6 +113,50 @@ fn writable_len(pending: &[u8], tail_since: Option<Instant>, now: Instant) -> us
     }
 }
 
+/// Follow the unfinished line at the end of `pending` and return when it began to wait for
+/// its newline. A line is known by where it starts, counted in bytes ever appended at the back
+/// of `pending` (`appended`), so a new unfinished line gets a fresh wait even when no newline
+/// was read since the last one ended, and a line inserted at the front (the recovery summary)
+/// does not restart the wait of the line it is inserted before.
+fn track_tail(
+    pending: &[u8],
+    appended: u64,
+    tail: &mut Option<(u64, Instant)>,
+    now: Instant,
+) -> Option<Instant> {
+    let whole = pending
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |at| at + 1);
+    let unfinished = (pending.len() - whole) as u64;
+    if unfinished == 0 {
+        *tail = None;
+        return None;
+    }
+    let start = appended - unfinished;
+    match *tail {
+        Some((at, since)) if at == start => Some(since),
+        _ => {
+            *tail = Some((start, now));
+            Some(now)
+        }
+    }
+}
+
+/// How long the writer's poll may wait, in ms: until the held line's wait ends when that is
+/// what it waits for, else the regular tick. While gated nothing can be written, so the end of
+/// a hold is no reason to wake.
+fn poll_tick(tail_since: Option<Instant>, want_write: bool, gated: bool, now: Instant) -> u16 {
+    match tail_since {
+        Some(since) if !want_write && !gated => {
+            let left = PARTIAL_LINE_HOLD.saturating_sub(now.saturating_duration_since(since));
+            // At least 1 ms, so a hold that just ended does not poll with no wait.
+            (left.as_millis() as u16).clamp(1, POLL_TICK_MS)
+        }
+        _ => POLL_TICK_MS,
+    }
+}
+
 /// Writer thread poll tick. Bounds how quickly the writer notices a gate
 /// transition; pipe data wakes it immediately via POLLIN.
 const POLL_TICK_MS: u16 = 100;
@@ -265,8 +309,10 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
 fn writer_loop(state: Arc<ConsoleShared>) {
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut buf = [0u8; 8192];
-    // When the unfinished line at the end of `pending` began to wait for its newline.
-    let mut tail_since: Option<Instant> = None;
+    // Bytes ever appended at the back of `pending`, and the unfinished line at its end:
+    // where it starts in those terms and when it began to wait (see `track_tail`).
+    let mut appended: u64 = 0;
+    let mut tail: Option<(u64, Instant)> = None;
 
     loop {
         // Poll: always watch the pipe; watch the console for writability only
@@ -274,16 +320,10 @@ fn writer_loop(state: Arc<ConsoleShared>) {
         // A held unfinished line is not something to write yet: waiting on POLLOUT for it
         // would spin, so the poll waits for the pipe or the end of the hold instead.
         let now = Instant::now();
-        let want_write = state.gate.load(Ordering::SeqCst) == 0
-            && writable_len(pending.make_contiguous(), tail_since, now) > 0;
-        let tick = match tail_since {
-            Some(since) if !want_write => {
-                let left = PARTIAL_LINE_HOLD.saturating_sub(now.saturating_duration_since(since));
-                // At least 1 ms, so a hold that just ended does not poll with no wait.
-                (left.as_millis() as u16).clamp(1, POLL_TICK_MS)
-            }
-            _ => POLL_TICK_MS,
-        };
+        let gated = state.gate.load(Ordering::SeqCst) != 0;
+        let tail_since = tail.map(|(_, since)| since);
+        let want_write = !gated && writable_len(pending.make_contiguous(), tail_since, now) > 0;
+        let tick = poll_tick(tail_since, want_write, gated, now);
         {
             let mut fds = [
                 PollFd::new(state.pipe_rd.as_fd(), PollFlags::POLLIN),
@@ -304,7 +344,6 @@ fn writer_loop(state: Arc<ConsoleShared>) {
         }
 
         // 1) Drain the pipe (non-blocking) so producers can never wedge on it.
-        let mut saw_newline = false;
         loop {
             match read(&state.pipe_rd, &mut buf) {
                 Ok(0) => break, // all write ends closed (cannot happen: we hold one)
@@ -313,7 +352,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                     let room = PENDING_CAP.saturating_sub(pending.len());
                     let keep = n.min(room);
                     pending.extend(&buf[..keep]);
-                    saw_newline |= buf[..keep].contains(&b'\n');
+                    appended += keep as u64;
                     if keep < n {
                         let over = (n - keep) as u64;
                         // Dropped bytes are disposed: the enqueued/disposed
@@ -331,14 +370,12 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             }
         }
 
-        // The unfinished line's wait starts when it is first seen and ends with it. A
-        // newline read now ends the line that was waiting, so a tail after it is a new one.
-        if saw_newline || pending.back().is_none_or(|&b| b == b'\n') {
-            tail_since = None;
-        }
-        if pending.back().is_some_and(|&b| b != b'\n') && tail_since.is_none() {
-            tail_since = Some(Instant::now());
-        }
+        let tail_since = track_tail(
+            pending.make_contiguous(),
+            appended,
+            &mut tail,
+            Instant::now(),
+        );
 
         // 2) Flush pending to the console — never while gated, never blocking.
         // Whole lines only, each write one contiguous run (see PARTIAL_LINE_HOLD).
@@ -377,9 +414,11 @@ fn writer_loop(state: Arc<ConsoleShared>) {
         }
 
         // 3) Console proven alive again after drops: emit ONE summary line.
-        // Only after a fully successful flush (wrote_any && empty) so a dead
-        // console can't loop summary → drop → summary.
-        if wrote_any && pending.is_empty() {
+        // Only after a fully successful flush (wrote_any, and nothing left that may be
+        // written now) so a dead console can't loop summary → drop → summary. An unfinished
+        // line held back may remain; the summary goes in front of it, so it is neither held
+        // behind that line nor joined to it.
+        if wrote_any && writable_len(pending.make_contiguous(), tail_since, Instant::now()) == 0 {
             let dropped = state.dropped.swap(0, Ordering::SeqCst);
             if dropped > 0 {
                 let line = format!(
@@ -391,7 +430,9 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                 state
                     .enqueued
                     .fetch_add(line.len() as u64, Ordering::SeqCst);
-                pending.extend(line.as_bytes());
+                for &b in line.as_bytes().iter().rev() {
+                    pending.push_front(b);
+                }
             }
         }
     }
@@ -884,6 +925,76 @@ mod tests {
         );
         let long = vec![b'x'; PARTIAL_LINE_CAP];
         assert_eq!(writable_len(&long, Some(now), now), PARTIAL_LINE_CAP);
+    }
+
+    /// An unfinished line is known by where it starts: one that grows keeps its wait, a new
+    /// one after a line ended gets a fresh wait even when no newline was read in between,
+    /// and the recovery summary inserted in front does not restart the wait behind it.
+    #[test]
+    fn an_unfinished_line_keeps_its_own_wait() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(500);
+        let mut tail = None;
+        assert_eq!(track_tail(b"", 0, &mut tail, t0), None);
+        assert_eq!(track_tail(b"old", 3, &mut tail, t0), Some(t0));
+        assert_eq!(
+            track_tail(b"oldmore", 7, &mut tail, t1),
+            Some(t0),
+            "the same line grew"
+        );
+        assert_eq!(
+            track_tail(b"summary\noldmore", 7, &mut tail, t1),
+            Some(t0),
+            "a line inserted in front"
+        );
+        // "oldmore" was written once its wait ended, the summary went in front of nothing,
+        // and the next read brought a fragment with no newline.
+        assert_eq!(
+            track_tail(b"summary\nfrag", 11, &mut tail, t1),
+            Some(t1),
+            "a new fragment inherited the wait of the line before it"
+        );
+        assert_eq!(track_tail(b"frag\n", 12, &mut tail, t1), None);
+    }
+
+    #[test]
+    fn a_gated_writer_does_not_wake_for_the_end_of_a_hold() {
+        let now = Instant::now();
+        let ended = now - PARTIAL_LINE_HOLD;
+        assert_eq!(poll_tick(Some(ended), false, true, now), POLL_TICK_MS);
+        assert_eq!(poll_tick(Some(ended), false, false, now), 1);
+        assert_eq!(poll_tick(Some(now), false, false, now), 100);
+        assert_eq!(poll_tick(None, true, false, now), POLL_TICK_MS);
+    }
+
+    /// The recovery summary is not held behind an unfinished line: output that always ends
+    /// with a fresh unfinished line keeps `pending` from ever being empty.
+    #[test]
+    fn the_recovery_summary_is_not_held_behind_an_unfinished_line() {
+        let (console_wr, mut console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        state.dropped.store(4, Ordering::SeqCst);
+        let mut seen: Vec<u8> = Vec::new();
+        write_pipe(&state, b"start");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while Instant::now() < deadline && !found {
+            // Each write ends the line before it and starts a new one, well inside the hold.
+            write_pipe(&state, b"\nnext");
+            std::thread::sleep(Duration::from_millis(20));
+            drain_console(&mut console_rd, &mut seen);
+            found = String::from_utf8_lossy(&seen)
+                .contains("dropped 4 bytes of log output while the console was stalled");
+        }
+        let text = String::from_utf8_lossy(&seen);
+        assert!(
+            found,
+            "no recovery summary while lines kept flowing: {text:?}"
+        );
+        assert!(
+            text.lines().all(|l| !l.contains("next[fc-agent]")),
+            "the summary was joined to an unfinished line: {text:?}"
+        );
     }
 
     #[test]
