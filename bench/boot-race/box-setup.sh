@@ -1,8 +1,10 @@
 #!/bin/bash
-# Set up a parallel box (pbox up N kvm-96) for a boot-race campaign: host prep from CLAUDE.md "Fresh Bare-Metal
+# Set up a parallel box (pbox up N kvm-96 --local-nvme) for a boot-race campaign: host prep from CLAUDE.md "Fresh Bare-Metal
 # Box Quickstart", fcvm at a pinned commit, then the workload image. Run as ubuntu: box-setup.sh <fcvm commit>.
 # Expects ~/boot-race/img/{boot-race-workload,Containerfile} copied from bench/boot-race/workload.
 set -euxo pipefail
+SCRATCH_HELPER="$(cd -- "$(dirname -- "$0")" && pwd)/scratch.py"
+sudo -n python3 -I "$SCRATCH_HELPER" check
 sudo usermod -aG kvm ubuntu
 sudo tee /etc/sysctl.d/99-fcvm.conf >/dev/null <<'SYSCTL'
 kernel.unprivileged_userns_clone=1
@@ -14,14 +16,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 update -q
 sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 install -y -q build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
     btrfs-progs bc bison flex libelf-dev libseccomp-dev python3-boto3 python3-botocore sysstat
-# The pbox bootstrap assembles the instance store as md127 (ext4 at /mnt/nvme). fcvm wants btrfs: reformat it.
-if ! mountpoint -q /mnt/fcvm-btrfs; then
-  [ -z "$(ls -A /mnt/nvme 2>/dev/null | grep -v lost+found)" ] || { echo "/mnt/nvme not empty"; exit 1; }
-  sudo umount /mnt/nvme || true
-  sudo mkfs.btrfs -f /dev/md127
-  sudo mkdir -p /mnt/fcvm-btrfs && sudo mount /dev/md127 /mnt/fcvm-btrfs
-  sudo chown ubuntu:ubuntu /mnt/fcvm-btrfs
-fi
+sudo -n python3 -I "$SCRATCH_HELPER" prepare
 [ -e /dev/userfaultfd ] || sudo mknod /dev/userfaultfd c 10 126
 sudo chmod 666 /dev/userfaultfd
 sudo sysctl -w vm.unprivileged_userfaultfd=1

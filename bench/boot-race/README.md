@@ -27,8 +27,8 @@ after RunTask; t0 is the time before, and the invoke's own cost is recorded besi
 - `workload/`: the program every lane runs (std-only Rust, static). In HTTP mode it serves `GET /`; as a Lambda
   custom runtime `bootstrap` it runs the Runtime API loop, and exits after each response when
   `BOOT_RACE_EXIT_AFTER_RESPONSE=1`. Each answer carries a random id drawn at process start and the kernel boot id.
-- `box-setup.sh`: prepares a fresh parallel box (host settings, btrfs on the instance store, fcvm at a pinned commit,
-  the workload image).
+- `box-setup.sh` and `scratch.py`: prepare a fresh parallel box (host settings, Btrfs on verified instance storage,
+  fcvm at a pinned commit, the workload image). Copy both files into the same directory.
 - `fcvm-prep.sh`: boots the workload in a 1 vCPU, 2 GiB VM, snapshots it, starts the memory server.
 - `prepare.py`: pushes the image, uploads the Lambda code, makes the AMI, launches the stopped and hibernated
   instances and the ECS container instance, and cleans up.
@@ -40,8 +40,24 @@ after RunTask; t0 is the time before, and the invoke's own cost is recorded besi
 
 ## Running a campaign
 
-The AWS resources and the `boot-race-driver` role are in ejc3/aws `boot-race.tf`. On a parallel box in us-east-2
-(`pbox up N kvm-96`) with fcvm built and set up (`make build && make setup-fcvm`):
+The AWS resources and the `boot-race-driver` role are in ejc3/aws `boot-race.tf`. Once the campaign is
+approved and the NVMe launch filter is deployed, use a fresh Ohio pbox with KVM and local instance storage:
+
+```bash
+pbox up N kvm-96 --local-nvme
+```
+
+That option tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`. Plain `kvm-96` can select a box with
+no instance store. After the pbox bootstrap has mounted `/mnt/nvme`, copy `box-setup.sh` and `scratch.py`
+together and run `box-setup.sh <fcvm commit>` on the pbox before starting any other jobs there. It verifies the exact mounted block device and
+all of its backing disks before installing anything. It converts only the empty pbox ext4 filesystem
+labeled `local-nvme` to the benchmark Btrfs mount. An already prepared mount is reused only after the
+same storage checks. If the check fails, use a fresh compatible pbox; keep persistent work and root disks
+out of the benchmark. Setup restores the original ext4 mount on pre-format failures when the same
+filesystem can still be verified. If formatting starts but Btrfs cannot mount, setup stops; a fresh
+compatible pbox is the safe retry.
+
+With fcvm built and set up:
 
 ```bash
 make build-boot-race-workload                      # copy the binary to the box, podman build workload/Containerfile
@@ -57,4 +73,4 @@ python3 bench/chromium/records.py move --campaign $CAMPAIGN --records $RECORDS b
 python3 bench/chromium/records.py manifest --campaign $CAMPAIGN --records $RECORDS bench/boot-race/results/$CAMPAIGN
 ```
 
-`make test-boot-race` runs the workload's and the renderer's tests.
+`make test-boot-race` runs the workload and Python harness tests, including the storage guard regressions.
