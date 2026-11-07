@@ -130,7 +130,8 @@ admit_unlock() {
   ADMIT_ETAG=""
 }
 # The ledger's entries of the last ADMIT_LEDGER_S seconds: "<unix time> <instance id> <market>
-# <vCPUs>". Fails when the ledger exists and cannot be read, or holds a line of any other shape.
+# <vCPUs>", market spot or on-demand. Fails when the ledger exists and cannot be read, or holds a
+# recent line of any other shape.
 ledger_recent() {
   local t f; t=$(now); f=$(mktemp)
   if ! S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err"; then
@@ -140,8 +141,9 @@ ledger_recent() {
   # An expired line is dropped whatever its shape: the ledger is rewritten only by ledger_add,
   # which reads it first, so a refused expired line would refuse every launch for good.
   awk -v t="$t" -v keep=$ADMIT_LEDGER_S 'NF == 0 || ($1 ~ /^[0-9]+$/ && t - $1 > keep) {next}
-       NF != 4 || $1 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ {bad = 1; next} {print} END {exit bad}' "$f" \
-    || { say "the admission ledger s3://$BUCKET/$ADMIT_LEDGER holds a line that is not \"<time> <id> <market> <vCPUs>\""; rm -f "$f" "$f.err"; return 1; }
+       NF != 4 || $1 !~ /^[0-9]+$/ || ($3 != "spot" && $3 != "on-demand") || $4 !~ /^[0-9]+$/ {bad = 1; next}
+       {print} END {exit bad}' "$f" \
+    || { say "the admission ledger s3://$BUCKET/$ADMIT_LEDGER holds a line that is not \"<time> <id> <spot|on-demand> <vCPUs>\""; rm -f "$f" "$f.err"; return 1; }
   rm -f "$f" "$f.err"
 }
 ledger_add() { # id market vcpus

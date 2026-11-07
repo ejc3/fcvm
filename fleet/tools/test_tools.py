@@ -604,7 +604,8 @@ class GpuboxWallReserve(unittest.TestCase):
         # an expired line is dropped whatever its shape, and the rewritten ledger is four-field.
         import tempfile
         now = int(time.time())
-        for line, admitted in ((f"{now} i-other on-demand", 0), (f"{now - 7200} i-other on-demand", 1)):
+        for line, admitted in ((f"{now} i-other on-demand", 0), (f"{now} i-other on-demnad 96", 0),
+                               (f"{now - 7200} i-other on-demand", 1)):
             with self.subTest(line=line):
                 s3 = tempfile.mkdtemp()
                 os.makedirs(os.path.join(s3, "gpubox"))
@@ -617,7 +618,7 @@ class GpuboxWallReserve(unittest.TestCase):
                 if admitted:
                     self.assertEqual([len(row) for row in rows], [4], rows)
                 else:
-                    self.assertIn("is not \"<time> <id> <market> <vCPUs>\"", r.stderr)
+                    self.assertIn("is not \"<time> <id> <spot|on-demand> <vCPUs>\"", r.stderr)
 
     def test_a_held_lock_is_broken_once_stale(self):
         import tempfile
