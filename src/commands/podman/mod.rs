@@ -2493,10 +2493,8 @@ async fn prepare_vm_for_lifecycle(
     // Services use mutual TLS with client certs, not source IP matching.
     let egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
         let socket_path = vsock_socket_path.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
-                tracing::warn!("Egress proxy error: {}", e);
-            }
+        Some(crate::companion::spawn_task("egress proxy", async move {
+            crate::network::egress_proxy::run_egress_proxy(&socket_path).await
         }))
     } else {
         None
@@ -2961,6 +2959,20 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 watchdog
                     .fire(ctx.vm_manager.as_mut())
                     .context("killing a VMM whose guest did not power off")?;
+            }
+            // The namespace holder or pasta died: the VM has lost its network for good.
+            // End it with the companion's own name, status and last stderr output (#852).
+            message = crate::companion::registered_death("namespace holder", &mut ctx.holder_child) => {
+                tracing::error!("{message}");
+                bail!("a process this VM depends on died: {message}");
+            }
+            message = ctx.network.companion_death() => {
+                tracing::error!("{message}");
+                bail!("a process this VM depends on died: {message}");
+            }
+            message = crate::companion::task_death("egress proxy", &mut ctx.egress_proxy_handle) => {
+                tracing::error!("{message}");
+                bail!("a process this VM depends on died: {message}");
             }
             status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "Firecracker child exited");
@@ -3706,7 +3718,12 @@ async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
 
     let mut companions = vec![("status listener", ctx.status_handle)];
     if let Some(handle) = ctx.egress_proxy_handle.take() {
-        companions.push(("egress proxy", handle));
+        handle.abort();
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                companion_errors.push(format!("joining egress proxy: {error}"));
+            }
+        }
     }
     if let Some(handle) = ctx.bootplan_handle.take() {
         companions.push(("boot-plan listener", handle));
