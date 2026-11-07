@@ -8,7 +8,7 @@ IMAGE ?= localhost/fcvm-windows-bridge:$(TAG)
 # Extra podman build flags (a proxy on the host's loopback needs --network=host).
 BUILD_FLAGS ?=
 
-.PHONY: bridge-image bridge-image-id test-host
+.PHONY: bridge-image bridge-image-id test-host test-host-asan
 bridge-image-id:
 	@echo $(ID)
 
@@ -17,3 +17,6 @@ bridge-image:
 
 test-host:
 	$(MAKE) -C bridge test-host
+
+test-host-asan:
+	$(MAKE) -C bridge test-host-asan

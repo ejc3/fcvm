@@ -14,7 +14,7 @@ HOST_SRC := logic.cpp x264enc.cpp $(RSRC)/json.cpp $(RSRC)/admit.cpp $(RSRC)/h26
 ALL_SRC := $(HOST_SRC) rdp.cpp bridge.cpp main.cpp $(RSRC)/subscriber.cpp $(RSRC)/server.cpp $(RSRC)/jpeg.cpp \
 	$(RSRC)/tls.cpp $(RSRC)/access.cpp
 
-.PHONY: all test-host clean
+.PHONY: all test-host test-host-asan clean
 all: $(OUT)/windows-bridge $(OUT)/test-host
 
 $(OUT)/windows-bridge: $(ALL_SRC) *.h $(RSRC)/*.h
@@ -28,6 +28,16 @@ $(OUT)/test-host: test_host.cpp $(HOST_SRC) *.h $(RSRC)/*.h
 
 test-host: $(OUT)/test-host
 	$(OUT)/test-host
+
+# The same tests under AddressSanitizer (with LeakSanitizer) and UndefinedBehaviorSanitizer,
+# float-to-integer overflow included (GCC leaves it out of `undefined`); any report fails.
+SAN := -fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer
+$(OUT)/test-host-asan: test_host.cpp $(HOST_SRC) *.h $(RSRC)/*.h
+	@mkdir -p $(OUT)
+	$(CXX) -O1 -g $(SAN) -std=c++17 -Wall -Wextra -Wno-unused-parameter -I. -I$(RSRC) -I$(RTESTS) -o $@ test_host.cpp $(HOST_SRC) $(LDLIBS)
+
+test-host-asan: $(OUT)/test-host-asan
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 $(OUT)/test-host-asan
 
 clean:
 	rm -rf $(OUT)
