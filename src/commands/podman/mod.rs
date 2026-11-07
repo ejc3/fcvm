@@ -48,6 +48,8 @@ pub(crate) use vm_config::{
     guest_dns, setup_nfs_exports, GuestBootInputs, GuestDns,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
+// `fcvm vm run` builds a raw VM's rootless namespace the way a container VM's is built.
+pub(crate) use namespace::setup_rootless_namespace;
 
 use crate::hypervisor::firecracker::FirecrackerBackend;
 
@@ -1280,7 +1282,7 @@ async fn invalidate_unusable_snapshot(
 /// before the VM is fully set up. When setup fails partway, remove both so failed
 /// runs don't leave phantom `fcvm ls` entries, allocated loopback IPs, or per-VM
 /// disk directories behind.
-async fn cleanup_failed_prepare(
+pub(crate) async fn cleanup_failed_prepare(
     state_manager: &StateManager,
     vm_id: &str,
     data_dir: &std::path::Path,
@@ -3834,7 +3836,7 @@ pub(crate) fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Re
 /// VM state file, and the data directory behind. Shutdown is deferred until setup finishes,
 /// then the caller's cleanup runs. The request cancels every lifecycle gate of the process,
 /// including one a cache-hit restore creates later (`common::request_process_shutdown`).
-fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
+pub(crate) fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {

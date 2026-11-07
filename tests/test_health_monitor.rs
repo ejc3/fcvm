@@ -86,6 +86,10 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             balloon_free_page_reporting: false,
             gpus: Vec::new(),
             container_start_version: None,
+            guest: Default::default(),
+            firmware: None,
+            health_port: None,
+            rdp_socket: None,
         },
     }
 }

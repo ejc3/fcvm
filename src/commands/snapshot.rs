@@ -1125,6 +1125,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // memory dump) is dispatched below when args.disk_only is set.
 
     ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
+    ensure_raw_snapshot_supported(&vm_state, &args)?;
     if args.gpu_warm {
         anyhow::ensure!(
             matches!(
@@ -1279,8 +1280,12 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             continue;
         }
 
-        let vsock_socket_path =
-            super::common::recorded_vsock_socket_path(&fresh_state)?.to_path_buf();
+        // A raw guest has no vsock and no fc-agent to reach over one.
+        let vsock_socket_path = if fresh_state.config.guest.runs_fc_agent() {
+            Some(super::common::recorded_vsock_socket_path(&fresh_state)?.to_path_buf())
+        } else {
+            None
+        };
         break (
             generation_locks,
             vm_lock,
@@ -1326,7 +1331,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         super::common::create_disk_only_snapshot_core(
             snapshot_config.clone(),
             &vm_disk_path,
-            &vsock_socket_path,
+            fc_agent_vsock(&vsock_socket_path)?,
         )
         .await?;
         None
@@ -1336,7 +1341,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         // creator takes the same hook.
         let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
         let table_vsock = vsock_socket_path.clone();
-        let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
+        let fetch_tables = move || crate::volume::fetch_inode_tables(fc_agent_vsock(&table_vsock)?);
         let inode_tables: super::common::SnapshotExtraFiles<'_> = if has_portable {
             Some(&fetch_tables)
         } else {
@@ -1360,13 +1365,14 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         match vm_state.config.hypervisor {
             crate::hypervisor::Backend::Firecracker => {
                 use crate::firecracker::FirecrackerClient;
+                let vsock_socket_path = fc_agent_vsock(&vsock_socket_path)?;
                 let client = FirecrackerClient::new(socket_path.clone())?;
                 let core = || {
                     super::common::create_snapshot_core(
                         &client,
                         snapshot_config.clone(),
                         &vm_disk_path,
-                        &vsock_socket_path,
+                        vsock_socket_path,
                         parent_dir.as_deref(),
                         inode_tables,
                         if args.stop {
@@ -1382,7 +1388,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                             .unwrap_or_default();
                     let mut steps = FirecrackerWarmGpu {
                         client: &client,
-                        vsock_socket: &vsock_socket_path,
+                        vsock_socket: vsock_socket_path,
                         vm_id: &vm_state.vm_id,
                         core: Some(core),
                         timings: Vec::new(),
@@ -1410,7 +1416,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &client,
                     snapshot_config.clone(),
                     &vm_disk_path,
-                    &vsock_socket_path,
+                    super::common::ChSnapshotGuest::of(&vm_state, vsock_socket_path.as_deref())?,
                     inode_tables,
                 )
                 .await?;
@@ -1570,6 +1576,42 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// The vsock socket of a VM's fc-agent, for the snapshot steps only fc-agent can do. A raw
+/// guest has none (`snapshot create` records `None` for it).
+fn fc_agent_vsock(vsock_socket_path: &Option<PathBuf>) -> Result<&Path> {
+    vsock_socket_path
+        .as_deref()
+        .context("a raw VM runs no fc-agent")
+}
+
+/// What `snapshot create` can do with a raw VM (no fc-agent): a Cloud Hypervisor memory
+/// snapshot, pause, save and resume. A disk-only capture freezes the guest's filesystems
+/// through fc-agent, `--gpu-warm` checkpoints CUDA through it, and `--stop` and
+/// `--inherit-working-set` are for Firecracker snapshots.
+fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) -> Result<()> {
+    if vm_state.config.guest.runs_fc_agent() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        vm_state.config.hypervisor == crate::hypervisor::Backend::CloudHypervisor,
+        "VM {} is a raw VM on {}; raw VMs run on Cloud Hypervisor",
+        vm_state.vm_id,
+        vm_state.config.hypervisor
+    );
+    for (set, flag) in [
+        (args.disk_only, "--disk-only"),
+        (args.gpu_warm, "--gpu-warm"),
+        (args.stop, "--stop"),
+        (args.inherit_working_set, "--inherit-working-set"),
+    ] {
+        anyhow::ensure!(
+            !set,
+            "{flag} is not supported for a raw VM: it runs no fc-agent"
+        );
+    }
+    Ok(())
 }
 
 /// How long serve shutdown waits for clones to exit after SIGTERM before escalating to SIGKILL.
@@ -2665,6 +2707,19 @@ async fn cmd_snapshot_run_inner(
         )
         .await;
     }
+    // A raw guest (no fc-agent) has none of the listeners and handshakes below: it
+    // restores, resumes, and is published when its RDP stack answers.
+    if !snapshot_config.metadata.guest.runs_fc_agent() {
+        return cmd_snapshot_run_raw(
+            snapshot_name,
+            snapshot_config,
+            args,
+            port_mappings,
+            snapshot_shared_lock,
+            lifecycle_gate,
+        )
+        .await;
+    }
 
     info!(
         snapshot = %snapshot_name,
@@ -3658,6 +3713,7 @@ async fn cmd_snapshot_run_inner(
         balloon_target_mib: args.balloon,
         gpus: &gpus,
         identity: &restore_identity,
+        raw_ns_helper: None,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
@@ -5270,6 +5326,230 @@ fn default_clone_name(snapshot_name: &str, vm_id: &str) -> String {
 /// `dir_lock` is the shared per-snapshot lock held by the caller; it is dropped
 /// once `prepare_vm` has reflinked the disk out of the snapshot directory, so a
 /// concurrent re-create of the tag can't swap the disk mid-reflink.
+/// Refuse what a restore of a raw guest's snapshot cannot do. A published port needs a route
+/// out of the namespace, which a raw VM does not have. The rest reach the guest through
+/// fc-agent (a command, volumes, a restore hook, the huge page mode, a vsock directory),
+/// need a memory server or a passthrough device, or pick a routed address.
+fn ensure_raw_restore_supported(
+    args: &SnapshotRunArgs,
+    meta: &crate::storage::SnapshotMetadata,
+) -> Result<()> {
+    anyhow::ensure!(
+        meta.hypervisor == crate::hypervisor::Backend::CloudHypervisor,
+        "a raw VM's snapshot made on {} cannot be restored; raw VMs run on Cloud Hypervisor",
+        meta.hypervisor
+    );
+    anyhow::ensure!(
+        meta.network_mode == FcNetworkMode::Rootless,
+        "a raw VM's snapshot restores with rootless networking only"
+    );
+    anyhow::ensure!(
+        args.publish.is_empty(),
+        "--publish is not supported when restoring a raw VM: its namespace has no route out, \
+         and Remote Desktop is reached through the clone's rdp.sock"
+    );
+    for (given, flag) in [
+        (args.pid.is_some(), "--pid (a memory server)"),
+        (args.exec.is_some(), "--exec"),
+        (!args.map.is_empty(), "--map"),
+        (!args.gpu.is_empty(), "--gpu"),
+        (args.on_restore.is_some(), "--on-restore"),
+        (args.guest_thp.is_some(), "--guest-thp"),
+        (args.vsock_dir.is_some(), "--vsock-dir"),
+        (args.ipv6_address.is_some(), "--ipv6-address"),
+        (args.prepare.is_some(), "a prepare"),
+    ] {
+        anyhow::ensure!(
+            !given,
+            "{flag} is not supported when restoring a raw VM: it runs no fc-agent"
+        );
+    }
+    Ok(())
+}
+
+/// `snapshot run` of a raw guest's snapshot (`fcvm vm run`, no fc-agent).
+///
+/// The Cloud Hypervisor restore without what fc-agent does in a Linux clone: no status,
+/// boot-plan or output listener, no restore epoch, no wait for the guest's acknowledgement,
+/// no console watchdog, no pasta and no published port. The namespace helper starts in the
+/// clone's namespace before the guest resumes (`RestoreParams::raw_ns_helper`): the guest
+/// agent reads from its clock line that it was restored and the host's time, and
+/// acknowledges. The clone is healthy once it has acknowledged its own generation with the
+/// host's time and Remote Desktop answers through its rdp.sock, which is when the bridge can
+/// connect.
+async fn cmd_snapshot_run_raw(
+    snapshot_name: String,
+    snapshot_config: crate::storage::SnapshotConfig,
+    args: SnapshotRunArgs,
+    port_mappings: Vec<crate::network::PortMapping>,
+    snapshot_shared_lock: std::fs::File,
+    lifecycle_gate: super::common::LifecycleReadyGate,
+) -> Result<()> {
+    let meta = &snapshot_config.metadata;
+    ensure_raw_restore_supported(&args, meta)?;
+    anyhow::ensure!(
+        port_mappings.is_empty(),
+        "the raw VM's snapshot records published ports ({port_mappings:?}); raw VMs publish none"
+    );
+    info!(
+        snapshot = %snapshot_name,
+        guest = ?meta.guest,
+        vcpu = meta.vcpu,
+        mem_mib = meta.memory_mib,
+        "restoring a raw VM"
+    );
+
+    crate::reclaim::reclaim_abandoned().await;
+    let vm_id = generate_vm_id();
+    let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: paths::vm_runtime_dir(&vm_id),
+    })?;
+    let vm_name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| default_clone_name(&snapshot_name, &vm_id));
+    validate_vm_name(&vm_name).context("invalid VM name")?;
+    paths::check_socket_path_budget(&vm_id)?;
+
+    let state_manager = StateManager::new(paths::state_dir());
+    state_manager.init().await?;
+    let mut vm_state = VmState::new(
+        vm_id.clone(),
+        meta.image.clone(),
+        meta.vcpu,
+        meta.memory_mib,
+    );
+    vm_state.name = Some(vm_name.clone());
+    vm_state.config.snapshot_name = Some(snapshot_name.clone());
+    vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
+    vm_state.config.labels = super::podman::parse_labels(&args.label);
+    vm_state.config.guest = meta.guest;
+    vm_state.config.health_port = Some(
+        meta.health_port
+            .unwrap_or(crate::cli::VmRunArgs::DEFAULT_HEALTH_PORT),
+    );
+    vm_state.config.hypervisor = meta.hypervisor;
+    vm_state.config.network_mode = FcNetworkMode::Rootless;
+    vm_state.config.balloon_mib = meta.balloon_mib;
+    vm_state.config.published_guest_ports = Some(Vec::new());
+    vm_state.config.vsock_socket_path = None;
+
+    let data_dir = paths::vm_runtime_dir(&vm_id);
+    vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
+    if let Err(e) = async {
+        state_manager
+            .claim_name(&mut vm_state)
+            .await
+            .context("claiming the VM name")?;
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .context("creating VM data directory")
+    }
+    .await
+    {
+        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        return Err(e);
+    }
+
+    let mut network =
+        PastaNetwork::isolated(vm_id.clone(), format!("tap-{}", truncate_id(&vm_id, 8)));
+    let network_config = match network.setup().await.context("setting up network") {
+        Ok(config) => config,
+        Err(e) => {
+            if let Err(error) = network.cleanup().await {
+                warn!(%error, "failed to clean up the network after a setup error");
+            }
+            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            return Err(e);
+        }
+    };
+
+    let restore_config = SnapshotRestoreConfig {
+        vmstate_path: snapshot_config.vmstate_path.clone(),
+        // Unused by the Cloud Hypervisor restore, which reads its own `ch/` directory.
+        memory_backend: MemoryBackend::File {
+            memory_path: snapshot_config.memory_path.clone(),
+        },
+        source_disk_path: snapshot_config.disk_path.clone(),
+        original_vm_id: snapshot_config
+            .original_vsock_vm_id
+            .clone()
+            .unwrap_or_else(|| snapshot_config.vm_id.clone()),
+        source_vsock_socket_path: snapshot_config.source_vsock_socket_path.clone(),
+        vsock_target_dir: Some(data_dir.clone()),
+        snapshot_vm_id: snapshot_config
+            .original_vsock_vm_id
+            .is_some()
+            .then(|| snapshot_config.vm_id.clone()),
+        hugepages: false,
+        extra_disks: meta.extra_disks.clone(),
+        snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
+    };
+    let mut ns_helper = None;
+    let restore_started = std::time::Instant::now();
+    let restored = super::common::restore_from_snapshot_ch(
+        RestoreParams {
+            vm_id: &vm_id,
+            vm_name: &vm_name,
+            data_dir: &data_dir,
+            socket_path: &data_dir.join("firecracker.sock"),
+            runtime_config: &RuntimeConfig::default(),
+            restore_config: &restore_config,
+            network_config: &network_config,
+            restore_epoch: "",
+            clone_ipv6: None,
+            track_dirty_pages: false,
+            firecracker_choice: FirecrackerChoice::NotRecorded,
+            balloon_target_mib: args.balloon,
+            gpus: &[],
+            identity: &super::common::RestoreIdentity::default(),
+            raw_ns_helper: Some(&mut ns_helper),
+        },
+        &mut network,
+        &state_manager,
+        &mut vm_state,
+    )
+    .await;
+    // Everything the restore reads from the snapshot directory is open or copied.
+    drop(snapshot_shared_lock);
+    let (vm_manager, holder_child) = match restored {
+        Ok(restored) => restored,
+        Err(e) => {
+            // The restore killed what it started; the helper is the caller's.
+            warn!(vm_id = %vm_id, error = %format!("{e:#}"), "raw VM restore failed, cleaning up");
+            super::vm::stop_ns_helper(&mut ns_helper).await;
+            if let Err(error) = network.cleanup().await {
+                warn!(%error, "failed to clean up the network after a restore error");
+            }
+            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            return Err(e);
+        }
+    };
+    info!(
+        vm_id = %vm_id,
+        name = %vm_name,
+        restore_ms = restore_started.elapsed().as_millis() as u64,
+        "raw VM restored and resumed; healthy once its clock is acknowledged and RDP answers"
+    );
+
+    super::vm::run_until_exit(
+        super::vm::RawVm {
+            vm_id,
+            data_dir,
+            vm_manager: Box::new(vm_manager),
+            holder_child,
+            network: Box::new(network),
+            ns_helper,
+            state_manager,
+            vm_state,
+            reclaim_owner,
+        },
+        &lifecycle_gate,
+    )
+    .await
+}
+
 async fn cmd_snapshot_run_disk_only(
     snapshot_name: String,
     snapshot_config: crate::storage::SnapshotConfig,
@@ -6070,6 +6350,8 @@ mod tests {
             balloon_free_page_reporting: false,
             page_reporting_order: None,
             parked_gpus: 0,
+            guest: Default::default(),
+            health_port: None,
         }
     }
 
@@ -7184,6 +7466,138 @@ mod tests {
         let written = serde_json::to_value(&fixture).unwrap();
         assert_eq!(written["dns_override"], serde_json::Value::Null);
         assert_eq!(read(&written).dns_override, Some(None));
+    }
+
+    /// A raw clone (no fc-agent) runs none of the Linux restore's fc-agent steps: no
+    /// status, boot-plan, output or restore-completion listener, no restore epoch, no wait
+    /// for the guest's acknowledgement or its output connection, no console watchdog. It
+    /// is dispatched before the Linux restore sets any of them up, and it starts its clock
+    /// line through the restore.
+    #[test]
+    fn a_raw_restore_never_waits_for_fc_agent() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = &code[code.find("async fn cmd_snapshot_run_raw(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        for absent in [
+            "run_status_listener",
+            "spawn_bootplan_listener",
+            "spawn_restore_completion_listener",
+            "wait_for_restore_completion",
+            "wait_for_restored_output",
+            "run_output_listener",
+            "new_restore_epoch",
+            "console_line_counter",
+            "egress_proxy",
+            "spawn_volume_servers",
+        ] {
+            assert!(!body.contains(absent), "the raw restore calls `{absent}`");
+        }
+        assert!(body.contains("raw_ns_helper: Some(&mut ns_helper)"));
+        assert!(body.contains("PastaNetwork::isolated("));
+        assert!(!body.contains(concat!("PastaNetwork", "::new(")));
+        assert!(body.contains("restore_from_snapshot_ch("));
+
+        let inner = &code[code.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let inner = &inner[..inner.find("\n}\n").unwrap()];
+        let dispatched = inner
+            .find("return cmd_snapshot_run_raw(")
+            .expect("cmd_snapshot_run_inner does not dispatch raw snapshots");
+        for later in [
+            "run_status_listener(",
+            "spawn_bootplan_listener(",
+            "spawn_restore_completion_listener(",
+            "generate_vm_id()",
+        ] {
+            let at = inner.find(later).unwrap_or_else(|| panic!("no `{later}`"));
+            assert!(dispatched < at, "a raw snapshot reaches `{later}`");
+        }
+    }
+
+    /// What a raw clone cannot do is refused before anything is allocated: each of these
+    /// needs fc-agent, a memory server, a passthrough device or a routed address.
+    #[test]
+    fn a_raw_restore_refuses_what_needs_fc_agent() {
+        let mut meta = metadata_fixture();
+        meta.guest = crate::state::Guest::Windows;
+        meta.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        meta.network_mode = FcNetworkMode::Rootless;
+        ensure_raw_restore_supported(&snapshot_runtime_args_without_overrides(), &meta)
+            .expect("a plain raw restore");
+        type Refusal = (&'static str, fn(&mut SnapshotRunArgs));
+        let refusals: [Refusal; 6] = [
+            ("--pid", |a| a.pid = Some(1)),
+            ("--exec", |a| a.exec = Some("true".to_string())),
+            ("--map", |a| a.map = vec!["/a:/b".to_string()]),
+            ("--gpu", |a| a.gpu = vec!["0000:01:00.0".to_string()]),
+            ("--on-restore", |a| a.on_restore = Some("true".to_string())),
+            ("--vsock-dir", |a| a.vsock_dir = Some("/tmp/v".to_string())),
+        ];
+        for (flag, set) in refusals {
+            let mut args = snapshot_runtime_args_without_overrides();
+            set(&mut args);
+            let error = ensure_raw_restore_supported(&args, &meta)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(flag) && error.contains("runs no fc-agent"),
+                "{error}"
+            );
+        }
+        let mut publish = snapshot_runtime_args_without_overrides();
+        publish.publish = vec!["13389:3389".to_string()];
+        let error = ensure_raw_restore_supported(&publish, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--publish") && error.contains("rdp.sock"),
+            "{error}"
+        );
+        meta.hypervisor = crate::hypervisor::Backend::Firecracker;
+        assert!(
+            ensure_raw_restore_supported(&snapshot_runtime_args_without_overrides(), &meta)
+                .is_err()
+        );
+    }
+
+    /// `snapshot create` of a raw VM is a Cloud Hypervisor memory snapshot only: the
+    /// captures that go through fc-agent, and the Firecracker-only options, are refused.
+    #[test]
+    fn a_raw_snapshot_refuses_what_needs_fc_agent() {
+        let create_args = || SnapshotCreateArgs {
+            name: Some("w0".to_string()),
+            pid: None,
+            tag: Some("wtest".to_string()),
+            disk_only: false,
+            inherit_working_set: false,
+            gpu_warm: false,
+            stop: false,
+            expect_vm_id: None,
+        };
+        let mut state = VmState::new("vm-raw".to_string(), "win.raw".to_string(), 2, 4096);
+        state.config.guest = crate::state::Guest::Windows;
+        state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        ensure_raw_snapshot_supported(&state, &create_args()).expect("a memory snapshot");
+        type Refusal = (&'static str, fn(&mut SnapshotCreateArgs));
+        let refusals: [Refusal; 4] = [
+            ("--disk-only", |a| a.disk_only = true),
+            ("--gpu-warm", |a| a.gpu_warm = true),
+            ("--stop", |a| a.stop = true),
+            ("--inherit-working-set", |a| a.inherit_working_set = true),
+        ];
+        for (flag, set) in refusals {
+            let mut args = create_args();
+            set(&mut args);
+            let error = ensure_raw_snapshot_supported(&state, &args)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(flag), "{error}");
+        }
+        // A Linux guest is unaffected.
+        state.config.guest = crate::state::Guest::Linux;
+        let mut disk_only = create_args();
+        disk_only.disk_only = true;
+        ensure_raw_snapshot_supported(&state, &disk_only).unwrap();
     }
 
     fn snapshot_runtime_args_without_overrides() -> SnapshotRunArgs {

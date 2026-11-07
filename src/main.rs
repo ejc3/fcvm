@@ -67,8 +67,14 @@ async fn run() -> Result<()> {
             // Setup handles its own path initialization after loading config
             // Don't pre-initialize here since setup may create storage first
         }
-        Commands::Completions(_) | Commands::Fleet(_) | Commands::Gpu(_) => {
-            // Shell completions, the fleet control plane and the GPU pool commands don't need config
+        Commands::Completions(_)
+        | Commands::Fleet(_)
+        | Commands::Gpu(_)
+        | Commands::Vm(cli::VmArgs {
+            cmd: cli::VmCommands::NsHelper(_),
+        }) => {
+            // Shell completions, the fleet control plane, the GPU pool commands and the
+            // raw VM's namespace helper don't need config
             paths::init_with_defaults();
         }
         _ => {
@@ -149,6 +155,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
+        Commands::Vm(args) => commands::cmd_vm(args).await,
     };
 
     if let Some(scope) = scope {

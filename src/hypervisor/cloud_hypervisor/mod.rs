@@ -1274,7 +1274,11 @@ mod tests {
             serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
             "{config}"
         );
-        assert_eq!(config["console"], serde_json::json!({"mode": "Off"}), "{config}");
+        assert_eq!(
+            config["console"],
+            serde_json::json!({"mode": "Off"}),
+            "{config}"
+        );
     }
 
     /// The kernel path is unchanged by firmware support: a kernel, its command line and
@@ -1292,7 +1296,11 @@ mod tests {
             "{config}"
         );
         assert!(config["cpus"].get("kvm_hyperv").is_none(), "{config}");
-        assert_eq!(config["serial"], serde_json::json!({"mode": "Null"}), "{config}");
+        assert_eq!(
+            config["serial"],
+            serde_json::json!({"mode": "Null"}),
+            "{config}"
+        );
         assert_eq!(
             config["console"],
             serde_json::json!({"mode": "File", "file": "/vm/ch-console.log"}),
@@ -1309,7 +1317,10 @@ mod tests {
         be.configure_firmware_boot(Path::new("/assets/CLOUDHV.fd"), 1, 1024);
         let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
         assert!(config["payload"].get("kernel").is_none(), "{config}");
-        let error = backend_with_log().build_vm_config().unwrap_err().to_string();
+        let error = backend_with_log()
+            .build_vm_config()
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no kernel or firmware"), "{error}");
     }
 

@@ -395,7 +395,9 @@ pub async fn create_podman_snapshot(
                 &ch_client,
                 snapshot_config,
                 disk_path,
-                &vsock_socket_path,
+                crate::commands::common::ChSnapshotGuest::FcAgent {
+                    vsock_socket_path: &vsock_socket_path,
+                },
                 Some(&extra_files),
             )
             .await?;
