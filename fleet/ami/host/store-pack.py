@@ -187,6 +187,8 @@ def main():
     ap.add_argument("--exclude", action="append", default=[])
     ap.add_argument("--split-mib", type=int, default=256)
     a = ap.parse_args()
+    if a.split_mib < 1:
+        ap.error("--split-mib must be at least 1")
     root = os.path.abspath(a.root).rstrip("/") or "/"
     dirs, groups = walk(root, a.exclude)
     if os.path.lexists(os.path.join(root, ".fcvm-segments")) or os.path.lexists(os.path.join(root, ".fcvm-seg")):

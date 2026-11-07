@@ -262,7 +262,7 @@ fx=$(mktemp -d)
   python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 --split-mib 1 "${ex[@]}" > "$fx/pack.out" || exit 1
   grep -qx 'store-pack: 2 files split into 7 pieces of at most 1 MiB' "$fx/pack.out" || exit 1
   # The pieces are spread: at least two parts hold one.
-  [ "$(grep -c ' [1-9][0-9]* pieces' "$fx/pack.out")" -ge 2 ] || exit 1
+  [ "$(grep -cE '^store-pack: part-[0-9]+: .* [1-9][0-9]* pieces' "$fx/pack.out")" -ge 2 ] || exit 1
   mapfile -t parts < "$fx/pack/parts"
   [ "${#parts[@]}" = 3 ] || exit 1
   fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
