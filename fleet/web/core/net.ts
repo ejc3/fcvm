@@ -5,6 +5,38 @@ export function reconnectDelayMs(attempt: number): number {
   return Math.min(10_000, 500 * 2 ** Math.max(0, Math.min(attempt, 10)));
 }
 
+/**
+ * Which of the page's /live URLs a socket uses: `index` into them, and how many have failed
+ * in a row without opening. The page lists its URLs fastest first: on staging the
+ * coordinator's own host, which needs the browser to hold an Access session there, then the
+ * page's origin, which its Worker forwards (core/live-proxy.ts).
+ */
+export interface LiveTry {
+  index: number;
+  failedInRow: number;
+}
+
+export const FIRST_LIVE_TRY: LiveTry = { index: 0, failedInRow: 0 };
+
+/**
+ * How long a socket that is not the last URL may take to open before the next URL is tried.
+ * A direct socket to the staging coordinator opened in 196 to 244 ms (median of 6, three
+ * runs, 2026-11-07), and one without an Access session fails with Access's 302 in about
+ * 40 ms; 2 s is eight times the slower median.
+ */
+export const LIVE_OPEN_DEADLINE_MS = 2000;
+
+/**
+ * After a socket closed without opening: the next URL, tried at once, until every URL has
+ * failed in a row, when the next try waits for the reconnect delay and starts over at the
+ * first. A socket that opened and closed later reconnects to the URL that worked.
+ */
+export function afterLiveFailure(t: LiveTry, count: number): { next: LiveTry; now: boolean } {
+  const failedInRow = t.failedInRow + 1;
+  if (failedInRow >= count) return { next: FIRST_LIVE_TRY, now: false };
+  return { next: { index: (t.index + 1) % count, failedInRow }, now: true };
+}
+
 /** A frame socket URL: frame_url with h set, and q when it is not the default. */
 export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" | "std" | "lo" = "std"): string {
   const [base, query = ""] = frameUrl.split("?", 2) as [string, string?];

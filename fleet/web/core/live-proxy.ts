@@ -78,6 +78,14 @@ export function forwardedRequest(proxy: LiveProxy, path: string, search: string,
 }
 
 /**
+ * The /live URL the page tries before its own origin: the coordinator's host, when the
+ * Worker forwards (the browser may hold an Access session there too), else null.
+ */
+export function pageDirectLiveUrl(env: ProxyEnv): string | null {
+  return liveProxy(env) === null ? null : (env.FLEET_COORD_URL as string);
+}
+
+/**
  * The /live URL the page connects to: its own origin when the Worker forwards, else
  * FLEET_COORD_URL. `proto` is the page request's scheme ("https" or "http").
  */
