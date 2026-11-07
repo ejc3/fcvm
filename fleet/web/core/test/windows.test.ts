@@ -492,4 +492,14 @@ describe("captions", () => {
     const wide = layoutWindows({ area: STAGE, tiles: windowsOf(4).tiles, imageAspect: windowsOf(4).image_aspect, narrow: false, panel: false, dpr: 1 });
     expect(wide.every((b) => !b.compact)).toBe(true);
   });
+
+  it("with the panel open on a short phone, eight desktops still get room: the columns that make them largest", () => {
+    const w = windowsOf(8);
+    const short = { x: 8, y: 150, w: 304, h: 205 };
+    const L = layoutWindows({ area: short, tiles: w.tiles, imageAspect: 32 / 9, narrow: true, panel: true, dpr: 2 });
+    expect(L.every((b) => b.compact)).toBe(true);
+    expect(L[0]!.box.w).toBeGreaterThan(0);
+    expect(L[0]!.box.h).toBeGreaterThan(0);
+    for (const b of L) expect(b.caption.y + b.caption.h).toBeLessThanOrEqual(short.y + short.h + 1e-6);
+  });
 });

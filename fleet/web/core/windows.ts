@@ -101,9 +101,10 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
     const availH = area.h - rows * capH - (rows - 1) * WINDOWS_TILE_GAP;
     return Math.max(0, Math.floor(Math.min((area.w - (cols - 1) * WINDOWS_TILE_GAP) / cols, (availH / rows) * aspect) * dpr) / dpr);
   };
-  const largest = (from: number) => {
+  /** The columns, `min` or more, that make the desktops largest; `from` on a tie. */
+  const largest = (from: number, min = 1) => {
     let best = from;
-    for (let c = 1; c <= n; c++) if (cellFor(c) > cellFor(best)) best = c;
+    for (let c = min; c <= n; c++) if (cellFor(c) > cellFor(best)) best = c;
     return best;
   };
   const rectCols = Math.max(1, gridOf(sorted).cols);
@@ -113,9 +114,11 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
   if (!compact && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
     compact = true;
     capH = WINDOWS_CAPTION_H_COMPACT;
-    // A wide screen keeps the snapshot's rows; a phone takes the largest desktops.
-    if (inp.narrow) cols = largest(cols);
   }
+  // A wide screen keeps the snapshot's rows; a phone whose cells are under a full caption's
+  // width takes the columns that make the desktops largest. Above the open panel it keeps rows
+  // of at least four, so a short room gets one long row rather than rows of no height.
+  if (inp.narrow && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) cols = largest(cols, inp.panel ? cols : 1);
   const cellW = cellFor(cols);
   const cellH = snap(cellW / aspect, dpr);
   const top = area.y;
