@@ -53,10 +53,12 @@
 //! This module requires the `fuse-client` feature (enabled by default).
 
 mod fuse;
+mod host_change;
 mod mount;
 mod multiplexer;
 
 pub use fuse::FuseClient;
+pub use host_change::NotifierSlot;
 pub use mount::{mount, mount_spawn, MountConfig, MountHandle, MountSettings};
 #[cfg(target_os = "linux")]
 pub use mount::{

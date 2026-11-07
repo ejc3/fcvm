@@ -1,5 +1,6 @@
 //! fuser::Filesystem implementation for remote FUSE.
 
+use super::host_change::{HostChanges, NotifierSlot};
 use super::mount::MountSettings;
 use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
@@ -14,7 +15,7 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Parse supplementary groups from /proc/<pid>/status.
@@ -63,6 +64,9 @@ pub struct FuseClient {
     max_write: u32,
     /// Ask the kernel for FUSE_WRITEBACK_CACHE at INIT, as the mount's settings say.
     writeback_cache: bool,
+    /// What this client told the kernel about each regular file, to find the host's changes
+    /// the kernel would not act on (see `host_change`).
+    host_changes: HostChanges,
 }
 
 impl FuseClient {
@@ -88,6 +92,7 @@ impl FuseClient {
             destroyed,
             max_write,
             writeback_cache: settings.writeback_cache(),
+            host_changes: HostChanges::new(Arc::new(OnceLock::new())),
         }
     }
 
@@ -104,7 +109,14 @@ impl FuseClient {
             destroyed,
             max_write: 0,
             writeback_cache: settings.writeback_cache(),
+            host_changes: HostChanges::new(Arc::new(OnceLock::new())),
         }
+    }
+
+    /// Where the session's notifier must be put before the session reads its first request.
+    /// Without it a file the host changed without changing its size or mtime keeps its pages.
+    pub fn notifier_slot(&self) -> NotifierSlot {
+        self.host_changes.notifier_slot()
     }
 
     /// Get a clone of the destroyed flag for sharing with reader threads.
@@ -234,6 +246,7 @@ impl Filesystem for FuseClient {
                     "Kernel doesn't support FUSE_WRITEBACK_CACHE"
                 );
             } else {
+                self.host_changes.set_writeback(true);
                 tracing::debug!(
                     target: "fuse-pipe::client",
                     "Enabled FUSE_WRITEBACK_CACHE for better write performance"
@@ -324,6 +337,7 @@ impl Filesystem for FuseClient {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.host_changes.forget(ino.into(), nlookup);
         self.mux.send_request_no_reply(VolumeRequest::Forget {
             ino: ino.into(),
             nlookup,
@@ -336,6 +350,7 @@ impl Filesystem for FuseClient {
     // for clients that can batch them.
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let asked = self.host_changes.now();
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent: parent.into(),
             name: name.as_bytes().to_vec(),
@@ -350,10 +365,16 @@ impl Filesystem for FuseClient {
                 generation,
                 ttl_secs,
             } => {
-                reply.entry(
-                    &Duration::from_secs(ttl_secs),
-                    &to_fuser_attr(&attr),
-                    Generation(generation),
+                let stale = self.host_changes.refreshed(attr.ino, &attr, asked, true);
+                self.host_changes.reply_after(
+                    stale.then_some(attr.ino).into_iter().collect(),
+                    move || {
+                        reply.entry(
+                            &Duration::from_secs(ttl_secs),
+                            &to_fuser_attr(&attr),
+                            Generation(generation),
+                        )
+                    },
                 );
             }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
@@ -362,11 +383,17 @@ impl Filesystem for FuseClient {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let asked = self.host_changes.now();
         let response = self.send_request_sync(VolumeRequest::Getattr { ino: ino.into() });
 
         match response {
             VolumeResponse::Attr { attr, ttl_secs } => {
-                reply.attr(&Duration::from_secs(ttl_secs), &to_fuser_attr(&attr));
+                let ino = u64::from(ino);
+                let stale = self.host_changes.refreshed(ino, &attr, asked, false);
+                self.host_changes
+                    .reply_after(stale.then_some(ino).into_iter().collect(), move || {
+                        reply.attr(&Duration::from_secs(ttl_secs), &to_fuser_attr(&attr))
+                    });
             }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
@@ -414,6 +441,7 @@ impl Filesystem for FuseClient {
         // Use send_request_with_groups for setattr (which handles chown).
         // Supplementary groups are needed for proper permission checks when
         // a non-root user chowns to one of their supplementary groups.
+        let change = self.host_changes.changing(ino.into());
         let response = self.send_request_with_groups(
             VolumeRequest::Setattr {
                 ino: ino.into(),
@@ -434,9 +462,11 @@ impl Filesystem for FuseClient {
             },
             req.pid(),
         );
+        drop(change);
 
         match response {
             VolumeResponse::Attr { attr, ttl_secs } => {
+                self.host_changes.changed_here(ino.into(), &attr, false);
                 reply.attr(&Duration::from_secs(ttl_secs), &to_fuser_attr(&attr));
             }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
@@ -513,6 +543,7 @@ impl Filesystem for FuseClient {
                 generation,
                 ttl_secs,
             } => {
+                self.host_changes.created(attr.ino, &attr);
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
@@ -568,6 +599,7 @@ impl Filesystem for FuseClient {
                 fh,
                 flags,
             } => {
+                self.host_changes.created(attr.ino, &attr);
                 reply.created(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
@@ -639,6 +671,7 @@ impl Filesystem for FuseClient {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let _change = self.host_changes.changing(ino.into());
         let response = self.send_request_sync(VolumeRequest::Write {
             ino: ino.into(),
             fh: fh.into(),
@@ -815,6 +848,7 @@ impl Filesystem for FuseClient {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let change = self.host_changes.changing(ino.into());
         let response = self.send_request_sync(VolumeRequest::Link {
             ino: ino.into(),
             newparent: newparent.into(),
@@ -823,6 +857,7 @@ impl Filesystem for FuseClient {
             gid: req.gid(),
             pid: req.pid(),
         });
+        drop(change);
 
         match response {
             VolumeResponse::Entry {
@@ -830,6 +865,7 @@ impl Filesystem for FuseClient {
                 generation,
                 ttl_secs,
             } => {
+                self.host_changes.changed_here(attr.ino, &attr, true);
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
@@ -923,6 +959,7 @@ impl Filesystem for FuseClient {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        let asked = self.host_changes.now();
         let response = self.send_request_sync(VolumeRequest::Readdirplus {
             ino: ino.into(),
             fh: fh.into(),
@@ -934,6 +971,7 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::DirEntriesPlus { entries } => {
+                let mut stale = Vec::new();
                 for (i, entry) in entries.iter().enumerate() {
                     let entry_offset = offset + i as u64 + 1;
                     let attr = to_fuser_attr(&entry.attr);
@@ -946,10 +984,20 @@ impl Filesystem for FuseClient {
                         &attr,
                         Generation(entry.generation),
                     ) {
+                        // Full: this entry is not in the reply.
                         break;
                     }
+                    // The kernel takes no lookup and no attributes for "." and "..".
+                    if entry.name != b"."
+                        && entry.name != b".."
+                        && self
+                            .host_changes
+                            .refreshed(entry.ino, &entry.attr, asked, true)
+                    {
+                        stale.push(entry.ino);
+                    }
                 }
-                reply.ok();
+                self.host_changes.reply_after(stale, move || reply.ok());
             }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
@@ -1023,6 +1071,7 @@ impl Filesystem for FuseClient {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let _change = self.host_changes.changing(ino.into());
         let response = self.send_request_sync(VolumeRequest::Setxattr {
             ino: ino.into(),
             name: name.as_bytes().to_vec(),
@@ -1076,6 +1125,7 @@ impl Filesystem for FuseClient {
     }
 
     fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _change = self.host_changes.changing(ino.into());
         let response = self.send_request_sync(VolumeRequest::Removexattr {
             ino: ino.into(),
             name: name.as_bytes().to_vec(),
@@ -1101,6 +1151,7 @@ impl Filesystem for FuseClient {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let _change = self.host_changes.changing(ino.into());
         let response = self.send_request_sync(VolumeRequest::Fallocate {
             ino: ino.into(),
             fh: fh.into(),
@@ -1217,6 +1268,7 @@ impl Filesystem for FuseClient {
         flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
+        let _change = self.host_changes.changing(ino_out.into());
         let response = self.send_request_sync(VolumeRequest::CopyFileRange {
             ino_in: ino_in.into(),
             fh_in: fh_in.into(),
@@ -1254,6 +1306,7 @@ impl Filesystem for FuseClient {
             "remap_file_range called"
         );
 
+        let _change = self.host_changes.changing(ino_out);
         let response = self.send_request_sync(VolumeRequest::RemapFileRange {
             ino_in,
             fh_in,
