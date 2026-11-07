@@ -353,7 +353,7 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -426,7 +426,7 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -510,7 +510,7 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -604,7 +604,7 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
