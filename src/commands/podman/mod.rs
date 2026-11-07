@@ -4468,7 +4468,9 @@ mod tests {
         let check = "settle_balloon_check(ctx).await";
 
         let run_loop = body_of("pub async fn run_vm_loop");
-        let checks: Vec<usize> = run_loop.match_indices(check).map(|(at, _)| at).collect();
+        // The run loop races each check with cancellation (#1075), as a select! arm.
+        let raced = "settled = settle_balloon_check(ctx) =>";
+        let checks: Vec<usize> = run_loop.match_indices(raced).map(|(at, _)| at).collect();
         assert_eq!(
             checks.len(),
             2,

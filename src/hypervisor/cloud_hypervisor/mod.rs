@@ -123,6 +123,15 @@ impl CloudHypervisorBackend {
         self.client.as_ref().context("Cloud Hypervisor not started")
     }
 
+    /// Set the balloon target of a restored VM before it resumes, the way a Firecracker
+    /// restore sets its own (`vm.resize`).
+    pub async fn set_balloon_target(&self, target_mib: u32) -> Result<()> {
+        self.client()?
+            .resize_balloon(u64::from(target_mib) << 20)
+            .await
+            .with_context(|| format!("setting the restored VM's balloon to {target_mib} MiB"))
+    }
+
     async fn stop_reboot_monitor(&mut self) {
         // Keep ownership across await: wait() can be cancelled by the VM loop.
         if let Some(monitor) = self.reboot_monitor.as_mut() {
