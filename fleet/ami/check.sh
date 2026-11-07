@@ -249,6 +249,8 @@ fx=$(mktemp -d)
   chmod 0640 "$fx/src/d/big" && touch -d '2026-01-04 05:06:07.987654321' "$fx/src/d/big" || exit 1
   # Split too, with an mtime of fewer than ten digits of nanoseconds (0.1 s after the epoch).
   head -c $((2 << 20)) /dev/urandom > "$fx/src/d/old" && touch -d @0.1 "$fx/src/d/old" || exit 1
+  # Large, with a carriage return in its name: archived whole (the list of pieces is line based).
+  head -c $((2 << 20)) /dev/urandom > "$fx/src/d/cr$(printf '\r')name" || exit 1
   chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05.123456789' "$fx/src/d/a" || exit 1
   # A directory that holds a file (so a part creates it) and an empty directory (which only
   # the directory pass creates): its mtime must survive the empty one being made in it.
