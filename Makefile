@@ -630,9 +630,12 @@ minecraft-image:
 	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
 
 # mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's), and the
-# density harness's tests.
+# density harness's tests. fleet/minecraft is a workspace of its own with its own target
+# directory, which the run leases like every other Cargo command (scripts/cargo-target-run.sh);
+# CARGO_LOCAL_CONFIG is the root workspace's and is not passed.
+MINECRAFT_TARGET ?= target
 test-minecraft:
-	cd fleet/minecraft && CARGO_TARGET_DIR=$(or $(MINECRAFT_TARGET),target) cargo test --locked --release
+	cd fleet/minecraft && mkdir -p "$(MINECRAFT_TARGET)" && CARGO_TARGET_DIR="$(MINECRAFT_TARGET)" "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) test --locked --release
 	python3 -B fleet/minecraft/bench/test_bench.py
 
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
