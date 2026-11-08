@@ -214,6 +214,60 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 /// fcvm never removes NAT configuration an admin or another tool put in place.
 const FCVM_RULE_COMMENT: &str = "fcvm-bridged";
 
+/// The subnets bridged guests send from: baseline guests' 172.30.x.y, and the
+/// 10.x.y.2 namespace side of a clone's veth.
+pub const BRIDGED_EGRESS_SUBNETS: [&str; 2] = ["172.30.0.0/16", "10.0.0.0/8"];
+
+/// The `iptables -t nat` rule (after the chain name) that translates bridged guests'
+/// traffic from `subnet` leaving through `iface` (#1735).
+///
+/// The source match is a subnet the host's own address can be in: 10.0.0.0/8 holds
+/// many cloud hosts' VPC address, and a MASQUERADE on it rewrote every connection the
+/// host opened. So the rule never matches an address the host owns (`addrtype !
+/// --src-type LOCAL`); a guest's address, forwarded through the host, is never one.
+/// And it translates to `source`, the default route's source address, which the
+/// host's own connections leave from: MASQUERADE takes the uplink's primary address
+/// for the next hop's subnet instead, and on a host whose uplink lists another
+/// address first (a secondary private address with no public mapping) the guests'
+/// traffic left from an address nothing answers. Without a route source the kernel's
+/// own choice is the host's choice too, so MASQUERADE is kept.
+pub fn global_nat_rule(subnet: &str, iface: &str, source: Option<&str>) -> Vec<String> {
+    let mut rule: Vec<String> = [
+        "-s",
+        subnet,
+        "-o",
+        iface,
+        "-m",
+        "addrtype",
+        "!",
+        "--src-type",
+        "LOCAL",
+        "-m",
+        "comment",
+        "--comment",
+        FCVM_RULE_COMMENT,
+        "-j",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match source {
+        Some(source) => rule.extend(["SNAT".into(), "--to-source".into(), source.to_string()]),
+        None => rule.push("MASQUERADE".into()),
+    }
+    rule
+}
+
+/// The `src` of `ip -4 route show default` output: the address the host's own
+/// connections leave from.
+pub fn parse_default_route_source(stdout: &str) -> Option<String> {
+    let words: Vec<&str> = stdout.lines().next()?.split_whitespace().collect();
+    let at = words.iter().position(|w| *w == "src")?;
+    let source = words.get(at + 1)?;
+    source.parse::<std::net::Ipv4Addr>().ok()?;
+    Some(source.to_string())
+}
+
 /// Ensures global NAT is enabled for VM traffic
 ///
 /// Sets up:
@@ -275,58 +329,38 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         .await
         .context("acquiring bridged NAT lock")?;
 
-    // Check if the fcvm-tagged MASQUERADE rule already exists
+    // The host's own connections leave from the default route's source address; the
+    // guests' leave from it too (`global_nat_rule`).
+    let route = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .await
+        .context("reading the default route's source address")?;
+    let source = parse_default_route_source(&String::from_utf8_lossy(&route.stdout));
+    let rule = global_nat_rule(vm_subnet, outbound_iface, source.as_deref());
+
+    // Check if the fcvm-tagged rule already exists
     let output = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-C",
-            "POSTROUTING",
-            "-s",
-            vm_subnet,
-            "-o",
-            outbound_iface,
-            "-m",
-            "comment",
-            "--comment",
-            FCVM_RULE_COMMENT,
-            "-j",
-            "MASQUERADE",
-        ])
+        .args(["-t", "nat", "-C", "POSTROUTING"])
+        .args(&rule)
         .output()
         .await?;
 
     if output.status.success() {
-        // Rule already exists
-        debug!("global MASQUERADE rule already exists");
+        debug!("global NAT rule already exists");
         return Ok(());
     }
 
-    // Add MASQUERADE rule for outbound traffic
     let output = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            vm_subnet,
-            "-o",
-            outbound_iface,
-            "-m",
-            "comment",
-            "--comment",
-            FCVM_RULE_COMMENT,
-            "-j",
-            "MASQUERADE",
-        ])
+        .args(["-t", "nat", "-A", "POSTROUTING"])
+        .args(&rule)
         .output()
         .await
-        .context("adding MASQUERADE rule")?;
+        .context("adding the bridged NAT rule")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to add MASQUERADE rule: {}", stderr);
+        anyhow::bail!("failed to add the bridged NAT rule {rule:?}: {}", stderr);
     }
 
     debug!("global NAT configuration complete");
@@ -370,49 +404,33 @@ pub async fn cleanup_global_nat_if_unused() -> Result<()> {
 
     info!("no bridged VMs running, cleaning up global NAT rules");
 
-    // Detect outbound interface for MASQUERADE rule deletion
-    let outbound_iface = detect_default_interface()
+    // Remove every fcvm-tagged rule for the guests' subnets, whatever its interface
+    // or translation: the rule carries the source address the host's default route
+    // had when it was added, which can have changed since.
+    let listed = crate::utils::helper_command("iptables")
+        .args(["-t", "nat", "-S", "POSTROUTING"])
+        .output()
         .await
-        .context("detecting the default interface for NAT cleanup")?;
-
-    // Remove the fcvm-tagged MASQUERADE rules for both subnets
+        .context("listing the NAT rules to remove")?;
+    anyhow::ensure!(
+        listed.status.success(),
+        "`iptables -t nat -S POSTROUTING` failed: {}",
+        String::from_utf8_lossy(&listed.stderr).trim()
+    );
     let mut failures = Vec::new();
-    for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
+    for rule in global_nat_rules_in(&String::from_utf8_lossy(&listed.stdout)) {
         let output = crate::utils::helper_command("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-s",
-                subnet,
-                "-o",
-                &outbound_iface,
-                "-m",
-                "comment",
-                "--comment",
-                FCVM_RULE_COMMENT,
-                "-j",
-                "MASQUERADE",
-            ])
+            .args(["-t", "nat", "-D", "POSTROUTING"])
+            .args(&rule)
             .output()
             .await;
-
         match output {
-            Ok(o) if o.status.success() => {
-                debug!(subnet = %subnet, "removed MASQUERADE rule");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                // Rule may already be gone (or was never added by fcvm)
-                if !stderr.contains("does not exist")
-                    && !stderr.contains("No chain")
-                    && !stderr.contains("Bad rule")
-                {
-                    failures.push(format!("{subnet}: {}", stderr.trim()));
-                }
-            }
-            Err(e) => failures.push(format!("{subnet}: {e}")),
+            Ok(o) if o.status.success() => debug!(?rule, "removed a bridged NAT rule"),
+            Ok(o) => failures.push(format!(
+                "{rule:?}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => failures.push(format!("{rule:?}: {e}")),
         }
     }
 
@@ -428,6 +446,27 @@ pub async fn cleanup_global_nat_if_unused() -> Result<()> {
     );
     debug!("global NAT cleanup complete");
     Ok(())
+}
+
+/// The fcvm-tagged rules for the guests' subnets in `iptables -t nat -S POSTROUTING`
+/// output, as the arguments that follow the chain name.
+fn global_nat_rules_in(listing: &str) -> Vec<Vec<String>> {
+    listing
+        .lines()
+        .filter_map(|line| line.strip_prefix("-A POSTROUTING "))
+        .map(|rule| {
+            rule.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|rule| {
+            let has = |a: &str, b: &str| rule.windows(2).any(|w| w[0] == a && w[1] == b);
+            has("--comment", FCVM_RULE_COMMENT)
+                && BRIDGED_EGRESS_SUBNETS
+                    .iter()
+                    .any(|subnet| has("-s", subnet))
+        })
+        .collect()
 }
 
 /// Detects the default network interface for outbound traffic
@@ -473,6 +512,69 @@ fn parse_default_interface(stdout: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bridged NAT rule leaves the host's own traffic alone (#1735). Its source
+    /// match is a subnet the host's own address can be in (10.20.30.40 is in
+    /// 10.0.0.0/8), and a MASQUERADE there rewrote every connection the host opened
+    /// to the uplink's primary address, which had no public mapping: the host lost
+    /// IPv4 for as long as a bridged VM ran. The rule now excludes every address the
+    /// host owns, and translates to the default route's source address, the one the
+    /// host's own connections use.
+    #[test]
+    fn the_bridged_nat_rule_never_translates_the_hosts_own_traffic() {
+        let has = |rule: &[String], run: &[&str]| rule.windows(run.len()).any(|w| w == run);
+        for subnet in BRIDGED_EGRESS_SUBNETS {
+            for source in [Some("10.20.30.40"), None] {
+                let rule = global_nat_rule(subnet, "eth0", source);
+                assert!(has(&rule, &["-s", subnet]), "{rule:?}");
+                assert!(
+                    has(&rule, &["-m", "addrtype", "!", "--src-type", "LOCAL"]),
+                    "the rule's source match covers the host's own addresses: {rule:?}"
+                );
+                match source {
+                    Some(source) => assert!(
+                        has(&rule, &["-j", "SNAT", "--to-source", source]),
+                        "{rule:?}"
+                    ),
+                    None => assert!(has(&rule, &["-j", "MASQUERADE"]), "{rule:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_routes_source_is_read_from_ip_route() {
+        assert_eq!(
+            parse_default_route_source(
+                "default via 10.20.30.1 dev eth0 proto dhcp src 10.20.30.40 metric 100\n"
+            )
+            .as_deref(),
+            Some("10.20.30.40")
+        );
+        assert_eq!(
+            parse_default_route_source("default via 10.20.30.1 dev eth0\n"),
+            None
+        );
+        assert_eq!(parse_default_route_source(""), None);
+    }
+
+    /// Cleanup removes fcvm's rules for the guests' subnets in any form, and nothing
+    /// else.
+    #[test]
+    fn cleanup_selects_only_fcvms_rules_for_the_guests_subnets() {
+        let listing = "-P POSTROUTING ACCEPT\n\
+            -A POSTROUTING -s 10.0.0.0/8 -o eth0 -m comment --comment fcvm-bridged -j MASQUERADE\n\
+            -A POSTROUTING -s 172.30.0.0/16 -o eth0 -m addrtype ! --src-type LOCAL -m comment --comment fcvm-bridged -j SNAT --to-source 10.20.30.40\n\
+            -A POSTROUTING -d 172.30.1.2/32 -p tcp -m tcp --dport 80 -m comment --comment fcvm-bridged -j MASQUERADE\n\
+            -A POSTROUTING -s 10.0.0.0/8 -o eth0 -j MASQUERADE\n";
+        let rules = global_nat_rules_in(listing);
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!(rules[0][..2], ["-s".to_string(), "10.0.0.0/8".to_string()]);
+        assert_eq!(
+            rules[1][..2],
+            ["-s".to_string(), "172.30.0.0/16".to_string()]
+        );
+    }
 
     #[test]
     fn an_ipv6_only_host_is_diagnosed_not_reported_as_a_parse_failure() {

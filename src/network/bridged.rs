@@ -48,6 +48,62 @@ async fn is_ip_in_use_on_veth(ip: &str) -> bool {
     false
 }
 
+/// Whether the /30 around `host_ip` overlaps a network the host is on, from
+/// `ip -o -4 addr show` output. fcvm's own veths (`veth0-*`) are not the host's.
+///
+/// A clone's /30 is drawn from 10.0.0.0/8 and a baseline VM's from 172.30.0.0/16,
+/// where a host's own LAN can be (10.20.30.0/24 on a cloud VPC). The /30 is a more
+/// specific route than the LAN's, so it would take the host's traffic to the LAN
+/// addresses it covers (#1735), and the routing probe after it cannot see that: the
+/// /30 wins there by design.
+///
+fn overlaps_a_host_network(host_ip: &str, addresses: &str) -> bool {
+    let Ok(candidate) = host_ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let network = |address: std::net::Ipv4Addr, len: u32| {
+        u32::from(address) & u32::MAX.checked_shl(32 - len).unwrap_or(0)
+    };
+    addresses.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let device = words.get(1).copied().unwrap_or("");
+        if device.starts_with("veth0-") {
+            return false;
+        }
+        let Some(cidr) = words
+            .iter()
+            .position(|w| *w == "inet")
+            .and_then(|at| words.get(at + 1))
+        else {
+            return false;
+        };
+        let Some((address, len)) = cidr.split_once('/') else {
+            return false;
+        };
+        let (Ok(address), Ok(len)) = (address.parse::<std::net::Ipv4Addr>(), len.parse::<u32>())
+        else {
+            return false;
+        };
+        let shorter = len.min(30);
+        len <= 32 && network(address, shorter) == network(candidate, shorter)
+    })
+}
+
+/// [`overlaps_a_host_network`] over the host's addresses now. An unreadable list
+/// counts as no overlap, as `is_ip_in_use_on_veth` does.
+async fn overlaps_host_network(host_ip: &str) -> bool {
+    match tokio::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            overlaps_a_host_network(host_ip, &String::from_utf8_lossy(&o.stdout))
+        }
+        _ => false,
+    }
+}
+
 /// The /30 peer of a derived host-side veth address (.1 → .2).
 fn peer_of(host_ip: &str) -> Option<String> {
     let (prefix, last) = host_ip.rsplit_once('.')?;
@@ -396,7 +452,7 @@ impl NetworkManager for BridgedNetwork {
             let mut attempts = 0u32;
             loop {
                 let host_ip = derive_host_ip(subnet_id, self.is_clone);
-                if !is_ip_in_use_on_veth(&host_ip).await {
+                if !is_ip_in_use_on_veth(&host_ip).await && !overlaps_host_network(&host_ip).await {
                     let host_ip_with_cidr = format!("{}/30", host_ip);
                     if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
                         let _ = self.cleanup().await;
@@ -898,6 +954,38 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VM's /30 never overlaps a network the host is on (#1735): on a VPC host at
+    /// 10.20.30.40/24, a clone's 10.20.30.4/30 would take the host's traffic to
+    /// 10.20.30.4-7. fcvm's own veths and loopback do not count.
+    #[test]
+    fn a_vms_subnet_never_overlaps_the_hosts_own_network() {
+        let addresses = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+            2: eth0    inet 10.20.30.40/24 metric 100 brd 10.20.30.255 scope global dynamic eth0\n\
+            9: veth0-abc    inet 10.0.2.9/30 scope global veth0-abc\n";
+        for (candidate, overlaps) in [
+            ("10.20.30.5", true),  // 10.20.30.4/30, inside the host's /24
+            ("10.20.30.41", true), // 10.20.30.40/30, around the host's own address
+            ("10.0.2.9", false),   // another VM's veth: not the host's network
+            ("10.1.0.1", false),
+            ("172.30.0.1", false),
+        ] {
+            assert_eq!(
+                overlaps_a_host_network(candidate, addresses),
+                overlaps,
+                "{candidate}"
+            );
+        }
+        // A host network wider than the /30 and one inside it both overlap.
+        assert!(overlaps_a_host_network(
+            "10.9.9.1",
+            "3: eth1    inet 10.0.0.1/8 scope global eth1\n"
+        ));
+        assert!(overlaps_a_host_network(
+            "10.9.9.1",
+            "3: eth1    inet 10.9.9.2/32 scope global eth1\n"
+        ));
+    }
 
     /// The guest reaches the host side of its veth at its gateway: a fresh boot's gateway
     /// is that address, and a clone's namespace DNATs every guest-to-gateway TCP
