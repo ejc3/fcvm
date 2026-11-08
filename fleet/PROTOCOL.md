@@ -1549,8 +1549,11 @@ stops nothing, and podman does not pass SIGKILL on to the container, so before i
 agent removes every container labelled `fcvm.fleet.windows-bridge=1` (`podman ps -a -q --filter
 label=...`, then `podman rm -f`). The agent gives each bridge the shared scene's clock and
 admission keys (`POST /scene` with `epoch_unix_ms` and `admit_keys`, the scene token) and each
-new one as it comes; a bridge with a certificate serves no frames without a scene, so with
-`--tls-dir` a sandbox reports `running` only once its bridge holds one. Every failure of a launch stops both its
+new one as it comes; a bridge with a certificate serves no frames without a scene. A sandbox
+reports `running` only once its bridge holds the current scene, or, without `--tls-dir`, when
+the agent has no scene yet; a bridge that reached the desktop but never took the scene fails
+its launch saying so. The removal of labelled containers assumes one agent per host, which
+systemd's unit gives (an agent restarts only after the old one stopped). Every failure of a launch stops both its
 VM and its bridge this way. A sandbox that replaces another on the same index starts only once
 the old one's VM and bridge have exited, waiting as long as the steps of a teardown may take
 together (both podman commands, the client, the VM's grace and the SIGKILLs). Every fcvm and

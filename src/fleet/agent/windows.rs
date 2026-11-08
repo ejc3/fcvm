@@ -134,10 +134,13 @@ pub fn verdict(installed: DateTime<Utc>, expires: DateTime<Utc>, now: DateTime<U
 /// the installation and expiry dates) and of its sandbox password. The id hashes the build's
 /// recipe only, so a rebuild of the same recipe is a new installation with the same id; a
 /// gold snapshot of the old one would log on with the wrong password and be aged by the
-/// wrong dates.
+/// wrong dates. The key also names how the gold flow made the snapshot (`GOLD_FLOW`), so a
+/// change to the flow makes a new one instead of reusing a snapshot and reference made the old
+/// way.
 pub fn gold_key(image_dir: &Path, manifest: &Manifest) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update(GOLD_FLOW.as_bytes());
     for f in ["manifest.json", "sandbox-password"] {
         let p = image_dir.join(f);
         let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -150,6 +153,10 @@ pub fn gold_key(image_dir: &Path, manifest: &Manifest) -> Result<String> {
         &hex::encode(h.finalize())[..12]
     ))
 }
+
+/// The gold flow's version, part of the gold key. 2: the reference is the second logon's
+/// (the first logon's could miss the taskbar and match no restored desktop).
+pub const GOLD_FLOW: &str = "gold-flow-2";
 
 /// The gold snapshot's tag for an image: one per image id, so a new image makes a new one and
 /// an agent that restarts reuses the one it made.
@@ -1470,6 +1477,8 @@ impl Sandbox {
             scene: None,
         };
         let mut tick = tokio::time::interval(self.cfg.poll);
+        // The bridge reached the desktop: a deadline after that is the scene's, not Windows'.
+        let mut desktop_seen = false;
         let fail = |why: String, r: &Running| {
             Some(format!(
                 "{why}; fcvm said: {} | the bridge said: {}",
@@ -1490,10 +1499,11 @@ impl Sandbox {
                         return Err(e);
                     }
                     // A bridge with a certificate serves frames only once it has a scene, so the
-                    // sandbox runs once its bridge holds one (or, without a certificate, when
-                    // there is none yet).
+                    // sandbox runs once its bridge holds the current scene, or, without a
+                    // certificate, when there is no scene yet.
                     let scene_ok = r.scene.is_some()
                         || (self.cfg.tls_dir.is_none() && self.scene.borrow().is_none());
+                    desktop_seen |= state == Some("desktop");
                     if state == Some("desktop") && scene_ok {
                         if let Some(desktop) = times.desktop {
                             let timings = launch_timings(teardown_ms, restore_ms, healthy_at, started_at, want.clicked_at, times);
@@ -1514,7 +1524,12 @@ impl Sandbox {
                     return Err(e);
                 }
                 _ = &mut deadline => {
-                    let e = fail(format!("no desktop {} s after fcvm started", self.cfg.start_timeout.as_secs()), &r);
+                    let why = if desktop_seen {
+                        format!("the bridge reached the desktop but did not take the scene in {} s", self.cfg.start_timeout.as_secs())
+                    } else {
+                        format!("no desktop {} s after fcvm started", self.cfg.start_timeout.as_secs())
+                    };
+                    let e = fail(why, &r);
                     self.stop(&mut r).await;
                     return Err(e);
                 }
@@ -1866,6 +1881,17 @@ mod tests {
             "a new installation date"
         );
         assert!(gold_tag(&first).len() <= 64);
+        // A key made before the flow had a version (manifest and password alone) names
+        // another snapshot: a gold snapshot and reference the old flow left are not reused.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for f in ["manifest.json", "sandbox-password"] {
+            let bytes = std::fs::read(dir.path().join(f)).unwrap();
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(&bytes);
+        }
+        let unversioned = format!("3f9c0a1b2c4d-{}", &hex::encode(h.finalize())[..12]);
+        assert_ne!(write("2026-12-01T10:00:00Z", "Sbaaaa!7"), unversioned);
     }
 
     /// Every process the Windows mode starts gets PR_SET_PDEATHSIG: a VM or bridge through
