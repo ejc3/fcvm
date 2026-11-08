@@ -339,57 +339,21 @@ pub async fn ensure_global_nat(vm_subnet: &str) -> Result<()> {
         );
     }
 
-    // The rule replaces any fcvm rule for this subnet that differs from it: one added
-    // under an earlier route source would otherwise keep translating to an address the
-    // host no longer has. It goes where the first of those stood, so it keeps that
-    // rule's place among rules others added, and in before they are deleted, so no
-    // guest connection leaves untranslated between.
-    let listed = Command::new("iptables")
-        .args(["-t", "nat", "-S", "POSTROUTING"])
-        .output()
-        .await
-        .context("listing the NAT rules")?;
-    anyhow::ensure!(
-        listed.status.success(),
-        "`iptables -t nat -S POSTROUTING` failed: {}",
-        String::from_utf8_lossy(&listed.stderr).trim()
-    );
-    let (insert, stale) =
-        global_nat_replacement(&String::from_utf8_lossy(&listed.stdout), vm_subnet, &rule);
-    let position = match insert {
-        Insert::Present => None,
-        Insert::At(position) => Some(vec!["-I".to_string(), position.to_string()]),
-        Insert::Append => Some(vec!["-A".to_string()]),
-    };
-    if let Some(position) = position {
-        let (verb, at) = position.split_first().expect("a verb");
-        let output = Command::new("iptables")
-            .args(["-t", "nat", verb, "POSTROUTING"])
-            .args(at)
-            .args(&rule)
-            .output()
-            .await
-            .context("adding the bridged NAT rule")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to add the bridged NAT rule {rule:?}: {}", stderr);
-        }
-    }
-    for old in stale {
-        let output = Command::new("iptables")
-            .args(["-t", "nat", "-D", "POSTROUTING"])
-            .args(&old)
-            .output()
-            .await
-            .context("removing a stale bridged NAT rule")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "failed to remove the stale bridged NAT rule {old:?}: {}",
-                stderr
-            );
-        }
-    }
+    place_global_nat_rule(vm_subnet, &rule, &mut |args| {
+        Box::pin(async move {
+            let output = Command::new("iptables")
+                .args(&args)
+                .output()
+                .await
+                .with_context(|| format!("running iptables {args:?}"))?;
+            Ok(IptablesRun {
+                ok: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        })
+    })
+    .await?;
 
     debug!("global NAT configuration complete");
     Ok(())
@@ -495,6 +459,83 @@ fn global_nat_rules_in(listing: &str) -> Vec<Vec<String>> {
                     .any(|subnet| has("-s", subnet))
         })
         .collect()
+}
+
+/// What one `iptables` run returned.
+pub(crate) struct IptablesRun {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `iptables` with the given arguments.
+type IptablesRunner<'a> = dyn FnMut(
+        Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<IptablesRun>> + Send>>
+    + Send
+    + 'a;
+
+/// How many times `place_global_nat_rule` lists the chain and places its rule.
+const PLACE_ATTEMPTS: usize = 3;
+
+/// Put `rule` in POSTROUTING for `subnet` and delete the fcvm rules it replaces.
+///
+/// The rule replaces any fcvm rule for this subnet that differs from it: one added
+/// under an earlier route source would otherwise keep translating to an address the
+/// host no longer has. It goes where the first of those stood, so it keeps that rule's
+/// place among rules others added, and in before they are deleted, so no guest
+/// connection leaves untranslated between. The NAT lock does not hold off other
+/// firewall writers: a position from the listing can be past the end once one has
+/// deleted rules, and a stale rule can be gone already. A refused insert lists the
+/// chain again; a stale rule already gone is not a failure.
+async fn place_global_nat_rule(
+    subnet: &str,
+    rule: &[String],
+    run: &mut IptablesRunner<'_>,
+) -> Result<()> {
+    let strings = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let mut last_refusal = String::new();
+    for _attempt in 0..PLACE_ATTEMPTS {
+        let listed = run(strings(&["-t", "nat", "-S", "POSTROUTING"])).await?;
+        anyhow::ensure!(
+            listed.ok,
+            "`iptables -t nat -S POSTROUTING` failed: {}",
+            listed.stderr.trim()
+        );
+        let (insert, stale) = global_nat_replacement(&listed.stdout, subnet, rule);
+        let mut args = match insert {
+            Insert::Present => None,
+            Insert::At(position) => Some(
+                strings(&["-t", "nat", "-I", "POSTROUTING"])
+                    .into_iter()
+                    .chain([position.to_string()])
+                    .collect::<Vec<_>>(),
+            ),
+            Insert::Append => Some(strings(&["-t", "nat", "-A", "POSTROUTING"])),
+        };
+        if let Some(args) = args.as_mut() {
+            args.extend(rule.iter().cloned());
+            let inserted = run(args.clone()).await?;
+            if !inserted.ok {
+                last_refusal = inserted.stderr.trim().to_string();
+                continue;
+            }
+        }
+        for old in stale {
+            let mut args = strings(&["-t", "nat", "-D", "POSTROUTING"]);
+            args.extend(old.iter().cloned());
+            let deleted = run(args).await?;
+            let gone = deleted.stderr.contains("does a matching rule exist")
+                || deleted.stderr.contains("Bad rule");
+            anyhow::ensure!(
+                deleted.ok || gone,
+                "failed to remove the stale bridged NAT rule {old:?}: {}",
+                deleted.stderr.trim()
+            );
+        }
+        return Ok(());
+    }
+    anyhow::bail!("failed to add the bridged NAT rule {rule:?}: {last_refusal}")
 }
 
 /// Where `ensure_global_nat` puts its rule.
@@ -661,6 +702,72 @@ mod tests {
             global_nat_replacement(&listing(&[&admins, &other]), "10.0.0.0/8", &wanted),
             (Insert::Append, Vec::<Vec<String>>::new())
         );
+    }
+
+    /// A position from the listing can be past the end once another firewall writer
+    /// has deleted rules: the refused insert lists the chain again and places the rule
+    /// there, and a stale rule someone else already removed is not a failure.
+    #[tokio::test]
+    async fn a_refused_insert_lists_the_chain_again() {
+        let wanted = global_nat_rule("10.0.0.0/8", "eth0", Some("10.20.30.40"));
+        let old = global_nat_rule("10.0.0.0/8", "eth0", Some("10.20.30.7"));
+        let line = |rule: &[String]| format!("-A POSTROUTING {}\n", rule.join(" "));
+        let first = format!(
+            "-A POSTROUTING -s 192.0.2.0/24 -j RETURN\n-A POSTROUTING -s 192.0.2.128/25 -j RETURN\n{}",
+            line(&old)
+        );
+        let second = line(&old);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let mut listings = vec![second, first];
+        let seen = calls.clone();
+        let mut run = move |args: Vec<String>| {
+            seen.lock().unwrap().push(args.clone());
+            let reply = match args[2].as_str() {
+                "-S" => IptablesRun {
+                    ok: true,
+                    stdout: listings.pop().unwrap_or_default(),
+                    stderr: String::new(),
+                },
+                // The first insert's position (3) is past the end of the shrunk chain.
+                "-I" if args[4] == "3" => IptablesRun {
+                    ok: false,
+                    stdout: String::new(),
+                    stderr: "iptables: Index of insertion too big.".into(),
+                },
+                "-D" => IptablesRun {
+                    ok: false,
+                    stdout: String::new(),
+                    stderr: "iptables: Bad rule (does a matching rule exist in that chain?)."
+                        .into(),
+                },
+                _ => IptablesRun {
+                    ok: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            };
+            Box::pin(async move { Ok(reply) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<IptablesRun>> + Send>>
+        };
+        place_global_nat_rule("10.0.0.0/8", &wanted, &mut run)
+            .await
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        let verbs: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|args| {
+                (
+                    args[2].as_str(),
+                    args.get(4).map(String::as_str).unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            verbs[..4],
+            [("-S", ""), ("-I", "3"), ("-S", ""), ("-I", "1")],
+            "{calls:?}"
+        );
+        assert_eq!(calls[4][2], "-D");
     }
 
     /// The interface and the route source are read together under the NAT lock, so a
