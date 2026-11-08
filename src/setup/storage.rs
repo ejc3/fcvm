@@ -44,14 +44,92 @@ fn get_filesystem_size(path: &Path) -> Option<String> {
     Some(format!("{}", bytes))
 }
 
-/// Check if a path is on a btrfs filesystem
-fn is_btrfs(path: &Path) -> bool {
-    Command::new("stat")
-        .args(["-f", "-c", "%T"])
-        .arg(path)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false)
+/// The filesystem family that holds a store directory, as far as setup cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreFs {
+    Btrfs,
+    /// A FUSE mount, which is what a nested guest sees of the host store
+    /// (`--map`, served by fuse-pipe). `statfs` reports the FUSE magic whatever
+    /// backs it, so the backing store is told apart by what it can do.
+    Fuse,
+    Other,
+}
+
+fn store_fs(path: &Path) -> StoreFs {
+    match nix::sys::statfs::statfs(path).map(|fs| fs.filesystem_type()) {
+        Ok(nix::sys::statfs::BTRFS_SUPER_MAGIC) => StoreFs::Btrfs,
+        Ok(nix::sys::statfs::FUSE_SUPER_MAGIC) => StoreFs::Fuse,
+        _ => StoreFs::Other,
+    }
+}
+
+/// `ioctl(FICLONE)`: make the destination share the source's extents.
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// Clone a small file inside `dir` and report whether the filesystem did it.
+///
+/// Both files get a unique name (a uuid, not a pid, because VMs sharing the
+/// store have separate pid namespaces), so two guests probing one shared store
+/// never touch each other's files. Both are removed before returning.
+fn reflink_probe(dir: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let id = uuid::Uuid::new_v4();
+    let src = dir.join(format!(".fcvm-reflink-probe.{id}.src"));
+    let dst = dir.join(format!(".fcvm-reflink-probe.{id}.dst"));
+    let result = (|| {
+        std::fs::write(&src, [0u8; 4096])?;
+        let src_file = std::fs::File::open(&src)?;
+        let dst_file = std::fs::File::create(&dst)?;
+        // SAFETY: both descriptors are open for the duration of the call.
+        let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    result
+}
+
+/// Decide whether a directory on `fs` can hold the store.
+///
+/// `Ok(true)`: use it as is. `Ok(false)`: not a store filesystem; the caller
+/// goes on to create or mount btrfs. `Err`: a FUSE mount that cannot clone
+/// files, which must not be mounted over or treated as absent.
+///
+/// A FUSE mount is accepted when reflinks work through it. The store needs
+/// reflinks (CoW disks) and unique-temp-plus-rename writes (which the store
+/// builders already use, because `flock` does not cross fuse-pipe). It does not
+/// need the guest to see btrfs: the host side of the map does the cloning, and
+/// a clone that works proves it is btrfs there.
+fn judge_store_fs(
+    fs: StoreFs,
+    dir: &Path,
+    probe: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<bool> {
+    match fs {
+        StoreFs::Btrfs => Ok(true),
+        StoreFs::Other => Ok(false),
+        StoreFs::Fuse => match probe(dir) {
+            Ok(()) => Ok(true),
+            Err(err) => anyhow::bail!(
+                "{} is a FUSE mount that cannot clone files ({err}), so it cannot hold the \
+                 fcvm store. A nested VM shares the host's store by mapping a btrfs \
+                 directory of the host, e.g. `--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs`, and \
+                 needs a guest kernel with FUSE_REMAP_FILE_RANGE (`--kernel-profile nested`). \
+                 Check that the host directory is on btrfs, that the guest kernel is the \
+                 nested profile, and that the directory is writable by this user.",
+                dir.display()
+            ),
+        },
+    }
+}
+
+/// [`judge_store_fs`] for a real directory.
+fn store_dir_usable(path: &Path) -> Result<bool> {
+    judge_store_fs(store_fs(path), path, reflink_probe)
 }
 
 /// Get storage paths and btrfs size from config
@@ -113,7 +191,7 @@ fn ensure_storage_with(
     let (mount_point, loopback_image, btrfs_size) = get_storage_paths(config_path)?;
 
     // Already btrfs? Just ensure directories exist (no root needed)
-    if is_btrfs(&mount_point) {
+    if store_dir_usable(&mount_point)? {
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
             std::fs::create_dir_all(&path).with_context(|| {
@@ -132,7 +210,7 @@ fn ensure_storage_with(
     // causes podman namespace divergence (podman's pause process gets its own mount
     // namespace, and file operations in the host namespace become invisible to podman).
     if let Some(parent) = mount_point.parent() {
-        if parent.exists() && is_btrfs(parent) {
+        if parent.exists() && store_dir_usable(parent)? {
             info!(
                 "Parent {} is already btrfs, creating {} directly (no loopback needed)",
                 parent.display(),
@@ -273,6 +351,61 @@ fn ensure_storage_with(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod store_fs_tests {
+    use super::*;
+    use std::io;
+
+    fn no_probe(_: &Path) -> io::Result<()> {
+        panic!("only a FUSE mount is probed");
+    }
+
+    /// A nested guest sees the host store as a FUSE mount. Setup refused it
+    /// ("mounted but not btrfs"), so nested setup needed a `stat` wrapper that
+    /// reported btrfs. A FUSE mount on which reflinks work is the host's btrfs
+    /// and is the store.
+    #[test]
+    fn a_fuse_mount_that_clones_files_is_the_store() {
+        let usable = judge_store_fs(StoreFs::Fuse, Path::new("/m"), |_| Ok(())).unwrap();
+        assert!(usable);
+    }
+
+    /// A FUSE mount that cannot clone is not a store, and it is an error, not
+    /// "absent": falling through would mount a loopback over it. The message
+    /// says how to set up a nested shared store.
+    #[test]
+    fn a_fuse_mount_that_cannot_clone_files_names_how_to_share_a_store() {
+        let err = judge_store_fs(StoreFs::Fuse, Path::new("/m"), |_| {
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        })
+        .unwrap_err()
+        .to_string();
+        for needle in ["/m", "--map", "FUSE_REMAP_FILE_RANGE", "btrfs"] {
+            assert!(err.contains(needle), "{needle} missing from: {err}");
+        }
+    }
+
+    #[test]
+    fn btrfs_is_the_store_and_other_filesystems_are_not_probed() {
+        assert!(judge_store_fs(StoreFs::Btrfs, Path::new("/m"), no_probe).unwrap());
+        assert!(!judge_store_fs(StoreFs::Other, Path::new("/m"), no_probe).unwrap());
+    }
+
+    /// The probe leaves nothing behind, success or failure. tmpfs and ext4
+    /// refuse FICLONE; btrfs accepts it. Either way the directory is empty.
+    #[test]
+    fn the_reflink_probe_removes_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = reflink_probe(dir.path());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_reflink_probe_reports_an_unwritable_directory() {
+        assert!(reflink_probe(Path::new("/nonexistent-probe-dir")).is_err());
+    }
 }
 
 #[cfg(all(test, feature = "privileged-tests"))]
