@@ -2732,6 +2732,162 @@ fn review_gate_treats_a_status_block_walkthrough_with_additions_as_a_claim() {
     }
 }
 
+/// The head the range quoted in the review-limit notice fixture ends at.
+const LIMIT_NOTICE_HEAD: &str = "7e1f3a5c9b2d4f6081a3c5e7092b4d6f8a0c2e4b";
+
+/// CodeRabbit's "Review limit reached" notice as posted on #1740 (2026-11-07), whose folds
+/// open with a `<br>` line. It says no review ran: it needs no disposition, and it covers no
+/// head although the range it quotes ends at the head.
+///
+/// No notice shape listed a `<br>` line, so the gate counted this notice as an unanswered
+/// finding.
+#[test]
+fn review_gate_reads_a_coderabbit_review_limit_notice_with_br_lines() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-limit-notice-br",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-review-limit-notice-br.md"),
+        LIMIT_NOTICE_HEAD,
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a notice saying no review ran is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice saying no review ran covers no head.\n{out}"
+    );
+}
+
+/// The same notice with a finding where a `<br>` line was, or appended, is a claim.
+#[test]
+fn review_gate_treats_a_review_limit_notice_with_br_lines_and_additions_as_a_claim() {
+    require_jq();
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-review-limit-notice-br.md"),
+    )
+    .unwrap();
+    let cases = [
+        (
+            "a finding in place of a <br> line",
+            text.replacen("> <br>", "> P1: this drops the last row", 1),
+        ),
+        (
+            "a finding appended",
+            format!("{text}\nP1: this drops the last row\n"),
+        ),
+    ];
+    for (case, body) in cases {
+        assert_ne!(body, text, "{case}: the fixture edit did not apply");
+        let (code, out) = run_gate_on_comment(
+            "cr-limit-notice-br-claim",
+            "coderabbitai",
+            "Bot",
+            &serde_json::to_string(&body).unwrap(),
+            LIMIT_NOTICE_HEAD,
+        );
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the notice with {case} is a claim.\n{out}"
+        );
+    }
+}
+
+/// CodeRabbit's "Review skipped" notice as posted on #1741 (2026-11-07), whose retry box
+/// reads "Trigger review" with no icon in front. It says no review ran: it needs no
+/// disposition and covers no head. With a finding where the box's label was, it is a claim.
+///
+/// The only box shape listed had the icon, so the gate counted this notice as an unanswered
+/// finding.
+#[test]
+fn review_gate_reads_a_coderabbit_review_skipped_notice_with_a_plain_trigger_box() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-skipped-notice",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-review-skipped-notice.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a notice saying no review ran is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice saying no review ran covers no head.\n{out}"
+    );
+
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-review-skipped-notice.md"),
+    )
+    .unwrap();
+    let body = text.replacen("--> Trigger review", "--> P1: this drops the last row", 1);
+    assert_ne!(body, text, "the fixture edit did not apply");
+    let (code, out) = run_gate_on_comment(
+        "cr-skipped-notice-claim",
+        "coderabbitai",
+        "Bot",
+        &serde_json::to_string(&body).unwrap(),
+        "deadbeef",
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("carry no disposition"),
+        "the notice with a finding where the box's label was is a claim.\n{out}"
+    );
+}
+
+/// The usage-limit notice Codex posted on #1740 (2026-11-08): its second line links
+/// chatgpt.com/settings/code-review. It says no review ran: it needs no disposition and
+/// covers no head. With a finding appended, it is a claim.
+///
+/// The listed second line linked chatgpt.com/codex/cloud/settings/code-review, so the gate
+/// counted this notice as an unanswered finding.
+#[test]
+fn review_gate_reads_a_codex_usage_limit_notice_with_the_settings_link() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "codex-limit-settings",
+        "chatgpt-codex-connector",
+        "Bot",
+        &review_gate_fixture("codex-limit-notice-settings.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a notice saying no review ran is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice saying no review ran covers no head.\n{out}"
+    );
+
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/codex-limit-notice-settings.md"),
+    )
+    .unwrap();
+    let body = format!("{text}P1: this drops the last row\n");
+    let (code, out) = run_gate_on_comment(
+        "codex-limit-settings-claim",
+        "chatgpt-codex-connector",
+        "Bot",
+        &serde_json::to_string(&body).unwrap(),
+        "deadbeef",
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("carry no disposition"),
+        "the notice with a finding appended is a claim.\n{out}"
+    );
+}
+
 /// CodeRabbit's reply "Review finished." under "Action performed", in the layout it has
 /// posted since the folds gained <dl><dd> wrappers (#1392), needs no disposition and covers
 /// no head.
