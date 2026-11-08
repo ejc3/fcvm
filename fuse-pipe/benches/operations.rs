@@ -108,11 +108,16 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     let before = 0o644;
     let after = 0o600;
 
-    // The cached half is only meaningful while the mount's 1s attr_timeout has
-    // not elapsed between the priming statx and the plain stat. A descheduling
-    // longer than that (a loaded CI host) expires the cache and the plain stat
-    // reports the new mode — a scheduling artifact, not the property under
-    // test — so that half retries. The forced half stays a hard assertion.
+    // The mount's attr_timeout (ATTR_TTL_SECS in fuse-pipe/src/server/passthrough.rs).
+    let attr_timeout = std::time::Duration::from_secs(1);
+
+    // Both halves are only meaningful while the attributes the priming statx
+    // cached have not expired. A descheduling longer than the attr_timeout (a
+    // loaded CI host) expires them: the plain stat then reports the new mode,
+    // or the forced stat reports it through ordinary expiry, which would pass
+    // even with AT_STATX_FORCE_SYNC ignored. Either is a scheduling artifact,
+    // so the attempt is retried. A forced stat that returns the old mode is a
+    // hard failure whenever it happens.
     //
     // A chmod moves the host file's ctime and nothing else, which the client
     // takes as a possible rewrite that kept the size and mtime
@@ -121,37 +126,48 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     // does not cache the attributes of a reply that an invalidation overtook. So
     // the cache is primed by the second forced statx, whose reply carries the
     // ctime the client already recorded.
-    let mut cache_held = false;
+    let mut saw_chmod = 0;
+    let mut expired = 0;
     for _ in 0..5 {
         fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
-        for _ in 0..2 {
+        let agrees = |what: &str| {
             assert_eq!(
                 forced_statx_mode(fd) as u32,
                 before,
                 "the mount does not agree with the backing file even before anything is \
-                 changed behind its back, so neither half of this check would mean anything"
-            );
-        }
+                 changed behind its back ({what}), so neither half of this check would mean \
+                 anything"
+            )
+        };
+        agrees("first refresh");
+        // Taken before the call: the cached attributes expire no earlier than
+        // attr_timeout after the request that brought them was sent.
+        let primed = std::time::Instant::now();
+        agrees("priming refresh");
 
         fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
 
-        if fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777 == before {
-            cache_held = true;
-            break;
+        if fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777 != before {
+            saw_chmod += 1;
+            continue;
         }
-    }
-    assert!(
-        cache_held,
-        "a plain stat through {} saw the out-of-band chmod on five consecutive attempts, so \
-         the attribute cache is not in play here and the forced case proves nothing",
-        via_mount.display()
-    );
 
-    let forced = forced_statx_mode(fd) as u32;
-    assert_eq!(
-        forced, after,
-        "AT_STATX_FORCE_SYNC returned the cached mode, so this benchmark would measure the \
-         attribute cache rather than a GETATTR round trip"
+        let forced = forced_statx_mode(fd) as u32;
+        assert_eq!(
+            forced, after,
+            "AT_STATX_FORCE_SYNC returned the cached mode, so this benchmark would measure the \
+             attribute cache rather than a GETATTR round trip"
+        );
+        if primed.elapsed() < attr_timeout {
+            return;
+        }
+        expired += 1;
+    }
+    panic!(
+        "five attempts through {} proved nothing: on {saw_chmod} a plain stat saw the \
+         out-of-band chmod, so the attribute cache was not in play, and on {expired} the \
+         forced stat finished after the cached attributes could have expired",
+        via_mount.display()
     );
 }
 
