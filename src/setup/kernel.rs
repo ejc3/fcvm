@@ -1061,6 +1061,24 @@ async fn run_kernel_build(
     status
 }
 
+/// Remove one host kernel build's entries from the shared host build dir: its source tree
+/// `linux-<version>` and every file named for its release (`<version>-fcvm-<sha>`: the
+/// packages, .buildinfo and .changes). Other builds' entries stay.
+async fn remove_host_build_entries(build_dir: &Path, kernel_version: &str, release: &str) {
+    remove_kernel_build_dir(&build_dir.join(format!("linux-{kernel_version}"))).await;
+    let Ok(mut entries) = tokio::fs::read_dir(build_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().contains(release) {
+            let path = entry.path();
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!(path = %path.display(), error = %e, "could not remove host kernel build file");
+            }
+        }
+    }
+}
+
 async fn build_kernel_locally(
     profile: &KernelProfile,
     profile_name: &str,
@@ -1536,9 +1554,15 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
     // Update GRUB with boot args
     update_grub_config(kernel_name, boot_args).await?;
 
-    // The package is installed; the tree (source, objects and debs, tens of GiB) is not
-    // read again. A failed build or install keeps it, for the "Deb already built" retry.
-    remove_kernel_build_dir(&build_dir).await;
+    // The package is installed, so this build's source tree and packages are not read
+    // again. The build dir itself is shared by every host build, so only this build's own
+    // entries go. A failed build or install keeps them, for the "Deb already built" retry.
+    remove_host_build_entries(
+        &build_dir,
+        kernel_version,
+        &format!("{kernel_version}{localversion}"),
+    )
+    .await;
 
     println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
@@ -3077,6 +3101,40 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host build dir is shared by every host kernel build. Cleaning up after one
+    /// install must leave another build's source and packages in place.
+    #[tokio::test]
+    async fn a_host_install_removes_only_its_own_build_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = dir.path();
+        for path in ["linux-7.3.3/vmlinux.o", "linux-6.18.60/vmlinux.o"] {
+            std::fs::create_dir_all(b.join(path).parent().unwrap()).unwrap();
+            std::fs::write(b.join(path), b"o").unwrap();
+        }
+        for file in [
+            "linux-image-7.3.3-fcvm-aaaa_7.3.3-1_arm64.deb",
+            "linux-headers-7.3.3-fcvm-aaaa_7.3.3-1_arm64.deb",
+            "linux-image-6.18.60-fcvm-bbbb_6.18.60-1_arm64.deb",
+        ] {
+            std::fs::write(b.join(file), b"d").unwrap();
+        }
+
+        remove_host_build_entries(b, "7.3.3", "7.3.3-fcvm-aaaa").await;
+
+        let mut left: Vec<String> = std::fs::read_dir(b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "linux-6.18.60",
+                "linux-image-6.18.60-fcvm-bbbb_6.18.60-1_arm64.deb"
+            ]
+        );
+    }
 
     /// A guest kernel build left /tmp/kernel-build-<profile>-<sha> (several GiB each) behind
     /// after it finished, and a run of campaign builds filled a box's root disk with them.
