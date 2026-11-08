@@ -449,9 +449,10 @@ pub fn scope_request(cmd: &crate::cli::Commands) -> Option<bool> {
         Commands::Snapshot(args) => match &args.cmd {
             SnapshotCommands::Serve(serve) => Some(serve.no_swap),
             SnapshotCommands::Run(run) => Some(run.no_swap),
-            SnapshotCommands::Create(_) | SnapshotCommands::Ls | SnapshotCommands::Export(_) => {
-                None
-            }
+            SnapshotCommands::Create(_)
+            | SnapshotCommands::Ls
+            | SnapshotCommands::Export(_)
+            | SnapshotCommands::Import(_) => None,
         },
         Commands::Vm(args) => match &args.cmd {
             VmCommands::Run(_) => Some(false),

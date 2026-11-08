@@ -1081,7 +1081,7 @@ async fn undo_snapshot_staging(path: &Path, lock: &Path) -> Undo {
 }
 
 /// The record of a snapshot staging directory, for the create that makes it
-/// ([`record_snapshot_staging`]).
+/// ([`record_snapshot_staging_in`]).
 ///
 /// Dropping it deletes the record when the directory is gone, which is how every create
 /// leaves it: renamed into place, or removed on a failure. The create still holds the tag's
@@ -1095,13 +1095,8 @@ pub struct SnapshotStagingRecord {
 }
 
 /// Record the staging directory `path` of a snapshot whose tag lock is `lock`, before
-/// making it. The caller holds `lock` exclusively, and keeps the returned record until it
-/// has renamed `path` into place or removed it.
-pub fn record_snapshot_staging(path: &Path, lock: &Path) -> Result<SnapshotStagingRecord> {
-    record_snapshot_staging_in(&owner_dir()?, path, lock)
-}
-
-/// [`record_snapshot_staging`] with its record in the owner directory `owners`.
+/// making it, in the owner directory `owners`. The caller holds `lock` exclusively, and
+/// keeps the returned record until it has renamed `path` into place or removed it.
 pub fn record_snapshot_staging_in(
     owners: &Path,
     path: &Path,
