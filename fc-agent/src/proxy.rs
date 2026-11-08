@@ -217,19 +217,82 @@ pub async fn run_egress_proxy(gen_tx: watch::Sender<u64>) {
         eprintln!("[fc-agent] egress proxy vsock connected (gen={})", count);
         let _ = gen_tx.send(count);
 
-        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock).await;
+        let ended = run_mux_session(&listener_v4, listener_v6.as_ref(), vsock).await;
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
+        reset_in_background(ended);
     }
 }
 
+/// Start the reset of an ended session's streams and return at once. Returns whether there
+/// was anything to reset.
+///
+/// A restore waits 5 s for the reconnect that follows this call and fails closed without
+/// it, and a restored clone can hold thousands of streams: the walk over about 4,500 of
+/// them has taken up to 31 s there. The reset runs on a thread of its own and not on the
+/// blocking pool, where it would queue behind exec handshakes and where a thread the pool
+/// cannot start panics the proxy's task.
+fn reset_in_background(ended: Arc<ProxyState>) -> bool {
+    // A session that opened no stream has none to reset. The counter is read, not the
+    // map: asking the map takes its locks.
+    if ended.next_stream_id.load(Ordering::Relaxed) == 1 {
+        return false;
+    }
+    let inline = ended.clone();
+    let reset = move || {
+        let started = std::time::Instant::now();
+        let reset = reset_streams(&ended);
+        eprintln!(
+            "[fc-agent] egress proxy reset {reset} streams of the ended session in {}ms",
+            started.elapsed().as_millis()
+        );
+    };
+    let thread = std::thread::Builder::new().name("egress-reset".to_string());
+    if let Err(e) = thread.spawn(reset) {
+        eprintln!(
+            "[fc-agent] WARNING: no thread for the egress proxy's stream reset ({e}); resetting before the reconnect"
+        );
+        reset_streams(&inline);
+    }
+    true
+}
+
+/// Send RST to every stream of a session whose vsock connection has died, and forget them.
+/// Returns how many there were.
+fn reset_streams(state: &ProxyState) -> usize {
+    take_streams(state, |stream| {
+        let _ = stream.send((FRAME_RST, Vec::new()));
+    })
+}
+
+/// Remove every stream from the map and hand each to `each`, with no lock of the map held
+/// while `each` runs. Returns how many there were.
+///
+/// A handler that ends on its own removes its entry (`handle_redirected_connection`), on a
+/// runtime worker, and waits for the entry's shard if this walk holds it. So the ids are
+/// read first and each stream is then removed by id: iterating the map would keep a shard
+/// locked across every stream in it.
+fn take_streams(state: &ProxyState, mut each: impl FnMut(StreamSender)) -> usize {
+    let ids: Vec<u32> = state.streams.iter().map(|entry| *entry.key()).collect();
+    let mut taken = 0;
+    for id in ids {
+        if let Some((_, stream)) = state.streams.remove(&id) {
+            each(stream);
+            taken += 1;
+        }
+    }
+    taken
+}
+
 /// Run a single multiplexed session over one vsock connection.
-/// Returns when the vsock connection dies (reader/writer error or EPOLLERR).
+/// Returns the session's state when the vsock connection dies (reader/writer error or
+/// EPOLLERR). Its streams are still open: the caller starts their reset
+/// ([`reset_in_background`]).
 async fn run_mux_session(
     listener_v4: &TcpListener,
     listener_v6: Option<&TcpListener>,
     vsock: VsockStream,
-) {
+) -> Arc<ProxyState> {
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ProxyState {
         streams: DashMap::new(),
@@ -298,11 +361,7 @@ async fn run_mux_session(
         },
     }
 
-    // RST all active streams
-    for entry in state.streams.iter() {
-        let _ = entry.value().send((FRAME_RST, Vec::new()));
-    }
-    state.streams.clear();
+    state
 }
 
 /// Writer task: reads serialized frames from channel and writes to vsock.
@@ -774,6 +833,141 @@ mod tests {
     }
 
     use super::*;
+
+    type StreamReceiver = mpsc::UnboundedReceiver<(u8, Vec<u8>)>;
+
+    fn state_with_streams(
+        ids: std::ops::RangeInclusive<u32>,
+    ) -> (Arc<ProxyState>, Vec<StreamReceiver>) {
+        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
+        let state = Arc::new(ProxyState {
+            streams: DashMap::new(),
+            writer_tx,
+            next_stream_id: AtomicU32::new(ids.end() + 1),
+        });
+        let mut receivers = Vec::new();
+        for stream_id in ids {
+            let (tx, rx) = mpsc::unbounded_channel();
+            state.streams.insert(stream_id, tx);
+            receivers.push(rx);
+        }
+        (state, receivers)
+    }
+
+    /// A restore waits for the reconnect, so nothing between the end of a session and the
+    /// next connect may wait for the ended session's streams: the session itself touches
+    /// none of them, and the proxy only starts their reset.
+    #[test]
+    fn the_reconnect_does_not_wait_for_the_ended_sessions_streams() {
+        let source = include_str!("proxy.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body_of = |start: &str| {
+            let body = &code[code.find(start).unwrap_or_else(|| panic!("no {start}"))..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        let session = body_of("async fn run_mux_session(");
+        for walk in ["streams.", "reset_streams(", "take_streams("] {
+            assert!(
+                !session.contains(walk),
+                "run_mux_session touches the streams ({walk}) before it returns"
+            );
+        }
+        let proxy = body_of("pub async fn run_egress_proxy(");
+        let ended = proxy
+            .find("run_mux_session(")
+            .expect("the proxy runs a session");
+        let after = &proxy[ended..];
+        let after = &after[after.find('\n').unwrap()..];
+        assert!(
+            after.contains("reset_in_background(ended);"),
+            "the proxy starts the reset of the ended session's streams"
+        );
+        for wait in [".await", "reset_streams(", "take_streams(", "streams."] {
+            assert!(
+                !after.contains(wait),
+                "between the end of a session and the next connect the proxy waits ({wait})"
+            );
+        }
+    }
+
+    /// `reset_in_background` returns while the reset cannot make progress, and the reset
+    /// then runs without the caller.
+    #[test]
+    fn the_reset_of_an_ended_session_runs_after_the_call_returns() {
+        let (state, mut receivers) = state_with_streams(1..=1);
+        // The reset needs this stream's entry, and the test holds it.
+        let held = state.streams.get_mut(&1).unwrap();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let ended = state.clone();
+        let caller = std::thread::spawn(move || {
+            assert!(reset_in_background(ended));
+            let _ = returned_tx.send(());
+        });
+        let returned = returned_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        caller.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "reset_in_background waited for the streams of the ended session"
+        );
+        let mut rx = receivers.pop().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let frame = loop {
+            match rx.try_recv() {
+                Ok(frame) => break frame,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+                Err(e) => panic!("the stream was not reset after the call returned: {e}"),
+            }
+        };
+        assert_eq!(frame, (FRAME_RST, Vec::new()));
+    }
+
+    /// A session that opened no stream starts no reset thread.
+    #[test]
+    fn a_session_without_streams_starts_no_reset() {
+        let (state, _receivers) = state_with_streams(1..=1);
+        state.next_stream_id.store(1, Ordering::Relaxed);
+        assert!(
+            !reset_in_background(state.clone()),
+            "a reset was started for a session whose stream counter never moved"
+        );
+        assert_eq!(state.streams.len(), 1);
+    }
+
+    /// A handler that ends on its own takes its entry's shard to remove it. The reset holds
+    /// no shard while it resets a stream, so that handler never waits for the walk.
+    #[test]
+    fn a_reset_holds_no_lock_of_the_map_while_it_resets_a_stream() {
+        let (state, _receivers) = state_with_streams(1..=256);
+        let mut locked = std::collections::BTreeSet::new();
+        let taken = take_streams(&state, |_stream| {
+            for id in 1..=256u32 {
+                if state.streams.try_get_mut(&id).is_locked() {
+                    locked.insert(id);
+                }
+            }
+        });
+        assert_eq!(taken, 256);
+        assert!(
+            locked.is_empty(),
+            "the reset held the map's lock over {} of 256 entries while it reset a stream",
+            locked.len()
+        );
+    }
+
+    #[test]
+    fn a_reset_sends_rst_to_every_stream_and_forgets_them() {
+        let (state, receivers) = state_with_streams(1..=3);
+        assert_eq!(reset_streams(&state), 3);
+        assert!(state.streams.is_empty());
+        for mut rx in receivers {
+            assert_eq!(rx.try_recv().ok(), Some((FRAME_RST, Vec::new())));
+            // The sender is gone with the map entry.
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn egress_generation_timeout_is_a_readiness_error() {
