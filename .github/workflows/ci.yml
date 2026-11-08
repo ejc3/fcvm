@@ -1441,10 +1441,17 @@ jobs:
   # The top of a stack tests every lower PR's commits. When its run passes, each
   # lower PR whose head is an ancestor of this head gets a "Stack CI" success
   # status naming this run, which is what says that PR was tested.
+  #
+  # `!cancelled()` is what lets this job run at all. Without a status function
+  # GitHub adds success() to the condition, and success() is false when a job
+  # anywhere before this one in the needs graph was skipped. Summary waits for
+  # jobs most PRs skip (the bench and fleet tests), so this job was skipped on
+  # every stack. Summary's own result is still required below.
   stack-coverage:
     name: Stack coverage
     needs: [changes, summary]
     if: >-
+      !cancelled() &&
       github.event_name == 'pull_request' &&
       needs.changes.outputs.run == 'true' &&
       needs.summary.result == 'success' &&
