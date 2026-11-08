@@ -692,7 +692,8 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #     reviews. You can see your limits in the [Codex usage dashboard](...)." alone (#898 at
 #     05:16Z, #842) or followed by "To continue using code reviews, add credits to your
 #     account and enable them for code reviews in your [settings](...)." (#898 at 05:20Z
-#     and 06:04Z, aws #46, aws #27).
+#     and 06:04Z, aws #46, aws #27). The settings link is chatgpt.com/codex/cloud/settings/
+#     code-review there and chatgpt.com/settings/code-review since #1740 (2026-11-08).
 #   - CodeRabbit's reply to a command it did not carry out: one of "Review rate limited.",
 #     "Already reviewed.", "Already reviewed the last commit. Use `@coderabbitai full
 #     review` to rerun a review of the entire changeset.", "No files to review." or "Pull
@@ -1059,8 +1060,11 @@ def walkthrough_sha:
      | capture(cr_range_re) | .sha ] | first) // "";
 def codex_limit_line1: "You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).";
 def codex_limit_line2: "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).";
+def codex_limit_line2_settings: "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/settings/code-review).";
 def is_codex_limit_notice:
-  verdict_lines as $l | ($l == [codex_limit_line1]) or ($l == [codex_limit_line1, codex_limit_line2]);
+  verdict_lines as $l
+  | ($l == [codex_limit_line1]) or ($l == [codex_limit_line1, codex_limit_line2])
+    or ($l == [codex_limit_line1, codex_limit_line2_settings]);
 def cr_not_done_re: "^(Review rate limited\\.|Already reviewed\\.|Already reviewed the last commit\\. Use `@coderabbitai full review` to rerun a review of the entire changeset\\.|No files to review\\.|Pull request is closed\\.)$";
 def cr_fair_usage_re: "^Your included review limit is currently reached under our \\[Fair Usage Limits Policy\\]\\(https://docs\\.coderabbit\\.ai/management/plans#fair-usage-limits-policy\\)\\. This review may still proceed through usage-based billing if eligible\\. Your next included review will be available in [0-9]+ (minutes?|seconds?|hours?)\\.$";
 def cr_chat_limit_re: "^`@[A-Za-z0-9-]+` have exceeded the limit for the number of chat messages per hour\\. Please wait \\*\\*[0-9]+ (minutes?|seconds?|hours?)( and [0-9]+ (minutes?|seconds?))?\\*\\* before sending another message\\.$";

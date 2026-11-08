@@ -2843,6 +2843,51 @@ fn review_gate_reads_a_coderabbit_review_skipped_notice_with_a_plain_trigger_box
     );
 }
 
+/// The usage-limit notice Codex posted on #1740 (2026-11-08): its second line links
+/// chatgpt.com/settings/code-review. It says no review ran: it needs no disposition and
+/// covers no head. With a finding appended, it is a claim.
+///
+/// The listed second line linked chatgpt.com/codex/cloud/settings/code-review, so the gate
+/// counted this notice as an unanswered finding.
+#[test]
+fn review_gate_reads_a_codex_usage_limit_notice_with_the_settings_link() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "codex-limit-settings",
+        "chatgpt-codex-connector",
+        "Bot",
+        &review_gate_fixture("codex-limit-notice-settings.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a notice saying no review ran is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice saying no review ran covers no head.\n{out}"
+    );
+
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/codex-limit-notice-settings.md"),
+    )
+    .unwrap();
+    let body = format!("{text}P1: this drops the last row\n");
+    let (code, out) = run_gate_on_comment(
+        "codex-limit-settings-claim",
+        "chatgpt-codex-connector",
+        "Bot",
+        &serde_json::to_string(&body).unwrap(),
+        "deadbeef",
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("carry no disposition"),
+        "the notice with a finding appended is a claim.\n{out}"
+    );
+}
+
 /// CodeRabbit's reply "Review finished." under "Action performed", in the layout it has
 /// posted since the folds gained <dl><dd> wrappers (#1392), needs no disposition and covers
 /// no head.

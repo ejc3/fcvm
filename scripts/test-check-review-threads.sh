@@ -2400,5 +2400,21 @@ run_case "the review-skipped notice with a finding where the box's label was is 
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(skip_edit 'sub("--> Trigger review"; "--> P1: this drops the last row")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 
 echo
+echo "== finding 54: the Codex usage-limit notice with the new settings link =="
+# The notice Codex posted on #1740 (2026-11-08), read from tests/fixtures/review-gate. Its
+# second line links chatgpt.com/settings/code-review, where the listed line links
+# chatgpt.com/codex/cloud/settings/code-review, so a notice saying no review ran read as an
+# unanswered finding.
+CODEX_LIM=$(jq -Rs . < "$FIXDIR/codex-limit-notice-settings.md")
+run_case "the usage-limit notice with the settings link needs no disposition" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIM")")" 0 "CLEAR"
+run_case "the usage-limit notice with the settings link covers no head" \
+  "$(wrap7 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIM")]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the usage-limit notice with a finding appended is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(jq -c '. + "P1: this drops the last row\n"' <<<"$CODEX_LIM")")")" 1 "carry no disposition"
+run_case "the usage-limit notice with another link is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(jq -c 'sub("chatgpt.com/settings/code-review"; "example.com/settings/code-review")' <<<"$CODEX_LIM")")")" 1 "carry no disposition"
+
+echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
