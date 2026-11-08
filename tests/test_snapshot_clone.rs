@@ -3774,13 +3774,37 @@ fn snapshot_files(dir: &std::path::Path) -> Result<Vec<(std::path::PathBuf, u64)
     Ok(files)
 }
 
+/// The working set a memory server of the snapshot `tag` loads when it starts, as the
+/// `(offset, length)` of its runs, with the store it was read through.
+fn snapshot_working_set(tag: &str) -> Result<(fcvm::uffd::WorkingSetStore, Vec<(u64, u64)>)> {
+    let root = fcvm::paths::snapshot_dir();
+    let memory = root.join(tag).join("memory.bin");
+    let len = std::fs::metadata(&memory)
+        .with_context(|| format!("reading the size of {}", memory.display()))?
+        .len();
+    let store = fcvm::uffd::WorkingSetStore::open(
+        &memory,
+        len,
+        &root.join(tag).join("config.json"),
+        &root.join(format!("{tag}.lock")),
+    )?;
+    let runs = store
+        .to_prefetch()
+        .runs()
+        .map(|run| (run.offset, run.len))
+        .collect();
+    Ok((store, runs))
+}
+
 /// `snapshot export`, a delete of the tag, and `snapshot import` of the archive give back a
 /// snapshot that restores: a clone of it turns healthy and answers an exec. The imported
 /// directory holds the files the exported one held, at the same lengths, under a config
-/// that is a generation of its own with no parent.
+/// that is a generation of its own with no parent, and its sidecar holds the working set
+/// that was recorded for the exported one. A clone restored through a memory server of the
+/// imported snapshot replays that set: the server's replay line for it counts pages.
 #[tokio::test]
 async fn test_snapshot_export_delete_import_restores() -> Result<()> {
-    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("import");
+    let (baseline_name, clone_name, snapshot_name, serve_name) = common::unique_names("import");
     let fcvm_path = common::find_fcvm_binary()?;
     let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
     let snapshot_dir = fcvm::paths::snapshot_dir().join(&snapshot_name);
@@ -3805,11 +3829,35 @@ async fn test_snapshot_export_delete_import_restores() -> Result<()> {
     .context("spawning the VM to snapshot")?;
     let mut baseline_running = true;
     let mut clone_pid = None;
+    let mut serve_pid = None;
     let result = async {
         common::poll_health_by_pid(baseline_pid, 120).await?;
         common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
         common::kill_process(baseline_pid).await;
         baseline_running = false;
+
+        // What a memory server leaves beside the memory image after its first clone: a
+        // working set under this snapshot's key, written by the store's own transaction.
+        let recorded = vec![(0, 16 * 4096), (1 << 20, 4096)];
+        {
+            let (store, before) = snapshot_working_set(&snapshot_name)?;
+            anyhow::ensure!(
+                before.is_empty(),
+                "the snapshot has a working set before any was recorded: {before:?}"
+            );
+            let mut pages = store.recorder();
+            for (offset, len) in &recorded {
+                pages.insert_range(*offset, *len);
+            }
+            anyhow::ensure!(
+                store.merge_and_persist(&pages)?.persisted,
+                "the working set was not written"
+            );
+        }
+        anyhow::ensure!(
+            snapshot_working_set(&snapshot_name)?.1 == recorded,
+            "the exported snapshot's working set did not read back"
+        );
 
         let mut export = tokio::process::Command::new(&fcvm_path);
         export
@@ -3823,9 +3871,12 @@ async fn test_snapshot_export_delete_import_restores() -> Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
         let exported = snapshots.load_snapshot(&snapshot_name).await?;
-        // A memory server leaves its working set and that file's lock beside the memory
-        // image, and neither is imported. This snapshot was never served.
         let exported_files = snapshot_files(&snapshot_dir)?;
+        let sidecar = std::path::Path::new("memory.bin.working-set");
+        anyhow::ensure!(
+            exported_files.iter().any(|(name, _)| name == sidecar),
+            "the exported snapshot has no working set: {exported_files:?}"
+        );
         anyhow::ensure!(
             exported_files
                 .iter()
@@ -3865,10 +3916,15 @@ async fn test_snapshot_export_delete_import_restores() -> Result<()> {
             "the import changed the snapshot's VM id, vsock path or memory path"
         );
         let imported_files = snapshot_files(&snapshot_dir)?;
+        // The config is rewritten, and the working set's lock file belongs to the host: an
+        // archive does not carry it and an import makes none.
         let without_config = |files: &[(std::path::PathBuf, u64)]| {
             files
                 .iter()
-                .filter(|(name, _)| name != std::path::Path::new("config.json"))
+                .filter(|(name, _)| {
+                    name != std::path::Path::new("config.json")
+                        && name != std::path::Path::new("memory.bin.working-set.lock")
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -3876,6 +3932,21 @@ async fn test_snapshot_export_delete_import_restores() -> Result<()> {
             without_config(&imported_files) == without_config(&exported_files),
             "the imported directory is not the exported one: {imported_files:?} and \
              {exported_files:?}"
+        );
+        anyhow::ensure!(
+            !imported_files
+                .iter()
+                .any(|(name, _)| name == std::path::Path::new("memory.bin.working-set.lock")),
+            "the import made a working-set lock file: {imported_files:?}"
+        );
+        // The import wrote a new config and a new memory image, so the sidecar it installed
+        // is under another key than the exported one. A memory server of the imported
+        // snapshot loads the recorded pages from it.
+        let installed = snapshot_working_set(&snapshot_name)?.1;
+        anyhow::ensure!(
+            installed == recorded,
+            "a memory server of the imported snapshot loads the working set {installed:?}, \
+             and {recorded:?} was recorded for the exported one"
         );
 
         let (_clone_child, pid) = common::spawn_fcvm_with_logs(
@@ -3910,10 +3981,43 @@ async fn test_snapshot_export_delete_import_restores() -> Result<()> {
             "the clone of the imported snapshot did not answer an exec: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        common::kill_process(pid).await;
+        clone_pid = None;
+
+        // The clone above was restored from the file and replays nothing. A memory server
+        // loads the installed set when it starts and replays it into the clone it serves,
+        // and logs one replay line for that clone with the pages it populated.
+        let (_serve_child, pid, serve_log) = common::spawn_fcvm_with_log_path(
+            &working_set_serve_args(&snapshot_name, "copy"),
+            &serve_name,
+        )
+        .await
+        .context("spawning a memory server of the imported snapshot")?;
+        serve_pid = Some(pid);
+        common::poll_serve_ready(&snapshot_name, pid, 60).await?;
+        let served_name = format!("{clone_name}-served");
+        let (_served_child, served) = spawn_working_set_clone(pid, &served_name)
+            .await
+            .context("spawning a clone through the memory server")?;
+        clone_pid = Some(served);
+        let log = serve_log_until(&serve_log, 60, "the served clone's replay line", |log| {
+            !prefetched_by_vm(log).is_empty()
+        })
+        .await?;
+        let replayed = prefetched_by_vm(&log);
+        anyhow::ensure!(
+            replayed.len() == 1 && replayed[0].1 > 0,
+            "the memory server of the imported snapshot served one clone and did not replay \
+             the installed working set into it: prefetched pages by clone {replayed:?}"
+        );
         Ok(())
     }
     .await;
+    // The clone before its memory server: the server keeps serving a connected clone.
     if let Some(pid) = clone_pid {
+        common::kill_process(pid).await;
+    }
+    if let Some(pid) = serve_pid {
         common::kill_process(pid).await;
     }
     if baseline_running {

@@ -3092,6 +3092,21 @@ separately.
   and against 606 s with no set, but held 52.7 GiB at healthy against 25.4 GiB. Inheriting
   skips the recording pass at the price of every clone's memory, until a recording that
   replaces the set (rather than adding to it) takes its place.
+- **Import (`snapshot import`)**: an import writes a `config.json` with a new generation id and
+  a memory image with a new mtime, so the archived sidecar's key is the key of nothing on the
+  importing host. When the import reaches the sidecar's entry it compares the staged memory
+  image's length with the manifest's, and holds the sidecar's bytes in memory only if they
+  agree and the sidecar is no longer than a set of that length can be. Once the archive's
+  trailer has verified, it decodes the held bytes under the exporting host's key, built from
+  the digest of the archived `config.json` and the manifest's
+  `memory {len, mtime_sec, mtime_nsec}` (`ImageKey::from_parts`). A set that decodes is
+  written into the staging directory under the key of the staged config and memory image
+  (`WorkingSetStore::seed_staged_generation`), after the config is written and before the
+  directory is synced and renamed, so it needs no sidecar lock and a serve never sees the
+  snapshot without it. The first clone restored through a memory server then replays it. A
+  sidecar the import cannot use leaves the snapshot without a set and one warning with the
+  reason, and the import still succeeds; DESIGN.md (`fcvm snapshot import`) lists the
+  reasons. An archive with no sidecar is logged at info level.
 - **Isolation**: replay touches pages the guest never asked for, so it must stay private.
   `UFFDIO_COPY` writes into the clone's own anonymous memory, and `UFFDIO_CONTINUE` installs a
   read-only PTE that copies on write. Proven by `prefetched_pages_are_private_to_each_clone`
