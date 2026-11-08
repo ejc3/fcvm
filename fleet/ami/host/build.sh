@@ -188,6 +188,18 @@ build)
   # carries a new installation and its 180-day evaluation starts at this build; it is built as
   # root, the user the agent runs fcvm as, and its files are root's alone (mode 0600).
   as_user "cd $SRC && make setup-cloud-hypervisor"
+  # A build from a base image inherits its store, an installation included, and build-image.sh
+  # reuses an installation of the same recipe. One more than 30 days old is installed again, so
+  # every published host image has at least 140 days before the agent refuses its sandboxes
+  # (pipeline_guest.py windows_image_publishable checks the same before publishing).
+  for d in /mnt/fcvm-btrfs/windows/image-*; do
+    [ -d "$d" ] || continue
+    at=$(jq -r '.installed_at // empty' "$d/manifest.json" 2>/dev/null || true)
+    if [ -z "$at" ] || [ $(( $(date -u +%s) - $(date -u -d "$at" +%s) )) -gt $(( 30 * 86400 )) ]; then
+      echo "removing the Windows installation $d (installed ${at:-at an unknown time})"
+      rm -rf "$d"
+    fi
+  done
   WIN_IMAGE=$(bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows)
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
   as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"

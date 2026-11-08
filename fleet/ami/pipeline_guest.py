@@ -6,6 +6,7 @@ commands and secret-bearing exception text are never returned to CodeBuild.
 """
 import base64
 import contextlib
+import datetime
 import hashlib
 import hmac
 import io
@@ -423,13 +424,44 @@ def host_proof(new, old):
                 process.wait(timeout=60)
 
 
+# A published host image's Windows installation is at most this old. build.sh installs again
+# once an inherited one passes it, and the agent warns at 150 days and refuses at 170 (or 7 days
+# before the evaluation expires), so a host image published today has 120 days of sandboxes.
+WINDOWS_PUBLISH_MAX_AGE_DAYS = 30
+WINDOWS_REFUSE_AGE_DAYS = 170
+WINDOWS_REFUSE_BEFORE_EXPIRY_DAYS = 7
+
+
+def windows_image_publishable(manifest, now):
+    """Refuse an installation too old to publish: older than WINDOWS_PUBLISH_MAX_AGE_DAYS, or one
+    whose sandboxes the agent would refuse within the rest of that window."""
+    def when(key):
+        text = manifest.get(key)
+        need(isinstance(text, str) and text, f"the Windows image's manifest has no {key}")
+        try:
+            t = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise RuntimeError(f"the Windows image's {key} is not a date: {text!r}") from None
+        need(t.tzinfo is not None, f"the Windows image's {key} has no time zone: {text!r}")
+        return t
+    installed, expires = when("installed_at"), when("eval_expires")
+    day = datetime.timedelta(days=1)
+    need(now - installed <= WINDOWS_PUBLISH_MAX_AGE_DAYS * day,
+         f"the Windows image was installed {installed:%Y-%m-%d}, more than {WINDOWS_PUBLISH_MAX_AGE_DAYS} days ago")
+    refused_at = min(installed + WINDOWS_REFUSE_AGE_DAYS * day, expires - WINDOWS_REFUSE_BEFORE_EXPIRY_DAYS * day)
+    runway = (WINDOWS_REFUSE_AGE_DAYS - WINDOWS_PUBLISH_MAX_AGE_DAYS) * day
+    need(refused_at - now >= runway,
+         f"the agent would refuse this Windows image from {refused_at:%Y-%m-%d} (evaluation expires {expires:%Y-%m-%d})")
+
+
 def windows_proof():
     """A Windows sandbox from the image this build installed boots to a healthy desktop: Remote
     Desktop answers and the guest agent acknowledged its clock (docs/fleet/windows-sandboxes.md)."""
     found = re.search(r"--windows-image (/\S+)", Path("/etc/fcvm-fleet/windows.env").read_text())
     need(found is not None, "windows.env names no Windows image")
     image = Path(found.group(1))
-    need(json.loads((image / "manifest.json").read_text()).get("eval_expires"), "the Windows image has no expiry")
+    windows_image_publishable(json.loads((image / "manifest.json").read_text()),
+                              datetime.datetime.now(datetime.timezone.utc))
     argv = ["fcvm", "vm", "run", "--name", "factory-windows-proof", "--firmware", str(image / "CLOUDHV.fd"),
         "--disk", str(image / "disk.raw"), "--guest", "windows"]
 
