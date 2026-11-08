@@ -98,14 +98,9 @@ describe(`the coordinator's snapshot states (#1146 at ${fixture.source.commit})`
     expect([arrivals.last_arrival_at, arrivals.sleep_without_arrival_at]).toEqual([2_200_000, 3_200_000]);
   });
 
-  // Minecraft mode's intents are the coordinator PR's (the stack in docs/fleet/minecraft.md), whose
-  // vectors this fixture does not hold yet. Regenerate the fixture from them and delete this
-  // list: the check below fails as soon as the fixture knows one of them.
-  const NOT_IN_FIXTURE_YET = ["minecraft_reset", "minecraft_fork", "claim_minecraft", "release_minecraft"];
   it("the page sends only intents the coordinator knows", () => {
     expect(fixture.intents.known).toContain("restart_now");
-    for (const n of NOT_IN_FIXTURE_YET) expect(fixture.intents.known, `${n} is in the fixture now: drop it from NOT_IN_FIXTURE_YET`).not.toContain(n);
-    for (const n of INTENT_NAMES.filter((x) => !NOT_IN_FIXTURE_YET.includes(x))) {
+    for (const n of INTENT_NAMES) {
       expect(fixture.intents.known, n).toContain(n);
       expect(fixture.intents.unknown, n).not.toContain(n);
     }
