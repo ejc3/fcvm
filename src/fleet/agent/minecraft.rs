@@ -140,10 +140,43 @@ pub fn gold_argv(cfg: &MinecraftCfg, prefix: &str, place: &Place) -> Vec<String>
 }
 
 /// `fcvm snapshot run` of `tag` as server `name`.
+/// The command the guest runs in the tile's container once a restore has retired the
+/// snapshot's sockets and before the clone takes connections: the tile drops the scene it was
+/// copied with (a fork's source borrower among it) until the agent gives it its own.
+pub const RESTORE_HOOK: &str = "mctile restored";
+
 pub fn restore_argv(tag: &str, name: &str, prefix: &str, place: &Place) -> Vec<String> {
     let mut a = s(&["snapshot", "run", "--snapshot", tag, "--name", name]);
     a.extend(network_args(prefix, place));
+    a.extend(s(&["--on-restore", RESTORE_HOOK]));
     a
+}
+
+/// A fork's snapshot, removed when it is dropped: after the copy runs, after it fails, and when
+/// the relaunch is given up (the server unassigned) after the snapshot was made.
+struct ForkSnapshot {
+    dir: PathBuf,
+    tag: String,
+}
+
+impl Drop for ForkSnapshot {
+    fn drop(&mut self) {
+        remove_snapshot(&self.dir, &self.tag);
+    }
+}
+
+/// The fork snapshots an earlier agent left (one that died between a fork's snapshot and its
+/// removal): removed when the agent starts, before any server runs.
+pub fn sweep_fork_snapshots(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("mc-fork-") {
+            remove_snapshot(dir, name.trim_end_matches(".lock"));
+        }
+    }
 }
 
 /// `fcvm snapshot create` of a running server; `stop` for the gold VM only.
@@ -278,6 +311,7 @@ impl Minecraft {
         http: reqwest::Client,
         scene: watch::Receiver<Option<SharedScene>>,
     ) -> Minecraft {
+        sweep_fork_snapshots(&cfg.snapshot_dir);
         let (gold_tx, gold) = watch::channel(GoldState::Building);
         let (stop, stop_rx) = watch::channel(false);
         let flow = {
@@ -447,8 +481,14 @@ async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
     r.json().await.ok()
 }
 
+/// `fcvm snapshot create`. Its process is never killed, not past the deadline and not when the
+/// caller gives up on it (a relaunch dropped by an unassignment): killed after it paused the
+/// source, it would leave a running server paused for good. Past the deadline it finishes on
+/// its own and is reaped; a fork's snapshot it leaves is swept at the next agent start.
 async fn snapshot(fcvm: &Path, pid: u32, tag: &str, stop: bool, deadline: Duration) -> Result<()> {
-    let run = child(fcvm).args(snapshot_argv(pid, tag, stop)).output();
+    let mut c = child(fcvm);
+    c.kill_on_drop(false);
+    let run = c.args(snapshot_argv(pid, tag, stop)).output();
     let out = tokio::time::timeout(deadline, run)
         .await
         .with_context(|| format!("fcvm snapshot create took over {} s", deadline.as_secs()))?
@@ -697,12 +737,16 @@ impl Server {
 
     /// Stop what runs and start `want`: a fork of another server when it asks for one and that
     /// server runs, else the gold snapshot.
+    /// Stop what runs and start `want`: a copy of another server when it asks for a fork,
+    /// `fork_ok` holds (no copy of this generation failed yet) and that server runs here, else
+    /// the gold snapshot.
     async fn relaunch(
         &self,
         live: &mut Option<Live>,
         gold: &str,
         gold_sessions: u64,
         want: &Desired,
+        fork_ok: bool,
     ) -> std::result::Result<Live, String> {
         let generation = want.generation;
         let t0 = Instant::now();
@@ -710,7 +754,7 @@ impl Server {
         let source = want
             .fork
             .as_ref()
-            .filter(|f| f.index != self.index)
+            .filter(|f| fork_ok && f.index != self.index)
             .and_then(|f| {
                 self.running
                     .lock()
@@ -719,7 +763,9 @@ impl Server {
                     .copied()
                     .map(|(pid, place)| (f.clone(), pid, place))
             });
-        let (tag, sessions, fork_tag) = match source {
+        // Dropped on every way out of this function: the copy's snapshot is removed.
+        let mut fork_snapshot = None;
+        let (tag, sessions) = match source {
             Some((f, pid, place)) => {
                 self.report("forking", generation, BTreeMap::new(), None, None, None);
                 let before = health(&self.http, &place).await.map(|h| h.sessions);
@@ -735,18 +781,22 @@ impl Server {
                 )
                 .await
                 .map_err(|e| format!("snapshotting {} for the fork: {e:#}", f.slot))?;
+                fork_snapshot = Some(ForkSnapshot {
+                    dir: self.cfg.snapshot_dir.clone(),
+                    tag: tag.clone(),
+                });
                 timings.insert("snapshot_ms".to_string(), ts.elapsed().as_millis() as u64);
                 tracing::info!(target: "fcvm::fleet::minecraft", server = %self.id, from = %f.slot, snapshot_ms = timings["snapshot_ms"], "forking");
                 let s =
                     before.ok_or_else(|| format!("{} did not answer before its fork", f.slot))?;
-                (tag.clone(), s, Some(tag))
+                (tag, s)
             }
             None => {
                 if want.fork.is_some() {
-                    tracing::warn!(target: "fcvm::fleet::minecraft", server = %self.id, "the fork's source is not running here; restoring from the gold snapshot");
+                    tracing::warn!(target: "fcvm::fleet::minecraft", server = %self.id, fork_ok, "no copy of the fork's source this time; restoring from the gold snapshot");
                 }
                 self.report("restoring", generation, BTreeMap::new(), None, None, None);
-                (gold.to_string(), gold_sessions, None)
+                (gold.to_string(), gold_sessions)
             }
         };
         if let Some(mut old) = live.take() {
@@ -754,60 +804,61 @@ impl Server {
         }
         let tr = Instant::now();
         let argv = restore_argv(&tag, &self.id, &self.prefix, &self.place);
-        let spawned = Vm::spawn_args(&self.agent.fcvm, &argv, &self.id);
-        let cleanup = |tag: &Option<String>| {
-            if let Some(t) = tag {
-                remove_snapshot(&self.cfg.snapshot_dir, t);
+        let mut vm =
+            Vm::spawn_args(&self.agent.fcvm, &argv, &self.id).map_err(|e| format!("{e:#}"))?;
+        // The tile's scene as soon as it answers, posted beside the wait for its first chunk so
+        // that neither holds up the other.
+        let want_scene = self.scene_for(want, generation);
+        let poster = async {
+            loop {
+                if let Some(h) = self.sync_scene(None, want_scene.clone()).await {
+                    return (h, tr.elapsed().as_millis() as u64);
+                }
+                tokio::time::sleep(self.cfg.poll).await;
             }
         };
-        let mut vm = match spawned {
-            Ok(vm) => vm,
-            Err(e) => {
-                cleanup(&fork_tag);
-                return Err(format!("{e:#}"));
-            }
-        };
-        // The scene as soon as the tile answers: its name and generation reseed its choices.
         let mut held = None;
         let up = {
             let wait = self.wait_up(&mut vm, sessions);
             tokio::pin!(wait);
+            tokio::pin!(poster);
             loop {
                 tokio::select! {
                     r = &mut wait => break r,
-                    _ = tokio::time::sleep(self.cfg.poll), if held.is_none() => {
-                        held = self.sync_scene(None, self.scene_for(want, generation)).await;
-                        if held.is_some() {
-                            timings.insert("restore_ms".to_string(), tr.elapsed().as_millis() as u64);
-                        }
+                    (h, ms) = &mut poster, if held.is_none() => {
+                        held = Some(h);
+                        timings.insert("restore_ms".to_string(), ms);
                     }
                 }
             }
         };
-        cleanup(&fork_tag);
+        let first_chunk_at = unix_ms();
+        drop(fork_snapshot);
         if let Err(e) = up {
             vm.stop(self.agent.stop_grace).await;
             return Err(e);
         }
-        let first_chunk_at = unix_ms();
+        let attempt_ms = tr.elapsed().as_millis() as u64;
         timings
             .entry("restore_ms".to_string())
-            .or_insert(tr.elapsed().as_millis() as u64);
-        timings.insert(
-            "first_chunk_ms".to_string(),
-            tr.elapsed().as_millis() as u64,
-        );
-        timings.insert("total_ms".to_string(), t0.elapsed().as_millis() as u64);
+            .or_insert(attempt_ms);
+        timings.insert("first_chunk_ms".to_string(), attempt_ms);
+        // From the click when there was one (the coordinator's clock, which NTP keeps near the
+        // host's), else from the start of this launch.
+        let total = want
+            .clicked_at
+            .map(|c| first_chunk_at.saturating_sub(c))
+            .filter(|t| *t < 600_000)
+            .unwrap_or(t0.elapsed().as_millis() as u64);
+        timings.insert("total_ms".to_string(), total);
         if held.is_none() {
-            held = self
-                .sync_scene(None, self.scene_for(want, generation))
-                .await;
+            held = self.sync_scene(None, want_scene).await;
         }
         self.running
             .lock()
             .unwrap()
             .insert(self.index, (vm.pid, self.place));
-        tracing::info!(target: "fcvm::fleet::minecraft", server = %self.id, generation, forked = fork_tag.is_some(), ?timings, "server up");
+        tracing::info!(target: "fcvm::fleet::minecraft", server = %self.id, generation, forked = timings.contains_key("snapshot_ms"), ?timings, "server up");
         self.report(
             "running",
             generation,
@@ -846,6 +897,8 @@ async fn supervise(
         }
     }
     let mut live: Option<Live> = None;
+    // The generation whose fork failed once: its next attempt restores the gold snapshot.
+    let mut fork_failed: Option<u64> = None;
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
@@ -885,7 +938,7 @@ async fn supervise(
             }
             let want = desired.borrow_and_update().clone();
             let r = tokio::select! {
-                r = ctx.relaunch(&mut live, &tag, sessions, &want) => Some(r),
+                r = ctx.relaunch(&mut live, &tag, sessions, &want, fork_failed != Some(want.generation)) => Some(r),
                 _ = removed(&mut desired) => None,
             };
             match r {
@@ -893,6 +946,9 @@ async fn supervise(
                 Some(Ok(l)) => live = Some(l),
                 Some(Err(e)) => {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
+                    if want.fork.is_some() {
+                        fork_failed = Some(want.generation);
+                    }
                     let delay = backoff;
                     backoff = (backoff * 2).min(ctx.agent.backoff_max);
                     ctx.report(

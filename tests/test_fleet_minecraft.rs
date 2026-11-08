@@ -82,18 +82,21 @@ async fn serve_tile(dir: &Path, name: &str) -> (SocketAddr, Scenes) {
     (addr, scenes)
 }
 
-fn wrapper(dir: &Path, snaps: &Path) -> PathBuf {
+fn wrapper(dir: &Path, snaps: &Path, env: &[(&str, &str)]) -> PathBuf {
     let p = dir.join("fcvm");
-    std::fs::write(
-        &p,
-        format!(
-            "#!/bin/sh\nexport FAKE_FCVM_DIR='{}'\nexport FAKE_SNAPSHOT_DIR='{}'\nexec '{}' \"$@\"\n",
-            dir.display(),
-            snaps.display(),
-            fixture("fake-minecraft-fcvm.sh").display()
-        ),
-    )
-    .unwrap();
+    let mut script = format!(
+        "#!/bin/sh\nexport FAKE_FCVM_DIR='{}'\nexport FAKE_SNAPSHOT_DIR='{}'\n",
+        dir.display(),
+        snaps.display()
+    );
+    for (k, v) in env {
+        script.push_str(&format!("export {k}='{v}'\n"));
+    }
+    script.push_str(&format!(
+        "exec '{}' \"$@\"\n",
+        fixture("fake-minecraft-fcvm.sh").display()
+    ));
+    std::fs::write(&p, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
@@ -198,11 +201,26 @@ impl Fake {
 const IDS: [&str; 3] = ["mc-1", "mc-2", "mc-3"];
 
 async fn fake() -> Fake {
+    fake_with(&[], |_| {}).await
+}
+
+/// As [`fake`], with the fake fcvm's environment and a change to the agent's configuration,
+/// and with whatever `before` leaves in the snapshot directory before the agent starts.
+async fn fake_with(env: &[(&str, &str)], tweak: impl FnOnce(&mut MinecraftCfg)) -> Fake {
+    fake_from(env, tweak, |_| {}).await
+}
+
+async fn fake_from(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut MinecraftCfg),
+    before: impl FnOnce(&Path),
+) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     let snaps = path.join("snapshots");
     std::fs::create_dir_all(&snaps).unwrap();
-    let fcvm = wrapper(&path, &snaps);
+    before(&snaps);
+    let fcvm = wrapper(&path, &snaps, env);
     let mut places = Vec::new();
     let mut scenes = Vec::new();
     for id in IDS {
@@ -221,8 +239,10 @@ async fn fake() -> Fake {
     }))
     .unwrap();
     let (scene_tx, scene_rx) = watch::channel(Some(shared));
+    let mut cfg = mc_cfg(&snaps);
+    tweak(&mut cfg);
     let mc = Minecraft::start(
-        Arc::new(mc_cfg(&snaps)),
+        Arc::new(cfg),
         Arc::new(agent_cfg(&fcvm)),
         String::new(),
         places,
@@ -482,4 +502,131 @@ async fn stopping_the_agent_stops_every_server() {
             "{id} stopped: {ev}"
         );
     }
+}
+
+/// A restore runs the tile's restore hook, which drops the scene the VM was copied with, so a
+/// fork's target never serves its source's borrower before the agent posts its own scene.
+#[tokio::test]
+async fn every_restore_runs_the_tiles_restore_hook() {
+    let mut f = fake().await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    let args = std::fs::read_to_string(f.path.join("args-mc-1")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let i = args
+        .iter()
+        .position(|a| *a == "--on-restore")
+        .expect("no restore hook");
+    assert_eq!(args[i + 1], "mctile restored");
+    f.mc.stop().await;
+}
+
+/// A fork whose copy cannot run is tried once; the next attempt restores the gold snapshot
+/// rather than snapshotting the source again, and the copy's snapshot is removed.
+#[tokio::test]
+async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
+    let mut f = fake_with(&[("FAKE_FAIL_FORK", "1")], |_| {}).await;
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 1, None, None),
+    ]);
+    f.report("mc-1", "running", 1).await;
+    f.report("mc-2", "running", 1).await;
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 2, Some(("mc-1", 0)), None),
+    ]);
+    let end = tokio::time::Instant::now() + Duration::from_secs(30);
+    let r = loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("no report")
+            .unwrap();
+        if let AgentMsg::Slot(r) = m {
+            if r.id == "mc-2" && r.phase == "running" && r.generation == 2 {
+                break r;
+            }
+        }
+    };
+    assert!(!r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
+    let ev = f.events();
+    let snaps: Vec<_> = ev
+        .iter()
+        .filter(|e| e[0] == "snapshot_create" && e[1] == "mc-1")
+        .collect();
+    assert_eq!(snaps.len(), 1, "the source is snapshotted once: {ev:?}");
+    let gold = mc_cfg(&f.snaps).gold_tag();
+    assert!(
+        ev.iter()
+            .any(|e| e[0] == "snapshot_run" && e[1] == "mc-2" && e[3] == gold),
+        "{ev:?}"
+    );
+    assert!(
+        !f.snaps.join("mc-fork-mc-2-2").exists(),
+        "the failed copy's snapshot is left"
+    );
+    f.mc.stop().await;
+}
+
+/// A snapshot create that outlives its deadline is never killed: killed after it paused the
+/// source, it would leave that server paused for good. It runs to its end.
+#[tokio::test]
+async fn a_slow_fork_snapshot_is_never_killed() {
+    let mut f = fake_with(&[], |c| c.snapshot_deadline = Duration::from_millis(500)).await;
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 1, None, None),
+    ]);
+    f.report("mc-1", "running", 1).await;
+    f.report("mc-2", "running", 1).await;
+    // Only now: the gold flow's own snapshot runs at full speed.
+    std::fs::write(
+        f.path.join("fcvm"),
+        std::fs::read_to_string(f.path.join("fcvm"))
+            .unwrap()
+            .replace("exec '", "export FAKE_SNAPSHOT_SECS=2\nexec '"),
+    )
+    .unwrap();
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 2, Some(("mc-1", 0)), None),
+    ]);
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if f.events()
+            .iter()
+            .any(|e| e[0] == "snapshot_done" && e[1] == "mc-1")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "the snapshot create was killed: {:?}",
+            f.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f.mc.stop().await;
+}
+
+/// A fork snapshot an earlier agent left is removed when the agent starts.
+#[tokio::test]
+async fn fork_snapshots_left_by_an_earlier_agent_are_removed_at_start() {
+    let f = fake_from(
+        &[],
+        |_| {},
+        |snaps| {
+            std::fs::create_dir_all(snaps.join("mc-fork-mc-2-7/disk")).unwrap();
+            std::fs::write(snaps.join("mc-fork-mc-2-7.lock"), "").unwrap();
+            std::fs::create_dir_all(snaps.join("mc-gold-keep")).unwrap();
+        },
+    )
+    .await;
+    assert!(!f.snaps.join("mc-fork-mc-2-7").exists());
+    assert!(!f.snaps.join("mc-fork-mc-2-7.lock").exists());
+    assert!(
+        f.snaps.join("mc-gold-keep").exists(),
+        "only fork snapshots are swept"
+    );
+    f.mc.stop().await;
 }

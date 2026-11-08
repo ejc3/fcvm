@@ -8,6 +8,10 @@
 #                                           with --stop only
 #   snapshot run --snapshot T --name N      a VM of T: its bots join again, one past T's count
 #
+#   FAKE_UP_SECS        time before a VM's tile answers (default 0.1)
+#   FAKE_SNAPSHOT_SECS  a snapshot create takes this long, then logs snapshot_done
+#   FAKE_FAIL_FORK      a VM restored from a mc-fork-* snapshot exits with status 3
+#
 # The test's fake tiles read sessions-<name> (absent while the VM is down). It logs `<event>
 # <name> <pid> <tag or -> <ns>` lines to $FAKE_FCVM_DIR/events.log and each VM's arguments, one
 # per line, to $FAKE_FCVM_DIR/args-<name>.
@@ -28,6 +32,11 @@ if [ "${1:-}" = snapshot ] && [ "${2:-}" = create ]; then
     done
     name=$(cat "$dir/pid-$pid")
     echo "snapshot_create $name $pid $tag${stop:+ stop} $(date +%s%N)" >> "$log"
+    # FAKE_SNAPSHOT_SECS: a slow save; the end is logged so a test sees it ran to completion.
+    if [ -n "${FAKE_SNAPSHOT_SECS:-}" ]; then
+        sleep "$FAKE_SNAPSHOT_SECS"
+        echo "snapshot_done $name $pid $tag $(date +%s%N)" >> "$log"
+    fi
     mkdir -p "$snaps/$tag"
     echo '{}' > "$snaps/$tag/config.json"
     cp "$dir/sessions-$name" "$snaps/$tag/sessions"
@@ -54,6 +63,11 @@ stop() {
 }
 trap stop TERM INT
 sleep "${FAKE_UP_SECS:-0.1}" & wait $!
+# FAKE_FAIL_FORK: a restore of a fork's snapshot exits at once, as a copy that cannot run.
+if [ -n "${FAKE_FAIL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
+    echo "died $name $$ $tag $(date +%s%N)" >> "$log"
+    exit 3
+fi
 if [ -n "$tag" ]; then
     echo $(( $(cat "$snaps/$tag/sessions") + 1 )) > "$dir/sessions-$name"
 else
