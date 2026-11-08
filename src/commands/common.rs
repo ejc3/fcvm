@@ -5865,11 +5865,10 @@ fn parent_memory_is_a_diff_base(parent_memory: &Path) -> bool {
     std::fs::symlink_metadata(parent_memory).is_ok_and(|m| m.file_type().is_file())
 }
 
-/// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`
-/// for the snapshot whose published `memory.bin` will be `link`. A create killed before it
-/// publishes leaves the file to be removed; one killed after, before it discards the record,
-/// leaves it in place, since the published link names it.
-fn begin_memory_file_owner(target: &Path, link: &Path) -> Result<crate::reclaim::Owner> {
+/// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`,
+/// with the file recorded as a plain temporary: until the snapshot is published, every build's
+/// reclaim removes it.
+fn begin_memory_file_owner(target: &Path) -> Result<crate::reclaim::Owner> {
     let id = target
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -5877,9 +5876,32 @@ fn begin_memory_file_owner(target: &Path, link: &Path) -> Result<crate::reclaim:
     let owner = crate::reclaim::Owner::begin(id)?;
     owner.record(crate::reclaim::Resource::Temp {
         path: target.to_path_buf(),
-        spare_if_linked_by: Some(link.to_path_buf()),
     })?;
     Ok(owner)
+}
+
+/// Just before the snapshot whose `memory.bin` will be `link` is published: record the memory
+/// file `target` as one a reclaim keeps once that link names it, then drop its plain temporary
+/// record. A create killed after publishing, before it discards the owner, then leaves the
+/// published file in place: a build that knows `LinkedMemory` sees the link, and an older
+/// build reads the kind as unknown and leaves the file alone.
+fn hand_memory_file_to_publication(
+    owner: &crate::reclaim::Owner,
+    target: &Path,
+    link: &Path,
+) -> Result<()> {
+    owner.record(crate::reclaim::Resource::LinkedMemory {
+        path: target.to_path_buf(),
+        link: link.to_path_buf(),
+    })?;
+    let id = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("a memory file has a name")?;
+    crate::reclaim::forget(
+        id,
+        |resource| matches!(resource, crate::reclaim::Resource::Temp { path } if path == target),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6071,14 +6093,14 @@ pub async fn create_snapshot_core(
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
     // The reclaim record of a memory file in --memory-dir, discarded just before publication.
-    let mut memory_file_owner: Option<crate::reclaim::Owner> = None;
+    let mut memory_file_owner: Option<(crate::reclaim::Owner, PathBuf)> = None;
     if !has_base {
         let created = match memory_dir {
             Some(dir) => {
                 // Recorded before it exists: a create killed before it publishes leaves the
                 // file to the next launch's reclaim instead of to the memory directory forever.
                 let target = crate::storage::disk::linked_memory_target(dir);
-                begin_memory_file_owner(&target, &snapshot_dir.join("memory.bin"))
+                begin_memory_file_owner(&target)
                     .and_then(|owner| {
                         crate::storage::disk::create_linked_memory_file(
                             &target,
@@ -6089,7 +6111,7 @@ pub async fn create_snapshot_core(
                     .map(|owner| {
                         info!(snapshot = %snapshot_config.name, memory_file = %target.display(),
                             "writing the memory file outside the snapshot directory");
-                        memory_file_owner = Some(owner);
+                        memory_file_owner = Some((owner, target.clone()));
                     })
             }
             None => create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name),
@@ -6548,6 +6570,14 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
+    if let Some((owner, target)) = &memory_file_owner {
+        if let Err(e) =
+            hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
+        {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(e.context("recording the memory file for publication"));
+        }
+    }
     let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
@@ -6559,7 +6589,7 @@ pub async fn create_snapshot_core(
     let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
     // The published snapshot owns its memory file now. A record that cannot be discarded is
     // harmless: its undo spares the file the published link names.
-    if let Some(owner) = memory_file_owner.take() {
+    if let Some((owner, _)) = memory_file_owner.take() {
         if let Err(e) = owner.discard() {
             warn!(snapshot = %snapshot_config.name, error = %format!("{e:#}"),
                 "the memory file's reclaim record was not discarded; reclaim will keep the file");
@@ -8341,9 +8371,10 @@ mod tests {
 
     /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made
     /// ready before the free-space check, so a new nested directory is checked too; the memory
-    /// file is recorded for reclaim before it is created and the record is discarded only after
-    /// publication, so a create killed at any point leaves nothing for good (the record's undo
-    /// spares a file the published link names, `undo_linked_memory`). No fake VMM drives this function, so the
+    /// file is recorded for reclaim as a plain temporary before it is created, the record turns
+    /// into one that spares the published file just before publication, and the owner is
+    /// discarded after it. A create killed at any point leaves nothing for good and never has a
+    /// published file removed, by this build's reclaim or an older one's. No fake VMM drives this function, so the
     /// order is pinned by its source.
     #[test]
     fn a_memory_dir_create_checks_records_and_hands_over_its_file_in_order() {

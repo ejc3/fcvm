@@ -179,10 +179,7 @@ impl StoreTemp {
             owners,
             &format!("store-temp-{}", uuid::Uuid::new_v4().simple()),
         )?;
-        owner.record(crate::reclaim::Resource::Temp {
-            path: path.clone(),
-            spare_if_linked_by: None,
-        })?;
+        owner.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
         Ok(Self {
             path,
             published: false,

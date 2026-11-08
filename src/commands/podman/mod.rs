@@ -1442,7 +1442,6 @@ async fn export_localhost_image_disk(
         let temps = image::temp_owner()?;
         temps.record(crate::reclaim::Resource::Temp {
             path: tmp_path.clone(),
-            spare_if_linked_by: None,
         })?;
         let exported = async {
             image::export_image_archive(image_id, &args.image, &tmp_path, Some(&temps.holder()?))
