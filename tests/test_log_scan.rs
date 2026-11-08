@@ -2797,6 +2797,52 @@ fn review_gate_treats_a_review_limit_notice_with_br_lines_and_additions_as_a_cla
     }
 }
 
+/// CodeRabbit's "Review skipped" notice as posted on #1741 (2026-11-07), whose retry box
+/// reads "Trigger review" with no icon in front. It says no review ran: it needs no
+/// disposition and covers no head. With a finding where the box's label was, it is a claim.
+///
+/// The only box shape listed had the icon, so the gate counted this notice as an unanswered
+/// finding.
+#[test]
+fn review_gate_reads_a_coderabbit_review_skipped_notice_with_a_plain_trigger_box() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-skipped-notice",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-review-skipped-notice.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a notice saying no review ran is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice saying no review ran covers no head.\n{out}"
+    );
+
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-review-skipped-notice.md"),
+    )
+    .unwrap();
+    let body = text.replacen("--> Trigger review", "--> P1: this drops the last row", 1);
+    assert_ne!(body, text, "the fixture edit did not apply");
+    let (code, out) = run_gate_on_comment(
+        "cr-skipped-notice-claim",
+        "coderabbitai",
+        "Bot",
+        &serde_json::to_string(&body).unwrap(),
+        "deadbeef",
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("carry no disposition"),
+        "the notice with a finding where the box's label was is a claim.\n{out}"
+    );
+}
+
 /// CodeRabbit's reply "Review finished." under "Action performed", in the layout it has
 /// posted since the folds gained <dl><dd> wrappers (#1392), needs no disposition and covers
 /// no head.

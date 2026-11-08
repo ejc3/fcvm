@@ -2387,6 +2387,17 @@ run_case "the review-limit notice with a finding in place of a <br> line is clai
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(lim_edit 'sub("> <br>"; "> P1: this drops the last row")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "the review-limit notice with a finding appended is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(lim_edit '. + "\nP1: this drops the last row\n"')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+# The "Review skipped" notice CodeRabbit posted on #1741 (2026-11-07), read from the same
+# directory. Its retry box reads "Trigger review" with no icon in front, and the only listed
+# box shape had the icon, so this notice read as an unanswered finding too.
+CR_SKIP=$(jq -Rs . < "$FIXDIR/cr-review-skipped-notice.md")
+skip_edit() { jq -c "$1" <<<"$CR_SKIP"; }
+run_case "the review-skipped notice with a plain Trigger review box needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_SKIP" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "the review-skipped notice covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_SKIP" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the review-skipped notice with a finding where the box's label was is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(skip_edit 'sub("--> Trigger review"; "--> P1: this drops the last row")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 
 echo
 echo "passed=$pass failed=$fail"

@@ -1103,7 +1103,7 @@ def cr_notice_payload_res:
   , cr_icon_summary_re("file-plus-corner"; "Files selected for processing: [0-9]+")
   , cr_icon_summary_re("file-minus-corner"; "Files ignored due to path filters: [0-9]+")
   , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
-  , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> 🔍 Trigger review$"
+  , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> (🔍 )?Trigger review$"
   , "^\\*\\*(Configuration used|Review profile|Plan)\\*\\*: [A-Za-z0-9 +]+$"
   , "^\\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
   , "^- \\*\\*(Source mode\\*\\*: Auto|(Repository|Branch|Commit)\\*\\*: Unavailable|File\\*\\*: No configuration file from this repository applied|(Layers|Configuration used)\\*\\*: defaults|Review profile\\*\\*: CHILL|Plan\\*\\*: (Advanced|Pro Plus|Team))$"
