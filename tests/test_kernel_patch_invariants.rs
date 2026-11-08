@@ -498,3 +498,28 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Committing the whole kernel tree leaves tens of thousands of loose objects, so
+/// git starts `gc --auto` in the background after the commit. `validate` then
+/// removes its work directory while that gc still writes into `.git`, and the
+/// removal fails with "Directory not empty", failing every validate run.
+#[test]
+fn the_kernel_source_repository_runs_no_background_gc() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+    )
+    .expect("read scripts/kernel-patch.sh");
+    let setup = extract_block(&script, "setup_kernel_source() {", "}")
+        .expect("kernel-patch.sh defines setup_kernel_source");
+    let init = setup
+        .find("git init")
+        .expect("setup_kernel_source makes a repository");
+    let commit = setup[init..]
+        .find("git commit")
+        .map(|at| init + at)
+        .expect("setup_kernel_source commits the tree");
+    assert!(
+        setup[init..commit].contains("git config gc.auto 0"),
+        "setup_kernel_source must turn off automatic gc before its first commit"
+    );
+}
