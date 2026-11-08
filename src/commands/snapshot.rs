@@ -1033,13 +1033,6 @@ async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
     let vm_state = load_snapshot_create_target(&state_manager, &args)
         .await
         .context("loading VM state")?;
-    anyhow::ensure!(
-        matches!(
-            vm_state.config.hypervisor,
-            crate::hypervisor::Backend::Firecracker
-        ),
-        "--stop needs a Firecracker VM"
-    );
     let pid = vm_state
         .pid
         .context("the VM's state names no fcvm process to stop")?;
@@ -1418,6 +1411,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &vm_disk_path,
                     super::common::ChSnapshotGuest::of(&vm_state, vsock_socket_path.as_deref())?,
                     inode_tables,
+                    if args.stop {
+                        super::common::SnapshotSourceDisposition::LeavePaused
+                    } else {
+                        super::common::SnapshotSourceDisposition::Resume
+                    },
                 )
                 .await?;
                 None
