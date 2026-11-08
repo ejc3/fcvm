@@ -5875,9 +5875,9 @@ fn begin_memory_file_owner(target: &Path, link: &Path) -> Result<crate::reclaim:
         .and_then(|stem| stem.to_str())
         .context("a memory file has a name")?;
     let owner = crate::reclaim::Owner::begin(id)?;
-    owner.record(crate::reclaim::Resource::LinkedMemory {
+    owner.record(crate::reclaim::Resource::Temp {
         path: target.to_path_buf(),
-        link: link.to_path_buf(),
+        spare_if_linked_by: Some(link.to_path_buf()),
     })?;
     Ok(owner)
 }
@@ -8364,7 +8364,10 @@ mod tests {
         assert_in_order(
             "begin_memory_file_owner",
             body_of(source, "fn begin_memory_file_owner("),
-            &["Owner::begin(id)", "Resource::LinkedMemory {"],
+            &[
+                "Owner::begin(id)",
+                "spare_if_linked_by: Some(link.to_path_buf())",
+            ],
         );
     }
 

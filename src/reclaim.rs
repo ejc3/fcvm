@@ -60,12 +60,15 @@ pub enum Resource {
     /// A VM's runtime directory. Removed whole.
     RuntimeDir { path: PathBuf },
     /// A temporary file or directory that is renamed into place or removed when its
-    /// operation finishes.
-    Temp { path: PathBuf },
-    /// A memory file `snapshot create --memory-dir` wrote outside its snapshot directory.
-    /// Removed unless `link`, the published snapshot's `memory.bin`, names it: a create killed
-    /// before it published leaves the file to be removed, one killed after keeps it.
-    LinkedMemory { path: PathBuf, link: PathBuf },
+    /// operation finishes. With `spare_if_linked_by`, a symbolic link (a snapshot's published
+    /// `memory.bin`): the file is kept when that link names it, since its operation then
+    /// finished but for discarding the record. A build that does not know the field removes
+    /// the file as any temporary, which is what this record asks for until publication.
+    Temp {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spare_if_linked_by: Option<PathBuf>,
+    },
     /// A named network namespace (`ip netns add`).
     Netns { name: String },
     /// A host network interface. Deleting one end of a veth pair deletes the other.
@@ -98,10 +101,7 @@ impl Resource {
     fn is_kernel_object(&self) -> bool {
         !matches!(
             self,
-            Resource::RuntimeDir { .. }
-                | Resource::Temp { .. }
-                | Resource::LinkedMemory { .. }
-                | Resource::Unknown
+            Resource::RuntimeDir { .. } | Resource::Temp { .. } | Resource::Unknown
         )
     }
 
@@ -116,8 +116,7 @@ impl std::fmt::Display for Resource {
         match self {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
             Resource::Unknown => write!(f, "a resource of a kind this build does not know"),
-            Resource::Temp { path } => write!(f, "temporary {}", path.display()),
-            Resource::LinkedMemory { path, .. } => write!(f, "memory file {}", path.display()),
+            Resource::Temp { path, .. } => write!(f, "temporary {}", path.display()),
             Resource::Netns { name } => write!(f, "network namespace {name}"),
             Resource::Link { name } => write!(f, "interface {name}"),
             Resource::Rule { program, args } => write!(f, "{program} {}", args.join(" ")),
@@ -868,8 +867,14 @@ async fn undo(resource: &Resource) -> Undo {
     match resource {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
         Resource::Unknown => Undo::Done,
-        Resource::Temp { path } => undo_temp(path).await,
-        Resource::LinkedMemory { path, link } => undo_linked_memory(path, link),
+        Resource::Temp {
+            path,
+            spare_if_linked_by: None,
+        } => undo_temp(path).await,
+        Resource::Temp {
+            path,
+            spare_if_linked_by: Some(link),
+        } => undo_linked_memory(path, link),
         Resource::Netns { name } => {
             undo_result(crate::network::namespace::delete_namespace(name).await)
         }
@@ -949,8 +954,27 @@ async fn remove_tree(path: &Path) -> Undo {
 }
 
 /// Remove `path`, a memory file of a create that did not finish, unless the published
-/// snapshot's `link` names it.
+/// snapshot's `link` names it. The check and the removal hold the snapshot's generation lock
+/// (`<snapshot>.lock`), so a create replacing that snapshot meanwhile, whose rename leaves no
+/// link for a moment, cannot make the check miss a published file; a busy snapshot is left
+/// for a later reclaim.
 fn undo_linked_memory(path: &Path, link: &Path) -> Undo {
+    let Some(snapshot) = link.parent() else {
+        return Undo::Kept(format!("{} has no snapshot directory", link.display()));
+    };
+    let lock_path = crate::commands::common::snapshot_sibling(snapshot, "lock");
+    let lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) => return Undo::Kept(format!("opening {}: {error}", lock_path.display())),
+    };
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+        return Undo::Kept(format!("{} is held: {error}", lock_path.display()));
+    }
     if std::fs::read_link(link).is_ok_and(|target| target == path) {
         return Undo::Done;
     }
@@ -1116,13 +1140,16 @@ mod tests {
 
     /// A memory file of a create that did not finish is removed; one the published snapshot's
     /// memory.bin names (a create killed after publishing, before it discarded its record) is
-    /// kept, and so the snapshot stays restorable.
+    /// kept, and so the snapshot stays restorable. While another create holds the snapshot's
+    /// generation lock (it may be between its two renames, with no link), nothing is removed.
     #[test]
     fn a_linked_memory_file_is_kept_only_when_the_published_link_names_it() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("fcvm-memory-a.bin");
         std::fs::write(&file, b"m").unwrap();
-        let link = dir.path().join("memory.bin");
+        let snapshot = dir.path().join("snap");
+        std::fs::create_dir(&snapshot).unwrap();
+        let link = snapshot.join("memory.bin");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
         assert!(
@@ -1130,6 +1157,11 @@ mod tests {
             "the published snapshot's memory file was removed"
         );
         std::fs::remove_file(&link).unwrap();
+        let held = std::fs::File::create(dir.path().join("snap.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Kept(_)));
+        assert!(file.exists(), "removed while a create held the snapshot");
+        drop(held);
         std::os::unix::fs::symlink(dir.path().join("fcvm-memory-b.bin"), &link).unwrap();
         assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
         assert!(!file.exists(), "an unpublished memory file was kept");
@@ -1137,7 +1169,16 @@ mod tests {
             matches!(undo_linked_memory(&file, &link), Undo::Done),
             "a gone file is done"
         );
+        // a build that does not know the link field reads the record as a plain temporary
+        let record = serde_json::to_value(Resource::Temp {
+            path: file.clone(),
+            spare_if_linked_by: Some(link.clone()),
+        })
+        .unwrap();
+        assert_eq!(record["kind"], "temp");
+        assert_eq!(record["path"], serde_json::json!(file));
     }
+
     use std::io::BufRead;
 
     const CHILD_DIR: &str = "FCVM_RECLAIM_TEST_CHILD_DIR";
@@ -1179,7 +1220,12 @@ mod tests {
             .unwrap();
         std::fs::create_dir_all(runtime_dir.join("disks")).unwrap();
         std::fs::write(runtime_dir.join("disks/rootfs.raw"), b"disk").unwrap();
-        owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+        owner
+            .record(Resource::Temp {
+                path: temp.clone(),
+                spare_if_linked_by: None,
+            })
+            .unwrap();
         std::fs::create_dir_all(temp.parent().unwrap()).unwrap();
         std::fs::write(&temp, b"partial export").unwrap();
         // A setup store build (#1182): its uniquely named temp.
@@ -1285,7 +1331,12 @@ mod tests {
         owner
             .record(Resource::RuntimeDir { path: gone.clone() })
             .unwrap();
-        owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+        owner
+            .record(Resource::Temp {
+                path: temp.clone(),
+                spare_if_linked_by: None,
+            })
+            .unwrap();
         std::fs::write(&temp, b"x").unwrap();
         assert_eq!(
             files_in(&dir),
@@ -1296,7 +1347,14 @@ mod tests {
         assert!(!temp.exists());
         assert!(files_in(&dir).is_empty());
         assert!(
-            record("vm-complete", Resource::Temp { path: temp }).is_err(),
+            record(
+                "vm-complete",
+                Resource::Temp {
+                    path: temp,
+                    spare_if_linked_by: None,
+                }
+            )
+            .is_err(),
             "a completed owner accepted a record"
         );
         drop(owner);
@@ -1340,6 +1398,7 @@ mod tests {
             "vm-nobody",
             Resource::Temp {
                 path: PathBuf::from("/nonexistent"),
+                spare_if_linked_by: None,
             },
         )
         .unwrap_err();
@@ -1675,7 +1734,12 @@ mod tests {
         let temp = root.path().join("being-written.tmp");
         std::fs::write(&temp, b"x").unwrap();
         let owner = Owner::begin_in(&dir, "image-temp-helper").unwrap();
-        owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+        owner
+            .record(Resource::Temp {
+                path: temp.clone(),
+                spare_if_linked_by: None,
+            })
+            .unwrap();
         let mut command = tokio::process::Command::new("sleep");
         command.arg("600").kill_on_drop(true);
         owner.holder().unwrap().hold_in(&mut command);
@@ -1716,12 +1780,23 @@ mod tests {
                 name: "fcvm-vm-forget".into(),
             })
             .unwrap();
-        owner.record(Resource::Temp { path: kept.clone() }).unwrap();
+        owner
+            .record(Resource::Temp {
+                path: kept.clone(),
+                spare_if_linked_by: None,
+            })
+            .unwrap();
         forget("vm-forget", Resource::is_network).unwrap();
         drop(owner);
         let record: Record =
             serde_json::from_slice(&std::fs::read(dir.join("vm-forget.json")).unwrap()).unwrap();
-        assert_eq!(record.resources, [Resource::Temp { path: kept.clone() }]);
+        assert_eq!(
+            record.resources,
+            [Resource::Temp {
+                path: kept.clone(),
+                spare_if_linked_by: None,
+            }]
+        );
         assert!(kept.exists(), "forget undid a resource");
         forget("vm-without-owner", |_| true).unwrap();
     }
@@ -1743,7 +1818,10 @@ mod tests {
                     program: "/nonexistent/iptables".into(),
                     args: vec!["-A".into(), "FORWARD".into()],
                 },
-                Resource::Temp { path: temp.clone() },
+                Resource::Temp {
+                    path: temp.clone(),
+                    spare_if_linked_by: None,
+                },
             ],
         };
         std::fs::write(
@@ -1782,7 +1860,10 @@ mod tests {
                     program: "/nonexistent/iptables".into(),
                     args: vec!["-A".into(), "FORWARD".into()],
                 },
-                Resource::Temp { path: temp.clone() },
+                Resource::Temp {
+                    path: temp.clone(),
+                    spare_if_linked_by: None,
+                },
             ],
         };
         std::fs::write(
@@ -1817,7 +1898,10 @@ mod tests {
         let remaining = undo_all(
             "vm-retire",
             vec![
-                Resource::Temp { path: temp.clone() },
+                Resource::Temp {
+                    path: temp.clone(),
+                    spare_if_linked_by: None,
+                },
                 rule("true", "FORWARD"),
             ],
             true,
@@ -1830,7 +1914,10 @@ mod tests {
         assert!(remaining.is_empty());
         assert_eq!(
             persisted.into_inner().unwrap(),
-            [vec![Resource::Temp { path: temp }]],
+            [vec![Resource::Temp {
+                path: temp,
+                spare_if_linked_by: None,
+            }]],
             "the rule was not retired before its delete"
         );
     }
@@ -1901,6 +1988,7 @@ mod tests {
             user_namespace: current_user_namespace(),
             resources: vec![Resource::Temp {
                 path: victim.clone(),
+                spare_if_linked_by: None,
             }],
         };
         std::fs::write(forged.join("x.json"), serde_json::to_vec(&record).unwrap()).unwrap();

@@ -1892,7 +1892,8 @@ mod tests {
     #[test]
     fn a_failed_sleep_still_counts_its_memory() {
         let source = include_str!("potato.rs");
-        let sleep = &source[source
+        let ops = &source[source.find("impl Ops for FcvmOps {").unwrap()..];
+        let sleep = &ops[ops
             .find("    fn sleep(&self, n: u32, vm: Option<Vm>")
             .unwrap()..];
         let sleep = &sleep[..sleep.find("\n    }\n").unwrap()];

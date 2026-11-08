@@ -106,6 +106,7 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         .with_context(|| format!("resolving {}", memory_dir.display()))?;
     let meta = std::fs::metadata(&dir).with_context(|| format!("reading {}", dir.display()))?;
     let euid = nix::unistd::geteuid().as_raw();
+    let egid = nix::unistd::getegid().as_raw();
     anyhow::ensure!(
         meta.is_dir() && meta.uid() == euid && meta.mode() & 0o022 == 0,
         "--memory-dir {} must be a directory owned by uid {euid} that group and others cannot \
@@ -120,7 +121,10 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         let meta = std::fs::metadata(ancestor)
             .with_context(|| format!("reading {}", ancestor.display()))?;
         let owner_ok = meta.uid() == 0 || meta.uid() == euid;
-        let others_kept_out = meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0;
+        // group write is this user's own when the group is its primary one (umask 002 with a
+        // private group); others' write needs the sticky bit
+        let group_ok = meta.mode() & 0o020 == 0 || meta.gid() == egid;
+        let others_kept_out = (group_ok && meta.mode() & 0o002 == 0) || meta.mode() & 0o1000 != 0;
         anyhow::ensure!(
             owner_ok && others_kept_out,
             "--memory-dir {}: {} lets another user replace it (uid {}, mode {:o}); use a \

@@ -532,7 +532,10 @@ impl TempStore {
             .join(format!("{RUNROOT_PREFIX}{}", uuid::Uuid::new_v4().simple()));
         let holder = match temps {
             Some(temps) => {
-                temps.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+                temps.record(crate::reclaim::Resource::Temp {
+                    path: path.clone(),
+                    spare_if_linked_by: None,
+                })?;
                 Some(temps.holder()?)
             }
             None => None,
@@ -623,7 +626,10 @@ pub async fn build_storage_image(
     // whatever the build did not remove or rename into place.
     let temps = temp_owner()?;
     for path in [&tmp_dir, &tmp_img] {
-        temps.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+        temps.record(crate::reclaim::Resource::Temp {
+            path: path.clone(),
+            spare_if_linked_by: None,
+        })?;
     }
     let built = build_storage_image_in(archive_path, output_path, &tmp_dir, &tmp_img, &temps).await;
     complete_temps(temps).await;
