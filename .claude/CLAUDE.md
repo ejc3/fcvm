@@ -1351,8 +1351,10 @@ because the double S2 translation creates a cross-domain cache coherency issue.
 **Test results**: With the DSB SY patch, 100MB file copies through FUSE-over-FUSE complete
 successfully with unbounded max_write (~1MB packets). Test: `make test-root FILTER=nested_l2_with_large`
 
-**Dropped on 6.18.60 (#770)**: the same test, `test_vsock_integrity_nested` and the other nested
-tests pass on 6.18.60 host and guest kernels built without either barrier
+**Dropped on 6.18.60 (#770)**: `test_nested_l2_with_large_files`, which now copies 32 MiB of random
+data each way through FUSE-over-FUSE at unbounded max_write and compares the round trip (past the
+~10 MB where the corruption appeared), `test_vsock_integrity_nested` and the other nested tests
+pass on 6.18.60 host and guest kernels built without either barrier
 (`nv2-vsock-cache-sync.patch` in `kvm_nested_sync_hwstate()`, `nv2-vsock-rx-barrier.patch` in
 `virtio_transport_rx_work()`). Which change between 6.18.3 and 6.18.60 removed the need for them
 was not identified.
