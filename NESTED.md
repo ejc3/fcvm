@@ -117,7 +117,7 @@ See [PERFORMANCE.md](PERFORMANCE.md#nested-virtualization) for full benchmarks. 
 - ~5-7x FUSE overhead at L2 due to FUSE-over-FUSE chaining
 - Local disk ~4-7x overhead (virtio block only)
 - L1: 40-53 Gbps network, L2: 8-13 Gbps (~4-5x overhead)
-- L2 VMs limited to single vCPU (NV2 multi-vCPU interrupt issue)
+- L2 runs at the default 2 vCPUs; at 1 vCPU, L2 egress was 2.9 Gbit/s against 7.4 Gbit/s at 2 (median, one stream, #659)
 
 ## Testing
 
@@ -134,8 +134,7 @@ make test-root FILTER=kvm
 
 - This guide and the L2 tests cover ARM64. x86_64 nests through Intel VT-x or AMD-V and has the restriction under [x86_64](#x86_64).
 - Requires bare-metal instance (c7g.metal)
-- L3+ blocked by FUSE-over-FUSE latency (~5x per level)
-- L2 limited to single vCPU (NV2 multi-vCPU interrupt delivery issue)
+- L3 runs: the three L3 tests take 627 to 1041 s on a c8g.metal-48xl. L4 is not reached: its Firecracker missed fcvm's 5 s API socket wait after about 45 minutes of setup (#660)
 
 ## x86_64
 

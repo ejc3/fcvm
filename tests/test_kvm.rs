@@ -1687,14 +1687,6 @@ async fn run_nested_n_levels(
         fuse_max_write
     );
 
-    // ARM64 NV2 has NETDEV WATCHDOG issues with multiple vCPUs in L2+ VMs
-    // Limit to 1 vCPU to avoid virtio-net TX queue timeout
-    let cpu_arg = if std::env::consts::ARCH == "aarch64" {
-        "--cpu 1 \\\n    "
-    } else {
-        ""
-    };
-
     // L1 reads the archive through the mount under test (FUSE or NFS). It starts
     // its L2 with only `--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs`, so L2 and deeper
     // read the same file through that map; /mnt/image-cache does not exist there
@@ -1757,7 +1749,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {cpu_arg}{mem_arg} \
+    {mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1770,7 +1762,6 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = level_image_cache(level),
-                cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -1820,7 +1811,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {cpu_arg}{mem_arg} \
+    {mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1833,7 +1824,6 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = level_image_cache(level),
-                cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -1882,7 +1872,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {cpu_arg}{mem_arg} \
+    {mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1894,7 +1884,6 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = level_image_cache(level),
-                cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -2214,39 +2203,9 @@ async fn test_podman_load_over_fuse() -> Result<()> {
     Ok(())
 }
 
-/// Known failure: L2 FUSE-over-FUSE corrupts with unbounded max_write.
-///
-/// This test documents the corruption that occurs when FCVM_FUSE_MAX_WRITE is
-/// not set (unbounded). Under NV2 nested virtualization, large FUSE writes
-/// (~1MB+) cause vsock data loss due to cache coherency issues in double
-/// Stage 2 translation.
-///
-/// Symptoms:
-/// - STREAM CORRUPTION: zero-length message after ~7MB transferred
-/// - Raw vsock works fine with 2MB packets (4480/4480 tests pass)
-/// - Only FUSE-over-FUSE path triggers corruption
-///
-/// Workaround: Set FCVM_FUSE_MAX_WRITE=32768 for L2 VMs (done in other tests).
-#[ignore = "documents known L2 corruption with unbounded max_write - see FCVM_FUSE_MAX_WRITE"]
-#[tokio::test]
-async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
-    // This test would run L2 without FCVM_FUSE_MAX_WRITE limit.
-    // It's expected to fail with vsock data loss.
-    //
-    // To investigate the corruption, run manually:
-    //   FCVM_FUSE_MAX_WRITE=0 make test-root FILTER=nested_l2_with_large
-    //
-    // Error will be:
-    //   STREAM CORRUPTION: zero-length message (vsock data loss?)
-    //   count=61 total_bytes_read=7343452 last_len=1048645
-    bail!("This test intentionally fails to document known corruption")
-}
-
-/// Minimal repro: NV2 kernel + high-throughput FUSE writes.
-///
-/// Expected: FAILS with stream corruption on fuse-writeback-perf branch.
-/// Expected: PASSES on main branch (no writeback cache).
-#[ignore = "repro for NV2 + writeback cache vsock corruption"]
+/// NV2 kernel + high-throughput FUSE writes: 10 MiB written through a map of an L1 on the
+/// nested kernel profile. This once reproduced stream corruption with the writeback cache
+/// under NV2; on 6.18.60 it passes (#659), and it stays as a guard.
 #[tokio::test]
 async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("nv2-repro");
@@ -2271,7 +2230,10 @@ async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
 
     common::poll_health_by_pid(pid, 180).await?;
 
-    // Write 10MB - this triggers corruption with NV2 + writeback cache
+    // Write 10 MiB of a known nonzero pattern and compare the host's copy byte for byte:
+    // the corruption this guards showed up as zeroed or stale ranges, not as a failed write.
+    const LEN: usize = 10 << 20;
+    const LINE: &[u8] = b"fcvm-nv2-guard\n";
     let output = tokio::process::Command::new(common::find_fcvm_binary()?)
         .args([
             "exec",
@@ -2280,16 +2242,28 @@ async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
             "--",
             "sh",
             "-c",
-            "dd if=/dev/zero of=/mnt/test/data bs=1M count=10 && sync && echo OK",
+            "yes fcvm-nv2-guard | head -c 10485760 > /mnt/test/data && sync && echo OK",
         ])
         .output()
         .await?;
 
+    let written = tokio::fs::read(format!("{}/data", test_dir)).await;
     common::kill_process(pid).await;
     let _ = tokio::fs::remove_dir_all(&test_dir).await;
 
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("OK"), "Write failed: {}", out);
+    let written = written?;
+    let expected: Vec<u8> = LINE.iter().copied().cycle().take(LEN).collect();
+    assert_eq!(
+        written.len(),
+        LEN,
+        "the host file holds {} bytes",
+        written.len()
+    );
+    if let Some(at) = written.iter().zip(&expected).position(|(a, b)| a != b) {
+        panic!("the host file differs from what the guest wrote at byte {at}");
+    }
     Ok(())
 }
 

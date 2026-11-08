@@ -318,7 +318,7 @@ sudo ./fcvm podman run --name outer --network bridged \
     /opt/fcvm/fcvm podman run --name inner --network bridged alpine:latest echo "nested!"
 ```
 
-L2 VMs have ~5-7x FUSE overhead and are limited to one vCPU. See [NESTED.md](NESTED.md) for details.
+L2 VMs have ~5-7x FUSE overhead. See [NESTED.md](NESTED.md) for details.
 
 ---
 
