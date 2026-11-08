@@ -439,6 +439,53 @@ export interface Windows {
   tiles: WindowTile[];
 }
 
+/** A Minecraft server: a Tile with the address Java Edition players join and the server it was copied from. */
+export interface MinecraftTile extends Tile {
+  /** The host name Java Edition players connect to (port 25565); null when the view socket is not `wss://` on a DNS name. */
+  join: string | null;
+  /** The slot whose running server the current launch is a copy of; null for a launch from the gold snapshot. */
+  forked_from: string | null;
+}
+
+/** The last committed reset of every server. */
+export interface MinecraftResetAll {
+  clicked_at: number;
+  /** `viewer:<id>`, or whatever else the coordinator names. */
+  by: string;
+  servers: number;
+}
+
+/** The last fork that reached `running`, with the agent's times. */
+export interface MinecraftFork {
+  from: string;
+  to: string;
+  clicked_at: number;
+  by: string;
+  first_chunk_at: number | null;
+  /** The source's `fcvm snapshot create`. */
+  snapshot_ms: number | null;
+  /** The copy's `fcvm snapshot run` until its view answered. */
+  restore_ms: number | null;
+  /** The click to the copy's first chunk. */
+  total_ms: number | null;
+}
+
+/**
+ * Minecraft mode (PROTOCOL.md, "Minecraft mode"): Pumpkin servers, one per VM, laid out in an
+ * image of their own (square tiles: one row of up to four, then rows of equal length), never
+ * part of the wall.
+ */
+export interface Minecraft {
+  /** The server's name and version, as the first host says (`Pumpkin 3ea7d281 (Java Edition 26.3)`). */
+  server: string | null;
+  image_aspect: number;
+  claim_secs: number;
+  borrow: Borrow;
+  last_reset_all: MinecraftResetAll | null;
+  last_fork: MinecraftFork | null;
+  tiles: MinecraftTile[];
+}
+
 /**
  * Potato mode (PROTOCOL.md, "Potato mode"; fleet/core/src/potato.rs, `PotatoView`): a ladder of
  * rings of CPU-only player VMs passing a ball. Absent until a host has run players.
@@ -571,6 +618,8 @@ export interface FleetState {
   potato: Potato | null;
   /** Null when the fleet runs no Windows sandboxes. */
   windows: Windows | null;
+  /** Null when the fleet runs no Minecraft servers. */
+  minecraft: Minecraft | null;
 }
 
 export interface SnapshotMsg {
@@ -676,7 +725,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart", "windows_reset", "claim_windows", "release_windows", "windows_action"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart", "windows_reset", "claim_windows", "release_windows", "windows_action", "minecraft_reset", "minecraft_fork", "claim_minecraft", "release_minecraft"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -937,6 +986,55 @@ function parseWindows(v: unknown): Windows | null {
     borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
     image: parseWindowsImage(v["image"], `${w}.image`),
     last_reset_all: parseWindowsResetAll(v["last_reset_all"], `${w}.last_reset_all`),
+    tiles,
+  };
+}
+
+function parseMinecraftResetAll(v: unknown, where: string): MinecraftResetAll | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+}
+
+function parseMinecraftFork(v: unknown, where: string): MinecraftFork | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return {
+    from: str(v, "from", where),
+    to: str(v, "to", where),
+    clicked_at: num(v, "clicked_at", where),
+    by: str(v, "by", where),
+    first_chunk_at: numOrNull(v, "first_chunk_at", where),
+    snapshot_ms: numOrNull(v, "snapshot_ms", where),
+    restore_ms: numOrNull(v, "restore_ms", where),
+    total_ms: numOrNull(v, "total_ms", where),
+  };
+}
+
+function parseMinecraft(v: unknown): Minecraft | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("minecraft is not an object");
+  const w = "minecraft";
+  const aspect = num(v, "image_aspect", w);
+  if (aspect <= 0) throw new ProtocolError("minecraft.image_aspect is not positive");
+  const b = obj(v, "borrow", w);
+  const tiles: MinecraftTile[] = arr(v, "tiles", w).map((t, i) => ({
+    ...parseTile(t, i),
+    join: strOrNull(t as Obj, "join", `${w}.tiles[${i}]`),
+    forked_from: strOrNull(t as Obj, "forked_from", `${w}.tiles[${i}]`),
+  }));
+  const ids = new Set<string>();
+  for (const t of tiles) {
+    if (ids.has(t.id)) throw new ProtocolError(`server ${t.id} appears twice`);
+    ids.add(t.id);
+  }
+  return {
+    server: strOrNull(v, "server", w),
+    image_aspect: aspect,
+    claim_secs: num(v, "claim_secs", w),
+    borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
+    last_reset_all: parseMinecraftResetAll(v["last_reset_all"], `${w}.last_reset_all`),
+    last_fork: parseMinecraftFork(v["last_fork"], `${w}.last_fork`),
     tiles,
   };
 }
@@ -1266,6 +1364,7 @@ function parseState(o: Obj): FleetState {
     phones: parsePhones(o["phones"]),
     potato: parsePotato(o["potato"]),
     windows: parseWindows(o["windows"]),
+    minecraft: parseMinecraft(o["minecraft"]),
   };
 }
 

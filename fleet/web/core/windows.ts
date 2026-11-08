@@ -7,7 +7,7 @@
 import { snap, type Box } from "./layout.ts";
 import * as fmt from "./format.ts";
 import { serverNow } from "./clock.ts";
-import { sameViewer, type Windows, type WindowTile } from "./protocol.ts";
+import { sameViewer, type Tile, type Windows, type WindowTile } from "./protocol.ts";
 import type { ClientState, Notice } from "./store.ts";
 import { BLANK_PLAN, directPlan, gridOf, openedArea, tenths } from "./phones.ts";
 import { phaseText, sleepView, verifyView, type DrawPlan, type SleepView } from "./view.ts";
@@ -63,7 +63,7 @@ export interface WindowBox {
 
 export interface WindowsLayoutInput {
   area: Box;
-  tiles: readonly WindowTile[];
+  tiles: readonly Tile[];
   imageAspect: number;
   /** A phone-sized screen: two columns, or one row with the panel open. */
   narrow: boolean;
@@ -73,7 +73,7 @@ export interface WindowsLayoutInput {
 }
 
 /** The sandboxes' own tile shape from the snapshot: one tile's rectangle in the image of `imageAspect`. */
-export function windowTileAspect(tiles: readonly WindowTile[], imageAspect: number): number {
+export function windowTileAspect(tiles: readonly Tile[], imageAspect: number): number {
   const r = tiles[0]?.rect;
   const a = r ? (r.w * imageAspect) / r.h : 0;
   return a > 0 && Number.isFinite(a) ? a : 16 / 9;
@@ -88,12 +88,27 @@ export function windowTileAspect(tiles: readonly WindowTile[], imageAspect: numb
  * that make the desktops largest.
  */
 export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
+  return layoutCaptioned(inp, WINDOWS_CAPTIONS);
+}
+
+/** The room under a tile, CSS pixels: wide, narrow, compact, and the width below which a caption is compact. */
+export interface CaptionSizes {
+  full: number;
+  narrow: number;
+  compact: number;
+  fullMinW: number;
+}
+
+export const WINDOWS_CAPTIONS: CaptionSizes = { full: WINDOWS_CAPTION_H, narrow: WINDOWS_CAPTION_H_NARROW, compact: WINDOWS_CAPTION_H_COMPACT, fullMinW: WINDOWS_CAPTION_FULL_MIN_W };
+
+/** `layoutWindows` with captions of `caps`: the Minecraft servers' tiles are laid out the same way. */
+export function layoutCaptioned(inp: WindowsLayoutInput, caps: CaptionSizes): WindowBox[] {
   const { area, dpr, tiles } = inp;
   if (tiles.length === 0) return [];
   const sorted = [...tiles].sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
   const n = sorted.length;
   let compact = inp.narrow && inp.panel;
-  let capH = compact ? WINDOWS_CAPTION_H_COMPACT : inp.narrow ? WINDOWS_CAPTION_H_NARROW : WINDOWS_CAPTION_H;
+  let capH = compact ? caps.compact : inp.narrow ? caps.narrow : caps.full;
   const aspect = windowTileAspect(tiles, inp.imageAspect);
   /** The cell width, in whole device pixels, that `cols` columns allow. */
   const cellFor = (cols: number) => {
@@ -116,11 +131,11 @@ export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
   // the start) it keeps rows of at least four, so a short room gets one long row rather than
   // rows of no height.
   let pick = false;
-  if (!compact && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
+  if (!compact && cellFor(cols) < caps.fullMinW) {
     compact = true;
-    capH = WINDOWS_CAPTION_H_COMPACT;
+    capH = caps.compact;
     pick = inp.narrow;
-  } else if (compact && inp.narrow && cellFor(cols) < WINDOWS_CAPTION_FULL_MIN_W) {
+  } else if (compact && inp.narrow && cellFor(cols) < caps.fullMinW) {
     pick = true;
   }
   if (pick) cols = largest(cols, inp.panel ? cols : 1);
