@@ -1477,8 +1477,9 @@ impl Sandbox {
             scene: None,
         };
         let mut tick = tokio::time::interval(self.cfg.poll);
-        // The bridge reached the desktop: a deadline after that is the scene's, not Windows'.
-        let mut desktop_seen = false;
+        // The bridge is at the desktop: a deadline while it is, with no scene taken, is the
+        // scene's, not Windows'.
+        let mut at_desktop = false;
         let fail = |why: String, r: &Running| {
             Some(format!(
                 "{why}; fcvm said: {} | the bridge said: {}",
@@ -1503,7 +1504,7 @@ impl Sandbox {
                     // certificate, when there is no scene yet.
                     let scene_ok = r.scene.is_some()
                         || (self.cfg.tls_dir.is_none() && self.scene.borrow().is_none());
-                    desktop_seen |= state == Some("desktop");
+                    at_desktop = state == Some("desktop");
                     if state == Some("desktop") && scene_ok {
                         if let Some(desktop) = times.desktop {
                             let timings = launch_timings(teardown_ms, restore_ms, healthy_at, started_at, want.clicked_at, times);
@@ -1524,7 +1525,7 @@ impl Sandbox {
                     return Err(e);
                 }
                 _ = &mut deadline => {
-                    let why = if desktop_seen {
+                    let why = if at_desktop && r.scene.is_none() {
                         format!("the bridge reached the desktop but did not take the scene in {} s", self.cfg.start_timeout.as_secs())
                     } else {
                         format!("no desktop {} s after fcvm started", self.cfg.start_timeout.as_secs())

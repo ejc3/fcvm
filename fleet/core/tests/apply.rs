@@ -1371,6 +1371,69 @@ fn the_potato_ladder_and_records_survive_a_coordinator_restart() {
     assert_eq!((r.id, r.size), (2, 4));
 }
 
+/// A borrow given back just before the coordinator restarts (or its host is lost) has already
+/// left its claim, so the reset it asked for must survive on its own: the host comes back
+/// running the borrower's desktop at the old generation, and that desktop is reset before
+/// anyone else can borrow it.
+#[test]
+fn a_returned_sandbox_whose_reset_never_ran_is_reset_after_a_restart() {
+    let host = |at: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "hello",
+            "host": "h1", "arch": "x86_64", "gpus": [], "capacity": 0, "windows": 2,
+            "windows_actions": ["notepad"]}})
+    };
+    let running = |at: u64, generation: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": "win-2", "phase": "running", "generation": generation, "timings": {}}})
+    };
+    let cfg = config_with(serde_json::json!({}));
+    let s = events(serde_json::json!([
+        host(1000),
+        running(2000, 1),
+        {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 3000, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+         "name": "claim_windows", "args": {"slot": "win-2"}},
+        {"type": "intent", "at": 3500, "viewer": "v1", "client": "198.51.100.20", "id": "c2",
+         "name": "release_windows", "args": {}}
+    ]))
+    .iter()
+    .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(s.receipts["c2"].outcome, fleet_core::Outcome::Committed);
+    // The restart comes before the host ran the reset.
+    let s = s.resumed(cfg, 4000);
+    let s = events(serde_json::json!([
+        host(6000),
+        running(6500, 1),
+        {"type": "viewer_joined", "at": 6600, "viewer": "v2", "client": "198.51.100.30"},
+        {"type": "intent", "at": 7000, "viewer": "v2", "client": "198.51.100.30", "id": "c3",
+         "name": "claim_windows", "args": {"slot": "win-2"}}
+    ]))
+    .iter()
+    .fold(s, apply);
+    let a = &host_assignments(&s)["h1"];
+    let w2 = a.iter().find(|a| a.id == "win-2").unwrap();
+    assert!(
+        w2.generation >= 2,
+        "the returned desktop is reset: {}",
+        w2.generation
+    );
+    assert_eq!(
+        s.receipts["c3"].outcome,
+        fleet_core::Outcome::Refused,
+        "nobody borrows the old desktop"
+    );
+    // Once the reset launch runs, the debt is settled and the sandbox can be borrowed.
+    let s = events(serde_json::json!([
+        running(8000, w2.generation),
+        {"type": "intent", "at": 8500, "viewer": "v2", "client": "198.51.100.30", "id": "c4",
+         "name": "claim_windows", "args": {"slot": "win-2"}}
+    ]))
+    .iter()
+    .fold(s, apply);
+    assert_eq!(s.receipts["c4"].outcome, fleet_core::Outcome::Committed);
+    assert!(s.fleet.windows_to_reset.is_empty());
+}
+
 /// A coordinator that restarts while a sandbox is lent loses the claim with its process; the
 /// host that comes back is still running the borrower's desktop. That sandbox is reset before
 /// anyone can borrow it, and the borrower's cooldown runs from the restart.

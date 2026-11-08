@@ -2340,6 +2340,7 @@ fn expire_windows(f: &mut Fleet, at: u64) {
 /// Remove the sandboxes `gone` picks. A lent one's borrow ends here (its client's cooldown
 /// starts), and it is marked to be reset when its host reports it again: the agent keeps
 /// its VMs running across a lost connection, and a coordinator restart does not stop them.
+/// One given back whose reset has not run yet is already marked (`release_windows`).
 pub fn forget_windows(f: &mut Fleet, gone: impl Fn(&Slot) -> bool, at: u64) {
     for s in f.windows.values().filter(|s| gone(s)) {
         if let (Some(c), Some(host), Some(i)) = (windows_claim(s), &s.host, windows_index(s)) {
@@ -2519,7 +2520,10 @@ fn claim_windows(state: &mut State, c: &Ctx, want: Option<&str>) -> Result<Strin
 }
 
 /// Give a sandbox back: it is restored from the gold snapshot, so nothing the viewer did
-/// survives them and the next viewer finds the idle desktop.
+/// survives them and the next viewer finds the idle desktop. The reset is owed until a launch
+/// of its generation reports running (`observe_windows`), so a host lost or a coordinator
+/// restarted before then, which drops the slot and its generation with it, still resets the
+/// desktop when the host reports it again.
 fn release_windows(f: &mut Fleet, n: u32, at: u64) {
     let Some(slot) = f.windows.get_mut(&n) else {
         return;
@@ -2528,6 +2532,15 @@ fn release_windows(f: &mut Fleet, n: u32, at: u64) {
         return;
     };
     bump(slot, &format!("return:{}", claim.session), at);
+    if let (Some(host), Some(i)) = (slot.host.clone(), windows_index(slot)) {
+        f.windows_to_reset.insert(
+            crate::windows::key(&host, i),
+            crate::windows::ResetOwed {
+                session: claim.session.clone(),
+                generation: Some(slot.generation),
+            },
+        );
+    }
     f.last_windows_claim_end.insert(claim.client, at);
 }
 
