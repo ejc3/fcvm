@@ -1,7 +1,9 @@
 //! What the coordinator sends out, derived from the state: the browser snapshot, each
 //! host's slot assignment, the EC2 driver's assignment and the shared scene.
 
-use crate::protocol::{AssignPhone, AssignSlot, AssignWindows, SharedScene};
+use crate::protocol::{
+    AssignMinecraft, AssignPhone, AssignSlot, AssignWindows, ForkFrom, SharedScene,
+};
 use crate::scene::Scene;
 use crate::state::*;
 use crate::tiling::{Half, Rect};
@@ -407,6 +409,10 @@ pub struct View {
     /// sandboxes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows: Option<WindowsView>,
+    /// Minecraft mode (`?mode=minecraft`): the servers and their own image. Absent with no
+    /// servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<MinecraftView>,
     /// Potato mode (`?mode=potato`): the ladder, the round and the players. Absent until a
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,6 +439,35 @@ pub struct WindowsView {
     /// The Windows image of the first host (by name) that reported one.
     pub image: Option<crate::windows::WindowsImage>,
     pub last_reset_all: Option<crate::windows::ResetAll>,
+}
+
+/// The Minecraft servers, laid out in their own image, row-major (`mc:<k>`, 1-based).
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftView {
+    /// The servers' name and version: the first host's (by name) that gave one.
+    pub server: Option<String>,
+    pub image_aspect: f64,
+    /// How long a borrowed server stays with its viewer.
+    pub claim_secs: u64,
+    /// Servers lent to viewers: at most `cap` at once.
+    pub borrow: BorrowView,
+    pub last_reset_all: Option<crate::minecraft::ResetAll>,
+    /// The last fork that reached `running`.
+    pub last_fork: Option<crate::minecraft::LastFork>,
+    pub tiles: Vec<MinecraftTileView>,
+}
+
+/// A server's tile: a wall tile's fields, the name players join it at, and the server its
+/// current launch is a copy of.
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftTileView {
+    #[serde(flatten)]
+    pub tile: TileView,
+    /// The frame URL's DNS name (`minecraft::join_host`); null without one.
+    pub join: Option<String>,
+    /// The slot whose running world the current launch copies; null for a launch from the
+    /// gold snapshot.
+    pub forked_from: Option<String>,
 }
 
 /// The phones, laid out in their own image, row-major (`phone:<k>`, 1-based).
@@ -718,6 +753,7 @@ pub fn view(state: &State) -> View {
         actions: f.actions.iter().cloned().collect(),
         phones: phones_view(state),
         windows: windows_view(state),
+        minecraft: minecraft_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
     }
 }
@@ -866,6 +902,78 @@ fn windows_view(state: &State) -> Option<WindowsView> {
         claim_secs: state.config.windows_claim_secs,
         image,
         last_reset_all: f.last_reset_all.clone(),
+    })
+}
+
+/// Each server's place in the servers' image, by server number, and the image's aspect.
+pub fn minecraft_places(state: &State) -> (BTreeMap<u32, (usize, Rect)>, f64) {
+    let (rects, aspect) = crate::minecraft::layout(state.fleet.minecraft.len());
+    let places = state
+        .fleet
+        .minecraft
+        .keys()
+        .zip(rects)
+        .enumerate()
+        .map(|(i, (n, r))| (*n, (i, r)))
+        .collect();
+    (places, aspect)
+}
+
+fn minecraft_view(state: &State) -> Option<MinecraftView> {
+    let f = &state.fleet;
+    if f.minecraft.is_empty() {
+        return None;
+    }
+    let (places, image_aspect) = minecraft_places(state);
+    let tiles = places
+        .iter()
+        .map(|(n, (i, rect))| {
+            let s = &f.minecraft[n];
+            let mut t = tile(state, format!("mc:{}", i + 1), Half::Fcvm, *rect, Some(s));
+            let m = s.minecraft.as_ref();
+            t.borrowed = m.and_then(|m| m.claim.as_ref()).map(|c| BorrowedView {
+                session: c.session.clone(),
+                viewer: c.viewer.clone(),
+                since: c.claimed_at,
+                until: c.expires_at,
+            });
+            MinecraftTileView {
+                join: t.frame_url.as_deref().and_then(crate::minecraft::join_host),
+                forked_from: m
+                    .and_then(|m| m.forked_from.as_ref())
+                    .filter(|k| k.generation == s.generation)
+                    .map(|k| k.slot.clone()),
+                tile: t,
+            }
+        })
+        .collect();
+    let lent: Vec<u64> = f
+        .minecraft
+        .values()
+        .filter_map(|s| s.minecraft.as_ref()?.claim.as_ref())
+        .map(|c| c.expires_at)
+        .collect();
+    let server = f
+        .hosts
+        .values()
+        .filter(|h| {
+            f.minecraft
+                .values()
+                .any(|s| s.host.as_deref() == Some(h.name.as_str()))
+        })
+        .find_map(|h| h.minecraft_server.clone());
+    Some(MinecraftView {
+        server,
+        image_aspect,
+        claim_secs: state.config.minecraft_claim_secs,
+        borrow: BorrowView {
+            cap: state.config.minecraft_lend_cap(f.minecraft.len()),
+            lent: lent.len(),
+            next_return_at: lent.iter().copied().min(),
+        },
+        last_reset_all: f.last_minecraft_reset_all.clone(),
+        last_fork: f.last_minecraft_fork.clone(),
+        tiles,
     })
 }
 
@@ -1189,6 +1297,46 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         .collect(),
                 }),
                 minecraft: None,
+            });
+        }
+    }
+    // The servers: a fork's source while the fork is pending, and the borrower as driver.
+    for s in state.fleet.minecraft.values() {
+        let (Some(host), Some(m)) = (&s.host, &s.minecraft) else {
+            continue;
+        };
+        if let Some(list) = out.get_mut(host) {
+            list.push(AssignSlot {
+                id: s.id.clone(),
+                sbdf: String::new(),
+                generation: s.generation,
+                rect: None,
+                private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
+                standby: false,
+                warm: false,
+                phone: None,
+                windows: None,
+                minecraft: Some(AssignMinecraft {
+                    index: m.index,
+                    clicked_at: s
+                        .last_relaunch
+                        .as_ref()
+                        .filter(|r| r.generation == s.generation)
+                        .map(|r| r.clicked_at),
+                    fork: m
+                        .fork
+                        .as_ref()
+                        .filter(|k| k.generation == s.generation)
+                        .map(|k| ForkFrom {
+                            slot: k.slot.clone(),
+                            index: k.index,
+                        }),
+                    driver: m.claim.as_ref().map(|c| c.viewer.clone()),
+                    driver_until: m.claim.as_ref().map(|c| c.expires_at),
+                }),
             });
         }
     }

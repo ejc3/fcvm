@@ -1489,3 +1489,63 @@ fn a_coordinator_restart_resets_a_lent_sandbox_and_keeps_the_cooldown() {
         Some("your last sandbox was returned 2 s ago; borrow again in 58 s")
     );
 }
+
+/// A coordinator that restarts while a Minecraft server is lent loses the claim with its
+/// process; the host that comes back is still running the borrower's world. That server is
+/// reset before anyone can borrow it, its driver is gone from the assignment, and the
+/// borrower's cooldown runs from the restart.
+#[test]
+fn a_coordinator_restart_resets_a_lent_server_and_keeps_the_cooldown() {
+    let host = |at: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "hello",
+            "host": "h1", "arch": "aarch64", "gpus": [], "capacity": 0, "minecraft": 2,
+            "minecraft_server": "Pumpkin 3ea7d281 (Java Edition 26.3)"}})
+    };
+    let running = |at: u64, generation: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": "mc-2", "phase": "running", "generation": generation, "timings": {},
+            "first_chunk_at": at - 50}})
+    };
+    let cfg = config_with(serde_json::json!({}));
+    let s = events(serde_json::json!([
+        host(1000),
+        running(2000, 1),
+        {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 3000, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+         "name": "claim_minecraft", "args": {"slot": "mc-2"}}
+    ]))
+    .iter()
+    .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(s.receipts["c1"].outcome, fleet_core::Outcome::Committed);
+    let a = &host_assignments(&s)["h1"];
+    let m2 = a.iter().find(|a| a.id == "mc-2").unwrap();
+    assert_eq!(m2.minecraft.as_ref().unwrap().driver.as_deref(), Some("v1"));
+    let s = s.resumed(cfg, 5000);
+    let s = events(serde_json::json!([
+        host(6000),
+        running(6500, 1),
+        {"type": "viewer_joined", "at": 6600, "viewer": "v-1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 7000, "viewer": "v-1", "client": "198.51.100.20", "id": "c2",
+         "name": "claim_minecraft", "args": {}}
+    ]))
+    .iter()
+    .fold(s, apply);
+    let a = &host_assignments(&s)["h1"];
+    let m2 = a.iter().find(|a| a.id == "mc-2").unwrap();
+    assert_eq!(m2.generation, 2, "the lent world is reset");
+    assert_eq!(m2.minecraft.as_ref().unwrap().driver, None);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(
+        v["minecraft"]["tiles"][1]["last_relaunch"]["by"],
+        "return:minecraft-claim-1"
+    );
+    assert_eq!(
+        s.receipts["c2"].reason.as_deref(),
+        Some("your last server was returned 2 s ago; borrow again in 58 s")
+    );
+    // Once the reset launch runs the debt is settled.
+    let s = events(serde_json::json!([running(8000, 2)]))
+        .iter()
+        .fold(s, apply);
+    assert!(s.fleet.minecraft_to_reset.is_empty());
+}
