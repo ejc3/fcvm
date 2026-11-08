@@ -470,7 +470,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -519,7 +519,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -554,7 +554,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -654,7 +654,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Persistent self-hosted targets live in leased btrfs generations.
           # Restoring a cache here would replace the checkout symlink with an
@@ -953,7 +953,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Persistent self-hosted targets live in leased btrfs generations.
           # Restoring a cache here would replace the checkout symlink with an
