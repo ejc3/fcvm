@@ -1095,6 +1095,7 @@ def cr_notice_payload_res:
   [ "^$"
   , "^</?details>$"
   , "^</?(dl|dd)>$"
+  , "^<br>$"
   , "^<summary><strong>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing: [0-9]+|⛔ Files ignored due to path filters: [0-9]+|View limit details)</strong></summary>$"
   , "^<summary>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing \\([0-9]+\\)|⛔ Files ignored due to path filters \\([0-9]+\\)|How can I continue\\?|How do review limits work\\?|Review details|View limit details)</summary>$"
   , cr_icon_summary_re("cog"; "Run configuration")

@@ -2371,6 +2371,23 @@ run_case "a findings count beside the clean line in the older layout covers noth
 run_case "the status-block walkthrough with a finding appended is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit '. + "\nP1: this drops the last row\n"')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 
+echo "== finding 53: CodeRabbit's review-limit notice with <br> lines in its folds =="
+# The notice CodeRabbit posted on #1740 (2026-11-07), read from tests/fixtures/review-gate with
+# its ids replaced. Its folds open with a <br> line, as the folds of the clean walkthrough do
+# since #1713. No notice shape listed that line, so a notice saying no review ran read as an
+# unanswered finding. The range the notice quotes ends at LIMIT_HEAD.
+LIMIT_HEAD=7e1f3a5c9b2d4f6081a3c5e7092b4d6f8a0c2e4b
+CR_LIM=$(jq -Rs --arg from "$LIMIT_HEAD" --arg to "$HEAD40" 'gsub($from; $to)' < "$FIXDIR/cr-review-limit-notice-br.md")
+lim_edit() { jq -c "$1" <<<"$CR_LIM"; }
+run_case "the review-limit notice with <br> lines needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_LIM" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "the review-limit notice with <br> lines, quoting the head's range, covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_LIM" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the review-limit notice with a finding in place of a <br> line is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(lim_edit 'sub("> <br>"; "> P1: this drops the last row")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the review-limit notice with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(lim_edit '. + "\nP1: this drops the last row\n"')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
