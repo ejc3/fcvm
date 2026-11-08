@@ -1681,7 +1681,6 @@ async fn run_nested_n_levels(
     println!("L{}: {} + echo marker", n, mode_desc);
 
     // Get FCVM_FUSE_MAX_WRITE from environment, default to 0 (unbounded)
-    // The DSB SY patch in nested.c fixes L2 cache coherency issues
     let fuse_max_write = std::env::var("FCVM_FUSE_MAX_WRITE").unwrap_or_else(|_| "0".into());
     println!(
         "Using FCVM_FUSE_MAX_WRITE={} for nested VMs",

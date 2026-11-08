@@ -1187,19 +1187,15 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
-- **Host kernel**: 6.18+ with `kvm-arm.mode=nested` AND DSB patches
+- **Host kernel**: 6.18+ with `kvm-arm.mode=nested`, built from `kernel/patches-arm64`
 - **Nested kernel**: Custom kernel with CONFIG_KVM=y (use `--kernel-profile nested`)
 
-### Host Kernel with DSB Patches
-
-**CRITICAL**: Both host AND guest kernels need DSB patches for cache coherency under NV2.
+### Host Kernel
 
 **Install host kernel**: `make install-host-kernel` (builds kernel, installs to /boot, updates GRUB).
-Patches from `kernel/patches/` are applied automatically during the build.
+Patches from `kernel/patches-arm64/` are applied automatically during the build.
 
-**Current patches** (all apply to both host and guest kernels):
-- `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
-- `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
+**Current patches** (all apply to both host and guest kernels, except `.vm.patch`, guest only):
 - `nv2-targeted-shadow-s2-unmap.patch`: backport of upstream e6084aecaeef and its series, so an
   MMU notifier invalidation unmaps only the shadow stage-2 mappings of the invalidated range (#1274)
 - `mmfr4-override.vm.patch`: ID register override for recursive nesting (guest only)
@@ -1308,14 +1304,14 @@ From [`arch/arm64/kvm/arch_timer.c`](https://github.com/torvalds/linux/blob/mast
 issues due to double Stage 2 translation (L2 GPA → L1 S2 → L1 HPA → L0 S2 → physical). Large writes
 that fragment into multiple vsock packets may see stale/zero data instead of actual content.
 
-**Fix**: The DSB SY kernel patch in `kernel/patches/nv2-vsock-cache-sync.patch` fixes this issue.
-The patch adds a full system data synchronization barrier in `kvm_nested_sync_hwstate()` to ensure
-L2's writes are visible to L1's reads before returning from the nested guest exit handler.
+**Status on 6.18.60**: the two DSB patches below were dropped in #770. Host and guest kernels
+built without them (and without the WFx and PSCI debug patches) passed 13 rounds of five
+nested checks on a c8g.metal-48xl (65 of 65, 2026-11-08): `test_kvm_available_in_vm`,
+`test_nested_run_fcvm_inside_vm`, `test_nested_l2_nfs`, `test_nested_l2_with_large_files` and
+`test_vsock_integrity_nested`. FUSE max_write stays unbounded. If the corruption below comes back, `FCVM_FUSE_MAX_WRITE=32768`
+limits writes to 32 KB.
 
-With the patch applied, FUSE max_write can be unbounded (default). Without the patch, set
-`FCVM_FUSE_MAX_WRITE=32768` to limit writes to 32KB as a workaround.
-
-### L2 Cache Coherency Fix (2026-01)
+### L2 Cache Coherency Fix (2026-01, on 6.18.3; patches dropped on 6.18.60)
 
 **Problem**: L2 FUSE-over-FUSE corrupted with unbounded max_write (~1MB). After ~3-10MB
 transferred, L1 reads all zeros where L2's data should be.
@@ -1354,6 +1350,14 @@ because the double S2 translation creates a cross-domain cache coherency issue.
 
 **Test results**: With the DSB SY patch, 100MB file copies through FUSE-over-FUSE complete
 successfully with unbounded max_write (~1MB packets). Test: `make test-root FILTER=nested_l2_with_large`
+
+**Dropped on 6.18.60 (#770)**: `test_nested_l2_with_large_files`, which now copies 32 MiB of random
+data each way through FUSE-over-FUSE at unbounded max_write and compares the round trip (past the
+~10 MB where the corruption appeared), `test_vsock_integrity_nested` and the other nested tests
+pass on 6.18.60 host and guest kernels built without either barrier
+(`nv2-vsock-cache-sync.patch` in `kvm_nested_sync_hwstate()`, `nv2-vsock-rx-barrier.patch` in
+`virtio_transport_rx_work()`). Which change between 6.18.3 and 6.18.60 removed the need for them
+was not identified.
 
 ### NV2 Snapshot Lifecycle: Timer Coherence + One Restore Path (#630, 2026-06)
 

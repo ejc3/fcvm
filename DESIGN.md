@@ -3014,7 +3014,7 @@ Nothing watches the host's trees. The guest discovers changes only on access, af
 
 ### Nested VM Performance (NV2)
 
-ARM64 FEAT_NV2 has architectural issues with cache coherency under double Stage 2 translation. The DSB SY kernel patch fixes this for vsock/FUSE data paths, but multi-vCPU L2 VMs still hit interrupt delivery issues (NETDEV WATCHDOG). L2 VMs are limited to single vCPU.
+On 6.18.3, ARM64 FEAT_NV2 corrupted L2 vsock/FUSE data under double Stage 2 translation until a DSB SY kernel patch was carried. On 6.18.60 the nested tests pass without it, and the patch was dropped (#770). L2 VMs still launch with one vCPU; multi-vCPU L2 is tracked in #659.
 
 ### Snapshot + FUSE Volumes
 
