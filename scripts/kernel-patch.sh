@@ -148,6 +148,10 @@ setup_kernel_source() {
     if [[ ! -d ".git" ]]; then
         info "Initializing git repo..."
         git init -q
+        # A commit of the whole tree leaves enough loose objects for git to start
+        # `gc --auto` in the background, and validate's `rm -rf` of the work
+        # directory then races it ("Directory not empty").
+        git config gc.auto 0
         git add -A
         git commit -q -m "Initial kernel $version"
     fi
