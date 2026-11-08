@@ -547,7 +547,7 @@ pub struct Action {
     /// The intent's client id.
     pub id: String,
     pub name: String,
-    /// The intent's args, except a refused word's (`{}`).
+    /// The intent's args, except a refused word's and any that are not an object (`{}`).
     pub args: serde_json::Value,
     pub summary: String,
     pub outcome: Outcome,

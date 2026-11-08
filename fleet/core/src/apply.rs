@@ -166,8 +166,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 }
             };
             // A refused word's text is never shown: its args are left out and the summary
-            // is the reason only.
-            let shown_args = if name == "word" && outcome == Outcome::Refused {
+            // is the reason only. Args that are not an object (refused, `args must be an
+            // object`) are shown as `{}` too: an intent's args are an object on the wire, and
+            // a page keeps nothing else.
+            let shown_args = if (name == "word" && outcome == Outcome::Refused) || !args.is_object()
+            {
                 serde_json::json!({})
             } else {
                 args.clone()

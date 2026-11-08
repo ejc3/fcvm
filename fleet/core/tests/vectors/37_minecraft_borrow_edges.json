@@ -681,7 +681,7 @@
         "viewer": "v1"
       },
       {
-        "args": "mc-1",
+        "args": {},
         "at": 1600,
         "id": "c0b",
         "name": "claim_minecraft",
