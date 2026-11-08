@@ -159,22 +159,55 @@ struct ForkSnapshot {
     tag: String,
 }
 
+impl ForkSnapshot {
+    /// Remove it now, once the copy has run (or failed to).
+    async fn remove(mut self) {
+        let tag = std::mem::take(&mut self.tag);
+        remove_snapshot(&self.dir, &tag).await;
+    }
+}
+
 impl Drop for ForkSnapshot {
+    /// The relaunch was given up before `remove`: the removal waits for the snapshot's
+    /// generation lock (another fork's create can hold it while it reads this snapshot as its
+    /// parent), so it runs on a task of its own.
     fn drop(&mut self) {
-        remove_snapshot(&self.dir, &self.tag);
+        if self.tag.is_empty() {
+            return;
+        }
+        let (dir, tag) = (self.dir.clone(), std::mem::take(&mut self.tag));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { remove_snapshot(&dir, &tag).await });
+        }
     }
 }
 
 /// The fork snapshots an earlier agent left (one that died between a fork's snapshot and its
-/// removal): removed when the agent starts, before any server runs.
-pub fn sweep_fork_snapshots(dir: &Path) {
+/// removal), and their lock files: removed when the agent starts, before any server runs, so no
+/// fork of this agent can hold or wait on one of those locks.
+pub async fn sweep_fork_snapshots(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with("mc-fork-") {
-            remove_snapshot(dir, name.trim_end_matches(".lock"));
+    let mut tags: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("mc-fork-"))
+        .map(|n| n.trim_end_matches(".lock").to_string())
+        .collect();
+    tags.sort();
+    tags.dedup();
+    for tag in tags {
+        remove_snapshot(dir, &tag).await;
+        let lock = dir.join(format!("{tag}.lock"));
+        // Unlinked while held, and only here: a create left by the earlier agent (never killed)
+        // finishes before the removal above gets the lock, and no fork of this agent has begun.
+        if let Ok(_held) =
+            crate::commands::common::acquire_snapshot_dir_lock(&dir.join(&tag), true).await
+        {
+            if !dir.join(&tag).exists() {
+                let _ = std::fs::remove_file(&lock);
+            }
         }
     }
 }
@@ -301,7 +334,7 @@ async fn stopping(mut stop: watch::Receiver<bool>) {
 
 impl Minecraft {
     #[allow(clippy::too_many_arguments)]
-    pub fn start(
+    pub async fn start(
         cfg: Arc<MinecraftCfg>,
         agent: Arc<AgentCfg>,
         prefix: String,
@@ -311,7 +344,7 @@ impl Minecraft {
         http: reqwest::Client,
         scene: watch::Receiver<Option<SharedScene>>,
     ) -> Minecraft {
-        sweep_fork_snapshots(&cfg.snapshot_dir);
+        sweep_fork_snapshots(&cfg.snapshot_dir).await;
         let (gold_tx, gold) = watch::channel(GoldState::Building);
         let (stop, stop_rx) = watch::channel(false);
         let flow = {
@@ -512,19 +545,16 @@ fn sessions_file(dir: &Path, tag: &str) -> PathBuf {
     dir.join(format!("{tag}.minecraft.json"))
 }
 
-/// Remove a fork's snapshot (its directory, a btrfs subvolume inside it included, and its lock).
-pub fn remove_snapshot(dir: &Path, tag: &str) {
-    for p in [dir.join(tag), dir.join(format!("{tag}.lock"))] {
-        let r = if p.is_dir() {
-            std::fs::remove_dir_all(&p)
-        } else {
-            std::fs::remove_file(&p)
-        };
-        if let Err(e) = r {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(target: "fcvm::fleet::minecraft", path = %p.display(), error = %e, "could not remove a fork's snapshot");
-            }
-        }
+/// Remove a fork's snapshot as `fcvm snapshots delete` does: under its generation lock, which a
+/// create holds while it reads the snapshot as its diff parent (a second fork of the same
+/// source), so the removal waits for that create. The lock file stays: unlinked while held, the
+/// next locker would lock a different file.
+pub async fn remove_snapshot(dir: &Path, tag: &str) {
+    if let Err(e) = crate::storage::snapshot::SnapshotManager::new(dir.to_path_buf())
+        .delete_snapshot(tag)
+        .await
+    {
+        tracing::warn!(target: "fcvm::fleet::minecraft", %tag, error = %format!("{e:#}"), "could not remove a fork's snapshot");
     }
 }
 
@@ -770,7 +800,7 @@ impl Server {
                 self.report("forking", generation, BTreeMap::new(), None, None, None);
                 let before = health(&self.http, &place).await.map(|h| h.sessions);
                 let tag = format!("mc-fork-{}-{generation}", self.id);
-                remove_snapshot(&self.cfg.snapshot_dir, &tag);
+                remove_snapshot(&self.cfg.snapshot_dir, &tag).await;
                 let ts = Instant::now();
                 snapshot(
                     &self.agent.fcvm,
@@ -833,7 +863,9 @@ impl Server {
             }
         };
         let first_chunk_at = unix_ms();
-        drop(fork_snapshot);
+        if let Some(f) = fork_snapshot.take() {
+            f.remove().await;
+        }
         if let Err(e) = up {
             vm.stop(self.agent.stop_grace).await;
             return Err(e);
@@ -1115,7 +1147,9 @@ mod tests {
                 "--ipv6-prefix",
                 "2001:db8::/64",
                 "--ipv6-address",
-                "2001:db8::7"
+                "2001:db8::7",
+                "--on-restore",
+                RESTORE_HOOK
             ])
         );
         assert_eq!(
@@ -1158,16 +1192,29 @@ mod tests {
         assert!(!h(false, Some(20.0)).steady());
     }
 
-    #[test]
-    fn removing_a_fork_snapshot_takes_its_directory_and_its_lock() {
+    /// A fork's snapshot is removed under its generation lock: while a create holds it (reading
+    /// the snapshot as a second fork's parent) the removal waits, and the lock file stays.
+    #[tokio::test]
+    async fn removing_a_fork_snapshot_waits_for_its_generation_lock() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join("mc-fork-mc-2-3/disk")).unwrap();
-        std::fs::write(d.path().join("mc-fork-mc-2-3/config.json"), "{}").unwrap();
-        std::fs::write(d.path().join("mc-fork-mc-2-3.lock"), "").unwrap();
-        remove_snapshot(d.path(), "mc-fork-mc-2-3");
-        assert!(!d.path().join("mc-fork-mc-2-3").exists());
-        assert!(!d.path().join("mc-fork-mc-2-3.lock").exists());
+        let snap = d.path().join("mc-fork-mc-2-3");
+        std::fs::create_dir_all(snap.join("disk")).unwrap();
+        std::fs::write(snap.join("config.json"), "{}").unwrap();
+        let held = crate::commands::common::acquire_snapshot_dir_lock(&snap, false)
+            .await
+            .unwrap();
+        let dir = d.path().to_path_buf();
+        let removal = tokio::spawn(async move { remove_snapshot(&dir, "mc-fork-mc-2-3").await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(snap.exists(), "removed while a create held its lock");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), removal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!snap.exists());
+        assert!(d.path().join("mc-fork-mc-2-3.lock").exists());
         // Removing again is quiet.
-        remove_snapshot(d.path(), "mc-fork-mc-2-3");
+        remove_snapshot(d.path(), "mc-fork-mc-2-3").await;
     }
 }

@@ -84,11 +84,17 @@ def main(out):
                       for r in sorted(steps, key=lambda r: r["servers"])],
             "restore_first_chunk_ms": dist([r.get("first_chunk_ms") for r in rs]),
             "probe_join_ms": dist([r.get("probe_join_ms") for r in rs]),
-            "fork_snapshot_ms": dist([r.get("snapshot_ms") for r in fs]),
+            # A restore with no first chunk, and a fork whose snapshot failed or whose copy sent
+            # no first chunk, are counted here and have no time in the distributions.
+            "restore_failed": sum(1 for r in rs if r.get("first_chunk_ms") is None),
+            "fork_failed": sum(1 for r in fs if r.get("fork_ms") is None),
+            "fork_snapshot_ms": dist([r.get("snapshot_ms") for r in fs if r.get("snapshot_rc") == 0]),
             "fork_restore_first_chunk_ms": dist([r.get("restore_first_chunk_ms") for r in fs]),
             "fork_total_ms": dist([r.get("fork_ms") for r in fs]),
+            # Kept only when both counts were read and equal.
             "fork_source_kept_its_bots": all(
-                r.get("source_sessions_after") == r.get("source_sessions_before") for r in fs) if fs else None,
+                r.get("source_sessions_before") is not None
+                and r.get("source_sessions_after") == r.get("source_sessions_before") for r in fs) if fs else None,
             "fork_source_tps_after_min": min((r.get("source_tps_after") or 0 for r in fs), default=None),
         }
     print(json.dumps(summary, indent=1))

@@ -18,7 +18,7 @@ cpuset holds --cores cores, so what the VMs use is what the servers use.
 Arms: pumpkin (the tile image, its own bots off), vanilla, paper. Every time is taken on the
 host by this process's clock, and every server's tick rate by its bots (mctile's Tps).
 """
-import argparse, atexit, json, os, signal, socket, subprocess, sys, time, urllib.request
+import argparse, atexit, ctypes, json, os, signal, socket, subprocess, sys, time, urllib.request
 
 FCVM = os.environ.get("FCVM", "/usr/local/bin/fcvm")
 MCTILE = os.environ.get("MCTILE", "/usr/local/bin/mctile")
@@ -57,6 +57,28 @@ def _reap():
 
 atexit.register(_reap)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+PR_SET_PDEATHSIG = 1
+
+
+def _dies_with(parent):
+    """preexec_fn: the child gets SIGTERM when this process dies, SIGKILL and OOM kills included,
+    which no atexit handler survives. Checked again after arming, for a parent that died first."""
+
+    def arm():
+        if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            os._exit(127)
+        if os.getppid() != parent:
+            os._exit(1)
+
+    return arm
+
+
+def popen(argv, **kw):
+    """Every child of a run: its own process group (stopped as one), dying with this process."""
+    p = subprocess.Popen(argv, start_new_session=True, preexec_fn=_dies_with(os.getpid()), **kw)
+    CHILDREN.append(p)
+    return p
 
 
 def now():
@@ -152,11 +174,10 @@ class Bots:
             if probe.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"port {port} is already served: a bots process left by another run")
         self.log = open(f"/tmp/mcbench-bots-{port}.log", "w")
-        self.p = subprocess.Popen(
+        self.p = popen(
             ["taskset", "-c", bot_cores(cores), MCTILE, "bots", "--server", server, "--bots", str(n),
              "--port", str(port), "--bot-prefix", prefix],
-            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
-        CHILDREN.append(self.p)
+            stdout=self.log, stderr=subprocess.STDOUT)
 
     def health(self):
         return get(f"http://127.0.0.1:{self.port}/health")
@@ -189,9 +210,7 @@ def gold_tag(arm):
 
 def spawn(argv, logpath):
     lf = open(logpath, "w")
-    p = subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT, env=fcvm_env(), start_new_session=True)
-    CHILDREN.append(p)
-    return p
+    return popen(argv, stdout=lf, stderr=subprocess.STDOUT, env=fcvm_env())
 
 
 def kill_vm(proc, deadline=30):
@@ -450,6 +469,14 @@ def cmd_restore(args):
                 log(json.dumps(rec))
 
 
+def fork_total(snap_ms, snap_rc, restore_ms):
+    """A fork's time, or None for a fork that did not copy (its snapshot failed) or whose copy
+    sent no first chunk: the summary counts those as failed."""
+    if snap_rc != 0 or restore_ms is None:
+        return None
+    return snap_ms + restore_ms
+
+
 def cmd_fork(args):
     os.makedirs(args.out, exist_ok=True)
     cg_setup(args.cores)
@@ -482,7 +509,7 @@ def cmd_fork(args):
                     after = bs.health()
                     rec = {"arm": arm, "trial": t, "snapshot_ms": snap_ms, "snapshot_rc": r.returncode,
                            "restore_first_chunk_ms": restore_ms,
-                           "fork_ms": snap_ms + (restore_ms or 0),
+                           "fork_ms": fork_total(snap_ms, r.returncode, restore_ms),
                            "source_sessions_before": before and before.get("sessions"),
                            "source_sessions_after": after and after.get("sessions"),
                            "source_tps_after": after and after.get("tps")}

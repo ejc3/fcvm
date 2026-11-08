@@ -613,19 +613,22 @@ where
         )
     });
     let mut servers = match (agent.minecraft, mc_gold) {
-        (Some(m), Some(gold)) => Some(minecraft::Minecraft::start(
-            Arc::new(m),
-            cfg.clone(),
-            cfg.ipv6_prefix
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
-            mc_places,
-            gold,
-            out.clone(),
-            http.clone(),
-            scene_rx.clone(),
-        )),
+        (Some(m), Some(gold)) => Some(
+            minecraft::Minecraft::start(
+                Arc::new(m),
+                cfg.clone(),
+                cfg.ipv6_prefix
+                    .as_ref()
+                    .map(|p| p.to_string())
+                    .unwrap_or_default(),
+                mc_places,
+                gold,
+                out.clone(),
+                http.clone(),
+                scene_rx.clone(),
+            )
+            .await,
+        ),
         _ => None,
     };
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetPlan>>(None);

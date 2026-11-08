@@ -629,9 +629,11 @@ minecraft-image:
 	podman build --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
 	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
 
-# mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's).
+# mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's), and the
+# density harness's tests.
 test-minecraft:
 	cd fleet/minecraft && CARGO_TARGET_DIR=$(or $(MINECRAFT_TARGET),target) cargo test --locked --release
+	python3 -B fleet/minecraft/bench/test_bench.py
 
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link

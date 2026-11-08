@@ -249,10 +249,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: mctile tests
+        with:
+          persist-credentials: false
+      - name: mctile and density harness tests
         run: make test-minecraft MINECRAFT_TARGET="$RUNNER_TEMP/mctile-target"
-      - name: Density bench syntax
-        run: python3 -B -m py_compile fleet/minecraft/bench/mcbench.py
 
   fleet-renderer:
     name: Fleet Renderer

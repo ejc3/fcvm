@@ -9,6 +9,7 @@ import * as fmt from "./format.ts";
 import { serverNow } from "./clock.ts";
 import { ProtocolError, sameViewer, type Minecraft, type MinecraftTile } from "./protocol.ts";
 import type { ClientState, Notice } from "./store.ts";
+import { streamUrl } from "./net.ts";
 import { openedArea, tenths } from "./phones.ts";
 import { sleepView, verifyView, type SleepView } from "./view.ts";
 import { hundredthsText, layoutCaptioned, medianMs, type CaptionSizes } from "./windows.ts";
@@ -977,7 +978,9 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     const lastFork = m.last_fork !== null && m.last_fork.to === slot ? m.last_fork : null;
     const phases = t.last_relaunch?.phases ?? {};
     const split = t.forked_from === null ? null : forkSplitText(lastFork?.snapshot_ms ?? phases["snapshot_ms"], lastFork?.restore_ms ?? phases["restore_ms"]);
-    const url = running ? t.frame_url : null;
+    // The view socket over the family the page's probe chose (core/net.ts), as every stream is:
+    // a viewer with no IPv6 reaches the tile over its IPv4 name.
+    const url = running ? streamUrl(t, s.net.family) : null;
     const socket = url !== null && first !== null ? { url, first, key: `${url}#${t.generation ?? 0}` } : null;
     const state = running ? "running" : t.phase === "failed" ? "failed" : t.phase === "forking" ? "forking" : "restoring";
     return {

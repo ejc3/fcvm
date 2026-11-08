@@ -209,37 +209,39 @@
    }
   ],
   "restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 1175.0667049996082,
+   "p90": 1186.1434105004264,
+   "max": 1214.0443510006662
   },
   "probe_join_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 444.3812399995295,
+   "p90": 487.31340200038176,
+   "max": 488.7569570000778
   },
+  "restore_failed": 0,
+  "fork_failed": 0,
   "fork_snapshot_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 864.8019029997158,
+   "p90": 875.5274433999148,
+   "max": 880.9210489998804
   },
   "fork_restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 1148.8854669996726,
+   "p90": 1197.033535200353,
+   "max": 1212.273558000561
   },
   "fork_total_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 1990.5490080009258,
+   "p90": 2062.4457650001204,
+   "max": 2093.1946070004415
   },
-  "fork_source_kept_its_bots": null,
-  "fork_source_tps_after_min": null
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 18.931426167437948
  },
  "pumpkin": {
   "cores": 4,
@@ -467,37 +469,39 @@
    }
   ],
   "restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 869.8832330005644,
+   "p90": 896.8002243003866,
+   "max": 965.4784530002871
   },
   "probe_join_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 136.20083449995946,
+   "p90": 172.4405484998897,
+   "max": 175.40847399959603
   },
+  "restore_failed": 0,
+  "fork_failed": 0,
   "fork_snapshot_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 372.6261309993788,
+   "p90": 377.3718469996311,
+   "max": 377.49708899991674
   },
   "fork_restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 747.8937779997068,
+   "p90": 801.5206762001981,
+   "max": 809.6472450006331
   },
   "fork_total_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 1116.1611169991374,
+   "p90": 1172.9695595997327,
+   "max": 1177.2727280003892
   },
-  "fork_source_kept_its_bots": null,
-  "fork_source_tps_after_min": null
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 19.997778024663926
  },
  "vanilla": {
   "cores": 4,
@@ -665,36 +669,38 @@
    }
   ],
   "restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 775.262713000302,
+   "p90": 807.6889282001503,
+   "max": 860.6110900000203
   },
   "probe_join_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 10,
+   "p50": 347.3253349998231,
+   "p90": 385.48910760046056,
+   "max": 397.5136980006937
   },
+  "restore_failed": 0,
+  "fork_failed": 0,
   "fork_snapshot_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 1330.9645970002748,
+   "p90": 1343.2410245997744,
+   "max": 1349.7773250001046
   },
   "fork_restore_first_chunk_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 911.9506600000022,
+   "p90": 981.3276917997428,
+   "max": 1015.4317249998712
   },
   "fork_total_ms": {
-   "n": 0,
-   "p50": null,
-   "p90": null,
-   "max": null
+   "n": 5,
+   "p50": 2216.9774390004022,
+   "p90": 2321.300566199352,
+   "max": 2348.8682989991503
   },
-  "fork_source_kept_its_bots": null,
-  "fork_source_tps_after_min": null
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 19.964507542147295
  }
 }

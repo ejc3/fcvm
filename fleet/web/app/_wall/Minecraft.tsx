@@ -192,7 +192,7 @@ function Sheet({
 
 export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl: string | null }) {
   // No frame streams: each tile is drawn from its own view socket.
-  const client = useMemo(() => new WallClient(coordUrl, () => [], directUrl), [coordUrl, directUrl]);
+  const client = useMemo(() => new WallClient(coordUrl, (st) => st.minecraft?.tiles ?? [], directUrl), [coordUrl, directUrl]);
   const tiles = useMemo(() => new McTiles(), []);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const live = useSyncExternalStore(tiles.subscribe, tiles.getLive, tiles.getLive);

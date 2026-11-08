@@ -160,8 +160,16 @@ async fn view(State(app): State<App>, ws: WebSocketUpgrade) -> Response {
     if app.fleet && !app.tile.scene.read().set {
         return (StatusCode::SERVICE_UNAVAILABLE, "no scene yet").into_response();
     }
-    ws.on_upgrade(move |socket| view_socket(app, socket))
+    // A first message holds a token and a drive message a few keys: nothing on this socket is
+    // near 16 KiB, and the default limits (tens of MiB) would let an unadmitted client make the
+    // tile buffer that much per socket before its token is read.
+    ws.max_message_size(VIEW_MAX_MESSAGE)
+        .max_frame_size(VIEW_MAX_MESSAGE)
+        .on_upgrade(move |socket| view_socket(app, socket))
 }
+
+/// The largest message a view socket takes.
+const VIEW_MAX_MESSAGE: usize = 16 * 1024;
 
 fn text(v: serde_json::Value) -> Message {
     Message::Text(v.to_string().into())
@@ -177,6 +185,10 @@ async fn admit_first(app: &App, socket: &mut WebSocket) -> Option<String> {
     let Message::Text(t) = first else { return None };
     let v: serde_json::Value = serde_json::from_str(&t).ok()?;
     let keys = app.tile.scene.read().admit_keys.clone();
+    // A fleet tile admits only a direct token: a scene with no keys opens it to nobody.
+    if keys.is_empty() && app.fleet {
+        return None;
+    }
     if keys.is_empty() {
         return Some(
             v.get("viewer")
@@ -317,7 +329,16 @@ pub async fn serve_tls(
 ) -> anyhow::Result<()> {
     let l = tokio::net::TcpListener::bind(addr).await?;
     loop {
-        let (tcp, _) = l.accept().await?;
+        // An accept error (EMFILE, ECONNABORTED) is about one connection or a moment: the
+        // listener keeps going, or the tile would stay healthy over plain HTTP and dark over TLS.
+        let tcp = match l.accept().await {
+            Ok((tcp, _)) => tcp,
+            Err(e) => {
+                tracing::warn!(error = %e, "accepting a TLS connection failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let Some(config) = tls.config.read().clone() else {
             continue;
         };
@@ -428,6 +449,57 @@ mod tests {
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["viewer"], "v-1");
         assert_eq!(hello["tile"], "mc-1");
+    }
+
+    /// A fleet tile whose scene carries no keys admits nobody, whatever viewer a socket names.
+    #[tokio::test]
+    async fn a_fleet_scene_with_no_keys_admits_nobody() {
+        let (addr, _) = serve(true).await;
+        let body =
+            serde_json::json!({"tile": "mc-1", "generation": 2, "admit_keys": [], "driver": "v-1"});
+        assert_eq!(post_scene(addr, Some("tok"), body).await, 200);
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/view"))
+            .await
+            .unwrap();
+        ws.send(WsMsg::text(
+            serde_json::json!({"viewer": "v-1"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        match ws.next().await {
+            Some(Ok(WsMsg::Close(Some(f)))) => assert_eq!(u16::from(f.code), 1008),
+            other => panic!("a keyless fleet scene admitted a viewer: {other:?}"),
+        }
+    }
+
+    /// A first message over the view socket's limit ends the socket before its token is read.
+    #[tokio::test]
+    async fn an_oversized_first_message_is_refused() {
+        let (addr, _) = serve(true).await;
+        assert_eq!(post_scene(addr, Some("tok"), scene(None)).await, 200);
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/view"))
+            .await
+            .unwrap();
+        // A valid token padded past the limit: read whole, it would be admitted.
+        let good = crate::admit::make_token(&KEY, "v-1", unix_ms() / 1000 + 60);
+        let big = serde_json::json!({"admit": good, "pad": "x".repeat(VIEW_MAX_MESSAGE)});
+        let _ = ws.send(WsMsg::text(big.to_string())).await;
+        if let Some(Ok(WsMsg::Text(t))) = ws.next().await {
+            panic!("an oversized first message was read: {t}");
+        }
+    }
+
+    /// One failed accept does not end the TLS listener (the tile would stay healthy over plain
+    /// HTTP and dark over TLS).
+    #[test]
+    fn the_tls_listener_survives_an_accept_error() {
+        let src = include_str!("server.rs");
+        let f = &src[src.find("pub async fn serve_tls").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(
+            !f.contains(".accept().await?"),
+            "serve_tls returns on an accept error"
+        );
     }
 
     async fn drive_reply(

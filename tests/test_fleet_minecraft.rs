@@ -253,7 +253,8 @@ async fn fake_from(
         out,
         reqwest::Client::builder().no_proxy().build().unwrap(),
         scene_rx,
-    );
+    )
+    .await;
     Fake {
         _dir: dir,
         path,

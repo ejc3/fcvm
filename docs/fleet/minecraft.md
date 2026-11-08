@@ -165,7 +165,10 @@ The headline is servers per vCPU: how many server VMs share one vCPU while every
 tick rate at 19.5 or more with three bots playing on it. Measured on a bare-metal arm64 host
 (c8gd.metal-24xl, 96 vCPUs, 188 GiB; never the shared dev host), 2026-11-08, one boot, with
 `fleet/minecraft/bench/mcbench.py`; the records are in
-`fleet/minecraft/bench/results/2026-11-08-c8gd-metal-24xl/`.
+`fleet/minecraft/bench/results/2026-11-08-c8gd-metal-24xl/`, and the table below is its
+`summary.json` (`summarize.py` over `ladder.jsonl`, `restore.jsonl` and `fork.jsonl`).
+`sweep.jsonl` is the first sweep of the same boot, which found each server's edge; its readings
+had no freshness check (below), so no number here comes from it.
 
 - **The shape.** Every server VM has 1 vCPU and 3 GiB (Paper ran out of memory in 2 GiB), bridged
   networking, and is restored from its arm's gold snapshot: the server booted, three bots

@@ -488,6 +488,25 @@ describe("a server's words", () => {
     expect(none.cards.every((c) => c.socket === null)).toBe(true);
     expect(none.banner).toMatch(/only to viewers with a direct seat/);
   });
+
+  it("opens each socket over the family the page's probe chose, and none before it has", () => {
+    const m = minecraftOf(1, {});
+    m.tiles[0]!.frame_url_v4 = "wss://mc-1-v4.example.test:8443/view";
+    const at = (family: "v4" | "v6" | null) => {
+      let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
+      if (family !== null) s = reduce(s, { type: "family", family, probeMs: 100, via: "race" });
+      s = reduce(s, { type: "message", text: JSON.stringify({ type: "hello", viewer: "v-1", turnstile: null }), at: EPOCH });
+      s = reduce(s, { type: "message", text: JSON.stringify({ type: "admission", seat: "s", locked: false, reason: null, direct: { value: TOKEN, expires_at: NOW + 600_000 }, broadcast: null, seat_free: false, capacity: null }), at: EPOCH });
+      s = reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), minecraft: m }), at: EPOCH });
+      return minecraftView(input(s)).cards[0]!.socket?.url ?? null;
+    };
+    expect(at("v4")).toBe("wss://mc-1-v4.example.test:8443/view");
+    expect(at("v6")).toBe("wss://mc-1.example.test/view");
+    expect(at(null)).toBeNull();
+    // The probe tries the Minecraft servers' own sockets: without them it never settles.
+    const page = readFileSync(new URL("../../app/_wall/Minecraft.tsx", import.meta.url), "utf8");
+    expect(page).toMatch(/new WallClient\(coordUrl, \(st\) => st\.minecraft\?\.tiles \?\? \[\], directUrl\)/);
+  });
 });
 
 describe("the header", () => {
