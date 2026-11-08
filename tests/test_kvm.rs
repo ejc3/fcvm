@@ -650,6 +650,53 @@ except OSError as e:
     }
 }
 
+/// `localhost/nested-test` as a docker-archive at
+/// `/mnt/fcvm-btrfs/image-cache/{digest}.oci.tar`, the path the nested levels
+/// `podman load` from. The tests used to find this file only when an earlier
+/// launch of the image had left it in the image cache, and a fresh store has
+/// none: every L3 and L4 test then failed in L1 with "stat
+/// /mnt/image-cache/<digest>.oci.tar: no such file or directory" (#660). It is
+/// exported by image ID, under a unique temporary name, and renamed into place.
+async fn nested_test_archive(digest_stripped: &str) -> Result<String> {
+    // The archive is named by digest and reused while it exists, so an empty digest
+    // would name every build's image the same file and run a stale one.
+    if digest_stripped.is_empty() {
+        bail!("localhost/nested-test has no digest to name its archive by");
+    }
+    let path = format!("/mnt/fcvm-btrfs/image-cache/{digest_stripped}.oci.tar");
+    if std::path::Path::new(&path).exists() {
+        return Ok(path);
+    }
+    let id_output = tokio::process::Command::new("podman")
+        .args(["inspect", "localhost/nested-test", "--format", "{{.Id}}"])
+        .output()
+        .await
+        .context("getting the nested-test image ID")?;
+    let image_id = String::from_utf8_lossy(&id_output.stdout)
+        .trim()
+        .to_string();
+    if image_id.is_empty() {
+        bail!(
+            "no image ID for localhost/nested-test: {}",
+            String::from_utf8_lossy(&id_output.stderr)
+        );
+    }
+    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache").await?;
+    let temp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+    fcvm::commands::podman::export_image_archive(
+        &image_id,
+        "localhost/nested-test",
+        std::path::Path::new(&temp),
+        None,
+    )
+    .await
+    .context("exporting localhost/nested-test for the nested levels")?;
+    tokio::fs::rename(&temp, &path)
+        .await
+        .with_context(|| format!("publishing {path}"))?;
+    Ok(path)
+}
+
 /// Run an nested chain test with configurable depth.
 ///
 /// This function attempts to run VMs nested N levels deep:
@@ -782,7 +829,7 @@ except OSError as e:
     }
     // Strip sha256: prefix to match fcvm's cache path format
     let digest_stripped = image_digest.trim_start_matches("sha256:");
-    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let image_cache_path = nested_test_archive(digest_stripped).await?;
     println!("[Setup] Image digest: {}", image_digest);
     println!("[Setup] Cache path: {}", image_cache_path);
 
@@ -1000,14 +1047,14 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L3 network: measures throughput degradation through triple NAT chain
+/// Test L3 network: measures throughput degradation through triple NAT chain.
 ///
-/// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
-/// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
-/// container startup to exceed the 10-minute test timeout.
-/// disk-dir and NFS may work better at L3.
+/// 672 to 810 s in four runs on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI: Makefile CI_ROOT_BASE runs only the kept nested tests. Every
+/// transfer must complete (`network_script`), and the rate is reported, not judged: L3
+/// moved 0 to 3 Mbit/s out and 24 to 107 Mbit/s in with one stream, and 0 with four, in
+/// 2 s transfers, against 25 to 50 Gbit/s at L1 and 2 to 11 Gbit/s at L2.
 #[tokio::test]
-#[ignore = "nested L3 (FUSE-over-FUSE x2): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1018,9 +1065,11 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
     .await
 }
 
-/// Test L3 network with NFS (may be faster than FUSE)
+/// Test L3 network with the image cache over NFS.
+///
+/// 695 to 741 s in four runs on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660). Not in CI.
 #[tokio::test]
-#[ignore = "nested L3 (NFS): slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3_network_nfs() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1031,14 +1080,12 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
     .await
 }
 
-/// Test L1→L2→L3: 3 levels of nesting
+/// Test L1→L2→L3: 3 levels of nesting.
 ///
-/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
-/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
-/// initialization alone takes 10+ minutes. Need to implement request pipelining
-/// or async PassthroughFs before this test can complete in reasonable time.
+/// 627 to 681 s in four runs on a c8g.metal-48xl with the 6.18.60 host and guest kernels
+/// (#660); about 9 of those minutes are L3 booting through the three-hop FUSE
+/// chain. Not in CI.
 #[tokio::test]
-#[ignore = "nested L3: slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
 async fn test_nested_l3() -> Result<()> {
     run_nested_n_levels(
         3,
@@ -1049,11 +1096,18 @@ async fn test_nested_l3() -> Result<()> {
     .await
 }
 
-/// Test L1→L2→L3→L4: 4 levels of nesting
+/// Test L1→L2→L3→L4: 4 levels of nesting.
 ///
-/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
+/// Measured on a c8g.metal-48xl with the 6.18.60 host and guest kernels (#660), with
+/// the L1 lifetime cap raised to 3600 s: L3 is up and has loaded the image about 45 min
+/// in, and then the L4 Firecracker, started by L3, did not open its API socket within
+/// fcvm's 5 s wait ("Firecracker socket not ready after 5 seconds"), in the one run that got
+/// that far.
+/// With 4 GiB at every level L1 ran out of memory instead, its kernel killing L2's
+/// Firecracker 37 min in; the levels now get more memory the more levels run under
+/// them (`run_nested_n_levels`).
 #[tokio::test]
-#[ignore = "nested L4: very slow + NV2-flaky on shared runners; run manually — tracked in #630-B"]
+#[ignore = "nested L4: over 45 min to reach L4 on a c8g.metal-48xl, where L4's Firecracker misses fcvm's 5 s API socket wait (#660); run manually"]
 async fn test_nested_l4() -> Result<()> {
     run_nested_n_levels(
         4,
@@ -1292,18 +1346,17 @@ echo "Server: $SERVER:$PORT"
 
 # Check if iperf3 is available
 if ! command -v iperf3 &> /dev/null; then
-    echo "NETBENCH_L${{LEVEL}}=SKIP (iperf3 not installed)"
-    echo "MARKER_NET_L${{LEVEL}}_OK"
-    exit 0
+    echo "NETBENCH_L${{LEVEL}}=FAIL (iperf3 not installed)"
+    exit 1
 fi
 
 # Check connectivity first
 echo "--- Connectivity Test ---"
 if ! timeout 5 bash -c "echo > /dev/tcp/$SERVER/$PORT" 2>/dev/null; then
-    echo "NETBENCH_L${{LEVEL}}=SKIP (cannot reach $SERVER:$PORT)"
-    echo "MARKER_NET_L${{LEVEL}}_OK"
-    exit 0
+    echo "NETBENCH_L${{LEVEL}}=FAIL (cannot reach $SERVER:$PORT)"
+    exit 1
 fi
+FAILED=0
 echo "Server reachable"
 
 # One block size, two parallelism levels, short duration: the test gates
@@ -1332,6 +1385,7 @@ except:
     print('FAIL')
 " 2>/dev/null || echo "FAIL")
         echo "NET_EGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+        [ "$throughput" = FAIL ] && FAILED=1
     done
 done
 
@@ -1354,11 +1408,14 @@ except:
     print('FAIL')
 " 2>/dev/null || echo "FAIL")
         echo "NET_INGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+        [ "$throughput" = FAIL ] && FAILED=1
     done
 done
 
 echo ""
 echo "=== END NETWORK BENCHMARK L${{LEVEL}} ==="
+# A transfer that failed is a broken network, not a slow one: no marker.
+[ "$FAILED" = 0 ] || exit 1
 echo "MARKER_NET_L${{LEVEL}}_OK"
 "#
     )
@@ -1441,17 +1498,20 @@ async fn run_nested_n_levels(
     // This avoids mounting the entire image-cache which could be large
     let image_dir = format!("/mnt/fcvm-btrfs/nested-test/{}", digest_stripped);
     let image_archive = format!("{}/{}.oci.tar", image_dir, digest_stripped);
-    let src_archive = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let src_archive = nested_test_archive(digest_stripped).await?;
 
     // Create directory and reflink-copy the archive (fast CoW copy on btrfs)
-    tokio::fs::create_dir_all(&image_dir).await.ok();
+    tokio::fs::create_dir_all(&image_dir).await?;
     if !tokio::fs::try_exists(&image_archive).await.unwrap_or(false) {
         println!("Copying OCI archive to dedicated directory...");
-        tokio::process::Command::new("cp")
+        let copied = tokio::process::Command::new("cp")
             .args(["--reflink=auto", &src_archive, &image_archive])
             .status()
             .await
             .context("copying OCI archive")?;
+        if !copied.success() {
+            bail!("copying {src_archive} to {image_archive}: {copied}");
+        }
     }
 
     // Both methods mount the same directory, just via different mechanisms
@@ -1468,11 +1528,14 @@ async fn run_nested_n_levels(
     };
     let image_cache_guest_path = "/mnt/image-cache".to_string();
 
-    // Memory allocation strategy:
-    // - Each VM needs enough memory to run its child's Firecracker (~2GB) + OS overhead (~500MB)
-    // - Intermediate levels (L1..L(n-1)): 4GB each to accommodate child VM + OS
-    // - Deepest level (Ln): 2GB (default) since it just runs echo
-    let intermediate_mem = "4096"; // 4GB for VMs that spawn children
+    // Memory: every level gets 4 GiB, and a level with two or more levels below it
+    // 2 GiB more per extra level, so each parent holds its child's guest RAM plus its
+    // own. With 4 GiB everywhere a 4-level chain ran L1 out of memory: L1's kernel
+    // OOM-killed L2's Firecracker (anon-rss 3.6 GB) while L3 loaded the image, 37 min
+    // into the test (#660). Chains of 2 and 3 levels keep their sizes but L1 of an
+    // L3 chain, which gets 6 GiB.
+    let level_mem = |level: usize| (4096 + 2048 * n.saturating_sub(level + 1)).to_string();
+    let intermediate_mem = level_mem(1);
 
     // Use unique scripts directory per test to avoid race conditions when tests run in parallel
     // Extract a short suffix from the marker (e.g., "NESTED_2_LEVELS_FUSE_SUCCESS" -> "fuse")
@@ -1633,10 +1696,22 @@ async fn run_nested_n_levels(
         ""
     };
 
+    // L1 reads the archive through the mount under test (FUSE or NFS). It starts
+    // its L2 with only `--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs`, so L2 and deeper
+    // read the same file through that map; /mnt/image-cache does not exist there
+    // (#660: every L3 and L4 run failed in L2 with "stat /mnt/image-cache/...").
+    let level_image_cache = |level: usize| {
+        if level == 1 {
+            image_cache_guest_path.clone()
+        } else {
+            image_dir.clone()
+        }
+    };
+
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
-        let mem_arg = format!("--mem {}", intermediate_mem);
+        let mem_arg = format!("--mem {}", level_mem(level + 1));
 
         let script = match mode {
             BenchmarkMode::WithLargeFiles => format!(
@@ -1695,7 +1770,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1758,7 +1833,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1819,7 +1894,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
-                image_cache = image_cache_guest_path,
+                image_cache = level_image_cache(level),
                 cpu_arg = cpu_arg,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
@@ -1874,10 +1949,12 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     let image_cache_args = image_cache_mount_args.join(" ");
     // `timeout` bounds the L1 VM's lifetime: when nextest kills a timed-out
     // test, this spawned pipeline would otherwise survive as an orphan and
-    // collide with the retry. 840s < the 900s nextest budget so the VM dies
-    // (and cleans up) before the test harness gives up.
+    // collide with the retry. 1140 s < the nested group's 1200 s nextest budget
+    // so the VM dies (and cleans up) before the test harness gives up. The L3
+    // tests complete in 627 to 810 s (#660), so 840 s left them as little as 4% headroom,
+    // and an L3 run on a host busy with other VM tests took 847 s and was killed.
     let fcvm_cmd = format!(
-        "timeout -k 10 840 sudo ./target/release/fcvm podman run \
+        "timeout -k 10 1140 sudo ./target/release/fcvm podman run \
          --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
@@ -1997,11 +2074,9 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
 /// Measures how long it takes to import the nested container image
 /// inside a VM when the image archive is accessed over FUSE-over-vsock.
 ///
-/// Disabled: takes 389s in CI due to NV2 nested virtualization overhead (75x
-/// slower than L1). FUSE throughput itself is fine (181-224 MB/s on L1).
-/// The bottleneck is podman load's gzip decompression + overlay writes running
-/// under double Stage 2 translation with a single vCPU.
-#[ignore = "podman load over FUSE in nested VM: slow + NV2-flaky; run manually — tracked in #630-B"]
+/// It took 389 s in CI before the #630 fixes. On a c8g.metal-48xl with the
+/// 6.18.60 host and guest kernels the whole test took 13 to 28 s in six runs
+/// (#660). Not in CI.
 #[tokio::test]
 async fn test_podman_load_over_fuse() -> Result<()> {
     println!("\nPodman Load Over FUSE Performance Test");
@@ -2032,12 +2107,8 @@ async fn test_podman_load_over_fuse() -> Result<()> {
     }
 
     let digest_stripped = digest.trim_start_matches("sha256:");
-    let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    let archive_path = nested_test_archive(digest_stripped).await?;
     println!("   Digest: sha256:{}...", &digest_stripped[..12]);
-
-    if !std::path::Path::new(&archive_path).exists() {
-        bail!("OCI archive not found at {}", archive_path);
-    }
 
     // Get archive size
     let metadata = std::fs::metadata(&archive_path)?;
@@ -2104,6 +2175,15 @@ async fn test_podman_load_over_fuse() -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&load_output.stdout);
     println!("\n   Output:\n   {}", stdout.trim().replace('\n', "\n   "));
+    if !load_output.status.success() || !stdout.contains("Loaded image") {
+        common::kill_process(vm_pid).await;
+        bail!(
+            "podman load in the VM failed ({}): {}{}",
+            load_output.status,
+            stdout,
+            String::from_utf8_lossy(&load_output.stderr)
+        );
+    }
 
     // 5. Clean up
     println!("\n5. Cleaning up...");
