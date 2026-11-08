@@ -108,40 +108,71 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     let before = 0o644;
     let after = 0o600;
 
-    // The cached half is only meaningful while the mount's 1s attr_timeout has
-    // not elapsed between the priming statx and the plain stat. A descheduling
-    // longer than that (a loaded CI host) expires the cache and the plain stat
-    // reports the new mode — a scheduling artifact, not the property under
-    // test — so that half retries. The forced half stays a hard assertion.
-    let mut cache_held = false;
+    // The mount's attr_timeout (ATTR_TTL_SECS in fuse-pipe/src/server/passthrough.rs).
+    let attr_timeout = std::time::Duration::from_secs(1);
+
+    // Both halves are only meaningful while the attributes the priming cached
+    // have not expired. A descheduling longer than the attr_timeout (a loaded
+    // CI host) expires them: the plain stat then reports the new mode, or the
+    // forced stat reports it through ordinary expiry, which would pass even
+    // with AT_STATX_FORCE_SYNC ignored. Either is a scheduling artifact, so the
+    // attempt is retried. A forced stat that returns the old mode is a hard
+    // failure whenever it happens.
+    //
+    // The priming must not rely on the flag under test: an ignored flag would
+    // return attributes cached earlier without moving their expiry, and the time
+    // measured from the priming would bound nothing. So it waits out the
+    // attr_timeout, which leaves the kernel nothing cached, and primes with plain
+    // stats of the path. Through the path, because the plain stat below resolves
+    // it: with the dentry's entry_timeout (also 1 s) run out, that stat would send
+    // a LOOKUP whose reply refreshes the attributes. A chmod moves the host file's
+    // ctime and nothing else, which the client takes as a possible rewrite that
+    // kept the size and mtime (fuse-pipe/src/client/host_change.rs): it sends
+    // FUSE_NOTIFY_INVAL_INODE ahead of the first reply that reports it, and the
+    // kernel does not cache the attributes of a reply an invalidation overtook.
+    // The kernel then asks again with a GETATTR, in the same stat or in the second
+    // one, and that reply, carrying the ctime the client already recorded, is
+    // cached. Every request that refreshes the dentry or the attributes is sent
+    // after `primed`, so both expire no earlier than 1 s after it.
+    let mut saw_chmod = 0;
+    let mut expired = 0;
     for _ in 0..5 {
         fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
-        assert_eq!(
-            forced_statx_mode(fd) as u32,
-            before,
-            "the mount does not agree with the backing file even before anything is changed \
-             behind its back, so neither half of this check would mean anything"
-        );
+        std::thread::sleep(attr_timeout + std::time::Duration::from_millis(100));
+        let primed = std::time::Instant::now();
+        for what in ["first refresh", "priming refresh"] {
+            assert_eq!(
+                fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777,
+                before,
+                "the mount does not agree with the backing file even before anything is \
+                 changed behind its back ({what}), so neither half of this check would mean \
+                 anything"
+            );
+        }
 
         fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
 
-        if fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777 == before {
-            cache_held = true;
-            break;
+        if fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777 != before {
+            saw_chmod += 1;
+            continue;
         }
-    }
-    assert!(
-        cache_held,
-        "a plain stat through {} saw the out-of-band chmod on five consecutive attempts, so \
-         the attribute cache is not in play here and the forced case proves nothing",
-        via_mount.display()
-    );
 
-    let forced = forced_statx_mode(fd) as u32;
-    assert_eq!(
-        forced, after,
-        "AT_STATX_FORCE_SYNC returned the cached mode, so this benchmark would measure the \
-         attribute cache rather than a GETATTR round trip"
+        let forced = forced_statx_mode(fd) as u32;
+        assert_eq!(
+            forced, after,
+            "AT_STATX_FORCE_SYNC returned the cached mode, so this benchmark would measure the \
+             attribute cache rather than a GETATTR round trip"
+        );
+        if primed.elapsed() < attr_timeout {
+            return;
+        }
+        expired += 1;
+    }
+    panic!(
+        "five attempts through {} proved nothing: on {saw_chmod} a plain stat saw the \
+         out-of-band chmod, so the attribute cache was not in play, and on {expired} the \
+         forced stat finished after the cached attributes could have expired",
+        via_mount.display()
     );
 }
 
