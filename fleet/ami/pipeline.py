@@ -435,6 +435,7 @@ class Pipeline:
             require(all(result.get(key) == value for key, value in self.tls.items()),
                     "the validation TLS identity changed during this build")
             require(kind != "host" or result.get("phone_clone") is True, "candidate phone clone failed")
+            require(kind != "host" or result.get("windows_sandbox") is True, "candidate Windows sandbox failed")
             require(re.fullmatch(r"[0-9a-f-]{36}", result.get("boot_id", "")), "candidate has no boot identity")
             boots.append(result["boot_id"])
         require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")

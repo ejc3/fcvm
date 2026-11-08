@@ -10,7 +10,10 @@
 #                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst;
 #                    then the phones: the phone profile, the emulator and system image built
 #                    from source, Robot Park, the web browser, the phone image, and the warm snapshot of a
-#                    running phone every phone of a host is a clone of (warm-phone.sh)
+#                    running phone every phone of a host is a clone of (warm-phone.sh);
+#                    then the Windows sandboxes: Cloud Hypervisor, the evaluation image
+#                    installed from Microsoft's media (fleet/windows/build-image.sh), and the
+#                    bridge image
 #   build.sh bake    packs the store into /var/lib/fcvm-fleet/store/ (store-pack.py) and cleans up
 #                    for imaging
 #
@@ -47,7 +50,8 @@ prep)
   $APT update
   $APT install -y build-essential git jq qemu-utils busybox-static pkg-config libssl-dev clang make \
     podman skopeo uidmap slirp4netns fuse3 passt btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    curl zstd ffmpeg python3-pil python3-boto3 strace openjdk-17-jdk-headless
+    curl zstd ffmpeg python3-pil python3-boto3 strace openjdk-17-jdk-headless \
+    qemu-system-x86 ovmf genisoimage
   # AGENTS.md "Fresh Bare-Metal Box Quickstart", steps 1, 1b, 1c and 4, made persistent.
   usermod -aG kvm "$U"
   loginctl enable-linger "$U"
@@ -179,6 +183,32 @@ build)
   bash "$HERE/warm-phone.sh" "$G0" "$G1" "$(as_user "cd $SRC && ./scripts/phone/aosp.sh --root-path")" \
     "$(as_user "cd $SRC && ./scripts/phone/emulator.sh --path")" "$(as_user "cd $SRC && ./scripts/phone/app.sh --apk-path")" \
     /etc/fcvm-fleet/phone.env "$(as_user "cd $SRC && ./scripts/phone/browser.sh --apk-path")"
+  # Windows sandboxes (docs/fleet/windows-sandboxes.md): Cloud Hypervisor, the image and the
+  # bridge. The image is installed here, from Microsoft's evaluation media, so every host image
+  # carries a new installation and its 180-day evaluation starts at this build; it is built as
+  # root, the user the agent runs fcvm as, and its files are root's alone (mode 0600).
+  as_user "cd $SRC && make setup-cloud-hypervisor"
+  # A build from a base image inherits its store, an installation included, and build-image.sh
+  # reuses an installation of the same recipe. One more than 30 days old is installed again, so
+  # every published host image has at least 140 days before the agent refuses its sandboxes
+  # (pipeline_guest.py windows_image_publishable checks the same before publishing).
+  for d in /mnt/fcvm-btrfs/windows/image-*; do
+    [ -d "$d" ] || continue
+    at=$(jq -r '.installed_at // empty' "$d/manifest.json" 2>/dev/null || true)
+    if [ -z "$at" ] || [ $(( $(date -u +%s) - $(date -u -d "$at" +%s) )) -gt $(( 30 * 86400 )) ]; then
+      echo "removing the Windows installation $d (installed ${at:-at an unknown time})"
+      rm -rf "$d"
+    fi
+  done
+  WIN_IMAGE=$(bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows)
+  jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
+  as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"
+  as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
+  podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar
+  rm -f /mnt/fcvm-btrfs/windows-bridge.oci.tar
+  printf 'WINDOWS_AGENT_ARGS="--windows-image %s --windows-bridge-image localhost/fcvm-windows-bridge:fleet"\n' "$WIN_IMAGE" \
+    > /etc/fcvm-fleet/windows.env
+  cat /etc/fcvm-fleet/windows.env
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
   sha256sum /mnt/fcvm-btrfs/renderer.oci.tar.zst | tee "$S/renderer.sha256"
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"
@@ -192,6 +222,7 @@ bake)
   systemctl enable fcvm-fleet-prefetch.service
   [ -s /etc/fcvm-fleet/prefetch.list ] || { echo "no /etc/fcvm-fleet/prefetch.list: run the build phase (warm-root.sh)"; exit 1; }
   [ -s /etc/fcvm-fleet/phone.env ] || { echo "no /etc/fcvm-fleet/phone.env: run the build phase (warm-phone.sh)"; exit 1; }
+  [ -s /etc/fcvm-fleet/windows.env ] || { echo "no /etc/fcvm-fleet/windows.env: run the build phase (the Windows image)"; exit 1; }
   # Where the store's parts are fetched at boot (<prefix><part>.tar.zst); they are uploaded
   # there after bake (fleet/ami/README.md).
   if [ -n "${STORE_S3_PREFIX:-}" ]; then
@@ -210,7 +241,8 @@ bake)
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
       --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
-      --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads'
+      --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads' \
+      --exclude=./windows/src
   ls -la /var/lib/fcvm-fleet/store
   # Each part goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
   # S3 restore fails falls back to the AMI's copy, which took 1006 s against 78 s (2026-10-24).

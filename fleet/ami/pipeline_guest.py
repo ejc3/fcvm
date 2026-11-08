@@ -6,6 +6,7 @@ commands and secret-bearing exception text are never returned to CodeBuild.
 """
 import base64
 import contextlib
+import datetime
 import hashlib
 import hmac
 import io
@@ -423,6 +424,64 @@ def host_proof(new, old):
                 process.wait(timeout=60)
 
 
+# A published host image's Windows installation is at most this old. build.sh installs again
+# once an inherited one passes it, and the agent warns at 150 days and refuses at 170 (or 7 days
+# before the evaluation expires), so a host image published today has 120 days of sandboxes.
+WINDOWS_PUBLISH_MAX_AGE_DAYS = 30
+WINDOWS_REFUSE_AGE_DAYS = 170
+WINDOWS_REFUSE_BEFORE_EXPIRY_DAYS = 7
+
+
+def windows_image_publishable(manifest, now):
+    """Refuse an installation too old to publish: older than WINDOWS_PUBLISH_MAX_AGE_DAYS, or one
+    whose sandboxes the agent would refuse within the rest of that window."""
+    def when(key):
+        text = manifest.get(key)
+        need(isinstance(text, str) and text, f"the Windows image's manifest has no {key}")
+        try:
+            t = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise RuntimeError(f"the Windows image's {key} is not a date: {text!r}") from None
+        need(t.tzinfo is not None, f"the Windows image's {key} has no time zone: {text!r}")
+        return t
+    installed, expires = when("installed_at"), when("eval_expires")
+    day = datetime.timedelta(days=1)
+    need(now - installed <= WINDOWS_PUBLISH_MAX_AGE_DAYS * day,
+         f"the Windows image was installed {installed:%Y-%m-%d}, more than {WINDOWS_PUBLISH_MAX_AGE_DAYS} days ago")
+    refused_at = min(installed + WINDOWS_REFUSE_AGE_DAYS * day, expires - WINDOWS_REFUSE_BEFORE_EXPIRY_DAYS * day)
+    runway = (WINDOWS_REFUSE_AGE_DAYS - WINDOWS_PUBLISH_MAX_AGE_DAYS) * day
+    need(refused_at - now >= runway,
+         f"the agent would refuse this Windows image from {refused_at:%Y-%m-%d} (evaluation expires {expires:%Y-%m-%d})")
+
+
+def windows_proof():
+    """A Windows sandbox from the image this build installed boots to a healthy desktop: Remote
+    Desktop answers and the guest agent acknowledged its clock (docs/fleet/windows-sandboxes.md)."""
+    found = re.search(r"--windows-image (/\S+)", Path("/etc/fcvm-fleet/windows.env").read_text())
+    need(found is not None, "windows.env names no Windows image")
+    image = Path(found.group(1))
+    windows_image_publishable(json.loads((image / "manifest.json").read_text()),
+                              datetime.datetime.now(datetime.timezone.utc))
+    argv = ["fcvm", "vm", "run", "--name", "factory-windows-proof", "--firmware", str(image / "CLOUDHV.fd"),
+        "--disk", str(image / "disk.raw"), "--guest", "windows"]
+
+    def healthy():
+        out = subprocess.run(["fcvm", "ls", "--json"], capture_output=True, timeout=30, check=True).stdout
+        return any(vm.get("name") == "factory-windows-proof" and vm.get("health_status") == "healthy"
+                   for vm in json.loads(out))
+    with tempfile.TemporaryFile() as log:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        try:
+            wait(healthy, seconds=600)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("Windows validator did not stop") from None
+
+
 def verify(kind, expected_image, build_arn, test_arn, region):
     need(kind in {"host", "tile"}, "invalid validator kind")
     sanitized()
@@ -435,11 +494,13 @@ def verify(kind, expected_image, build_arn, test_arn, region):
     if kind == "host":
         store_parts()
         host_proof(new, old)
+        windows_proof()
     else:
         wait(lambda: (request(8080, "/health")[1] or {}).get("ready") is True)
         tls_proof(443, new)
         scene_proof(8080, new, old)
     return {**boot(), "guard": True, "frames": True, "phone_clone": kind == "host",
+            "windows_sandbox": kind == "host",
             "tls_rotation": True, "sanitized": True,
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 

@@ -227,7 +227,8 @@ class Worker:
                     value = {"image_id": "sha256:" + "5" * 64 if self.bad_renderer else IMAGE}
                 elif action == "verify":
                     value = {"boot_id": identity, "guard": True, "frames": True, "tls_rotation": True,
-                        "sanitized": True, "phone_clone": slot.startswith("host-")}
+                        "sanitized": True, "phone_clone": slot.startswith("host-"),
+                        "windows_sandbox": slot.startswith("host-")}
                     value.update(self.tls)
                     if self.bad_proof:
                         value[self.bad_proof] = False
@@ -806,7 +807,7 @@ print("warm-log-permissions-pass")
                 self.assertEqual(output.getvalue(), "")
 
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
-        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone"):
+        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox"):
             with self.subTest(proof=proof):
                 self.setUp()
                 self.worker.bad_proof = proof
@@ -1014,6 +1015,23 @@ print("warm-log-permissions-pass")
 
 
 class GuestTests(unittest.TestCase):
+    def test_a_windows_image_too_old_to_publish_is_refused_before_it_boots(self):
+        # The agent refuses sandboxes at 170 days from installation (or 7 days before the
+        # evaluation expires) and warns at 150; build.sh installs again once an inherited image
+        # is 30 days old. A host image may publish only an image at most 30 days old.
+        import datetime as dt
+        now = dt.datetime(2026, 11, 8, tzinfo=dt.timezone.utc)
+        def manifest(age_days, runway_days=180):
+            installed = now - dt.timedelta(days=age_days)
+            return {"installed_at": installed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "eval_expires": (installed + dt.timedelta(days=runway_days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")}
+        guest.windows_image_publishable(manifest(0), now)
+        guest.windows_image_publishable(manifest(30), now)
+        for bad, why in ((manifest(31), "31 days old"), (manifest(171), "171 days old"),
+                         (manifest(2, runway_days=100), "expires too soon"), ({}, "no dates")):
+            with self.assertRaises(RuntimeError, msg=why):
+                guest.windows_image_publishable(bad, now)
+
     def test_actual_renderer_prestart_refreshes_stale_cdi_on_every_boot(self):
         unit = (HERE / 'tile/fcvm-fleet-renderer.service').read_text()
         commands = [line.split('=', 1)[1].lstrip('-') for line in unit.splitlines()
