@@ -259,6 +259,7 @@ def job_if(block):
 
 def evaluate(expression, context):
     expression = expression.replace('skip-check', 'skip_check').replace('&&', ' and ').replace('||', ' or ')
+    expression = re.sub(r'!(?!=)', ' not ', expression).strip()
     tree = ast.parse(expression, mode='eval')
 
     def visit(node):
@@ -282,8 +283,12 @@ def evaluate(expression, context):
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
             left, right = visit(node.left), visit(node.comparators[0])
             return left == right if isinstance(node.ops[0], ast.Eq) else left != right
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not visit(node.operand)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'always':
             return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'cancelled':
+            return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'format':
             args = [visit(a) for a in node.args]
             return args[0].format(*args[1:])
@@ -348,6 +353,29 @@ class Workflow(unittest.TestCase):
         self.assertEqual(text.count('statuses: write'), 1)
         self.assertIn('statuses: write', jobs(text)['stack-coverage'])
         self.assertIn("needs.summary.result == 'success'", jobs(text)['stack-coverage'])
+
+    def test_the_coverage_job_runs_when_summary_waited_for_a_skipped_job(self):
+        # GitHub adds success() to an `if:` that names no status function, and success() is false
+        # when a job anywhere before this one in the needs graph was skipped. Summary waits for
+        # jobs most PRs skip (the bench and fleet tests), so a coverage job gated on the event and
+        # Summary's result alone is skipped on every stack whose top passed, and no lower PR is
+        # ever marked as tested.
+        blocks = jobs(CI.read_text())
+        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
+        can_skip = [name for name in waited_for if job_if(blocks[name]) is not None]
+        self.assertTrue(can_skip, 'summary waits for no job that can be skipped')
+        gate = job_if(blocks['stack-coverage'])
+        self.assertTrue(gate.startswith('!cancelled() && '),
+                        f'stack-coverage is skipped whenever one of {can_skip} is: {gate}')
+        passed = {
+            'needs': {'changes': {'outputs': {'run': 'true'}, 'result': 'success'}, 'summary': {'result': 'success'}},
+            'github': {'event_name': 'pull_request', 'repository': REPO,
+                       'event': {'pull_request': {'base': {'ref': 'feature-a'}, 'head': {'repo': {'full_name': REPO}}},
+                                 'repository': {'default_branch': 'main'}}},
+        }
+        self.assertTrue(evaluate(gate, passed), f'stack-coverage does not run for the top of a stack that passed: {gate}')
+        failed = {**passed, 'needs': {**passed['needs'], 'summary': {'result': 'failure'}}}
+        self.assertFalse(evaluate(gate, failed), f'stack-coverage runs after a failed Summary: {gate}')
 
 
 if __name__ == '__main__':
