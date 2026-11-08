@@ -352,6 +352,147 @@ async fn a_sigkilled_snapshot_create_leaves_its_staging_directory_to_the_next_la
     result.and(stopped)
 }
 
+/// A snapshot directory `tag` under `<data_dir>/snapshots` that `snapshot export` accepts,
+/// made without a VM: the config a create writes, a Firecracker that only prints a version,
+/// and a memory image, VM state and disk of a few pages.
+fn snapshot_without_a_vm(data_dir: &Path, tag: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = data_dir.join("snapshots").join(tag);
+    std::fs::create_dir_all(dir.join("disk"))?;
+    let firecracker = data_dir.join("firecracker");
+    std::fs::write(
+        &firecracker,
+        "#!/bin/sh\necho 'Firecracker v0.0.0-example'\n",
+    )?;
+    std::fs::set_permissions(&firecracker, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut vm =
+        fcvm::state::VmState::new("vm-export".to_string(), "example-image".to_string(), 1, 1);
+    vm.config.source_vsock_socket_path = Some(PathBuf::from("/run/example-vsock/vsock.sock"));
+    let mut config = fcvm::commands::common::build_snapshot_config(
+        &vm,
+        tag,
+        fcvm::storage::SnapshotType::User,
+        &dir,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )?;
+    config.metadata.firecracker_bin = Some(firecracker);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
+    std::fs::write(dir.join("memory.bin"), vec![1u8; 1 << 20])?;
+    std::fs::write(dir.join("vmstate.bin"), vec![2u8; 4096])?;
+    std::fs::write(dir.join("disk/disk.raw"), vec![3u8; 8192])?;
+    Ok(())
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// `snapshot export --output` writes a temporary beside its output. An export killed before
+/// it renamed the temporary leaves it, with the output's name still unused, and the next
+/// export to a file removes it before it writes its own.
+#[tokio::test]
+async fn a_sigkilled_export_leaves_its_temporary_to_the_next_export() -> Result<()> {
+    let data = tempfile::tempdir()?;
+    let tag = "reclaim-export";
+    snapshot_without_a_vm(data.path(), tag)?;
+    let out = tempfile::tempdir()?;
+    let output = out.path().join("snapshot.archive");
+    let park = tempfile::tempdir()?;
+    let spec = format!("snapshot.export.pre_rename:park:{}", park.path().display());
+    let export = || {
+        let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
+        command
+            .args(["snapshot", "export", tag, "--output"])
+            .arg(&output)
+            .env("FCVM_DATA_DIR", data.path());
+        common::set_test_pdeathsig(&mut command);
+        command
+    };
+
+    let mut killed = export()
+        .env("FCVM_FAILPOINT", &spec)
+        .spawn()
+        .context("spawning the export to kill")?;
+    let killed_pid = killed.id().context("the export has no pid")?;
+    let observed = async {
+        wait_for(
+            "the export did not park at snapshot.export.pre_rename",
+            Duration::from_secs(120),
+            || parked(park.path()),
+        )
+        .await?;
+        let names = names_in(out.path())?;
+        anyhow::ensure!(
+            names.len() == 1 && names[0].ends_with(".tmp"),
+            "the parked export has not written exactly one temporary beside its output: \
+             {names:?}"
+        );
+        Ok(out.path().join(&names[0]))
+    }
+    .await;
+    sigkill(&mut killed, killed_pid).await?;
+    let temporary = observed?;
+    anyhow::ensure!(
+        temporary.exists(),
+        "the killed export's temporary is already gone, so the kill ran its cleanup"
+    );
+
+    let status = export().status().await.context("running the next export")?;
+    anyhow::ensure!(status.success(), "the next export failed: {status}");
+    assert_eq!(
+        names_in(out.path())?,
+        ["snapshot.archive"],
+        "the killed export's temporary survived the next export"
+    );
+    Ok(())
+}
+
+/// Every `fcvm snapshot export` the tests start by hand carries the parent-death signal
+/// (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"), here and in the lifecycle test that parks one
+/// on a pipe: an export that outlived a test nextest killed would keep its snapshot's lock.
+#[test]
+fn every_hand_built_export_command_dies_with_its_test() {
+    const EXPORT_ARGS: &str = r#"["snapshot", "export","#;
+    const ARMED: &str = "common::set_test_pdeathsig(&mut ";
+    for (file, source) in [
+        ("test_reclaim.rs", include_str!("test_reclaim.rs")),
+        (
+            "test_lifecycle_interleave.rs",
+            include_str!("test_lifecycle_interleave.rs"),
+        ),
+    ] {
+        let source = source
+            .split("fn every_hand_built_export_command_dies_with_its_test")
+            .next()
+            .unwrap();
+        let built: Vec<usize> = source
+            .match_indices(EXPORT_ARGS)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            built.len(),
+            1,
+            "{file}: the place that builds the export command moved"
+        );
+        // The command is armed between its arguments and the first spawn after them.
+        let rest = &source[built[0]..];
+        let before_spawn = &rest[..rest.find("spawn()").expect("the export is spawned")];
+        assert!(
+            before_spawn.contains(ARMED),
+            "{file}: the export command is built without set_test_pdeathsig:\n{before_spawn}"
+        );
+    }
+}
+
 /// Build a localhost image whose content, and so whose digest, is this test's own, and
 /// return its image-cache key (the manifest digest, or the image id when there is none).
 async fn unique_localhost_image(name: &str) -> Result<String> {
