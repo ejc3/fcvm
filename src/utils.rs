@@ -2292,6 +2292,37 @@ pub fn image_disk_digest(path: &std::path::Path) -> anyhow::Result<String> {
     })
 }
 
+/// Record `digest` (`sha256:<hex>`) as [`image_disk_digest`] of the image disk at `path`,
+/// for a caller that computed it from the bytes it wrote through `written`, so the first
+/// check of the disk against a snapshot does not read it whole again. `snapshot import`
+/// calls it for a disk it has just published.
+///
+/// The entry is stored under the stamp `version_cache` reads by path, and only when that
+/// is the stamp of `written`: a file that was replaced at `path` since is not given the
+/// digest of other bytes. Returns what the cache now answers for the file, which is
+/// another digest when an entry for this path, stamp and fingerprint was there already.
+pub fn remember_image_disk_digest(
+    path: &std::path::Path,
+    written: &std::fs::File,
+    digest: &str,
+) -> anyhow::Result<String> {
+    let md = written
+        .metadata()
+        .with_context(|| format!("stat image disk {}", path.display()))?;
+    let opened = crate::version_cache::FileStamp::of(&md);
+    let fingerprint = sampled_fingerprint(written, md.len())
+        .with_context(|| format!("reading image disk {}", path.display()))?;
+    let namespace = format!("{IMAGE_DISK_DIGEST_NAMESPACE}:{fingerprint}");
+    crate::version_cache::derived_from_file(path, &namespace, |cached_under| {
+        anyhow::ensure!(
+            opened.is_some() && opened == cached_under,
+            "image disk build changed after it was written: {}",
+            path.display()
+        );
+        Ok(digest.to_string())
+    })
+}
+
 /// `version_cache` namespace of `image_disk_digest`; a change to the digest's format
 /// changes it. The image's `sampled_fingerprint` is appended to it.
 const IMAGE_DISK_DIGEST_NAMESPACE: &str = "image-disk-sha256-v1";
@@ -2468,6 +2499,48 @@ mod image_disk_identity_tests {
                 "{err:#}"
             );
         }
+    }
+
+    /// A digest remembered for a file its caller wrote is what `image_disk_digest` answers
+    /// for it, without the file being hashed: the test remembers a digest that is not the
+    /// file's. A file that was replaced at the path since it was written is not given the
+    /// digest, and is hashed.
+    #[test]
+    fn a_remembered_digest_is_served_for_the_file_it_was_computed_from() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remembered.storage-v2.img");
+        std::fs::write(&path, vec![b'r'; 3 << 20]).unwrap();
+        let written = std::fs::File::open(&path).unwrap();
+        let marker = format!("sha256:{}", "5".repeat(64));
+
+        assert_eq!(
+            remember_image_disk_digest(&path, &written, &marker).unwrap(),
+            marker
+        );
+        assert_eq!(
+            image_disk_digest(&path).unwrap(),
+            marker,
+            "the remembered digest was not served: the file was hashed"
+        );
+
+        // Another build takes the path. The digest of the first is not recorded for it.
+        let replaced = dir.path().join("replaced.storage-v2.img");
+        std::fs::write(&replaced, vec![b'r'; 3 << 20]).unwrap();
+        let written = std::fs::File::open(&replaced).unwrap();
+        let other = vec![b's'; (3 << 20) + 1];
+        let rebuilt = dir.path().join("rebuilt.tmp");
+        std::fs::write(&rebuilt, &other).unwrap();
+        std::fs::rename(&rebuilt, &replaced).unwrap();
+        let error = remember_image_disk_digest(&replaced, &written, &marker).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("image disk build changed after it was written"),
+            "{error:#}"
+        );
+        assert_eq!(
+            image_disk_digest(&replaced).unwrap(),
+            format!("sha256:{}", hex::encode(Sha256::digest(&other)))
+        );
     }
 
     /// The cached digest is looked up by path, mtime and length. A different image of

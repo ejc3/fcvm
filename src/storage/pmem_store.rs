@@ -52,6 +52,13 @@
 //! run hashes it again. Setting the realtime clock back by about 2 s or more can let a
 //! later write repeat a recorded change time; nothing in the store detects that.
 //!
+//! `snapshot import` publishes an entry from the bytes an archive carries, with no image on
+//! this host to read them from (`begin_stream_ingest`). The bytes are written into a temp
+//! under the same lock, hashed with the same digest as they arrive, and published by the
+//! same steps, so the entry is the one a `--pmem` run of those bytes by the same user would
+//! have published. There is no image whose identity could be recorded, so no source symlink
+//! is made, and the first run of such an image on this host hashes it and finds the entry.
+//!
 //! fcvm refuses an image on tmpfs, ramfs and hugetlbfs, where a write through a shared
 //! mapping changes no timestamp, on FUSE, NFS, SMB and 9p, where the kernel serves the size
 //! and times from a cache that a write through another mount or client need not update and
@@ -302,9 +309,7 @@ impl PmemStore {
     /// handed, or this run's real uid. It is part of every name, so two users of one data_dir
     /// never publish under one name an entry only one of them can use.
     fn owner(&self) -> u32 {
-        self.invoker
-            .as_ref()
-            .map_or_else(|| nix::unistd::getuid().as_raw(), |user| user.uid.as_raw())
+        owner_of_run(self.invoker.as_ref())
     }
 
     /// The name of the entry that holds the bytes whose digest is `digest` (`content_digest`).
@@ -356,39 +361,7 @@ impl PmemStore {
     /// under a shared data_dir is refused here, under sudo too: root could read it, but
     /// Firecracker in a VM's holder namespace could not.
     pub fn check_entry(&self, entry: &Path, len: Option<u64>) -> Result<std::fs::Metadata> {
-        let metadata = std::fs::symlink_metadata(entry)
-            .with_context(|| format!("reading pmem store entry {}", entry.display()))?;
-        let mode = metadata.permissions().mode() & 0o7777;
-        ensure!(
-            metadata.is_file() && mode == ENTRY_MODE && len.is_none_or(|len| metadata.len() == len),
-            "pmem store entry {} is not a mode 0400 regular file{}, so fcvm did not publish \
-             it; remove it and run again",
-            entry.display(),
-            len.map(|len| format!(" of {len} bytes"))
-                .unwrap_or_default()
-        );
-        crate::storage::pmem::check_image_metadata(&metadata, entry)?;
-        check_entry_owner(
-            entry,
-            (metadata.uid(), metadata.gid()),
-            &self.dir,
-            RunIds::of_run(self.invoker.as_ref()),
-        )?;
-        let euid = nix::unistd::geteuid().as_raw();
-        if let Err(errno) = nix::unistd::faccessat(
-            nix::fcntl::AT_FDCWD,
-            entry,
-            nix::unistd::AccessFlags::R_OK,
-            AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            return Err(errno).with_context(|| {
-                format!(
-                    "checking that uid {euid} can read pmem store entry {}",
-                    entry.display()
-                )
-            });
-        }
-        Ok(metadata)
+        check_entry_in(&self.dir, self.invoker.as_ref(), entry, len)
     }
 
     /// Return the entry holding the image at `source` (a canonical path) as it is now. An
@@ -650,6 +623,226 @@ impl PmemStore {
             .map_err(|(_, errno)| errno)
             .with_context(|| format!("locking {}", path.display()))
     }
+
+    /// Start an entry of `len` bytes whose bytes arrive as a stream, with no image on this
+    /// host to copy them from (`snapshot import`). The caller gives the pieces to
+    /// [`StreamIngest::write_at`] and ends with [`StreamIngest::finish_as`] and
+    /// [`PmemStore::publish_staged`].
+    ///
+    /// The temp and the lock are `ingest`'s: a temp under `tmp/`, made with `.lock` held
+    /// shared, which is held until the temp is removed. A stream that is dropped removes its
+    /// temp, and one whose process is killed leaves it to `collect_abandoned_temps`.
+    pub(crate) fn begin_stream_ingest(&self, len: u64) -> Result<StreamIngest<'_>> {
+        ensure!(
+            len > 0 && len.is_multiple_of(crate::storage::pmem::PMEM_ALIGNMENT),
+            "a pmem image is a non-empty multiple of 2 MiB, and this one is {len} bytes"
+        );
+        let lock = self.lock_shared()?;
+        let temp = TempFile::create(&self.tmp, &self.dir.join("tmp"))?;
+        Ok(StreamIngest {
+            store: self,
+            temp,
+            _lock: lock,
+            len,
+            digest: StreamDigest::new(len),
+        })
+    }
+
+    /// Publish a staged entry as `ingest` publishes a copy: read-only, handed to the invoker,
+    /// synced, linked into place, and the store directory synced. When another run published
+    /// those bytes first, its inode is kept and the staged copy is removed.
+    pub(crate) fn publish_staged(&self, staged: StagedEntry<'_>) -> Result<PublishedEntry> {
+        let staged_inode = staged
+            .temp
+            .file
+            .metadata()
+            .with_context(|| format!("reading {}", staged.temp.path.display()))?
+            .ino();
+        self.publish(&staged.temp, &staged.name, &staged.entry, staged.len)?;
+        make_name_durable(&sync_parent, &self.pmem, &staged.entry)?;
+        let metadata = self.check_entry(&staged.entry, Some(staged.len))?;
+        let linked = metadata.ino() == staged_inode;
+        if linked {
+            info!(
+                entry = %staged.entry.display(),
+                bytes = staged.len,
+                allocated = metadata.blocks() * 512,
+                "published a pmem store entry from a snapshot archive"
+            );
+        } else {
+            info!(
+                entry = %staged.entry.display(),
+                "using the pmem store's copy of these bytes, which another run published \
+                 while the archive was read"
+            );
+        }
+        Ok(PublishedEntry {
+            path: staged.entry.clone(),
+            linked,
+        })
+    }
+}
+
+/// The uid a run with the sudo invoker `invoker` publishes store entries for: the
+/// invoker's, or the run's real uid.
+fn owner_of_run(invoker: Option<&User>) -> u32 {
+    invoker.map_or_else(|| nix::unistd::getuid().as_raw(), |user| user.uid.as_raw())
+}
+
+/// The uid this process publishes store entries for (`PmemStore::owner`), without a store.
+pub(crate) fn run_owner() -> u32 {
+    owner_of_run(crate::setup::sudo_invoker())
+}
+
+/// An entry whose bytes arrive as a stream (`PmemStore::begin_stream_ingest`).
+pub(crate) struct StreamIngest<'a> {
+    store: &'a PmemStore,
+    temp: TempFile<'a>,
+    /// `.lock`, shared, from before the temp was created until it is removed.
+    _lock: Flock<File>,
+    len: u64,
+    digest: StreamDigest,
+}
+
+impl<'a> StreamIngest<'a> {
+    /// The piece `bytes` of the image at `offset`. Pieces come in file order, and what
+    /// lies between two of them is a hole. All-zero 4 KiB blocks are left unwritten, as the
+    /// byte copy of `ingest` leaves them.
+    pub(crate) fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            offset
+                .checked_add(bytes.len() as u64)
+                .is_some_and(|end| end <= self.len),
+            "{} bytes at offset {offset} end past the image's {} bytes",
+            bytes.len(),
+            self.len
+        );
+        self.digest.piece(offset, bytes)?;
+        write_nonzero_blocks(&self.temp.file, bytes, offset)
+            .with_context(|| format!("writing {}", self.temp.path.display()))
+    }
+
+    /// End the stream. The bytes name an entry (`PmemStore::entry_name`: the owner's uid and
+    /// their digest), and it has to be `expected`, the path the snapshot recorded: Firecracker
+    /// reopens that path and nothing can point it elsewhere. Another name means the archive's
+    /// bytes are not the recorded entry's, or the entry was named for another uid than the
+    /// one this run publishes for, and the stream is dropped with its temp.
+    pub(crate) fn finish_as(self, expected: &Path) -> Result<StagedEntry<'a>> {
+        self.temp
+            .file
+            .set_len(self.len)
+            .with_context(|| format!("setting the length of {}", self.temp.path.display()))?;
+        let name = self.store.entry_name(&self.digest.finish());
+        let entry = self.store.dir.join(&name);
+        ensure!(
+            entry == expected,
+            "the pmem image the archive carries for {} is the store entry {} when uid {} \
+             publishes it: a store entry's name is a digest of the uid it belongs to and of \
+             its bytes, so the bytes are not the ones the snapshot mapped, or the snapshot's \
+             entry belongs to another uid. A snapshot's pmem images import only for the uid \
+             that owns them on the exporting host",
+            expected.display(),
+            entry.display(),
+            self.store.owner()
+        );
+        Ok(StagedEntry {
+            temp: self.temp,
+            _lock: self._lock,
+            name,
+            entry,
+            len: self.len,
+        })
+    }
+}
+
+/// What `PmemStore::publish_staged` left under an entry's name.
+pub(crate) struct PublishedEntry {
+    pub(crate) path: PathBuf,
+    /// Whether the staged copy got the name. `false` when another run had published the
+    /// same bytes first, whose file is the entry.
+    pub(crate) linked: bool,
+}
+
+/// A whole entry in its temp, named and not yet published (`StreamIngest::finish_as`).
+/// Dropping it removes the temp.
+pub(crate) struct StagedEntry<'a> {
+    temp: TempFile<'a>,
+    _lock: Flock<File>,
+    name: String,
+    entry: PathBuf,
+    len: u64,
+}
+
+/// `PmemStore::check_entry` for the entry `entry` of the store directory `store_dir`, in a
+/// run with the sudo invoker `invoker`.
+fn check_entry_in(
+    store_dir: &Path,
+    invoker: Option<&User>,
+    entry: &Path,
+    len: Option<u64>,
+) -> Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(entry)
+        .with_context(|| format!("reading pmem store entry {}", entry.display()))?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    ensure!(
+        metadata.is_file() && mode == ENTRY_MODE && len.is_none_or(|len| metadata.len() == len),
+        "pmem store entry {} is not a mode 0400 regular file{}, so fcvm did not publish \
+         it; remove it and run again",
+        entry.display(),
+        len.map(|len| format!(" of {len} bytes"))
+            .unwrap_or_default()
+    );
+    crate::storage::pmem::check_image_metadata(&metadata, entry)?;
+    check_entry_owner(
+        entry,
+        (metadata.uid(), metadata.gid()),
+        store_dir,
+        RunIds::of_run(invoker),
+    )?;
+    let euid = nix::unistd::geteuid().as_raw();
+    if let Err(errno) = nix::unistd::faccessat(
+        nix::fcntl::AT_FDCWD,
+        entry,
+        nix::unistd::AccessFlags::R_OK,
+        AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        return Err(errno).with_context(|| {
+            format!(
+                "checking that uid {euid} can read pmem store entry {}",
+                entry.display()
+            )
+        });
+    }
+    Ok(metadata)
+}
+
+/// `PmemStore::check_entry` for an entry that is already in the store directory
+/// `store_dir`, without opening the store, which would create its `tmp` where that is
+/// missing: `snapshot import` asks this before it has written anything.
+pub(crate) fn check_existing_entry(
+    store_dir: &Path,
+    entry: &Path,
+    len: u64,
+) -> Result<std::fs::Metadata> {
+    check_entry_in(store_dir, crate::setup::sudo_invoker(), entry, Some(len))
+}
+
+/// The canonical path the store directory under `data_dir` has, or will have once a run
+/// creates it. Creates nothing. A symlink or another file in the store's place is refused,
+/// as `PmemStore::open` refuses it.
+pub(crate) fn store_dir_under(data_dir: &Path) -> Result<PathBuf> {
+    if let Some(dir) = PmemStore::existing_dir(data_dir)? {
+        return Ok(dir);
+    }
+    let data_dir = match data_dir.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => data_dir.to_path_buf(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("resolving data directory {}", data_dir.display()))
+        }
+    };
+    Ok(data_dir.join("pmem"))
 }
 
 /// Remove the temps that ingests killed before they finished left in the store's `tmp`
@@ -1665,6 +1858,112 @@ fn segment_digest(file: &File, start: u64, end: u64, buffer: &mut [u8]) -> Resul
         Ok(())
     })?;
     Ok(hasher.finalize().into())
+}
+
+/// `content_digest` of an image whose bytes arrive in file order, pieces at any offsets with
+/// holes between them, as a snapshot archive carries a file. It gives the digest
+/// `content_digest` gives for a file holding those bytes: a segment's digest covers the
+/// 4 KiB blocks that hold a non-zero byte, whatever was a hole.
+struct StreamDigest {
+    len: u64,
+    /// The digest of the whole: the domain, the length, and the digest of every finished
+    /// segment, in order. A finished segment's digest is fed to it at once, so nothing
+    /// here grows with the length the stream claims.
+    whole: Sha256,
+    /// How many segments are finished.
+    finished: u64,
+    /// The digest of the segment after those, which holds `block_at`.
+    segment: Sha256,
+    /// A block that pieces cover in part, zeros where none has.
+    block: [u8; ZERO_BLOCK],
+    /// The offset of the block the last piece ended in.
+    block_at: u64,
+    /// Whether `block` holds bytes that are not hashed yet.
+    gathered: bool,
+    /// The end of the last piece, which no later piece may start before.
+    at: u64,
+}
+
+impl StreamDigest {
+    fn new(len: u64) -> Self {
+        let mut whole = Sha256::new();
+        whole.update(CONTENT_DOMAIN);
+        whole.update(len.to_le_bytes());
+        Self {
+            len,
+            whole,
+            finished: 0,
+            segment: Sha256::new(),
+            block: [0; ZERO_BLOCK],
+            block_at: 0,
+            gathered: false,
+            at: 0,
+        }
+    }
+
+    /// One whole block at `at`: hashed with its offset unless it is all zero.
+    fn hash_block(segment: &mut Sha256, at: u64, block: &[u8]) {
+        if !is_zero(block) {
+            segment.update(at.to_le_bytes());
+            segment.update(block);
+        }
+    }
+
+    /// Leave the block the last piece ended in for the block at `next`: hash what was
+    /// gathered of the first, and finish every segment that ends at or before `next`.
+    fn move_to(&mut self, next: u64) {
+        if self.gathered {
+            Self::hash_block(&mut self.segment, self.block_at, &self.block);
+            self.block = [0; ZERO_BLOCK];
+            self.gathered = false;
+        }
+        self.block_at = next;
+        let total = self.len.div_ceil(HASH_SEGMENT);
+        while self.finished < (next / HASH_SEGMENT).min(total) {
+            let finished = std::mem::replace(&mut self.segment, Sha256::new());
+            self.whole.update(finished.finalize());
+            self.finished += 1;
+        }
+    }
+
+    fn piece(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        const BLOCK: u64 = ZERO_BLOCK as u64;
+        ensure!(
+            offset >= self.at,
+            "a piece at offset {offset} follows one that ended at {}",
+            self.at
+        );
+        let mut offset = offset;
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
+            let block_at = offset / BLOCK * BLOCK;
+            if block_at != self.block_at {
+                self.move_to(block_at);
+            }
+            let within = (offset - block_at) as usize;
+            if within == 0 && bytes.len() >= ZERO_BLOCK {
+                // A whole block, hashed where it is. Pieces come in order, so nothing of
+                // this block was gathered before.
+                Self::hash_block(&mut self.segment, block_at, &bytes[..ZERO_BLOCK]);
+                offset += BLOCK;
+                bytes = &bytes[ZERO_BLOCK..];
+                continue;
+            }
+            let count = bytes.len().min(ZERO_BLOCK - within);
+            self.block[within..within + count].copy_from_slice(&bytes[..count]);
+            self.gathered = true;
+            offset += count as u64;
+            bytes = &bytes[count..];
+        }
+        self.at = offset;
+        Ok(())
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        // Past the last block: what was gathered is hashed and every segment finished.
+        self.move_to(self.len.div_ceil(HASH_SEGMENT) * HASH_SEGMENT);
+        self.whole.finalize().into()
+    }
 }
 
 /// Whether `bytes` are all zero, 16 at a time where it can.
@@ -3331,5 +3630,311 @@ mod tests {
             "a run that lost both publications did not sync the winner's store directory and \
              tmp into the directories that hold them: {log:?}"
         );
+    }
+
+    /// The pieces of `bytes` that hold a non-zero byte, as an archive carries a file: runs
+    /// on 512-byte boundaries, cut into pieces of at most `piece` bytes.
+    fn data_pieces(bytes: &[u8], piece: usize) -> Vec<(u64, &[u8])> {
+        let mut pieces = Vec::new();
+        let mut run: Option<usize> = None;
+        let blocks = bytes.len().div_ceil(512);
+        for block in 0..=blocks {
+            let start = block * 512;
+            let data = block < blocks && !is_zero(&bytes[start..(start + 512).min(bytes.len())]);
+            match (data, run) {
+                (true, None) => run = Some(start),
+                (false, Some(first)) => {
+                    let end = start.min(bytes.len());
+                    let mut at = first;
+                    while at < end {
+                        let stop = (at + piece).min(end);
+                        pieces.push((at as u64, &bytes[at..stop]));
+                        at = stop;
+                    }
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        pieces
+    }
+
+    fn stream_digest(len: u64, pieces: &[(u64, &[u8])]) -> [u8; 32] {
+        let mut digest = StreamDigest::new(len);
+        for (offset, bytes) in pieces {
+            digest.piece(*offset, bytes).unwrap();
+        }
+        digest.finish()
+    }
+
+    /// The digest of an image's bytes as they arrive in a stream is the digest of the file
+    /// that holds them, whatever the pieces are: whole MiBs with their zeros, data runs on
+    /// 512-byte boundaries in pieces that end inside 4 KiB blocks, and pieces smaller than
+    /// a block. One changed byte changes it.
+    #[test]
+    fn the_stream_digest_is_the_content_digest_of_the_same_bytes() {
+        const LEN: u64 = HASH_SEGMENT + 2 * MIB;
+        let mut bytes = vec![0u8; LEN as usize];
+        let mut put = |at: usize, len: usize| bytes[at..at + len].copy_from_slice(&random(len));
+        // The first block, a run across the segment boundary, a run that starts and ends
+        // inside 4 KiB blocks, two runs with an all-zero block between them, and the last
+        // block of the image.
+        put(0, 4096);
+        put((HASH_SEGMENT - 6 * 4096) as usize, 12 * 4096);
+        put(3 * MIB as usize + 512, 4096 + 1024);
+        put(5 * MIB as usize, 4096);
+        put(5 * MIB as usize + 2 * 4096, 4096);
+        put((LEN - 4096) as usize, 4096);
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(disk.path().join("image"))
+            .unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        let expected = content_digest(&file, LEN).unwrap();
+
+        let whole: Vec<(u64, &[u8])> = bytes
+            .chunks(MIB as usize)
+            .enumerate()
+            .map(|(index, chunk)| (index as u64 * MIB, chunk))
+            .collect();
+        assert_eq!(stream_digest(LEN, &whole), expected, "whole MiBs");
+        for piece in [MIB as usize, 7000, 1000] {
+            let pieces = data_pieces(&bytes, piece);
+            assert!(
+                pieces.len() >= 6,
+                "control: the image streams as several pieces"
+            );
+            assert_eq!(
+                stream_digest(LEN, &pieces),
+                expected,
+                "data runs in pieces of at most {piece} bytes"
+            );
+        }
+        assert_eq!(
+            stream_digest(LEN, &[]),
+            content_digest(&tempfile_of_len(disk.path(), LEN), LEN).unwrap(),
+            "an image of holes"
+        );
+
+        bytes[3 * MIB as usize + 600] ^= 0x01;
+        assert_ne!(
+            stream_digest(LEN, &data_pieces(&bytes, 7000)),
+            expected,
+            "one changed byte"
+        );
+
+        let mut digest = StreamDigest::new(LEN);
+        digest.piece(8192, &[1; 100]).unwrap();
+        assert!(
+            digest.piece(8000, &[1; 100]).is_err(),
+            "a piece before the end of the last one was taken"
+        );
+    }
+
+    /// A file of `len` bytes under `dir` that is one hole.
+    fn tempfile_of_len(dir: &Path, len: u64) -> File {
+        let file = tempfile::tempfile_in(dir).unwrap();
+        file.set_len(len).unwrap();
+        file
+    }
+
+    /// Stream the bytes of the file at `source` into a stream ingest of `store`, as an
+    /// import does: in pieces, zeros included.
+    fn stream_into<'a>(store: &'a PmemStore, source: &Path) -> StreamIngest<'a> {
+        let bytes = std::fs::read(source).unwrap();
+        let mut ingest = store.begin_stream_ingest(bytes.len() as u64).unwrap();
+        for (index, chunk) in bytes.chunks(64 << 10).enumerate() {
+            ingest.write_at((index * (64 << 10)) as u64, chunk).unwrap();
+        }
+        ingest
+    }
+
+    /// A stream ingest leaves what a run of the same bytes by the same user leaves: the
+    /// entry under the same name, read-only, with the same bytes and its holes, the store's
+    /// lock and no temp. It leaves no link from an image to the entry, because there is no
+    /// image, and a later run of the image finds the entry by its bytes.
+    #[test]
+    fn a_stream_ingest_publishes_the_entry_a_run_of_the_same_bytes_publishes() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let source = image_in(disk.path(), 4 * MIB);
+        let exporting = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let ran = PmemStore::open(exporting.path()).unwrap();
+        let published = ran.ingest(&source).unwrap();
+
+        let importing = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let store = PmemStore::open(importing.path()).unwrap();
+        let expected = store.dir().join(published.file_name().unwrap());
+        let staged = stream_into(&store, &published)
+            .finish_as(&expected)
+            .unwrap();
+        assert!(
+            !expected.exists(),
+            "the entry has its name before it is published"
+        );
+        let installed = store.publish_staged(staged).unwrap();
+        assert!(installed.linked, "the staged copy did not get the name");
+        let entry = installed.path;
+        assert_eq!(entry, expected);
+        let metadata = std::fs::metadata(&entry).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, ENTRY_MODE);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert!(
+            std::fs::read(&entry).unwrap() == std::fs::read(&published).unwrap(),
+            "the entry does not hold the streamed bytes"
+        );
+        assert_eq!(
+            seek(&File::open(&entry).unwrap(), MIB, libc::SEEK_DATA).unwrap(),
+            None,
+            "the zeros after the image's first MiB were written"
+        );
+        assert_eq!(
+            names_in(store.dir()),
+            [".lock", entry.file_name().unwrap().to_str().unwrap(), "tmp"]
+        );
+        assert_eq!(contents(&store), (vec![entry.clone()], vec![]));
+
+        // A run of the image on this host maps the entry the import published.
+        let inode = metadata.ino();
+        assert_eq!(store.ingest(&source).unwrap(), entry);
+        assert_eq!(std::fs::metadata(&entry).unwrap().ino(), inode);
+    }
+
+    /// The name of an entry is a digest of its owner's uid and of its bytes. A stream whose
+    /// bytes get another name than the path the snapshot recorded, because the store
+    /// publishes for another uid or because the bytes are others, is refused with a message
+    /// that says so, and leaves no entry and no temp.
+    #[test]
+    fn a_stream_that_is_not_the_recorded_entry_is_refused_and_leaves_no_temp() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let data = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let mut store = PmemStore::open(data.path()).unwrap();
+        let recorded = store.ingest(&source).unwrap();
+        let bytes = std::fs::read(&recorded).unwrap();
+        std::fs::remove_file(&recorded).unwrap();
+        let failure = |store: &PmemStore, bytes: &[u8]| {
+            let mut ingest = store.begin_stream_ingest(bytes.len() as u64).unwrap();
+            ingest.write_at(0, bytes).unwrap();
+            assert_eq!(
+                contents(store).1.len(),
+                1,
+                "control: the stream has its temp"
+            );
+            match ingest.finish_as(&recorded) {
+                Ok(_) => panic!("the stream was staged as {}", recorded.display()),
+                Err(error) => format!("{error:#}"),
+            }
+        };
+
+        let mut other = bytes.clone();
+        other[100] ^= 0x01;
+        let message = failure(&store, &other);
+        assert!(
+            message.contains("the bytes are not the ones the snapshot mapped"),
+            "other bytes: {message}"
+        );
+        assert_eq!(contents(&store), (vec![], vec![]), "other bytes");
+
+        // The same bytes, in a store that publishes for another uid.
+        let here = nix::unistd::geteuid();
+        let another = here.as_raw() + 1;
+        store.invoker = Some(user(another, nix::unistd::getegid().as_raw()));
+        let message = failure(&store, &bytes);
+        assert!(
+            message.contains(&format!("when uid {another} publishes it"))
+                && message.contains("belongs to another uid"),
+            "another uid: {message}"
+        );
+        assert_eq!(contents(&store), (vec![], vec![]), "another uid");
+
+        // Control: the same bytes for the uid that owns the entry are the recorded entry.
+        store.invoker = None;
+        let mut ingest = store.begin_stream_ingest(bytes.len() as u64).unwrap();
+        ingest.write_at(0, &bytes).unwrap();
+        let staged = ingest.finish_as(&recorded).unwrap();
+        assert_eq!(store.publish_staged(staged).unwrap().path, recorded);
+    }
+
+    /// A stream holds the store's lock for as long as its temp exists, so a collection of
+    /// abandoned temps leaves it, and a stream that is dropped removes its temp. A run
+    /// that publishes the same bytes while a stream is staged keeps its entry: the stream's
+    /// publication uses the file that has the name.
+    #[test]
+    fn a_stream_keeps_its_temp_from_a_collector_and_never_replaces_an_entry() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let data = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let store = PmemStore::open(data.path()).unwrap();
+        let recorded = store.ingest(&source).unwrap();
+        let aside = disk.path().join("entry-aside");
+        std::fs::rename(&recorded, &aside).unwrap();
+
+        let ingest = stream_into(&store, &aside);
+        assert_eq!(contents(&store).1.len(), 1);
+        assert_eq!(
+            collect_abandoned_temps(data.path()).unwrap(),
+            0,
+            "the collector removed the temp of a stream that is running"
+        );
+        drop(ingest);
+        assert_eq!(
+            contents(&store),
+            (vec![], vec![]),
+            "a dropped stream left its temp"
+        );
+
+        let staged = stream_into(&store, &aside).finish_as(&recorded).unwrap();
+        // A run of the image publishes while the stream is staged. Its source link is
+        // gone with the entry it named, so the image is hashed and copied again.
+        assert_eq!(store.ingest(&source).unwrap(), recorded);
+        let inode = std::fs::metadata(&recorded).unwrap().ino();
+        let published = store.publish_staged(staged).unwrap();
+        assert_eq!(published.path, recorded);
+        assert!(!published.linked);
+        assert_eq!(
+            std::fs::metadata(&published.path).unwrap().ino(),
+            inode,
+            "the stream replaced an entry a run had published"
+        );
+        assert_eq!(contents(&store), (vec![recorded], vec![]));
+    }
+
+    /// The length of a stream comes from an archive. Nothing is allocated for it before
+    /// the bytes arrive: an ingest of a length no host has memory to describe starts, takes
+    /// a piece, and ends with its temp removed.
+    #[test]
+    fn a_stream_ingest_allocates_nothing_for_the_length_it_is_told() {
+        let root = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let store = PmemStore::open(root.path()).unwrap();
+        // 2^62 bytes: one 32-byte digest per 64 MiB segment of it is 2 TiB.
+        let mut ingest = store.begin_stream_ingest(1 << 62).unwrap();
+        ingest.write_at(MIB, &[7u8; 4096]).unwrap();
+        drop(ingest);
+        assert_eq!(contents(&store), (vec![], vec![]));
+    }
+
+    /// A pmem image is a non-empty multiple of 2 MiB, and a piece lies inside it.
+    #[test]
+    fn a_stream_ingest_refuses_a_length_or_a_piece_that_is_not_an_images() {
+        let data = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let store = PmemStore::open(data.path()).unwrap();
+        for len in [0, MIB, 2 * MIB + 4096] {
+            let error = match store.begin_stream_ingest(len) {
+                Ok(_) => panic!("a stream of {len} bytes was started"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("multiple of 2 MiB"), "{len}: {error}");
+        }
+        let mut ingest = store.begin_stream_ingest(2 * MIB).unwrap();
+        let error = ingest.write_at(2 * MIB - 100, &[1; 200]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("end past the image"),
+            "{error:#}"
+        );
+        drop(ingest);
+        assert_eq!(contents(&store), (vec![], vec![]));
     }
 }

@@ -1388,6 +1388,14 @@ pub enum SnapshotCommands {
     /// Write a snapshot as one archive, to a file or to stdout
     Export(SnapshotExportArgs),
     /// Install the snapshot in an archive that `snapshot export` wrote
+    ///
+    /// Installs the snapshot under the tag it was exported from, and the image disk and the
+    /// pmem images it reads where this host lacks them.
+    ///
+    /// An archive is trusted as a snapshot made on this host is: its config names host paths
+    /// a restored VM is given (mapped directories, the image disk), and an image disk it
+    /// installs becomes this host's cached disk for that image. Import only archives whose
+    /// exporter you would let create snapshots on this host.
     Import(SnapshotImportArgs),
 }
 

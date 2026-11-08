@@ -152,14 +152,14 @@ pub struct ArchiveManifest {
     pub memory: Option<ManifestMemory>,
     pub firecracker: ManifestFirecracker,
     /// The files outside the snapshot directory that the archive carries: `externals[n]` is
-    /// the entry `external/<n>`.
+    /// the entry `external/<n>`. The image disk the snapshot attaches, then the pmem store
+    /// entry of each of its pmem devices.
     pub externals: Vec<ManifestExternal>,
     pub pmem_owner_uid: Option<u32>,
     /// What a restore reads that the archive does not carry, as far as the snapshot's
-    /// `config.json` records a path for it: the image disk, pmem images, mapped directories,
-    /// NFS shares and firmware. A read-only `--disk` file outside the VM's directory and a
-    /// kernel profile's NVIDIA driver image are recorded only in Firecracker's VM state, so
-    /// they are not listed.
+    /// `config.json` records a path for it: mapped directories, NFS shares and firmware. A
+    /// read-only `--disk` file outside the VM's directory and a kernel profile's NVIDIA
+    /// driver image are recorded only in Firecracker's VM state, so they are not listed.
     pub not_shipped: Vec<String>,
 }
 
@@ -183,15 +183,46 @@ pub struct ManifestFirecracker {
     pub sha256: String,
 }
 
+/// What an external file is to the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalRole {
+    /// The image disk the snapshot attaches read-only (`metadata.image_disk_path`).
+    ImageDisk,
+    /// The pmem store entry of one of the snapshot's pmem devices.
+    Pmem,
+}
+
+impl std::fmt::Display for ExternalRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExternalRole::ImageDisk => "image disk",
+            ExternalRole::Pmem => "pmem image",
+        })
+    }
+}
+
 /// One file outside the snapshot directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestExternal {
-    pub role: String,
-    /// Where the file is on the exporting host.
+    pub role: ExternalRole,
+    /// The path the snapshot's `config.json` records for the file, which is where it is on
+    /// the exporting host and where a restore opens it.
     pub path: PathBuf,
     pub len: u64,
-    pub sha256: String,
+    /// The digest the snapshot's `config.json` binds the file's bytes to, in hex. Both come
+    /// from the config, so a manifest is written without reading the file:
+    ///
+    /// - the image disk: the SHA-256 of its bytes, which is the image disk identity the
+    ///   snapshot recorded, or `None` when it recorded none;
+    /// - a pmem image: the digest in its store entry's name, SHA-256 over the uid the entry
+    ///   belongs to and the store's digest of its bytes.
+    ///
+    /// The bytes an archive carries for the file are checked against it while they are
+    /// streamed ([`ContentSha256`], `PmemStore::begin_stream_ingest`), and the trailer's
+    /// digest of the entry says they arrived as they were sent.
+    pub sha256: Option<String>,
 }
 
 /// What `trailer.json` records about one entry, and what the writer returns for it.
@@ -293,6 +324,69 @@ fn plain_record(name: &str, bytes: &[u8]) -> EntryRecord {
         digest.data(bytes);
     }
     digest.record(name.to_string(), len)
+}
+
+/// The SHA-256 of a file's bytes, holes read as zeros, computed from its data runs as an
+/// archive carries them: the pieces [`ArchiveWriter::append_external_with`] shows its
+/// caller and [`ArchiveReader::next_run`] hands over, in order. It is the digest
+/// `sha256sum` prints for the file, which an entry's own digest in the trailer is not (that
+/// one covers the run offsets too), so a caller that has to compare a file with a digest
+/// recorded elsewhere computes this one in the same pass.
+pub struct ContentSha256 {
+    hasher: Sha256,
+    /// The bytes hashed so far, which is the offset the next piece is expected at.
+    at: u64,
+}
+
+impl Default for ContentSha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContentSha256 {
+    pub fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            at: 0,
+        }
+    }
+
+    /// Hash zeros up to `offset`.
+    fn zeros_to(&mut self, offset: u64) {
+        static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
+        while self.at < offset {
+            let count =
+                usize::try_from(offset - self.at).map_or(ZEROS.len(), |n| n.min(ZEROS.len()));
+            self.hasher.update(&ZEROS[..count]);
+            self.at += count as u64;
+        }
+    }
+
+    /// The piece `bytes` of the file at `offset`. Pieces come in file order; what lies
+    /// between two of them is a hole.
+    pub fn piece(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            offset >= self.at,
+            "a piece at offset {offset} follows one that ended at {}",
+            self.at
+        );
+        self.zeros_to(offset);
+        self.hasher.update(bytes);
+        self.at += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// The digest of the file of `len` bytes, in hex.
+    pub fn finish(mut self, len: u64) -> Result<String> {
+        ensure!(
+            len >= self.at,
+            "{} bytes were hashed of a file of {len}",
+            self.at
+        );
+        self.zeros_to(len);
+        Ok(hex::encode(self.hasher.finalize()))
+    }
 }
 
 /// The zero bytes after `len` bytes of entry data, up to the next block.
@@ -629,13 +723,26 @@ impl<W: Write> ArchiveWriter<W> {
                 parse_entry_name(&name)? == EntryName::Snapshot(relative.to_path_buf()),
                 "the snapshot file name {relative:?} is not a plain relative path"
             );
-            writer.append_sparse(name, file)
+            writer.append_sparse(name, file, &mut |_, _| Ok(()))
         })
     }
 
     /// Append the next external file, reading only its data runs. The first call writes
     /// `external/0`, the file `manifest.externals[0]` describes, and so on.
     pub fn append_external(&mut self, file: &File) -> Result<EntryRecord> {
+        self.append_external_with(file, |_, _| Ok(()))
+    }
+
+    /// [`ArchiveWriter::append_external`], showing `piece` every piece of the file's data
+    /// with its offset, in file order, after the piece is written: the pieces a reader's
+    /// [`ArchiveReader::next_run`] hands over. A caller that has to know something about the
+    /// bytes it sent (their SHA-256, with [`ContentSha256`]) learns it from this one read of
+    /// the file. An error from `piece` fails the append and tears the stream.
+    pub fn append_external_with(
+        &mut self,
+        file: &File,
+        mut piece: impl FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<EntryRecord> {
         self.guard(|writer| {
             writer.room_for_a_file()?;
             ensure!(
@@ -644,7 +751,7 @@ impl<W: Write> ArchiveWriter<W> {
                 writer.externals_expected
             );
             let name = format!("{EXTERNAL_PREFIX}{}", writer.externals_written);
-            let record = writer.append_sparse(name, file)?;
+            let record = writer.append_sparse(name, file, &mut piece)?;
             writer.externals_written += 1;
             Ok(record)
         })
@@ -746,8 +853,14 @@ impl<W: Write> ArchiveWriter<W> {
         self.put(&ZERO_BLOCK[..padding(len)])
     }
 
-    /// Write `file` as the sparse entry `name`: its map, then its data runs.
-    fn append_sparse(&mut self, name: String, file: &File) -> Result<EntryRecord> {
+    /// Write `file` as the sparse entry `name`: its map, then its data runs. `piece` is
+    /// shown each piece of data with its offset once the piece is written.
+    fn append_sparse(
+        &mut self,
+        name: String,
+        file: &File,
+        piece: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<EntryRecord> {
         ensure!(
             !self.names.contains(&name),
             "the archive already has an entry named {name}"
@@ -834,6 +947,7 @@ impl<W: Write> ArchiveWriter<W> {
                     .write_all(&self.buf[..count])
                     .context("writing the archive")?;
                 digest.data(&self.buf[..count]);
+                piece(offset, &self.buf[..count])?;
                 offset += count as u64;
             }
         }
@@ -1485,10 +1599,10 @@ mod tests {
             },
             externals: (0..externals)
                 .map(|n| ManifestExternal {
-                    role: "image-disk".into(),
+                    role: ExternalRole::ImageDisk,
                     path: format!("/example/external-{n}").into(),
                     len: 0,
-                    sha256: "22".repeat(32),
+                    sha256: Some("22".repeat(32)),
                 })
                 .collect(),
             pmem_owner_uid: None,
@@ -1903,7 +2017,9 @@ mod tests {
     /// of names, with a trailer that lists it.
     fn archive_with_entry_named(file: &File, name: &str) -> Vec<u8> {
         let mut writer = ArchiveWriter::new(Vec::new(), &manifest(0)).unwrap();
-        writer.append_sparse(name.to_string(), file).unwrap();
+        writer
+            .append_sparse(name.to_string(), file, &mut |_, _| Ok(()))
+            .unwrap();
         writer.finish().unwrap()
     }
 
@@ -2465,7 +2581,7 @@ mod tests {
         let mut writer = ArchiveWriter::new(Vec::new(), &manifest(0)).unwrap();
         for n in 0..files {
             writer
-                .append_sparse(format!("snapshot/file-{n}"), empty)
+                .append_sparse(format!("snapshot/file-{n}"), empty, &mut |_, _| Ok(()))
                 .unwrap();
         }
         writer.finish().unwrap()
@@ -2541,5 +2657,79 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("more than 2 data runs"), "{error}");
+    }
+
+    /// `append_external_with` shows its caller the pieces a reader hands over, and
+    /// [`ContentSha256`] over either side's pieces is the SHA-256 of the file's bytes, holes
+    /// read as zeros: the digest a caller compares with one recorded elsewhere. An error
+    /// from the caller fails the append and the writer.
+    #[test]
+    fn the_pieces_of_an_external_file_give_the_sha256_of_its_bytes() {
+        let dir = test_dir();
+        const LEN: u64 = 5 << 20;
+        // A hole at each end, a run longer than one copy buffer, and a run that neither
+        // starts nor ends on a 512-byte block.
+        let file = sparse_file(
+            dir.path(),
+            "external",
+            LEN,
+            &[
+                (PAGE, pattern(31, CHUNK + 3 * PAGE as usize)),
+                (3 << 20, pattern(32, 700)),
+            ],
+        );
+        let mut whole = vec![0u8; LEN as usize];
+        file.read_exact_at(&mut whole, 0).unwrap();
+        let expected = hex::encode(Sha256::digest(&whole));
+
+        let mut written = ContentSha256::new();
+        let mut shown = Vec::new();
+        let mut writer = ArchiveWriter::new(Vec::new(), &manifest(1)).unwrap();
+        writer
+            .append_external_with(&file, |offset, bytes| {
+                shown.push((offset, bytes.len()));
+                written.piece(offset, bytes)
+            })
+            .unwrap();
+        let stream = writer.finish().unwrap();
+        assert_eq!(
+            written.finish(LEN).unwrap(),
+            expected,
+            "the writer's pieces"
+        );
+        assert!(
+            shown.len() > 2,
+            "control: the file was shown in several pieces: {shown:?}"
+        );
+
+        let mut reader = ArchiveReader::new(stream.as_slice()).unwrap();
+        let entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(entry.name, EntryName::External(0));
+        let mut read = ContentSha256::new();
+        let mut handed = Vec::new();
+        while let Some((offset, bytes)) = reader.next_run().unwrap() {
+            handed.push((offset, bytes.len()));
+            read.piece(offset, bytes).unwrap();
+        }
+        assert_eq!(read.finish(LEN).unwrap(), expected, "the reader's pieces");
+        assert_eq!(
+            handed, shown,
+            "the writer shows the pieces a reader hands over"
+        );
+
+        // Pieces out of order, and more bytes than the file has, are refused.
+        let mut content = ContentSha256::new();
+        content.piece(4096, b"later").unwrap();
+        assert!(content.piece(0, b"earlier").is_err());
+        assert!(content.finish(4000).is_err());
+
+        let mut writer = ArchiveWriter::new(Vec::new(), &manifest(1)).unwrap();
+        let error = writer
+            .append_external_with(&file, |_, _| bail!("the caller refused the piece"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the caller refused the piece"), "{error}");
+        let error = writer.finish().map(|_| ()).unwrap_err().to_string();
+        assert!(error.contains("an earlier write"), "{error}");
     }
 }
