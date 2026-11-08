@@ -5,6 +5,7 @@ pub mod inode_flags;
 pub mod pmem;
 pub mod pmem_store;
 pub mod snapshot;
+pub mod snapshot_archive;
 pub mod volume;
 
 pub use disk::{DiskConfig, DiskManager};
