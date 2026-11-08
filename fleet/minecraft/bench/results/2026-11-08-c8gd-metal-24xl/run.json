@@ -1,0 +1,17 @@
+{
+ "instance_type": "c8gd.metal-24xl",
+ "cpus": 96,
+ "mem_gib": 188,
+ "kernel": "7.0.0-1013-aws",
+ "started_utc": "2026-11-08T07:20:50Z",
+ "fcvm_tree": "ejc3/fcvm minecraft/pumpkin stack (#1757), Firecracker from fcvm setup's default profile",
+ "versions": {
+  "pumpkin": "Pumpkin 3ea7d281 (Pumpkin-MC/Pumpkin, Java Edition 26.3, protocol 777), built by make minecraft-image",
+  "vanilla": "Mojang's server 26.3 (server.jar SHA-1 33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c)",
+  "paper": "Paper 26.3 build 244 (SHA-256 9601f9a26a2a52a0f2c807cf1abf691f96ee4fb287878313b601cebc2c51eabf)",
+  "java": "Eclipse Temurin 25 JRE (docker.io/library/eclipse-temurin:25-jre)",
+  "bots": "azalea, ejc3/azalea 070ad4a4 (26.3 branch plus the swing packet fix)"
+ },
+ "booted_utc": "2026-11-08T05:56:03Z",
+ "still_up_at_utc": "2026-11-08T10:14:27Z"
+}

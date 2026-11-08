@@ -617,6 +617,22 @@ potato-image: cargo-target-link
 	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile "$$ctx/" && \
 	podman build --squash-all -t $(POTATO_IMAGE) -f "$$ctx/Containerfile" "$$ctx"
 
+# The Minecraft mode's tile (fleet/minecraft, docs/fleet/minecraft.md): Pumpkin built unmodified
+# from PUMPKIN_COMMIT, and mctile. Its own Cargo workspace on its own pinned toolchains (azalea,
+# the bot client, needs nightly); the build runs in the image and runs mctile's tests first.
+MINECRAFT_IMAGE ?= localhost/fcvm-minecraft:dev
+PUMPKIN_COMMIT ?= 3ea7d281654a03fdc4f4fee43734c098acd1fb52
+# The one Java Edition version that commit speaks (its pumpkin-data CURRENT_MC_VERSION).
+MINECRAFT_JAVA_VERSION ?= 26.3
+.PHONY: minecraft-image test-minecraft
+minecraft-image:
+	podman build --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
+	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
+
+# mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's).
+test-minecraft:
+	cd fleet/minecraft && CARGO_TARGET_DIR=$(or $(MINECRAFT_TARGET),target) cargo test --locked --release
+
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."

@@ -1,0 +1,17 @@
+# The density bench's comparison arms (docs/fleet/minecraft.md, "Density"): Mojang's vanilla
+# server or Paper, in the same VM shape as a Pumpkin tile. Built only on the bench box
+# (mcbench.py java-image), which downloads the server jar there. Never pushed, never in the host
+# image, never on a staging tile: the jar is Mojang's (Paper's includes it) and is not
+# redistributed. The bench accepts Mojang's EULA on that box by the owner's decision (2026-11-08).
+FROM docker.io/library/eclipse-temurin:25-jre
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG SERVER_URL
+ARG SERVER_SHA256
+ARG SERVER_SHA1
+RUN test -n "$SERVER_URL" && mkdir -p /srv/mc && curl -fsSL "$SERVER_URL" -o /srv/server.jar \
+    && { [ -z "$SERVER_SHA256" ] || echo "$SERVER_SHA256  /srv/server.jar" | sha256sum -c -; } \
+    && { [ -z "$SERVER_SHA1" ] || echo "$SERVER_SHA1  /srv/server.jar" | sha1sum -c -; }
+COPY entry.sh /usr/local/bin/entry.sh
+ENV MC_PORT=25565 MC_SEED=fcvm1 MC_VIEW_DISTANCE=6 MC_HEAP=1536M
+EXPOSE 25565
+ENTRYPOINT ["/usr/local/bin/entry.sh"]
