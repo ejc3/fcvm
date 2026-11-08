@@ -33,7 +33,7 @@ exec > >(tee -a "$L/$PHASE.log") 2>&1
 # to SIGKILL after TimeoutStopSec, and a name is never another process's. Every way out of
 # a phase stops them, so a failed phase leaves nothing writing to the checkout or the store
 # while it is retried.
-BG_UNITS="fleet-ami-windows-image fleet-ami-windows-bridge"
+BG_UNITS="fleet-ami-windows-image"
 bg_stop() { systemctl stop $BG_UNITS 2>/dev/null || true; systemctl reset-failed $BG_UNITS 2>/dev/null || true; }
 # bg_start UNIT LOG [systemd-run options] -- COMMAND...: run COMMAND as UNIT, its output in LOG.
 # The unit stays loaded once its command ends (RemainAfterExit), so bg_wait reads its result.
@@ -41,9 +41,12 @@ bg_start() {
   local unit=$1 log=$2; shift 2
   local opts=()
   while [ "$1" != -- ]; do opts+=("$1"); shift; done; shift
+  # A builder from a base image keeps the previous build's log, whose lines the result is read
+  # from: empty it first. Both streams append, so neither overwrites the other's lines.
+  : > "$log"
   systemd-run --quiet --unit="$unit" --property=RemainAfterExit=yes --property=TimeoutStopSec=30 \
-    --property=KillMode=control-group --property=StandardOutput="file:$log" \
-    --property=StandardError="file:$log" "${opts[@]}" "$@"
+    --property=KillMode=control-group --property=StandardOutput="append:$log" \
+    --property=StandardError="append:$log" "${opts[@]}" "$@"
 }
 # bg_wait UNIT LOG: until UNIT's command has ended; fails, with LOG's tail, unless it exited 0.
 bg_wait() {
@@ -166,11 +169,12 @@ build)
   # build's checkout, whose untracked files can block the checkout or be built: force the
   # checkout over them and remove untracked files (ignored ones, the cargo target, stay).
   as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
-  # The Windows sandboxes' image and bridge depend on nothing else this phase builds, and
-  # together take about half an hour (the evaluation media's download and an 18-minute
-  # install, FreeRDP built from source): they run beside the rest of the phase, which waits
-  # for them where it installs them. fe5ccbfc's build, with them in line, sealed the host
-  # image 3 h 15 min into the factory's fixed 4 h.
+  # The Windows sandboxes' image depends on nothing else this phase builds and takes about
+  # 20 minutes (the evaluation media's download and an 18-minute install in QEMU): it runs
+  # beside the rest of the phase, which waits for it where it installs it. fe5ccbfc's build,
+  # with it in line, sealed the host image 3 h 15 min into the factory's fixed 4 h. The
+  # bridge stays in line: rootless podman's build runs outside a unit's cgroup, so stopping
+  # the unit would not stop it.
   # A build from a base image inherits its store, an installation included, and build-image.sh
   # reuses an installation of the same recipe. One more than 30 days old is installed again, so
   # every published host image has at least 140 days before the agent refuses its sandboxes
@@ -185,11 +189,6 @@ build)
   done
   # build-image.sh prints the image directory last on stdout, after its log lines on stderr.
   bg_start fleet-ami-windows-image "$L/windows-image.log" -- bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows
-  uid=$(id -u "$U")
-  bg_start fleet-ami-windows-bridge "$L/windows-bridge.log" --uid="$U" --gid="$U" --working-directory="$SRC" \
-    --setenv=HOME="$UH" --setenv=PATH="$UH/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    --setenv=XDG_RUNTIME_DIR="/run/user/$uid" --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" -- \
-    make -C fleet/windows bridge-image TAG=fleet
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
@@ -246,11 +245,11 @@ build)
   # carries a new installation and its 180-day evaluation starts at this build; it is built as
   # root, the user the agent runs fcvm as, and its files are root's alone (mode 0600).
   as_user "cd $SRC && make setup-cloud-hypervisor"
-  # The Windows image and the bridge started after the checkout; both must have finished.
+  # The Windows image started after the checkout.
   bg_wait fleet-ami-windows-image "$L/windows-image.log"
   WIN_IMAGE=$(grep -E '^/mnt/fcvm-btrfs/windows/image-[0-9a-f]+$' "$L/windows-image.log" | tail -n 1)
   [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory"; exit 1; }
-  bg_wait fleet-ami-windows-bridge "$L/windows-bridge.log"
+  as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
   as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar
