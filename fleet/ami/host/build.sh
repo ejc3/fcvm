@@ -229,7 +229,8 @@ bake)
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
       --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
-      --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads'
+      --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads' \
+      --exclude=./windows/src
   ls -la /var/lib/fcvm-fleet/store
   # Each part goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
   # S3 restore fails falls back to the AMI's copy, which took 1006 s against 78 s (2026-10-24).
