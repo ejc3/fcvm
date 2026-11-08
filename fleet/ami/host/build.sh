@@ -28,18 +28,36 @@ install -d -m 0700 "$S"
 install -d -o root -g "$U" -m 0710 "$L"
 [ -f "$S/env" ] && . "$S/env"
 exec > >(tee -a "$L/$PHASE.log") 2>&1
-# A process and everything below it (a background job of the build phase: sudo, bash, make,
-# podman, QEMU), children first.
-kill_tree() {
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
-  kill -TERM "$1" 2>/dev/null || true
+# The build phase's background jobs run as transient systemd units of fixed names (bg_start):
+# stopping one stops its whole cgroup (sudo, make, podman, QEMU), waits for it, and escalates
+# to SIGKILL after TimeoutStopSec, and a name is never another process's. Every way out of
+# a phase stops them, so a failed phase leaves nothing writing to the checkout or the store
+# while it is retried.
+BG_UNITS="fleet-ami-windows-image fleet-ami-windows-bridge"
+bg_stop() { systemctl stop $BG_UNITS 2>/dev/null || true; systemctl reset-failed $BG_UNITS 2>/dev/null || true; }
+# bg_start UNIT LOG [systemd-run options] -- COMMAND...: run COMMAND as UNIT, its output in LOG.
+# The unit stays loaded once its command ends (RemainAfterExit), so bg_wait reads its result.
+bg_start() {
+  local unit=$1 log=$2; shift 2
+  local opts=()
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done; shift
+  systemd-run --quiet --unit="$unit" --property=RemainAfterExit=yes --property=TimeoutStopSec=30 \
+    --property=KillMode=control-group --property=StandardOutput="file:$log" \
+    --property=StandardError="file:$log" "${opts[@]}" "$@"
 }
-# The build phase's background jobs (BG_PIDS) are stopped and reaped on every way out, so a
-# failed phase leaves nothing writing to the checkout or the store while it is retried.
+# bg_wait UNIT LOG: until UNIT's command has ended; fails, with LOG's tail, unless it exited 0.
+bg_wait() {
+  while [ "$(systemctl show -p SubState --value "$1")" = running ]; do sleep 5; done
+  if [ "$(systemctl show -p Result --value "$1")" != success ] ||
+     [ "$(systemctl show -p ExecMainStatus --value "$1")" != 0 ]; then
+    tail -n 40 "$2"; echo "$1 failed"; return 1
+  fi
+}
 # EXIT, not ERR: an ERR trap does not fire for a failure inside a function under set -e.
 # shellcheck disable=SC2154 # rc is assigned inside the trap string
-trap 'rc=$?; for p in ${BG_PIDS:-}; do kill_tree "$p"; wait "$p" 2>/dev/null || true; done; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
+trap 'rc=$?; bg_stop; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
+# A phase retried after one that could not run its trap (a killed shell) stops what it left.
+bg_stop
 rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive
@@ -165,11 +183,13 @@ build)
       rm -rf "$d"
     fi
   done
-  bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows > "$S/windows-image.path" 2> "$L/windows-image.log" &
-  WIN_PID=$!
-  as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet" > "$L/windows-bridge.log" 2>&1 &
-  BRIDGE_PID=$!
-  BG_PIDS="$WIN_PID $BRIDGE_PID"
+  # build-image.sh prints the image directory last on stdout, after its log lines on stderr.
+  bg_start fleet-ami-windows-image "$L/windows-image.log" -- bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows
+  uid=$(id -u "$U")
+  bg_start fleet-ami-windows-bridge "$L/windows-bridge.log" --uid="$U" --gid="$U" --working-directory="$SRC" \
+    --setenv=HOME="$UH" --setenv=PATH="$UH/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --setenv=XDG_RUNTIME_DIR="/run/user/$uid" --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" -- \
+    make -C fleet/windows bridge-image TAG=fleet
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
@@ -227,10 +247,10 @@ build)
   # root, the user the agent runs fcvm as, and its files are root's alone (mode 0600).
   as_user "cd $SRC && make setup-cloud-hypervisor"
   # The Windows image and the bridge started after the checkout; both must have finished.
-  wait "$WIN_PID" || { tail -n 40 "$L/windows-image.log"; echo "the Windows image build failed"; exit 1; }
-  WIN_IMAGE=$(cat "$S/windows-image.path")
-  [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory: $WIN_IMAGE"; exit 1; }
-  wait "$BRIDGE_PID" || { tail -n 40 "$L/windows-bridge.log"; echo "the bridge image build failed"; exit 1; }
+  bg_wait fleet-ami-windows-image "$L/windows-image.log"
+  WIN_IMAGE=$(grep -E '^/mnt/fcvm-btrfs/windows/image-[0-9a-f]+$' "$L/windows-image.log" | tail -n 1)
+  [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory"; exit 1; }
+  bg_wait fleet-ami-windows-bridge "$L/windows-bridge.log"
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
   as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar

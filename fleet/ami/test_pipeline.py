@@ -502,47 +502,35 @@ class PipelineTests(unittest.TestCase):
         source = (HERE / "host/build.sh").read_text()
         build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
         checkout = build.index("git checkout -q -f --detach $FCVM_COMMIT")
-        image = build.index('build-image.sh" /mnt/fcvm-btrfs/windows')
-        bridge = build.index("make -C fleet/windows bridge-image TAG=fleet")
+        image = build.index("bg_start fleet-ami-windows-image")
+        bridge = build.index("bg_start fleet-ami-windows-bridge")
         first_build = build.index('as_user "cd $SRC && make build"')
         self.assertLess(checkout, image)
         self.assertLess(image, first_build, "the Windows image starts before fcvm's own build")
         self.assertLess(bridge, first_build, "the bridge image starts before fcvm's own build")
-        for start in (image, bridge):
-            line = build[start:build.index("\n", start)]
-            self.assertTrue(line.rstrip().endswith("&"), line)
+        self.assertIn('build-image.sh" /mnt/fcvm-btrfs/windows', build[image:build.index("\n", image)])
+        self.assertIn("make -C fleet/windows bridge-image TAG=fleet", build[bridge:first_build])
         env = build.index("/etc/fcvm-fleet/windows.env")
-        for job in ('wait "$WIN_PID"', 'wait "$BRIDGE_PID"'):
-            self.assertIn(job, build)
-            self.assertLess(build.index(job), env)
+        for unit in ("fleet-ami-windows-image", "fleet-ami-windows-bridge"):
+            self.assertLess(build.index("bg_wait " + unit), env)
         self.assertLess(build.index("rm -rf \"$d\""), image, "an aging installation is removed before the build reuses it")
-        # A phase that fails before its waits stops and reaps both jobs (a retry would otherwise
-        # share the checkout and the store with them).
-        self.assertIn('BG_PIDS="$WIN_PID $BRIDGE_PID"', build)
-        self.assertLess(build.index('BG_PIDS="$WIN_PID $BRIDGE_PID"'), first_build)
-        trap = [line for line in source.splitlines() if line.startswith("trap ") and line.endswith(" EXIT")]
-        self.assertEqual(len(trap), 1)
-        self.assertIn('for p in ${BG_PIDS:-}; do kill_tree "$p"; wait "$p"', trap[0])
 
-    def test_kill_tree_stops_a_background_job_and_everything_below_it(self):
+    def test_background_jobs_are_named_units_stopped_on_every_way_out(self):
+        # A failed phase must not leave a job writing to the checkout or the store while it is
+        # retried (Codex on #1778): the jobs are transient systemd units of fixed names, the
+        # EXIT trap stops them (their whole cgroup, escalating to SIGKILL), and a phase starts
+        # by stopping any a phase that could not run its trap left behind.
         source = (HERE / "host/build.sh").read_text()
-        helper = re.search(r"\nkill_tree\(\) \{\n.*?\n\}\n", source, re.S).group(0)
-        script = helper + (
-            "tree() { echo $1; for c in $(pgrep -P $1); do tree $c; done; }\n"
-            # four deep: the job, a sleep, and a shell (kept by its second command) with a sleep
-            "bash -c 'sleep 307 & bash -c \"sleep 309; :\" & wait' >/dev/null 2>&1 &\n"
-            "job=$!\n"
-            "sleep 0.5\n"
-            "all=$(tree $job)\n"
-            "trap 'kill -9 $all 2>/dev/null' EXIT\n"
-            "[ $(echo $all | wc -w) -ge 4 ] || { echo \"tree too small: $all\"; exit 1; }\n"
-            "kill_tree $job\n"
-            "wait $job 2>/dev/null || true\n"
-            "sleep 0.3\n"
-            "for p in $all; do kill -0 $p 2>/dev/null && { echo \"alive $p\"; exit 1; }; done\n"
-            "echo ok\n")
-        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
-        self.assertEqual((out.returncode, out.stdout.strip()), (0, "ok"), out.stderr)
+        preamble = source.split('\ncase "$PHASE" in\n', 1)[0]
+        self.assertIn('BG_UNITS="fleet-ami-windows-image fleet-ami-windows-bridge"', preamble)
+        trap = [line for line in preamble.splitlines() if line.startswith("trap ") and line.endswith(" EXIT")]
+        self.assertEqual(len(trap), 1)
+        self.assertIn("bg_stop;", trap[0])
+        self.assertIn("\nbg_stop\n", preamble[preamble.index(trap[0]):])
+        start = re.search(r"\nbg_start\(\) \{\n(.*?)\n\}\n", preamble, re.S).group(1)
+        for prop in ("RemainAfterExit=yes", "TimeoutStopSec=30", "KillMode=control-group"):
+            self.assertIn(prop, start)
+        self.assertNotIn(" & ", re.sub(r"#.*", "", source), "no shell background jobs: only named units")
 
     def test_host_prep_runs_on_fcvms_host_kernel_too(self):
         # Revising a host image that already boots fcvm's host kernel runs prep on it, and that
