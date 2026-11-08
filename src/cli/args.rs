@@ -729,10 +729,12 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value = "/dev/shm/fcvm-potato")]
     pub potato_sleep_memory_dir: std::path::PathBuf,
 
-    /// The most sleeping players' memory may take in --potato-sleep-memory-dir, in MiB; a
-    /// sleep that would go over it keeps its memory on the store. 0: twice the players'
-    /// memory (--potato-players times --potato-mem), room for every player's sleep and for
-    /// each one's next while the earlier is still held.
+    /// The most sleeping players' memory may take in --potato-sleep-memory-dir, in MiB,
+    /// counting one --potato-mem for each player whose last sleep is there and one for each
+    /// sleep in flight; a sleep that would go over it keeps its memory on the store. 0: twice
+    /// the players' memory (--potato-players times --potato-mem), room for every player's
+    /// sleep and for each one's next while the earlier is still held. The agent empties the
+    /// directory when it starts, and keeps every sleep on the store if fcvm would refuse it.
     #[arg(long, default_value_t = 0)]
     pub potato_sleep_memory_cap_mib: u64,
 

@@ -90,32 +90,66 @@ pub fn files_are_cheaper_to_reflink(files: &[PathBuf]) -> bool {
 /// snapshot directory. [`remove_linked_memory_file`] removes only targets named this way.
 pub const LINKED_MEMORY_PREFIX: &str = "fcvm-memory-";
 
-/// Create an empty memory file in `memory_dir` (created if missing), named
-/// `fcvm-memory-<uuid>.bin` and readable only by its owner, and make `link` a symbolic link to
-/// it. Firecracker follows the link when it writes the snapshot, and so does a restore. The
-/// file is removed again if the link cannot be made.
-pub fn create_linked_memory_file(memory_dir: &Path, link: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::create_dir_all(memory_dir)
+/// Make `memory_dir` ready for `snapshot create --memory-dir` and return its resolved path:
+/// created with mode 0700 when missing, and refused unless it is a directory owned by this
+/// user that no group or other user can write (anyone who could would be able to swap the
+/// memory file's name for another file between its creation and Firecracker's write), and
+/// unless it is outside `snapshots_root`, whose generations are renamed and removed whole.
+pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(memory_dir)
         .with_context(|| format!("creating {}", memory_dir.display()))?;
     let dir = std::fs::canonicalize(memory_dir)
         .with_context(|| format!("resolving {}", memory_dir.display()))?;
-    let target = dir.join(format!(
+    let meta = std::fs::metadata(&dir).with_context(|| format!("reading {}", dir.display()))?;
+    let euid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(
+        meta.is_dir() && meta.uid() == euid && meta.mode() & 0o022 == 0,
+        "--memory-dir {} must be a directory owned by uid {euid} that group and others cannot \
+         write (it is uid {}, mode {:o})",
+        dir.display(),
+        meta.uid(),
+        meta.mode() & 0o7777
+    );
+    let root =
+        std::fs::canonicalize(snapshots_root).unwrap_or_else(|_| snapshots_root.to_path_buf());
+    anyhow::ensure!(
+        !dir.starts_with(&root),
+        "--memory-dir {} is inside the snapshot directory {}, whose generations are removed whole",
+        dir.display(),
+        root.display()
+    );
+    Ok(dir)
+}
+
+/// The path of a new memory file in a prepared memory directory: `fcvm-memory-<uuid>.bin`.
+pub fn linked_memory_target(memory_dir: &Path) -> PathBuf {
+    memory_dir.join(format!(
         "{LINKED_MEMORY_PREFIX}{}.bin",
         uuid::Uuid::new_v4()
-    ));
+    ))
+}
+
+/// Create the empty memory file `target`, readable only by its owner, and make `link` a
+/// symbolic link to it. Firecracker follows the link when it writes the snapshot, and so does
+/// a restore. The file is removed again if the link cannot be made.
+pub fn create_linked_memory_file(target: &Path, link: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&target)
+        .open(target)
         .with_context(|| format!("creating {}", target.display()))?;
-    if let Err(error) = std::os::unix::fs::symlink(&target, link) {
-        let _ = std::fs::remove_file(&target);
+    if let Err(error) = std::os::unix::fs::symlink(target, link) {
+        let _ = std::fs::remove_file(target);
         return Err(error)
             .with_context(|| format!("linking {} to {}", link.display(), target.display()));
     }
-    Ok(target)
+    Ok(())
 }
 
 /// Refuse a restore of snapshot `name` whose memory file, `memory_path`, is a link to a file
@@ -136,32 +170,49 @@ pub fn ensure_memory_file_present(memory_path: &Path, name: &str) -> Result<()> 
 }
 
 /// Remove the memory file that `dir`'s `memory.bin` links to, when it is one
-/// [`create_linked_memory_file`] made: a regular file named `fcvm-memory-*.bin`, owned by
-/// the owner of `dir`. A link to anything else is left alone, so a snapshot directory
-/// someone else wrote cannot make fcvm remove a file it did not create. Removing the
-/// directory then removes the link.
-pub fn remove_linked_memory_file(dir: &Path) {
+/// `snapshot create --memory-dir` made: a regular file named `fcvm-memory-*.bin`, owned by
+/// the owner of `dir`. A link to anything else is left alone, and so is everything when `dir`
+/// is itself a symbolic link (it names another snapshot's directory, whose memory stays).
+/// A removal that fails is an error, so the caller keeps the directory and its link rather
+/// than lose the only reference to a file that takes the guest's memory size.
+pub fn remove_linked_memory_file(dir: &Path) -> std::io::Result<()> {
+    remove_linked_memory_file_with(dir, &|target| std::fs::remove_file(target))
+}
+
+/// [`remove_linked_memory_file`] with the removal passed in, for the tests.
+fn remove_linked_memory_file_with(
+    dir: &Path,
+    remove: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let Ok(dir_meta) = std::fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    if !dir_meta.is_dir() {
+        return Ok(());
+    }
     let link = dir.join(crate::storage::snapshot::SNAPSHOT_MEMORY_FILE);
     let Ok(target) = std::fs::read_link(&link) else {
-        return;
+        return Ok(());
     };
-    let ours = target.is_absolute()
+    let named = target.is_absolute()
         && target
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(LINKED_MEMORY_PREFIX) && name.ends_with(".bin"))
-        && matches!(
-            (std::fs::symlink_metadata(&target), std::fs::symlink_metadata(dir)),
-            (Ok(file), Ok(owner)) if file.file_type().is_file() && file.uid() == owner.uid()
-        );
-    if !ours {
+            .is_some_and(|name| name.starts_with(LINKED_MEMORY_PREFIX) && name.ends_with(".bin"));
+    let file = match std::fs::symlink_metadata(&target) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !(named && file.file_type().is_file() && file.uid() == dir_meta.uid()) {
         warn!(link = %link.display(), target = %target.display(),
             "memory.bin links to a file fcvm did not make; leaving it");
-        return;
+        return Ok(());
     }
-    if let Err(error) = std::fs::remove_file(&target) {
-        warn!(target = %target.display(), %error, "removing the snapshot's linked memory file");
+    match remove(&target) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -223,7 +274,9 @@ pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
 pub async fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     {
         let dir = dir.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || remove_linked_memory_file(&dir)).await;
+        tokio::task::spawn_blocking(move || remove_linked_memory_file(&dir))
+            .await
+            .map_err(std::io::Error::other)??;
     }
     if is_btrfs_subvolume(dir) {
         let disk = dir.join(crate::storage::snapshot::SNAPSHOT_DISK_SUBDIR);
@@ -1310,7 +1363,9 @@ mod snapshot_dir_tests {
         let snapshot = root.path().join("snap");
         std::fs::create_dir_all(&snapshot).unwrap();
         let link = snapshot.join("memory.bin");
-        let target = create_linked_memory_file(&memory_dir, &link).unwrap();
+        let memory_dir = prepare_memory_dir(&memory_dir, &root.path().join("snapshots")).unwrap();
+        let target = linked_memory_target(&memory_dir);
+        create_linked_memory_file(&target, &link).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
         std::fs::write(&link, b"guest memory").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"guest memory");
@@ -1323,6 +1378,68 @@ mod snapshot_dir_tests {
         assert_eq!(std::fs::read_dir(&memory_dir).unwrap().count(), 0);
     }
 
+    /// A snapshot directory reached through a symbolic link (an alias of another snapshot)
+    /// is removed as the link alone: the snapshot it names keeps its memory file.
+    #[tokio::test]
+    async fn removing_an_alias_of_a_snapshot_keeps_the_snapshots_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let memory_dir =
+            prepare_memory_dir(&root.path().join("shm"), &root.path().join("snapshots")).unwrap();
+        let target = linked_memory_target(&memory_dir);
+        create_linked_memory_file(&target, &live.join("memory.bin")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&live, &alias).unwrap();
+        remove_snapshot_dir(&alias).await.unwrap();
+        assert!(!alias.exists());
+        assert!(target.exists(), "the aliased snapshot lost its memory file");
+    }
+
+    /// A linked memory file that cannot be removed fails the removal, and the link that is the
+    /// only reference to the file stays.
+    #[test]
+    fn a_linked_memory_file_that_cannot_be_removed_keeps_its_link() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("snap");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let memory_dir =
+            prepare_memory_dir(&root.path().join("shm"), &root.path().join("snapshots")).unwrap();
+        let target = linked_memory_target(&memory_dir);
+        let link = snapshot.join("memory.bin");
+        create_linked_memory_file(&target, &link).unwrap();
+        let refused = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        let error = remove_linked_memory_file_with(&snapshot, &refused).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(std::fs::symlink_metadata(&link).is_ok() && target.exists());
+    }
+
+    /// A memory directory others could write, or one inside the snapshot directory, is
+    /// refused; a new one is made closed to group and others.
+    #[test]
+    fn a_memory_directory_must_be_private_and_outside_the_snapshots() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let snapshots = root.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let fresh = prepare_memory_dir(&root.path().join("a/b"), &snapshots).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let error = prepare_memory_dir(&open, &snapshots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("group and others cannot write"), "{error}");
+        let inside = prepare_memory_dir(&snapshots.join("tag/memory"), &snapshots)
+            .unwrap_err()
+            .to_string();
+        assert!(inside.contains("inside the snapshot directory"), "{inside}");
+    }
+
     /// A snapshot whose linked memory file is gone (a tmpfs cleared by a reboot) is refused
     /// with that reason; one whose memory file is present, linked or not, is not.
     #[test]
@@ -1331,7 +1448,10 @@ mod snapshot_dir_tests {
         let snapshot = root.path().join("snap");
         std::fs::create_dir_all(&snapshot).unwrap();
         let link = snapshot.join("memory.bin");
-        let target = create_linked_memory_file(&root.path().join("shm"), &link).unwrap();
+        let memory_dir =
+            prepare_memory_dir(&root.path().join("shm"), &root.path().join("snapshots")).unwrap();
+        let target = linked_memory_target(&memory_dir);
+        create_linked_memory_file(&target, &link).unwrap();
         ensure_memory_file_present(&link, "potato-1").unwrap();
         std::fs::remove_file(&target).unwrap();
         let error = ensure_memory_file_present(&link, "potato-1")

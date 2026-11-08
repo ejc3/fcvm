@@ -385,11 +385,23 @@ pub async fn run(
     let (heard_tx, mut heard) = mpsc::unbounded_channel::<Heard>();
     tokio::spawn(serve_reports(listener, heard_tx));
     let (done_tx, mut done) = mpsc::unbounded_channel::<Done>();
+    // A memory directory fcvm would refuse (another user's, or one others can write), or one
+    // that cannot be emptied, leaves every sleep on the store rather than failing each one.
+    let sleep_memory = SleepMemory::new(&cfg).filter(|memory| {
+        let ready =
+            crate::storage::disk::prepare_memory_dir(&memory.dir, &crate::paths::snapshot_dir())
+                .and_then(|_| memory.clear());
+        if let Err(e) = &ready {
+            tracing::warn!(dir = %memory.dir.display(), error = %format!("{e:#}"),
+                "potato: sleeps keep their memory on the store");
+        }
+        ready.is_ok()
+    });
     let mut d = Driver {
         cfg: cfg.clone(),
         ops: Arc::new(FcvmOps {
             cfg: cfg.clone(),
-            sleep_memory: SleepMemory::new(&cfg),
+            sleep_memory,
             boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
             tasks: Default::default(),
         }),
@@ -474,24 +486,53 @@ pub(crate) trait Ops: Send + Sync {
     fn shutdown(&self);
 }
 
-/// Where sleeping players' memory goes, and its budget: the bytes the directory's memory
-/// files hold plus those sleeps in flight have reserved stay under `cap`.
+/// Where sleeping players' memory goes, and its budget, counted from what the agent did
+/// rather than read from the directory: each player whose last sleep put its memory there
+/// holds one memory's worth until its next sleep replaces it, and each sleep in flight
+/// holds one more until it ends. The directory is the agent's own, emptied when it starts.
 pub(crate) struct SleepMemory {
     dir: PathBuf,
+    /// One player's memory, in bytes.
+    each: u64,
+    /// The most the memory files may take, in bytes.
     cap: u64,
-    reserved: std::sync::Mutex<u64>,
+    state: std::sync::Mutex<SleepMemoryState>,
 }
 
-/// A sleep's share of [`SleepMemory`]'s budget, given back when the sleep ends: its memory
-/// file then counts in the directory itself.
+#[derive(Default)]
+struct SleepMemoryState {
+    /// Players whose last sleep put their memory in the directory.
+    held: std::collections::BTreeSet<u32>,
+    /// Sleeps writing there now.
+    in_flight: u64,
+}
+
+/// One sleep's place in [`SleepMemory`]'s budget, given back when the sleep ends
+/// ([`SleepReservation::finish`], or a drop for a sleep that did not finish).
 struct SleepReservation {
     memory: Arc<SleepMemory>,
-    bytes: u64,
+    player: u32,
+    done: bool,
+}
+
+impl SleepReservation {
+    /// The sleep ended; `published` says whether its snapshot (and so its memory file) took
+    /// the player's place, replacing and removing the one before.
+    fn finish(mut self, published: bool) {
+        let mut state = self.memory.state.lock().unwrap();
+        state.in_flight -= 1;
+        if published {
+            state.held.insert(self.player);
+        }
+        self.done = true;
+    }
 }
 
 impl Drop for SleepReservation {
     fn drop(&mut self) {
-        *self.memory.reserved.lock().unwrap() -= self.bytes;
+        if !self.done {
+            self.memory.state.lock().unwrap().in_flight -= 1;
+        }
     }
 }
 
@@ -500,46 +541,59 @@ impl SleepMemory {
         let dir = cfg.sleep_memory_dir.clone()?;
         Some(Arc::new(Self {
             dir,
+            each: u64::from(cfg.mem_mib) << 20,
             cap: cfg.sleep_memory_cap_mib.saturating_mul(1 << 20),
-            reserved: Default::default(),
+            state: Default::default(),
         }))
     }
 
-    /// Reserve `bytes` for one sleep's memory file, if the files in the directory, the other
-    /// reservations and `bytes` fit under the cap.
-    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<SleepReservation> {
-        let mut reserved = self.reserved.lock().unwrap();
-        let held = memory_files_bytes(&self.dir);
-        if held.saturating_add(*reserved).saturating_add(bytes) > self.cap {
-            tracing::warn!(dir = %self.dir.display(), held_mib = held >> 20, reserved_mib = *reserved >> 20,
+    /// Reserve room for player `n`'s sleep, if every memory held, every sleep in flight and
+    /// this one fit under the cap. None: the sleep keeps its memory on the store, and a
+    /// player whose memory was held stops being counted once that sleep replaces it.
+    fn reserve(self: &Arc<Self>, n: u32) -> Option<SleepReservation> {
+        let mut state = self.state.lock().unwrap();
+        let after = (state.held.len() as u64 + state.in_flight + 1).saturating_mul(self.each);
+        if after > self.cap {
+            tracing::warn!(dir = %self.dir.display(), held = state.held.len(), in_flight = state.in_flight,
                 cap_mib = self.cap >> 20, "potato: the sleep memory directory is at its cap; this sleep keeps its memory on the store");
             return None;
         }
-        *reserved += bytes;
+        state.in_flight += 1;
         Some(SleepReservation {
             memory: self.clone(),
-            bytes,
+            player: n,
+            done: false,
         })
     }
-}
 
-/// The bytes the memory files `snapshot create --memory-dir` wrote in `dir` take (0 when it
-/// does not exist yet).
-fn memory_files_bytes(dir: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
+    /// A sleep of player `n` that kept its memory on the store published: the player's memory
+    /// file in the directory, if it had one, went with the generation it replaced.
+    fn left(&self, n: u32) {
+        self.state.lock().unwrap().held.remove(&n);
+    }
+
+    /// Remove what an earlier agent's sleeps left in the directory (its players are not woken
+    /// again, and a sleep killed before it published leaves a file nothing links to), so the
+    /// count starts from an empty directory. Called before any sleep.
+    fn clear(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", self.dir.display()))?;
+            let name = entry.file_name();
+            if name
                 .to_str()
                 .is_some_and(|n| n.starts_with(crate::storage::disk::LINKED_MEMORY_PREFIX))
-        })
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.blocks() * 512)
-        .sum()
+            {
+                std::fs::remove_file(entry.path())
+                    .with_context(|| format!("removing {}", entry.path().display()))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct FcvmOps {
@@ -646,12 +700,14 @@ impl Ops for FcvmOps {
                 return;
             };
             let create = Instant::now();
-            let reservation = sleep_memory
-                .as_ref()
-                .and_then(|m| m.reserve(u64::from(cfg.mem_mib) << 20));
-            let memory_dir = reservation.as_ref().map(|r| r.memory.dir.as_path());
-            let r = run_fcvm(&cfg.fcvm, &PotatoCfg::sleep_args(n, vm.pid, memory_dir)).await;
-            drop(reservation);
+            let reservation = sleep_memory.as_ref().and_then(|m| m.reserve(n));
+            let memory_dir = reservation.as_ref().map(|r| r.memory.dir.clone());
+            let r = run_fcvm(&cfg.fcvm, &PotatoCfg::sleep_args(n, vm.pid, memory_dir.as_deref())).await;
+            match (reservation, &sleep_memory) {
+                (Some(reservation), _) => reservation.finish(r.is_ok()),
+                (None, Some(memory)) if r.is_ok() => memory.left(n),
+                _ => {}
+            }
             let created = create.elapsed();
             // --stop has stopped the VM's fcvm (also on failure); reap it
             let reap = Instant::now();
@@ -1767,41 +1823,94 @@ mod tests {
         );
     }
 
-    /// The sleeps' memory stays under its cap, counting the files already in the directory and
-    /// the sleeps in flight: a sleep that would go over keeps its memory on the store, and the
-    /// room comes back when a sleep in flight ends.
+    /// The sleeps' memory stays under its cap: each player whose memory is held and each sleep
+    /// in flight count once. A sleep over the cap keeps its memory on the store; a sleep that
+    /// ends gives its room back, a published one holds it for its player (once, however often
+    /// it sleeps), and a player re-slept on the store stops holding any.
     #[test]
     fn sleeps_keep_their_memory_under_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
         let mib = 1u64 << 20;
         let memory = Arc::new(SleepMemory {
-            dir: dir.path().to_path_buf(),
+            dir: "/nonexistent".into(),
+            each: mib,
             cap: 3 * mib,
-            reserved: Default::default(),
+            state: Default::default(),
         });
-        // one sleeping player's memory file is in the directory already
-        std::fs::write(
-            dir.path().join(format!(
-                "{}a.bin",
-                crate::storage::disk::LINKED_MEMORY_PREFIX
-            )),
-            vec![1u8; mib as usize],
-        )
-        .unwrap();
-        // a file of another name is not the sleeps'
-        std::fs::write(dir.path().join("other"), vec![1u8; 4 * mib as usize]).unwrap();
-        let first = memory.reserve(mib).expect("1 held + 1 fits under 3");
-        let second = memory.reserve(mib).expect("1 held + 2 reserved fits");
+        let held = |m: &SleepMemory| m.state.lock().unwrap().held.len();
+        memory.reserve(0).unwrap().finish(true);
+        memory.reserve(1).unwrap().finish(true);
+        assert_eq!(held(&memory), 2);
+        // both players awake and sleeping again: one fits beside their two memories
+        let a = memory.reserve(0).expect("2 held + 1 fits under 3");
         assert!(
-            memory.reserve(mib).is_none(),
-            "a fourth MiB would go over the cap"
+            memory.reserve(1).is_none(),
+            "2 held + 2 in flight is over 3"
         );
-        drop(first);
-        let third = memory
-            .reserve(mib)
-            .expect("a finished sleep gives its room back");
-        drop((second, third));
-        assert_eq!(*memory.reserved.lock().unwrap(), 0);
+        a.finish(true);
+        assert_eq!(
+            held(&memory),
+            2,
+            "a player's next sleep replaces its memory"
+        );
+        let b = memory.reserve(1).expect("room again once the sleep ended");
+        drop(b);
+        assert_eq!(
+            memory.state.lock().unwrap().in_flight,
+            0,
+            "a dropped sleep gives its room back"
+        );
+        memory.left(1);
+        assert_eq!(
+            held(&memory),
+            1,
+            "a player re-slept on the store holds no memory"
+        );
+
+        // the default cap, twice the players' memory, fits every player's memory and the next
+        // sleep of each at once: a sleep in flight is counted once, however much it has written
+        let memory = Arc::new(SleepMemory {
+            dir: "/nonexistent".into(),
+            each: mib,
+            cap: 4 * mib,
+            state: Default::default(),
+        });
+        memory.reserve(0).unwrap().finish(true);
+        memory.reserve(1).unwrap().finish(true);
+        let a = memory.reserve(0).expect("2 held + 1 in flight");
+        let b = memory
+            .reserve(1)
+            .expect("2 held + 2 in flight fits the default cap of 4");
+        a.finish(true);
+        b.finish(true);
+    }
+
+    /// The agent starts from an empty memory directory: what an earlier agent's sleeps left,
+    /// linked or not, is removed, and nothing else in it is.
+    #[test]
+    fn a_new_agent_empties_its_sleep_memory_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = crate::storage::disk::LINKED_MEMORY_PREFIX;
+        std::fs::write(dir.path().join(format!("{prefix}a.bin")), b"m").unwrap();
+        std::fs::write(dir.path().join(format!("{prefix}b.bin")), b"m").unwrap();
+        std::fs::write(dir.path().join("other"), b"o").unwrap();
+        let memory = SleepMemory {
+            dir: dir.path().to_path_buf(),
+            each: 1,
+            cap: 1,
+            state: Default::default(),
+        };
+        memory.clear().unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["other"]);
+        SleepMemory {
+            dir: dir.path().join("missing"),
+            ..memory
+        }
+        .clear()
+        .unwrap();
     }
 
     /// Shutdown aborts the work in flight: a boot still waiting for a slot never starts a VM
