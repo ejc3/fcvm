@@ -84,8 +84,10 @@ async fn run() -> Result<()> {
     }
 
     // Initialize logging
-    // Use RUST_LOG if set, otherwise default to WARN (quiet by default, use RUST_LOG=info for verbose)
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Use RUST_LOG if set, otherwise warnings only (the fleet agent keeps its own info lines,
+    // cli::default_log_filter)
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(fcvm::cli::default_log_filter(&cli.cmd)));
 
     // `log_internal_errors(false)` on both: when stderr's reader is gone, tracing-subscriber
     // would report the failed write with eprintln!, which panics on the same broken stderr
