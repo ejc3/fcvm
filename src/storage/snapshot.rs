@@ -90,6 +90,12 @@ pub const SNAPSHOT_DISK_SUBDIR: &str = "disk";
 /// The memory file's name in a snapshot's directory.
 pub const SNAPSHOT_MEMORY_FILE: &str = "memory.bin";
 
+/// The VM state file's name in a snapshot's directory.
+pub const SNAPSHOT_VMSTATE_FILE: &str = "vmstate.bin";
+
+/// The root disk's name in a snapshot's disk directory.
+pub const SNAPSHOT_DISK_FILE: &str = "disk.raw";
+
 /// Where a snapshot directory keeps its disks.
 pub fn snapshot_disk_dir(snapshot_dir: &Path) -> PathBuf {
     snapshot_dir.join(SNAPSHOT_DISK_SUBDIR)
@@ -641,7 +647,90 @@ impl SnapshotManager {
     }
 }
 
-fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotConfig> {
+/// Check that the snapshot directory `dir` holds every file a restore of the snapshot that
+/// `config` describes opens from it, each as a non-empty regular file: the disk and every
+/// extra disk, and for a full snapshot the memory image, the VM state and the inode table of
+/// every volume. `what` names the snapshot in the messages.
+///
+/// A generation that lacks one of these restores wrong or not at all: a clone fails without
+/// an extra disk, and without a volume's table it answers EBADF or EIO for every inode the
+/// guest held at the snapshot (#1684). A disk-only snapshot has no memory image, no VM state
+/// and no inode tables (a create writes none for it, and its clones boot from the disk and
+/// load none). Both `podman prepare` and
+/// `snapshot import` check a directory with this before they publish it.
+pub(crate) async fn check_generation_files(
+    dir: &Path,
+    config: &SnapshotConfig,
+    what: &str,
+) -> Result<()> {
+    let full = config.kind == SnapshotKind::Full;
+    let mut artifacts = Vec::new();
+    if full {
+        artifacts.push(("memory", dir.join(SNAPSHOT_MEMORY_FILE)));
+        artifacts.push(("VM state", dir.join(SNAPSHOT_VMSTATE_FILE)));
+    }
+    artifacts.push(("disk", snapshot_disk_dir(dir).join(SNAPSHOT_DISK_FILE)));
+    for (label, path) in artifacts {
+        ensure_non_empty_file(&path, &format!("{what} {label} artifact")).await?;
+    }
+
+    check_extra_disk_names(config, what)?;
+    for disk in &config.metadata.extra_disks {
+        ensure_non_empty_file(
+            &snapshot_disk_dir(dir).join(&disk.filename),
+            &format!("{what} extra disk {} artifact", disk.drive_id),
+        )
+        .await?;
+    }
+
+    // Every volume restores the guest's inodes from a table written into the generation.
+    // A clone that finds no table answers EBADF or EIO for every inode the guest held.
+    for volume in config.metadata.volumes.iter().filter(|_| full) {
+        ensure_non_empty_file(
+            &dir.join(crate::volume::inode_table_file_name(volume.vsock_port)),
+            &format!("{what} volume {} inode table", volume.guest_path),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Fail unless every extra disk of `config` is named by one path component, so that joined
+/// to a snapshot's disk directory it cannot name a file outside it. `what` names the
+/// snapshot in the messages.
+pub(crate) fn check_extra_disk_names(config: &SnapshotConfig, what: &str) -> Result<()> {
+    for disk in &config.metadata.extra_disks {
+        let mut components = Path::new(&disk.filename).components();
+        let contained = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        anyhow::ensure!(
+            contained,
+            "{what} extra disk {} names a path outside its generation: {}",
+            disk.drive_id,
+            disk.filename
+        );
+    }
+    Ok(())
+}
+
+/// Fail unless `path` is a regular file with something in it. `what` names it.
+async fn ensure_non_empty_file(path: &Path, what: &str) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("reading {what} {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "{what} is not a non-empty regular file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Parse the `config.json` of snapshot `name`, refusing one this fcvm cannot restore: a
+/// missing required field, another container start or network boundary version, or a vsock
+/// path of the wrong shape. Every load goes through it, and so does `snapshot import`, on
+/// the config an archive carries, before it writes anything.
+pub(crate) fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotConfig> {
     let value: serde_json::Value =
         serde_json::from_slice(metadata_json).context("parsing snapshot metadata JSON")?;
     let object = value.as_object().ok_or_else(|| {

@@ -79,7 +79,7 @@ use crate::storage::{
 /// two JSON entries are what it gathers.
 const OUTPUT_BUFFER: usize = 1 << 20;
 
-const CONFIG_FILE: &str = "config.json";
+pub(crate) const CONFIG_FILE: &str = "config.json";
 
 /// Where the exporting host keeps its snapshots and its data.
 pub(crate) struct ExportHost {
@@ -627,7 +627,7 @@ fn pmem_owner_uid(config: &SnapshotConfig) -> Result<Option<u32>> {
 /// the VM's directory (`commands::common::extra_disks_to_snapshot` records only the disks a
 /// snapshot keeps in its own directory) and a kernel profile's NVIDIA driver image. A
 /// restore reopens both from the paths in Firecracker's VM state.
-fn not_shipped(config: &SnapshotConfig) -> Vec<String> {
+pub(crate) fn not_shipped(config: &SnapshotConfig) -> Vec<String> {
     let metadata = &config.metadata;
     let mut list = Vec::new();
     if let Some(path) = &metadata.image_disk_path {
@@ -665,7 +665,7 @@ fn not_shipped(config: &SnapshotConfig) -> Vec<String> {
 }
 
 /// SHA-256 of the file at `path`, in hex.
-fn sha256_hex(path: &Path) -> Result<String> {
+pub(crate) fn sha256_hex(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     std::io::copy(
@@ -677,7 +677,7 @@ fn sha256_hex(path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::snapshot::{
         SNAPSHOT_CONTAINER_START_VERSION, SNAPSHOT_NETWORK_BOUNDARY_VERSION,
@@ -690,16 +690,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const TAG: &str = "example-tag";
-    const PAGE: u64 = 4096;
-    const MIB: u64 = 1 << 20;
-    const MEMORY_LEN: u64 = 8 * MIB;
+    pub(crate) const TAG: &str = "example-tag";
+    pub(crate) const PAGE: u64 = 4096;
+    pub(crate) const MIB: u64 = 1 << 20;
+    pub(crate) const MEMORY_LEN: u64 = 8 * MIB;
     const VERSION_OUTPUT: &str = "Firecracker v0.0.0-example\n";
 
     /// A directory on the filesystem the snapshot store is on, which keeps a 4 KiB hole and
     /// lets a file be dropped from the page cache. `sparse` and the page cache tests check
     /// that it does both.
-    fn test_dir() -> tempfile::TempDir {
+    pub(crate) fn test_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("snapshot-export-test-")
             .tempdir_in("/mnt/fcvm-btrfs")
@@ -707,7 +707,7 @@ mod tests {
     }
 
     /// `len` bytes that are never zero and differ from offset to offset.
-    fn pattern(seed: u64, len: u64) -> Vec<u8> {
+    pub(crate) fn pattern(seed: u64, len: u64) -> Vec<u8> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..len)
             .map(|_| {
@@ -721,7 +721,7 @@ mod tests {
 
     /// The file `path` of `len` bytes holding `runs` and nothing else, synced so its extents
     /// are settled.
-    fn sparse(path: &Path, len: u64, runs: &[(u64, Vec<u8>)]) {
+    pub(crate) fn sparse(path: &Path, len: u64, runs: &[(u64, Vec<u8>)]) {
         let file = File::options()
             .read(true)
             .write(true)
@@ -743,7 +743,7 @@ mod tests {
 
     /// The data runs of the file at `path` as `(start, end)`, the way an archive stores
     /// them: whole 512-byte blocks, clipped to the file's length, runs that touch merged.
-    fn data_runs(path: &Path) -> Vec<(u64, u64)> {
+    pub(crate) fn data_runs(path: &Path) -> Vec<(u64, u64)> {
         let file = File::open(path).unwrap();
         let len = file.metadata().unwrap().len();
         let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -760,22 +760,22 @@ mod tests {
 
     /// A snapshot directory as `snapshot create` leaves one, under a snapshot store of its
     /// own, with the files a serve adds beside the memory image.
-    struct Fake {
-        root: tempfile::TempDir,
-        host: ExportHost,
+    pub(crate) struct Fake {
+        pub(crate) root: tempfile::TempDir,
+        pub(crate) host: ExportHost,
         tag: String,
     }
 
     impl Fake {
-        fn dir(&self) -> PathBuf {
+        pub(crate) fn dir(&self) -> PathBuf {
             self.host.snapshots_dir.join(&self.tag)
         }
 
-        fn memory(&self) -> PathBuf {
+        pub(crate) fn memory(&self) -> PathBuf {
             self.dir().join(SNAPSHOT_MEMORY_FILE)
         }
 
-        fn firecracker(&self) -> PathBuf {
+        pub(crate) fn firecracker(&self) -> PathBuf {
             self.root.path().join("firecracker")
         }
 
@@ -796,7 +796,7 @@ mod tests {
         }
     }
 
-    fn names_in(dir: &Path) -> Vec<String> {
+    pub(crate) fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -829,12 +829,12 @@ mod tests {
         config
     }
 
-    fn fake_snapshot() -> Fake {
+    pub(crate) fn fake_snapshot() -> Fake {
         fake_snapshot_with(|_| {})
     }
 
     /// [`fake_snapshot`] with `edit` applied to the config before it is written.
-    fn fake_snapshot_with(edit: impl FnOnce(&mut SnapshotConfig)) -> Fake {
+    pub(crate) fn fake_snapshot_with(edit: impl FnOnce(&mut SnapshotConfig)) -> Fake {
         fake_snapshot_tagged(TAG, edit)
     }
 

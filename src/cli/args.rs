@@ -1387,6 +1387,8 @@ pub enum SnapshotCommands {
     Ls,
     /// Write a snapshot as one archive, to a file or to stdout
     Export(SnapshotExportArgs),
+    /// Install the snapshot in an archive that `snapshot export` wrote
+    Import(SnapshotImportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1399,6 +1401,15 @@ pub struct SnapshotExportArgs {
     /// this the archive goes to stdout, which must not be a terminal.
     #[arg(long, value_name = "FILE")]
     pub output: Option<std::path::PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotImportArgs {
+    /// Read the archive from FILE. Without this the archive is read from stdin, which must
+    /// not be a terminal. The snapshot is installed under the tag it was exported from, which
+    /// must not exist here.
+    #[arg(long, value_name = "FILE")]
+    pub input: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]

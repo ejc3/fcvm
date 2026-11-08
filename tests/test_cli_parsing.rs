@@ -269,3 +269,41 @@ fn snapshot_export_needs_exactly_one_tag_and_a_file_for_output() {
     assert_eq!(kind(&["one", "two"]), ErrorKind::UnknownArgument);
     assert_eq!(kind(&["my-tag", "--output"]), ErrorKind::InvalidValue);
 }
+
+/// The arguments `fcvm snapshot import` parses to.
+fn parse_snapshot_import(args: &[&str]) -> Result<fcvm::cli::SnapshotImportArgs, clap::Error> {
+    use clap::Parser;
+    let mut line = vec!["fcvm", "snapshot", "import"];
+    line.extend_from_slice(args);
+    match fcvm::cli::Cli::try_parse_from(line)?.cmd {
+        fcvm::cli::Commands::Snapshot(snapshot) => match snapshot.cmd {
+            fcvm::cli::SnapshotCommands::Import(import) => Ok(import),
+            other => panic!("`snapshot import` parsed as {other:?}"),
+        },
+        other => panic!("`snapshot import` parsed as {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_import_reads_stdin_unless_given_a_file() {
+    assert_eq!(parse_snapshot_import(&[]).unwrap().input, None);
+
+    let import = parse_snapshot_import(&["--input", "/example/in.archive"]).unwrap();
+    assert_eq!(
+        import.input.as_deref(),
+        Some(std::path::Path::new("/example/in.archive"))
+    );
+}
+
+/// The tag comes from the archive, and the command has no other flag.
+#[test]
+fn snapshot_import_takes_no_tag_and_needs_a_file_for_input() {
+    use clap::error::ErrorKind;
+    let kind = |args: &[&str]| parse_snapshot_import(args).unwrap_err().kind();
+    assert_eq!(kind(&["my-tag"]), ErrorKind::UnknownArgument);
+    assert_eq!(kind(&["--input"]), ErrorKind::InvalidValue);
+    assert_eq!(
+        kind(&["--output", "/example/out.archive"]),
+        ErrorKind::UnknownArgument
+    );
+}

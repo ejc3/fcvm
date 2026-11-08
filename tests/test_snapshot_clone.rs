@@ -3754,6 +3754,175 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     }
 }
 
+/// The regular files of a snapshot's directory with their lengths, by path relative to it.
+fn snapshot_files(dir: &std::path::Path) -> Result<Vec<(std::path::PathBuf, u64)>> {
+    let mut files = Vec::new();
+    let mut pending = vec![std::path::PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        for entry in std::fs::read_dir(dir.join(&relative))? {
+            let entry = entry?;
+            let name = relative.join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(name);
+            } else if kind.is_file() {
+                files.push((name, entry.metadata()?.len()));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// `snapshot export`, a delete of the tag, and `snapshot import` of the archive give back a
+/// snapshot that restores: a clone of it turns healthy and answers an exec. The imported
+/// directory holds the files the exported one held, at the same lengths, under a config
+/// that is a generation of its own with no parent.
+#[tokio::test]
+async fn test_snapshot_export_delete_import_restores() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("import");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+    let snapshot_dir = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    // On the store, not in /tmp: the archive holds the guest's memory image.
+    let archive_dir = tempfile::Builder::new()
+        .prefix("import-test-")
+        .tempdir_in(fcvm::paths::data_dir())
+        .context("creating a directory for the archive")?;
+    let archive = archive_dir.path().join("snapshot.archive");
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning the VM to snapshot")?;
+    let mut baseline_running = true;
+    let mut clone_pid = None;
+    let result = async {
+        common::poll_health_by_pid(baseline_pid, 120).await?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+        common::kill_process(baseline_pid).await;
+        baseline_running = false;
+
+        let mut export = tokio::process::Command::new(&fcvm_path);
+        export
+            .args(["snapshot", "export", &snapshot_name, "--output"])
+            .arg(&archive);
+        common::set_test_pdeathsig(&mut export);
+        let out = export.output().await.context("running snapshot export")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "snapshot export failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let exported = snapshots.load_snapshot(&snapshot_name).await?;
+        // A memory server leaves its working set and that file's lock beside the memory
+        // image, and neither is imported. This snapshot was never served.
+        let exported_files = snapshot_files(&snapshot_dir)?;
+        anyhow::ensure!(
+            exported_files
+                .iter()
+                .any(|(name, len)| name == std::path::Path::new("memory.bin") && *len > 0),
+            "the exported snapshot has no memory image: {exported_files:?}"
+        );
+
+        common::delete_snapshot(&snapshot_name).await?;
+        anyhow::ensure!(
+            !snapshot_dir.exists(),
+            "the snapshot's directory survived its delete"
+        );
+
+        let mut import = tokio::process::Command::new(&fcvm_path);
+        import.args(["snapshot", "import", "--input"]).arg(&archive);
+        common::set_test_pdeathsig(&mut import);
+        let out = import.output().await.context("running snapshot import")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "snapshot import failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let imported = snapshots.load_snapshot(&snapshot_name).await?;
+        anyhow::ensure!(
+            imported.generation_id != exported.generation_id,
+            "the imported snapshot kept the exported generation id"
+        );
+        anyhow::ensure!(
+            imported.parent_snapshot.is_none(),
+            "the imported snapshot names a parent: {:?}",
+            imported.parent_snapshot
+        );
+        anyhow::ensure!(
+            imported.vm_id == exported.vm_id
+                && imported.source_vsock_socket_path == exported.source_vsock_socket_path
+                && imported.memory_path == exported.memory_path,
+            "the import changed the snapshot's VM id, vsock path or memory path"
+        );
+        let imported_files = snapshot_files(&snapshot_dir)?;
+        let without_config = |files: &[(std::path::PathBuf, u64)]| {
+            files
+                .iter()
+                .filter(|(name, _)| name != std::path::Path::new("config.json"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        anyhow::ensure!(
+            without_config(&imported_files) == without_config(&exported_files),
+            "the imported directory is not the exported one: {imported_files:?} and \
+             {exported_files:?}"
+        );
+
+        let (_clone_child, pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning a clone of the imported snapshot")?;
+        clone_pid = Some(pid);
+        common::poll_health_by_pid(pid, 120).await?;
+        let out = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "exec",
+                "--pid",
+                &pid.to_string(),
+                "--",
+                "echo",
+                "IMPORTED_SNAPSHOT_RESTORED",
+            ])
+            .output()
+            .await
+            .context("running exec in the clone")?;
+        anyhow::ensure!(
+            String::from_utf8_lossy(&out.stdout).contains("IMPORTED_SNAPSHOT_RESTORED"),
+            "the clone of the imported snapshot did not answer an exec: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+    .await;
+    if let Some(pid) = clone_pid {
+        common::kill_process(pid).await;
+    }
+    if baseline_running {
+        common::kill_process(baseline_pid).await;
+    }
+    common::delete_snapshot(&snapshot_name).await.ok();
+    result
+}
+
 /// `snapshot create --stop` puts a VM to sleep: the source is never resumed after its
 /// snapshot, its fcvm has exited when the command returns, and the snapshot restores. The
 /// oracle for "never resumed" is the source's own Firecracker log, which fcvm copies at
