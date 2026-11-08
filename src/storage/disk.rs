@@ -359,8 +359,14 @@ pub async fn wait_for_deleted_subvolumes(path: &Path) {
 }
 
 /// `btrfs subvolume delete`, without waiting for the cleaner. Whether it succeeded.
+///
+/// The helper dies with fcvm (`helper_command`). It deletes a directory by a name that every
+/// create of one tag uses in turn (`<tag>`, `<tag>.creating`, `<tag>.old`), under the tag's
+/// lock, and a killed fcvm no longer holds that lock: a delete that ran on after it could
+/// remove the directory the next create made under the name. A reclaim pass removes a killed
+/// create's staging directory through here (`crate::reclaim`).
 async fn delete_subvolume(path: &Path) -> bool {
-    let output = tokio::process::Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args(["subvolume", "delete"])
         .arg(path)
         .output()
