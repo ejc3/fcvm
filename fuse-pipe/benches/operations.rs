@@ -125,14 +125,15 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     // attr_timeout, which leaves the kernel nothing cached, and primes with plain
     // stats of the path. Through the path, because the plain stat below resolves
     // it: with the dentry's entry_timeout (also 1 s) run out, that stat would send
-    // a LOOKUP whose reply refreshes the attributes. The first priming stat goes
-    // to the server. A chmod moves the host file's ctime and nothing else, which
-    // the client takes as a possible rewrite that kept the size and mtime (fuse-
-    // pipe/src/client/host_change.rs): it sends FUSE_NOTIFY_INVAL_INODE ahead of
-    // that reply, and the kernel does not cache the attributes of a reply an
-    // invalidation overtook. The second stat then goes to the server too, and its
-    // reply, carrying the ctime the client already recorded, is cached. Either way
-    // the cached dentry and attributes expire no earlier than 1 s after `primed`.
+    // a LOOKUP whose reply refreshes the attributes. A chmod moves the host file's
+    // ctime and nothing else, which the client takes as a possible rewrite that
+    // kept the size and mtime (fuse-pipe/src/client/host_change.rs): it sends
+    // FUSE_NOTIFY_INVAL_INODE ahead of the first reply that reports it, and the
+    // kernel does not cache the attributes of a reply an invalidation overtook.
+    // The kernel then asks again with a GETATTR, in the same stat or in the second
+    // one, and that reply, carrying the ctime the client already recorded, is
+    // cached. Every request that refreshes the dentry or the attributes is sent
+    // after `primed`, so both expire no earlier than 1 s after it.
     let mut saw_chmod = 0;
     let mut expired = 0;
     for _ in 0..5 {
