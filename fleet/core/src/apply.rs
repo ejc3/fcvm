@@ -1356,8 +1356,9 @@ fn tick(state: &mut State, at: u64) {
             });
         }
     }
-    // Borrowed servers come back.
+    // Borrowed servers come back, and servers nobody holds are reset on a schedule.
     expire_minecraft(f, at);
+    reset_stale_minecraft(f, at);
     // A reclaimed host is listed for a minute after it is gone.
     let hosts = f.hosts.clone();
     f.reclaimed.retain(|h, (_, gone)| {
@@ -2843,6 +2844,26 @@ fn expire_minecraft(f: &mut Fleet, at: u64) {
         .collect();
     for n in expired {
         release_minecraft(f, n, at);
+    }
+}
+
+/// Reset every running server nobody holds whose launch is [`crate::minecraft::AUTO_RESET_MS`]
+/// old: it is restored from the gold snapshot as a Reset is, with no viewer needed. A launch
+/// is timed from its relaunch, or from when the server was first listed.
+fn reset_stale_minecraft(f: &mut Fleet, at: u64) {
+    for slot in f.minecraft.values_mut() {
+        let launched = slot
+            .last_relaunch
+            .as_ref()
+            .map_or(slot.created_at, |r| r.clicked_at);
+        let running =
+            slot.observed.phase == "running" && slot.observed.generation >= slot.generation;
+        if running
+            && minecraft_claim(slot).is_none()
+            && at >= launched + crate::minecraft::AUTO_RESET_MS
+        {
+            bump_minecraft(slot, "schedule", at);
+        }
     }
 }
 

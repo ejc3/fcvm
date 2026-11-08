@@ -1617,3 +1617,80 @@ fn only_a_launch_that_copied_its_source_is_shown_as_a_fork() {
         v["minecraft"]["tiles"][1]
     );
 }
+
+/// A server nobody holds is reset to the gold snapshot once its launch is AUTO_RESET_MS old,
+/// with no viewer; a borrowed one is not, and a reset times the next one from itself.
+#[test]
+fn a_server_nobody_holds_is_reset_on_a_schedule() {
+    let every = fleet_core::minecraft::AUTO_RESET_MS;
+    let host = serde_json::json!({"type": "agent", "at": 1000, "host": "h1", "msg": {"type": "hello",
+        "host": "h1", "arch": "aarch64", "gpus": [], "capacity": 0, "minecraft": 2}});
+    let report = |at: u64, id: &str, generation: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": id, "phase": "running", "generation": generation, "timings": {},
+            "first_chunk_at": at - 50}})
+    };
+    let tick = |at: u64| serde_json::json!({"type": "tick", "at": at});
+    // A borrow longer than the period, to see a held server keep its world.
+    let cfg = config_with(serde_json::json!({"minecraft_claim_secs": 7200}));
+    let gen = |s: &State, id: &str| {
+        s.fleet
+            .minecraft
+            .values()
+            .find(|m| m.id == id)
+            .unwrap()
+            .generation
+    };
+    let by = |s: &State, id: &str| {
+        s.fleet
+            .minecraft
+            .values()
+            .find(|m| m.id == id)
+            .unwrap()
+            .last_relaunch
+            .as_ref()
+            .map(|r| r.by.clone())
+    };
+    let s = events(serde_json::json!([
+        host,
+        report(2000, "mc-1", 1),
+        report(2000, "mc-2", 1),
+        {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 2200, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+            "name": "claim_minecraft", "args": {"slot": "mc-2"}},
+        tick(1950 + every - 1),
+    ]))
+    .iter()
+    .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(
+        (gen(&s, "mc-1"), gen(&s, "mc-2")),
+        (1, 1),
+        "nothing is due yet"
+    );
+    let s = events(serde_json::json!([tick(1950 + every)]))
+        .iter()
+        .fold(s, apply);
+    assert_eq!(
+        gen(&s, "mc-1"),
+        2,
+        "an unheld server is reset when its launch is due"
+    );
+    assert_eq!(by(&s, "mc-1").as_deref(), Some("schedule"));
+    assert_eq!(gen(&s, "mc-2"), 1, "a held server keeps its world");
+    // The reset launch is not reset again until it is due itself, and only once it runs.
+    let s = events(serde_json::json!([tick(1950 + 2 * every - 1)]))
+        .iter()
+        .fold(s, apply);
+    assert_eq!(
+        gen(&s, "mc-1"),
+        2,
+        "a launch that never reported running is the agent's to retry"
+    );
+    let s = events(serde_json::json!([
+        report(1950 + every + 5000, "mc-1", 2),
+        tick(1950 + 2 * every)
+    ]))
+    .iter()
+    .fold(s, apply);
+    assert_eq!(gen(&s, "mc-1"), 3);
+}

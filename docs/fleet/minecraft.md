@@ -141,6 +141,7 @@ fcvm's lockfile.
 | a fork's snapshot fails | the target is left as it was and reports the error; the source keeps running |
 | a fork's restore fails | the target is failed and relaunched from the gold snapshot |
 | the agent disconnects | every server's VM is stopped, as slots are |
+| a world is griefed or wedged, and nobody holds it | the coordinator resets the server to its gold snapshot 30 min after its launch (`fleet_core::minecraft::AUTO_RESET_MS`), with no viewer; a borrowed server is reset when its borrow ends |
 
 ## Licensing
 
@@ -151,9 +152,13 @@ fcvm's lockfile.
 - **No Mojang asset.** The page draws flat colours of our own; the image holds no client or
   server jar, texture, sound or language file.
 - **Offline mode** means the servers check no Minecraft account, so anyone with a Java Edition
-  client can join under any name. It is the usual setting for a server full of bots; the tile
-  addresses are public IPv6 for staging (already allowed), and the page and the coordinator stay
-  behind Cloudflare Access.
+  client can join under any name. The owner chose open joins in offline mode (2026-11-08), with
+  the servers reset from their snapshot: on the schedule above, on Reset, and when a borrow
+  ends. A public player reaches only the Java listener: the fleet security group admits TCP
+  25565 over IPv6 and nothing else of the server's beyond the view socket on 443, and Pumpkin's
+  query, management, proxy, LAN and Bedrock services are off by name. At most 20 players join a
+  server, and Pumpkin's packet limiter is on. The page and the coordinator stay behind
+  Cloudflare Access.
 - **The density comparison** runs Mojang's vanilla server and Paper beside Pumpkin, on the
   bench box only, with Mojang's EULA accepted there by the owner's decision (2026-11-08,
   "Compare is fine for research"). The jars are downloaded on that box and are never in git, a
