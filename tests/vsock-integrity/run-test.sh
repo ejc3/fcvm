@@ -48,8 +48,9 @@ echo ""
 # Run L2 VM
 # Note: L2 just needs to run the vsock client - no nested virtualization needed
 # Use ECR image to avoid Docker Hub rate limits
-# FCVM_FUSE_MAX_WRITE=32768 prevents vsock data loss in L2 FUSE-over-FUSE
-FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
+# FUSE max_write is unbounded, as everywhere else: the 32 KiB limit that worked around
+# L2 vsock data loss on 6.18.3 is not needed on 6.18.60 (#659).
+fcvm podman run \
     --no-snapshot \
     --name l2-vsock-test \
     --network bridged \

@@ -3014,7 +3014,7 @@ Nothing watches the host's trees. The guest discovers changes only on access, af
 
 ### Nested VM Performance (NV2)
 
-On 6.18.3, ARM64 FEAT_NV2 corrupted L2 vsock/FUSE data under double Stage 2 translation until a DSB SY kernel patch was carried. On 6.18.60 the nested tests pass without it, and the patch was dropped (#770). L2 VMs still launch with one vCPU; multi-vCPU L2 is tracked in #659.
+On 6.18.3, ARM64 FEAT_NV2 corrupted L2 vsock/FUSE data under double Stage 2 translation until a DSB SY kernel patch was carried. On 6.18.60 the nested tests pass without it, and the patch was dropped (#770). L2 VMs run at the default 2 vCPUs since #659, which measured no NETDEV WATCHDOG at 2 vCPUs on 6.18.60.
 
 ### Snapshot + FUSE Volumes
 

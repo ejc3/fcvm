@@ -98,7 +98,7 @@ endif
 # them. Instead CI runs four that cover the distinct nested risks and skips the rest
 # (which still run locally with a normal `make test-root`):
 #   - test_nested_run_fcvm_inside_vm  : nesting works at all + /dev/kvm usable in the guest
-#   - test_nested_l2_with_large_files : FUSE-over-FUSE cache coherency (the #630 DSB regression guard)
+#   - test_nested_l2_with_large_files : FUSE-over-FUSE data integrity at unbounded max_write
 #   - test_nested_l2_nfs              : the NFS-share data path under nesting
 #   - test_vsock_integrity_nested     : 2.5 GB of L2 vsock traffic checked byte for byte (arm64)
 # Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
@@ -117,8 +117,8 @@ ifeq ($(CI),true)
 CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested))
 ifeq ($(FCVM_NO_SNAPSHOT),)
 # SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
-# It guards FUSE-over-FUSE DATA INTEGRITY (the #630 DSB cache-coherency fix) — a live-traffic
-# property of the always-on kernel patch, independent of the snapshot feature — and it already
+# It guards FUSE-over-FUSE DATA INTEGRITY (the corruption the dropped #630 DSB patches once
+# fixed, #770) — a live-traffic property independent of the snapshot feature — and it already
 # runs in the SnapshotDisabled job (~225s). Under SnapshotEnabled it runs TWICE (cold + restore)
 # and the warm run is a 4GB *nested* VM UFFD restore whose page faults go through double Stage-2
 # translation (~842s), ~18 min total for zero extra integrity coverage. Snapshot/restore

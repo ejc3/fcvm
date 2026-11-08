@@ -1432,8 +1432,10 @@ env-gated `FC_DEBUG_REG_DUMP` / `FC_DEBUG_REG_DIFF` register instrumentation.
 **Historical note — "L2 single vCPU requirement"**: multi-vCPU L2 VMs hitting NETDEV
 WATCHDOG (TX queue not serviced) was previously attributed to NV2 cross-vCPU interrupt
 issues. That symptom matches bug 2 (host event loop starvation, which always reports the
-watchdog on the queue's CPU). Nested launches still use `--cpu 1` as a conservative
-default; re-evaluating multi-vCPU L2 is tracked in #632.
+watchdog on the queue's CPU). The `--cpu 1` default for L2 launches was removed in #659:
+on 6.18.60 host and guest kernels, 40 runs of the L2 NFS, large-file and network tests at
+2 vCPUs passed, and each L2's own `dmesg` held no NETDEV WATCHDOG or queue timeout. L2
+egress with one stream went from a median 2.9 Gbit/s at 1 vCPU to 7.4 Gbit/s at 2.
 
 ## FUSE Performance Tracing
 
