@@ -2218,14 +2218,17 @@ struct HeldVm<'a> {
 /// (`test_route_replacement_on_clone_bridged`). A health check that needs that route reads
 /// unhealthy for every clone but the newest, for as long as the newest lives.
 ///
-/// Clone1 reads healthy while it holds the route, then clone2 takes it. From then on every
-/// VM here has to keep passing its health check: clone1 without the route, clone2 with it,
-/// and the baseline, whose reachable address is the guest address that the route now sends
-/// to clone2.
+/// Clone1 reads healthy while it holds the route, then clone2 takes it, then a stranger
+/// with the same address takes it from clone2 and exits, which deletes it. From then on
+/// every VM here has to keep passing its health check with the route on neither clone:
+/// clone1, clone2, and the baseline, whose reachable address can be that guest address.
 ///
-/// The baseline's health check URL is this test's own, so its startup snapshot is too: a
-/// baseline restored from a startup snapshot that another running test also restored from
-/// would share the guest address with VMs this test does not control.
+/// The route is host-wide and this test does not own it. The baseline restores from the
+/// pre-start snapshot every bridged VM of this image shares, so other tests' VMs carry the
+/// same guest address and take and drop the route while this test runs (CI run 42478736232:
+/// a `running-*` test's VMs took it from clone2 and exited, leaving none). The stranger
+/// does the same here on every run, so the test asserts only that neither clone holds the
+/// route, and that no health check needs it.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route() -> Result<()> {
@@ -2330,6 +2333,31 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
         );
         let clone1_veth = common::get_network_field(clone1_pid, "host_veth").await?;
         let clone2_veth = common::get_network_field(clone2_pid, "host_veth").await?;
+
+        // A stranger with the same guest address takes the route from clone2 and exits,
+        // which deletes it. Every bridged VM of this image restored from the shared
+        // pre-start snapshot has this address, and on a busy host other tests' VMs do
+        // exactly this at any moment; here it happens on every run.
+        let stranger_name = format!("{clone1_name}-stranger");
+        let (mut stranger_child, stranger_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_str,
+                "--name",
+                &stranger_name,
+            ],
+            &stranger_name,
+        )
+        .await
+        .context("spawning the stranger clone")?;
+        let stranger_ready = common::poll_health(&mut stranger_child, 120)
+            .await
+            .context("the stranger clone never read healthy");
+        terminate_and_reap(&mut stranger_child, stranger_pid, "stranger clone").await?;
+        stranger_ready?;
+
         let route_output = tokio::process::Command::new("ip")
             .args(["route", "show", &format!("{guest_ip}/32")])
             .output()
@@ -2338,10 +2366,13 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
         let route = String::from_utf8_lossy(&route_output.stdout)
             .trim()
             .to_string();
+        // Only the absence is this test's to assert: the route is host-wide, and any VM
+        // with this address, this test's or another's, may hold it or have just
+        // dropped it.
         anyhow::ensure!(
-            route.contains(&clone2_veth) && !route.contains(&clone1_veth),
-            "the host route to {guest_ip} should be on clone2's veth {clone2_veth} and off \
-             clone1's {clone1_veth}, got: {route:?}"
+            !route.contains(&clone1_veth) && !route.contains(&clone2_veth),
+            "the host route to {guest_ip} should be on neither clone's veth ({clone1_veth}, \
+             {clone2_veth}) once the stranger that took it has exited, got: {route:?}"
         );
         println!("host route: {route}");
 
@@ -2394,7 +2425,8 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
                 anyhow::ensure!(
                     state.health_status == fcvm::state::HealthStatus::Healthy,
                     "{} read {:?} {:.1}s into the hold, with the host route to {guest_ip} on \
-                     clone2's veth ({route}). No VM's health check may depend on that route.",
+                     neither clone's veth ({route:?}). No VM's health check may depend on that \
+                     route.",
                     vm.label,
                     state.health_status,
                     held_from.elapsed().as_secs_f64()
@@ -2406,7 +2438,8 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
             }
         }
         println!(
-            "every VM persisted two healthy checks in {:.1}s with the host route on clone2's veth",
+            "every VM persisted two healthy checks in {:.1}s with the host route on neither \
+             clone's veth",
             held_from.elapsed().as_secs_f64()
         );
         Ok(())
