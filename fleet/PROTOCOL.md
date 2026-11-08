@@ -1513,7 +1513,11 @@ reference in `--windows-state-dir/<key>/desktop-ref.ppm` are both there. Otherwi
 3. until the gold VM's processes (its fcvm and every process below it, from `/proc`) use
    under `--windows-idle-cpu` of one core (0.25) on average over 20 s (300 s; the settled gold
    desktop measured 0.14 to 0.17 of a core);
-4. `fcvm snapshot create --pid <pid> --tag win-gold-<key> --stop`.
+4. the logon again, which reconnects to the session and saves the reference clones are checked
+   against: the first logon creates the profile, and its shell can draw the wallpaper seconds
+   before the taskbar, so its reference can match no restored desktop;
+5. step 3 again;
+6. `fcvm snapshot create --pid <pid> --tag win-gold-<key> --stop`.
 
 A step that fails reports the gold snapshot `failed` (`windows_image`) and every sandbox
 `failed` with it. Every way out of the flow (success, a failure, the agent stopping) stops the

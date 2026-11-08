@@ -1007,71 +1007,28 @@ async fn gold_steps(
         secs = t0.elapsed().as_secs(),
         "the gold VM is healthy; logging on"
     );
-    let bridge = kids.bridge.insert(Bridge::spawn(
-        cfg,
-        "fleet-win-gold-bridge",
-        &rdp,
-        &BridgeMode::Logon {
-            state_dir: dir.clone(),
-            ref_out: ref_out.clone(),
-        },
-    )?);
-    tokio::select! {
-        status = bridge.client.exited() => {
-            if !status.success() {
-                bail!("the bridge's logon failed ({status}): {}", bridge.client.tail());
-            }
-        }
-        status = vm.exited() => bail!("fcvm exited ({status}) during the logon; fcvm said: {}", vm.tail()),
-        _ = tokio::time::sleep(cfg.logon_deadline) => {
-            bail!("the bridge did not reach the desktop in {} s: {}", cfg.logon_deadline.as_secs(), bridge.client.tail());
-        }
-    }
-    // It exited 0: its container is gone (`--rm`).
-    kids.bridge = None;
-    if !ref_out.is_file() {
-        bail!(
-            "the bridge's logon saved no desktop reference at {}",
-            ref_out.display()
-        );
-    }
+    // The first logon creates the sandbox user's profile and starts its shell, which can
+    // draw the wallpaper seconds before the taskbar: a reference taken then (it settled for
+    // the bridge's 5 s) matched no restored desktop, and every sandbox waited for a desktop
+    // that never came. The second logon, once the desktop is idle, reconnects to the session
+    // the shell has finished drawing, and its reference is the one clones are checked against.
+    gold_logon(cfg, kids, &rdp, &dir, &ref_out).await?;
     tracing::info!(
         secs = t0.elapsed().as_secs(),
         "logged on; waiting for the desktop to go idle"
     );
-    let mut idle = IdleDetector::new(cfg.idle_cpu, cfg.idle_for);
-    let started = Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {}
-            status = vm.exited() => bail!("fcvm exited ({status}) while the desktop settled; fcvm said: {}", vm.tail()),
-        }
-        let root = cfg.proc_root.clone();
-        let pid = vm.pid;
-        let cpu = tokio::task::spawn_blocking(move || tree_cpu_secs(&root, pid))
-            .await
-            .ok()
-            .flatten();
-        if let Some(cpu) = cpu {
-            if idle.sample(started.elapsed().as_secs_f64(), cpu) {
-                break;
-            }
-        }
-        if started.elapsed() >= cfg.idle_deadline {
-            bail!(
-                "the gold desktop did not go idle in {} s: its VM used {} of a core over the last {} s (idle is under {})",
-                cfg.idle_deadline.as_secs(),
-                idle.last_share.map_or("an unknown share".into(), |s| format!("{s:.2}")),
-                cfg.idle_for.as_secs(),
-                cfg.idle_cpu
-            );
-        }
-    }
+    gold_idle(cfg, kids).await?;
+    gold_logon(cfg, kids, &rdp, &dir, &ref_out).await?;
+    tracing::info!(
+        secs = t0.elapsed().as_secs(),
+        "the desktop reference is taken; waiting for the desktop to go idle again"
+    );
+    gold_idle(cfg, kids).await?;
     tracing::info!(
         secs = t0.elapsed().as_secs(),
         "the desktop is idle; taking the snapshot"
     );
+    let vm = kids.vm.as_mut().expect("the gold VM runs");
     let run = child(&agent.fcvm)
         .args(snapshot_argv(vm.pid, &tag))
         .output();
@@ -1101,6 +1058,82 @@ async fn gold_steps(
     }
     tracing::info!(%tag, secs = t0.elapsed().as_secs(), "gold snapshot made");
     Ok(tag)
+}
+
+/// One logon of the gold flow: the bridge's `logon` mode, which saves the desktop it reached
+/// as the reference at `ref_out` (replacing one saved before) and disconnects.
+async fn gold_logon(
+    cfg: &WindowsCfg,
+    kids: &mut GoldChildren,
+    rdp: &Path,
+    dir: &Path,
+    ref_out: &Path,
+) -> Result<()> {
+    let _ = std::fs::remove_file(ref_out);
+    let vm = kids.vm.as_mut().expect("the gold VM runs");
+    let bridge = kids.bridge.insert(Bridge::spawn(
+        cfg,
+        "fleet-win-gold-bridge",
+        rdp,
+        &BridgeMode::Logon {
+            state_dir: dir.to_path_buf(),
+            ref_out: ref_out.to_path_buf(),
+        },
+    )?);
+    tokio::select! {
+        status = bridge.client.exited() => {
+            if !status.success() {
+                bail!("the bridge's logon failed ({status}): {}", bridge.client.tail());
+            }
+        }
+        status = vm.exited() => bail!("fcvm exited ({status}) during the logon; fcvm said: {}", vm.tail()),
+        _ = tokio::time::sleep(cfg.logon_deadline) => {
+            bail!("the bridge did not reach the desktop in {} s: {}", cfg.logon_deadline.as_secs(), bridge.client.tail());
+        }
+    }
+    // It exited 0: its container is gone (`--rm`).
+    kids.bridge = None;
+    if !ref_out.is_file() {
+        bail!(
+            "the bridge's logon saved no desktop reference at {}",
+            ref_out.display()
+        );
+    }
+    Ok(())
+}
+
+/// Wait until the gold VM's processes are idle (`IdleDetector`), at most `idle_deadline`.
+async fn gold_idle(cfg: &WindowsCfg, kids: &mut GoldChildren) -> Result<()> {
+    let vm = kids.vm.as_mut().expect("the gold VM runs");
+    let mut idle = IdleDetector::new(cfg.idle_cpu, cfg.idle_for);
+    let started = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            status = vm.exited() => bail!("fcvm exited ({status}) while the desktop settled; fcvm said: {}", vm.tail()),
+        }
+        let root = cfg.proc_root.clone();
+        let pid = vm.pid;
+        let cpu = tokio::task::spawn_blocking(move || tree_cpu_secs(&root, pid))
+            .await
+            .ok()
+            .flatten();
+        if let Some(cpu) = cpu {
+            if idle.sample(started.elapsed().as_secs_f64(), cpu) {
+                return Ok(());
+            }
+        }
+        if started.elapsed() >= cfg.idle_deadline {
+            bail!(
+                "the gold desktop did not go idle in {} s: its VM used {} of a core over the last {} s (idle is under {})",
+                cfg.idle_deadline.as_secs(),
+                idle.last_share.map_or("an unknown share".into(), |s| format!("{s:.2}")),
+                cfg.idle_for.as_secs(),
+                cfg.idle_cpu
+            );
+        }
+    }
 }
 
 /// A bridge container and its `podman run` client. The container is podman's (conmon keeps

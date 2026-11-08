@@ -522,7 +522,17 @@ async fn the_gold_flow_runs_in_order_and_every_sandbox_restores_from_it() {
             .unwrap_or_else(|| panic!("no {kind} {name} in {log:?}"))
     };
     assert!(at("vm_run", "win-gold") < at("podman_logon", "fleet-win-gold-bridge"));
-    assert!(at("podman_logon", "fleet-win-gold-bridge") < at("snapshot_create", tag));
+    // Two logons: the first creates the profile, the second, once the desktop is idle, takes
+    // the reference the clones are checked against (a shell still drawing its taskbar at the
+    // first gave a reference no restored desktop matched).
+    let logons: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, n))| k == "podman_logon" && n == "fleet-win-gold-bridge")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(logons.len(), 2, "{log:?}");
+    assert!(logons[1] < at("snapshot_create", tag));
     assert!(at("snapshot_create", tag) < at("exit", "win-gold"));
     for id in ["win-1", "win-2"] {
         assert!(at("snapshot_create", tag) < at("snapshot_run", id));

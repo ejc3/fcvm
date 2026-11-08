@@ -251,8 +251,7 @@ The gold flow, run by the agent once per host and image (stack PR 6):
 
 1. Cold boot the image in a raw VM. Health answers when Remote Desktop listens.
 2. The bridge logs on as `sandbox` at the sandbox's size (1280 x 720) and waits for
-   the desktop. The first logon creates the profile and runs first-logon tasks. It saves the
-   desktop it reached as the reference a clone's first desktop frame is checked against.
+   the desktop. The first logon creates the profile and runs first-logon tasks.
 3. The bridge disconnects. The session stays logged on, in the Disconnected state, with the
    desktop and its windows alive.
 4. The agent waits until the desktop is idle: the gold VM's processes (its fcvm and every
@@ -261,7 +260,12 @@ The gold flow, run by the agent once per host and image (stack PR 6):
    through the logon, then settled at 14 to 17% of a core with a busy second (0.3 to 1.1 of a
    core) every half minute or so. Requiring every second under 15% never settled on it, and
    the 2% first written here would not either.
-5. `fcvm snapshot create --stop`.
+5. The bridge logs on again: it reconnects to the session, saves the reference a clone's
+   first desktop frame is checked against, and disconnects; the agent waits for idle again.
+   The first logon's reference is replaced: its shell can draw the wallpaper seconds before
+   the taskbar, and on the x86 host one reference held no taskbar and matched no restored
+   desktop (RMSE 0.17 against the 0.05 a match needs), so no sandbox ever ran.
+6. `fcvm snapshot create --stop`.
 
 A clone's bridge then connects and reconnects to that session: no logon, no profile load, no
 shell start. Disconnecting before the snapshot matters: a connection open at the snapshot
