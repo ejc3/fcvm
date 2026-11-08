@@ -602,7 +602,7 @@ async fn a_notify_check_raises_its_event_where_an_earlier_generation_left_a_file
     let log = dir.path().join("hold.log");
     // The shell's pid is the hold's after exec, so the leftovers carry its names.
     let script = format!(
-        "for n in 0 1 2 3 4 5; do touch {w}/created-$$-$n; done; exec {g} {l} notify {w}",
+        "set -e; for n in 0 1 2 3 4 5; do touch {w}/created-$$-$n; done; exec {g} {l} notify {w}",
         w = watched.display(),
         g = gymhold.display(),
         l = log.display()
@@ -626,6 +626,31 @@ async fn a_notify_check_raises_its_event_where_an_earlier_generation_left_a_file
     assert!(
         checks.iter().all(|line| line.ends_with(" ok")),
         "a check missed its IN_CREATE: {checks:?}"
+    );
+}
+
+/// A snapshot can catch a notify check between drawing its random name and creating
+/// the file, so the clone restored from it draws the same name. Only an exclusive
+/// create, drawn again when the name exists, keeps every check's IN_CREATE.
+#[test]
+fn a_notify_check_creates_its_file_exclusively_and_draws_again_when_it_exists() {
+    let source = include_str!("gym/gymhold.c");
+    // The first notify branch sets the watch up; the last one runs each check.
+    let start = source
+        .rfind("!strcmp(kind, \"notify\")")
+        .expect("gymhold.c has a notify hold");
+    let branch = &source[start..];
+    let branch = &branch[..branch.find("} else if").unwrap_or(branch.len())];
+    let create = branch
+        .find("O_CREAT | O_EXCL")
+        .expect("the notify create is exclusive");
+    assert!(
+        branch[create..].contains("errno != EEXIST"),
+        "the notify hold draws a new name when the exclusive create finds one"
+    );
+    assert!(
+        branch[..create].contains("getrandom"),
+        "the notify name is drawn inside the retry"
     );
 }
 
