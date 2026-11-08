@@ -82,6 +82,8 @@ impl Replay {
             "aggregate" => "aggregate".into(),
             "draining" => "draining".into(),
             "quarantine" => format!("quarantine/{}", s("sbdf")),
+            // The Windows image's age and the gold snapshot's state: only the latest is true.
+            "windows_image" => "windows_image".into(),
             // Health readings and scrub outcomes are events, not state.
             _ => return,
         };
@@ -379,5 +381,19 @@ mod tests {
         // Scenes and budgets change nothing.
         r.coordinator_frame(r#"{"type":"scene","epoch_unix_ms":1}"#);
         assert_eq!(r.lines().len(), 3);
+    }
+
+    /// A coordinator that lost the host learns the image's latest state on the next
+    /// connection: the newest `windows_image` replaces the one before.
+    #[test]
+    fn the_replay_keeps_the_latest_windows_image() {
+        let mut r = Replay::default();
+        r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":0,"windows":2}"#);
+        r.note(r#"{"type":"windows_image","id":"3f9c","gold":"building","age_days":3}"#);
+        r.note(r#"{"type":"windows_image","id":"3f9c","gold":"ready","age_days":3}"#);
+        r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"win-1"}],"region":null}"#);
+        let lines = r.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains(r#""gold":"ready""#), "{lines:?}");
     }
 }

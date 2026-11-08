@@ -118,6 +118,7 @@ enum : uint16_t {
   SC_F4 = 0x3E,
   SC_KEY_E = 0x12,
   SC_KEY_R = 0x13,
+  SC_KEY_N = 0x31,
   SC_LWIN = 0x15B,
 };
 
@@ -132,7 +133,7 @@ enum StepKind {
   STEP_TEXT,         // type text on a US layout
   STEP_WAIT,         // wait ms
   STEP_WAIT_CHANGE,  // wait until the screen changes from what it showed before the last step, at most ms
-  STEP_CLOSE_UNTIL_DESKTOP,  // Alt+F4 until the screen is the desktop reference, at most ms times
+  STEP_CLOSE_UNTIL_DESKTOP,  // rounds of kCloseRound until the screen is the desktop, at most ms rounds
 };
 struct Step {
   StepKind kind;
@@ -158,11 +159,15 @@ std::string action_refusal(const std::string& name);
 const Action* action_from_body(const std::string& body, std::string* err);
 // The key events of one chord or text step; false for a character the US map lacks.
 bool step_keys(const Step& s, std::vector<KeyEvent>* out);
-#define CLOSE_ALL_TRIES 10
-// close_all's one key: Alt+F4.
-extern const Step kCloseWindowStep;
-// How long close_all waits after each Alt+F4 before it looks at the screen again.
-#define CLOSE_ALL_WAIT_MS 700
+#define CLOSE_ALL_ROUNDS 5
+// close_all's round: Esc (the Start menu, a menu, a Save As dialog), Alt+F4 (the window in
+// front), N (a "save changes?" prompt's Don't Save, which the Notepad action's text raises).
+// The bridge looks for the desktop before every key and stops there, so a bare desktop never
+// gets the Alt+F4 that would open the Shut Down dialog.
+#define CLOSE_ROUND_KEYS 3
+extern const Step kCloseRound[CLOSE_ROUND_KEYS];
+// How long close_all waits after each key of the round before it looks at the screen again.
+extern const int kCloseRoundWaitMs[CLOSE_ROUND_KEYS];
 // A screen differs from another (STEP_WAIT_CHANGE) past this thumbnail RMSE.
 #define CHANGE_RMSE 0.02
 

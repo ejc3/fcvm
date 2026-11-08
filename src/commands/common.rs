@@ -6636,12 +6636,6 @@ pub async fn create_snapshot_core(
 /// `--restore source_url`.
 pub const CH_SNAPSHOT_SUBDIR: &str = "ch";
 
-/// Cloud Hypervisor snapshot create. Full snapshots only — CH has no diff/dirty-page
-/// tracking in fcvm yet (#632 P2). Mirrors [`create_snapshot_core`]'s scaffolding (temp
-/// dir, paused-disk reflink for memory/disk consistency, atomic rename) but drives CH's
-/// `vm.pause` → `vm.snapshot` → `vm.resume` instead of Firecracker's snapshot API.
-///
-/// The VM is resumed regardless of success or failure, mirroring the Firecracker path.
 /// What a Cloud Hypervisor snapshot asks of the guest around its pause.
 ///
 /// A Linux guest's fc-agent closes the guest network boundary before the pause (dumping
@@ -6721,12 +6715,21 @@ impl<'a> ChSnapshotGuest<'a> {
     }
 }
 
+/// Cloud Hypervisor snapshot create. Full snapshots only — CH has no diff/dirty-page
+/// tracking in fcvm yet (#632 P2). Mirrors [`create_snapshot_core`]'s scaffolding (temp
+/// dir, paused-disk reflink for memory/disk consistency, atomic rename) but drives CH's
+/// `vm.pause` → `vm.snapshot` → `vm.resume` instead of Firecracker's snapshot API.
+///
+/// After the save the VM is resumed whether it succeeded or not, mirroring the Firecracker
+/// path, unless `source_disposition` is [`SnapshotSourceDisposition::LeavePaused`]
+/// (`snapshot create --stop`), whose source stays paused until its fcvm is stopped.
 pub async fn create_snapshot_ch(
     client: &crate::hypervisor::cloud_hypervisor::api::ChClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     guest: ChSnapshotGuest<'_>,
     extra_files: SnapshotExtraFiles<'_>,
+    source_disposition: SnapshotSourceDisposition,
 ) -> Result<()> {
     // CH snapshots are always self-contained (no diff base / parent chain).
     snapshot_config.parent_snapshot = None;
@@ -6867,20 +6870,27 @@ pub async fn create_snapshot_ch(
         .record_pause(&snapshot_config.vm_id, &snapshot_config.name)
         .await;
 
-    // Resume ALWAYS, even if the snapshot or disk copy failed.
-    let hypervisor_resume_result = client
-        .resume_vm()
-        .await
-        .context("resuming Cloud Hypervisor VM after snapshot");
+    // Resume a normal source even if the snapshot or disk copy failed. A `--stop` source
+    // never runs again: its fcvm is stopped next, so it stays paused and its guest gate shut.
+    let hypervisor_resume_result = match source_disposition {
+        SnapshotSourceDisposition::Resume => client
+            .resume_vm()
+            .await
+            .context("resuming Cloud Hypervisor VM after snapshot"),
+        SnapshotSourceDisposition::LeavePaused => Ok(()),
+    };
     if let Err(e) = &hypervisor_resume_result {
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to resume Cloud Hypervisor VM after snapshot — VM may be paused!");
     }
 
-    let guest_network_resume_result = guest
-        .resume(&snapshot_config.vm_id)
-        .await
-        .context("reopening guest network after Cloud Hypervisor snapshot");
+    let guest_network_resume_result = match source_disposition {
+        SnapshotSourceDisposition::Resume => guest
+            .resume(&snapshot_config.vm_id)
+            .await
+            .context("reopening guest network after Cloud Hypervisor snapshot"),
+        SnapshotSourceDisposition::LeavePaused => Ok(()),
+    };
     if let Err(e) = &guest_network_resume_result {
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
@@ -6896,7 +6906,14 @@ pub async fn create_snapshot_ch(
         return Err(error);
     }
 
-    info!(snapshot = %snapshot_config.name, "CH VM and guest network resumed, finalizing snapshot");
+    match source_disposition {
+        SnapshotSourceDisposition::Resume => {
+            info!(snapshot = %snapshot_config.name, "CH VM and guest network resumed, finalizing snapshot");
+        }
+        SnapshotSourceDisposition::LeavePaused => {
+            info!(snapshot = %snapshot_config.name, "CH source remains paused, finalizing snapshot");
+        }
+    }
 
     publish_snapshot_dir(
         &temp_snapshot_dir,
@@ -8453,6 +8470,55 @@ mod tests {
         &source[start..start + end]
     }
 
+    /// `snapshot create --stop` works on a Cloud Hypervisor VM (the fleet's Windows gold
+    /// snapshot uses it): nothing refuses a non-Firecracker source, the CH create gets the
+    /// command's disposition, and a LeavePaused source is neither resumed nor has its guest
+    /// network reopened, as on Firecracker.
+    #[test]
+    fn snapshot_create_stop_leaves_a_cloud_hypervisor_source_paused() {
+        let commands = include_str!("snapshot.rs");
+        let stop = body_of(commands, "async fn cmd_snapshot_create_and_stop(");
+        assert!(
+            !stop.contains("Backend::Firecracker"),
+            "cmd_snapshot_create_and_stop refuses a Cloud Hypervisor source"
+        );
+        let create = body_of(commands, "async fn cmd_snapshot_create(");
+        let ch_call = &create[create
+            .find("create_snapshot_ch(")
+            .expect("cmd_snapshot_create calls create_snapshot_ch")..];
+        let ch_call = &ch_call[..ch_call.find(".await").expect("the call is awaited")];
+        assert!(
+            ch_call.contains("args.stop") && ch_call.contains("LeavePaused"),
+            "create_snapshot_ch is not given --stop's disposition: {ch_call}"
+        );
+        let ch = body_of(
+            include_str!("common.rs"),
+            "pub async fn create_snapshot_ch(",
+        );
+        let after_save = &ch[ch.find(".snapshot_vm(").expect("the save")..];
+        for (step, what) in [
+            (".resume_vm()", "the VM resume"),
+            (".resume(&snapshot_config.vm_id)", "the guest reopen"),
+        ] {
+            let at = after_save
+                .find(step)
+                .unwrap_or_else(|| panic!("no {what} after the save"));
+            let arm = &after_save[..at];
+            let arm = &arm[arm.rfind("match source_disposition").unwrap_or_else(|| {
+                panic!("{what} after the save does not depend on the disposition")
+            })..];
+            assert!(
+                after_save[at..]
+                    .split_once(';')
+                    .unwrap()
+                    .0
+                    .contains("LeavePaused => Ok(())")
+                    || arm.contains("SnapshotSourceDisposition::Resume =>"),
+                "{what} after the save does not skip a LeavePaused source"
+            );
+        }
+    }
+
     /// Fail unless each of `steps` appears in `body`, in that order.
     fn assert_in_order(name: &str, body: &str, steps: &[&str]) {
         let offsets: Vec<usize> = steps
@@ -8724,7 +8790,7 @@ mod tests {
                 "reflink_disks_to_snapshot(",
                 "guest\n        .record_pause(",
                 "\"resuming Cloud Hypervisor VM after snapshot\"",
-                "guest\n        .resume(",
+                "SnapshotSourceDisposition::Resume => guest\n            .resume(",
             ],
         );
 

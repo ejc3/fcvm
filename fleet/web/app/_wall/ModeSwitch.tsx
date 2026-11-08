@@ -1,11 +1,11 @@
-// The wall, the phones (`?mode=phones`) and the potato game (`?mode=potato`) are three views of
-// one page; every header carries this switch in the same place, on its own line under the title,
-// so each view is one click from the others.
+// The wall, the phones (`?mode=phones`), the potato game (`?mode=potato`) and the Windows
+// sandboxes (`?mode=windows`) are four views of one page; every header carries this switch in
+// the same place, on its own line under the title, so each view is one click from the others.
 
 import { useSyncExternalStore } from "react";
 import type { StreamModeView } from "../../core/view.ts";
 
-export type Mode = "wall" | "phones" | "potato";
+export type Mode = "wall" | "phones" | "potato" | "windows";
 
 /** The address of `mode` with the rest of the current query kept (`?broadcast=1` and the like). */
 export function modeHref(mode: Mode, search: string): string {
@@ -35,6 +35,7 @@ export function ModeSwitch({ current, stream = null, onStream }: { current: Mode
       {item("wall", "Wall")}
       {item("phones", "Phones")}
       {item("potato", "Potato")}
+      {item("windows", "Windows")}
       {stream === null ? null : onStream ? (
         <button type="button" className="stream-mode" title={stream.detail} aria-label={`${stream.label}: ${stream.detail}`} data-testid="stream-mode" onClick={(e) => onStream(e.currentTarget)}>
           {stream.label}

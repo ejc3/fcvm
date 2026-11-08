@@ -291,7 +291,7 @@ constexpr Step kTerminal[] = {
     chord2(SC_LWIN, SC_KEY_R), wait(RUN_DIALOG_MS),
     text("powershell -NoExit -Command Get-ComputerInfo -Property OsName,OsVersion,CsProcessors,CsTotalPhysicalMemory"),
     chord1(SC_RETURN)};
-constexpr Step kCloseAll[] = {Step{STEP_CLOSE_UNTIL_DESKTOP, {0, 0, 0}, 0, nullptr, CLOSE_ALL_TRIES}};
+constexpr Step kCloseAll[] = {Step{STEP_CLOSE_UNTIL_DESKTOP, {0, 0, 0}, 0, nullptr, CLOSE_ALL_ROUNDS}};
 
 template <size_t N>
 constexpr Action act(const char* name, const Step (&s)[N]) {
@@ -386,7 +386,8 @@ bool step_keys(const Step& s, std::vector<KeyEvent>* out) {
   return true;
 }
 
-const Step kCloseWindowStep = chord2(SC_LMENU, SC_F4);
+const Step kCloseRound[CLOSE_ROUND_KEYS] = {chord1(SC_ESCAPE), chord2(SC_LMENU, SC_F4), chord1(SC_KEY_N)};
+const int kCloseRoundWaitMs[CLOSE_ROUND_KEYS] = {300, 700, 400};
 
 bool KeyQueue::submit(const std::vector<KeyEvent>& ev, uint64_t* ticket, std::string* err) {
   if (held_) {

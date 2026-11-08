@@ -40,6 +40,7 @@ static_assert(SC_SPACE == RDP_SCANCODE_SPACE, "scancode");
 static_assert(SC_F4 == RDP_SCANCODE_F4, "scancode");
 static_assert(SC_KEY_E == RDP_SCANCODE_KEY_E, "scancode");
 static_assert(SC_KEY_R == RDP_SCANCODE_KEY_R, "scancode");
+static_assert(SC_KEY_N == RDP_SCANCODE_KEY_N, "scancode");
 static_assert(SC_LWIN == RDP_SCANCODE_LWIN, "scancode");
 static_assert(0x10 == RDP_SCANCODE_KEY_Q && 0x1E == RDP_SCANCODE_KEY_A && 0x2C == RDP_SCANCODE_KEY_Z, "scancode");
 static_assert(0x02 == RDP_SCANCODE_KEY_1 && 0x0B == RDP_SCANCODE_KEY_0 && 0x0C == RDP_SCANCODE_OEM_MINUS, "scancode");

@@ -237,8 +237,10 @@ That is acceptable for disposable sandboxes and is stated here so nobody builds 
 
 - no sandbox joins a domain or talks to another sandbox (each is alone in a namespace with no
   route out), so no peer can see two machines with one SID or name;
-- the RDP certificate is the bridge's to trust, and the bridge pins it by fingerprint from the
-  gold image; nobody else connects;
+- the RDP certificate is the bridge's to trust, and the bridge accepts it without a check:
+  it reaches the guest only through the sandbox's `rdp/rdp.sock`, a socket in a 0700
+  directory that serves only its owner's uid, and the guest has no other network peer, so
+  there is no one in between to impersonate it; nobody else connects;
 - the password never leaves the host: the bridge reads it from the image's directory.
 
 A per-clone identity (sysprep generalize, a new SID and name at first start) costs a reboot
@@ -252,11 +254,20 @@ The gold flow, run by the agent once per host and image (stack PR 6):
 1. Cold boot the image in a raw VM. Health answers when Remote Desktop listens.
 2. The bridge logs on as `sandbox` at the sandbox's size (1280 x 720) and waits for
    the desktop. The first logon creates the profile and runs first-logon tasks.
-3. It waits until the desktop is idle: the VM's vCPU threads under 2% of a core for 10 s in a
-   row, read from `/proc` on the host.
-4. The bridge disconnects. The session stays logged on, in the Disconnected state, with the
+3. The bridge disconnects. The session stays logged on, in the Disconnected state, with the
    desktop and its windows alive.
-5. `fcvm snapshot create --stop`.
+4. The agent waits until the desktop is idle: the gold VM's processes (its fcvm and every
+   process below it, read from `/proc` on the host) under 25% of one core on average over 20 s
+   (`--windows-idle-cpu`). On the x86 host the gold VM of the fleet's image used 2 cores
+   through the logon, then settled at 14 to 17% of a core with a busy second (0.3 to 1.1 of a
+   core) every half minute or so. Requiring every second under 15% never settled on it, and
+   the 2% first written here would not either.
+5. The bridge logs on again: it reconnects to the session, saves the reference a clone's
+   first desktop frame is checked against, and disconnects; the agent waits for idle again.
+   The first logon's reference is replaced: its shell can draw the wallpaper seconds before
+   the taskbar, and on the x86 host one reference held no taskbar and matched no restored
+   desktop (RMSE 0.17 against the 0.05 a match needs), so no sandbox ever ran.
+6. `fcvm snapshot create --stop`.
 
 A clone's bridge then connects and reconnects to that session: no logon, no profile load, no
 shell start. Disconnecting before the snapshot matters: a connection open at the snapshot

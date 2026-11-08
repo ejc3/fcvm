@@ -193,6 +193,23 @@ pub enum Intent {
         action: crate::phone::PhoneAction,
         point: Option<crate::phone::TapPoint>,
     },
+    /// Restore a Windows sandbox from its host's gold snapshot (`slot`), or every sandbox.
+    WindowsReset {
+        slot: Option<String>,
+    },
+    /// Borrow a Windows sandbox: `slot` names one (`win-2`), or none takes any free one.
+    ClaimWindows {
+        slot: Option<String>,
+    },
+    /// Give the viewer's sandbox back; `claim`, when given, must name its session.
+    ReleaseWindows {
+        claim: Option<String>,
+    },
+    /// One of the fixed take-over actions, on the viewer's borrowed sandbox.
+    WindowsAction {
+        claim: Option<String>,
+        action: crate::windows::WindowsAction,
+    },
     /// A connected page asks for the GPUs: an arrival, which wakes a sleeping fleet.
     Wake,
     /// Potato mode: shorten the hold the ball carries by a fifth.
@@ -409,6 +426,48 @@ impl Intent {
                     claim: opt_str(args, "claim", "a claim id")?,
                     action,
                     point,
+                })
+            }
+            "windows_reset" => {
+                let slot = opt_str(args, "slot", "a sandbox id")?;
+                let all = match args.get("all") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(v) => v.as_bool().ok_or("args.all must be true or false")?,
+                };
+                match (slot, all) {
+                    (Some(slot), false) => Ok(Intent::WindowsReset { slot: Some(slot) }),
+                    (None, true) => Ok(Intent::WindowsReset { slot: None }),
+                    _ => Err("args must name a slot or say all".into()),
+                }
+            }
+            "claim_windows" => Ok(Intent::ClaimWindows {
+                slot: opt_str(args, "slot", "a sandbox id")?,
+            }),
+            "release_windows" => Ok(Intent::ReleaseWindows {
+                claim: opt_str(args, "claim", "a claim id")?,
+            }),
+            "windows_action" => {
+                // Fail closed: only the enumerated names, and no other argument, so no point,
+                // key or text can ride along.
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::windows::WindowsAction::parse)
+                    .ok_or_else(|| {
+                        format!(
+                            "args.action must be one of {}",
+                            crate::windows::WindowsAction::NAMES
+                        )
+                    })?;
+                if let Some(k) = args
+                    .as_object()
+                    .and_then(|o| o.keys().find(|k| *k != "action" && *k != "claim"))
+                {
+                    return Err(format!("args.{k} is not accepted"));
+                }
+                Ok(Intent::WindowsAction {
+                    claim: opt_str(args, "claim", "a claim id")?,
+                    action,
                 })
             }
             other => Err(format!("unknown intent {other:?}")),

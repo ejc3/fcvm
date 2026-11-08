@@ -492,6 +492,7 @@ async fn report(
                 // A tile serves TLS on 443 at its own IPv4 address.
                 v4_port: None,
                 place: l.and_then(|l| place_of(&l.instance)),
+                desktop_at: None,
             },
         })
         .await;

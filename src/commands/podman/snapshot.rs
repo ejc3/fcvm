@@ -442,6 +442,8 @@ pub async fn create_podman_snapshot(
                     vsock_socket_path: &vsock_socket_path,
                 },
                 Some(&extra_files),
+                // As before: a Cloud Hypervisor source resumes even for a prepare.
+                crate::commands::common::SnapshotSourceDisposition::Resume,
             )
             .await?;
             None

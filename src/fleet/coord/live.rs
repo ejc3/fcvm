@@ -293,9 +293,12 @@ struct Page {
 /// nothing waits this long.
 pub const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Why a late viewer's `claim_gpu` or `claim_phone` is refused: a private GPU is a direct
-/// stream too, and a borrowed phone is shown from its direct stream.
+/// Why a late viewer's `claim_gpu`, `claim_phone` or `claim_windows` is refused: a private GPU
+/// is a direct stream too, and a borrowed phone or sandbox is shown from its direct stream.
 pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the broadcast";
+
+/// The intents a late viewer is refused with [`LATE_CLAIM`].
+pub const LATE_REFUSED: [&str; 3] = ["claim_gpu", "claim_phone", "claim_windows"];
 
 async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
@@ -513,7 +516,7 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
                     })
                 } else if !verified.load(Ordering::SeqCst) {
                     Some(unrecorded_refusal(id, "verify first"))
-                } else if late && (name == "claim_gpu" || name == "claim_phone") {
+                } else if late && LATE_REFUSED.contains(&name.as_str()) {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
                     let app = app.clone();

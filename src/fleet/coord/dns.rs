@@ -44,6 +44,7 @@ pub fn facts(state: &State) -> Vec<Fact> {
         .values()
         .chain(f.ec2.values())
         .chain(f.phones.values())
+        .chain(f.windows.values())
         .map(|s| Fact {
             id: s.id.clone(),
             generation: s.observed.generation,

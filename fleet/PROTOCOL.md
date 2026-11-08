@@ -931,6 +931,105 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   `sleep_failed`, `wake_failed`, `kickoff_failed` today; a page shows any such value),
   `deadline` (no catch reported by the hold plus the flight plus 3 s) or `host_gone`.
 
+### Windows mode
+
+`?mode=windows` on the page shows disposable Windows sandboxes (design:
+`docs/fleet/windows-sandboxes.md`). An agent started with `--windows N` on an x86_64 host runs
+N CPU-only Windows VMs and says so in its hello (`windows`, below); the coordinator makes one
+sandbox per VM, `win-<n>` (numbered fleet-wide, lowest free first), apart from the wall's
+slots and the phones. A sandbox is never a wall tile, never in a race, never given the
+budget. Every sandbox is a Cloud Hypervisor clone of its host's gold snapshot: one idle,
+logged-on desktop of the host's Windows image.
+
+The snapshot's `state.windows` is absent with no sandboxes, else:
+
+```json
+{"label": "Windows Server 2025 evaluation, for demonstration only",
+ "image_aspect": 7.111111111111111, "claim_secs": 120,
+ "borrow": {"cap": 2, "lent": 1, "next_return_at": 1761134525000},
+ "image": {"id": "3f9c0a1b2c4d", "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+           "build": "26100.1742", "installed_at": "2026-11-07T10:00:00Z", "eval_expires": "2027-05-06T10:00:00+00:00",
+           "age_days": 12, "warning": null, "refused": null, "gold": "ready", "gold_error": null},
+ "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "sandboxes": 4},
+ "tiles": [{"id": "win:1", "slot": "win-1", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 1}, "phase": "running",
+            "actions": ["start_menu", "notepad", "explorer", "task_manager", "about", "terminal", "close_all", "reset"],
+            "frame_url": "wss://...", "borrowed": {"session": "windows-claim-3", "viewer": "v-12", "since": ..., "until": ...},
+            "last_relaunch": {"clicked_at": ..., "by": "reset_all", "first_frame_at": ...,
+                              "phases": {"restore_ms": 2100, "connect_ms": 900, "first_frame_ms": 300, "desktop_ms": 120, "total_ms": 3500}}, ...}]}
+```
+
+`tiles` are wall tiles' fields (`TileView`) laid out in the sandboxes' own image: one row of
+up to four, then rows of equal length, each sandbox 16:9 (its desktop, 1280 x 720).
+`image_aspect` is that image's. A tile's `phase` is the agent's (`restoring`, `connecting`,
+`running`, `failed`; `relaunching` until the agent reports the new launch, `pending` before
+its first report). `last_relaunch` times the sandbox's last restore from the click to the
+first frame of its desktop: `first_frame_at` is the bridge's desktop time
+(`desktop_at`, below), kept between the click and the coordinator's read of the report, so a
+host clock ahead of the coordinator's cannot put it after the report or before the click.
+`label` is the line every tile and the take-over panel show. `image` is the Windows image of
+the first host (by name) that reported one (`windows_image`, below): its manifest, its age in
+whole days, `warning` from 150 days after its installation, `refused` once the agent refuses
+to start sandboxes from it (170 days old, or within 7 days of its evaluation's expiry), and the
+gold snapshot's state, `building`, `ready` or `failed` (`gold_error` says why).
+`last_reset_all` is the last committed `windows_reset` of every sandbox, with how many it
+reset.
+
+Intents:
+
+| name | args | effect |
+|------|------|--------|
+| `windows_reset` | `{"slot": "win-2"}` or `{"all": true}` | the sandbox (or every sandbox) is restored from the gold snapshot: its generation moves, timed from the click (`last_relaunch.by` `viewer:<id>`, or `reset_all` for all) |
+| `claim_windows` | `{"slot": "win-2"}` or `{}` | borrow a sandbox (below) |
+| `release_windows` | `{"claim": "windows-claim-3"}` or `{}` | give it back |
+| `windows_action` | `{"action": "notepad", "claim": ...}` | one fixed action on the borrowed sandbox (below) |
+
+**Resets.** `windows_reset` of one sandbox is limited per client as the wall's `relaunch`
+is (`one reset per 2 s per client`, `relaunch_interval_ms`); reset all, at most once every 10 s
+per client (`one reset all per 10 s per client`), resets every sandbox that is not lent and
+not on a draining host. A lent sandbox is refused (`win-2 is lent to a viewer`), and so is a
+sandbox on a draining host (`win-2 is on a draining host`), a name that is no sandbox (`no
+sandbox "win-9"`), args with both or neither of `slot` and `all` (`args must name a slot or
+say all`), a reset all with nothing to reset (`no sandbox can be reset now`), and every reset
+while the fleet sleeps (`the hosts are asleep`).
+
+**Borrowing** (`claim_windows`) follows `claim_phone`'s rules: one sandbox per client
+address, at most `cap` lent at once (`max_windows_lent`, default 2 or half the sandboxes,
+the smaller), and after a sandbox comes back its client waits
+`windows_claim_cooldown_secs` (60) to borrow again. A named sandbox must be running its
+current launch and not lent; without a name the lowest-numbered such sandbox is taken.
+Refusals name the rule: `one sandbox per client at a time`, `1 of 1 sandboxes are already
+lent; the next comes back in 28 s`, `your last sandbox was returned 1 s ago; borrow again in
+59 s`, `win-2 is lent to another viewer`, `win-2 is not running`, `no sandbox can be lent now:
+none is running and free`. A broadcast-only viewer is refused before the state sees the
+intent, as for `claim_phone`. The borrow ends after `windows_claim_secs` (120), on
+`release_windows`, or when its viewer leaves; the sandbox is then reset
+(`last_relaunch.by` `return:<session>`), so the next viewer finds the snapshot's idle desktop.
+
+**Actions** (`windows_action`): only the viewer holding the sandbox, at most one a second
+(`one action a second; wait 500 ms`), and only these names; anything else is refused
+(`args.action must be one of start_menu, notepad, explorer, task_manager, about, terminal,
+close_all, reset`) and nothing reaches Windows. No intent carries a point, a key or text:
+there is no free input of any kind, and any argument but `action` and `claim` is refused
+(`args.text is not accepted`). A sandbox offers only what its host's agent lists in its
+hello (`windows_actions`), and `reset`, which is the coordinator's own; an action the host does
+not list is refused (`win-1's host does not support terminal`).
+
+| action | what the sandbox does |
+|---|---|
+| `start_menu` | opens the Start menu |
+| `notepad` | opens Notepad with a fixed line naming the sandbox and its restore time |
+| `explorer` | opens File Explorer on This PC |
+| `task_manager` | opens Task Manager on its Performance tab |
+| `about` | opens `winver` (edition, build, evaluation expiry) |
+| `terminal` | opens PowerShell running `Get-ComputerInfo` for the OS fields |
+| `close_all` | closes every window the actions opened |
+| `reset` | the sandbox is restored from the gold snapshot (`last_relaunch.by` `reset:<session>`) |
+
+The coordinator hands every action but `reset` to the sandbox's agent in its assignment
+(`windows.actions` below) for 30 s, numbered (`seq`) and tagged with the launch they are for;
+the agent posts each once to the sandbox's bridge (`POST /action {"name": "<action>"}`, with
+the scene token as the bearer token), which sends its fixed input sequence over Remote
+Desktop.
 
 ## Agent
 
@@ -975,7 +1074,11 @@ GPUs the host runs phones on (`--phones N`: the last N of its inventory), apart 
 `gpus`; the coordinator makes one phone per address not among `gpus`. `phone_actions`
 (optional, phones mode) names the take-over actions the host's phones carry out (an agent
 whose phones have no browser leaves out `open_browser` and `open_app`; an agent that knows `tap`
-lists it, and an older one does not). `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+lists it, and an older one does not). `windows` (optional, Windows mode) is how many Windows
+sandboxes the host runs (`--windows N`); the coordinator makes one sandbox per index below it
+and keeps a sandbox's name across a hello that keeps its index. `windows_actions` (optional,
+Windows mode) names the take-over actions the host's sandboxes carry out (every action of
+"Windows mode" but `reset`, the coordinator's own). `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A
@@ -1017,6 +1120,40 @@ reports `standby` once its GPU is free (and scrubbed, with `--scrub`) and no VM 
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 A `/health` reply carrying `error` (the renderer failed) fails the relaunch at once.
+
+A Windows sandbox (Windows mode) reports as a slot with its `win-<n>` id, its phases
+`stopping`, `restoring` (fcvm started the clone), `connecting` (fcvm reports it healthy; the
+bridge is starting), `running` (the bridge reports the desktop) and `failed` (`error`,
+`retry_in_ms` as for a slot; the image's refusal, or a failed gold snapshot, is a `failed`
+with no retry). `vm` is the sandbox's id, and `running` carries `desktop_at`, the bridge's
+`times_unix_ms.desktop` (Unix ms, the host's clock). Its `timings`, all milliseconds, on the
+host's clock, present once known:
+
+| key | from | to |
+|-----|------|----|
+| `teardown_ms` | the agent starts stopping the old VM and its bridge | both have exited |
+| `restore_ms` | the agent starts `fcvm snapshot run` | `fcvm ls --json` shows the VM `healthy` with its `rdp_socket` |
+| `connect_ms` | healthy | the bridge's Remote Desktop connection is up (`times_unix_ms.rdp`) |
+| `first_frame_ms` | `rdp` | the bridge's first frame of the session (`first_frame`) |
+| `desktop_ms` | `first_frame` | the first frame that is the desktop (`desktop`) |
+| `total_ms` | the agent starts the relaunch | `desktop` |
+| `click_to_desktop_ms` | the assignment's `clicked_at` (the coordinator's clock) | `desktop`; absent when the host's clock puts the click after it |
+
+```json
+{"type": "windows_image", "id": "3f9c0a1b2c4d", "edition": "Windows Server 2025 Datacenter Evaluation (Desktop Experience)",
+ "build": "26100.1742", "installed_at": "2026-11-07T10:00:00Z", "eval_expires": "2027-05-06T10:00:00+00:00",
+ "age_days": 150, "warning": "the Windows image installed 2026-11-07 is 150 days old; sandboxes stop starting from it on 2027-04-26: rebuild it from fresh evaluation media",
+ "refused": null, "gold": "ready", "gold_error": null}
+```
+
+Windows mode: the host's image (`--windows-image`, its `manifest.json`), its age in whole days
+on the host's clock, the evaluation rules' verdict and the gold snapshot's state (`building`,
+`ready`, `failed` with `gold_error`). Sent after the hello, whenever any of it changes (the age
+is read every minute), and again at the start of every connection. `warning` is set from 150
+days after `installed_at`; `refused` from 170 days, or from 7 days before `eval_expires`,
+whichever is first, and then every sandbox reports `failed` with it and none starts; a running
+sandbox is stopped within a minute of it (the agent checks the image every minute). The
+coordinator logs a new warning, refusal or gold failure.
 
 ```json
 {"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2}
@@ -1132,6 +1269,20 @@ none is placed). For each slot the agent reconciles:
   running launch with a `seq` above the last carried out is carried out once, in order
   (`fcvm exec --pid <vm> -- /usr/local/bin/phone.sh action <name>`); `reboot_phone` never
   appears (the coordinator relaunches the phone). The aggregator's layout leaves phones out.
+- `windows: {"index": 0, "clicked_at": 1761134400000, "actions": [{"seq": 4, "action": "notepad", "at": ..., "generation": 3}]}`
+  (Windows mode): the slot is a Windows sandbox, the `index`-th of the host's (its ports and
+  address follow every GPU's: inventory index GPUs plus `index`); `sbdf` is empty and `rect`
+  null. `clicked_at` is the click that asked for this generation, when one did. The agent
+  restores it from the gold snapshot (`fcvm snapshot run --snapshot win-gold-<image id>
+  --name <slot id>`), waits until `fcvm ls --json` shows it healthy, starts its bridge (below),
+  and reports `running` once the bridge's `/health` says `windows.state` is `desktop`. Each
+  action of the running launch with a `seq` above the last carried out is posted once, in
+  order, to the bridge (`POST /action {"name": "<action>"}`, the scene token as the bearer
+  token); `reset` never appears (the coordinator relaunches the sandbox). An action is one of the
+  sandbox's events: a new generation, the sandbox leaving the assignment or its image's refusal
+  ends the batch at once, the request in flight included, so a slow action never holds back a
+  reset, a borrow's end, a teardown or the cutoff. A sandbox whose VM or
+  bridge exits, or whose bridge reports `failed`, is relaunched with the slots' backoff.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
   backoff resets once a VM has run for 60 s.
@@ -1300,6 +1451,8 @@ fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image
                  [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
                  [--ipv6-prefix <prefix/len> | --ipv6-prefix-from-imds] [--frame-zone <zone>]
                  [--tls-publish-base <port> [--public-ipv4-from-imds]]
+                 [--windows <n> --windows-image <dir> [--windows-bridge-image <image>]
+                  [--windows-state-dir <dir>] [--windows-snapshot-dir <dir>] [--windows-idle-cpu <share>]]
 ```
 
 `--host-from-imds` names the host by its EC2 instance id. `--tls-secret` hands the fleet's
@@ -1342,6 +1495,69 @@ rootless; the pre-start snapshot cache makes every launch after the first a rest
 frame URL is `ws://<frame host>:<port>/frames`, or the slot's name with `--frame-zone`. `--gpus` replaces
 the sysfs inventory (tests and hosts without vfio-pci). `--spot-notice-url` polls an EC2
 metadata URL (IMDSv2) for `spot/instance-action` every 5 s.
+
+With `--windows N --windows-image <dir>` (Windows mode, an x86_64 host) the agent runs N
+Windows sandboxes from the image directory `fleet/windows/build-image.sh` made (`disk.raw`,
+`CLOUDHV.fd`, `sandbox-password`, `manifest.json`). At start it makes the gold snapshot,
+`win-gold-<key>`, where the key is the image id and the first 12 hex digits of a SHA-256 of
+`manifest.json` and `sandbox-password` (the id hashes the build's recipe only, so a rebuild of
+the same recipe is a new installation, with a new password and new dates, under the same id).
+It is reused when the snapshot's `config.json` in `--windows-snapshot-dir` and the desktop
+reference in `--windows-state-dir/<key>/desktop-ref.ppm` are both there. Otherwise:
+
+1. `fcvm vm run --name win-gold --firmware <dir>/CLOUDHV.fd --disk <dir>/disk.raw --cpu 2
+   --mem 4096 --guest windows --health-port 3389`, until `fcvm ls --json` shows it `healthy`
+   (600 s at most);
+2. the bridge in logon mode (`logon`, below, with `DESKTOP_REF_OUT`), which logs
+   on, saves the desktop it reached as the reference, disconnects and exits 0 (300 s);
+3. until the gold VM's processes (its fcvm and every process below it, from `/proc`) use
+   under `--windows-idle-cpu` of one core (0.25) on average over 20 s (300 s; the settled gold
+   desktop measured 0.14 to 0.17 of a core);
+4. the logon again, which reconnects to the session and saves the reference clones are checked
+   against: the first logon creates the profile, and its shell can draw the wallpaper seconds
+   before the taskbar, so its reference can match no restored desktop;
+5. step 3 again;
+6. `fcvm snapshot create --pid <pid> --tag win-gold-<key> --stop`.
+
+A step that fails reports the gold snapshot `failed` (`windows_image`) and every sandbox
+`failed` with it. Every way out of the flow (success, a failure, the agent stopping) stops the
+gold VM and the logon container and waits for both before the outcome is reported. Each
+sandbox's bridge runs in a container on the host, one per sandbox, named afresh for every
+launch (`fleet-<slot>-bridge-g<generation>-<8 hex>`):
+
+```
+podman run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1
+  --name fleet-<slot>-bridge-g<generation>-<8 hex>
+  --volume <rdp_socket>:/run/windows/rdp.sock --volume <dir>/sandbox-password:/run/windows/sandbox-password:ro
+  --env RDP_SOCKET=/run/windows/rdp.sock --env RDP_USER=sandbox --env RDP_PASSWORD_FILE=/run/windows/sandbox-password
+  --volume <state dir>/<image id>/desktop-ref.ppm:/run/windows/desktop-ref.ppm:ro --env DESKTOP_REF=/run/windows/desktop-ref.ppm
+  --env PORT=8080 --publish <publish ip>:<port>:8080
+  [--volume <tls dir>:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443
+   [--publish <publish ip>:<tls port>:443] [--publish [<ipv6>]:443:443]]
+  <--windows-bridge-image> serve
+```
+
+with the ports a slot at its index would have (`--base-port`, `--tls-publish-base`, and with
+an IPv6 prefix its address, which the agent puts on the host's default IPv6 interface as for
+the aggregator); the scene token is in `tls.json`, as for a renderer. The logon is the same
+container without ports or certificate, with `--volume <state dir>/<image id>:/run/windows/state
+--env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `logon`; the image's entrypoint
+is the bridge, so the mode is its only argument. A bridge is stopped through podman, since the
+container outlives a killed `podman run` client: `podman stop -t 10 <name>`, `podman rm -f
+<name>`, then the client is awaited (killed after 5 s more). An agent killed with SIGKILL
+stops nothing, and podman does not pass SIGKILL on to the container, so before its gold flow an
+agent removes every container labelled `fcvm.fleet.windows-bridge=1` (`podman ps -a -q --filter
+label=...`, then `podman rm -f`). The agent gives each bridge the shared scene's clock and
+admission keys (`POST /scene` with `epoch_unix_ms` and `admit_keys`, the scene token) and each
+new one as it comes; a bridge with a certificate serves no frames without a scene. A sandbox
+reports `running` only once its bridge holds the current scene, or, without `--tls-dir`, when
+the agent has no scene yet; a bridge that reached the desktop but never took the scene fails
+its launch saying so. The removal of labelled containers assumes one agent per host, which
+systemd's unit gives (an agent restarts only after the old one stopped). Every failure of a launch stops both its
+VM and its bridge this way. A sandbox that replaces another on the same index starts only once
+the old one's VM and bridge have exited, waiting as long as the steps of a teardown may take
+together (both podman commands, the client, the VM's grace and the SIGKILLs). Every fcvm and
+podman child is armed with `PR_SET_PDEATHSIG`.
 
 With `--aggregate-port` the agent runs `fcvm fleet aggregate --listen <publish ip>:<port>`
 as a child (it dies with the agent, and is restarted with backoff if it exits), posts it
@@ -2594,7 +2810,7 @@ it is sent in, and at once to a new stream.
 | `task_manager` | Ctrl+Shift+Esc |
 | `about` | Win+R, 800 ms, `winver`, Enter |
 | `terminal` | Win+R, 800 ms, `powershell -NoExit -Command Get-ComputerInfo -Property OsName,OsVersion,CsProcessors,CsTotalPhysicalMemory`, Enter |
-| `close_all` | Alt+F4, 700 ms apart, until the screen matches the desktop reference (or the settled desktop) or 10 times; the reply carries `presses` |
+| `close_all` | rounds of Esc, Alt+F4 and N (300, 700 and 400 ms apart), looking for the desktop reference (or the settled desktop) before every key and stopping there, at most 5 rounds; the reply carries `presses` |
 
 Text is typed as US-layout scancodes. Every key pressed is released within its step.
 

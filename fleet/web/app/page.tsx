@@ -3,6 +3,7 @@ import { NO_FLEET } from "../core/index.ts";
 import { pageDirectLiveUrl, pageLiveUrl } from "../core/live-proxy.ts";
 import { Phones } from "./_wall/Phones.tsx";
 import { Potato } from "./_wall/Potato.tsx";
+import { Windows } from "./_wall/Windows.tsx";
 import { Wall } from "./_wall/Wall.tsx";
 
 // The coordinator's /live URL is read per request, so one build serves any fleet. With the
@@ -20,10 +21,11 @@ export default async function Page({ searchParams }: { searchParams: Promise<Rec
   }
   // The recording shown while the fleet sleeps: static files beside the page, or elsewhere.
   const mediaUrl = process.env.FLEET_MEDIA_URL ?? "/media";
-  // `?mode=phones` shows the phones and `?mode=potato` the potato game instead of the wall;
-  // anything else is the wall.
+  // `?mode=phones` shows the phones, `?mode=potato` the potato game and `?mode=windows` the
+  // Windows sandboxes instead of the wall; anything else is the wall.
   const { mode } = await searchParams;
   if (mode === "phones") return <Phones coordUrl={coordUrl} directUrl={directUrl} mediaUrl={mediaUrl} />;
   if (mode === "potato") return <Potato coordUrl={coordUrl} directUrl={directUrl} />;
+  if (mode === "windows") return <Windows coordUrl={coordUrl} directUrl={directUrl} />;
   return <Wall coordUrl={coordUrl} directUrl={directUrl} mediaUrl={mediaUrl} />;
 }

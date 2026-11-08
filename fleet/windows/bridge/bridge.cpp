@@ -424,13 +424,16 @@ int Bridge::play(const Action& a, std::string* reply) {
           ref = detector_.has_reference() ? detector_.reference() : detector_.desktop_thumb();
         }
         presses = 0;
-        while (presses < s.ms && (ref.empty() || thumb_rmse(current_thumb(), ref) > DESKTOP_RMSE)) {
-          keys.clear();
-          step_keys(kCloseWindowStep, &keys);
-          std::string e;
-          if (!link_.send_keys(keys, &e)) return fail(503, e);
-          presses++;
-          std::this_thread::sleep_for(std::chrono::milliseconds(CLOSE_ALL_WAIT_MS));
+        auto at_desktop = [&] { return !ref.empty() && thumb_rmse(current_thumb(), ref) <= DESKTOP_RMSE; };
+        for (int round = 0; round < s.ms && !at_desktop(); round++) {
+          for (int k = 0; k < CLOSE_ROUND_KEYS && !at_desktop(); k++) {
+            keys.clear();
+            step_keys(kCloseRound[k], &keys);
+            std::string e;
+            if (!link_.send_keys(keys, &e)) return fail(503, e);
+            presses++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(kCloseRoundWaitMs[k]));
+          }
         }
         break;
       }

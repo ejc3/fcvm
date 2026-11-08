@@ -27,6 +27,12 @@
 //   FLEET_MOCK_PHONE_COOLDOWN_S  after a phone comes back, its viewer waits this long to borrow again (60)
 //   FLEET_MOCK_PHONE_RESTORE_MS  a phone's restore after a reboot or a return (2000)
 //   FLEET_MOCK_PHONE_ZOOM_GAP_MS a viewer's zoom is refused sooner than this after its last (2000)
+//   FLEET_MOCK_WINDOWS       Windows sandboxes for windows mode (0: none, and no `windows` in the snapshot)
+//   FLEET_MOCK_WINDOWS_CAP   sandboxes lent at once at most (2)
+//   FLEET_MOCK_WINDOWS_CLAIM_S   how long a borrowed sandbox lasts (120)
+//   FLEET_MOCK_WINDOWS_COOLDOWN_S  after a sandbox comes back, its viewer waits this long to borrow again (60)
+//   FLEET_MOCK_WINDOWS_RESTORE_MS  a sandbox's reset, click to its first desktop frame (3000)
+//   FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS  the Windows image's age in days (12; from 150 it warns, from 170 it is refused)
 //   FLEET_MOCK_POTATO_PLAYERS    potato players one host runs (0: none, and no `potato` in the snapshot)
 //   FLEET_MOCK_POTATO_BUDGET_MS  a ring of n starts at this / (n - 1) ms of hold (2000)
 //   FLEET_MOCK_POTATO_FLOOR_MS   and never below this (400)
@@ -135,6 +141,18 @@ export async function startMock() {
             wakeMs: int("FLEET_MOCK_POTATO_WAKE_MS", 350),
             slowWakeMs: int("FLEET_MOCK_POTATO_SLOW_WAKE_MS", 1500),
             slowWakeChance: int("FLEET_MOCK_POTATO_SLOW_WAKE_PERCENT", 5) / 100,
+          },
+        }
+      : {}),
+    ...(int("FLEET_MOCK_WINDOWS", 0) > 0
+      ? {
+          windows: {
+            count: int("FLEET_MOCK_WINDOWS", 0),
+            cap: int("FLEET_MOCK_WINDOWS_CAP", 2),
+            claimSecs: int("FLEET_MOCK_WINDOWS_CLAIM_S", 120),
+            cooldownSecs: int("FLEET_MOCK_WINDOWS_COOLDOWN_S", 60),
+            restoreMs: int("FLEET_MOCK_WINDOWS_RESTORE_MS", 3000),
+            imageAgeDays: int("FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS", 12),
           },
         }
       : {}),

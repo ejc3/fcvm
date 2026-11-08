@@ -1033,13 +1033,6 @@ async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
     let vm_state = load_snapshot_create_target(&state_manager, &args)
         .await
         .context("loading VM state")?;
-    anyhow::ensure!(
-        matches!(
-            vm_state.config.hypervisor,
-            crate::hypervisor::Backend::Firecracker
-        ),
-        "--stop needs a Firecracker VM"
-    );
     let pid = vm_state
         .pid
         .context("the VM's state names no fcvm process to stop")?;
@@ -1430,6 +1423,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &vm_disk_path,
                     super::common::ChSnapshotGuest::of(&vm_state, vsock_socket_path.as_deref())?,
                     inode_tables,
+                    if args.stop {
+                        super::common::SnapshotSourceDisposition::LeavePaused
+                    } else {
+                        super::common::SnapshotSourceDisposition::Resume
+                    },
                 )
                 .await?;
                 None
@@ -1599,9 +1597,9 @@ fn fc_agent_vsock(vsock_socket_path: &Option<PathBuf>) -> Result<&Path> {
 }
 
 /// What `snapshot create` can do with a raw VM (no fc-agent): a Cloud Hypervisor memory
-/// snapshot, pause, save and resume. A disk-only capture freezes the guest's filesystems
-/// through fc-agent, `--gpu-warm` checkpoints CUDA through it, and `--stop`,
-/// `--inherit-working-set` and `--memory-dir` are for Firecracker snapshots.
+/// snapshot, pause, save and resume, or with `--stop` pause, save and stop. A disk-only
+/// capture freezes the guest's filesystems through fc-agent, `--gpu-warm` checkpoints CUDA
+/// through it, and `--inherit-working-set` and `--memory-dir` are for Firecracker snapshots.
 fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) -> Result<()> {
     if vm_state.config.guest.runs_fc_agent() {
         return Ok(());
@@ -1615,7 +1613,6 @@ fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) 
     for (set, flag) in [
         (args.disk_only, "--disk-only"),
         (args.gpu_warm, "--gpu-warm"),
-        (args.stop, "--stop"),
         (args.inherit_working_set, "--inherit-working-set"),
         (args.memory_dir.is_some(), "--memory-dir"),
     ] {
@@ -7634,11 +7631,15 @@ mod tests {
         state.config.guest = crate::state::Guest::Windows;
         state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
         ensure_raw_snapshot_supported(&state, &create_args()).expect("a memory snapshot");
+        // --stop needs nothing of the guest: the source stays paused and its fcvm is stopped
+        // (the fleet's Windows gold snapshot uses it).
+        let mut stop = create_args();
+        stop.stop = true;
+        ensure_raw_snapshot_supported(&state, &stop).expect("--stop on a raw VM");
         type Refusal = (&'static str, fn(&mut SnapshotCreateArgs));
-        let refusals: [Refusal; 5] = [
+        let refusals: [Refusal; 4] = [
             ("--disk-only", |a| a.disk_only = true),
             ("--gpu-warm", |a| a.gpu_warm = true),
-            ("--stop", |a| a.stop = true),
             ("--inherit-working-set", |a| a.inherit_working_set = true),
             ("--memory-dir", |a| a.memory_dir = Some("/dev/shm".into())),
         ];

@@ -76,6 +76,7 @@ pnpm build && pnpm start:mock    # the same with a production build
 pnpm lint && pnpm typecheck && pnpm test     # 141 unit tests (vitest)
 pnpm build && pnpm test:e2e                  # the wall's browser tests, then phones mode's and potato mode's (Playwright)
 pnpm build && pnpm exec playwright test -c playwright.phones.config.ts   # phones mode only, against a mock with four phones
+pnpm build && pnpm exec playwright test -c playwright.windows.config.ts  # windows mode only, against a mock with four sandboxes, on a desktop and a phone screen
 pnpm build && pnpm exec playwright test -c playwright.potato.config.ts   # potato mode only, against a mock host with eight players
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
@@ -109,6 +110,21 @@ none unless `FLEET_MOCK_PHONES=<n>` is set (`pnpm dev:mock` with it, or the phon
 config); the other `FLEET_MOCK_PHONE_*` knobs are listed at the top of `mock/main.ts`. The zoom
 between the seamless picture and the phones apart in bezels is the fleet's (`phones_zoom`), so
 every viewer sees it move; the phone a viewer has opened is that viewer's own.
+
+`/?mode=windows` shows the Windows sandboxes (PROTOCOL.md, "Windows mode"): each sandbox's desktop
+drawn from its own stream (one row of up to four 16:9 tiles, then rows of equal length), labelled
+with its slot, the image's edition, "Desktop in X.XX s" (click to first desktop frame) and
+"Windows Server 2025 evaluation, for demonstration only". The header gives the sandboxes up, the
+median and slowest time to desktop, the last "Reset all", and the image's warning, refusal and
+gold snapshot state. Clicking a tile resets that sandbox (`windows_reset`) and it shows a running
+timer until its desktop is back; "Reset all" resets every sandbox. "Take over" borrows one
+(`claim_windows`) and opens a panel of the fixed actions its host lists, plus Reset and Give back.
+There is no free input: nothing typed or pointed at reaches Windows. The mock has none unless
+`FLEET_MOCK_WINDOWS=<n>` is set; `FLEET_MOCK_WINDOWS_CAP` (sandboxes lent at once, 2),
+`FLEET_MOCK_WINDOWS_CLAIM_S` (120), `FLEET_MOCK_WINDOWS_COOLDOWN_S` (60),
+`FLEET_MOCK_WINDOWS_RESTORE_MS` (a reset's time to the first desktop frame, 3000) and
+`FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS` (12; from 150 it warns, from 170 it is refused) are listed at
+the top of `mock/main.ts`.
 
 `/?mode=potato` shows the hot potato game (PROTOCOL.md, "Potato mode"): a ring of CPU-only
 player VMs, each drawn in its colour, bright while awake, dim while asleep and with a bar while it

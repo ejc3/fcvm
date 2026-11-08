@@ -1,0 +1,861 @@
+{
+  "config": {
+    "max_windows_lent": 1,
+    "windows_claim_cooldown_secs": 60,
+    "windows_claim_secs": 30
+  },
+  "description": "Windows mode, the edges of a borrow: an action at the borrow's deadline is refused and the sandbox reset at that moment, before any tick; a host that leaves and comes back still running a lent desktop has that sandbox reset, and the borrower's cooldown kept; a launch reported late is timed from the bridge's desktop time less its total.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 2000,
+        "frame_url": "ws://h1:20101/frames",
+        "generation": 1,
+        "id": "win-1",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 2400,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 1,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 1000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2600,
+      "client": "198.51.100.20",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 3000,
+      "client": "198.51.100.20",
+      "id": "c1",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "action": "notepad"
+      },
+      "at": 33000,
+      "client": "198.51.100.20",
+      "id": "a1",
+      "name": "windows_action",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 36000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 35900,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 36500,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 37000,
+      "client": "198.51.100.21",
+      "id": "c2",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 38000,
+      "host": "h1",
+      "type": "agent_gone"
+    },
+    {
+      "at": 38500,
+      "client": "198.51.100.22",
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
+      "at": 39000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 39500,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 39400,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 39600,
+      "host": "h1",
+      "type": "agent_gone"
+    },
+    {
+      "at": 39700,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "type": "hello",
+        "windows": 2,
+        "windows_actions": [
+          "start_menu",
+          "notepad",
+          "explorer",
+          "task_manager",
+          "about",
+          "close_all"
+        ]
+      },
+      "type": "agent"
+    },
+    {
+      "at": 39800,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 39400,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 2,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 39900,
+      "client": "198.51.100.22",
+      "id": "c3a",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 40000,
+      "client": "198.51.100.21",
+      "id": "c3",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 40100,
+      "client": "198.51.100.22",
+      "id": "c4",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 42000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 41900,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 3,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "win-2"
+      },
+      "at": 42500,
+      "client": "198.51.100.22",
+      "id": "c5",
+      "name": "claim_windows",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 43000,
+      "host": "h1",
+      "msg": {
+        "desktop_at": 41900,
+        "frame_url": "ws://h1:20102/frames",
+        "generation": 3,
+        "id": "win-2",
+        "phase": "running",
+        "timings": {
+          "total_ms": 2000
+        },
+        "type": "slot",
+        "vm": "win-2"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 1,
+      "checks": {
+        "/view/windows/tiles/0/last_relaunch/clicked_at": 0,
+        "/view/windows/tiles/0/last_relaunch/first_frame_at": 2000
+      },
+      "note": "a report read 500 ms after the desktop showed still times the launch's 2000 ms: the start is the desktop time less total_ms"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/c1/outcome": "committed",
+        "/view/windows/tiles/1/borrowed/until": 33000
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/assign/h1/1/generation": 2,
+        "/assign/h1/1/windows/actions": [],
+        "/receipts/a1/outcome": "refused",
+        "/receipts/a1/reason": "sandbox actions need a sandbox of your own (claim_windows)",
+        "/view/windows/tiles/1/borrowed": null,
+        "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-1"
+      },
+      "note": "an action at the borrow's end, before any tick, is refused and the sandbox is reset at once"
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/c2/outcome": "committed"
+      }
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/windows": null
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/view/windows/borrow/lent": 0,
+        "/view/windows/tiles/1/phase": "pending"
+      }
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-2",
+        "/view/windows/tiles/1/last_relaunch/clicked_at": 39500,
+        "/view/windows/tiles/1/phase": "relaunching"
+      },
+      "note": "the host comes back still running the lent desktop: it is reset before anyone can borrow it"
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/windows": null
+      },
+      "note": "the host leaves again before it ran the reset"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/view/windows/tiles/1/last_relaunch/by": "return:windows-claim-2",
+        "/view/windows/tiles/1/phase": "relaunching"
+      },
+      "note": "it comes back still on the lent launch: the reset is asked for again, until the fresh launch runs"
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/receipts/c3a/reason": "win-2 is not running"
+      }
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/receipts/c3/reason": "your last sandbox was returned 2 s ago; borrow again in 58 s"
+      },
+      "note": "the borrow that ended with the host keeps its cooldown"
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/receipts/c4/reason": "win-2 is not running"
+      }
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/receipts/c5/outcome": "committed"
+      },
+      "note": "once reset it is lent again, and the mark is gone: a later report does not reset it twice"
+    },
+    {
+      "after": 21,
+      "checks": {
+        "/assign/h1/1/generation": 3
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 3000,
+        "id": "c1",
+        "name": "claim_windows",
+        "outcome": "committed",
+        "summary": "windows-claim-1 on win-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "action": "notepad"
+        },
+        "at": 33000,
+        "id": "a1",
+        "name": "windows_action",
+        "outcome": "refused",
+        "summary": "sandbox actions need a sandbox of your own (claim_windows)",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 37000,
+        "id": "c2",
+        "name": "claim_windows",
+        "outcome": "committed",
+        "summary": "windows-claim-2 on win-2",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 39900,
+        "id": "c3a",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "win-2 is not running",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 40000,
+        "id": "c3",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "your last sandbox was returned 2 s ago; borrow again in 58 s",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 40100,
+        "id": "c4",
+        "name": "claim_windows",
+        "outcome": "refused",
+        "summary": "win-2 is not running",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "slot": "win-2"
+        },
+        "at": 42500,
+        "id": "c5",
+        "name": "claim_windows",
+        "outcome": "committed",
+        "summary": "windows-claim-3 on win-2",
+        "viewer": "v3"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 4,
+      "restores_last_hour": 4,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 38500,
+        "last_wake": null,
+        "sleep_without_arrival_at": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 8000,
+      "holding": "plains",
+      "holding_label": "Across the plains to the mountains",
+      "leading": "ridges",
+      "next": null,
+      "next_hold_at": 10000,
+      "next_label": null,
+      "opened_at": 0,
+      "targets": [
+        {
+          "arrive_at": 34000,
+          "id": "ridges",
+          "label": "Across the ridges",
+          "votes": 0
+        },
+        {
+          "arrive_at": 34000,
+          "id": "western-sea",
+          "label": "Over the western sea",
+          "votes": 0
+        },
+        {
+          "arrive_at": 34000,
+          "id": "peak-close",
+          "label": "Circling the peak",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -12.861588,
+            1.35,
+            -101.722203
+          ],
+          "pos": [
+            3.0,
+            0.55,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.1036,
+            1.36,
+            -100.987452
+          ],
+          "pos": [
+            3.0,
+            0.56,
+            -89.6
+          ],
+          "t": 1.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.338549,
+            1.37,
+            -100.247706
+          ],
+          "pos": [
+            3.0,
+            0.57,
+            -89.2
+          ],
+          "t": 2.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.566332,
+            1.38,
+            -99.503114
+          ],
+          "pos": [
+            3.0,
+            0.58,
+            -88.8
+          ],
+          "t": 3.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.786847,
+            1.39,
+            -98.753828
+          ],
+          "pos": [
+            3.0,
+            0.59,
+            -88.4
+          ],
+          "t": 4.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.0,
+            1.4,
+            -98.0
+          ],
+          "pos": [
+            3.0,
+            0.6,
+            -88.0
+          ],
+          "t": 5.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.205696,
+            1.41,
+            -97.241786
+          ],
+          "pos": [
+            3.0,
+            0.61,
+            -87.6
+          ],
+          "t": 6.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.403845,
+            1.42,
+            -96.479342
+          ],
+          "pos": [
+            3.0,
+            0.62,
+            -87.2
+          ],
+          "t": 7.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.59436,
+            1.43,
+            -95.712828
+          ],
+          "pos": [
+            3.0,
+            0.63,
+            -86.8
+          ],
+          "t": 8.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.777157,
+            1.44,
+            -94.942405
+          ],
+          "pos": [
+            3.0,
+            0.64,
+            -86.4
+          ],
+          "t": 9.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.952157,
+            1.45,
+            -94.168235
+          ],
+          "pos": [
+            3.0,
+            0.65,
+            -86.0
+          ],
+          "t": 10.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -15.123232,
+            1.46,
+            -93.392246
+          ],
+          "pos": [
+            3.0,
+            0.66,
+            -85.6
+          ],
+          "t": 11.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.71,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7,
+          "t": 0.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 3,
+      "count": 3
+    },
+    "windows": {
+      "borrow": {
+        "cap": 1,
+        "lent": 1,
+        "next_return_at": 72500
+      },
+      "claim_secs": 30,
+      "image": null,
+      "image_aspect": 3.5555555555555554,
+      "label": "Windows Server 2025 evaluation, for demonstration only",
+      "last_reset_all": null,
+      "tiles": [
+        {
+          "actions": [
+            "start_menu",
+            "notepad",
+            "explorer",
+            "task_manager",
+            "about",
+            "close_all",
+            "reset"
+          ],
+          "borrowed": null,
+          "error": null,
+          "failure": null,
+          "fps": null,
+          "frame_url": null,
+          "frame_url_v4": null,
+          "generation": 1,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h1",
+          "id": "win:1",
+          "last_relaunch": null,
+          "phase": "pending",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "slot": "win-1",
+          "vm": null
+        },
+        {
+          "actions": [
+            "start_menu",
+            "notepad",
+            "explorer",
+            "task_manager",
+            "about",
+            "close_all",
+            "reset"
+          ],
+          "borrowed": {
+            "session": "windows-claim-3",
+            "since": 42500,
+            "until": 72500,
+            "viewer": "v3"
+          },
+          "error": null,
+          "failure": null,
+          "fps": null,
+          "frame_url": "ws://h1:20102/frames",
+          "frame_url_v4": null,
+          "generation": 3,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h1",
+          "id": "win:2",
+          "last_relaunch": {
+            "by": "return:windows-claim-2",
+            "clicked_at": 39800,
+            "first_frame_at": 41900,
+            "phases": {
+              "total_ms": 2000
+            }
+          },
+          "phase": "running",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.5,
+            "y": 0.0
+          },
+          "slot": "win-2",
+          "vm": "win-2"
+        }
+      ]
+    }
+  }
+}

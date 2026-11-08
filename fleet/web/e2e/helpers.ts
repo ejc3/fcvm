@@ -285,3 +285,22 @@ function solve4(A: number[][], y: number[]): number[] {
   }
   return m.map((row, i) => row[4]! / row[i]!);
 }
+
+/**
+ * Whether a Windows tile's demonstration label is whole: its text does not overflow its own box
+ * (`fits`: scrollWidth and scrollHeight within clientWidth and clientHeight), and the box lies
+ * inside the tile's caption, which hides what overflows it (`inside`).
+ */
+export async function labelIsWhole(page: Page, slot: string): Promise<{ fits: boolean; inside: boolean }> {
+  return page.evaluate((slot) => {
+    const label = document.querySelector<HTMLElement>(`[data-testid="sandbox-label-${slot}"]`);
+    const caption = document.querySelector<HTMLElement>(`[data-testid="sandbox-caption-${slot}"]`);
+    if (!label || !caption) return { fits: false, inside: false };
+    const l = label.getBoundingClientRect();
+    const c = caption.getBoundingClientRect();
+    return {
+      fits: label.scrollWidth <= label.clientWidth + 1 && label.scrollHeight <= label.clientHeight + 1,
+      inside: l.left >= c.left - 1 && l.top >= c.top - 1 && l.right <= c.right + 1 && l.bottom <= c.bottom + 1,
+    };
+  }, slot);
+}
