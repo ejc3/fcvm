@@ -4,7 +4,8 @@
 
 use std::fs::File;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use nix::sys::statfs::{fstatfs, FsType, FUSE_SUPER_MAGIC};
 use nix::unistd::{lseek, Whence};
 use tracing::warn;
 
@@ -59,8 +60,9 @@ impl HoleMap {
     /// nothing.
     ///
     /// The kernel may report a hole as data, which only leaves that granule unmarked. It never
-    /// reports data as a hole. The walk moves the file offset of `file`, which a caller that
-    /// reads through the offset has to set again.
+    /// reports data as a hole, once the walk has flushed a file on FUSE
+    /// ([`flush_for_hole_walk`]). The walk moves the file offset of `file`, which a caller
+    /// that reads through the offset has to set again.
     pub fn from_file(file: &File, len: usize) -> Result<Self> {
         let mut map = Self::new(len);
         let mut hole_start = 0usize;
@@ -379,15 +381,55 @@ fn resident_run(
     Some((first, (run * page_size).min(len)))
 }
 
+/// Whether a file on a filesystem of type `fs_type` has to be flushed before `SEEK_DATA` and
+/// `SEEK_HOLE` describe it. Only on FUSE: fuse-pipe forwards both to the host, so in a nested
+/// L1 whose data dir is on fuse-pipe with the writeback cache, a page still dirty in the L1's
+/// page cache reads as a hole. A caller that trusts the walk would then take written data for
+/// zeros: a memory server would serve zeros for the page, and a copy of the data runs would
+/// leave it out. A local filesystem answers from its page cache, dirty pages included, and
+/// flushing a file just written costs seconds (`fdatasync` took 3.27 s for one on btrfs).
+pub(crate) fn hole_walk_needs_flush(fs_type: FsType) -> bool {
+    fs_type == FUSE_SUPER_MAGIC
+}
+
+/// Flush `file` if its filesystem needs that before `SEEK_DATA` and `SEEK_HOLE` describe it
+/// ([`hole_walk_needs_flush`]). [`for_each_data_run`] calls this itself. Code that seeks for
+/// data and holes with a loop of its own calls it once before its first seek.
+pub(crate) fn flush_for_hole_walk(file: &File) -> Result<()> {
+    let fs_type = fstatfs(file)
+        .context("reading the filesystem type of a file before walking its holes")?
+        .filesystem_type();
+    if hole_walk_needs_flush(fs_type) {
+        file.sync_data()
+            .context("flushing a file on FUSE before walking its holes")?;
+    }
+    Ok(())
+}
+
 /// Call `each(start, end)` for every data run of the first `len` bytes of `file`, in order,
 /// from `lseek(SEEK_DATA)` and `lseek(SEEK_HOLE)`, so no data is read. Everything between two
 /// runs is a hole, which reads as zeros and stores nothing. A run that ends past `len` is an
 /// error: the file is then longer than the caller believes, and its runs would not describe
 /// the bytes the caller asked about.
 ///
-/// The kernel may report a hole as data, and never reports data as a hole. The calls move the
-/// file offset of `file`, which a caller that reads through the offset has to set again.
+/// A file on FUSE is flushed first ([`flush_for_hole_walk`]). After that the kernel may
+/// report a hole as data, and never reports data as a hole. The calls move the file offset of
+/// `file`, which a caller that reads through the offset has to set again.
 pub fn for_each_data_run(file: &File, len: u64, mut each: impl FnMut(u64, u64)) -> Result<()> {
+    try_for_each_data_run(file, len, |start, end| {
+        each(start, end);
+        Ok(())
+    })
+}
+
+/// [`for_each_data_run`] for a caller that may have to stop: an error from `each` ends the
+/// walk there and is returned.
+pub fn try_for_each_data_run(
+    file: &File,
+    len: u64,
+    mut each: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<()> {
+    flush_for_hole_walk(file)?;
     let mut offset = 0u64;
     while offset < len {
         let at = i64::try_from(offset)?;
@@ -404,7 +446,7 @@ pub fn for_each_data_run(file: &File, len: u64, mut each: impl FnMut(u64, u64)) 
             data_start >= offset && data_end > data_start && data_end <= len,
             "the data run at offset {data_start} ends at {data_end} in a file of {len} bytes"
         );
-        each(data_start, data_end);
+        each(data_start, data_end)?;
         offset = data_end;
     }
     Ok(())
@@ -736,6 +778,90 @@ mod tests {
         assert!(!map.covers(0, page));
     }
 
+    /// A file on FUSE is flushed before its holes are read, and one on a local filesystem is
+    /// not. fuse-pipe forwards SEEK_HOLE to the host, so in a nested L1 with the writeback
+    /// cache a page still dirty in the L1 would read as a hole. A local filesystem answers
+    /// SEEK_HOLE from its page cache, and a flush of a file just written costs seconds.
+    #[test]
+    fn a_file_is_flushed_before_its_holes_are_read_only_on_fuse() {
+        use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, TMPFS_MAGIC, XFS_SUPER_MAGIC};
+        assert!(
+            hole_walk_needs_flush(FUSE_SUPER_MAGIC),
+            "a file on FUSE must be flushed: SEEK_HOLE there sees only what was written back"
+        );
+        for (name, local) in [
+            ("btrfs", BTRFS_SUPER_MAGIC),
+            ("ext4", EXT4_SUPER_MAGIC),
+            ("xfs", XFS_SUPER_MAGIC),
+            ("tmpfs", TMPFS_MAGIC),
+        ] {
+            assert!(
+                !hole_walk_needs_flush(local),
+                "a file on {name} must not be flushed: SEEK_HOLE there reads the page cache, \
+                 and a flush of a file just written costs seconds"
+            );
+        }
+        // Control: the decision is made on the type of the file walked, and a memfd is tmpfs.
+        let memfd = memfd_with_pages(c"fcvm-holes-fs-type", 1, &[]);
+        assert_eq!(
+            fstatfs(&memfd)
+                .expect("fstatfs on a memfd")
+                .filesystem_type(),
+            TMPFS_MAGIC
+        );
+        flush_for_hole_walk(&memfd).expect("a file that needs no flush");
+    }
+
+    /// The text of the function of `source` whose signature starts with `signature`, up to
+    /// the line that closes it.
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` was renamed without updating this test"));
+        let body = &source[start..];
+        &body[..body.find("\n}\n").expect("the function ends")]
+    }
+
+    /// Where `needle` is in `body`, the text of the function `name`.
+    fn position(body: &str, name: &str, needle: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("{name} has no `{needle}`"))
+    }
+
+    /// The flush that a file on FUSE gets comes before the first seek of the walk, inside the
+    /// walk itself, so every caller of the walk gets it, the memory server's hole map among
+    /// them. No fake filesystem misreports dirty pages to SEEK_HOLE, so the order is pinned
+    /// by the source.
+    #[test]
+    fn the_hole_walk_flushes_before_its_first_seek() {
+        let source = include_str!("holes.rs");
+
+        let walk = function_body(source, "pub fn try_for_each_data_run(");
+        assert!(
+            position(walk, "try_for_each_data_run", "flush_for_hole_walk(file)?")
+                < position(walk, "try_for_each_data_run", "lseek("),
+            "the walk must flush the file before its first seek"
+        );
+        let plain = function_body(source, "pub fn for_each_data_run(");
+        position(plain, "for_each_data_run", "try_for_each_data_run(");
+
+        let flush = function_body(source, "pub(crate) fn flush_for_hole_walk(");
+        assert!(
+            position(flush, "flush_for_hole_walk", "if hole_walk_needs_flush(")
+                < position(flush, "flush_for_hole_walk", ".sync_data()"),
+            "a file is flushed only where hole_walk_needs_flush says so"
+        );
+
+        let from_file = function_body(source, "pub fn from_file(");
+        position(from_file, "HoleMap::from_file", "for_each_data_run(");
+        let before_tests = &source[..source.find("\nmod tests {").expect("the tests")];
+        assert_eq!(
+            before_tests.matches("Whence::Seek").count(),
+            2,
+            "a seek for data or a hole outside for_each_data_run needs a flush of its own"
+        );
+    }
+
     /// A data run that ends past the length asked for is an error, for the hole map and for
     /// `data_run_bytes` alike. The file is then longer than its caller believes, and neither
     /// the map nor the byte count would describe it.
@@ -763,6 +889,27 @@ mod tests {
         assert!(
             HoleMap::from_file(&memfd, 2 * page).is_err(),
             "a hole map over a file longer than its length must not be built"
+        );
+    }
+
+    /// An error from the callback of `try_for_each_data_run` ends the walk at that run and
+    /// comes back to the caller.
+    #[test]
+    fn an_error_from_the_callback_stops_the_walk() {
+        let page = host_page_size();
+        let memfd = memfd_with_pages(c"fcvm-holes-stop", 6, &[(0, 1), (2, 2), (4, 3)]);
+        let mut seen = Vec::new();
+        let error = try_for_each_data_run(&memfd, 6 * page, |start, end| {
+            seen.push((start, end));
+            ensure!(seen.len() < 2, "stop at the second run");
+            Ok(())
+        })
+        .expect_err("the callback's error");
+        assert_eq!(error.to_string(), "stop at the second run");
+        assert_eq!(
+            seen,
+            [(0, page), (2 * page, 3 * page)],
+            "the third run is not reached"
         );
     }
 }
