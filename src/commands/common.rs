@@ -5331,6 +5331,12 @@ async fn publish_snapshot_dir(
     // A memory file in --memory-dir changes its reclaim record as the last step before the
     // rename (`hand_memory_file_to_publication`), which keeps the window in which a killed
     // create leaves an older build's reclaim a record it cannot read as short as it can be.
+    // A `<tag>.old` an earlier crash left, which the rename would remove first, goes before
+    // the handover, so nothing slow remains between the two.
+    if written.is_ok() && memory_file.is_some() {
+        let _ =
+            crate::storage::disk::remove_snapshot_dir(&snapshot_sibling(snapshot_dir, "old")).await;
+    }
     let written = written.and_then(|()| match memory_file {
         Some((owner, target)) => {
             hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
