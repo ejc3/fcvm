@@ -45,6 +45,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/random.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -259,10 +260,24 @@ int main(int argc, char **argv)
 			else
 				line(n, "ok");
 		} else if (!strcmp(kind, "notify")) {
-			char path[4096], name[64];
-			snprintf(name, sizeof(name), "created-%d-%d", (int)getpid(), n);
-			snprintf(path, sizeof(path), "%s/%s", arg, name);
-			int f = open(path, O_CREAT | O_WRONLY, 0644);
+			/* A clone restored from a snapshot runs the same check numbers again
+			 * (even the same random name, when the snapshot caught it between the
+			 * draw and the create), and a later generation killed between its create
+			 * and its unlink left that name on the shared host directory, where a
+			 * create finds the file and raises no IN_CREATE. So the create is
+			 * exclusive, and a name that exists is drawn again. */
+			char path[4096], name[96];
+			int f = -1;
+			for (int attempt = 0; attempt < 16; attempt++) {
+				unsigned long long nonce = 0;
+				if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce))
+					nonce = ((unsigned long long)time(NULL) << 16) ^ (unsigned long long)attempt;
+				snprintf(name, sizeof(name), "created-%d-%d-%llx", (int)getpid(), n, nonce);
+				snprintf(path, sizeof(path), "%s/%s", arg, name);
+				f = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+				if (f >= 0 || errno != EEXIST)
+					break;
+			}
 			if (f < 0) {
 				line(n, "BAD create %s: %s", path, strerror(errno));
 			} else {

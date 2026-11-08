@@ -589,6 +589,71 @@ async fn gymhold_binary() -> Result<PathBuf> {
         .cloned()
 }
 
+/// A notify hold's check names must never repeat: a clone restored from a snapshot runs
+/// the same check numbers again, and a name a killed later generation left on the shared
+/// host directory makes the create find the file and raise no IN_CREATE. Here the files
+/// the first checks would name already exist, as such a generation leaves them.
+#[tokio::test]
+async fn a_notify_check_raises_its_event_where_an_earlier_generation_left_a_file() {
+    let gymhold = gymhold_binary().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let watched = dir.path().join("notify");
+    std::fs::create_dir(&watched).unwrap();
+    let log = dir.path().join("hold.log");
+    // The shell's pid is the hold's after exec, so the leftovers carry its names.
+    let script = format!(
+        "set -e; for n in 0 1 2 3 4 5; do touch {w}/created-$$-$n; done; exec {g} {l} notify {w}",
+        w = watched.display(),
+        g = gymhold.display(),
+        l = log.display()
+    );
+    let mut hold = tokio::process::Command::new("sh")
+        .args(["-c", &script])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.lines().count() >= 4 || Instant::now() > deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let _ = hold.kill().await;
+    let checks: Vec<&str> = text.lines().take(4).collect();
+    assert_eq!(checks.len(), 4, "the hold logged {text:?}");
+    assert!(
+        checks.iter().all(|line| line.ends_with(" ok")),
+        "a check missed its IN_CREATE: {checks:?}"
+    );
+}
+
+/// A snapshot can catch a notify check between drawing its random name and creating
+/// the file, so the clone restored from it draws the same name. Only an exclusive
+/// create, drawn again when the name exists, keeps every check's IN_CREATE.
+#[test]
+fn a_notify_check_creates_its_file_exclusively_and_draws_again_when_it_exists() {
+    let source = include_str!("gym/gymhold.c");
+    // The first notify branch sets the watch up; the last one runs each check.
+    let start = source
+        .rfind("!strcmp(kind, \"notify\")")
+        .expect("gymhold.c has a notify hold");
+    let branch = &source[start..];
+    let branch = &branch[..branch.find("} else if").unwrap_or(branch.len())];
+    let create = branch
+        .find("O_CREAT | O_EXCL")
+        .expect("the notify create is exclusive");
+    assert!(
+        branch[create..].contains("errno != EEXIST"),
+        "the notify hold draws a new name when the exclusive create finds one"
+    );
+    assert!(
+        branch[..create].contains("getrandom"),
+        "the notify name is drawn inside the retry"
+    );
+}
+
 /// Lay out the files every hold uses under `dir`.
 async fn populate(dir: &Path, gymhold: &Path) -> Result<()> {
     for sub in ["dir", "bin", "notify"] {
