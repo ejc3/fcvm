@@ -658,6 +658,11 @@ except OSError as e:
 /// /mnt/image-cache/<digest>.oci.tar: no such file or directory" (#660). It is
 /// exported by image ID, under a unique temporary name, and renamed into place.
 async fn nested_test_archive(digest_stripped: &str) -> Result<String> {
+    // The archive is named by digest and reused while it exists, so an empty digest
+    // would name every build's image the same file and run a stale one.
+    if digest_stripped.is_empty() {
+        bail!("localhost/nested-test has no digest to name its archive by");
+    }
     let path = format!("/mnt/fcvm-btrfs/image-cache/{digest_stripped}.oci.tar");
     if std::path::Path::new(&path).exists() {
         return Ok(path);
@@ -1045,7 +1050,10 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
 /// Test L3 network: measures throughput degradation through triple NAT chain.
 ///
 /// 672 to 810 s in four runs on a c8g.metal-48xl with the 6.18.60 host and guest kernels
-/// (#660). Not in CI: Makefile CI_ROOT_BASE runs only the kept nested tests.
+/// (#660). Not in CI: Makefile CI_ROOT_BASE runs only the kept nested tests. Every
+/// transfer must complete (`network_script`), and the rate is reported, not judged: L3
+/// moved 0 to 3 Mbit/s out and 24 to 107 Mbit/s in with one stream, and 0 with four, in
+/// 2 s transfers, against 25 to 50 Gbit/s at L1 and 2 to 11 Gbit/s at L2.
 #[tokio::test]
 async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -1338,18 +1346,17 @@ echo "Server: $SERVER:$PORT"
 
 # Check if iperf3 is available
 if ! command -v iperf3 &> /dev/null; then
-    echo "NETBENCH_L${{LEVEL}}=SKIP (iperf3 not installed)"
-    echo "MARKER_NET_L${{LEVEL}}_OK"
-    exit 0
+    echo "NETBENCH_L${{LEVEL}}=FAIL (iperf3 not installed)"
+    exit 1
 fi
 
 # Check connectivity first
 echo "--- Connectivity Test ---"
 if ! timeout 5 bash -c "echo > /dev/tcp/$SERVER/$PORT" 2>/dev/null; then
-    echo "NETBENCH_L${{LEVEL}}=SKIP (cannot reach $SERVER:$PORT)"
-    echo "MARKER_NET_L${{LEVEL}}_OK"
-    exit 0
+    echo "NETBENCH_L${{LEVEL}}=FAIL (cannot reach $SERVER:$PORT)"
+    exit 1
 fi
+FAILED=0
 echo "Server reachable"
 
 # One block size, two parallelism levels, short duration: the test gates
@@ -1378,6 +1385,7 @@ except:
     print('FAIL')
 " 2>/dev/null || echo "FAIL")
         echo "NET_EGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+        [ "$throughput" = FAIL ] && FAILED=1
     done
 done
 
@@ -1400,11 +1408,14 @@ except:
     print('FAIL')
 " 2>/dev/null || echo "FAIL")
         echo "NET_INGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+        [ "$throughput" = FAIL ] && FAILED=1
     done
 done
 
 echo ""
 echo "=== END NETWORK BENCHMARK L${{LEVEL}} ==="
+# A transfer that failed is a broken network, not a slow one: no marker.
+[ "$FAILED" = 0 ] || exit 1
 echo "MARKER_NET_L${{LEVEL}}_OK"
 "#
     )
@@ -2164,6 +2175,15 @@ async fn test_podman_load_over_fuse() -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&load_output.stdout);
     println!("\n   Output:\n   {}", stdout.trim().replace('\n', "\n   "));
+    if !load_output.status.success() || !stdout.contains("Loaded image") {
+        common::kill_process(vm_pid).await;
+        bail!(
+            "podman load in the VM failed ({}): {}{}",
+            load_output.status,
+            stdout,
+            String::from_utf8_lossy(&load_output.stderr)
+        );
+    }
 
     // 5. Clean up
     println!("\n5. Cleaning up...");
