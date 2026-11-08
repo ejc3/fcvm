@@ -33,6 +33,14 @@
 //   FLEET_MOCK_WINDOWS_COOLDOWN_S  after a sandbox comes back, its viewer waits this long to borrow again (60)
 //   FLEET_MOCK_WINDOWS_RESTORE_MS  a sandbox's reset, click to its first desktop frame (3000)
 //   FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS  the Windows image's age in days (12; from 150 it warns, from 170 it is refused)
+//   FLEET_MOCK_MINECRAFT     Minecraft servers for minecraft mode (0: none, and no `minecraft` in the snapshot)
+//   FLEET_MOCK_MINECRAFT_PORT  the servers' view sockets (required with FLEET_MOCK_MINECRAFT; 0 asks the kernel)
+//   FLEET_MOCK_MINECRAFT_CAP   servers lent at once at most (2)
+//   FLEET_MOCK_MINECRAFT_CLAIM_S   how long a borrowed server lasts (120)
+//   FLEET_MOCK_MINECRAFT_COOLDOWN_S  after a server comes back, its viewer waits this long to borrow again (60)
+//   FLEET_MOCK_MINECRAFT_RESTORE_MS  a server's reset, click to its first chunk (2000)
+//   FLEET_MOCK_MINECRAFT_SNAPSHOT_MS a fork's snapshot of its source, before the copy's restore (600)
+//   FLEET_MOCK_MINECRAFT_JOIN_ZONE   with a zone, each server's join address is mc-<n>.<zone> (unset: none)
 //   FLEET_MOCK_POTATO_PLAYERS    potato players one host runs (0: none, and no `potato` in the snapshot)
 //   FLEET_MOCK_POTATO_BUDGET_MS  a ring of n starts at this / (n - 1) ms of hold (2000)
 //   FLEET_MOCK_POTATO_FLOOR_MS   and never below this (400)
@@ -153,6 +161,21 @@ export async function startMock() {
             cooldownSecs: int("FLEET_MOCK_WINDOWS_COOLDOWN_S", 60),
             restoreMs: int("FLEET_MOCK_WINDOWS_RESTORE_MS", 3000),
             imageAgeDays: int("FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS", 12),
+          },
+        }
+      : {}),
+    ...(int("FLEET_MOCK_MINECRAFT", 0) > 0
+      ? {
+          minecraft: {
+            count: int("FLEET_MOCK_MINECRAFT", 0),
+            port: int("FLEET_MOCK_MINECRAFT_PORT"),
+            publicHost: env("FLEET_MOCK_HOST", "localhost"),
+            cap: int("FLEET_MOCK_MINECRAFT_CAP", 2),
+            claimSecs: int("FLEET_MOCK_MINECRAFT_CLAIM_S", 120),
+            cooldownSecs: int("FLEET_MOCK_MINECRAFT_COOLDOWN_S", 60),
+            restoreMs: int("FLEET_MOCK_MINECRAFT_RESTORE_MS", 2000),
+            forkSnapshotMs: int("FLEET_MOCK_MINECRAFT_SNAPSHOT_MS", 600),
+            joinZone: process.env.FLEET_MOCK_MINECRAFT_JOIN_ZONE || null,
           },
         }
       : {}),
