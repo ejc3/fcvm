@@ -971,6 +971,11 @@ fn undo_linked_memory_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Err(error) => Undo::Kept(error.to_string()),
     };
+    // a relative link (a relative FCVM_DATA_DIR) resolves against whatever directory this
+    // process runs in, so it cannot say whether the published snapshot names the file
+    if link.is_relative() {
+        return Undo::Kept(format!("{} is a relative path", link.display()));
+    }
     let Some(snapshot) = link.parent() else {
         return remove();
     };
@@ -1204,6 +1209,13 @@ mod tests {
             "kept although the snapshot's memory is on the store"
         );
         std::fs::write(&file, b"m").unwrap();
+        // a relative link (a relative FCVM_DATA_DIR) names nothing reliably from another
+        // working directory, so the file is kept rather than judged against the wrong path
+        assert!(matches!(
+            undo_linked_memory(&file, Path::new("data/snapshots/snap/memory.bin")),
+            Undo::Kept(_)
+        ));
+        assert!(file.exists(), "removed through a relative link");
         let gone = dir
             .path()
             .join("no-snapshots")

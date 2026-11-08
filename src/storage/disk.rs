@@ -104,7 +104,8 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         .with_context(|| format!("creating {}", memory_dir.display()))?;
     let dir = std::fs::canonicalize(memory_dir)
         .with_context(|| format!("resolving {}", memory_dir.display()))?;
-    let meta = std::fs::metadata(&dir).with_context(|| format!("reading {}", dir.display()))?;
+    let meta =
+        std::fs::symlink_metadata(&dir).with_context(|| format!("reading {}", dir.display()))?;
     let euid = nix::unistd::geteuid().as_raw();
     anyhow::ensure!(
         meta.is_dir() && meta.uid() == euid && meta.mode() & 0o022 == 0,
@@ -114,23 +115,7 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         meta.uid(),
         meta.mode() & 0o7777
     );
-    // Every directory above it must keep others from renaming it away: owned by root or by
-    // this user, and closed to group and other writes unless sticky (as /tmp and /dev/shm are).
-    for ancestor in dir.ancestors().skip(1) {
-        let meta = std::fs::metadata(ancestor)
-            .with_context(|| format!("reading {}", ancestor.display()))?;
-        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
-        let others_kept_out = meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0;
-        anyhow::ensure!(
-            owner_ok && others_kept_out,
-            "--memory-dir {}: {} lets another user replace it (uid {}, mode {:o}); use a \
-             directory whose every parent is root's or yours and closed to others or sticky",
-            dir.display(),
-            ancestor.display(),
-            meta.uid(),
-            meta.mode() & 0o7777
-        );
-    }
+    check_memory_dir_parents(&dir, euid)?;
     let root =
         std::fs::canonicalize(snapshots_root).unwrap_or_else(|_| snapshots_root.to_path_buf());
     anyhow::ensure!(
@@ -140,6 +125,31 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         root.display()
     );
     Ok(dir)
+}
+
+/// Every directory above the memory directory `dir` must keep others from renaming it away:
+/// owned by root or by this user, and closed to group and other writes unless sticky (as /tmp
+/// and /dev/shm are).
+fn check_memory_dir_parents(dir: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for ancestor in dir.ancestors().skip(1) {
+        // the parent itself, never what a link in its place names: a parent swapped for a link
+        // (to /tmp, say) must not borrow that directory's owner and mode
+        let meta = std::fs::symlink_metadata(ancestor)
+            .with_context(|| format!("reading {}", ancestor.display()))?;
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let others_kept_out = meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0;
+        anyhow::ensure!(
+            meta.is_dir() && owner_ok && others_kept_out,
+            "--memory-dir {}: {} lets another user replace it (uid {}, mode {:o}); use a \
+             directory whose every parent is root's or yours and closed to others or sticky",
+            dir.display(),
+            ancestor.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+    }
+    Ok(())
 }
 
 /// The path of a new memory file in a prepared memory directory: `fcvm-memory-<uuid>.bin`.
@@ -1438,6 +1448,21 @@ mod snapshot_dir_tests {
         let error = remove_linked_memory_file_with(&snapshot, &refused).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EACCES));
         assert!(std::fs::symlink_metadata(&link).is_ok() && target.exists());
+    }
+
+    /// A parent that has become a symbolic link (someone renamed the checked directory away and
+    /// put a link in its place) is refused, even when it points at a sticky root directory such
+    /// as /tmp: the check reads each parent itself, never what a link names.
+    #[test]
+    fn a_parent_swapped_for_a_link_is_refused() {
+        let root = private_tempdir();
+        let swapped = root.path().join("parent");
+        std::os::unix::fs::symlink("/tmp", &swapped).unwrap();
+        let euid = nix::unistd::geteuid().as_raw();
+        let error = check_memory_dir_parents(&swapped.join("memory"), euid)
+            .expect_err("a parent that is a link must be refused")
+            .to_string();
+        assert!(error.contains("lets another user replace it"), "{error}");
     }
 
     /// A memory directory others could write, or one inside the snapshot directory, is

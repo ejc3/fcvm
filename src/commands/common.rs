@@ -5907,9 +5907,12 @@ fn hand_memory_file_to_publication(
     target: &Path,
     link: &Path,
 ) -> Result<()> {
+    // absolute, so a reclaim from another working directory checks the same link
+    let link =
+        std::path::absolute(link).with_context(|| format!("resolving {}", link.display()))?;
     owner.record(crate::reclaim::Resource::LinkedMemory {
         path: target.to_path_buf(),
-        link: link.to_path_buf(),
+        link,
     })?;
     let id = target
         .file_stem()
@@ -8423,7 +8426,11 @@ mod tests {
         assert_in_order(
             "hand_memory_file_to_publication",
             body_of(source, "fn hand_memory_file_to_publication("),
-            &["Resource::LinkedMemory {", "crate::reclaim::forget("],
+            &[
+                "std::path::absolute(link)",
+                "Resource::LinkedMemory {",
+                "crate::reclaim::forget(",
+            ],
         );
     }
 
