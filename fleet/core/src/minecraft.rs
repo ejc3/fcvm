@@ -96,6 +96,10 @@ pub fn key(host: &str, index: u32) -> String {
 pub const RESET_ALL_INTERVAL_MS: u64 = 10_000;
 /// The least time between two forks from one client.
 pub const FORK_INTERVAL_MS: u64 = 10_000;
+/// How long a running server nobody holds keeps its world before it is reset to the gold
+/// snapshot. The servers take public joins in offline mode, so a griefed or wedged world lasts
+/// at most this long with no viewer to press Reset.
+pub const AUTO_RESET_MS: u64 = 30 * 60 * 1000;
 /// A server's tile, width / height: the map is 128 x 128 columns.
 pub const TILE_ASPECT: f64 = 1.0;
 

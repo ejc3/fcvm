@@ -20,6 +20,8 @@ pub struct ServerCfg {
 /// `pumpkin.toml`: offline mode (bots and players need no account), creative so everyone can
 /// build, no spawn protection, a fixed seed so every tile is the same world, a short view
 /// distance, and nothing that reaches out: no telemetry, no Bedrock listener, no plugins.
+/// The Java listener is the only one: the query, management and proxy services are off by
+/// name, not by Pumpkin's defaults, since the servers take public joins.
 pub fn config(c: &ServerCfg) -> String {
     format!(
         r#"seed = "{seed}"
@@ -54,6 +56,15 @@ online_mode = false
 enabled = false
 
 [networking.lan_broadcast]
+enabled = false
+
+[networking.query]
+enabled = false
+
+[networking.management]
+enabled = false
+
+[networking.proxy]
 enabled = false
 
 [telemetry]
@@ -133,5 +144,13 @@ mod tests {
         assert_eq!(t["telemetry"]["enabled"].as_bool(), Some(false));
         assert_eq!(t["networking"]["bedrock"]["enabled"].as_bool(), Some(false));
         assert_eq!(t["plugins"]["enabled"].as_bool(), Some(false));
+        // The Java listener is the only one a public player can reach.
+        for svc in ["bedrock", "lan_broadcast", "query", "management", "proxy"] {
+            assert_eq!(
+                t["networking"][svc]["enabled"].as_bool(),
+                Some(false),
+                "{svc}"
+            );
+        }
     }
 }
