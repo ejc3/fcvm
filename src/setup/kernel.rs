@@ -1024,6 +1024,43 @@ fi"#
     Ok(script)
 }
 
+/// The build tree of a guest kernel: `$BUILD_DIR` when the caller sets it (a pre-seeded
+/// source archive), else one per profile and SHA under the temp dir, so concurrent builds
+/// of different kernels never share one.
+fn vm_kernel_build_dir(profile_name: &str, sha: &str) -> PathBuf {
+    match std::env::var_os("BUILD_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(format!("/tmp/kernel-build-{profile_name}-{sha}")),
+    }
+}
+
+/// Remove a kernel build tree. A failure is logged, not returned: the kernel is already
+/// built or the build already failed, and a leftover tree costs disk, not correctness.
+async fn remove_kernel_build_dir(build_dir: &Path) {
+    match tokio::fs::remove_dir_all(build_dir).await {
+        Ok(()) => info!(dir = %build_dir.display(), "removed kernel build tree"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(dir = %build_dir.display(), error = %e, "could not remove kernel build tree")
+        }
+    }
+}
+
+/// Run a guest kernel build script in `build_dir` and remove the tree afterwards, whether the
+/// build succeeded or not. It holds the source archive, the extracted source and every object
+/// (several GiB); a built kernel is published to the store, and a rebuild of the same SHA
+/// after a failure downloads again, so nothing reads it after this.
+async fn run_kernel_build(
+    mut cmd: Command,
+    build_dir: &Path,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    cmd.env("BUILD_DIR", build_dir);
+    let status = run_streaming(cmd, label).await;
+    remove_kernel_build_dir(build_dir).await;
+    status
+}
+
 async fn build_kernel_locally(
     profile: &KernelProfile,
     profile_name: &str,
@@ -1073,9 +1110,13 @@ async fn build_kernel_locally(
     // and the staging path's record must stay live until it exits.
     let mut cmd = staging.command(&script_path)?;
     super::run_build_as_sudo_invoker(&mut cmd);
-    let status = run_streaming(cmd, "kernel_build")
-        .await
-        .context("running build script")?;
+    let status = run_kernel_build(
+        cmd,
+        &vm_kernel_build_dir(profile_name, &sha),
+        "kernel_build",
+    )
+    .await
+    .context("running build script")?;
 
     // Clean up script
     let _ = std::fs::remove_file(&script_path);
@@ -1494,6 +1535,10 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Update GRUB with boot args
     update_grub_config(kernel_name, boot_args).await?;
+
+    // The package is installed; the tree (source, objects and debs, tens of GiB) is not
+    // read again. A failed build or install keeps it, for the "Deb already built" retry.
+    remove_kernel_build_dir(&build_dir).await;
 
     println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
@@ -3032,6 +3077,37 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest kernel build left /tmp/kernel-build-<profile>-<sha> (several GiB each) behind
+    /// after it finished, and a run of campaign builds filled a box's root disk with them.
+    /// The tree must be gone after the build, whether it succeeded or failed.
+    #[tokio::test]
+    async fn a_kernel_build_removes_its_build_tree_whatever_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        for (exit, name) in [(0, "ok"), (1, "failed")] {
+            let build_dir = dir.path().join(format!("kernel-build-{name}"));
+            let script = dir.path().join(format!("build-{name}.sh"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nmkdir -p \"$BUILD_DIR/linux-x\"\n\
+                     head -c 4096 /dev/zero > \"$BUILD_DIR/linux-x/vmlinux.o\"\nexit {exit}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let status = run_kernel_build(Command::new(&script), &build_dir, "test_build")
+                .await
+                .unwrap();
+            assert_eq!(status.code(), Some(exit), "the stub build ran");
+            assert!(
+                !build_dir.exists(),
+                "the {name} build left its tree at {}",
+                build_dir.display()
+            );
+        }
+    }
 
     /// `install-host-kernel` on a box where the package is already installed (a host
     /// kernel built earlier, then another one installed over it) only selected the
