@@ -121,6 +121,7 @@ impl Coord {
             boot: Default::default(),
             potato: None,
             windows: None,
+            minecraft: None,
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -1047,6 +1048,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 ipv6: None,
             }),
         }),
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -1403,6 +1405,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let mut from_agent = LineReader::new(coord_in, "agent");
@@ -1481,6 +1484,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(dial(
         agent,
@@ -2134,6 +2138,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -2322,6 +2327,7 @@ fn dial_agent(f: &Fake) -> Agent {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     }
 }
 

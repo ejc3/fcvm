@@ -4,6 +4,7 @@
 pub mod addr;
 pub mod dial;
 pub mod inventory;
+pub mod minecraft;
 pub mod potato;
 pub mod slot;
 pub mod spot;
@@ -48,6 +49,8 @@ pub struct Agent {
     pub potato: Option<potato::PotatoCfg>,
     /// Windows mode: the host's Windows sandboxes.
     pub windows: Option<windows::WindowsCfg>,
+    /// Minecraft mode: the host's Minecraft servers.
+    pub minecraft: Option<minecraft::MinecraftCfg>,
 }
 
 /// The host's aggregator.
@@ -328,7 +331,34 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         }
         _ => None,
     };
+    let minecraft = if args.minecraft > 0 {
+        anyhow::ensure!(
+            ipv6_prefix.is_some(),
+            "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
+        );
+        let (image_id, server) =
+            minecraft::inspect_image(&args.windows_podman, &args.minecraft_image).await?;
+        Some(minecraft::MinecraftCfg {
+            count: args.minecraft,
+            image: args.minecraft_image.clone(),
+            image_id,
+            server,
+            mem_mib: args.minecraft_mem,
+            cpus: args.minecraft_cpus,
+            bots: args.minecraft_bots,
+            snapshot_dir: args.minecraft_snapshot_dir.clone(),
+            tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
+            gold_deadline: Duration::from_secs(300),
+            ready_deadline: Duration::from_secs(60),
+            snapshot_deadline: Duration::from_secs(120),
+            poll: Duration::from_millis(20),
+            steady: 5,
+        })
+    } else {
+        None
+    };
     let agent = Agent {
+        minecraft,
         windows,
         potato,
         host,
@@ -505,6 +535,24 @@ where
             },
         });
     }
+    // Minecraft servers take the addresses after the sandboxes', and the gold VM the one after
+    // the last server's.
+    let base = all.len() + agent.windows.as_ref().map_or(0, |w| w.count) as usize;
+    let mut mc_places = Vec::new();
+    let mut mc_gold = None;
+    if let Some(m) = &agent.minecraft {
+        let prefix = agent
+            .cfg
+            .ipv6_prefix
+            .as_ref()
+            .context("Minecraft mode needs the host's IPv6 prefix")?;
+        for k in 0..m.count as usize {
+            mc_places.push(minecraft::Place::routed(prefix.slot_address(base + k)?));
+        }
+        mc_gold = Some(minecraft::Place::routed(
+            prefix.slot_address(base + m.count as usize)?,
+        ));
+    }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
     out.send(AgentMsg::Hello {
         host: agent.host.clone(),
@@ -522,8 +570,8 @@ where
             .as_ref()
             .map(|_| windows::actions())
             .unwrap_or_default(),
-        minecraft: 0,
-        minecraft_server: None,
+        minecraft: agent.minecraft.as_ref().map_or(0, |m| m.count),
+        minecraft_server: agent.minecraft.as_ref().and_then(|m| m.server.clone()),
     })
     .ok();
     let (potato_tx, potato_rx) = watch::channel(None);
@@ -564,6 +612,22 @@ where
             scene_rx.clone(),
         )
     });
+    let mut servers = match (agent.minecraft, mc_gold) {
+        (Some(m), Some(gold)) => Some(minecraft::Minecraft::start(
+            Arc::new(m),
+            cfg.clone(),
+            cfg.ipv6_prefix
+                .as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            mc_places,
+            gold,
+            out.clone(),
+            http.clone(),
+            scene_rx.clone(),
+        )),
+        _ => None,
+    };
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetPlan>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
@@ -619,6 +683,19 @@ where
                 // The Windows sandboxes are the Windows mode's to run; they have no GPU.
                 let (sandbox_list, list): (Vec<AssignSlot>, Vec<AssignSlot>) =
                     list.into_iter().partition(|a| a.windows.is_some());
+                // So are the Minecraft servers.
+                let (server_list, list): (Vec<AssignSlot>, Vec<AssignSlot>) =
+                    list.into_iter().partition(|a| a.minecraft.is_some());
+                match &mut servers {
+                    Some(m) => m.assign(&server_list),
+                    None if !server_list.is_empty() => {
+                        tracing::warn!(
+                            servers = server_list.len(),
+                            "assigned Minecraft servers, but this agent runs none (--minecraft)"
+                        )
+                    }
+                    None => {}
+                }
                 match &mut sandboxes {
                     Some(w) => w.assign(&sandbox_list),
                     None if !sandbox_list.is_empty() => {
@@ -711,6 +788,9 @@ where
     }
     if let Some(w) = sandboxes {
         w.stop().await;
+    }
+    if let Some(m) = servers {
+        m.stop().await;
     }
     drop(out);
     let _ = writer.await;
