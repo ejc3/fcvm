@@ -93,7 +93,7 @@ endif
 
 # CI runs a representative SUBSET of the active nested (NV2) tests, not all of them.
 # Nested tests are the arm64 long pole and do NOT parallelize — they degrade ~3.7x under
-# mutual contention (system-wide dsb(sy) on every nested guest-exit + NV2 overhead; see the
+# mutual contention (measured before #770 dropped the dsb(sy) patch; see the
 # [test-groups.nested-tests] comment in .config/nextest.toml), so concurrency can't shrink
 # them. Instead CI runs four that cover the distinct nested risks and skips the rest
 # (which still run locally with a normal `make test-root`):

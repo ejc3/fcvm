@@ -84,8 +84,9 @@ max-threads = 8
 #    nested tests cold-cache concurrent = 1085s wall AND a flake (test_nested_l2_network_nfs's
 #    L2 ingress iperf3 starved and blew its internal 840s budget, killed at 852s); the SAME
 #    test alone = 227s. A ~3.7x slowdown from 2-way contention alone (no other suite load).
-#    Mechanism: every nested guest-exit issues a system-wide dsb(sy) (the #630 cache-coherency
-#    patch) + raw NV2 overhead, so concurrent chains stall each other globally. De-serializing
+#    The mechanism given then was a system-wide dsb(sy) on every nested guest-exit (the #630
+#    cache-coherency patch) + raw NV2 overhead. That patch is gone since #770 (6.18.60), and the
+#    measurement above predates it. De-serializing
 #    therefore widens the tail and adds retries — the long pole must be cut a different way
 #    (fewer/faster nested tests), not with concurrency.
 [test-groups.nested-tests]

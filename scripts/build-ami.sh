@@ -173,10 +173,9 @@ compute_hash() {
     cat "$KERNEL_DIR/nested.conf"
     # The HOST kernel baked into this AMI is built from the arm64 patch set —
     # [kernel_profiles.nested.arm64.host_kernel] build_inputs is
-    # "kernel/patches-arm64/*.patch" — NOT kernel/patches. Only two of those nine
-    # are symlinks into kernel/patches; the other seven (nv2-vsock-cache-sync,
-    # nv2-vsock-rx-barrier, wfx-stopped-exit, the psci-debug set) were invisible
-    # to this hash, so changing one produced an identical AMI hash and the
+    # "kernel/patches-arm64/*.patch" — NOT kernel/patches. Most of the files
+    # there were never in kernel/patches (the NV2 and debug patches of the time),
+    # so they were invisible to this hash, so changing one produced an identical AMI hash and the
     # builder reused a stale image carrying the OLD host kernel.
     # `.vm.patch` is excluded to match compute_host_kernel_sha in
     # src/setup/kernel.rs, which applies those only to the guest kernel.
