@@ -194,6 +194,14 @@ fn bridged_nat_leaves_the_hosts_own_connections_on_their_route_source() -> Resul
     let mut add = vec!["iptables", "-t", "nat", "-A", "POSTROUTING"];
     add.extend(rule.iter().map(String::as_str));
     in_ns(&host, &add)?;
+    // iptables lists the rule exactly as fcvm builds it, which is how a later launch
+    // tells its own rule from a stale one (`global_nat_replacement`).
+    let listed = in_ns(&host, &["iptables", "-t", "nat", "-S", "POSTROUTING"])?;
+    let line = format!("-A POSTROUTING {}", rule.join(" "));
+    assert!(
+        listed.lines().any(|l| l == line),
+        "iptables lists the rule differently from {line:?}:\n{listed}"
+    );
 
     let server = on_thread_in(&peer, || {
         let listener = TcpListener::bind(format!("{SERVER}:8080"))?;

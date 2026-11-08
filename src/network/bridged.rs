@@ -89,19 +89,26 @@ fn overlaps_a_host_network(host_ip: &str, addresses: &str) -> bool {
     })
 }
 
-/// [`overlaps_a_host_network`] over the host's addresses now. An unreadable list
-/// counts as no overlap, as `is_ip_in_use_on_veth` does.
-async fn overlaps_host_network(host_ip: &str) -> bool {
+/// The host's IPv4 addresses (`ip -o -4 addr show`). An unreadable list is empty,
+/// so nothing counts as overlapping, as `is_ip_in_use_on_veth` treats it.
+async fn host_addresses() -> String {
     match tokio::process::Command::new("ip")
         .args(["-o", "-4", "addr", "show"])
         .output()
         .await
     {
-        Ok(o) if o.status.success() => {
-            overlaps_a_host_network(host_ip, &String::from_utf8_lossy(&o.stdout))
-        }
-        _ => false,
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
     }
+}
+
+/// The first subnet id from `start` (wrapping) whose /30 is off every network the
+/// host is on, or None when all 16384 are on one.
+///
+fn first_subnet_off_the_host(start: u16, is_clone: bool, addresses: &str) -> Option<u16> {
+    (0..16384u16)
+        .map(|offset| (start + offset) % 16384)
+        .find(|&id| !overlaps_a_host_network(&derive_host_ip(id, is_clone), addresses))
 }
 
 /// The /30 peer of a derived host-side veth address (.1 → .2).
@@ -448,11 +455,25 @@ impl NetworkManager for BridgedNetwork {
         // resolver beats the /30 drawn by subnet_id 0) fails the probe and
         // the candidate is stripped and skipped instead of producing a
         // clone whose forwarded ports time out for its whole life.
+        // The host's own networks, read once: a candidate inside one is skipped
+        // without spending an attempt, since one host network can cover many /30s.
+        let host_addresses = host_addresses().await;
         let subnet_id = {
             let mut attempts = 0u32;
             loop {
+                subnet_id =
+                    match first_subnet_off_the_host(subnet_id, self.is_clone, &host_addresses) {
+                        Some(id) => id,
+                        None => {
+                            let _ = self.cleanup().await;
+                            anyhow::bail!(
+                                "subnet allocation failed: every candidate subnet overlaps a \
+                                 network this host is on"
+                            );
+                        }
+                    };
                 let host_ip = derive_host_ip(subnet_id, self.is_clone);
-                if !is_ip_in_use_on_veth(&host_ip).await && !overlaps_host_network(&host_ip).await {
+                if !is_ip_in_use_on_veth(&host_ip).await {
                     let host_ip_with_cidr = format!("{}/30", host_ip);
                     if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
                         let _ = self.cleanup().await;
@@ -954,6 +975,23 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One host network covers many /30s, and they are skipped without spending the
+    /// allocation's attempts: a host on 172.30.0.0/23 gets the first /30 after it.
+    #[test]
+    fn subnets_on_the_hosts_network_are_skipped_not_counted() {
+        let addresses = "2: eth0    inet 172.30.1.5/23 scope global eth0\n";
+        assert_eq!(first_subnet_off_the_host(0, false, addresses), Some(128));
+        assert_eq!(first_subnet_off_the_host(200, false, addresses), Some(200));
+        assert_eq!(
+            first_subnet_off_the_host(
+                0,
+                false,
+                "2: eth0    inet 172.30.0.1/16 scope global eth0\n"
+            ),
+            None
+        );
+    }
 
     /// A VM's /30 never overlaps a network the host is on (#1735): on a VPC host at
     /// 10.20.30.40/24, a clone's 10.20.30.4/30 would take the host's traffic to

@@ -339,28 +339,48 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     let source = parse_default_route_source(&String::from_utf8_lossy(&route.stdout));
     let rule = global_nat_rule(vm_subnet, outbound_iface, source.as_deref());
 
-    // Check if the fcvm-tagged rule already exists
-    let output = Command::new("iptables")
-        .args(["-t", "nat", "-C", "POSTROUTING"])
-        .args(&rule)
-        .output()
-        .await?;
-
-    if output.status.success() {
-        debug!("global NAT rule already exists");
-        return Ok(());
-    }
-
-    let output = Command::new("iptables")
-        .args(["-t", "nat", "-A", "POSTROUTING"])
-        .args(&rule)
+    // The rule goes first and replaces any fcvm rule for this subnet that differs from
+    // it: one added under an earlier route source would otherwise come first in the
+    // chain and keep translating to an address the host no longer has. Inserted before
+    // the stale ones are deleted, so no guest connection leaves untranslated between.
+    let listed = Command::new("iptables")
+        .args(["-t", "nat", "-S", "POSTROUTING"])
         .output()
         .await
-        .context("adding the bridged NAT rule")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to add the bridged NAT rule {rule:?}: {}", stderr);
+        .context("listing the NAT rules")?;
+    anyhow::ensure!(
+        listed.status.success(),
+        "`iptables -t nat -S POSTROUTING` failed: {}",
+        String::from_utf8_lossy(&listed.stderr).trim()
+    );
+    let (insert, stale) =
+        global_nat_replacement(&String::from_utf8_lossy(&listed.stdout), vm_subnet, &rule);
+    if insert {
+        let output = Command::new("iptables")
+            .args(["-t", "nat", "-I", "POSTROUTING", "1"])
+            .args(&rule)
+            .output()
+            .await
+            .context("adding the bridged NAT rule")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("failed to add the bridged NAT rule {rule:?}: {}", stderr);
+        }
+    }
+    for old in stale {
+        let output = Command::new("iptables")
+            .args(["-t", "nat", "-D", "POSTROUTING"])
+            .args(&old)
+            .output()
+            .await
+            .context("removing a stale bridged NAT rule")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "failed to remove the stale bridged NAT rule {old:?}: {}",
+                stderr
+            );
+        }
     }
 
     debug!("global NAT configuration complete");
@@ -469,6 +489,24 @@ fn global_nat_rules_in(listing: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// What `ensure_global_nat` does to the listed rules for `subnet`: whether `wanted`
+/// must be inserted, and the fcvm rules for the subnet to delete because they differ
+/// from it.
+///
+fn global_nat_replacement(
+    listing: &str,
+    subnet: &str,
+    wanted: &[String],
+) -> (bool, Vec<Vec<String>>) {
+    let ours: Vec<Vec<String>> = global_nat_rules_in(listing)
+        .into_iter()
+        .filter(|rule| rule.windows(2).any(|w| w[0] == "-s" && w[1] == subnet))
+        .collect();
+    let insert = !ours.iter().any(|rule| rule == wanted);
+    let stale = ours.into_iter().filter(|rule| rule != wanted).collect();
+    (insert, stale)
+}
+
 /// Detects the default network interface for outbound traffic
 pub async fn detect_default_interface() -> Result<String> {
     let output = Command::new("ip")
@@ -556,6 +594,33 @@ mod tests {
             None
         );
         assert_eq!(parse_default_route_source(""), None);
+    }
+
+    /// A rule added under an earlier route source is replaced, not shadowed: it came
+    /// first in the chain and kept translating to the old address.
+    #[test]
+    fn a_rule_for_an_old_route_source_is_replaced() {
+        let wanted = global_nat_rule("10.0.0.0/8", "eth0", Some("10.20.30.40"));
+        let old = global_nat_rule("10.0.0.0/8", "eth0", Some("10.20.30.7"));
+        let other = global_nat_rule("172.30.0.0/16", "eth0", Some("10.20.30.7"));
+        let listing = |rules: &[&Vec<String>]| {
+            rules
+                .iter()
+                .map(|rule| format!("-A POSTROUTING {}\n", rule.join(" ")))
+                .collect::<String>()
+        };
+        assert_eq!(
+            global_nat_replacement(&listing(&[&old, &other]), "10.0.0.0/8", &wanted),
+            (true, vec![old.clone()])
+        );
+        assert_eq!(
+            global_nat_replacement(&listing(&[&old, &wanted]), "10.0.0.0/8", &wanted),
+            (false, vec![old.clone()])
+        );
+        assert_eq!(
+            global_nat_replacement(&listing(&[&wanted, &other]), "10.0.0.0/8", &wanted),
+            (false, Vec::<Vec<String>>::new())
+        );
     }
 
     /// Cleanup removes fcvm's rules for the guests' subnets in any form, and nothing
