@@ -1065,8 +1065,11 @@ impl WorkingSetStore {
         let added = merged.union_from(observed);
         let total = merged.len();
         // The union holds everything on disk, so it differs from the file only when it gained
-        // granules or an earlier first-touch time.
-        let changed = on_disk.as_ref() != Some(&merged);
+        // granules or an earlier first-touch time. With no file, only a non-empty union is new.
+        let changed = match on_disk.as_ref() {
+            Some(disk) => disk != &merged,
+            None => !merged.is_empty(),
+        };
 
         // Publish ONLY if the path still names the image we served. A snapshot tag may have
         // been recreated before this merge acquired its shared generation lease: we keep
@@ -1668,6 +1671,19 @@ mod tests {
             "an unchanged union invalidated the split"
         );
         assert!(Arc::ptr_eq(&split, &reopened.to_prefetch_ordered()));
+    }
+
+    #[test]
+    fn an_empty_recording_writes_no_sidecar() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("empty-recording", mem_len);
+        let store = open_store(&image, mem_len);
+        let outcome = store.merge_and_persist(&store.recorder()).unwrap();
+        assert!(!outcome.persisted, "an empty recording was published");
+        assert!(
+            !WorkingSetStore::path_for(&image).exists(),
+            "an empty recording wrote a sidecar"
+        );
     }
 
     #[test]

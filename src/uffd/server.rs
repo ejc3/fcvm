@@ -968,9 +968,11 @@ impl FaultAround {
 /// window add the pages that work touched: on one 128 GiB guest, 8.6 M to 14.1 M pages over
 /// four such clones, and a clone of it held 52.7 GiB at healthy against 25.4 GiB for a set
 /// recorded at healthy. A limit bounds that cost per clone: replay stops planning once it
-/// has passed the limit, and the pages past it fault on demand. Unbounded by default: those
-/// pages are ones later work wanted, and replaying them cut that guest's first page render
-/// from 541 s to 305 s.
+/// has passed the limit, and the pages past it fault on demand. Replay goes tier by first-touch
+/// tier and in ascending offset within a tier, so the limit drops the latest tiers first; within
+/// the tier it cuts, a later-touched page at a lower offset can still replay. Unbounded by
+/// default: the pages past a limit are ones later work wanted, and replaying them cut that
+/// guest's first page render from 541 s to 305 s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplayLimit(Option<u64>);
 

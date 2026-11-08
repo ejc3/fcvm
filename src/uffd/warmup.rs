@@ -534,7 +534,8 @@ pub(crate) fn unpaced_budget(meminfo: &str) -> u64 {
     }
 }
 
-/// Issue the requests for `recorded` through `advise`, in ascending file offset.
+/// Issue the requests for `recorded` through `advise`, in replay order: tier by tier, each
+/// tier in ascending file offset.
 ///
 /// `stop` is read before every request and nothing serialises it with the call that
 /// follows, so at most one further request starts after a stop.
