@@ -493,6 +493,50 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any('case "$(uname -r)" in' in line for line in guard), guard)
         self.assertIn("*-fcvm-*)", build.split("make build")[0])
 
+    def test_the_windows_image_builds_beside_the_rest_of_the_host_build(self):
+        # fe5ccbfc's host build took 1 h 45 min, the Windows install 1066 s of it after the
+        # media download, and the host image was sealed 3 h 15 min into the factory's fixed
+        # 4 h, leaving the tile and the validation 45 min. The Windows image depends on
+        # nothing else the phase builds, so it starts right after the checkout and the phase
+        # waits for it only where it installs it.
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        checkout = build.index("git checkout -q -f --detach $FCVM_COMMIT")
+        image = build.index("bg_start fleet-ami-windows-image")
+        first_build = build.index('as_user "cd $SRC && make build"')
+        self.assertLess(checkout, image)
+        self.assertLess(image, first_build, "the Windows image starts before fcvm's own build")
+        self.assertIn('build-image.sh" /mnt/fcvm-btrfs/windows', build[image:build.index("\n", image)])
+        env = build.index("/etc/fcvm-fleet/windows.env")
+        self.assertLess(build.index("bg_wait fleet-ami-windows-image"), env)
+        # The bridge stays in line: rootless podman's build runs outside a unit's cgroup, so
+        # stopping a unit would not stop it (Codex on #1778).
+        self.assertNotIn("bg_start fleet-ami-windows-bridge", build)
+        self.assertLess(build.index("make -C fleet/windows bridge-image TAG=fleet"), env)
+        self.assertLess(build.index("rm -rf \"$d\""), image, "an aging installation is removed before the build reuses it")
+
+    def test_background_jobs_are_named_units_stopped_on_every_way_out(self):
+        # A failed phase must not leave a job writing to the checkout or the store while it is
+        # retried (Codex on #1778): the jobs are transient systemd units of fixed names, the
+        # EXIT trap stops them (their whole cgroup, escalating to SIGKILL), and a phase starts
+        # by stopping any a phase that could not run its trap left behind.
+        source = (HERE / "host/build.sh").read_text()
+        preamble = source.split('\ncase "$PHASE" in\n', 1)[0]
+        self.assertIn('BG_UNITS="fleet-ami-windows-image"', preamble)
+        trap = [line for line in preamble.splitlines() if line.startswith("trap ") and line.endswith(" EXIT")]
+        self.assertEqual(len(trap), 1)
+        self.assertIn("bg_stop;", trap[0])
+        self.assertIn("\nbg_stop\n", preamble[preamble.index(trap[0]):])
+        start = re.search(r"\nbg_start\(\) \{\n(.*?)\n\}\n", preamble, re.S).group(1)
+        # A builder from a base image keeps the previous build's log, and the image directory is
+        # read from the log's last matching line (Codex on #1778): the log is emptied first, and
+        # both streams append (a truncate: stdout overwrote stderr's lines from offset 0).
+        self.assertLess(start.index(': > "$log"'), start.index("systemd-run"))
+        for prop in ("RemainAfterExit=yes", "TimeoutStopSec=30", "KillMode=control-group",
+                     'StandardOutput="append:$log"', 'StandardError="append:$log"'):
+            self.assertIn(prop, start)
+        self.assertNotIn(" & ", re.sub(r"#.*", "", source), "no shell background jobs: only named units")
+
     def test_host_prep_runs_on_fcvms_host_kernel_too(self):
         # Revising a host image that already boots fcvm's host kernel runs prep on it, and that
         # kernel has neither Ubuntu's apparmor_restrict_unprivileged_userns nor Debian's
