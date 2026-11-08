@@ -1024,13 +1024,31 @@ fi"#
     Ok(script)
 }
 
-/// The build tree of a guest kernel: `$BUILD_DIR` when the caller sets it (a pre-seeded
-/// source archive), else one per profile and SHA under the temp dir, so concurrent builds
-/// of different kernels never share one.
-fn vm_kernel_build_dir(profile_name: &str, sha: &str) -> PathBuf {
-    match std::env::var_os("BUILD_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(format!("/tmp/kernel-build-{profile_name}-{sha}")),
+/// Where a guest kernel builds.
+enum BuildTree {
+    /// `$BUILD_DIR`, set by the caller (a pre-seeded source archive): used, never removed.
+    Caller(PathBuf),
+    /// A tree of this invocation's own, removed after the build. Two setups building the
+    /// same profile and SHA into different stores hold different store locks, so a tree
+    /// named only by profile and SHA would let one remove the other's mid-compile.
+    Owned(PathBuf),
+}
+
+impl BuildTree {
+    fn for_build(profile_name: &str, sha: &str) -> Self {
+        match std::env::var_os("BUILD_DIR") {
+            Some(dir) if !dir.is_empty() => Self::Caller(PathBuf::from(dir)),
+            _ => Self::Owned(std::env::temp_dir().join(format!(
+                "kernel-build-{profile_name}-{sha}-{}",
+                uuid::Uuid::new_v4().simple()
+            ))),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Caller(p) | Self::Owned(p) => p,
+        }
     }
 }
 
@@ -1046,18 +1064,20 @@ async fn remove_kernel_build_dir(build_dir: &Path) {
     }
 }
 
-/// Run a guest kernel build script in `build_dir` and remove the tree afterwards, whether the
-/// build succeeded or not. It holds the source archive, the extracted source and every object
-/// (several GiB); a built kernel is published to the store, and a rebuild of the same SHA
-/// after a failure downloads again, so nothing reads it after this.
+/// Run a guest kernel build script in `tree` and, when the tree is this build's own, remove
+/// it afterwards, whether the build succeeded or not. It holds the source archive, the
+/// extracted source and every object (several GiB); a built kernel is published to the
+/// store, and a rebuild after a failure downloads again, so nothing reads it after this.
 async fn run_kernel_build(
     mut cmd: Command,
-    build_dir: &Path,
+    tree: &BuildTree,
     label: &str,
 ) -> Result<std::process::ExitStatus> {
-    cmd.env("BUILD_DIR", build_dir);
+    cmd.env("BUILD_DIR", tree.path());
     let status = run_streaming(cmd, label).await;
-    remove_kernel_build_dir(build_dir).await;
+    if let BuildTree::Owned(dir) = tree {
+        remove_kernel_build_dir(dir).await;
+    }
     status
 }
 
@@ -1130,7 +1150,7 @@ async fn build_kernel_locally(
     super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_kernel_build(
         cmd,
-        &vm_kernel_build_dir(profile_name, &sha),
+        &BuildTree::for_build(profile_name, &sha),
         "kernel_build",
     )
     .await
@@ -3102,6 +3122,42 @@ async fn update_grub_config_at(
 mod tests {
     use super::*;
 
+    /// Two setups building the same profile and SHA into different stores hold different
+    /// store locks, so each needs a tree of its own: a shared one would let the first to
+    /// finish remove the other's source and objects mid-compile. A tree the caller names in
+    /// $BUILD_DIR stays the caller's.
+    #[tokio::test]
+    async fn two_builds_of_one_kernel_never_share_a_tree_and_a_callers_tree_stays() {
+        let a = BuildTree::for_build("nested", "0123456789ab");
+        let b = BuildTree::for_build("nested", "0123456789ab");
+        assert!(matches!(a, BuildTree::Owned(_)) && matches!(b, BuildTree::Owned(_)));
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two builds of one kernel share {}",
+            a.path().display()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let caller = dir.path().join("pre-seeded");
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::write(caller.join("linux-x.tar.xz"), b"archive").unwrap();
+        let script = dir.path().join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_kernel_build(
+            Command::new(&script),
+            &BuildTree::Caller(caller.clone()),
+            "test_build",
+        )
+        .await
+        .unwrap();
+        assert!(
+            caller.join("linux-x.tar.xz").exists(),
+            "the caller's tree was removed"
+        );
+    }
+
     /// The host build dir is shared by every host kernel build. Cleaning up after one
     /// install must leave another build's source and packages in place.
     #[tokio::test]
@@ -3155,9 +3211,13 @@ mod tests {
             .unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            let status = run_kernel_build(Command::new(&script), &build_dir, "test_build")
-                .await
-                .unwrap();
+            let status = run_kernel_build(
+                Command::new(&script),
+                &BuildTree::Owned(build_dir.clone()),
+                "test_build",
+            )
+            .await
+            .unwrap();
             assert_eq!(status.code(), Some(exit), "the stub build ran");
             assert!(
                 !build_dir.exists(),
