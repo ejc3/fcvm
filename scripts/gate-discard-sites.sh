@@ -59,8 +59,9 @@ END {
   # strip_accounted removes a declared region after checking its content against the
   # shapes that region declares. strip_hidden_comments is the check the html_comment
   # region declares instead: it removes a comment only where CommonMark hides it, and
-  # leaves every other one in the body.
-  nprim = split("def strip_accounted(|def strip_hidden_comments:", prim, "|")
+  # leaves every other one in the body. region_inner reads the inside of a declared region
+  # with the pattern that region declares, and nothing else.
+  nprim = split("def strip_accounted(|def strip_hidden_comments:|def region_inner(", prim, "|")
   for (i = 1; i <= nprim; i++) {
     p = index(jq, prim[i])
     if (p == 0) { print "BLOCKED: " prim[i] " is gone; nothing accounts for a removal" > "/dev/stderr"; exit 2 }
@@ -82,7 +83,7 @@ END {
   ok[norm("select(((length > 0) and all(.[]; test(\"^:?-{3,}:?$\"))) | not)")] = "drop the table separator row"
   ok[norm("select([scan(cr_marker_re)] == [cr_summarize_marker])")] = "whole-comment guard: the summarize marker is the only marker"
   ok[norm("select(test(\"(?m)^>[[:space:]]*##\") | not)")] = "whole-comment guard: no blockquoted notice heading"
-  ok[norm("select(test(\"No actionable comments were generated in the recent review\"))")] = "whole-block guard: the review finished clean"
+  ok[norm("select(cr_no_findings)")] = "whole-comment guard: the review finished clean"
   ok[norm("select(.name == \"f\")")] = "pick a named capture out of a match; no body text is touched"
   ok[norm("gsub(\"\\t\"; \"    \")")] = "count a tab as four columns while measuring indentation; no body text is touched"
 

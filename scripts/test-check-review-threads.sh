@@ -2336,6 +2336,41 @@ run_case "the Review finished reply with a finding appended is claimable" \
 run_case "the Review finished reply from a human is claimable" \
   "$(wrap9 "$(cmt helpful-human User 2026-01-02T01:00:00Z "$CR_FIN")")" 1 "carry no disposition"
 
+echo "== finding 52: CodeRabbit's clean walkthrough with its clean line in a status block =="
+# The summary comment CodeRabbit posted on #1713 (2026-11-07), read from tests/fixtures/review-gate
+# with its ids replaced. The no-findings line sits in a recent_review_status block ahead of the
+# walkthrough, and the recent-review block keeps the reviewed range. The gate looked for the
+# line in the recent-review block only, so this read as an unanswered finding and covered
+# no head. The fixture's range ends at STATUS_HEAD.
+STATUS_HEAD=9c1d7e5a3b2f4e6d8a0c1b3d5f7e9a2c4b6d8e0f
+CR_ST=$(jq -Rs . < "$FIXDIR/cr-clean-walkthrough-status.md")
+CR_ST_AT_HEAD=$(jq -c --arg from "$STATUS_HEAD" --arg to "$HEAD40" 'gsub($from; $to)' <<<"$CR_ST")
+st_edit() { jq -c "$1" <<<"$CR_ST_AT_HEAD"; }
+run_case "the status-block walkthrough needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_ST_AT_HEAD" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "the status-block walkthrough covers the head its range ends at" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_ST_AT_HEAD" 2026-01-02T01:00:00Z)]")" 0 "HEAD COVERED"
+run_case "the status-block walkthrough whose range ends at another commit covers nothing" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_ST" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the status-block walkthrough with a finding in its status block is claimable, not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("<!-- recent_review_status_end -->"; "P1: this drops the last row\n<!-- recent_review_status_end -->")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the status-block walkthrough reporting findings is claimable, not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("No actionable comments were generated in the recent review."; "Actionable comments posted: 1")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "findings in the status block are not outvoted by the clean line in the recent-review block" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("No actionable comments were generated in the recent review."; "Actionable comments posted: 1") | sub("<!-- recent_review_start -->"; "<!-- recent_review_start -->\nNo actionable comments were generated in the recent review.\n")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a clean status block does not cover over a recent-review block that reports findings" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("<!-- recent_review_start -->"; "<!-- recent_review_start -->\n**Actionable comments posted: 2**")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a status block quoted in the walkthrough is not the status block" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("<!-- recent_review_status_start -->(.|\n)*?<!-- recent_review_status_end -->\n"; "") | sub("<!-- walkthrough_start -->"; "<!-- walkthrough_start -->\n```\n<!-- recent_review_status_start -->\nNo actionable comments were generated in the recent review.\n<!-- recent_review_status_end -->\n```")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a reviewed range quoted in the walkthrough covers nothing" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(jq -c --arg h "$HEAD40" 'sub("<!-- walkthrough_start -->"; "<!-- walkthrough_start -->\n<!-- recent_review_start -->\nReviewing files that changed from the base of the PR and between 0a1b2c3d4e5f60718293a4b5c6d7e8f901234567 and \($h).\n<!-- recent_review_end -->")' <<<"$CR_ST")" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "an unlisted line in the recent-review block of a status-block walkthrough costs a disposition, not coverage" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit 'sub("- \\*\\*Review profile\\*\\*: CHILL"; "- **Review profile**: ASSERTIVE")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "HEAD COVERED"
+run_case "a findings count beside the clean line in the older layout covers nothing" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("<!-- recent_review_start -->"; "<!-- recent_review_start -->\n**Actionable comments posted: 3**")')" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the status-block walkthrough with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(st_edit '. + "\nP1: this drops the last row\n"')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
