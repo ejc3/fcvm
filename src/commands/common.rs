@@ -8434,7 +8434,7 @@ mod tests {
                 "reflink_disks_to_snapshot(",
                 "guest\n        .record_pause(",
                 "\"resuming Cloud Hypervisor VM after snapshot\"",
-                "guest\n        .resume(",
+                "SnapshotSourceDisposition::Resume => guest\n            .resume(",
             ],
         );
 

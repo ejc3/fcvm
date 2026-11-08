@@ -1585,9 +1585,9 @@ fn fc_agent_vsock(vsock_socket_path: &Option<PathBuf>) -> Result<&Path> {
 }
 
 /// What `snapshot create` can do with a raw VM (no fc-agent): a Cloud Hypervisor memory
-/// snapshot, pause, save and resume. A disk-only capture freezes the guest's filesystems
-/// through fc-agent, `--gpu-warm` checkpoints CUDA through it, and `--stop` and
-/// `--inherit-working-set` are for Firecracker snapshots.
+/// snapshot, pause, save and resume, or with `--stop` pause, save and stop. A disk-only
+/// capture freezes the guest's filesystems through fc-agent, `--gpu-warm` checkpoints CUDA
+/// through it, and `--inherit-working-set` is for Firecracker snapshots.
 fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) -> Result<()> {
     if vm_state.config.guest.runs_fc_agent() {
         return Ok(());
@@ -1601,7 +1601,6 @@ fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) 
     for (set, flag) in [
         (args.disk_only, "--disk-only"),
         (args.gpu_warm, "--gpu-warm"),
-        (args.stop, "--stop"),
         (args.inherit_working_set, "--inherit-working-set"),
     ] {
         anyhow::ensure!(
@@ -7613,11 +7612,15 @@ mod tests {
         state.config.guest = crate::state::Guest::Windows;
         state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
         ensure_raw_snapshot_supported(&state, &create_args()).expect("a memory snapshot");
+        // --stop needs nothing of the guest: the source stays paused and its fcvm is stopped
+        // (the fleet's Windows gold snapshot uses it).
+        let mut stop = create_args();
+        stop.stop = true;
+        ensure_raw_snapshot_supported(&state, &stop).expect("--stop on a raw VM");
         type Refusal = (&'static str, fn(&mut SnapshotCreateArgs));
-        let refusals: [Refusal; 4] = [
+        let refusals: [Refusal; 3] = [
             ("--disk-only", |a| a.disk_only = true),
             ("--gpu-warm", |a| a.gpu_warm = true),
-            ("--stop", |a| a.stop = true),
             ("--inherit-working-set", |a| a.inherit_working_set = true),
         ];
         for (flag, set) in refusals {
