@@ -5310,6 +5310,7 @@ async fn publish_snapshot_dir(
     snapshot_dir: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     extra_files: SnapshotExtraFiles<'_>,
+    memory_file: Option<(&crate::reclaim::Owner, &Path)>,
 ) -> Result<()> {
     let written: Result<()> = async {
         if let Some(extra_files) = extra_files {
@@ -5327,6 +5328,16 @@ async fn publish_snapshot_dir(
             .context("writing snapshot config")
     }
     .await;
+    // A memory file in --memory-dir changes its reclaim record as the last step before the
+    // rename (`hand_memory_file_to_publication`), which keeps the window in which a killed
+    // create leaves an older build's reclaim a record it cannot read as short as it can be.
+    let written = written.and_then(|()| match memory_file {
+        Some((owner, target)) => {
+            hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
+                .context("recording the memory file for publication")
+        }
+        None => Ok(()),
+    });
     if let Err(e) = written {
         let _ = crate::storage::disk::remove_snapshot_dir(temp_snapshot_dir).await;
         return Err(e);
@@ -6570,20 +6581,15 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
-    if let Some((owner, target)) = &memory_file_owner {
-        if let Err(e) =
-            hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
-        {
-            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
-            return Err(e.context("recording the memory file for publication"));
-        }
-    }
     let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        memory_file_owner
+            .as_ref()
+            .map(|(owner, target)| (owner, target.as_path())),
     )
     .await?;
     let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
@@ -6891,6 +6897,7 @@ pub async fn create_snapshot_ch(
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        None,
     )
     .await?;
 
@@ -8395,10 +8402,22 @@ mod tests {
         assert_in_order(
             "begin_memory_file_owner",
             body_of(source, "fn begin_memory_file_owner("),
+            &["Owner::begin(id)", "Resource::Temp {"],
+        );
+        assert_in_order(
+            "publish_snapshot_dir",
+            body_of(source, "async fn publish_snapshot_dir("),
             &[
-                "Owner::begin(id)",
-                "spare_if_linked_by: Some(link.to_path_buf())",
+                "extra_files()",
+                "\"config.json\"",
+                "hand_memory_file_to_publication(",
+                "atomic_replace_dir(",
             ],
+        );
+        assert_in_order(
+            "hand_memory_file_to_publication",
+            body_of(source, "fn hand_memory_file_to_publication("),
+            &["Resource::LinkedMemory {", "crate::reclaim::forget("],
         );
     }
 
