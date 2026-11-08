@@ -1405,7 +1405,8 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
             println!("  ✓ Host kernel already installed: {}", expected_pkg);
             println!();
 
-            // Still update GRUB config in case boot_args changed
+            // Still select it for the next boot: another kernel may have been installed
+            // since, and boot_args may have changed.
             let kernel_name = format!("{}{}", kernel_version, localversion);
             update_grub_config(&kernel_name, boot_args).await?;
 
@@ -1493,17 +1494,6 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Update GRUB with boot args
     update_grub_config(kernel_name, boot_args).await?;
-
-    println!("  → Running update-grub...");
-    let output = Command::new("update-grub")
-        .output()
-        .await
-        .context("running update-grub")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(stderr = %stderr, "update-grub had warnings");
-    }
 
     println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
@@ -2950,9 +2940,27 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
 }
 
 async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Result<()> {
-    let grub_default = Path::new("/etc/default/grub");
-    let grub_d = Path::new("/etc/default/grub.d");
+    update_grub_config_at(
+        Path::new("/etc/default/grub"),
+        Path::new("/etc/default/grub.d"),
+        "update-grub",
+        kernel_name,
+        boot_args,
+    )
+    .await
+}
 
+/// Select `kernel_name` for the next boot: write GRUB_DEFAULT and the boot args, then
+/// regenerate grub.cfg with `update_grub`. Without the last step the edit to
+/// /etc/default/grub does nothing, and the next boot starts whichever kernel was
+/// installed last.
+async fn update_grub_config_at(
+    grub_default: &Path,
+    grub_d: &Path,
+    update_grub: &str,
+    kernel_name: &str,
+    boot_args: Option<&str>,
+) -> Result<()> {
     if !grub_default.exists() {
         bail!("/etc/default/grub not found");
     }
@@ -3007,12 +3015,71 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
         info!(backup = %backup.display(), "GRUB config updated");
     }
 
+    println!("  → Running update-grub...");
+    let output = Command::new(update_grub)
+        .output()
+        .await
+        .context("running update-grub")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(stderr = %stderr, "update-grub had warnings");
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `install-host-kernel` on a box where the package is already installed (a host
+    /// kernel built earlier, then another one installed over it) only selected the
+    /// kernel in /etc/default/grub and never regenerated grub.cfg, so the reboot it
+    /// asked for started the kernel installed last. Selecting a kernel must run
+    /// update-grub, whichever path selects it.
+    #[tokio::test]
+    async fn selecting_a_host_kernel_regenerates_the_grub_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let grub_default = dir.path().join("grub");
+        let grub_d = dir.path().join("grub.d");
+        std::fs::create_dir(&grub_d).unwrap();
+        std::fs::write(&grub_default, "GRUB_DEFAULT=0\nGRUB_TIMEOUT=0\n").unwrap();
+        let ran = dir.path().join("update-grub-ran");
+        let update_grub = dir.path().join("update-grub");
+        std::fs::write(
+            &update_grub,
+            format!(
+                "#!/bin/sh\ncat {} > {}\n",
+                grub_default.display(),
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &update_grub,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        update_grub_config_at(
+            &grub_default,
+            &grub_d,
+            update_grub.to_str().unwrap(),
+            "6.18.60-fcvm-example",
+            Some("kvm-arm.mode=nested"),
+        )
+        .await
+        .unwrap();
+
+        let seen = std::fs::read_to_string(&ran).expect(
+            "selecting a kernel did not run update-grub, so grub.cfg keeps the old default",
+        );
+        assert!(
+            seen.contains("with Linux 6.18.60-fcvm-example"),
+            "update-grub ran before GRUB_DEFAULT named the kernel: {seen}"
+        );
+    }
 
     /// `make install-host-kernel` points the build at the scratch disk through
     /// FCVM_HOST_KERNEL_BUILD_DIR; the build script and the search for its debs
