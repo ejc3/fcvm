@@ -1031,6 +1031,125 @@ the agent posts each once to the sandbox's bridge (`POST /action {"name": "<acti
 the scene token as the bearer token), which sends its fixed input sequence over Remote
 Desktop.
 
+### Minecraft mode
+
+`?mode=minecraft` on the page shows Minecraft servers (design: `docs/fleet/minecraft.md`). An
+agent started with `--minecraft N` runs N Pumpkin VMs and says so in its hello (`minecraft`,
+below); the coordinator makes one server per VM, `mc-<n>` (numbered fleet-wide, lowest free
+first), apart from the wall's slots, the phones and the Windows sandboxes, and keeps a
+server's name across a hello that keeps its index. A server is never a wall tile, never in a
+race, never given the budget. Every server is an fcvm clone of its host's gold snapshot: one
+Pumpkin server with its world loaded and its bots joined.
+
+The snapshot's `state.minecraft` is absent with no servers, else:
+
+```json
+{"server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+ "image_aspect": 2.0, "claim_secs": 120,
+ "borrow": {"cap": 2, "lent": 1, "next_return_at": 1761134525000},
+ "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4},
+ "last_fork": {"from": "mc-1", "to": "mc-2", "clicked_at": 1761134410000, "by": "viewer:v-5",
+               "first_chunk_at": 1761134412300, "snapshot_ms": 640, "restore_ms": 1100, "total_ms": 2300},
+ "tiles": [{"id": "mc:1", "slot": "mc-1", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}, "phase": "running",
+            "frame_url": "wss://mc-1-<token>.<subzone>/view", "join": "mc-1-<token>.<subzone>",
+            "forked_from": null,
+            "borrowed": {"session": "minecraft-claim-3", "viewer": "v-12", "since": 1761134400000, "until": 1761134520000},
+            "last_relaunch": {"clicked_at": 1761134400000, "by": "reset_all", "first_frame_at": 1761134401900,
+                              "phases": {"restore_ms": 410, "first_chunk_ms": 1900, "total_ms": 1900}}, "...": "TileView's other fields"}]}
+```
+
+`tiles` are wall tiles' fields (`TileView`) laid out in the servers' own image: one row of up
+to four, then rows of equal length, each tile square (the map is 128 x 128 columns);
+`image_aspect` is that image's. `frame_url` is the tile's view socket ("Minecraft tile",
+below): the agent's URL, or with published names the launch's name under the subzone with the
+path `/view` (`mc-<n>-<token>`, as `slot-<n>-<token>` names a slot's frames). A lent server
+keeps its `frame_url`: everyone watches it, and only its driver drives it. `join` is the host
+name Java Edition players connect to (port 25565): the frame URL's host when the URL is
+`wss://` on a DNS name, else null (an IP literal, or a plain `ws://` URL). A tile's `phase` is
+the agent's (`restoring`, `forking`, `running`, `failed`; `relaunching` until the agent reports
+the new launch, `pending` before its first report). `last_relaunch` times the server's last
+restore from the click to the first chunk its bots received after it: `first_frame_at` is the
+report's `first_chunk_at` (below), kept between the click and the coordinator's read of the
+report, as a sandbox's desktop time is; a launch nobody clicked starts `total_ms` before it.
+`phases` are the report's `timings`. `server` is the first host's (by name) `minecraft_server`
+from its hello. `forked_from` names the server whose running world the current launch is a copy
+of, null for a launch from the gold snapshot; it is cleared by the server's next launch.
+`last_fork` is the last fork whose copy reached `running`, with the agent's times:
+`first_chunk_at` the copy's first chunk (kept as `first_frame_at` is), `snapshot_ms` the
+source's `fcvm snapshot create`, `restore_ms` the copy's `fcvm snapshot run` until its view
+answered, `total_ms` the click to the copy's first chunk. `last_reset_all` is the last committed
+`minecraft_reset` of every server, with how many it reset.
+
+Intents:
+
+| name | args | effect |
+|------|------|--------|
+| `minecraft_reset` | `{"slot": "mc-2"}` or `{"all": true}` | the server (or every server) is restored from the gold snapshot: its generation moves, timed from the click (`last_relaunch.by` `viewer:<id>`, or `reset_all` for all) |
+| `minecraft_fork` | `{"slot": "mc-2"}` | the server's running world is copied into the next server on its host (below) |
+| `claim_minecraft` | `{"slot": "mc-2"}` or `{}` | borrow a server to drive its first bot (below) |
+| `release_minecraft` | `{"claim": "minecraft-claim-3"}` or `{}` | give it back |
+
+Each intent takes only the arguments in its row; any other is refused (`args.keys is not
+accepted`), as are a `slot` that is not a string (`args.slot must be a server id`) and an `all`
+that is not a boolean (`args.all must be true or false`).
+
+**Resets** follow `windows_reset`'s rules and wording, with `server` for `sandbox`: one per 2 s
+per client (`one reset per 2 s per client`, `relaunch_interval_ms`), reset all at most once
+every 10 s per client (`one reset all per 10 s per client`) and of every server that is not lent
+and not on a draining host. Refused: a lent server (`mc-2 is lent to a viewer`), one on a
+draining host (`mc-2 is on a draining host`), a name that is no server (`no server "mc-9"`),
+args with both or neither of `slot` and `all` (`args must name a slot or say all`), a reset all
+with nothing to reset (`no server can be reset now`), and every reset while the fleet sleeps
+(`the hosts are asleep`). A reset of a fork's target before its copy runs drops the fork: the
+server restores from the gold snapshot.
+
+**Forks** (`minecraft_fork`): the source must be running its current launch (`mc-2 is not
+running`); a lent source is allowed and is not touched. The target is the next server after it
+on the same host, in index order and wrapping, that is running its current launch, not lent and
+not on a draining host (`no server on mc-2's host can take a copy`). The target's generation
+moves with `fork` set to the source in its assignment, `last_relaunch.by` is `fork:<source
+slot>`, and `forked_from` is the source until the target's next launch. The assignment carries
+`fork` for that generation only, and no longer once the agent reports it running: a copy that
+later fails is relaunched from the gold snapshot. One fork per 10 s per client (`one fork per 10
+s per client`), a name that is no server is refused (`no server "mc-9"`), and nothing forks
+while the fleet sleeps (`the hosts are asleep`). The coordinator logs each fork at target
+`fcvm::fleet::minecraft`: when it is asked for, and when its copy runs (with the times above)
+or the fork ends before that (the target's generation moved on, or its host left).
+
+**Borrowing** (`claim_minecraft`) follows `claim_windows`'s rules and wording with `server` for
+`sandbox`: one server per client address (`one server per client at a time`), at most `cap`
+lent at once (`max_minecraft_lent`, default 2 or half the servers, the smaller: `2 of 2 servers
+are already lent; the next comes back in 26 s`), and after a server comes back its client waits
+`minecraft_claim_cooldown_secs` (60) to borrow again (`your last server was returned 1 s ago;
+borrow again in 59 s`). A named server must be running its current launch, not lent and not on
+a draining host (`mc-2 is not running`, `mc-2 is lent to another viewer`, `mc-2 is leaving the
+fleet`); without a name the lowest-numbered such server is taken (`no server can be lent now:
+none is running and free`). A claim while the fleet sleeps is refused (`the GPUs are asleep`),
+and a broadcast-only viewer is refused before the state sees the intent, as for
+`claim_windows`. The borrow puts its viewer in the server's assignment (`driver`, with
+`driver_until`, the borrow's end), which the agent gives the tile, and the tile accepts drive
+messages on the view socket only from a socket whose direct token names that viewer. The
+borrow ends after `minecraft_claim_secs` (120), on `release_minecraft` (`this viewer holds no
+server`, `"minecraft-claim-1" is not this viewer's server`), or when its viewer leaves; the
+server is then reset (`last_relaunch.by` `return:<session>`). A server lent when its host
+leaves or the coordinator restarts is reset when its host reports it again, and stays owed
+that reset until its fresh launch reports running, as a sandbox does. There is no drive intent:
+keys go from the page to the tile.
+
+#### Agent messages (Minecraft mode)
+
+- Hello: `minecraft` (the servers the host runs, 0 or absent for none) and `minecraft_server`
+  (a name and version for the header, e.g. `Pumpkin 3ea7d281 (Java Edition 26.3)`).
+- Assignment: a server's `AssignSlot` has `minecraft` set and `sbdf` empty, `rect` null:
+  `{"index": 0, "clicked_at": 1761134400000, "fork": {"slot": "mc-1", "index": 1} | null,
+  "driver": "v-12" | null, "driver_until": 1761134520000 | null}` (absent fields are null).
+  `index` is the server's place among the host's; `clicked_at` the click that asked for this
+  generation, when one did; `fork` the server (and its index on the same host) whose running
+  world this generation copies.
+- Slot report: as a sandbox's, with the `mc-<n>` id, `phase` one of the above, `frame_url` the
+  view socket, `timings` with `restore_ms`, `first_chunk_ms`, `total_ms` and for a fork
+  `snapshot_ms`, and `first_chunk_at` (Unix ms, host clock) with `running`.
+
 ## Agent
 
 `fcvm fleet agent` runs on a GPU host, one per host. It speaks newline-delimited JSON:
@@ -2831,3 +2950,47 @@ Text is typed as US-layout scancodes. Every key pressed is released within its s
   (720), `FPS` (30, the cap), `DESKTOP_REF`, `DESKTOP_REF_OUT`, `LOGON_DEADLINE_SECS` (300),
   `ENC_BPP` as for the renderer, and `WLOG_LEVEL` (FreeRDP's log level; errors only when
   unset).
+
+## Minecraft tile
+
+`mctile` (`fleet/minecraft`), beside Pumpkin in each Minecraft tile VM: the renderer's access
+rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, reloaded every
+2 s) and its TLS contract, on `PORT` (8080, plain, for the host) and `TLS_PORT` (443).
+
+- `GET /view` (WebSocket): `503` before the first scene in a fleet run. The first message is
+  `{"admit": "<direct token>"}`, checked against the scene's `admit_keys` as a renderer checks
+  `/frames` (expired, unknown key or anything else: close 1008); with no `admit_keys` (a local
+  run) it may be `{"viewer": "<id>"}`. The socket acts as the viewer the token names. Then the
+  tile sends text messages:
+  - `{"type": "hello", "tile": "mc-2", "generation": 7, "viewer": "v-12", "materials": [...48
+    names], "bots": 3, "bot_names": ["fcvm_bot1", ...], "driver": "v-12" | null}`
+  - `{"type": "map", "seq": 41, "region": {"x0", "z0", "w", "h"}, "cells": "<base64>"}`: every
+    column, row by row (z then x), two bytes each: its top block's material (an index into
+    `materials`) and its height (`y + 64`, held to 0..255). Sent on connect, when the region
+    changes, and to a socket that fell behind.
+  - `{"type": "delta", "seq": 42, "cells": [[index, material, height], ...]}`: the columns that
+    changed, at most every 200 ms.
+  - `{"type": "status", "t": <unix ms>, "tps": 19.98 | null, "players": [{"name", "x", "y",
+    "z", "yaw", "bot", "driven"}], "drive": {"seq": 12, "moved_at": <unix ms>} | null}`, ten a
+    second. `drive` is the last drive message whose effect the tile saw (the driven bot moved
+    or turned), on the tile's clock.
+  - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
+    "reason": "..."}`, for each drive message.
+
+  The page sends drive messages: `{"type": "drive", "seq": 12, "keys": ["forward", "left",
+  "jump", "sprint", "back", "right"], "yaw": 90.0, "pitch": 45.0, "action": "place" | "dig" |
+  null}`. `seq` increases; `yaw` is degrees in the game's convention (0 faces +z, 90 faces -x),
+  within 3600 of 0; `pitch` within 90; at most 6 keys from that set; any other field is refused.
+  Only the scene's `driver` may drive (`another viewer holds this tile`, `nobody holds this
+  tile; take it over first`); the held keys end 1 s after the last message; at most 30 messages
+  a second per socket.
+- `POST /scene` (the agent; the scene token when one is configured): `{"tile": "mc-2",
+  "generation": 7, "admit_keys": ["<hex>", ...], "driver": "v-12" | null, "driver_until":
+  <unix ms> | null}`. `driver` and `driver_until` are the assignment's (Minecraft mode, above).
+  `400` names a refused field; any other field is refused.
+- `GET /health`: `ready` (the server listens, every bot spawned, every column known), `tile`,
+  `generation`, `scene`, `tps`, `bots` (`wanted`, `online`), `players`, `sessions` (how many
+  times the first bot joined; a restore makes it rejoin), `chunks` (in the current session),
+  `map` (`known`, `cells`), `viewers`, `driver`, `times_unix_ms` (`start`,
+  `server_listening`, `first_chunk` of the current session, `bots_spawned`, `map_ready`),
+  `top_blocks` (the commonest top blocks of the map), `tls` (`loaded`, `loads`) and `error`.
