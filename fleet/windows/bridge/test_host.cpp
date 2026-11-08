@@ -360,11 +360,17 @@ int main() {
     Step bad{STEP_TEXT, {0, 0, 0}, 0, "a;b", 0};
     CHECK(!step_keys(bad, &k), "a character the map lacks is refused, not skipped");
     k.clear();
-    CHECK(step_keys(kCloseWindowStep, &k) &&
-              k == std::vector<KeyEvent>({{SC_LMENU, true}, {SC_F4, true}, {SC_F4, false}, {SC_LMENU, false}}),
-          "close_all presses Alt+F4");
-    CHECK(action_find("close_all")->steps[0].kind == STEP_CLOSE_UNTIL_DESKTOP && action_find("close_all")->steps[0].ms == 10,
-          "close_all tries at most 10 times");
+    // A round is Esc, Alt+F4, N: on Windows Server 2025, Alt+F4 alone left the Notepad action's
+    // window behind a "save changes?" prompt and a Save As dialog, under the Start menu, for
+    // all 10 presses, and on a bare desktop opened the Shut Down dialog.
+    std::vector<KeyEvent> round;
+    for (const Step& r : kCloseRound) CHECK(step_keys(r, &round), "a close key");
+    CHECK(round == std::vector<KeyEvent>({{SC_ESCAPE, true}, {SC_ESCAPE, false},
+                                          {SC_LMENU, true}, {SC_F4, true}, {SC_F4, false}, {SC_LMENU, false},
+                                          {SC_KEY_N, true}, {SC_KEY_N, false}}),
+          "close_all's round is Esc, Alt+F4, N");
+    CHECK(action_find("close_all")->steps[0].kind == STEP_CLOSE_UNTIL_DESKTOP && action_find("close_all")->steps[0].ms == 5,
+          "close_all runs at most 5 rounds");
     CHECK(action_find("start_menu")->nsteps == 1 && action_find("start_menu")->steps[0].keys[0] == SC_LWIN,
           "start_menu is the Windows key");
     CHECK(action_find("explorer")->steps[0].keys[0] == SC_LWIN && action_find("explorer")->steps[0].keys[1] == SC_KEY_E,
@@ -390,9 +396,11 @@ int main() {
     CHECK(count(play, "step_keys(") == 2 && count(play, "std::vector<KeyEvent> keys;") == 1 && count(play, "keys.push_back") == 0 &&
               count(play, "KeyEvent{") == 0,
           "and play's keys come from step_keys");
-    CHECK(count(play, "step_keys(s, &keys)") == 1 && count(play, "step_keys(kCloseWindowStep, &keys)") == 1 &&
+    CHECK(count(play, "step_keys(s, &keys)") == 1 && count(play, "step_keys(kCloseRound[k], &keys)") == 1 &&
               count(play, "const Step& s = a.steps[i];") == 1,
           "over the action's own steps and the close step");
+    CHECK(count(play, "k < CLOSE_ROUND_KEYS && !at_desktop()") == 1 && count(play, "round < s.ms && !at_desktop()") == 1,
+          "close_all looks for the desktop before every key");
     CHECK(count(function_body(bridge, "int Bridge::post_action("), "action_from_body(body") == 1 &&
               count(function_body(bridge, "int Bridge::post_action("), "play(*a") == 1,
           "POST /action only names an action in the table");

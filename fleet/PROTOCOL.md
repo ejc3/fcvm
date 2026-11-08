@@ -2796,7 +2796,7 @@ it is sent in, and at once to a new stream.
 | `task_manager` | Ctrl+Shift+Esc |
 | `about` | Win+R, 800 ms, `winver`, Enter |
 | `terminal` | Win+R, 800 ms, `powershell -NoExit -Command Get-ComputerInfo -Property OsName,OsVersion,CsProcessors,CsTotalPhysicalMemory`, Enter |
-| `close_all` | Alt+F4, 700 ms apart, until the screen matches the desktop reference (or the settled desktop) or 10 times; the reply carries `presses` |
+| `close_all` | rounds of Esc, Alt+F4 and N (300, 700 and 400 ms apart), looking for the desktop reference (or the settled desktop) before every key and stopping there, at most 5 rounds; the reply carries `presses` |
 
 Text is typed as US-layout scancodes. Every key pressed is released within its step.
 
