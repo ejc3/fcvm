@@ -711,22 +711,14 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // Step 6: Ensure global NAT is configured
-        let default_iface = match portmap::detect_default_interface().await {
-            Ok(iface) => iface,
-            Err(e) => {
-                let _ = self.cleanup().await;
-                return Err(e).context("detecting default network interface");
-            }
-        };
-
         // NAT for baseline VMs (172.30.x.x)
-        if let Err(e) = portmap::ensure_global_nat("172.30.0.0/16", &default_iface).await {
+        if let Err(e) = portmap::ensure_global_nat("172.30.0.0/16").await {
             let _ = self.cleanup().await;
             return Err(e).context("ensuring global NAT for 172.30.0.0/16");
         }
 
         // NAT for clone veth traffic (10.x.x.x) - only needed for clones but harmless for baseline
-        if let Err(e) = portmap::ensure_global_nat("10.0.0.0/8", &default_iface).await {
+        if let Err(e) = portmap::ensure_global_nat("10.0.0.0/8").await {
             let _ = self.cleanup().await;
             return Err(e).context("ensuring global NAT for 10.0.0.0/8");
         }
