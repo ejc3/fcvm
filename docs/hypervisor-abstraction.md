@@ -52,7 +52,7 @@ Full table + citations in #632.
 | diff / incremental snapshots | ✅ | ❌ | cap `diff_snapshots` (FC-only; CH takes full) |
 | drive retarget on restore (`patch_drive`) | ✅ | ❌ | use **bind-mount redirect** (already VMM-agnostic) everywhere |
 | metadata service (boot plan) | ✅ MMDS | ❌ no MMDS | **boot-plan over vsock** (portable; keep MMDS as FC fast path) |
-| nested ARM64 (FEAT_NV2) | ✅ (custom fork + DSB kernel patches) | ❌ (CH nested is x86-only) | cap `nested_arm64` (FC-only) |
+| nested ARM64 (FEAT_NV2) | ✅ (custom fork + kernel/patches-arm64) | ❌ (CH nested is x86-only) | cap `nested_arm64` (FC-only) |
 
 Net: the capability gates separating the two are memory-sharing semantics (split into
 `file_backed_cow_restore` / `external_uffd_lazy_restore` / `internal_uffd_lazy_restore` —
