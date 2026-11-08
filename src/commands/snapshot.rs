@@ -1126,6 +1126,15 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
     ensure_raw_snapshot_supported(&vm_state, &args)?;
+    if args.memory_dir.is_some() {
+        anyhow::ensure!(
+            matches!(
+                vm_state.config.hypervisor,
+                crate::hypervisor::Backend::Firecracker
+            ),
+            "--memory-dir needs a Firecracker VM"
+        );
+    }
     if args.gpu_warm {
         anyhow::ensure!(
             matches!(
@@ -1373,13 +1382,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         snapshot_config.clone(),
                         &vm_disk_path,
                         vsock_socket_path,
-                        parent_dir.as_deref(),
+                        // A memory file in --memory-dir is a full snapshot: there is no
+                        // diff parent to merge into.
+                        parent_dir.as_deref().filter(|_| args.memory_dir.is_none()),
                         inode_tables,
                         if args.stop {
                             super::common::SnapshotSourceDisposition::LeavePaused
                         } else {
                             super::common::SnapshotSourceDisposition::Resume
                         },
+                        args.memory_dir.as_deref(),
                     )
                 };
                 if args.gpu_warm {
@@ -1588,8 +1600,8 @@ fn fc_agent_vsock(vsock_socket_path: &Option<PathBuf>) -> Result<&Path> {
 
 /// What `snapshot create` can do with a raw VM (no fc-agent): a Cloud Hypervisor memory
 /// snapshot, pause, save and resume. A disk-only capture freezes the guest's filesystems
-/// through fc-agent, `--gpu-warm` checkpoints CUDA through it, and `--stop` and
-/// `--inherit-working-set` are for Firecracker snapshots.
+/// through fc-agent, `--gpu-warm` checkpoints CUDA through it, and `--stop`,
+/// `--inherit-working-set` and `--memory-dir` are for Firecracker snapshots.
 fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) -> Result<()> {
     if vm_state.config.guest.runs_fc_agent() {
         return Ok(());
@@ -1605,6 +1617,7 @@ fn ensure_raw_snapshot_supported(vm_state: &VmState, args: &SnapshotCreateArgs) 
         (args.gpu_warm, "--gpu-warm"),
         (args.stop, "--stop"),
         (args.inherit_working_set, "--inherit-working-set"),
+        (args.memory_dir.is_some(), "--memory-dir"),
     ] {
         anyhow::ensure!(
             !set,
@@ -1933,6 +1946,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         .await
         .context("loading snapshot configuration")?;
     ensure_not_disk_only(snapshot_config.kind, "snapshot serve")?;
+    crate::storage::disk::ensure_memory_file_present(
+        &snapshot_config.memory_path,
+        &args.snapshot_name,
+    )?;
 
     info!(
         snapshot = %args.snapshot_name,
@@ -2721,6 +2738,7 @@ async fn cmd_snapshot_run_inner(
         .await;
     }
 
+    crate::storage::disk::ensure_memory_file_present(&snapshot_config.memory_path, &snapshot_name)?;
     info!(
         snapshot = %snapshot_name,
         image = %snapshot_config.metadata.image,
@@ -7610,17 +7628,19 @@ mod tests {
             gpu_warm: false,
             stop: false,
             expect_vm_id: None,
+            memory_dir: None,
         };
         let mut state = VmState::new("vm-raw".to_string(), "win.raw".to_string(), 2, 4096);
         state.config.guest = crate::state::Guest::Windows;
         state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
         ensure_raw_snapshot_supported(&state, &create_args()).expect("a memory snapshot");
         type Refusal = (&'static str, fn(&mut SnapshotCreateArgs));
-        let refusals: [Refusal; 4] = [
+        let refusals: [Refusal; 5] = [
             ("--disk-only", |a| a.disk_only = true),
             ("--gpu-warm", |a| a.gpu_warm = true),
             ("--stop", |a| a.stop = true),
             ("--inherit-working-set", |a| a.inherit_working_set = true),
+            ("--memory-dir", |a| a.memory_dir = Some("/dev/shm".into())),
         ];
         for (flag, set) in refusals {
             let mut args = create_args();

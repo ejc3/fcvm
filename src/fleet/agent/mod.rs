@@ -275,6 +275,12 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             players: args.potato_players,
             prefix,
             mem_mib: args.potato_mem,
+            sleep_memory_dir: Some(args.potato_sleep_memory_dir.clone())
+                .filter(|dir| !dir.as_os_str().is_empty()),
+            sleep_memory_cap_mib: match args.potato_sleep_memory_cap_mib {
+                0 => 2 * u64::from(args.potato_players) * u64::from(args.potato_mem),
+                cap => cap,
+            },
         })
     } else {
         None

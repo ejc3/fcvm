@@ -1973,6 +1973,8 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 | the agent disconnects | the round ends; the agent stops every player's VM, as it stops slots |
 | the coordinator restarts | the agent's round is replaced by a new one at the same size; records stay |
 | the fleet sleeps | the host goes with it; the next host boots new players (new colours) and the ladder continues from its size |
+| a sleeping player's memory file is gone (the host rebooted, or the memory directory was cleared) | `snapshot run` refuses it, naming the missing file; the wake fails as above, the round restarts, and the player is booted fresh |
+| the sleep memory directory is at its cap (`--potato-sleep-memory-cap-mib`) | that sleep keeps its memory on the store, at the store's speed |
 
 ### Cheaper sleep
 
@@ -1982,9 +1984,28 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
   page the guest wrote since is an anonymous page of that mapping. Firecracker could read
   the written set from `/proc/self/pagemap` instead of KVM's dirty log, which would keep
   the diff's 20 MiB writes and give the wake back the 130 ms the dirty log costs.
-- **No btrfs commit in the cycle.** Reflinks instead of subvolumes did not help (above); what
-  would is keeping the commit out of the sleep's path: the snapshots of the players on a
-  filesystem of their own, or the memory written somewhere a commit does not wait on.
+- **No btrfs commit in the cycle: done, with the memory in RAM.** A player sleeps with
+  `snapshot create --memory-dir /dev/shm/fcvm-potato` (the agent's
+  `--potato-sleep-memory-dir`): a full snapshot whose memory file is in a tmpfs, behind the
+  snapshot's `memory.bin` link, in an ordinary directory, with the disk reflinked into an
+  ordinary directory when it has few extents. Burst of 16 sleeps and 16 wakes at once on a
+  g4dn.metal with fcvm's host kernel, the arms interleaved in blocks of four trials and only
+  each block's last counted (128 sleeps and 128 wakes per arm, one session, 2026-11-07):
+
+  | arm | sleep p50 / p90 / p99 | wake p50 / p90 / p99 | btrfs commits per trial | trial |
+  |---|---|---|---|---|
+  | main (diff in a staged subvolume) | 1719 / 2145 / 2406 ms | 1162 / 1358 / 1401 ms | 10.2 | 2.14 s |
+  | diff reflinked into directories, no fsync | 2081 / 2620 / 2703 ms | 1378 / 1534 / 1613 ms | 0 | 2.52 s |
+  | full snapshot, memory in a tmpfs | 507 / 601 / 635 ms | 631 / 685 / 764 ms | 0.6 | 1.01 s |
+
+  The second arm takes no commit at all and is no faster: 16 sleeps at once queue on btrfs's
+  extent tree as much as on its commits. Out of btrfs, the memory save is a copy into RAM
+  (170 ms p50 against 297 ms) and nothing is staged (2 ms against 953 ms); the wake reads the
+  memory from RAM, and fc-agent acknowledges the restore 306 ms p50 after the resume against
+  850 ms, whose memory file a reflink gives a new inode with none of its pages cached. It
+  costs the guest's memory size in RAM per sleeping player (24 GiB for 96 players of 256 MiB),
+  capped at twice that by default; a sleep over the cap goes to the store. The memory does not
+  survive a reboot, and neither do the players: the next agent boots them fresh.
 - **Keep the network across a sleep.** The routed network costs 103 ms of the wake and
   46 ms of the teardown, and a player's address never changes.
 

@@ -722,6 +722,22 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value_t = 256)]
     pub potato_mem: u32,
 
+    /// Where a sleeping potato player's memory is kept (`snapshot create --memory-dir`): a
+    /// tmpfs, so a sleep commits no btrfs transaction and a wake reads the memory from RAM.
+    /// It takes each sleeping player's memory size there, and is lost on a reboot, as the
+    /// players are. Empty: keep the memory in the snapshot directory on the store.
+    #[arg(long, default_value = "/dev/shm/fcvm-potato")]
+    pub potato_sleep_memory_dir: std::path::PathBuf,
+
+    /// The most sleeping players' memory may take in --potato-sleep-memory-dir, in MiB,
+    /// counting one --potato-mem for each player whose last sleep is there and one for each
+    /// sleep in flight; a sleep that would go over it keeps its memory on the store. 0: twice
+    /// the players' memory (--potato-players times --potato-mem), room for every player's
+    /// sleep and for each one's next while the earlier is still held. The agent empties the
+    /// directory when it starts, and keeps every sleep on the store if fcvm would refuse it.
+    #[arg(long, default_value_t = 0)]
+    pub potato_sleep_memory_cap_mib: u64,
+
     /// Phones mode: run Android phones on the last N GPUs of the inventory instead of
     /// renderers (needs --phone-image, --phone-aosp, --phone-emulator and --phone-apk)
     #[arg(long, default_value_t = 0, requires_all = ["phone_image", "phone_aosp", "phone_emulator", "phone_apk"])]
@@ -1372,6 +1388,19 @@ pub struct SnapshotCreateArgs {
     /// selector's name or PID after the pin is never snapshotted and left paused.
     #[arg(skip)]
     pub expect_vm_id: Option<String>,
+
+    /// Write the snapshot's memory file in DIR, such as a tmpfs, rather than in the snapshot
+    /// directory on the store. The snapshot is a full one, and its directory and disk
+    /// directory are ordinary directories where the disks have few extents, so the create
+    /// commits no btrfs transaction and a restore reads the memory from RAM.
+    ///
+    /// The snapshot's `memory.bin` is a symbolic link to a file of DIR named
+    /// `fcvm-memory-<uuid>.bin`, and removing the snapshot directory through fcvm (a newer
+    /// generation replacing it, or a failed create) removes that file too. The memory does
+    /// not survive a reboot when DIR is a tmpfs, and it takes the guest's memory size in DIR
+    /// for as long as the snapshot exists. Firecracker VMs only.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["disk_only", "gpu_warm", "inherit_working_set"])]
+    pub memory_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
