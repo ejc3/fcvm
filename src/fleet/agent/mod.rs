@@ -545,10 +545,17 @@ where
     });
 
     let cfg = Arc::new(agent.cfg);
-    let mut sandboxes = agent.windows.map(|w| {
-        windows::Windows::start(Arc::new(w), cfg.clone(), places, out.clone(), http.clone())
-    });
     let (scene_tx, scene_rx) = watch::channel::<Option<SharedScene>>(None);
+    let mut sandboxes = agent.windows.map(|w| {
+        windows::Windows::start(
+            Arc::new(w),
+            cfg.clone(),
+            places,
+            out.clone(),
+            http.clone(),
+            scene_rx.clone(),
+        )
+    });
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetPlan>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);

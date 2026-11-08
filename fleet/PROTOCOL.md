@@ -1522,7 +1522,8 @@ sandbox's bridge runs in a container on the host, one per sandbox, named afresh 
 launch (`fleet-<slot>-bridge-g<generation>-<8 hex>`):
 
 ```
-podman run --rm --replace --pull=never --name fleet-<slot>-bridge-g<generation>-<8 hex>
+podman run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1
+  --name fleet-<slot>-bridge-g<generation>-<8 hex>
   --volume <rdp_socket>:/run/windows/rdp.sock --volume <dir>/sandbox-password:/run/windows/sandbox-password:ro
   --env RDP_SOCKET=/run/windows/rdp.sock --env RDP_USER=sandbox --env RDP_PASSWORD_FILE=/run/windows/sandbox-password
   --volume <state dir>/<image id>/desktop-ref.ppm:/run/windows/desktop-ref.ppm:ro --env DESKTOP_REF=/run/windows/desktop-ref.ppm
@@ -1539,7 +1540,13 @@ container without ports or certificate, with `--volume <state dir>/<image id>:/r
 --env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `logon`; the image's entrypoint
 is the bridge, so the mode is its only argument. A bridge is stopped through podman, since the
 container outlives a killed `podman run` client: `podman stop -t 10 <name>`, `podman rm -f
-<name>`, then the client is awaited (killed after 5 s more). Every failure of a launch stops both its
+<name>`, then the client is awaited (killed after 5 s more). An agent killed with SIGKILL
+stops nothing, and podman does not pass SIGKILL on to the container, so before its gold flow an
+agent removes every container labelled `fcvm.fleet.windows-bridge=1` (`podman ps -a -q --filter
+label=...`, then `podman rm -f`). The agent gives each bridge the shared scene's clock and
+admission keys (`POST /scene` with `epoch_unix_ms` and `admit_keys`, the scene token) and each
+new one as it comes; a bridge with a certificate serves no frames without a scene, so with
+`--tls-dir` a sandbox reports `running` only once its bridge holds one. Every failure of a launch stops both its
 VM and its bridge this way. A sandbox that replaces another on the same index starts only once
 the old one's VM and bridge have exited, waiting as long as the steps of a teardown may take
 together (both podman commands, the client, the VM's grace and the SIGKILLs). Every fcvm and

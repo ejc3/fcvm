@@ -14,7 +14,9 @@ use fcvm::fleet::agent::slot::AgentCfg;
 use fcvm::fleet::agent::windows::{Manifest, WindowsCfg};
 use fcvm::fleet::agent::{serve, Agent};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
-use fleet_core::protocol::{AgentMsg, AssignSlot, AssignWindows, CoordMsg, SlotReport};
+use fleet_core::protocol::{
+    AgentMsg, AssignSlot, AssignWindows, CoordMsg, SharedScene, SlotReport,
+};
 use fleet_core::windows::{Gold, WindowsAction, WindowsActionReq, WindowsImage};
 use fleet_support::consecutive_listeners;
 use std::collections::BTreeMap;
@@ -36,6 +38,23 @@ type Posted = Arc<Mutex<Vec<(Option<String>, serde_json::Value)>>>;
 struct Bridge {
     marker: PathBuf,
     actions: Posted,
+    scenes: Posted,
+}
+
+async fn scene(
+    State(b): State<Bridge>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    if !b.marker.exists() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    b.scenes.lock().unwrap().push((auth, body));
+    StatusCode::OK
 }
 
 async fn health(State(b): State<Bridge>) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -77,6 +96,7 @@ struct Fake {
     podman: PathBuf,
     base: u16,
     actions: Vec<Posted>,
+    scenes: Vec<Posted>,
 }
 
 fn wrapper(dir: &Path, name: &str, target: &Path, env: &[(&str, String)]) -> PathBuf {
@@ -114,16 +134,20 @@ fn fake_with(n: usize, extra: &[(&str, &str)]) -> Fake {
     );
     let (base, listeners) = consecutive_listeners(n);
     let mut actions = Vec::new();
+    let mut scenes = Vec::new();
     for (i, l) in listeners.into_iter().enumerate() {
         l.set_nonblocking(true).unwrap();
         let b = Bridge {
             marker: dir.path().join(format!("bridge-{}.up", base + i as u16)),
             actions: Arc::new(Mutex::new(Vec::new())),
+            scenes: Arc::new(Mutex::new(Vec::new())),
         };
         actions.push(b.actions.clone());
+        scenes.push(b.scenes.clone());
         let app = Router::new()
             .route("/health", get(health))
             .route("/action", post(action))
+            .route("/scene", post(scene))
             .with_state(b);
         let listener = tokio::net::TcpListener::from_std(l).unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -134,6 +158,7 @@ fn fake_with(n: usize, extra: &[(&str, &str)]) -> Fake {
         podman,
         base,
         actions,
+        scenes,
     }
 }
 
@@ -610,6 +635,110 @@ async fn the_gold_flow_runs_in_order_and_every_sandbox_restores_from_it() {
         .unwrap()
         .next()
         .is_none());
+}
+
+/// Each bridge is given the wall's clock and admission keys (`POST /scene`, with the scene
+/// token) before its sandbox reports running, and new keys as they come: a bridge with a
+/// certificate serves no frames without a scene, and checks direct tokens against its keys.
+#[tokio::test]
+async fn every_bridge_holds_the_scene_before_its_sandbox_runs_and_gets_each_new_one() {
+    let f = fake(1);
+    let (installed, expires) = recent();
+    let mut w = f.windows(1, f.image(&installed, &expires));
+    // As on a fleet host, where the bridge has a certificate.
+    w.tls_dir = Some(f.dir.path().join("tls"));
+    let mut c = Coord::start(&f, w);
+    let mut first = SharedScene::new(&fleet_core::scene::Scene::new(5), 2.0);
+    first.admit_keys = vec!["aa".repeat(32)];
+    c.to_agent.send(CoordMsg::Scene(first.clone())).unwrap();
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    let held = |n: usize| f.scenes[0].lock().unwrap().get(n).cloned();
+    let (auth, body) = held(0).expect("the bridge got the scene before its sandbox ran");
+    assert_eq!(auth.as_deref(), Some("Bearer tok-1"));
+    assert_eq!(
+        body,
+        serde_json::json!({"epoch_unix_ms": first.epoch_unix_ms, "admit_keys": first.admit_keys})
+    );
+    let mut next = first.clone();
+    next.admit_keys = vec!["bb".repeat(32), "aa".repeat(32)];
+    c.to_agent.send(CoordMsg::Scene(next.clone())).unwrap();
+    let t0 = std::time::Instant::now();
+    while held(1).is_none() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the new keys never reached the bridge"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        held(1).unwrap().1["admit_keys"],
+        serde_json::json!(next.admit_keys)
+    );
+    c.close().await;
+}
+
+/// A bridge container an earlier agent left (killed with SIGKILL, so it stopped nothing, and
+/// podman does not pass SIGKILL on to the container) is removed before the gold flow runs.
+#[tokio::test]
+async fn a_bridge_container_left_by_an_earlier_agent_is_removed_at_start() {
+    let f = fake(1);
+    let (installed, expires) = recent();
+    let w = f.windows(1, f.image(&installed, &expires));
+    // The earlier agent's bridge: its client killed, its container running on.
+    let mut client = std::process::Command::new(&f.podman)
+        .args([
+            "run",
+            "--rm",
+            "--replace",
+            "--pull=never",
+            "--label",
+            fcvm::fleet::agent::windows::BRIDGE_LABEL,
+            "--name",
+            "fleet-win-1-bridge-g7-0ld",
+            "--publish",
+            "127.0.0.1:1:8080",
+            "localhost/fcvm-windows-bridge:test",
+            "serve",
+        ])
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    while f.containers().is_empty() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the earlier bridge never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let left = f.containers();
+    client.kill().unwrap();
+    client.wait().unwrap();
+    assert_eq!(
+        f.containers(),
+        left,
+        "the container outlives its killed client"
+    );
+    let mut c = Coord::start(&f, w);
+    c.assign(&[("win-1", 0, 1, None, vec![])]);
+    c.until(&["win-1"], "running", 1).await;
+    for pid in &left {
+        assert!(
+            !f.containers().contains(pid),
+            "the earlier agent's bridge {pid} still runs"
+        );
+    }
+    let log = f.log();
+    let removed = log
+        .iter()
+        .position(|(k, n)| k == "podman_rm" && n == "fleet-win-1-bridge")
+        .expect("the earlier bridge was removed");
+    let gold = log
+        .iter()
+        .position(|(k, _)| k.starts_with("podman_logon") || k == "vm_run" || k == "run")
+        .unwrap_or(usize::MAX);
+    assert!(removed < gold, "removed after the gold flow began: {log:?}");
+    c.close().await;
 }
 
 #[tokio::test]

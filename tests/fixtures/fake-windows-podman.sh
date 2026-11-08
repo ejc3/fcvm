@@ -13,7 +13,8 @@
 #                                  FAKE_BRIDGE_CLIENT_DIES=1: the client exits 3 at once and
 #                                  the container runs on, never serving.
 #   stop -t N <name>               SIGTERM to the container, SIGKILL after N s
-#   rm -f <name>                   SIGKILL to the container, and its state removed
+#   rm -f <name>...                SIGKILL to each container, and its state removed
+#   ps -a -q --filter label=<l>    the names of the running containers with label <l>
 #
 # Events and arguments are logged as the fake fcvm logs them; the container's pid is in
 # $FAKE_FCVM_DIR/container-<name>.pid while it runs.
@@ -32,20 +33,32 @@ case "${1:-}" in
         rm -f "$(cat "$dir/container-$name.port" 2>/dev/null)"
         exit 0 ;;
     rm)
-        name="${*: -1}"
-        echo "podman_rm $name $$ $(date +%s%N)" >> "$log"
-        pid=$(cat "$dir/container-$name.pid" 2>/dev/null) && kill -KILL "$pid" 2>/dev/null
-        rm -f "$(cat "$dir/container-$name.port" 2>/dev/null)" "$dir/container-$name.pid" "$dir/container-$name.port"
+        shift; [ "${1:-}" = -f ] && shift
+        for name in "$@"; do
+            echo "podman_rm $name $$ $(date +%s%N)" >> "$log"
+            pid=$(cat "$dir/container-$name.pid" 2>/dev/null) && kill -KILL "$pid" 2>/dev/null
+            rm -f "$(cat "$dir/container-$name.port" 2>/dev/null)" "$dir/container-$name.pid" "$dir/container-$name.port" "$dir/container-$name.labels"
+        done
+        exit 0 ;;
+    ps)
+        # ps -a -q --filter label=<l>: the names of the running containers carrying label <l>
+        want="${*: -1}"; want="${want#label=}"
+        for f in "$dir"/container-*.labels; do
+            [ -e "$f" ] || continue
+            name="${f#"$dir"/container-}"; name="${name%.labels}"
+            [ -e "$dir/container-$name.pid" ] && grep -qxF "$want" "$f" && echo "$name"
+        done
         exit 0 ;;
     run) ;;
     *) exit 2 ;;
 esac
 argv=("$@")
 mode="${*: -1}"
-name="" port="" state="" ref_out=""
+name="" port="" state="" ref_out="" labels=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) name="$2"; shift ;;
+        --label) labels="$labels$2"$'\n'; shift ;;
         --publish) [ -n "$port" ] || { p="${2%:*}"; port="${p##*:}"; }; shift ;;
         --volume) case "$2" in *:/run/windows/state) state="${2%:/run/windows/state}" ;; esac; shift ;;
         --env) case "$2" in DESKTOP_REF_OUT=*) ref_out="${2#DESKTOP_REF_OUT=}" ;; esac; shift ;;
@@ -62,6 +75,7 @@ if [ "$mode" = logon ]; then
 fi
 marker="$dir/bridge-$port.up"
 echo "$marker" > "$dir/container-$name.port"
+printf '%s' "$labels" > "$dir/container-$name.labels"
 (
     if [ -n "${FAKE_BRIDGE_STUCK:-}" ]; then trap '' TERM; else trap 'rm -f "$marker"; exit 0' TERM; fi
     sleep "${FAKE_BRIDGE_SECS:-0.2}"

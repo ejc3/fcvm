@@ -20,7 +20,7 @@ use super::slot::{frame_url, AgentCfg};
 use super::vm::Vm;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use fleet_core::protocol::{AgentMsg, AssignSlot, AssignWindows, SlotReport};
+use fleet_core::protocol::{AgentMsg, AssignSlot, AssignWindows, SharedScene, SlotReport};
 use fleet_core::windows::{Gold, WindowsAction, WindowsImage};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -239,6 +239,61 @@ pub enum BridgeMode {
     },
 }
 
+/// Every bridge container carries this label, so an agent that starts finds and removes the
+/// containers an agent before it left behind: a SIGKILLed agent stops nothing, and podman does
+/// not pass SIGKILL from its client on to the container, which keeps its published ports.
+pub const BRIDGE_LABEL: &str = "fcvm.fleet.windows-bridge=1";
+
+/// Remove every bridge container a previous agent left (`BRIDGE_LABEL`). Runs before the gold
+/// flow, so before any bridge of this agent exists.
+pub async fn reclaim_bridges(cfg: &WindowsCfg) {
+    let filter = format!("label={BRIDGE_LABEL}");
+    let listed = tokio::time::timeout(
+        Duration::from_secs(60),
+        child(&cfg.podman)
+            .args(["ps", "-a", "-q", "--filter", &filter])
+            .output(),
+    )
+    .await;
+    let ids: Vec<String> = match listed {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        Ok(Ok(o)) => {
+            tracing::warn!(status = %o.status, out = %String::from_utf8_lossy(&o.stderr).trim(), "podman could not list leftover bridges");
+            return;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "podman did not start to list leftover bridges");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("podman timed out listing leftover bridges");
+            return;
+        }
+    };
+    if ids.is_empty() {
+        return;
+    }
+    tracing::warn!(containers = ?ids, "removing bridge containers a previous agent left");
+    let mut rm = vec!["rm".to_string(), "-f".to_string()];
+    rm.extend(ids);
+    match tokio::time::timeout(
+        Duration::from_secs(60),
+        child(&cfg.podman).args(&rm).output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) if o.status.success() => {}
+        Ok(Ok(o)) => {
+            tracing::warn!(status = %o.status, out = %String::from_utf8_lossy(&o.stderr).trim(), "podman could not remove leftover bridges")
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "podman did not start to remove leftover bridges"),
+        Err(_) => tracing::warn!("podman timed out removing leftover bridges"),
+    }
+}
+
 /// The bridge container's `podman run` arguments. It reaches Remote Desktop only through the
 /// VM's relay socket, reads the password from the image directory, and is given nothing else
 /// of the host: no network of its own beyond its published ports.
@@ -254,6 +309,8 @@ pub fn bridge_argv(
         "--rm",
         "--replace",
         "--pull=never",
+        "--label",
+        BRIDGE_LABEL,
         "--name",
         name,
         "--volume",
@@ -659,6 +716,8 @@ pub struct Windows {
     out: mpsc::UnboundedSender<AgentMsg>,
     http: reqwest::Client,
     gold: watch::Receiver<GoldState>,
+    /// The wall's shared scene: its clock and admission keys, which every bridge is given.
+    scene: watch::Receiver<Option<SharedScene>>,
     sandboxes: BTreeMap<String, Handle>,
     /// Supervisors told to stop, by the host index they held: a new sandbox on that index
     /// starts only once its old one has stopped.
@@ -677,6 +736,7 @@ impl Windows {
         places: Vec<Place>,
         out: mpsc::UnboundedSender<AgentMsg>,
         http: reqwest::Client,
+        scene: watch::Receiver<Option<SharedScene>>,
     ) -> Windows {
         let (gold_tx, gold) = watch::channel(GoldState::Building);
         let (stop, stop_rx) = watch::channel(false);
@@ -684,6 +744,7 @@ impl Windows {
             let cfg = cfg.clone();
             let agent = agent.clone();
             tokio::spawn(async move {
+                reclaim_bridges(&cfg).await;
                 let r = gold_flow(&cfg, &agent, stop_rx.clone()).await;
                 let state = match r {
                     Ok(tag) => {
@@ -736,6 +797,7 @@ impl Windows {
             out,
             http,
             gold,
+            scene,
             sandboxes: BTreeMap::new(),
             retired: Vec::new(),
             stop,
@@ -791,6 +853,7 @@ impl Windows {
                 agent: self.agent.clone(),
                 out: self.out.clone(),
                 http: self.http.clone(),
+                scene: self.scene.clone(),
             };
             // The index's ports and address are free once its old sandbox has stopped.
             let (before, kept) = std::mem::take(&mut self.retired)
@@ -1125,6 +1188,7 @@ struct Sandbox {
     agent: Arc<AgentCfg>,
     out: mpsc::UnboundedSender<AgentMsg>,
     http: reqwest::Client,
+    scene: watch::Receiver<Option<SharedScene>>,
 }
 
 struct Running {
@@ -1133,6 +1197,26 @@ struct Running {
     generation: u64,
     started: Instant,
     actions_done: u64,
+    /// The scene the bridge holds: without one a bridge with a certificate serves no frames,
+    /// and its admission keys are the ones a viewer's direct token is checked against.
+    scene: Option<BridgeScene>,
+}
+
+/// What a bridge takes of the shared scene (`POST /scene`): the wall's clock and the
+/// admission keys.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BridgeScene {
+    pub epoch_unix_ms: u64,
+    pub admit_keys: Vec<String>,
+}
+
+impl BridgeScene {
+    pub fn of(s: &SharedScene) -> BridgeScene {
+        BridgeScene {
+            epoch_unix_ms: s.epoch_unix_ms,
+            admit_keys: s.admit_keys.clone(),
+        }
+    }
 }
 
 impl Sandbox {
@@ -1180,6 +1264,35 @@ impl Sandbox {
             self.agent.health_host(),
             self.place.port
         )
+    }
+
+    /// Give the bridge the current scene when it holds another; what it holds afterwards.
+    async fn sync_scene(&self, held: Option<BridgeScene>) -> Option<BridgeScene> {
+        let Some(want) = self.scene.borrow().as_ref().map(BridgeScene::of) else {
+            return held;
+        };
+        if held.as_ref() == Some(&want) {
+            return held;
+        }
+        let sent = self
+            .agent
+            .scene_token
+            .authorize(self.http.post(self.url("/scene")))
+            .timeout(Duration::from_secs(5))
+            .json(&want)
+            .send()
+            .await;
+        match sent {
+            Ok(r) if r.status().is_success() => Some(want),
+            Ok(r) => {
+                tracing::warn!(sandbox = %self.id, status = %r.status(), "the bridge refused the scene");
+                held
+            }
+            Err(e) => {
+                tracing::debug!(sandbox = %self.id, error = %e, "the scene did not reach the bridge");
+                held
+            }
+        }
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
@@ -1321,6 +1434,7 @@ impl Sandbox {
             generation,
             started: spawned,
             actions_done: 0,
+            scene: None,
         };
         let mut tick = tokio::time::interval(self.cfg.poll);
         let fail = |why: String, r: &Running| {
@@ -1334,6 +1448,7 @@ impl Sandbox {
             tokio::select! {
                 _ = tick.tick() => {
                     let Some(h) = self.health().await else { continue };
+                    r.scene = self.sync_scene(r.scene.take()).await;
                     let (state, times) = bridge_state(&h);
                     if state == Some("failed") {
                         let why = h.pointer("/windows/error").and_then(|e| e.as_str()).unwrap_or("no reason given").to_string();
@@ -1341,7 +1456,12 @@ impl Sandbox {
                         self.stop(&mut r).await;
                         return Err(e);
                     }
-                    if state == Some("desktop") {
+                    // A bridge with a certificate serves frames only once it has a scene, so the
+                    // sandbox runs once its bridge holds one (or, without a certificate, when
+                    // there is none yet).
+                    let scene_ok = r.scene.is_some()
+                        || (self.cfg.tls_dir.is_none() && self.scene.borrow().is_none());
+                    if state == Some("desktop") && scene_ok {
                         if let Some(desktop) = times.desktop {
                             let timings = launch_timings(teardown_ms, restore_ms, healthy_at, started_at, want.clicked_at, times);
                             self.report("running", generation, timings, None, None, Some(desktop));
@@ -1437,6 +1557,9 @@ async fn supervise(
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The scene's changes (new admission keys) reach the running bridge as they come.
+    let mut scene = ctx.scene.clone();
+    let mut scene_open = true;
     loop {
         let want = desired.borrow_and_update().clone();
         let behind = running
@@ -1548,10 +1671,22 @@ async fn supervise(
             status = r.vm.exited() => Some(format!("fcvm exited ({status}): {}", r.vm.tail())),
             status = r.bridge.client.exited() => Some(format!("the bridge exited ({status}): {}", r.bridge.client.tail())),
             _ = health_tick.tick() => {
+                // A scene the bridge did not take is offered again here.
+                r.scene = ctx.sync_scene(r.scene.take()).await;
                 match ctx.health().await.as_ref().map(bridge_state) {
                     Some((Some("failed"), _)) => Some("the bridge lost the session".to_string()),
                     _ => None,
                 }
+            }
+            changed = scene.changed(), if scene_open => {
+                if changed.is_ok() {
+                    scene.borrow_and_update();
+                    r.scene = ctx.sync_scene(r.scene.take()).await;
+                } else {
+                    // The agent is stopping; no scene comes after this.
+                    scene_open = false;
+                }
+                None
             }
         };
         if let Some(error) = died {
@@ -1831,7 +1966,7 @@ mod tests {
         );
         let joined = logon.join(" ");
         assert!(
-            joined.starts_with("run --rm --replace --pull=never --name fleet-win-gold-bridge "),
+            joined.starts_with("run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1 --name fleet-win-gold-bridge "),
             "{joined}"
         );
         assert!(joined
@@ -2073,6 +2208,7 @@ mod tests {
             agent: Arc::new(agent),
             out: tx,
             http: reqwest::Client::new(),
+            scene: watch::channel(None).1,
         };
         s.report(
             "running",
