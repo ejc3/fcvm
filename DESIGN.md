@@ -50,7 +50,7 @@
    - `fcvm snapshot create`: Create snapshot from running VM
    - `fcvm snapshot serve`: Start UFFD memory server for cloning
    - `fcvm snapshot run`: Spawn clone from memory server
-   - `fcvm snapshot export`: Write a snapshot's directory as one archive
+   - `fcvm snapshot export`: Write a snapshot, with the image disk and pmem images it reads, as one archive
    - `fcvm snapshot import`: Install the snapshot in such an archive
    - Lightning-fast clone startup (<1 second)
    - Serves guest memory through a UFFD page fault handler; clones share clean pages only in minor mode (`--uffd-mode minor`)
@@ -1463,7 +1463,7 @@ One async session per connection:
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
-| `fcvm snapshot export` | Write a snapshot's directory as one archive |
+| `fcvm snapshot export` | Write a snapshot, with the image disk and pmem images it reads, as one archive |
 | `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote |
 | `fcvm snapshots ls` | List stored snapshots (also: `delete <NAME>`, `prune`) |
 
@@ -1706,9 +1706,10 @@ fcvm snapshot export nginx-warm | ssh other-host 'cat > nginx-warm.archive'
 
 The archive is one pax tar stream that GNU tar lists and extracts
 (`src/storage/snapshot_archive.rs`): a manifest, every regular file of the snapshot's
-directory with its holes kept as holes, and a trailer of digests that a reader checks before
-it accepts the archive. The memory image is read from where the snapshot's config says it
-is, so a snapshot made with `--memory-dir` exports like any other. Lock files and
+directory with its holes kept as holes, the image disk the snapshot attaches and the pmem
+store entry of each of its pmem devices, and a trailer of digests that a reader checks
+before it accepts the archive. The memory image is read from where the snapshot's config
+says it is, so a snapshot made with `--memory-dir` exports like any other. Lock files and
 temporaries are left out.
 
 - Without `--output` the archive goes to stdout, and a terminal is refused. With it, the
@@ -1721,11 +1722,26 @@ temporaries are left out.
   tag that ends in `.creating` or `.old` is refused: a create of the tag without the suffix
   works in a directory of that name, under its own lock.
 - Firecracker snapshots only. A Cloud Hypervisor snapshot is refused.
-- What a restore reads outside the snapshot's directory is not in the archive. The manifest
-  lists, by path, what the snapshot's config records: the image disk, pmem images, mapped
-  directories, NFS shares and firmware. It cannot list a read-only `--disk` file outside the
-  VM's directory or a kernel profile's NVIDIA driver image, because a snapshot's config does
-  not record them; Firecracker reopens them from the paths in its VM state.
+- The image disk and the pmem store entries follow the directory's files. The manifest
+  describes each with what the snapshot's config records of its bytes (the image disk
+  identity, which is the SHA-256 of the disk, and the digest in a store entry's name), so
+  no external file is read to write the manifest. Where the snapshot recorded an identity
+  for its image disk (it records one for an overlay storage image, and none for a Docker
+  archive disk), the disk's SHA-256 is computed as the disk is streamed, and the export
+  fails unless it is the recorded identity. An identity that is not `sha256:` and 64
+  lowercase hex digits is refused before anything is written. The pmem entries are checked
+  as a restore checks them, before the first is opened and after the last is streamed.
+- The archive version is still 1. The manifest's `externals` entries changed type (the
+  role is one of two names, and the digest can be absent). An import built before this
+  change refuses every archive that lists an external file, by its own check or, for an
+  entry without a digest, by its parser, and this import refuses an archive whose manifest
+  does not list what its config names. There is no code for the other tree's archives on
+  either side.
+- What else a restore reads outside the snapshot's directory is not in the archive. The
+  manifest lists, by path, what the snapshot's config records: mapped directories, NFS
+  shares and firmware. It cannot list a read-only `--disk` file outside the VM's directory
+  or a kernel profile's NVIDIA driver image, because a snapshot's config does not record
+  them; Firecracker reopens them from the paths in its VM state.
 - The manifest describes the Firecracker binary that is at the snapshot's recorded path when
   the export runs (its `--version` output and SHA-256), not the binary as it was when the
   snapshot was taken.
@@ -1736,8 +1752,17 @@ temporaries are left out.
   after the rename: FILE then holds the whole archive, and the error says so.
 - When the memory image has been written and no memory server or VM holds it in use, the
   export asks the kernel to drop it from the page cache, as a memory server does for idle
-  snapshots when it starts. Every other file is dropped once it is written, so a large disk
-  does not hold the page cache while the memory image is read.
+  snapshots when it starts. Every other file of the snapshot's directory is dropped once it
+  is written, so a large disk does not hold the page cache while the memory image is read.
+  The image disk and the pmem store entries are read by the running VMs of their image, so
+  their page cache is left as the export found it: one is dropped after it is written only
+  if none of it was cached before the export read it (`mincore`), and is left alone when
+  that cannot be asked. It cannot be asked about a file the exporting user neither owns nor
+  can write (a rootless export of a disk root built): the kernel reports every page of such
+  a file as cached.
+- Before it writes anything, the export holds the image disk against the rules an import
+  has for its place, its name and its identity (below), on the exporting host's image
+  cache, and refuses a snapshot whose image disk an import refuses.
 
 #### `fcvm snapshot import`
 
@@ -1753,6 +1778,14 @@ ssh other-host 'fcvm snapshot export nginx-warm' | fcvm snapshot import
 The snapshot is installed under the tag it was exported from. Without `--input` the archive
 is read from stdin, and a terminal is refused.
 
+**An archive is trusted as a snapshot made on this host is.** The import checks that the
+archive is whole and that it describes itself consistently. It does not make an archive
+from an untrusted source safe to restore. The archived config names host paths a restored
+VM is given (mapped directories, NFS shares, the image disk), the memory image and the VM
+state are loaded as they are, and an image disk the import installs becomes this host's
+cached disk for that image: later launches of the image attach it. Import only archives
+whose exporter you would let create snapshots on this host.
+
 Before it writes anything the import reads the archive's manifest and its `config.json`,
 and refuses the archive unless:
 
@@ -1763,13 +1796,22 @@ and refuses the archive unless:
 - the Firecracker binary it was taken on is at the recorded path, with the same SHA-256;
 - its kernel profile is configured;
 - the tag does not exist here;
-- the archive lists no files from outside the snapshot's directory, which this version does
-  not install;
-- the image disk the snapshot attaches, which the archive does not carry, is a file on this
-  host, with the digest the snapshot recorded if it recorded one;
-- the pmem images the snapshot maps, which the archive does not carry either, are the store
-  entries the snapshot recorded. A snapshot records each entry by inode, length and
-  modification time, so a snapshot with pmem images imports only on the host that took it.
+- the manifest lists the image disk and the pmem store entries the config names, with the
+  digests the config records for them;
+- the image disk's recorded path is one this host's image cache gives the disk of an image,
+  whether this host has the file or not: directly under the cache, named as a launch names
+  such a disk (`<digest>.storage-v<N>.img` of this build's format, or
+  `<digest>.docker.tar`). `<digest>` is the key a launch gives the image: the encoded part
+  of the digest or image id podman prints, or an algorithm, a colon and the encoded part,
+  since a launch takes only `sha256:` off the front. A launch reuses a file of that name
+  without looking inside. A storage image has to come with the identity the snapshot
+  recorded, as `sha256:` and 64 lowercase hex digits;
+- an image disk this host has at that path is a regular file and, where the snapshot
+  recorded an identity, the build it recorded;
+- a pmem store entry is named in this host's store, and for an entry this host lacks, the
+  entries belong to the uid the import runs for. An entry's name is a digest of its owner's
+  uid and its bytes, and Firecracker reopens the recorded path, so pmem images import only
+  for the uid that owns them on the exporting host.
 
 The import then stages the snapshot the way `snapshot create` does: under the tag's lock,
 in `<tag>.creating`, which is recorded for reclaim before it is made, with the directory
@@ -1781,14 +1823,51 @@ file a restore opens, and the files are synced. The rename replaces nothing
 cut stream or a digest that does not match installs nothing and removes the staging
 directory; a killed import leaves it to the next import or VM launch.
 
+The order after the trailer has verified is the same for every import: the staged directory
+is checked for every file a restore opens, the external files are published, `config.json`
+is written, the directory is synced, and the directory is renamed.
+
+The image disk and the pmem store entries are installed where this host lacks them, and
+kept as they are where it has them (the archived copy is then read and dropped). An image
+disk is written to a temporary beside its path, recorded for reclaim before the file
+exists. Where the snapshot recorded an identity, the temporary must hash to it; a Docker
+archive disk has no recorded identity and is installed as the archive carries it, checked
+by the archive's trailer only. A pmem entry is written to a temp of the pmem store under
+the store's lock, and the name the store gives its bytes must be the recorded path. Both
+are published only after the trailer has verified, and neither replaces a file: one that
+another process published meanwhile is kept, and an image disk among them has to be the
+recorded build.
+
+The image disk gets its name, or the one this host has is checked again, under the lock of
+its image in the image cache (`<digest>.lock`), which a launch holds from its look for the
+image's disk through the rename that publishes the one it builds. So an import never
+publishes into a build in flight on the same kernel: it waits, and then finds the build's
+disk under the name. The lock is a flock, which one kernel grants. VMs that share the store
+through a FUSE map each get it from their own guest kernel, so a build in another VM is not
+kept out, as a launch there is not: a build that replaces the disk an import linked leaves
+a snapshot whose restore is refused (image disk build changed). The staged disk is synced
+before the lock is taken, so a launch of the image does not wait behind that flush. The
+lock file is opened without following a link and is not truncated, a sudo import hands it
+to its invoker with the disk, and a user who cannot write the lock file (a run as root left
+it) takes the lock through a read-only descriptor.
+The digest the import computed while writing the disk is recorded for the published file,
+so the first restore does not read the disk again to check it.
+
+A failed import removes its temporaries and their reclaim records; directories it made (the
+image cache, the pmem store) and lock files stay. A killed import leaves no temporary for
+good: the next import or VM launch removes the image disk's through its reclaim record and
+the pmem entry's through the store's collector. External files that were published before a
+later step failed stay: each is a whole, verified entry of its store.
+
 - The memory image is always a file in the snapshot's directory, also when the exported
   snapshot was made with `--memory-dir`.
-- `config.json` gets a new generation id and no parent snapshot. Every other field is
-  kept as the export wrote it.
+- `config.json` gets a new generation id, no parent snapshot, and each pmem device's
+  identity (inode, length and modification time) as its store entry has it on this host.
+  Every other field is kept as the export wrote it.
 - The working set recorded beside the memory image is not installed: its key names the
   exporting host's files. The first restores record a new one.
-- What a restore of the snapshot reads outside its directory (mapped directories, NFS
-  shares, firmware, the image disk, pmem images) is logged as a warning, one line each.
+- What a restore of the snapshot reads that the archive does not carry (mapped
+  directories, NFS shares, firmware) is logged as a warning, one line each.
 
 #### `fcvm ls`
 

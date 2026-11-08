@@ -9,13 +9,30 @@
 //! always the entry `snapshot/memory.bin`; the export fails when that path and the
 //! directory's `memory.bin` are not the same file.
 //!
-//! What a restore reads outside the directory is not carried. `manifest.not_shipped` names
-//! what the snapshot's config records a path for (the image disk, each pmem image, each
-//! mapped directory, each NFS share, the firmware), so an importer can refuse or warn. It
-//! cannot name a read-only `--disk` file outside the VM's directory or a kernel profile's
-//! NVIDIA driver image: a snapshot's config does not record them
-//! (`commands::common::extra_disks_to_snapshot` keeps only the disks inside the directory),
-//! and Firecracker reopens them from the paths in its own VM state.
+//! After the directory's files come the external files, `external/<n>`, which
+//! `manifest.externals` describes in the same order: the image disk the snapshot attaches
+//! and the pmem store entry of each of its pmem devices, each once. The manifest is written
+//! before any of them is read, so what it says of a file's bytes is what the snapshot's
+//! config already records: the image disk identity (the SHA-256 of its bytes, where the
+//! snapshot recorded one) and a pmem entry's name. No external file is read to write the
+//! manifest, and each is read once, to be streamed.
+//!
+//! - Where the snapshot recorded an identity for the image disk (an overlay storage image
+//!   has one, a Docker archive disk has none), the disk's SHA-256 is computed from the
+//!   bytes as they are streamed, and the export fails unless it is the recorded identity:
+//!   the disk at that path is then another build than the one the snapshot's container was
+//!   provisioned against. An identity that is not `sha256:` and 64 lowercase hex digits is
+//!   refused before anything is written.
+//! - A pmem entry is immutable and is recorded by inode, length and modification time, so
+//!   the export runs the check a restore runs (`check_snapshot_pmem_images`) before the
+//!   first entry is opened and again after the last one is streamed.
+//!
+//! What else a restore reads outside the directory is not carried. `manifest.not_shipped`
+//! names what the snapshot's config records a path for (each mapped directory, each NFS
+//! share, the firmware), so an importer can warn. It cannot name a read-only `--disk` file
+//! outside the VM's directory or a kernel profile's NVIDIA driver image: a snapshot's config
+//! does not record them (`commands::common::extra_disks_to_snapshot` keeps only the disks
+//! inside the directory), and Firecracker reopens them from the paths in its own VM state.
 //!
 //! `manifest.firecracker` describes the binary that is at the recorded path when the export
 //! runs: its `--version` output and its SHA-256 are those of the file as it is then. A
@@ -47,7 +64,11 @@
 //! to ask: no reader keeps a snapshot's disk, VM state or sidecar in the page cache (a clone
 //! snapshots or reflinks the disk into a file of its own), and the request drops clean pages
 //! only. The disks sort before `memory.bin`, so without this a disk stays in the page
-//! cache while the memory image is read.
+//! cache while the memory image is read. An external file does have readers, the running
+//! VMs of its image, so its page cache is left as the export found it: the file is dropped
+//! once its entry is written only if none of it was cached before the export read it, and
+//! it is left alone when the kernel cannot be asked, or has no answer for the file because
+//! the exporting user neither owns it nor can write it.
 
 use std::fs::File;
 use std::io::{BufWriter, IsTerminal, Write};
@@ -67,8 +88,8 @@ use crate::paths;
 use crate::reclaim::{Owner, Resource};
 use crate::storage::snapshot::SNAPSHOT_MEMORY_FILE;
 use crate::storage::snapshot_archive::{
-    ArchiveManifest, ArchiveWriter, EntryRecord, ManifestFirecracker, ManifestMemory,
-    ARCHIVE_VERSION,
+    ArchiveManifest, ArchiveWriter, ContentSha256, EntryRecord, ExternalRole, ManifestExternal,
+    ManifestFirecracker, ManifestMemory, ARCHIVE_VERSION,
 };
 use crate::storage::{
     validate_snapshot_name, SnapshotConfig, SnapshotGeneration, SnapshotKind, SnapshotManager,
@@ -82,10 +103,13 @@ const OUTPUT_BUFFER: usize = 1 << 20;
 pub(crate) const CONFIG_FILE: &str = "config.json";
 
 /// Where the exporting host keeps its snapshots and its data.
+#[derive(Clone)]
 pub(crate) struct ExportHost {
     pub snapshots_dir: PathBuf,
     /// Goes into the manifest: the VM state embeds paths under it.
     pub data_dir: PathBuf,
+    /// Where a launch on this host keeps image disks, the one place an import takes one in.
+    pub image_cache_dir: PathBuf,
 }
 
 impl ExportHost {
@@ -93,6 +117,7 @@ impl ExportHost {
         Self {
             snapshots_dir: paths::snapshot_dir(),
             data_dir: paths::data_dir(),
+            image_cache_dir: paths::image_cache_dir(),
         }
     }
 }
@@ -333,12 +358,12 @@ where
         SnapshotKind::DiskOnly => None,
     };
 
-    let data_dir = host.data_dir.clone();
+    let host = host.clone();
     let tag = tag.to_string();
     tokio::task::spawn_blocking(move || {
         // Held until the archive is written, or the write has failed.
         let _generation_lock = generation_lock;
-        write_archive(&data_dir, &tag, &dir, &config, &generation, memory, out)
+        write_archive(&host, &tag, &dir, &config, &generation, memory, out)
     })
     .await
     .context("the task that writes the archive panicked")?
@@ -406,7 +431,7 @@ impl Drop for MarkedMemory {
 
 /// Write the archive of the snapshot in `dir`, under the tag's shared lock.
 fn write_archive<W: Write>(
-    data_dir: &Path,
+    host: &ExportHost,
     tag: &str,
     dir: &Path,
     config: &SnapshotConfig,
@@ -414,18 +439,27 @@ fn write_archive<W: Write>(
     mut memory: Option<MarkedMemory>,
     out: W,
 ) -> Result<(W, Vec<EntryRecord>)> {
+    // The check a restore makes of the pmem entries, before any of them is opened and
+    // again once the last one is streamed: an entry is recorded by inode, length and
+    // modification time, and Firecracker would reopen whatever has its path.
+    let data_dir = host.data_dir.as_path();
+    let pmem_devices = &config.metadata.pmem_devices;
+    crate::storage::pmem::check_snapshot_pmem_images(data_dir, pmem_devices)
+        .with_context(|| format!("checking the pmem images of snapshot '{tag}'"))?;
+    let externals = open_externals(tag, &host.image_cache_dir, config)?;
     let manifest = build_manifest(
         data_dir,
         tag,
         config,
         generation,
         memory.as_ref().map(|memory| &memory.file),
+        &externals,
     )?;
     let files = snapshot_files(dir, memory.is_some())?;
 
     let out = BufWriter::with_capacity(OUTPUT_BUFFER, out);
     let mut writer = ArchiveWriter::new(out, &manifest)?;
-    let mut entries = Vec::with_capacity(files.len());
+    let mut entries = Vec::with_capacity(files.len() + externals.len());
     for relative in &files {
         let is_memory = relative == Path::new(SNAPSHOT_MEMORY_FILE);
         // What the writer has read of this file once the append returns, failed or not: an
@@ -449,6 +483,13 @@ fn write_archive<W: Write>(
         entries.push(record);
     }
 
+    for external in &externals {
+        entries.push(append_external(&mut writer, tag, external)?);
+    }
+    crate::storage::pmem::check_snapshot_pmem_images(data_dir, pmem_devices).with_context(
+        || format!("checking the pmem images of snapshot '{tag}' after they were exported"),
+    )?;
+
     // The files were read under the shared lock, which keeps creates and deletes out. This
     // catches a config rewritten in place by something that does not take the lock.
     let config_path = dir.join(CONFIG_FILE);
@@ -468,12 +509,225 @@ fn write_archive<W: Write>(
     Ok((out, entries))
 }
 
+/// A file outside the snapshot's directory that the archive carries, opened once: the
+/// descriptor that was stat-ed for the manifest is the one that is streamed.
+struct External {
+    manifest: ManifestExternal,
+    file: File,
+}
+
+/// The files outside its directory that the snapshot's config names and an archive carries,
+/// in the order of `manifest.externals`, each as its role, its path and the digest the
+/// config binds its bytes to (`ManifestExternal::sha256`): the image disk, then the store
+/// entry of each pmem device, each path once (two devices can map one entry).
+///
+/// Everything here comes from the config. An export describes the files with it before it
+/// reads them, and an import holds the manifest of an archive against it.
+pub(crate) fn recorded_externals(
+    tag: &str,
+    config: &SnapshotConfig,
+) -> Result<Vec<(ExternalRole, PathBuf, Option<String>)>> {
+    let metadata = &config.metadata;
+    let mut externals: Vec<(ExternalRole, PathBuf, Option<String>)> = Vec::new();
+    if let Some(disk) = metadata.image_disk_path.as_deref() {
+        // `sha256:` and 64 lowercase hex digits, as `image_disk_digest` writes it. Anything
+        // else is refused here, before an export writes or an import stages anything.
+        let sha256 = metadata
+            .image_disk_identity
+            .as_deref()
+            .map(|identity| {
+                identity
+                    .strip_prefix("sha256:")
+                    .filter(|hex| {
+                        hex.len() == 64
+                            && hex
+                                .bytes()
+                                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                    })
+                    .map(str::to_string)
+                    .with_context(|| {
+                        format!(
+                            "snapshot '{tag}' records the image disk {} as {identity}, which \
+                             is not the SHA-256 of its bytes, so the disk cannot be checked \
+                             against it; recreate the snapshot",
+                            disk.display()
+                        )
+                    })
+            })
+            .transpose()?;
+        externals.push((ExternalRole::ImageDisk, disk.to_path_buf(), sha256));
+    }
+    for device in &metadata.pmem_devices {
+        let path = Path::new(&device.path);
+        if externals.iter().any(|(_, listed, _)| listed == path) {
+            continue;
+        }
+        // A store entry is `<64 hex>.img`, and the hex is the digest.
+        let digest = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .with_context(|| {
+                format!(
+                    "snapshot '{tag}' maps the pmem image {}, which has no name",
+                    device.path
+                )
+            })?;
+        externals.push((
+            ExternalRole::Pmem,
+            path.to_path_buf(),
+            Some(digest.to_string()),
+        ));
+    }
+    Ok(externals)
+}
+
+/// The key of the image in the recorded path `disk` of an image disk, which names the
+/// image's lock in the image cache. A launch of an image reuses a file of the image cache
+/// by its name alone, and an import installs an image disk at its recorded path, so the
+/// path has to be one the image cache `image_cache_dir` gives the disk of an image, whether
+/// the file is there or not: directly under the cache, with the name a launch gives such a
+/// disk. A storage image is bound to one build of itself (`is_overlay_storage_image`), so
+/// it has to come with the identity the snapshot recorded (`has_identity`).
+///
+/// An import makes these checks against its host's image cache before it writes, and again
+/// when it publishes the disk. An export makes them against its own before it writes, so
+/// it does not write an archive whose import fails on them.
+pub(crate) fn image_of_disk<'a>(
+    image_cache_dir: &Path,
+    disk: &'a Path,
+    has_identity: bool,
+) -> Result<&'a str> {
+    ensure!(
+        disk.parent() == Some(image_cache_dir),
+        "the snapshot reads the image disk {}, which is not a file of this host's image \
+         cache {}, the one directory an import takes an image disk in",
+        disk.display(),
+        image_cache_dir.display()
+    );
+    let key = disk
+        .file_name()
+        .and_then(crate::commands::podman::image_disk_name_digest)
+        .with_context(|| {
+            format!(
+                "the snapshot reads the image disk {}, which is not a name this host's image \
+                 cache gives an image disk, so no launch here would have made it",
+                disk.display()
+            )
+        })?;
+    ensure!(
+        has_identity || !crate::utils::is_overlay_storage_image(disk),
+        "the snapshot reads the storage image {} and records no identity for it, so the \
+         disk cannot be held against the build the snapshot was taken against; recreate \
+         the snapshot",
+        disk.display()
+    );
+    Ok(key)
+}
+
+/// Open the snapshot's external files ([`recorded_externals`]), in that order. Nothing is
+/// read: a file's length is from the descriptor that is streamed later. An image disk that
+/// an import refuses by its place, its name or its missing identity ([`image_of_disk`]) is
+/// refused here, before the export writes.
+fn open_externals(
+    tag: &str,
+    image_cache_dir: &Path,
+    config: &SnapshotConfig,
+) -> Result<Vec<External>> {
+    recorded_externals(tag, config)?
+        .into_iter()
+        .map(|(role, path, sha256)| {
+            if role == ExternalRole::ImageDisk {
+                image_of_disk(image_cache_dir, &path, sha256.is_some()).with_context(|| {
+                    format!("snapshot '{tag}' is not exported: an import refuses its image disk")
+                })?;
+            }
+            let file = File::open(&path).with_context(|| {
+                format!("opening the {role} {} of snapshot '{tag}'", path.display())
+            })?;
+            let stat = file
+                .metadata()
+                .with_context(|| format!("stat-ing the {role} {}", path.display()))?;
+            ensure!(
+                stat.is_file(),
+                "the {role} {} of snapshot '{tag}' is not a regular file",
+                path.display()
+            );
+            Ok(External {
+                manifest: ManifestExternal {
+                    role,
+                    path,
+                    len: stat.len(),
+                    sha256,
+                },
+                file,
+            })
+        })
+        .collect()
+}
+
+/// Stream one external file as the next `external/<n>`, and leave its page cache as it
+/// was: the file is dropped from the page cache once it is written only if none of it was
+/// cached before the export read it ([`any_page_cached`], which has no answer for a file
+/// the exporting user neither owns nor can write, so such a file is left alone). An image
+/// disk and a pmem store entry are read by every running VM of the image, and what those
+/// have cached is theirs. The image disk's bytes are hashed as they are streamed and have
+/// to be the build the snapshot recorded.
+fn append_external<W: Write>(
+    writer: &mut ArchiveWriter<W>,
+    tag: &str,
+    external: &External,
+) -> Result<EntryRecord> {
+    let described = &external.manifest;
+    let path = &described.path;
+    let recorded = match described.role {
+        ExternalRole::ImageDisk => described.sha256.as_deref(),
+        // An entry's name does not give the SHA-256 of its bytes, and an entry is never
+        // rewritten: the two checks of the pmem images stand for it.
+        ExternalRole::Pmem => None,
+    };
+    let mut content = recorded.map(|_| ContentSha256::new());
+    // Asked before the first read. Unknown counts as cached: the file is then left alone.
+    let was_cold = any_page_cached(&external.file, described.len) == Some(false);
+    let read_before = writer.data_bytes_read();
+    let appended = writer.append_external_with(&external.file, |offset, bytes| {
+        content
+            .as_mut()
+            .map_or(Ok(()), |content| content.piece(offset, bytes))
+    });
+    if was_cold && writer.data_bytes_read() > read_before {
+        drop_from_page_cache(&external.file, path);
+    }
+    let record =
+        appended.with_context(|| format!("exporting the {} {}", described.role, path.display()))?;
+    ensure!(
+        record.len == described.len,
+        "the {} {} was {} bytes when the manifest was written and {} when it was exported",
+        described.role,
+        path.display(),
+        described.len,
+        record.len
+    );
+    if let (Some(recorded), Some(content)) = (recorded, content) {
+        let streamed = content.finish(record.len)?;
+        ensure!(
+            streamed == recorded,
+            "the image disk {} is not the build snapshot '{tag}' was taken against: the bytes \
+             the export read have the SHA-256 {streamed} and the snapshot records {recorded}, \
+             so a restore of the snapshot is refused here too (image disk build changed)",
+            path.display()
+        );
+    }
+    Ok(record)
+}
+
 /// Ask the kernel to drop a file the export has read, other than the memory image, from the
-/// page cache. These files have no in-use mark to ask: no reader keeps a snapshot's disk, VM
-/// state or sidecar cached (a clone works on its own snapshot or reflink of the disk), and
-/// `POSIX_FADV_DONTNEED` drops clean pages that no process has mapped, so a page with a
-/// write still to reach the disk stays. The disks sort before `memory.bin`: left cached, a
-/// disk stays in the page cache while the memory image is read.
+/// page cache. The files of a snapshot's directory have no in-use mark to ask: no reader
+/// keeps a snapshot's disk, VM state or sidecar cached (a clone works on its own snapshot
+/// or reflink of the disk). An external file does have readers, the running VMs of its
+/// image, so [`append_external`] calls this only for one that was not cached before the
+/// export read it. `POSIX_FADV_DONTNEED` drops clean pages that no process has mapped, so
+/// a page with a write still to reach the disk stays. The disks sort before `memory.bin`:
+/// left cached, a disk stays in the page cache while the memory image is read.
 fn drop_from_page_cache(file: &File, path: &Path) {
     if let Err(error) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED) {
         warn!(
@@ -482,6 +736,68 @@ fn drop_from_page_cache(file: &File, path: &Path) {
             "the kernel refused to drop an exported file from the page cache"
         );
     }
+}
+
+/// Whether any page of the first `len` bytes of `file` is in the page cache: `mincore` on
+/// a mapping of the file that no page is read through, a GiB at a time. `None` when the
+/// file cannot be mapped, the kernel does not answer, or its answer is not about the file
+/// ([`mincore_answers_for`]).
+fn any_page_cached(file: &File, len: u64) -> Option<bool> {
+    const WINDOW: usize = 1 << 30;
+    if len == 0 {
+        return Some(false);
+    }
+    if !mincore_answers_for(file) {
+        return None;
+    }
+    let len = usize::try_from(len).ok()?;
+    // SAFETY: the mapping is passed to mincore only. No byte is read or written through it,
+    // so a file that is truncated meanwhile cannot fault here.
+    let map = unsafe { memmap2::MmapOptions::new().len(len).map(file) }.ok()?;
+    // SAFETY: sysconf reads a constant of the running kernel.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    if page == 0 {
+        return None;
+    }
+    let mut resident = vec![0u8; WINDOW.min(len).div_ceil(page)];
+    let mut at = 0;
+    while at < len {
+        let count = WINDOW.min(len - at);
+        let pages = count.div_ceil(page);
+        // SAFETY: `at..at + count` lies inside `map`, which stays mapped for the call, and
+        // `resident` has a byte for each page of it.
+        let rc = unsafe {
+            libc::mincore(
+                map.as_ptr().add(at).cast_mut().cast(),
+                count,
+                resident.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        if resident[..pages].iter().any(|byte| byte & 1 == 1) {
+            return Some(true);
+        }
+        at += count;
+    }
+    Some(false)
+}
+
+/// Whether `mincore` answers for `file`. The kernel reports every page of a file mapping
+/// as in the page cache to a caller that neither owns the file nor could open it for
+/// writing, so only a file that is this user's, or that opens for writing, is asked about.
+/// The open writes nothing and truncates nothing.
+fn mincore_answers_for(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let owned = file
+        .metadata()
+        .is_ok_and(|stat| stat.uid() == nix::unistd::geteuid().as_raw());
+    owned
+        || std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok()
 }
 
 /// The regular files of the snapshot in `dir` as paths relative to it: `config.json`, then
@@ -549,6 +865,7 @@ fn build_manifest(
     config: &SnapshotConfig,
     generation: &SnapshotGeneration,
     memory: Option<&File>,
+    externals: &[External],
 ) -> Result<ArchiveManifest> {
     let memory = memory
         .map(|file| {
@@ -573,7 +890,10 @@ fn build_manifest(
         config_sha256: generation.config_digest_hex(),
         memory,
         firecracker: firecracker_identity(tag, config)?,
-        externals: Vec::new(),
+        externals: externals
+            .iter()
+            .map(|external| external.manifest.clone())
+            .collect(),
         pmem_owner_uid: pmem_owner_uid(config)?,
         not_shipped: not_shipped(config),
     })
@@ -620,8 +940,9 @@ fn pmem_owner_uid(config: &SnapshotConfig) -> Result<Option<u32>> {
 }
 
 /// What a restore of the snapshot reads that the archive does not carry, one sentence each,
-/// for everything the config records a path for: the image disk, the pmem images, the
-/// mapped directories, the NFS shares and the firmware.
+/// for everything else the config records a path for: the mapped directories, the NFS
+/// shares and the firmware. The image disk and the pmem images are carried
+/// (`manifest.externals`).
 ///
 /// Not listed, because no field of the config names them: a read-only `--disk` file outside
 /// the VM's directory (`commands::common::extra_disks_to_snapshot` records only the disks a
@@ -630,18 +951,6 @@ fn pmem_owner_uid(config: &SnapshotConfig) -> Result<Option<u32>> {
 pub(crate) fn not_shipped(config: &SnapshotConfig) -> Vec<String> {
     let metadata = &config.metadata;
     let mut list = Vec::new();
-    if let Some(path) = &metadata.image_disk_path {
-        list.push(format!(
-            "The image disk {} holds the container image and is attached read-only at this path.",
-            path.display()
-        ));
-    }
-    for device in &metadata.pmem_devices {
-        list.push(format!(
-            "The pmem image {} (a copy of {}) is mapped at {} and reopened at this path.",
-            device.path, device.source, device.mount_path
-        ));
-    }
     for volume in &metadata.volumes {
         list.push(format!(
             "The directory {} is mapped into the guest at {}.",
@@ -780,10 +1089,7 @@ pub(crate) mod tests {
         }
 
         fn host(&self) -> ExportHost {
-            ExportHost {
-                snapshots_dir: self.host.snapshots_dir.clone(),
-                data_dir: self.host.data_dir.clone(),
-            }
+            self.host.clone()
         }
 
         /// The names in the reclaim owner directory that belong to an export.
@@ -844,6 +1150,7 @@ pub(crate) mod tests {
         let host = ExportHost {
             snapshots_dir: root.path().join("snapshots"),
             data_dir: root.path().join("data"),
+            image_cache_dir: root.path().join("assets/image-cache"),
         };
         let fake = Fake {
             root,
@@ -899,6 +1206,78 @@ pub(crate) mod tests {
         )
         .unwrap();
         fake
+    }
+
+    /// The external files of a fake snapshot ([`fake_snapshot_with_externals`]).
+    pub(crate) struct Externals {
+        /// The image disk, in the fake's image cache.
+        pub(crate) image_disk: PathBuf,
+        /// The pmem device the snapshot maps: an entry of the store under the fake's data
+        /// directory, published by a `--pmem` run's own ingest.
+        pub(crate) pmem: crate::state::types::PmemDevice,
+    }
+
+    pub(crate) const IMAGE_DISK_LEN: u64 = 3 * MIB;
+    pub(crate) const PMEM_LEN: u64 = crate::storage::pmem::PMEM_ALIGNMENT;
+
+    impl Fake {
+        /// Where the fake host keeps image disks.
+        pub(crate) fn image_cache(&self) -> PathBuf {
+            self.host.image_cache_dir.clone()
+        }
+
+        /// Rewrite the snapshot's config with `edit` applied.
+        pub(crate) fn edit_config(&self, edit: impl FnOnce(&mut SnapshotConfig)) {
+            let path = self.dir().join(CONFIG_FILE);
+            let mut config: SnapshotConfig =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            edit(&mut config);
+            std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        }
+    }
+
+    /// [`fake_snapshot`] whose config names an image disk, with the identity a launch
+    /// records for it, and one pmem device.
+    ///
+    /// The image disk has a hole at each end. The pmem entry is what a `--pmem` run of a
+    /// 2 MiB image leaves in the store under the fake's data directory.
+    pub(crate) fn fake_snapshot_with_externals() -> (Fake, Externals) {
+        let fake = fake_snapshot();
+        let image_disk = fake.image_cache().join("0123456789abcdef.storage-v2.img");
+        std::fs::create_dir_all(fake.image_cache()).unwrap();
+        sparse(
+            &image_disk,
+            IMAGE_DISK_LEN,
+            &[
+                (PAGE, pattern(11, 2 * PAGE)),
+                (MIB, pattern(12, MIB + PAGE)),
+            ],
+        );
+        let identity = format!("sha256:{}", sha256_hex(&image_disk).unwrap());
+
+        let models = fake.root.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        let source = models.join("model.img");
+        sparse(
+            &source,
+            PMEM_LEN,
+            &[(0, pattern(21, PAGE)), (MIB, pattern(22, 3 * PAGE))],
+        );
+        let store = crate::storage::pmem_store::PmemStore::open(&fake.host.data_dir).unwrap();
+        let pmem = crate::storage::pmem::resolve_pmem_devices(
+            &store,
+            &[format!("{}:/models:ro", source.display())],
+            &[],
+        )
+        .unwrap()
+        .remove(0);
+
+        fake.edit_config(|config| {
+            config.metadata.image_disk_path = Some(image_disk.clone());
+            config.metadata.image_disk_identity = Some(identity);
+            config.metadata.pmem_devices = vec![pmem.clone()];
+        });
+        (fake, Externals { image_disk, pmem })
     }
 
     /// An output a test keeps a handle on, so it can read what an export that failed wrote.
@@ -996,8 +1375,10 @@ pub(crate) mod tests {
         let manifest = reader.manifest().clone();
         let mut files = Vec::new();
         while let Some(entry) = reader.next_entry()? {
-            let EntryName::Snapshot(name) = entry.name else {
-                bail!("the archive holds an external file");
+            // An external file reads back under its name in the archive, `external/<n>`.
+            let name = match entry.name {
+                EntryName::Snapshot(name) => name,
+                EntryName::External(index) => PathBuf::from(format!("external/{index}")),
             };
             let mut bytes = vec![0u8; usize::try_from(entry.len)?];
             let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -1729,7 +2110,371 @@ pub(crate) mod tests {
         assert!(!temp.exists());
     }
 
-    /// One sentence, with the path, for each thing a restore reads outside the archive.
+    /// The file `name` of an archive read back.
+    fn read_back<'a>(files: &'a [ReadBack], name: &str) -> &'a ReadBack {
+        files
+            .iter()
+            .find(|file| file.name == Path::new(name))
+            .unwrap_or_else(|| panic!("the archive has no {name}"))
+    }
+
+    /// The image disk and each pmem store entry follow the snapshot's files as
+    /// `external/<n>`, with their lengths, hole maps and bytes, and the manifest describes
+    /// them with what the config records: the image disk identity, and the digest in the
+    /// entry's name. Two devices that map one entry carry it once. Neither is listed as
+    /// not shipped.
+    #[tokio::test]
+    async fn an_export_carries_the_image_disk_and_the_pmem_entries() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let entry = PathBuf::from(&externals.pmem.path);
+        fake.edit_config(|config| {
+            let mut again = externals.pmem.clone();
+            again.mount_path = "/models-again".to_string();
+            config.metadata.pmem_devices.push(again);
+        });
+        assert_eq!(
+            data_runs(&externals.image_disk),
+            [(PAGE, 3 * PAGE), (MIB, 2 * MIB + PAGE)],
+            "control: the fake image disk keeps its holes"
+        );
+        assert_eq!(
+            data_runs(&entry),
+            [(0, PAGE), (MIB, MIB + 3 * PAGE)],
+            "control: the fake pmem entry keeps its holes"
+        );
+
+        let (archive, records) = export_snapshot(&fake.host, TAG, Vec::new()).await.unwrap();
+        let (manifest, files) = read_archive(&archive).unwrap();
+
+        assert_eq!(
+            manifest.externals,
+            [
+                ManifestExternal {
+                    role: ExternalRole::ImageDisk,
+                    path: externals.image_disk.clone(),
+                    len: IMAGE_DISK_LEN,
+                    sha256: Some(sha256_of(&std::fs::read(&externals.image_disk).unwrap())),
+                },
+                ManifestExternal {
+                    role: ExternalRole::Pmem,
+                    path: entry.clone(),
+                    len: PMEM_LEN,
+                    sha256: Some(entry.file_stem().unwrap().to_str().unwrap().to_string()),
+                },
+            ]
+        );
+        assert_eq!(
+            manifest.pmem_owner_uid,
+            Some(nix::unistd::geteuid().as_raw())
+        );
+        assert_eq!(manifest.not_shipped, Vec::<String>::new());
+
+        let names: Vec<&str> = files
+            .iter()
+            .map(|file| file.name.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names[names.len() - 2..],
+            ["external/0", "external/1"],
+            "the external files follow the snapshot's: {names:?}"
+        );
+        assert_reads_back(read_back(&files, "external/0"), &externals.image_disk);
+        assert_reads_back(read_back(&files, "external/1"), &entry);
+        assert_eq!(
+            records[records.len() - 2..]
+                .iter()
+                .map(|record| (record.name.as_str(), record.len))
+                .collect::<Vec<_>>(),
+            [("external/0", IMAGE_DISK_LEN), ("external/1", PMEM_LEN)],
+            "the records the export returns name the external files"
+        );
+    }
+
+    /// A snapshot records an image disk's identity for an overlay storage image only. A
+    /// Docker archive disk, which has none, is carried all the same, and the manifest
+    /// gives no digest for it.
+    #[tokio::test]
+    async fn an_image_disk_with_no_recorded_identity_is_carried_without_a_digest() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        // A Docker archive disk, the kind a launch records no identity for.
+        let disk = fake.image_cache().join("0123456789abcdef.docker.tar");
+        std::fs::rename(&externals.image_disk, &disk).unwrap();
+        fake.edit_config(|config| {
+            config.metadata.image_disk_path = Some(disk.clone());
+            config.metadata.image_disk_identity = None;
+        });
+
+        let (archive, _) = export_snapshot(&fake.host, TAG, Vec::new()).await.unwrap();
+        let (manifest, files) = read_archive(&archive).unwrap();
+
+        assert_eq!(manifest.externals[0].role, ExternalRole::ImageDisk);
+        assert_eq!(manifest.externals[0].path, disk);
+        assert_eq!(manifest.externals[0].sha256, None);
+        assert_reads_back(read_back(&files, "external/0"), &disk);
+    }
+
+    /// The disk at the recorded path is another build than the snapshot recorded: the
+    /// export fails once the disk is streamed, and what it wrote is no archive.
+    #[tokio::test]
+    async fn an_image_disk_that_is_not_the_recorded_build_fails_the_export() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let recorded = std::fs::read(&externals.image_disk).unwrap();
+        // The same length and the same data runs, with other bytes in them.
+        let mut rebuilt = recorded.clone();
+        rebuilt[MIB as usize + 5] ^= 0x01;
+        std::fs::write(&externals.image_disk, &rebuilt).unwrap();
+        let out = SharedBuf::default();
+
+        let message = export_failure(&fake, out.clone()).await;
+
+        assert!(
+            message.contains("is not the build snapshot 'example-tag' was taken against")
+                && message.contains(&sha256_of(&rebuilt))
+                && message.contains(&sha256_of(&recorded)),
+            "the failure does not name the two digests: {message}"
+        );
+        assert!(
+            !out.bytes().is_empty(),
+            "control: the export had written part of the archive when it failed"
+        );
+        assert!(
+            read_archive(&out.bytes()).is_err(),
+            "a reader accepted what the failed export wrote"
+        );
+
+        // Control: with the recorded build back, the same snapshot exports.
+        std::fs::write(&externals.image_disk, &recorded).unwrap();
+        let (archive, _) = export_snapshot(&fake.host, TAG, Vec::new()).await.unwrap();
+        read_archive(&archive).unwrap();
+    }
+
+    /// An identity that is not a SHA-256 (inode, size and modification time, as snapshots
+    /// once recorded) cannot be held against the disk's bytes: refused before anything is
+    /// written.
+    #[tokio::test]
+    async fn an_image_disk_identity_that_is_not_a_digest_is_refused() {
+        let (fake, _externals) = fake_snapshot_with_externals();
+        let upper = format!("sha256:{}", "0123456789ABCDEF".repeat(4));
+        for identity in [
+            "1841:73678848:1765574672.000000000",
+            "sha256:abc",
+            upper.as_str(),
+        ] {
+            fake.edit_config(|config| {
+                config.metadata.image_disk_identity = Some(identity.to_string());
+            });
+            let out = SharedBuf::default();
+
+            let message = export_failure(&fake, out.clone()).await;
+
+            assert!(
+                message.contains("which is not the SHA-256 of its bytes"),
+                "{identity}: {message}"
+            );
+            assert!(
+                out.bytes().is_empty(),
+                "{identity}: the export wrote {} bytes before it refused",
+                out.bytes().len()
+            );
+        }
+    }
+
+    /// An import takes an image disk only at a path its host's image cache gives the disk
+    /// of an image, and a storage image only with the identity its snapshot recorded. An
+    /// export holds the snapshot against the same rules on its own host before it writes
+    /// anything, so it does not write an archive whose import fails on them.
+    #[tokio::test]
+    async fn an_image_disk_an_import_refuses_is_refused_before_anything_is_written() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        async fn refused(fake: &Fake, edit: impl FnOnce(&mut SnapshotConfig)) -> String {
+            fake.edit_config(edit);
+            let out = SharedBuf::default();
+            let message = export_failure(fake, out.clone()).await;
+            assert!(
+                message.contains("is not exported: an import refuses its image disk"),
+                "{message}"
+            );
+            assert!(
+                out.bytes().is_empty(),
+                "the export wrote {} bytes before it refused: {message}",
+                out.bytes().len()
+            );
+            message
+        }
+
+        // A storage image the snapshot recorded no identity for.
+        let message = refused(&fake, |config| {
+            config.metadata.image_disk_identity = None;
+        })
+        .await;
+        assert!(message.contains("records no identity for it"), "{message}");
+
+        // The recorded build, outside the image cache.
+        let outside = fake.root.path().join("0123456789abcdef.storage-v2.img");
+        std::fs::copy(&externals.image_disk, &outside).unwrap();
+        let identity = format!("sha256:{}", sha256_hex(&outside).unwrap());
+        let message = refused(&fake, |config| {
+            config.metadata.image_disk_path = Some(outside.clone());
+            config.metadata.image_disk_identity = Some(identity);
+        })
+        .await;
+        assert!(
+            message.contains("is not a file of this host's image cache"),
+            "{message}"
+        );
+
+        // The recorded build in the image cache, under a name no launch gives a disk.
+        let misnamed = fake.image_cache().join("layers.img");
+        std::fs::copy(&externals.image_disk, &misnamed).unwrap();
+        let message = refused(&fake, |config| {
+            config.metadata.image_disk_path = Some(misnamed.clone());
+        })
+        .await;
+        assert!(
+            message.contains("is not a name this host's image cache gives an image disk"),
+            "{message}"
+        );
+
+        // Control: the snapshot as it was made exports.
+        fake.edit_config(|config| config.metadata.image_disk_path = Some(externals.image_disk));
+        let (archive, _) = export_snapshot(&fake.host, TAG, Vec::new()).await.unwrap();
+        read_archive(&archive).unwrap();
+    }
+
+    /// `mincore` reports every page of a file as cached to a caller that neither owns the
+    /// file nor could open it for writing. Such a file has no answer, so the export leaves
+    /// its page cache alone. `/etc/passwd` is root's and nobody else's to write: a user
+    /// gets no answer for it, and root, whom the kernel answers, gets the true one.
+    #[test]
+    fn the_page_cache_of_a_file_the_caller_neither_owns_nor_can_write_has_no_answer() {
+        let path = Path::new("/etc/passwd");
+        let file = File::open(path).unwrap();
+        let stat = file.metadata().unwrap();
+        // In the page cache from here on.
+        std::fs::read(path).unwrap();
+        let callers = stat.uid() == nix::unistd::geteuid().as_raw()
+            || std::fs::OpenOptions::new().write(true).open(path).is_ok();
+
+        let answer = any_page_cached(&file, stat.len());
+
+        assert_eq!(
+            answer,
+            callers.then_some(true),
+            "{} (uid {}, mode {:o}) as uid {}",
+            path.display(),
+            stat.uid(),
+            stat.mode(),
+            nix::unistd::geteuid()
+        );
+    }
+
+    /// A pmem entry is recorded by inode, length and modification time, and the export
+    /// checks the entries as a restore does before it opens one and after it has streamed
+    /// the last. An entry that is gone is refused before anything is written. One replaced
+    /// while the archive is written fails the export, and what it wrote is no archive.
+    #[tokio::test]
+    async fn a_pmem_entry_that_is_gone_or_replaced_fails_the_export() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let entry = PathBuf::from(&externals.pmem.path);
+        let aside = fake.root.path().join("entry-aside");
+
+        std::fs::rename(&entry, &aside).unwrap();
+        let out = SharedBuf::default();
+        let message = export_failure(&fake, out.clone()).await;
+        assert!(
+            message.contains("snapshot pmem image changed") && message.contains("is missing"),
+            "an entry that is gone: {message}"
+        );
+        assert!(
+            out.bytes().is_empty(),
+            "the export wrote {} bytes before it refused",
+            out.bytes().len()
+        );
+        std::fs::rename(&aside, &entry).unwrap();
+
+        // The same bytes under the same name, in a new file: what a store that was copied
+        // from another host holds.
+        let out = SharedBuf::default();
+        let mut replaced = false;
+        let hooked = Hooked {
+            out: out.clone(),
+            before: {
+                let (entry, aside) = (entry.clone(), aside.clone());
+                move |_: &[u8]| {
+                    if !replaced {
+                        replaced = true;
+                        std::fs::copy(&entry, &aside).unwrap();
+                        std::fs::rename(&aside, &entry).unwrap();
+                    }
+                }
+            },
+        };
+        let message = export_failure(&fake, hooked).await;
+        assert!(
+            message.contains("after they were exported")
+                && message.contains("was replaced since the snapshot was taken"),
+            "an entry replaced during the export: {message}"
+        );
+        assert!(
+            read_archive(&out.bytes()).is_err(),
+            "a reader accepted what the failed export wrote"
+        );
+    }
+
+    /// An external file's page cache is left as the export found it. The running VMs of an
+    /// image read its disk and its pmem entry, so a file with cached pages keeps them, and a
+    /// file with none is dropped again once its entry is written.
+    #[tokio::test]
+    async fn an_external_files_page_cache_is_left_as_the_export_found_it() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let entry = PathBuf::from(&externals.pmem.path);
+        let (disk, pmem) = (
+            File::open(&externals.image_disk).unwrap(),
+            File::open(&entry).unwrap(),
+        );
+        // The image disk is in use: cached. The pmem entry is not: written out and dropped.
+        std::fs::read(&externals.image_disk).unwrap();
+        pmem.sync_all().unwrap();
+        posix_fadvise(&pmem, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED).unwrap();
+        assert_eq!(
+            (
+                any_page_cached(&disk, IMAGE_DISK_LEN),
+                any_page_cached(&pmem, PMEM_LEN)
+            ),
+            (Some(true), Some(false)),
+            "control: the image disk is cached and the pmem entry is not"
+        );
+        // SAFETY: the files are private to this test and are not written again. The mappings
+        // are for mincore only: no page is touched through them, so none is mapped.
+        let disk = unsafe { MmapOptions::new().len(IMAGE_DISK_LEN as usize).map(&disk) }.unwrap();
+        let pmem = unsafe { MmapOptions::new().len(PMEM_LEN as usize).map(&pmem) }.unwrap();
+        let cached_before = resident_pages(&disk, 0, IMAGE_DISK_LEN);
+
+        let (archive, _) = export_snapshot(&fake.host, TAG, Vec::new()).await.unwrap();
+
+        let (_, files) = read_archive(&archive).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.name.starts_with("external"))
+                .count(),
+            2,
+            "control: the export read both files"
+        );
+        assert_eq!(
+            resident_pages(&disk, 0, IMAGE_DISK_LEN),
+            cached_before,
+            "the export dropped an image disk that was cached before it read it"
+        );
+        assert_eq!(
+            resident_pages(&pmem, 0, PMEM_LEN),
+            0,
+            "the export left a pmem entry cached that was not cached before it read it"
+        );
+    }
+
+    /// One sentence, with the path, for each thing a restore reads that the archive does
+    /// not carry.
     #[test]
     fn the_manifest_names_what_a_restore_reads_outside_the_archive() {
         let mut config = fake_config(
@@ -1760,13 +2505,10 @@ pub(crate) mod tests {
         }];
         metadata.firmware = Some(PathBuf::from("/example/firmware/OVMF.fd"));
 
+        // The image disk and the pmem image are carried, so they are not listed.
         assert_eq!(
             not_shipped(&config),
             [
-                "The image disk /example/image-cache/layers.img holds the container image and \
-                 is attached read-only at this path.",
-                "The pmem image /example/data/pmem/0123.img (a copy of \
-                 /example/models/model.img) is mapped at /models and reopened at this path.",
                 "The directory /example/host/data is mapped into the guest at /data.",
                 "The directory /example/host/share is exported over NFS and mounted in the \
                  guest at /share.",
