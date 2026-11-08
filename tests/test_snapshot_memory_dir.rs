@@ -51,17 +51,19 @@ async fn sleep(fcvm: &Path, pid: u32, tag: &str, memory_dir: &Path) -> Result<()
     Ok(())
 }
 
-/// A VM put to sleep with its memory in a tmpfs wakes from it, a second sleep of the woken
+/// A VM put to sleep with its memory outside the store wakes from it, a second sleep of the woken
 /// clone replaces the first generation and its memory file, and a snapshot whose memory file
 /// is gone (a reboot clears a tmpfs) is refused with that reason before anything starts.
 #[tokio::test]
 async fn test_snapshot_memory_dir_sleeps_and_wakes() -> Result<()> {
     let (base, clone, tag, _) = common::unique_names("memdir");
     let fcvm = common::find_fcvm_binary()?;
+    // /tmp, not /dev/shm: a container's /dev/shm is 64 MiB, less than the guest's memory, and
+    // what this test checks does not depend on the directory being a tmpfs
     let memory_dir = tempfile::Builder::new()
         .prefix("fcvm-memdir-test-")
-        .tempdir_in("/dev/shm")
-        .context("making a memory directory in /dev/shm")?;
+        .tempdir_in("/tmp")
+        .context("making a memory directory in /tmp")?;
     // --memory-dir refuses a directory group or others could write, whatever the umask
     std::fs::set_permissions(
         memory_dir.path(),
