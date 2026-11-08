@@ -190,10 +190,12 @@ fcvm vm run --name win-1 --firmware <CLOUDHV.fd> --disk <image.raw> --cpu 2 --me
   by its agent on the virtio NIC) can reach the namespace's address and nothing beyond it, so
   no setting inside Windows can open egress. Every clone of one snapshot has the same address
   inside its own namespace, as Linux clones do.
-- **The host side.** fcvm runs one helper inside the namespace (entered with `nsenter` into the
-  holder's namespaces, killed with the VM by `PR_SET_PDEATHSIG`): it relays each connection to
-  the VM's Unix socket `rdp.sock` in its data directory to 10.0.2.100:3389, and serves the
-  clock line below on 10.0.2.1:4600. The bridge reaches Remote Desktop only through
+- **The host side.** fcvm runs one helper inside the namespace (it enters the holder's
+  namespaces in its own `pre_exec`, then arms `PR_SET_PDEATHSIG`, so it dies with the VM): it
+  relays each connection to the VM's Unix socket `rdp/rdp.sock` in its data directory (the
+  directory 0700, the socket 0600, every peer's uid checked against fcvm's) to
+  10.0.2.100:3389, and serves the clock line below on 10.0.2.1:4600. A guest restart boots the
+  same disk again in place, with the same helper. The bridge reaches Remote Desktop only through
   `rdp.sock` (FreeRDP connects to a Unix socket path directly); no port is published.
 - **The restore generation and the clock.** On each connection to 10.0.2.1:4600 fcvm sends
   `<generation> <host time in ms>`, the generation being the VM's id. The guest agent asks ten
@@ -273,9 +275,11 @@ would be a half-open connection in every clone, which Windows holds until it tim
 
 ## Memory
 
-Today a Cloud Hypervisor restore reads the whole memory file into anonymous memory
-(`memory_restore_mode=copy`): every clone pays a read of the full guest size before it runs,
-and holds a private copy of every page, including the zeros. The measurement section gives
+Before stack PR 5 a Cloud Hypervisor restore read the whole memory file into anonymous
+memory (`memory_restore_mode=copy`): every clone paid a read of the full guest size before it
+ran, and held a private copy of every page, including the zeros. Every Cloud Hypervisor
+clone now restores with `map` from a symbolic link to the snapshot's memory file
+(`prepare_ch_restore_files` in `src/commands/common.rs`). The measurement section gives
 both numbers for 1, 4 and 8 clones.
 
 The target is the sharing Firecracker's File backend already gives: map the snapshot's
@@ -289,13 +293,14 @@ in our Cloud Hypervisor fork, `memory_restore_mode=map`: after the memory manage
 guest RAM, each saved range of the memory file is mapped `MAP_PRIVATE | MAP_FIXED` over the
 RAM that backs it, from its offset in the file. KVM's memory slots already point at those
 host addresses and follow the new mapping through its MMU notifiers. It refuses shared and
-hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode: fcvm's restore
-today reflinks the snapshot's files into each clone's `ch-restore` directory, and a reflink is
-a new inode with its own page cache, so the clone's directory links the snapshot's memory file
-instead (it is immutable once published) and keeps its own copy of the configuration. fcvm
-then restores every Cloud Hypervisor clone with it (stack PR 5),
-measured against `copy` on the same host; it lands only if it wins on time to desktop at 8
-clones and on private memory per clone.
+hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode, and a
+reflink is a new inode with its own page cache, so each clone's `ch-restore` directory holds a
+symbolic link to the snapshot's memory file (immutable once published) and its own copy of
+the configuration. A hard link would do the same, but the snapshot directory is a btrfs
+subvolume and a link across subvolumes fails with `EXDEV`. Against `copy` on the same host it
+cut the first desktop update at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and the PSS
+of each clone from 4,097 to about 840 MiB (the measurement section). A Cloud Hypervisor
+without `map` fails the restore with an error naming `fcvm setup --cloud-hypervisor`.
 
 fcvm's UFFD memory server (`src/uffd/`, minor mode with working-set replay) would add
 prefetching on top of the same sharing, at the cost of a userfaultfd handshake in the fork.

@@ -425,6 +425,7 @@ pub async fn create_podman_snapshot(
                 parent_dir.as_deref(),
                 Some(&extra_files),
                 source_disposition,
+                None,
             )
             .await?,
         ),

@@ -8,7 +8,8 @@
 //!
 //! Every player is a clone of one snapshot of an unassigned player (`potato-gold`), made
 //! when the agent starts; a new player is restored from it and given its number over its
-//! ball port. A player sleeps with `fcvm snapshot create --tag potato-<n> --stop` and wakes
+//! ball port. A player sleeps with `fcvm snapshot create --tag potato-<n> --stop`, its memory
+//! in a tmpfs (`--memory-dir`, the agent's `--potato-sleep-memory-dir`), and wakes
 //! with `fcvm snapshot run --snapshot potato-<n>`. Players start fresh with every agent: a
 //! player is never woken from a snapshot an earlier agent left.
 
@@ -54,11 +55,35 @@ pub struct PotatoCfg {
     pub players: u32,
     pub prefix: Prefix,
     pub mem_mib: u32,
+    /// `snapshot create --memory-dir` for a sleep; None keeps the memory on the store.
+    pub sleep_memory_dir: Option<PathBuf>,
+    /// The most the sleeps' memory files may hold in `sleep_memory_dir`, in MiB. A sleep that
+    /// would go over it keeps its memory on the store instead.
+    pub sleep_memory_cap_mib: u64,
 }
 
 impl PotatoCfg {
     fn tag(n: u32) -> String {
         format!("potato-{n}")
+    }
+
+    /// `fcvm snapshot create` for putting player `n`, whose fcvm is `pid`, to sleep, its memory
+    /// in `memory_dir` when given.
+    fn sleep_args(n: u32, pid: u32, memory_dir: Option<&std::path::Path>) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "snapshot".into(),
+            "create".into(),
+            "--pid".into(),
+            pid.to_string(),
+            "--tag".into(),
+            Self::tag(n),
+            "--stop".into(),
+        ];
+        if let Some(dir) = memory_dir {
+            args.push("--memory-dir".into());
+            args.push(dir.display().to_string());
+        }
+        args
     }
 
     fn gold_args(&self) -> Result<Vec<String>> {
@@ -360,10 +385,23 @@ pub async fn run(
     let (heard_tx, mut heard) = mpsc::unbounded_channel::<Heard>();
     tokio::spawn(serve_reports(listener, heard_tx));
     let (done_tx, mut done) = mpsc::unbounded_channel::<Done>();
+    // A memory directory fcvm would refuse (another user's, or one others can write), or one
+    // that cannot be emptied, leaves every sleep on the store rather than failing each one.
+    let sleep_memory = SleepMemory::new(&cfg).filter(|memory| {
+        let ready =
+            crate::storage::disk::prepare_memory_dir(&memory.dir, &crate::paths::snapshot_dir())
+                .and_then(|_| memory.clear());
+        if let Err(e) = &ready {
+            tracing::warn!(dir = %memory.dir.display(), error = %format!("{e:#}"),
+                "potato: sleeps keep their memory on the store");
+        }
+        ready.is_ok()
+    });
     let mut d = Driver {
         cfg: cfg.clone(),
         ops: Arc::new(FcvmOps {
             cfg: cfg.clone(),
+            sleep_memory,
             boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
             tasks: Default::default(),
         }),
@@ -448,8 +486,121 @@ pub(crate) trait Ops: Send + Sync {
     fn shutdown(&self);
 }
 
+/// Where sleeping players' memory goes, and its budget, counted from what the agent did
+/// rather than read from the directory: each player whose last sleep put its memory there
+/// holds one memory's worth until its next sleep replaces it, and each sleep in flight
+/// holds one more until it ends. The directory is the agent's own, emptied when it starts.
+pub(crate) struct SleepMemory {
+    dir: PathBuf,
+    /// One player's memory, in bytes.
+    each: u64,
+    /// The most the memory files may take, in bytes.
+    cap: u64,
+    state: std::sync::Mutex<SleepMemoryState>,
+}
+
+#[derive(Default)]
+struct SleepMemoryState {
+    /// Players whose last sleep put their memory in the directory.
+    held: std::collections::BTreeSet<u32>,
+    /// Sleeps writing there now.
+    in_flight: u64,
+}
+
+/// One sleep's place in [`SleepMemory`]'s budget, given back when the sleep ends
+/// ([`SleepReservation::finish`], or a drop for a sleep that did not finish).
+struct SleepReservation {
+    memory: Arc<SleepMemory>,
+    player: u32,
+    done: bool,
+}
+
+impl SleepReservation {
+    /// The sleep ended. Its player is counted as holding a memory file whether or not the
+    /// create succeeded: `snapshot create` can fail after it published (recording the VM's
+    /// diff parent comes later), and a failure before publication leaves the player's earlier
+    /// file, if any, in place. Counting one that is not there only sends a later sleep to the
+    /// store; missing one that is there would let the directory outgrow its cap.
+    fn finish(mut self) {
+        let mut state = self.memory.state.lock().unwrap();
+        state.in_flight -= 1;
+        state.held.insert(self.player);
+        self.done = true;
+    }
+}
+
+impl Drop for SleepReservation {
+    fn drop(&mut self) {
+        if !self.done {
+            self.memory.state.lock().unwrap().in_flight -= 1;
+        }
+    }
+}
+
+impl SleepMemory {
+    fn new(cfg: &PotatoCfg) -> Option<Arc<Self>> {
+        let dir = cfg.sleep_memory_dir.clone()?;
+        Some(Arc::new(Self {
+            dir,
+            each: u64::from(cfg.mem_mib) << 20,
+            cap: cfg.sleep_memory_cap_mib.saturating_mul(1 << 20),
+            state: Default::default(),
+        }))
+    }
+
+    /// Reserve room for player `n`'s sleep, if every memory held, every sleep in flight and
+    /// this one fit under the cap. None: the sleep keeps its memory on the store, and a
+    /// player whose memory was held stops being counted once that sleep replaces it.
+    fn reserve(self: &Arc<Self>, n: u32) -> Option<SleepReservation> {
+        let mut state = self.state.lock().unwrap();
+        let after = (state.held.len() as u64 + state.in_flight + 1).saturating_mul(self.each);
+        if after > self.cap {
+            tracing::warn!(dir = %self.dir.display(), held = state.held.len(), in_flight = state.in_flight,
+                cap_mib = self.cap >> 20, "potato: the sleep memory directory is at its cap; this sleep keeps its memory on the store");
+            return None;
+        }
+        state.in_flight += 1;
+        Some(SleepReservation {
+            memory: self.clone(),
+            player: n,
+            done: false,
+        })
+    }
+
+    /// A sleep of player `n` that kept its memory on the store published: the player's memory
+    /// file in the directory, if it had one, went with the generation it replaced.
+    fn left(&self, n: u32) {
+        self.state.lock().unwrap().held.remove(&n);
+    }
+
+    /// Remove what an earlier agent's sleeps left in the directory (its players are not woken
+    /// again, and a sleep killed before it published leaves a file nothing links to), so the
+    /// count starts from an empty directory. Called before any sleep.
+    fn clear(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", self.dir.display()))?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with(crate::storage::disk::LINKED_MEMORY_PREFIX))
+            {
+                std::fs::remove_file(entry.path())
+                    .with_context(|| format!("removing {}", entry.path().display()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct FcvmOps {
     cfg: Arc<PotatoCfg>,
+    /// None: sleeps keep their memory on the store.
+    sleep_memory: Option<Arc<SleepMemory>>,
     boot_slots: Arc<Semaphore>,
     /// Every operation in flight, so a shutdown can abort them: an aborted task drops the VM it
     /// holds, which sends its fcvm SIGTERM, and a boot still waiting for a slot starts nothing.
@@ -532,6 +683,7 @@ impl Ops for FcvmOps {
 
     fn sleep(&self, n: u32, vm: Option<Vm>, stop: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
+        let sleep_memory = self.sleep_memory.clone();
         self.spawn(async move {
             let started = Instant::now();
             if let (Some(round), Ok(addr)) = (stop, cfg.prefix.player_address(n)) {
@@ -549,19 +701,14 @@ impl Ops for FcvmOps {
                 return;
             };
             let create = Instant::now();
-            let r = run_fcvm(
-                &cfg.fcvm,
-                &[
-                    "snapshot".into(),
-                    "create".into(),
-                    "--pid".into(),
-                    vm.pid.to_string(),
-                    "--tag".into(),
-                    PotatoCfg::tag(n),
-                    "--stop".into(),
-                ],
-            )
-            .await;
+            let reservation = sleep_memory.as_ref().and_then(|m| m.reserve(n));
+            let memory_dir = reservation.as_ref().map(|r| r.memory.dir.clone());
+            let r = run_fcvm(&cfg.fcvm, &PotatoCfg::sleep_args(n, vm.pid, memory_dir.as_deref())).await;
+            match (reservation, &sleep_memory) {
+                (Some(reservation), _) => reservation.finish(),
+                (None, Some(memory)) if r.is_ok() => memory.left(n),
+                _ => {}
+            }
             let created = create.elapsed();
             // --stop has stopped the VM's fcvm (also on failure); reap it
             let reap = Instant::now();
@@ -1230,6 +1377,8 @@ mod tests {
                 players,
                 prefix: Prefix::parse("2001:db8::/80").unwrap(),
                 mem_mib: 256,
+                sleep_memory_dir: None,
+                sleep_memory_cap_mib: 0,
             }),
             ops: Arc::new(rec.clone()),
             out,
@@ -1381,6 +1530,42 @@ mod tests {
             rec.take().is_empty(),
             "player 0 catches again in 8 catches, beyond the lead"
         );
+    }
+
+    /// A sleep whose memory is gone (its memory directory is a tmpfs, cleared by a reboot or by
+    /// hand) cannot wake: the agent reports the wake failed and forgets the player, and the next
+    /// round boots it again from the gold rather than trying the lost snapshot once more.
+    #[test]
+    fn a_player_whose_memory_is_gone_is_reported_and_booted_again_next_round() {
+        let (mut d, rec, mut out) = asleep(2, 300.0);
+        d.order(Some(round(1, vec![0, 1], 1000)));
+        assert_eq!(rec.take(), vec!["wake 0"]);
+        d.done(Done::Woke(
+            0,
+            Err(anyhow::anyhow!(
+                "the memory file of snapshot potato-0 is gone: /dev/shm/fcvm-potato/fcvm-memory-x.bin"
+            )),
+            0.0,
+        ));
+        let failed = std::iter::from_fn(|| out.try_recv().ok()).find_map(|m| match m {
+            AgentMsg::Potato(PotatoEvent {
+                player: 0,
+                kind: PotatoKind::Failed { stage, error },
+                ..
+            }) => Some((stage, error)),
+            _ => None,
+        });
+        let (stage, error) = failed.expect("the failed wake is reported");
+        assert_eq!(stage, "wake");
+        assert!(error.contains("is gone"), "{error}");
+        assert_eq!(d.players[0].phase, Phase::Missing);
+        // the coordinator drops the ball and starts the next round
+        d.order(None);
+        rec.take();
+        d.order(Some(round(2, vec![0, 1], 1000)));
+        let next = rec.take();
+        assert!(next.contains(&"boot 0".to_string()), "{next:?}");
+        assert!(!next.contains(&"wake 0".to_string()), "{next:?}");
     }
 
     #[test]
@@ -1615,6 +1800,146 @@ mod tests {
         assert_eq!(d.players[0].phase, Phase::Awake);
     }
 
+    /// A sleep keeps the player's memory in the memory directory when the agent has one, so it
+    /// commits no btrfs transaction, and on the store when it has none.
+    #[test]
+    fn a_sleep_puts_the_memory_in_the_sleep_memory_dir() {
+        assert_eq!(
+            PotatoCfg::sleep_args(3, 4242, Some(std::path::Path::new("/dev/shm/fcvm-potato"))),
+            [
+                "snapshot",
+                "create",
+                "--pid",
+                "4242",
+                "--tag",
+                "potato-3",
+                "--stop",
+                "--memory-dir",
+                "/dev/shm/fcvm-potato",
+            ]
+        );
+        assert_eq!(
+            PotatoCfg::sleep_args(3, 4242, None),
+            ["snapshot", "create", "--pid", "4242", "--tag", "potato-3", "--stop"]
+        );
+    }
+
+    /// The sleeps' memory stays under its cap: each player whose memory is held and each sleep
+    /// in flight count once. A sleep over the cap keeps its memory on the store; a sleep that
+    /// ends gives its room back, a published one holds it for its player (once, however often
+    /// it sleeps), and a player re-slept on the store stops holding any.
+    #[test]
+    fn sleeps_keep_their_memory_under_the_cap() {
+        let mib = 1u64 << 20;
+        let memory = Arc::new(SleepMemory {
+            dir: "/nonexistent".into(),
+            each: mib,
+            cap: 3 * mib,
+            state: Default::default(),
+        });
+        let held = |m: &SleepMemory| m.state.lock().unwrap().held.len();
+        memory.reserve(0).unwrap().finish();
+        memory.reserve(1).unwrap().finish();
+        assert_eq!(held(&memory), 2);
+        // both players awake and sleeping again: one fits beside their two memories
+        let a = memory.reserve(0).expect("2 held + 1 fits under 3");
+        assert!(
+            memory.reserve(1).is_none(),
+            "2 held + 2 in flight is over 3"
+        );
+        a.finish();
+        assert_eq!(
+            held(&memory),
+            2,
+            "a player's next sleep replaces its memory"
+        );
+        let b = memory.reserve(1).expect("room again once the sleep ended");
+        drop(b);
+        assert_eq!(
+            memory.state.lock().unwrap().in_flight,
+            0,
+            "a dropped sleep gives its room back"
+        );
+        memory.left(1);
+        assert_eq!(
+            held(&memory),
+            1,
+            "a player re-slept on the store holds no memory"
+        );
+
+        // the default cap, twice the players' memory, fits every player's memory and the next
+        // sleep of each at once: a sleep in flight is counted once, however much it has written
+        let memory = Arc::new(SleepMemory {
+            dir: "/nonexistent".into(),
+            each: mib,
+            cap: 4 * mib,
+            state: Default::default(),
+        });
+        memory.reserve(0).unwrap().finish();
+        memory.reserve(1).unwrap().finish();
+        let a = memory.reserve(0).expect("2 held + 1 in flight");
+        let b = memory
+            .reserve(1)
+            .expect("2 held + 2 in flight fits the default cap of 4");
+        a.finish();
+        b.finish();
+    }
+
+    /// A sleep that reserved room in the memory directory leaves its player counted as holding
+    /// a file whatever the create returned: `snapshot create` can publish and then fail on the
+    /// VM's state, and a missed file would let the directory outgrow its cap. The sleep task has
+    /// no fake fcvm to drive, so its call is pinned by its source.
+    #[test]
+    fn a_failed_sleep_still_counts_its_memory() {
+        let source = include_str!("potato.rs");
+        let ops = &source[source.find("impl Ops for FcvmOps {").unwrap()..];
+        let sleep = &ops[ops
+            .find("    fn sleep(&self, n: u32, vm: Option<Vm>")
+            .unwrap()..];
+        let sleep = &sleep[..sleep.find("\n    }\n").unwrap()];
+        assert!(
+            sleep.contains("(Some(reservation), _) => reservation.finish(),"),
+            "the sleep must finish its reservation whatever the create returned"
+        );
+        let memory = Arc::new(SleepMemory {
+            dir: "/nonexistent".into(),
+            each: 1,
+            cap: 2,
+            state: Default::default(),
+        });
+        memory.reserve(0).unwrap().finish();
+        assert_eq!(memory.state.lock().unwrap().held.len(), 1);
+    }
+
+    /// The agent starts from an empty memory directory: what an earlier agent's sleeps left,
+    /// linked or not, is removed, and nothing else in it is.
+    #[test]
+    fn a_new_agent_empties_its_sleep_memory_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = crate::storage::disk::LINKED_MEMORY_PREFIX;
+        std::fs::write(dir.path().join(format!("{prefix}a.bin")), b"m").unwrap();
+        std::fs::write(dir.path().join(format!("{prefix}b.bin")), b"m").unwrap();
+        std::fs::write(dir.path().join("other"), b"o").unwrap();
+        let memory = SleepMemory {
+            dir: dir.path().to_path_buf(),
+            each: 1,
+            cap: 1,
+            state: Default::default(),
+        };
+        memory.clear().unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["other"]);
+        SleepMemory {
+            dir: dir.path().join("missing"),
+            ..memory
+        }
+        .clear()
+        .unwrap();
+    }
+
     /// Shutdown aborts the work in flight: a boot still waiting for a slot never starts a VM
     /// once the agent is stopping.
     #[tokio::test]
@@ -1626,7 +1951,10 @@ mod tests {
                 players: 2,
                 prefix: Prefix::parse("2001:db8::/80").unwrap(),
                 mem_mib: 256,
+                sleep_memory_dir: None,
+                sleep_memory_cap_mib: 0,
             }),
+            sleep_memory: None,
             boot_slots: Arc::new(Semaphore::new(0)),
             tasks: Default::default(),
         };

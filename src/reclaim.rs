@@ -62,6 +62,10 @@ pub enum Resource {
     /// A temporary file or directory that is renamed into place or removed when its
     /// operation finishes.
     Temp { path: PathBuf },
+    /// A memory file `snapshot create --memory-dir` wrote outside its snapshot directory.
+    /// Removed unless `link`, the published snapshot's `memory.bin`, names it: a create killed
+    /// before it published leaves the file to be removed, one killed after keeps it.
+    LinkedMemory { path: PathBuf, link: PathBuf },
     /// A named network namespace (`ip netns add`).
     Netns { name: String },
     /// A host network interface. Deleting one end of a veth pair deletes the other.
@@ -94,7 +98,10 @@ impl Resource {
     fn is_kernel_object(&self) -> bool {
         !matches!(
             self,
-            Resource::RuntimeDir { .. } | Resource::Temp { .. } | Resource::Unknown
+            Resource::RuntimeDir { .. }
+                | Resource::Temp { .. }
+                | Resource::LinkedMemory { .. }
+                | Resource::Unknown
         )
     }
 
@@ -110,6 +117,7 @@ impl std::fmt::Display for Resource {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
             Resource::Unknown => write!(f, "a resource of a kind this build does not know"),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
+            Resource::LinkedMemory { path, .. } => write!(f, "memory file {}", path.display()),
             Resource::Netns { name } => write!(f, "network namespace {name}"),
             Resource::Link { name } => write!(f, "interface {name}"),
             Resource::Rule { program, args } => write!(f, "{program} {}", args.join(" ")),
@@ -861,6 +869,7 @@ async fn undo(resource: &Resource) -> Undo {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
         Resource::Unknown => Undo::Done,
         Resource::Temp { path } => undo_temp(path).await,
+        Resource::LinkedMemory { path, link } => undo_linked_memory(path, link),
         Resource::Netns { name } => {
             undo_result(crate::network::namespace::delete_namespace(name).await)
         }
@@ -936,6 +945,60 @@ async fn remove_tree(path: &Path) -> Undo {
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Ok(Err(error)) => Undo::Kept(error.to_string()),
         Err(error) => Undo::Kept(error.to_string()),
+    }
+}
+
+/// Remove `path`, a memory file of a create that did not finish, unless the published
+/// snapshot's `link` names it. The check and the removal hold the snapshot's generation lock
+/// (`<snapshot>.lock`), so a create replacing that snapshot meanwhile, whose rename leaves no
+/// link for a moment, cannot make the check miss a published file; a busy snapshot is left
+/// for a later reclaim. With the snapshots directory itself gone no link can name the file,
+/// and it is removed.
+fn undo_linked_memory(path: &Path, link: &Path) -> Undo {
+    undo_linked_memory_with(path, link, &|link| std::fs::read_link(link))
+}
+
+/// [`undo_linked_memory`] with the link's read passed in, for the tests. A link that cannot be
+/// read for another reason than being absent or not a link (a permission or I/O error) cannot
+/// rule out that it names the file, which is then kept.
+fn undo_linked_memory_with(
+    path: &Path,
+    link: &Path,
+    read_link: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Undo {
+    let remove = || match std::fs::remove_file(path) {
+        Ok(()) => Undo::Done,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
+        Err(error) => Undo::Kept(error.to_string()),
+    };
+    let Some(snapshot) = link.parent() else {
+        return remove();
+    };
+    let lock_path = crate::commands::common::snapshot_sibling(snapshot, "lock");
+    let lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return remove(),
+        Err(error) => return Undo::Kept(format!("opening {}: {error}", lock_path.display())),
+    };
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+        return Undo::Kept(format!("{} is held: {error}", lock_path.display()));
+    }
+    match read_link(link) {
+        Ok(target) if target == path => Undo::Done,
+        Ok(_) => remove(),
+        // absent, or a regular file: a snapshot published without --memory-dir took the tag
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::EINVAL) =>
+        {
+            remove()
+        }
+        Err(error) => Undo::Kept(format!("reading {}: {error}", link.display())),
     }
 }
 
@@ -1091,6 +1154,65 @@ pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A memory file of a create that did not finish is removed; one the published snapshot's
+    /// memory.bin names (a create killed after publishing, before it discarded its record) is
+    /// kept, and so the snapshot stays restorable. While another create holds the snapshot's
+    /// generation lock (it may be between its two renames, with no link), nothing is removed;
+    /// with the snapshots directory gone, the file is removed.
+    #[test]
+    fn a_linked_memory_file_is_kept_only_when_the_published_link_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fcvm-memory-a.bin");
+        std::fs::write(&file, b"m").unwrap();
+        let snapshot = dir.path().join("snap");
+        std::fs::create_dir(&snapshot).unwrap();
+        let link = snapshot.join("memory.bin");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(
+            file.exists(),
+            "the published snapshot's memory file was removed"
+        );
+        std::fs::remove_file(&link).unwrap();
+        let held = std::fs::File::create(dir.path().join("snap.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Kept(_)));
+        assert!(file.exists(), "removed while a create held the snapshot");
+        drop(held);
+        std::os::unix::fs::symlink(dir.path().join("fcvm-memory-b.bin"), &link).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(!file.exists(), "an unpublished memory file was kept");
+        assert!(
+            matches!(undo_linked_memory(&file, &link), Undo::Done),
+            "a gone file is done"
+        );
+        // a link that cannot be read keeps the file: it may name it
+        std::fs::write(&file, b"m").unwrap();
+        let unreadable = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(matches!(
+            undo_linked_memory_with(&file, &link, &unreadable),
+            Undo::Kept(_)
+        ));
+        assert!(file.exists(), "removed although the link could not be read");
+        // a regular memory.bin (a later snapshot without --memory-dir) names no file of ours
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"store memory").unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(
+            !file.exists(),
+            "kept although the snapshot's memory is on the store"
+        );
+        std::fs::write(&file, b"m").unwrap();
+        let gone = dir
+            .path()
+            .join("no-snapshots")
+            .join("snap")
+            .join("memory.bin");
+        assert!(matches!(undo_linked_memory(&file, &gone), Undo::Done));
+        assert!(!file.exists(), "kept although no snapshot can name it");
+    }
+
     use std::io::BufRead;
 
     const CHILD_DIR: &str = "FCVM_RECLAIM_TEST_CHILD_DIR";

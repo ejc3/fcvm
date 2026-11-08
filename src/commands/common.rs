@@ -4300,19 +4300,82 @@ pub async fn restore_from_snapshot(
     ))
 }
 
+/// Cloud Hypervisor's memory file in its snapshot directory (`memory-ranges`).
+pub const CH_MEMORY_FILE: &str = "memory-ranges";
+
+/// Fill a clone's Cloud Hypervisor restore directory from the snapshot's `ch/`, all but
+/// `config.json`, which the caller rewrites.
+///
+/// The memory file is a symbolic link to the snapshot's, not a copy: the restore maps it
+/// `MAP_PRIVATE` (`memory_restore_mode=map`), and clones share its clean pages only when
+/// they map the same inode. A reflink is a new inode with a page cache of its own, so every
+/// clone would read every page from disk again (measured: a reflinked memory file answered
+/// RDP 1.0 to 1.2 s after launch for one Windows clone, a shared one in 74 to 76 ms;
+/// docs/fleet/windows-sandboxes.md, "Measurements"). A hard link cannot be used: the
+/// snapshot directory is a btrfs subvolume and the clone's directory is not, and a link
+/// across subvolumes is refused. The link is resolved once, when Cloud Hypervisor opens the
+/// file during the restore, while the caller holds the snapshot's generation lock shared,
+/// so it names the generation whose config and state were copied beside it; the mapping
+/// then keeps that inode for the clone's life, whatever happens to the tag. The other files
+/// (`state.json`) are small and reflinked.
+async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(ch_dir)
+        .await
+        .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let (src, dst) = (ch_dir.join(&name), clone_ch_dir.join(&name));
+        if name == std::ffi::OsStr::new("config.json") {
+            continue;
+        }
+        if name == std::ffi::OsStr::new(CH_MEMORY_FILE) {
+            let src = std::path::absolute(&src)
+                .with_context(|| format!("resolving {}", src.display()))?;
+            tokio::fs::symlink(&src, &dst)
+                .await
+                .with_context(|| format!("linking {} to {}", dst.display(), src.display()))?;
+            continue;
+        }
+        reflink_copy(&src, &dst)
+            .await
+            .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
+    }
+    Ok(())
+}
+
+/// What a failed `--restore` launch says. A Cloud Hypervisor older than the pinned fork rejects
+/// `memory_restore_mode=map` while it parses its arguments ("unable to convert map for
+/// memory_restore_mode"), before any VM exists, so that failure names the fix.
+fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> anyhow::Error {
+    if format!("{error:#}").contains("memory_restore_mode") {
+        error.context(format!(
+            "{} does not support memory_restore_mode=map, which fcvm restores Cloud Hypervisor \
+             clones with; run `fcvm setup --cloud-hypervisor` to build the pinned fork \
+             (rootfs-config.toml [cloud_hypervisor]), or set FCVM_CLOUD_HYPERVISOR_BIN to such a build",
+            ch_bin.display()
+        ))
+    } else {
+        error
+    }
+}
+
 /// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
 ///
 /// The Cloud Hypervisor analogue of [`restore_from_snapshot`]. It reuses the shared clone
 /// substrate (network/namespace/CoW disk/mount-redirect via [`prepare_clone_substrate`]),
 /// then — instead of Firecracker's `LoadSnapshot` + `patch_drive` — launches
-/// `cloud-hypervisor --restore source_url=file://{snapshot}/ch,memory_restore_mode=copy`.
+/// `cloud-hypervisor --restore source_url=file://{clone dir}/ch-restore,memory_restore_mode=map`.
 /// CH reads its own `config.json`/`state.json`/memory ranges from that subdir; the disk
 /// paths it embeds are redirected to the clone's CoW disk by the mount namespace (CH has no
 /// `patch_drive`). The VM restores PAUSED (`resume=false`) so the network post-start runs
 /// before [`Hypervisor::resume`], mirroring Firecracker.
 ///
-/// `copy` mode is eager read-copy (simplest, proven); in-process on-demand UFFD
-/// (`memory_restore_mode=ondemand`) is a follow-on (P2.5). The restored guest reconnects its
+/// `map` (our fork, ejc3/cloud-hypervisor#1) maps the snapshot's memory file `MAP_PRIVATE`
+/// over guest RAM, so nothing is read before the guest resumes and clones of one snapshot
+/// share its clean pages through the page cache, as Firecracker's File backend does.
+/// Measured against `copy` (eager read-copy) on 4 GiB Windows clones: first desktop frame
+/// 2.2 to 2.6 s against 4.2 to 4.6 s for one, 3.0 s against 8.7 s for eight at once, 845 MiB
+/// PSS each against 4,097 MiB. The restored guest reconnects its
 /// vsock channels and syncs its clock when the CALLER serves a restore-epoch over the
 /// boot-plan vsock port (its restore-epoch watcher triggers `handle_clone_restore`).
 pub async fn restore_from_snapshot_ch(
@@ -4407,19 +4470,7 @@ pub async fn restore_from_snapshot_ch(
         tokio::fs::create_dir_all(&clone_ch_dir)
             .await
             .context("creating CH restore directory")?;
-        let mut entries = tokio::fs::read_dir(&ch_dir)
-            .await
-            .with_context(|| format!("reading CH snapshot dir {}", ch_dir.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            // config.json is rewritten below; reflink the rest (state.json, memory ranges).
-            if name == std::ffi::OsStr::new("config.json") {
-                continue;
-            }
-            reflink_copy(&ch_dir.join(&name), &clone_ch_dir.join(&name))
-                .await
-                .with_context(|| format!("reflinking CH snapshot file {name:?}"))?;
-        }
+        prepare_ch_restore_files(&ch_dir, &clone_ch_dir).await?;
         // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
         if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
             for net in nets.iter_mut() {
@@ -4458,9 +4509,10 @@ pub async fn restore_from_snapshot_ch(
 
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
     let restore_args = format!(
-        "--restore source_url=file://{},memory_restore_mode=copy,resume=false",
+        "--restore source_url=file://{},memory_restore_mode=map,resume=false",
         clone_ch_dir.display()
     );
+    let ch_bin_shown = ch_bin.clone();
     let spec = ProcessSpec {
         binary: ch_bin,
         extra_args: Some(restore_args),
@@ -4476,6 +4528,7 @@ pub async fn restore_from_snapshot_ch(
         .await
         .context("launching Cloud Hypervisor --restore")
     {
+        let error = ch_restore_launch_error(error, &ch_bin_shown);
         let _ = backend.kill().await;
         cleanup_failed_clone_holder(
             &mut substrate.holder_child,
@@ -4627,14 +4680,33 @@ async fn reflink_disks_to_snapshot(
     disk_path: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     temp_snapshot_dir: &Path,
+    commit_free: bool,
 ) -> Result<()> {
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
+    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
+    // `commit_free` (--memory-dir): disks with few extents are reflinked into an ordinary
+    // directory, which commits no transaction, and a clone of the snapshot reflinks them
+    // again (REFLINK_MAX_EXTENTS) rather than snapshotting a subvolume.
+    let reflink_into_dir = commit_free && {
+        let mut files = vec![disk_path.to_path_buf()];
+        files.extend(
+            snapshot_config
+                .metadata
+                .extra_disks
+                .iter()
+                .map(|d| runtime_disks.join(&d.filename)),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::storage::disk::files_are_cheaper_to_reflink(&files)
+        })
+        .await
+        .context("extent count task panicked")?
+    };
     // A VM whose disk directory is a subvolume (a restored clone's is a snapshot of its snapshot's
     // disk/) has it snapshotted whole: one transaction commit, while the VM is paused, where a
     // reflink of the root disk costs one reference per extent.
-    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
     if let (Some(src), Some(root_name)) = (disk_path.parent(), disk_path.file_name()) {
-        if src == runtime_disks {
+        if src == runtime_disks && !reflink_into_dir {
             let keep: Vec<String> = snapshot_config
                 .metadata
                 .extra_disks
@@ -4651,9 +4723,15 @@ async fn reflink_disks_to_snapshot(
             }
         }
     }
-    crate::storage::disk::create_dir_or_subvolume(&disk_dir)
-        .await
-        .context("creating the snapshot's disk directory")?;
+    if reflink_into_dir {
+        tokio::fs::create_dir_all(&disk_dir)
+            .await
+            .context("creating the snapshot's disk directory")?;
+    } else {
+        crate::storage::disk::create_dir_or_subvolume(&disk_dir)
+            .await
+            .context("creating the snapshot's disk directory")?;
+    }
     reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
     for extra_disk in &snapshot_config.metadata.extra_disks {
         let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
@@ -5232,6 +5310,7 @@ async fn publish_snapshot_dir(
     snapshot_dir: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     extra_files: SnapshotExtraFiles<'_>,
+    memory_file: Option<(&crate::reclaim::Owner, &Path)>,
 ) -> Result<()> {
     let written: Result<()> = async {
         if let Some(extra_files) = extra_files {
@@ -5249,6 +5328,22 @@ async fn publish_snapshot_dir(
             .context("writing snapshot config")
     }
     .await;
+    // A memory file in --memory-dir changes its reclaim record as the last step before the
+    // rename (`hand_memory_file_to_publication`), which keeps the window in which a killed
+    // create leaves an older build's reclaim a record it cannot read as short as it can be.
+    // A `<tag>.old` an earlier crash left, which the rename would remove first, goes before
+    // the handover, so nothing slow remains between the two.
+    if written.is_ok() && memory_file.is_some() {
+        let _ =
+            crate::storage::disk::remove_snapshot_dir(&snapshot_sibling(snapshot_dir, "old")).await;
+    }
+    let written = written.and_then(|()| match memory_file {
+        Some((owner, target)) => {
+            hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
+                .context("recording the memory file for publication")
+        }
+        None => Ok(()),
+    });
     if let Err(e) = written {
         let _ = crate::storage::disk::remove_snapshot_dir(temp_snapshot_dir).await;
         return Err(e);
@@ -5779,6 +5874,54 @@ impl SnapshotBoundaryTimes {
     }
 }
 
+/// Whether a parent's `memory.bin` can be a diff's base: it exists and is the store's own
+/// file. A memory file `--memory-dir` put elsewhere (a link) is not: the diff could not share
+/// its extents, and merging onto a copy of it would need the whole memory's space on the
+/// store, more than a diff's space check asks for. The snapshot is a full one instead.
+fn parent_memory_is_a_diff_base(parent_memory: &Path) -> bool {
+    std::fs::symlink_metadata(parent_memory).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`,
+/// with the file recorded as a plain temporary: until the snapshot is published, every build's
+/// reclaim removes it.
+fn begin_memory_file_owner(target: &Path) -> Result<crate::reclaim::Owner> {
+    let id = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("a memory file has a name")?;
+    let owner = crate::reclaim::Owner::begin(id)?;
+    owner.record(crate::reclaim::Resource::Temp {
+        path: target.to_path_buf(),
+    })?;
+    Ok(owner)
+}
+
+/// Just before the snapshot whose `memory.bin` will be `link` is published: record the memory
+/// file `target` as one a reclaim keeps once that link names it, then drop its plain temporary
+/// record. A create killed after publishing, before it discards the owner, then leaves the
+/// published file in place: a build that knows `LinkedMemory` sees the link, and an older
+/// build reads the kind as unknown and leaves the file alone.
+fn hand_memory_file_to_publication(
+    owner: &crate::reclaim::Owner,
+    target: &Path,
+    link: &Path,
+) -> Result<()> {
+    owner.record(crate::reclaim::Resource::LinkedMemory {
+        path: target.to_path_buf(),
+        link: link.to_path_buf(),
+    })?;
+    let id = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("a memory file has a name")?;
+    crate::reclaim::forget(
+        id,
+        |resource| matches!(resource, crate::reclaim::Resource::Temp { path } if path == target),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
@@ -5787,6 +5930,7 @@ pub async fn create_snapshot_core(
     parent_snapshot_dir: Option<&Path>,
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
+    memory_dir: Option<&Path>,
 ) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -5803,6 +5947,16 @@ pub async fn create_snapshot_core(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
     let temp_snapshot_dir = snapshot_sibling(snapshot_dir, "creating");
+    // --memory-dir is made ready (created, and checked private and outside the snapshots)
+    // before anything else, so the free-space check below reads its filesystem.
+    let memory_dir = match memory_dir {
+        Some(dir) => Some(crate::storage::disk::prepare_memory_dir(
+            dir,
+            snapshot_dir.parent().unwrap_or(snapshot_dir),
+        )?),
+        None => None,
+    };
+    let memory_dir = memory_dir.as_deref();
 
     // Determine base memory for diff snapshot support.
     //
@@ -5816,7 +5970,7 @@ pub async fn create_snapshot_core(
     let (has_base, base_memory_source, diff_parent_name) =
         if let Some(parent_dir) = parent_snapshot_dir {
             let parent_memory = parent_dir.join("memory.bin");
-            if parent_memory.exists() {
+            if parent_memory_is_a_diff_base(&parent_memory) {
                 let parent_name = parent_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -5848,15 +6002,16 @@ pub async fn create_snapshot_core(
     // Check available disk space before attempting snapshot.
     // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
     {
+        // A memory file in --memory-dir takes its space there (a tmpfs's size limit).
+        let space_dir = memory_dir.unwrap_or(snapshot_dir);
         let required_bytes = snapshot_space_required(snapshot_config.metadata.memory_mib, has_base);
-        if let Some(available_bytes) = snapshot_space_available(snapshot_dir, required_bytes).await
-        {
+        if let Some(available_bytes) = snapshot_space_available(space_dir, required_bytes).await {
             if available_bytes < required_bytes {
                 return Err(SnapshotSpaceShortfall {
                     kind: if has_base { "diff" } else { "full" },
                     required_bytes,
                     available_bytes,
-                    path: snapshot_dir.to_path_buf(),
+                    path: space_dir.to_path_buf(),
                 }
                 .into());
             }
@@ -5891,10 +6046,19 @@ pub async fn create_snapshot_core(
         }
         _ => false,
     };
+    // A snapshot whose memory is in --memory-dir is a full one, and nothing is staged into
+    // its directory later, so an ordinary directory serves: a subvolume would only add the
+    // transaction commit a file fsynced in a new subvolume forces.
     if !staged {
-        crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
-            .await
-            .context("creating temp snapshot directory")?;
+        if memory_dir.is_some() {
+            tokio::fs::create_dir_all(&temp_snapshot_dir)
+                .await
+                .context("creating temp snapshot directory")?;
+        } else {
+            crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+                .await
+                .context("creating temp snapshot directory")?;
+        }
     }
 
     // A diff snapshot is written in place when its memory file shares the parent's extents:
@@ -5945,8 +6109,31 @@ pub async fn create_snapshot_core(
         temp_snapshot_dir.join("memory.bin")
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
+    // The reclaim record of a memory file in --memory-dir, discarded just before publication.
+    let mut memory_file_owner: Option<(crate::reclaim::Owner, PathBuf)> = None;
     if !has_base {
-        if let Err(e) = create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name) {
+        let created = match memory_dir {
+            Some(dir) => {
+                // Recorded before it exists: a create killed before it publishes leaves the
+                // file to the next launch's reclaim instead of to the memory directory forever.
+                let target = crate::storage::disk::linked_memory_target(dir);
+                begin_memory_file_owner(&target)
+                    .and_then(|owner| {
+                        crate::storage::disk::create_linked_memory_file(
+                            &target,
+                            &temp_memory_path,
+                        )?;
+                        Ok(owner)
+                    })
+                    .map(|owner| {
+                        info!(snapshot = %snapshot_config.name, memory_file = %target.display(),
+                            "writing the memory file outside the snapshot directory");
+                        memory_file_owner = Some((owner, target.clone()));
+                    })
+            }
+            None => create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name),
+        };
+        if let Err(e) = created {
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e);
         }
@@ -6176,9 +6363,14 @@ pub async fn create_snapshot_core(
     boundary.save_ms = boundary.lap(boundary_started);
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
-            .await
-            .context("copying disk during snapshot")
+        reflink_disks_to_snapshot(
+            disk_path,
+            &snapshot_config,
+            &temp_snapshot_dir,
+            memory_dir.is_some(),
+        )
+        .await
+        .context("copying disk during snapshot")
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
@@ -6401,9 +6593,20 @@ pub async fn create_snapshot_core(
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        memory_file_owner
+            .as_ref()
+            .map(|(owner, target)| (owner, target.as_path())),
     )
     .await?;
     let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
+    // The published snapshot owns its memory file now. A record that cannot be discarded is
+    // harmless: its undo spares the file the published link names.
+    if let Some((owner, _)) = memory_file_owner.take() {
+        if let Err(e) = owner.discard() {
+            warn!(snapshot = %snapshot_config.name, error = %format!("{e:#}"),
+                "the memory file's reclaim record was not discarded; reclaim will keep the file");
+        }
+    }
 
     // stage_ms: the new generation's directory and its memory file, before the pause;
     // publish_ms: the atomic replace, the old generation's removal included
@@ -6654,7 +6857,7 @@ pub async fn create_snapshot_ch(
     // (a post-resume write would desync memory/disk and corrupt the clone's filesystem).
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (CH VM paused)");
-        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
+        reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir, false)
             .await
             .context("copying disk during Cloud Hypervisor snapshot")
     } else {
@@ -6717,6 +6920,7 @@ pub async fn create_snapshot_ch(
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        None,
     )
     .await?;
 
@@ -8100,6 +8304,158 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// A Cloud Hypervisor without `map` (upstream, or a cached build of the fork from before it)
+    /// fails at argument parsing with this stderr; the restore's error then says how to get one
+    /// that has it, and any other launch failure is left as it was.
+    #[test]
+    fn a_ch_without_map_restore_names_the_fix() {
+        let bin = std::path::Path::new("/assets/cloud-hypervisor/cloud-hypervisor-old.bin");
+        let parse = anyhow::anyhow!(
+            "Cloud Hypervisor exited with exit status: 1 before its API socket became ready; last stderr output:\n  \
+             Error: Cloud Hypervisor exited with the following chain of errors:\n  \
+             0: Error parsing restore\n  1: Error parsing --restore\n  \
+             2: unable to convert map for memory_restore_mode"
+        )
+        .context("launching Cloud Hypervisor --restore");
+        let message = format!("{:#}", ch_restore_launch_error(parse, bin));
+        assert!(
+            message.starts_with("/assets/cloud-hypervisor/cloud-hypervisor-old.bin does not support memory_restore_mode=map"),
+            "{message}"
+        );
+        assert!(
+            message.contains("fcvm setup --cloud-hypervisor"),
+            "{message}"
+        );
+        assert!(
+            message.contains("unable to convert map for memory_restore_mode"),
+            "{message}"
+        );
+        let other = anyhow::anyhow!("Cloud Hypervisor exited with signal 9")
+            .context("launching Cloud Hypervisor --restore");
+        assert_eq!(
+            format!("{:#}", ch_restore_launch_error(other, bin)),
+            "launching Cloud Hypervisor --restore: Cloud Hypervisor exited with signal 9"
+        );
+    }
+
+    /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=map`),
+    /// and clones share its pages only through one inode: the clone's restore directory gets
+    /// a link to the snapshot's memory file, never a copy, while every other snapshot file is the
+    /// clone's own and config.json is left to the caller to rewrite.
+    #[tokio::test]
+    async fn a_ch_clone_links_the_snapshot_memory_file_and_copies_the_rest() {
+        use std::os::unix::fs::MetadataExt;
+        // The snapshot's other files are reflinked, which needs btrfs, so the files live on
+        // the store. The build's target directory is not on it in the container tests. As in
+        // production, the snapshot is a btrfs subvolume and the clone's directory is not, so
+        // a hard link would be refused.
+        let root = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let snapshot_root = root.path().join("snapshot");
+        crate::storage::disk::create_dir_or_subvolume(&snapshot_root)
+            .await
+            .unwrap();
+        let (snap, clone) = (snapshot_root.join("ch"), root.path().join("ch-restore"));
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(snap.join(CH_MEMORY_FILE), vec![7u8; 8192]).unwrap();
+        std::fs::write(snap.join("state.json"), b"{}").unwrap();
+        std::fs::write(snap.join("config.json"), b"{}").unwrap();
+
+        prepare_ch_restore_files(&snap, &clone).await.unwrap();
+
+        let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(
+            ino(&clone.join(CH_MEMORY_FILE)),
+            ino(&snap.join(CH_MEMORY_FILE)),
+            "the clone's memory file is not the snapshot's inode"
+        );
+        assert_ne!(
+            ino(&clone.join("state.json")),
+            ino(&snap.join("state.json"))
+        );
+        assert_eq!(std::fs::read(clone.join("state.json")).unwrap(), b"{}");
+        assert!(!clone.join("config.json").exists());
+    }
+
+    /// Every Cloud Hypervisor restore maps the memory file; `copy` read the whole guest
+    /// into each clone before it ran (8.7 s to the first desktop frame for eight Windows
+    /// clones at once, against 3.0 s mapped).
+    #[test]
+    fn a_ch_restore_maps_the_memory_file() {
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn restore_from_snapshot_ch(",
+        );
+        assert!(
+            body.contains("memory_restore_mode=map,"),
+            "restore_from_snapshot_ch does not restore with map"
+        );
+        assert!(
+            !body.contains("memory_restore_mode=copy"),
+            "restore_from_snapshot_ch still copies"
+        );
+        assert!(body.contains("prepare_ch_restore_files(&ch_dir, &clone_ch_dir)"));
+    }
+
+    /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made
+    /// ready before the free-space check, so a new nested directory is checked too; the memory
+    /// file is recorded for reclaim as a plain temporary before it is created, the record turns
+    /// into one that spares the published file just before publication, and the owner is
+    /// discarded after it. A create killed at any point leaves nothing for good and never has a
+    /// published file removed, by this build's reclaim or an older one's. No fake VMM drives this function, so the
+    /// order is pinned by its source.
+    #[test]
+    fn a_memory_dir_create_checks_records_and_hands_over_its_file_in_order() {
+        let source = include_str!("common.rs");
+        let core = body_of(source, "pub async fn create_snapshot_core(");
+        assert_in_order(
+            "create_snapshot_core",
+            core,
+            &[
+                "crate::storage::disk::prepare_memory_dir(",
+                "snapshot_space_available(space_dir",
+                "begin_memory_file_owner(&target",
+                "create_linked_memory_file(",
+                "publish_snapshot_dir(",
+                "owner.discard()",
+            ],
+        );
+        assert_in_order(
+            "begin_memory_file_owner",
+            body_of(source, "fn begin_memory_file_owner("),
+            &["Owner::begin(id)", "Resource::Temp {"],
+        );
+        assert_in_order(
+            "publish_snapshot_dir",
+            body_of(source, "async fn publish_snapshot_dir("),
+            &[
+                "extra_files()",
+                "\"config.json\"",
+                "hand_memory_file_to_publication(",
+                "atomic_replace_dir(",
+            ],
+        );
+        assert_in_order(
+            "hand_memory_file_to_publication",
+            body_of(source, "fn hand_memory_file_to_publication("),
+            &["Resource::LinkedMemory {", "crate::reclaim::forget("],
+        );
+    }
+
+    /// A parent whose memory file --memory-dir put elsewhere is not a diff base: the next
+    /// snapshot is a full one, whose space check asks for the whole memory.
+    #[test]
+    fn a_linked_parent_memory_is_not_a_diff_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&plain, b"m").unwrap();
+        assert!(parent_memory_is_a_diff_base(&plain));
+        let linked = dir.path().join("memory.bin");
+        std::os::unix::fs::symlink(&plain, &linked).unwrap();
+        assert!(!parent_memory_is_a_diff_base(&linked));
+        assert!(!parent_memory_is_a_diff_base(&dir.path().join("missing")));
     }
 
     /// A function's source, from its signature to the first closing brace in

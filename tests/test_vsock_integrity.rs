@@ -26,8 +26,13 @@ use anyhow::{Context, Result};
 /// 2. Starts L1 VM which runs the built-in test script
 /// 3. L1 starts echo server, then L2 with vsock client
 /// 4. Verifies no corruption in the vsock data path
+///
+/// The sweep is 64 threads x 10 iterations x 7 sizes, 4480 transfers and about
+/// 2540 MB. It took 592 s and 680 s on a 64-core Graviton3 box and timed out at
+/// 840 s on the CI runners in 2026-06 (#664). On a c8g.metal-48xl with the 6.18.60
+/// host and guest kernels the whole test took 23 to 82 s in nine runs, so it runs
+/// in CI again (Makefile CI_ROOT_BASE).
 #[tokio::test]
-#[ignore = "exceeds small CI runner capacity (840s+; passes on dev hardware in ~10min) — re-enable via #664"]
 async fn test_vsock_integrity_nested() -> Result<()> {
     println!("\nVsock Integrity Test (NV2 Nested)");
     println!("==================================\n");

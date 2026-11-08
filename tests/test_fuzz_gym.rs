@@ -372,6 +372,14 @@ fn the_cross_product_skips_only_what_cannot_run() {
     .enumerate()
     {
         for value in 0..len {
+            // Cloud Hypervisor runs on arm64 only, so off arm64 its restore is in no
+            // scenario that runs, and skip_reason says why.
+            if dim == 1
+                && RESTORES[value] == Restore::CloudHypervisor
+                && !cfg!(target_arch = "aarch64")
+            {
+                continue;
+            }
             assert!(
                 all.iter().any(|s| coordinates(s)[dim] == value),
                 "dimension {dim} value {value} is in no scenario that runs"
@@ -581,6 +589,71 @@ async fn gymhold_binary() -> Result<PathBuf> {
         .cloned()
 }
 
+/// A notify hold's check names must never repeat: a clone restored from a snapshot runs
+/// the same check numbers again, and a name a killed later generation left on the shared
+/// host directory makes the create find the file and raise no IN_CREATE. Here the files
+/// the first checks would name already exist, as such a generation leaves them.
+#[tokio::test]
+async fn a_notify_check_raises_its_event_where_an_earlier_generation_left_a_file() {
+    let gymhold = gymhold_binary().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let watched = dir.path().join("notify");
+    std::fs::create_dir(&watched).unwrap();
+    let log = dir.path().join("hold.log");
+    // The shell's pid is the hold's after exec, so the leftovers carry its names.
+    let script = format!(
+        "set -e; for n in 0 1 2 3 4 5; do touch {w}/created-$$-$n; done; exec {g} {l} notify {w}",
+        w = watched.display(),
+        g = gymhold.display(),
+        l = log.display()
+    );
+    let mut hold = tokio::process::Command::new("sh")
+        .args(["-c", &script])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.lines().count() >= 4 || Instant::now() > deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let _ = hold.kill().await;
+    let checks: Vec<&str> = text.lines().take(4).collect();
+    assert_eq!(checks.len(), 4, "the hold logged {text:?}");
+    assert!(
+        checks.iter().all(|line| line.ends_with(" ok")),
+        "a check missed its IN_CREATE: {checks:?}"
+    );
+}
+
+/// A snapshot can catch a notify check between drawing its random name and creating
+/// the file, so the clone restored from it draws the same name. Only an exclusive
+/// create, drawn again when the name exists, keeps every check's IN_CREATE.
+#[test]
+fn a_notify_check_creates_its_file_exclusively_and_draws_again_when_it_exists() {
+    let source = include_str!("gym/gymhold.c");
+    // The first notify branch sets the watch up; the last one runs each check.
+    let start = source
+        .rfind("!strcmp(kind, \"notify\")")
+        .expect("gymhold.c has a notify hold");
+    let branch = &source[start..];
+    let branch = &branch[..branch.find("} else if").unwrap_or(branch.len())];
+    let create = branch
+        .find("O_CREAT | O_EXCL")
+        .expect("the notify create is exclusive");
+    assert!(
+        branch[create..].contains("errno != EEXIST"),
+        "the notify hold draws a new name when the exclusive create finds one"
+    );
+    assert!(
+        branch[..create].contains("getrandom"),
+        "the notify name is drawn inside the retry"
+    );
+}
+
 /// Lay out the files every hold uses under `dir`.
 async fn populate(dir: &Path, gymhold: &Path) -> Result<()> {
     for sub in ["dir", "bin", "notify"] {
@@ -635,6 +708,32 @@ async fn ext4_image(dir: &Path, image: &Path) -> Result<()> {
 
 /// Every fcvm process the scenario started, and the helpers under each, so teardown
 /// can be checked.
+/// Stop the fcvm `pid` the way a user does, with SIGTERM, and give its teardown the
+/// time it takes. common::kill_process sends SIGKILL after 5 s, and a bridged VM's
+/// teardown on an x86_64 CI runner took longer: the SIGKILL cut it short and left its
+/// state file, which the teardown oracle then reported. SIGKILL only after 60 s.
+async fn stop(pid: u32) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // Exited means gone, or a zombie waiting for its parent (this test) to reap it.
+    let exited = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
+            })
+            .unwrap_or(true)
+    };
+    while Instant::now() < deadline {
+        if exited() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
 #[derive(Default)]
 struct Started {
     pids: Vec<u32>,
@@ -693,13 +792,13 @@ impl Started {
     }
 
     async fn kill(&mut self, pid: u32) {
-        common::kill_process(pid).await;
+        stop(pid).await;
         self.pids.retain(|p| *p != pid);
     }
 
     async fn kill_all(&mut self) {
         for pid in self.pids.drain(..).rev() {
-            common::kill_process(pid).await;
+            stop(pid).await;
         }
         for mut child in self.children.drain(..) {
             let _ = child.wait().await;
