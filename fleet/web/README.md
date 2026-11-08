@@ -65,7 +65,8 @@ default. On a machine with the port registry, claim a block first
 FLEET_WEB_PORT=<block+0>
 FLEET_MOCK_COORD_PORT=<block+1>
 FLEET_MOCK_RENDER_PORT=<block+2>
-FLEET_TEST_BASE_PORT=<block+10>      # tests use it and the next two
+FLEET_MOCK_MINECRAFT_PORT=<block+3>  # the mock Minecraft servers' view sockets, with FLEET_MOCK_MINECRAFT
+FLEET_TEST_BASE_PORT=<block+10>      # tests use it and the next three
 FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 ```
 
@@ -77,6 +78,7 @@ pnpm lint && pnpm typecheck && pnpm test     # 141 unit tests (vitest)
 pnpm build && pnpm test:e2e                  # the wall's browser tests, then phones mode's and potato mode's (Playwright)
 pnpm build && pnpm exec playwright test -c playwright.phones.config.ts   # phones mode only, against a mock with four phones
 pnpm build && pnpm exec playwright test -c playwright.windows.config.ts  # windows mode only, against a mock with four sandboxes, on a desktop and a phone screen
+pnpm build && pnpm exec playwright test -c playwright.minecraft.config.ts  # minecraft mode only, against a mock with four servers, on a desktop and a phone screen
 pnpm build && pnpm exec playwright test -c playwright.potato.config.ts   # potato mode only, against a mock host with eight players
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
@@ -125,6 +127,22 @@ There is no free input: nothing typed or pointed at reaches Windows. The mock ha
 `FLEET_MOCK_WINDOWS_RESTORE_MS` (a reset's time to the first desktop frame, 3000) and
 `FLEET_MOCK_WINDOWS_IMAGE_AGE_DAYS` (12; from 150 it warns, from 170 it is refused) are listed at
 the top of `mock/main.ts`.
+
+`/?mode=minecraft` shows the Minecraft servers (PROTOCOL.md, "Minecraft mode"; design in
+docs/fleet/minecraft.md). Each tile opens its own WebSocket to the server's view socket, sends
+the page's direct token first, and draws the world from above on a canvas: one flat colour per
+material (`MATERIAL_COLORS` in core/minecraft.ts, no asset of the game), lighter the higher a
+column stands, with each player as a marker, a facing tick and its name. A tile is labelled with
+its slot, the ticks per second its server reports, "Up in X.XX s" (click to first chunk) and, for
+a copy, "Forked from mc-N in X.XX s", with Reset, Fork and Take over. The header gives the
+servers up, the server's name and version, the median and slowest restore, the last fork with
+its snapshot and restore times, the last reset all, and the address Java Edition players join.
+Take over borrows one (`claim_minecraft`); W A S D, the arrow keys or a drag, space, shift, E and
+Q then drive its first bot over the tile's socket (on-screen buttons on a touch screen), and the
+panel shows the time from a key to the first change it made. Escape or Give back returns it. The
+mock has none unless `FLEET_MOCK_MINECRAFT=<n>` is set, with `FLEET_MOCK_MINECRAFT_PORT` for the
+view sockets (`<block+3>` in `.env.ports`); the other `FLEET_MOCK_MINECRAFT_*` knobs are listed
+at the top of `mock/main.ts`.
 
 `/?mode=potato` shows the hot potato game (PROTOCOL.md, "Potato mode"): a ring of CPU-only
 player VMs, each drawn in its colour, bright while awake, dim while asleep and with a bar while it

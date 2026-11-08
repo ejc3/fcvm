@@ -1,14 +1,15 @@
 import { existsSync } from "node:fs";
 import { defineConfig, devices } from "@playwright/test";
 
-// Ports: FLEET_TEST_BASE_PORT (from the environment or .env.ports) and the two
-// after it. No framework default port is ever used.
+// Ports: FLEET_TEST_BASE_PORT (from the environment or .env.ports) and the three
+// after it (the third only for the Minecraft suite's view sockets). No framework default
+// port is ever used.
 if (existsSync(".env.ports")) process.loadEnvFile(".env.ports");
 const base = Number(process.env.FLEET_TEST_BASE_PORT);
 if (!Number.isInteger(base) || base <= 0) {
   throw new Error("FLEET_TEST_BASE_PORT is not set. Put it in fleet/web/.env.ports (see README.md).");
 }
-export const PORTS = { web: base, coord: base + 1, render: base + 2 };
+export const PORTS = { web: base, coord: base + 1, render: base + 2, minecraft: base + 3 };
 // A smaller screen and frame rate let a small CI runner draw the whole mock fleet. The
 // image fills the viewport, and the mock draws every pixel of it in JavaScript and encodes
 // each stream with its own ffmpeg: 1024x640 asks it for a 1024x576 image, half the pixels
@@ -64,7 +65,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: /(screenshots|phones|potato|windows|windows8|mirror)\.spec\.ts/,
+      testIgnore: /(screenshots|phones|potato|windows|windows8|minecraft|mirror)\.spec\.ts/,
       use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
     // WebKit (Playwright's Linux build, not Apple's Safari) runs the tests tagged
@@ -72,7 +73,7 @@ export default defineConfig({
     {
       name: "webkit",
       grep: /@engines/,
-      testIgnore: /(screenshots|phones|potato|windows|windows8|mirror)\.spec\.ts/,
+      testIgnore: /(screenshots|phones|potato|windows|windows8|minecraft|mirror)\.spec\.ts/,
       dependencies: ["chromium"],
       use: {
         ...devices["Desktop Safari"],
