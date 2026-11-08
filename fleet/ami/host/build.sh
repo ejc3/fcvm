@@ -139,6 +139,27 @@ build)
   # build's checkout, whose untracked files can block the checkout or be built: force the
   # checkout over them and remove untracked files (ignored ones, the cargo target, stay).
   as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
+  # The Windows sandboxes' image and bridge depend on nothing else this phase builds, and
+  # together take about half an hour (the evaluation media's download and an 18-minute
+  # install, FreeRDP built from source): they run beside the rest of the phase, which waits
+  # for them where it installs them. fe5ccbfc's build, with them in line, sealed the host
+  # image 3 h 15 min into the factory's fixed 4 h.
+  # A build from a base image inherits its store, an installation included, and build-image.sh
+  # reuses an installation of the same recipe. One more than 30 days old is installed again, so
+  # every published host image has at least 140 days before the agent refuses its sandboxes
+  # (pipeline_guest.py windows_image_publishable checks the same before publishing).
+  for d in /mnt/fcvm-btrfs/windows/image-*; do
+    [ -d "$d" ] || continue
+    at=$(jq -r '.installed_at // empty' "$d/manifest.json" 2>/dev/null || true)
+    if [ -z "$at" ] || [ $(( $(date -u +%s) - $(date -u -d "$at" +%s) )) -gt $(( 30 * 86400 )) ]; then
+      echo "removing the Windows installation $d (installed ${at:-at an unknown time})"
+      rm -rf "$d"
+    fi
+  done
+  bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows > "$S/windows-image.path" 2> "$L/windows-image.log" &
+  WIN_PID=$!
+  as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet" > "$L/windows-bridge.log" 2>&1 &
+  BRIDGE_PID=$!
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
@@ -195,21 +216,12 @@ build)
   # carries a new installation and its 180-day evaluation starts at this build; it is built as
   # root, the user the agent runs fcvm as, and its files are root's alone (mode 0600).
   as_user "cd $SRC && make setup-cloud-hypervisor"
-  # A build from a base image inherits its store, an installation included, and build-image.sh
-  # reuses an installation of the same recipe. One more than 30 days old is installed again, so
-  # every published host image has at least 140 days before the agent refuses its sandboxes
-  # (pipeline_guest.py windows_image_publishable checks the same before publishing).
-  for d in /mnt/fcvm-btrfs/windows/image-*; do
-    [ -d "$d" ] || continue
-    at=$(jq -r '.installed_at // empty' "$d/manifest.json" 2>/dev/null || true)
-    if [ -z "$at" ] || [ $(( $(date -u +%s) - $(date -u -d "$at" +%s) )) -gt $(( 30 * 86400 )) ]; then
-      echo "removing the Windows installation $d (installed ${at:-at an unknown time})"
-      rm -rf "$d"
-    fi
-  done
-  WIN_IMAGE=$(bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows)
+  # The Windows image and the bridge started after the checkout; both must have finished.
+  wait "$WIN_PID" || { tail -n 40 "$L/windows-image.log"; echo "the Windows image build failed"; exit 1; }
+  WIN_IMAGE=$(cat "$S/windows-image.path")
+  [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory: $WIN_IMAGE"; exit 1; }
+  wait "$BRIDGE_PID" || { tail -n 40 "$L/windows-bridge.log"; echo "the bridge image build failed"; exit 1; }
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
-  as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"
   as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar
   rm -f /mnt/fcvm-btrfs/windows-bridge.oci.tar

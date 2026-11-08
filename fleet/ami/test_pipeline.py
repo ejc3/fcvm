@@ -493,6 +493,30 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any('case "$(uname -r)" in' in line for line in guard), guard)
         self.assertIn("*-fcvm-*)", build.split("make build")[0])
 
+    def test_the_windows_image_and_bridge_build_beside_the_rest_of_the_host_build(self):
+        # fe5ccbfc's host build took 1 h 45 min, the Windows install 1066 s of it after the
+        # media download, and the host image was sealed 3 h 15 min into the factory's fixed
+        # 4 h, leaving the tile and the validation 45 min. The Windows image and the bridge
+        # depend on nothing else the phase builds, so they start right after the checkout and
+        # the phase waits for them only where it installs them.
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        checkout = build.index("git checkout -q -f --detach $FCVM_COMMIT")
+        image = build.index('build-image.sh" /mnt/fcvm-btrfs/windows')
+        bridge = build.index("make -C fleet/windows bridge-image TAG=fleet")
+        first_build = build.index('as_user "cd $SRC && make build"')
+        self.assertLess(checkout, image)
+        self.assertLess(image, first_build, "the Windows image starts before fcvm's own build")
+        self.assertLess(bridge, first_build, "the bridge image starts before fcvm's own build")
+        for start in (image, bridge):
+            line = build[start:build.index("\n", start)]
+            self.assertTrue(line.rstrip().endswith("&"), line)
+        env = build.index("/etc/fcvm-fleet/windows.env")
+        for job in ('wait "$WIN_PID"', 'wait "$BRIDGE_PID"'):
+            self.assertIn(job, build)
+            self.assertLess(build.index(job), env)
+        self.assertLess(build.index("rm -rf \"$d\""), image, "an aging installation is removed before the build reuses it")
+
     def test_host_prep_runs_on_fcvms_host_kernel_too(self):
         # Revising a host image that already boots fcvm's host kernel runs prep on it, and that
         # kernel has neither Ubuntu's apparmor_restrict_unprivileged_userns nor Debian's
