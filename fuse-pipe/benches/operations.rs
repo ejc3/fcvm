@@ -113,15 +113,25 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     // longer than that (a loaded CI host) expires the cache and the plain stat
     // reports the new mode — a scheduling artifact, not the property under
     // test — so that half retries. The forced half stays a hard assertion.
+    //
+    // A chmod moves the host file's ctime and nothing else, which the client
+    // takes as a possible rewrite that kept the size and mtime
+    // (fuse-pipe/src/client/host_change.rs): the refresh that first reports the
+    // new ctime sends FUSE_NOTIFY_INVAL_INODE ahead of its reply, and the kernel
+    // does not cache the attributes of a reply that an invalidation overtook. So
+    // the cache is primed by the second forced statx, whose reply carries the
+    // ctime the client already recorded.
     let mut cache_held = false;
     for _ in 0..5 {
         fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
-        assert_eq!(
-            forced_statx_mode(fd) as u32,
-            before,
-            "the mount does not agree with the backing file even before anything is changed \
-             behind its back, so neither half of this check would mean anything"
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                forced_statx_mode(fd) as u32,
+                before,
+                "the mount does not agree with the backing file even before anything is \
+                 changed behind its back, so neither half of this check would mean anything"
+            );
+        }
 
         fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
 
