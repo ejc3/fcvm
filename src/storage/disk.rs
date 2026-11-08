@@ -114,6 +114,23 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         meta.uid(),
         meta.mode() & 0o7777
     );
+    // Every directory above it must keep others from renaming it away: owned by root or by
+    // this user, and closed to group and other writes unless sticky (as /tmp and /dev/shm are).
+    for ancestor in dir.ancestors().skip(1) {
+        let meta = std::fs::metadata(ancestor)
+            .with_context(|| format!("reading {}", ancestor.display()))?;
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let others_kept_out = meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0;
+        anyhow::ensure!(
+            owner_ok && others_kept_out,
+            "--memory-dir {}: {} lets another user replace it (uid {}, mode {:o}); use a \
+             directory whose every parent is root's or yours and closed to others or sticky",
+            dir.display(),
+            ancestor.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+    }
     let root =
         std::fs::canonicalize(snapshots_root).unwrap_or_else(|_| snapshots_root.to_path_buf());
     anyhow::ensure!(
@@ -1352,13 +1369,22 @@ mod snapshot_dir_tests {
         clear_staging(&staging).await.unwrap();
     }
 
+    /// A temporary directory only this user can write, whatever the umask: `--memory-dir`
+    /// refuses one under a parent its group could write.
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     /// `snapshot create --memory-dir` leaves the memory file outside the snapshot directory,
     /// behind a `memory.bin` link. Removing the directory through fcvm (a replaced
     /// generation, a failed create) must remove that file, or every sleep leaks the guest's
     /// memory size in the memory directory.
     #[tokio::test]
     async fn removing_a_snapshot_removes_its_linked_memory_file() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let memory_dir = root.path().join("shm");
         let snapshot = root.path().join("snap");
         std::fs::create_dir_all(&snapshot).unwrap();
@@ -1382,7 +1408,7 @@ mod snapshot_dir_tests {
     /// is removed as the link alone: the snapshot it names keeps its memory file.
     #[tokio::test]
     async fn removing_an_alias_of_a_snapshot_keeps_the_snapshots_memory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let live = root.path().join("live");
         std::fs::create_dir_all(&live).unwrap();
         let memory_dir =
@@ -1400,7 +1426,7 @@ mod snapshot_dir_tests {
     /// only reference to the file stays.
     #[test]
     fn a_linked_memory_file_that_cannot_be_removed_keeps_its_link() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let snapshot = root.path().join("snap");
         std::fs::create_dir_all(&snapshot).unwrap();
         let memory_dir =
@@ -1419,9 +1445,10 @@ mod snapshot_dir_tests {
     #[test]
     fn a_memory_directory_must_be_private_and_outside_the_snapshots() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let snapshots = root.path().join("snapshots");
         std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(0o700)).unwrap();
         let fresh = prepare_memory_dir(&root.path().join("a/b"), &snapshots).unwrap();
         assert_eq!(
             std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
@@ -1434,6 +1461,16 @@ mod snapshot_dir_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("group and others cannot write"), "{error}");
+        // a parent others can write, not sticky, lets them rename the directory away
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = prepare_memory_dir(&shared.join("mem"), &snapshots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lets another user replace it"), "{error}");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        prepare_memory_dir(&shared.join("mem"), &snapshots).expect("a sticky parent is safe");
         let inside = prepare_memory_dir(&snapshots.join("tag/memory"), &snapshots)
             .unwrap_err()
             .to_string();
@@ -1444,7 +1481,7 @@ mod snapshot_dir_tests {
     /// with that reason; one whose memory file is present, linked or not, is not.
     #[test]
     fn a_restore_of_a_snapshot_whose_memory_is_gone_is_refused() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let snapshot = root.path().join("snap");
         std::fs::create_dir_all(&snapshot).unwrap();
         let link = snapshot.join("memory.bin");

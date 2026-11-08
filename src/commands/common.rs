@@ -5310,6 +5310,7 @@ async fn publish_snapshot_dir(
     snapshot_dir: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     extra_files: SnapshotExtraFiles<'_>,
+    memory_file: Option<(&crate::reclaim::Owner, &Path)>,
 ) -> Result<()> {
     let written: Result<()> = async {
         if let Some(extra_files) = extra_files {
@@ -5327,6 +5328,22 @@ async fn publish_snapshot_dir(
             .context("writing snapshot config")
     }
     .await;
+    // A memory file in --memory-dir changes its reclaim record as the last step before the
+    // rename (`hand_memory_file_to_publication`), which keeps the window in which a killed
+    // create leaves an older build's reclaim a record it cannot read as short as it can be.
+    // A `<tag>.old` an earlier crash left, which the rename would remove first, goes before
+    // the handover, so nothing slow remains between the two.
+    if written.is_ok() && memory_file.is_some() {
+        let _ =
+            crate::storage::disk::remove_snapshot_dir(&snapshot_sibling(snapshot_dir, "old")).await;
+    }
+    let written = written.and_then(|()| match memory_file {
+        Some((owner, target)) => {
+            hand_memory_file_to_publication(owner, target, &snapshot_dir.join("memory.bin"))
+                .context("recording the memory file for publication")
+        }
+        None => Ok(()),
+    });
     if let Err(e) = written {
         let _ = crate::storage::disk::remove_snapshot_dir(temp_snapshot_dir).await;
         return Err(e);
@@ -5866,7 +5883,8 @@ fn parent_memory_is_a_diff_base(parent_memory: &Path) -> bool {
 }
 
 /// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`,
-/// with the file recorded, so a create killed before publication leaves it to be removed.
+/// with the file recorded as a plain temporary: until the snapshot is published, every build's
+/// reclaim removes it.
 fn begin_memory_file_owner(target: &Path) -> Result<crate::reclaim::Owner> {
     let id = target
         .file_stem()
@@ -5877,6 +5895,30 @@ fn begin_memory_file_owner(target: &Path) -> Result<crate::reclaim::Owner> {
         path: target.to_path_buf(),
     })?;
     Ok(owner)
+}
+
+/// Just before the snapshot whose `memory.bin` will be `link` is published: record the memory
+/// file `target` as one a reclaim keeps once that link names it, then drop its plain temporary
+/// record. A create killed after publishing, before it discards the owner, then leaves the
+/// published file in place: a build that knows `LinkedMemory` sees the link, and an older
+/// build reads the kind as unknown and leaves the file alone.
+fn hand_memory_file_to_publication(
+    owner: &crate::reclaim::Owner,
+    target: &Path,
+    link: &Path,
+) -> Result<()> {
+    owner.record(crate::reclaim::Resource::LinkedMemory {
+        path: target.to_path_buf(),
+        link: link.to_path_buf(),
+    })?;
+    let id = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("a memory file has a name")?;
+    crate::reclaim::forget(
+        id,
+        |resource| matches!(resource, crate::reclaim::Resource::Temp { path } if path == target),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6068,7 +6110,7 @@ pub async fn create_snapshot_core(
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
     // The reclaim record of a memory file in --memory-dir, discarded just before publication.
-    let mut memory_file_owner: Option<crate::reclaim::Owner> = None;
+    let mut memory_file_owner: Option<(crate::reclaim::Owner, PathBuf)> = None;
     if !has_base {
         let created = match memory_dir {
             Some(dir) => {
@@ -6086,7 +6128,7 @@ pub async fn create_snapshot_core(
                     .map(|owner| {
                         info!(snapshot = %snapshot_config.name, memory_file = %target.display(),
                             "writing the memory file outside the snapshot directory");
-                        memory_file_owner = Some(owner);
+                        memory_file_owner = Some((owner, target.clone()));
                     })
             }
             None => create_memory_file_nodatacow(&temp_memory_path, &snapshot_config.name),
@@ -6545,25 +6587,26 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
-    // The published snapshot owns its memory file from here on, so its reclaim record goes
-    // first: a create killed between the two leaves the file behind its staging directory,
-    // which the next create of this tag clears, rather than a live snapshot's file recorded
-    // for removal.
-    if let Some(owner) = memory_file_owner.take() {
-        if let Err(e) = owner.discard() {
-            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
-            return Err(e.context("discarding the memory file's reclaim record"));
-        }
-    }
     let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        memory_file_owner
+            .as_ref()
+            .map(|(owner, target)| (owner, target.as_path())),
     )
     .await?;
     let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
+    // The published snapshot owns its memory file now. A record that cannot be discarded is
+    // harmless: its undo spares the file the published link names.
+    if let Some((owner, _)) = memory_file_owner.take() {
+        if let Err(e) = owner.discard() {
+            warn!(snapshot = %snapshot_config.name, error = %format!("{e:#}"),
+                "the memory file's reclaim record was not discarded; reclaim will keep the file");
+        }
+    }
 
     // stage_ms: the new generation's directory and its memory file, before the pause;
     // publish_ms: the atomic replace, the old generation's removal included
@@ -6860,6 +6903,7 @@ pub async fn create_snapshot_ch(
         snapshot_dir,
         &snapshot_config,
         extra_files,
+        None,
     )
     .await?;
 
@@ -8340,9 +8384,10 @@ mod tests {
 
     /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made
     /// ready before the free-space check, so a new nested directory is checked too; the memory
-    /// file is recorded for reclaim before it is created, so a create killed before it
-    /// publishes leaves nothing for good; and the record is discarded before publication, so no
-    /// reclaim removes a published snapshot's memory. No fake VMM drives this function, so the
+    /// file is recorded for reclaim as a plain temporary before it is created, the record turns
+    /// into one that spares the published file just before publication, and the owner is
+    /// discarded after it. A create killed at any point leaves nothing for good and never has a
+    /// published file removed, by this build's reclaim or an older one's. No fake VMM drives this function, so the
     /// order is pinned by its source.
     #[test]
     fn a_memory_dir_create_checks_records_and_hands_over_its_file_in_order() {
@@ -8354,16 +8399,31 @@ mod tests {
             &[
                 "crate::storage::disk::prepare_memory_dir(",
                 "snapshot_space_available(space_dir",
-                "begin_memory_file_owner(&target)",
+                "begin_memory_file_owner(&target",
                 "create_linked_memory_file(",
-                "owner.discard()",
                 "publish_snapshot_dir(",
+                "owner.discard()",
             ],
         );
         assert_in_order(
             "begin_memory_file_owner",
             body_of(source, "fn begin_memory_file_owner("),
             &["Owner::begin(id)", "Resource::Temp {"],
+        );
+        assert_in_order(
+            "publish_snapshot_dir",
+            body_of(source, "async fn publish_snapshot_dir("),
+            &[
+                "extra_files()",
+                "\"config.json\"",
+                "hand_memory_file_to_publication(",
+                "atomic_replace_dir(",
+            ],
+        );
+        assert_in_order(
+            "hand_memory_file_to_publication",
+            body_of(source, "fn hand_memory_file_to_publication("),
+            &["Resource::LinkedMemory {", "crate::reclaim::forget("],
         );
     }
 

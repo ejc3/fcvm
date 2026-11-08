@@ -62,6 +62,11 @@ async fn test_snapshot_memory_dir_sleeps_and_wakes() -> Result<()> {
         .prefix("fcvm-memdir-test-")
         .tempdir_in("/dev/shm")
         .context("making a memory directory in /dev/shm")?;
+    // --memory-dir refuses a directory group or others could write, whatever the umask
+    std::fs::set_permissions(
+        memory_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
 
     let (_base_child, base_pid) = common::spawn_fcvm_with_logs(
         &["podman", "run", "--name", &base, common::TEST_IMAGE],
