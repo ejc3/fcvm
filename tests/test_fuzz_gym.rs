@@ -372,6 +372,14 @@ fn the_cross_product_skips_only_what_cannot_run() {
     .enumerate()
     {
         for value in 0..len {
+            // Cloud Hypervisor runs on arm64 only, so off arm64 its restore is in no
+            // scenario that runs, and skip_reason says why.
+            if dim == 1
+                && RESTORES[value] == Restore::CloudHypervisor
+                && !cfg!(target_arch = "aarch64")
+            {
+                continue;
+            }
             assert!(
                 all.iter().any(|s| coordinates(s)[dim] == value),
                 "dimension {dim} value {value} is in no scenario that runs"
@@ -635,6 +643,32 @@ async fn ext4_image(dir: &Path, image: &Path) -> Result<()> {
 
 /// Every fcvm process the scenario started, and the helpers under each, so teardown
 /// can be checked.
+/// Stop the fcvm `pid` the way a user does, with SIGTERM, and give its teardown the
+/// time it takes. common::kill_process sends SIGKILL after 5 s, and a bridged VM's
+/// teardown on an x86_64 CI runner took longer: the SIGKILL cut it short and left its
+/// state file, which the teardown oracle then reported. SIGKILL only after 60 s.
+async fn stop(pid: u32) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // Exited means gone, or a zombie waiting for its parent (this test) to reap it.
+    let exited = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
+            })
+            .unwrap_or(true)
+    };
+    while Instant::now() < deadline {
+        if exited() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
 #[derive(Default)]
 struct Started {
     pids: Vec<u32>,
@@ -693,13 +727,13 @@ impl Started {
     }
 
     async fn kill(&mut self, pid: u32) {
-        common::kill_process(pid).await;
+        stop(pid).await;
         self.pids.retain(|p| *p != pid);
     }
 
     async fn kill_all(&mut self) {
         for pid in self.pids.drain(..).rev() {
-            common::kill_process(pid).await;
+            stop(pid).await;
         }
         for mut child in self.children.drain(..) {
             let _ = child.wait().await;
