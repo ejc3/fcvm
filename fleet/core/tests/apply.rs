@@ -1549,3 +1549,71 @@ fn a_coordinator_restart_resets_a_lent_server_and_keeps_the_cooldown() {
         .fold(s, apply);
     assert!(s.fleet.minecraft_to_reset.is_empty());
 }
+
+/// A fork's target that reports running without a snapshot time ran the gold snapshot, not a
+/// copy (its source was not running on the host); and a copy that later fails is relaunched
+/// from gold. Neither is shown as a copy, and only a real copy is the last fork.
+#[test]
+fn only_a_launch_that_copied_its_source_is_shown_as_a_fork() {
+    let host = serde_json::json!({"type": "agent", "at": 1000, "host": "h1", "msg": {"type": "hello",
+        "host": "h1", "arch": "aarch64", "gpus": [], "capacity": 0, "minecraft": 2}});
+    let report = |at: u64, id: &str, phase: &str, generation: u64, timings: serde_json::Value| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": id, "phase": phase, "generation": generation, "timings": timings,
+            "first_chunk_at": at - 50}})
+    };
+    let fork = |at: u64, id: &str| {
+        serde_json::json!({"type": "intent", "at": at, "viewer": "v1", "client": "198.51.100.20",
+            "id": id, "name": "minecraft_fork", "args": {"slot": "mc-1"}})
+    };
+    let cfg = config_with(serde_json::json!({}));
+    let s = events(serde_json::json!([
+        host,
+        report(2000, "mc-1", "running", 1, serde_json::json!({})),
+        report(2000, "mc-2", "running", 1, serde_json::json!({})),
+        {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+        fork(3000, "f1"),
+        report(4000, "mc-2", "running", 2, serde_json::json!({"restore_ms": 400, "first_chunk_ms": 900}))
+    ]))
+    .iter()
+    .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(s.receipts["f1"].outcome, fleet_core::Outcome::Committed);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(
+        v["minecraft"]["tiles"][1]["forked_from"].is_null(),
+        "{}",
+        v["minecraft"]
+    );
+    assert!(v["minecraft"]["last_fork"].is_null(), "{}", v["minecraft"]);
+    // A real copy, then its failure.
+    let s = events(serde_json::json!([
+        fork(14_000, "f2"),
+        report(
+            15_000,
+            "mc-2",
+            "running",
+            3,
+            serde_json::json!({"snapshot_ms": 380, "restore_ms": 400, "first_chunk_ms": 700})
+        )
+    ]))
+    .iter()
+    .fold(s, apply);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["minecraft"]["tiles"][1]["forked_from"], "mc-1");
+    assert_eq!(v["minecraft"]["last_fork"]["snapshot_ms"], 380);
+    let s = events(serde_json::json!([report(
+        16_000,
+        "mc-2",
+        "failed",
+        3,
+        serde_json::json!({})
+    )]))
+    .iter()
+    .fold(s, apply);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(
+        v["minecraft"]["tiles"][1]["forked_from"].is_null(),
+        "{}",
+        v["minecraft"]["tiles"][1]
+    );
+}

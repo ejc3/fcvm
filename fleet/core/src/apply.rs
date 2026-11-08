@@ -2793,6 +2793,10 @@ fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64)
     let Some(m) = slot.minecraft.as_mut() else {
         return;
     };
+    // A copy that failed is gone: the agent relaunches the server from the gold snapshot.
+    if r.phase == "failed" && r.generation >= generation {
+        m.forked_from = None;
+    }
     let Some(k) = m.fork.clone() else {
         return;
     };
@@ -2804,6 +2808,12 @@ fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64)
         return;
     }
     m.fork = None;
+    // A launch whose report has no snapshot time is no copy: the agent restored the gold
+    // snapshot instead (its source was not running there, or the copy failed).
+    if !r.timings.contains_key("snapshot_ms") {
+        m.forked_from = None;
+        return;
+    }
     let first_chunk_at = slot
         .last_relaunch
         .as_ref()
