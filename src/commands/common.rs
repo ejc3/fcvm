@@ -8286,11 +8286,11 @@ mod tests {
     #[tokio::test]
     async fn a_ch_clone_links_the_snapshot_memory_file_and_copies_the_rest() {
         use std::os::unix::fs::MetadataExt;
-        // The snapshot's other files are reflinked, which needs btrfs: the build's target
-        // directory is on the btrfs store wherever fcvm's tests run (the Makefile links it
-        // there). As in production, the snapshot is a btrfs subvolume and the clone's
-        // directory is not, so a hard link would be refused.
-        let root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        // The snapshot's other files are reflinked, which needs btrfs, so the files live on
+        // the store. The build's target directory is not on it in the container tests. As in
+        // production, the snapshot is a btrfs subvolume and the clone's directory is not, so
+        // a hard link would be refused.
+        let root = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
         let snapshot_root = root.path().join("snapshot");
         crate::storage::disk::create_dir_or_subvolume(&snapshot_root)
             .await
