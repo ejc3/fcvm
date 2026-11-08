@@ -2230,7 +2230,10 @@ async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
 
     common::poll_health_by_pid(pid, 180).await?;
 
-    // Write 10MB - this triggers corruption with NV2 + writeback cache
+    // Write 10 MiB of a known nonzero pattern and compare the host's copy byte for byte:
+    // the corruption this guards showed up as zeroed or stale ranges, not as a failed write.
+    const LEN: usize = 10 << 20;
+    const LINE: &[u8] = b"fcvm-nv2-guard\n";
     let output = tokio::process::Command::new(common::find_fcvm_binary()?)
         .args([
             "exec",
@@ -2239,16 +2242,28 @@ async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
             "--",
             "sh",
             "-c",
-            "dd if=/dev/zero of=/mnt/test/data bs=1M count=10 && sync && echo OK",
+            "yes fcvm-nv2-guard | head -c 10485760 > /mnt/test/data && sync && echo OK",
         ])
         .output()
         .await?;
 
+    let written = tokio::fs::read(format!("{}/data", test_dir)).await;
     common::kill_process(pid).await;
     let _ = tokio::fs::remove_dir_all(&test_dir).await;
 
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("OK"), "Write failed: {}", out);
+    let written = written?;
+    let expected: Vec<u8> = LINE.iter().copied().cycle().take(LEN).collect();
+    assert_eq!(
+        written.len(),
+        LEN,
+        "the host file holds {} bytes",
+        written.len()
+    );
+    if let Some(at) = written.iter().zip(&expected).position(|(a, b)| a != b) {
+        panic!("the host file differs from what the guest wrote at byte {at}");
+    }
     Ok(())
 }
 
