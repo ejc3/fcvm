@@ -62,6 +62,10 @@ pub enum Resource {
     /// A temporary file or directory that is renamed into place or removed when its
     /// operation finishes.
     Temp { path: PathBuf },
+    /// A memory file `snapshot create --memory-dir` wrote outside its snapshot directory.
+    /// Removed unless `link`, the published snapshot's `memory.bin`, names it: a create killed
+    /// before it published leaves the file to be removed, one killed after keeps it.
+    LinkedMemory { path: PathBuf, link: PathBuf },
     /// A named network namespace (`ip netns add`).
     Netns { name: String },
     /// A host network interface. Deleting one end of a veth pair deletes the other.
@@ -94,7 +98,10 @@ impl Resource {
     fn is_kernel_object(&self) -> bool {
         !matches!(
             self,
-            Resource::RuntimeDir { .. } | Resource::Temp { .. } | Resource::Unknown
+            Resource::RuntimeDir { .. }
+                | Resource::Temp { .. }
+                | Resource::LinkedMemory { .. }
+                | Resource::Unknown
         )
     }
 
@@ -110,6 +117,7 @@ impl std::fmt::Display for Resource {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
             Resource::Unknown => write!(f, "a resource of a kind this build does not know"),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
+            Resource::LinkedMemory { path, .. } => write!(f, "memory file {}", path.display()),
             Resource::Netns { name } => write!(f, "network namespace {name}"),
             Resource::Link { name } => write!(f, "interface {name}"),
             Resource::Rule { program, args } => write!(f, "{program} {}", args.join(" ")),
@@ -861,6 +869,7 @@ async fn undo(resource: &Resource) -> Undo {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
         Resource::Unknown => Undo::Done,
         Resource::Temp { path } => undo_temp(path).await,
+        Resource::LinkedMemory { path, link } => undo_linked_memory(path, link),
         Resource::Netns { name } => {
             undo_result(crate::network::namespace::delete_namespace(name).await)
         }
@@ -935,6 +944,19 @@ async fn remove_tree(path: &Path) -> Undo {
         Ok(Ok(())) => Undo::Done,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Ok(Err(error)) => Undo::Kept(error.to_string()),
+        Err(error) => Undo::Kept(error.to_string()),
+    }
+}
+
+/// Remove `path`, a memory file of a create that did not finish, unless the published
+/// snapshot's `link` names it.
+fn undo_linked_memory(path: &Path, link: &Path) -> Undo {
+    if std::fs::read_link(link).is_ok_and(|target| target == path) {
+        return Undo::Done;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Undo::Done,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Err(error) => Undo::Kept(error.to_string()),
     }
 }
@@ -1091,6 +1113,31 @@ pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A memory file of a create that did not finish is removed; one the published snapshot's
+    /// memory.bin names (a create killed after publishing, before it discarded its record) is
+    /// kept, and so the snapshot stays restorable.
+    #[test]
+    fn a_linked_memory_file_is_kept_only_when_the_published_link_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fcvm-memory-a.bin");
+        std::fs::write(&file, b"m").unwrap();
+        let link = dir.path().join("memory.bin");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(
+            file.exists(),
+            "the published snapshot's memory file was removed"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("fcvm-memory-b.bin"), &link).unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(!file.exists(), "an unpublished memory file was kept");
+        assert!(
+            matches!(undo_linked_memory(&file, &link), Undo::Done),
+            "a gone file is done"
+        );
+    }
     use std::io::BufRead;
 
     const CHILD_DIR: &str = "FCVM_RECLAIM_TEST_CHILD_DIR";

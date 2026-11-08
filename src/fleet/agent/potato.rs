@@ -516,14 +516,15 @@ struct SleepReservation {
 }
 
 impl SleepReservation {
-    /// The sleep ended; `published` says whether its snapshot (and so its memory file) took
-    /// the player's place, replacing and removing the one before.
-    fn finish(mut self, published: bool) {
+    /// The sleep ended. Its player is counted as holding a memory file whether or not the
+    /// create succeeded: `snapshot create` can fail after it published (recording the VM's
+    /// diff parent comes later), and a failure before publication leaves the player's earlier
+    /// file, if any, in place. Counting one that is not there only sends a later sleep to the
+    /// store; missing one that is there would let the directory outgrow its cap.
+    fn finish(mut self) {
         let mut state = self.memory.state.lock().unwrap();
         state.in_flight -= 1;
-        if published {
-            state.held.insert(self.player);
-        }
+        state.held.insert(self.player);
         self.done = true;
     }
 }
@@ -704,7 +705,7 @@ impl Ops for FcvmOps {
             let memory_dir = reservation.as_ref().map(|r| r.memory.dir.clone());
             let r = run_fcvm(&cfg.fcvm, &PotatoCfg::sleep_args(n, vm.pid, memory_dir.as_deref())).await;
             match (reservation, &sleep_memory) {
-                (Some(reservation), _) => reservation.finish(r.is_ok()),
+                (Some(reservation), _) => reservation.finish(),
                 (None, Some(memory)) if r.is_ok() => memory.left(n),
                 _ => {}
             }
@@ -1837,8 +1838,8 @@ mod tests {
             state: Default::default(),
         });
         let held = |m: &SleepMemory| m.state.lock().unwrap().held.len();
-        memory.reserve(0).unwrap().finish(true);
-        memory.reserve(1).unwrap().finish(true);
+        memory.reserve(0).unwrap().finish();
+        memory.reserve(1).unwrap().finish();
         assert_eq!(held(&memory), 2);
         // both players awake and sleeping again: one fits beside their two memories
         let a = memory.reserve(0).expect("2 held + 1 fits under 3");
@@ -1846,7 +1847,7 @@ mod tests {
             memory.reserve(1).is_none(),
             "2 held + 2 in flight is over 3"
         );
-        a.finish(true);
+        a.finish();
         assert_eq!(
             held(&memory),
             2,
@@ -1874,14 +1875,39 @@ mod tests {
             cap: 4 * mib,
             state: Default::default(),
         });
-        memory.reserve(0).unwrap().finish(true);
-        memory.reserve(1).unwrap().finish(true);
+        memory.reserve(0).unwrap().finish();
+        memory.reserve(1).unwrap().finish();
         let a = memory.reserve(0).expect("2 held + 1 in flight");
         let b = memory
             .reserve(1)
             .expect("2 held + 2 in flight fits the default cap of 4");
-        a.finish(true);
-        b.finish(true);
+        a.finish();
+        b.finish();
+    }
+
+    /// A sleep that reserved room in the memory directory leaves its player counted as holding
+    /// a file whatever the create returned: `snapshot create` can publish and then fail on the
+    /// VM's state, and a missed file would let the directory outgrow its cap. The sleep task has
+    /// no fake fcvm to drive, so its call is pinned by its source.
+    #[test]
+    fn a_failed_sleep_still_counts_its_memory() {
+        let source = include_str!("potato.rs");
+        let sleep = &source[source
+            .find("    fn sleep(&self, n: u32, vm: Option<Vm>")
+            .unwrap()..];
+        let sleep = &sleep[..sleep.find("\n    }\n").unwrap()];
+        assert!(
+            sleep.contains("(Some(reservation), _) => reservation.finish(),"),
+            "the sleep must finish its reservation whatever the create returned"
+        );
+        let memory = Arc::new(SleepMemory {
+            dir: "/nonexistent".into(),
+            each: 1,
+            cap: 2,
+            state: Default::default(),
+        });
+        memory.reserve(0).unwrap().finish();
+        assert_eq!(memory.state.lock().unwrap().held.len(), 1);
     }
 
     /// The agent starts from an empty memory directory: what an earlier agent's sleeps left,

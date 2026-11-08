@@ -114,6 +114,23 @@ pub fn prepare_memory_dir(memory_dir: &Path, snapshots_root: &Path) -> Result<Pa
         meta.uid(),
         meta.mode() & 0o7777
     );
+    // Every directory above it must keep others from renaming it away: owned by root or by
+    // this user, and closed to group and other writes unless sticky (as /tmp and /dev/shm are).
+    for ancestor in dir.ancestors().skip(1) {
+        let meta = std::fs::metadata(ancestor)
+            .with_context(|| format!("reading {}", ancestor.display()))?;
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let others_kept_out = meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0;
+        anyhow::ensure!(
+            owner_ok && others_kept_out,
+            "--memory-dir {}: {} lets another user replace it (uid {}, mode {:o}); use a \
+             directory whose every parent is root's or yours and closed to others or sticky",
+            dir.display(),
+            ancestor.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+    }
     let root =
         std::fs::canonicalize(snapshots_root).unwrap_or_else(|_| snapshots_root.to_path_buf());
     anyhow::ensure!(
@@ -1434,6 +1451,16 @@ mod snapshot_dir_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("group and others cannot write"), "{error}");
+        // a parent others can write, not sticky, lets them rename the directory away
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = prepare_memory_dir(&shared.join("mem"), &snapshots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lets another user replace it"), "{error}");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        prepare_memory_dir(&shared.join("mem"), &snapshots).expect("a sticky parent is safe");
         let inside = prepare_memory_dir(&snapshots.join("tag/memory"), &snapshots)
             .unwrap_err()
             .to_string();

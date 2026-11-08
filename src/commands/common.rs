@@ -5865,16 +5865,19 @@ fn parent_memory_is_a_diff_base(parent_memory: &Path) -> bool {
     std::fs::symlink_metadata(parent_memory).is_ok_and(|m| m.file_type().is_file())
 }
 
-/// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`,
-/// with the file recorded, so a create killed before publication leaves it to be removed.
-fn begin_memory_file_owner(target: &Path) -> Result<crate::reclaim::Owner> {
+/// Begin the reclaim owner of a memory file `--memory-dir` is about to create at `target`
+/// for the snapshot whose published `memory.bin` will be `link`. A create killed before it
+/// publishes leaves the file to be removed; one killed after, before it discards the record,
+/// leaves it in place, since the published link names it.
+fn begin_memory_file_owner(target: &Path, link: &Path) -> Result<crate::reclaim::Owner> {
     let id = target
         .file_stem()
         .and_then(|stem| stem.to_str())
         .context("a memory file has a name")?;
     let owner = crate::reclaim::Owner::begin(id)?;
-    owner.record(crate::reclaim::Resource::Temp {
+    owner.record(crate::reclaim::Resource::LinkedMemory {
         path: target.to_path_buf(),
+        link: link.to_path_buf(),
     })?;
     Ok(owner)
 }
@@ -6075,7 +6078,7 @@ pub async fn create_snapshot_core(
                 // Recorded before it exists: a create killed before it publishes leaves the
                 // file to the next launch's reclaim instead of to the memory directory forever.
                 let target = crate::storage::disk::linked_memory_target(dir);
-                begin_memory_file_owner(&target)
+                begin_memory_file_owner(&target, &snapshot_dir.join("memory.bin"))
                     .and_then(|owner| {
                         crate::storage::disk::create_linked_memory_file(
                             &target,
@@ -6545,16 +6548,6 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
-    // The published snapshot owns its memory file from here on, so its reclaim record goes
-    // first: a create killed between the two leaves the file behind its staging directory,
-    // which the next create of this tag clears, rather than a live snapshot's file recorded
-    // for removal.
-    if let Some(owner) = memory_file_owner.take() {
-        if let Err(e) = owner.discard() {
-            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
-            return Err(e.context("discarding the memory file's reclaim record"));
-        }
-    }
     let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
@@ -6564,6 +6557,14 @@ pub async fn create_snapshot_core(
     )
     .await?;
     let publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0;
+    // The published snapshot owns its memory file now. A record that cannot be discarded is
+    // harmless: its undo spares the file the published link names.
+    if let Some(owner) = memory_file_owner.take() {
+        if let Err(e) = owner.discard() {
+            warn!(snapshot = %snapshot_config.name, error = %format!("{e:#}"),
+                "the memory file's reclaim record was not discarded; reclaim will keep the file");
+        }
+    }
 
     // stage_ms: the new generation's directory and its memory file, before the pause;
     // publish_ms: the atomic replace, the old generation's removal included
@@ -8340,9 +8341,9 @@ mod tests {
 
     /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made
     /// ready before the free-space check, so a new nested directory is checked too; the memory
-    /// file is recorded for reclaim before it is created, so a create killed before it
-    /// publishes leaves nothing for good; and the record is discarded before publication, so no
-    /// reclaim removes a published snapshot's memory. No fake VMM drives this function, so the
+    /// file is recorded for reclaim before it is created and the record is discarded only after
+    /// publication, so a create killed at any point leaves nothing for good (the record's undo
+    /// spares a file the published link names, `undo_linked_memory`). No fake VMM drives this function, so the
     /// order is pinned by its source.
     #[test]
     fn a_memory_dir_create_checks_records_and_hands_over_its_file_in_order() {
@@ -8354,16 +8355,16 @@ mod tests {
             &[
                 "crate::storage::disk::prepare_memory_dir(",
                 "snapshot_space_available(space_dir",
-                "begin_memory_file_owner(&target)",
+                "begin_memory_file_owner(&target",
                 "create_linked_memory_file(",
-                "owner.discard()",
                 "publish_snapshot_dir(",
+                "owner.discard()",
             ],
         );
         assert_in_order(
             "begin_memory_file_owner",
             body_of(source, "fn begin_memory_file_owner("),
-            &["Owner::begin(id)", "Resource::Temp {"],
+            &["Owner::begin(id)", "Resource::LinkedMemory {"],
         );
     }
 
