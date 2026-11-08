@@ -271,6 +271,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   if (panel === null) driverRef.current = null;
   else if (driverRef.current?.session !== panel.session) {
     driverRef.current = { session: panel.session, id: panel.id, driver: new Driver() };
+  } else {
+    // Tile ids are places in the layout: the borrowed server keeps its session when another
+    // host's servers leave and its tile is renumbered.
+    driverRef.current.id = panel.id;
   }
   useEffect(() => {
     setSamples([]);
@@ -301,14 +305,15 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
         if (!d || d.id !== id) return;
         if (d.driver.observeStatus(players, t) !== null) setSamples([...d.driver.samples]);
       },
-      delta: (id, t) => {
+      delta: (id, t, columns) => {
         const d = driverRef.current;
         if (!d || d.id !== id) return;
-        if (d.driver.observeDelta(t) !== null) setSamples([...d.driver.samples]);
+        if (d.driver.observeDelta(t, columns) !== null) setSamples([...d.driver.samples]);
       },
       ack: (id, ack) => {
         const d = driverRef.current;
         if (!d || d.id !== id) return;
+        d.driver.observeAck(ack.ok);
         setRefused(ack.ok ? null : (ack.reason ?? "The server refused it."));
       },
     };

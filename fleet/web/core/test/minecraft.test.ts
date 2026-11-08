@@ -404,13 +404,25 @@ describe("driving", () => {
 
   it("times a place or a dig to the first delta, and gives up on a key with no change in 5 s", () => {
     const d = new Driver();
+    const near = [{ x: 1, z: 0 }];
+    d.observeStatus([{ name: "b", x: 0.5, y: 70, z: 0.5, yaw: 0, bot: true, driven: true }], 50);
     d.press("place", 100);
-    expect(d.observeDelta(160)).toBe(60);
+    expect(d.observeDelta(160, near)).toBe(60);
     d.press("dig", 1000);
-    expect(d.observeDelta(1000 + FIRST_CHANGE_GIVE_UP_MS + 1)).toBeNull();
+    expect(d.observeDelta(1000 + FIRST_CHANGE_GIVE_UP_MS + 1, near)).toBeNull();
     d.press("forward", 9000);
     d.observeStatus([{ name: "b", x: 0, y: 70, z: 0, yaw: 0, bot: true, driven: true }], 9000 + FIRST_CHANGE_GIVE_UP_MS + 10);
     expect(d.samples).toEqual([60]);
+  });
+
+  it("does not time a place by a change far from the driven bot, nor a refused one", () => {
+    const d = new Driver();
+    d.observeStatus([{ name: "b", x: 0.5, y: 70, z: 0.5, yaw: 0, bot: true, driven: true }], 50);
+    d.press("place", 100);
+    expect(d.observeDelta(150, [{ x: 40, z: 3 }])).toBeNull();
+    d.observeAck(false);
+    expect(d.observeDelta(200, [{ x: 1, z: 1 }])).toBeNull();
+    expect(d.samples).toEqual([]);
   });
 
   it("starts from the bot's own facing, so the first message does not turn it", () => {

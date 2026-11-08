@@ -434,6 +434,8 @@ export interface DriveMsg {
   action: DriveAction | null;
 }
 
+/** How far from the driven bot a changed column counts as its place or dig (a bot reaches 4.5 blocks). */
+export const ACTION_REACH_BLOCKS = 6;
 /** While a key is held the page repeats its message this often; the tile drops keys 1 s after the last. */
 export const DRIVE_HEARTBEAT_MS = 250;
 /** Never two messages closer than this: 25 a second, under the tile's 30. */
@@ -638,15 +640,26 @@ export class Driver {
     return this.finish(now);
   }
 
-  /** A delta arrived at `now`: it is the first change of a place or a dig. */
-  observeDelta(now: number): number | null {
+  /**
+   * A delta arrived at `now`: the first change of a place or a dig when one of its columns is
+   * within reach of the driven bot. Another bot's tower elsewhere on the map is not it.
+   */
+  observeDelta(now: number, columns: readonly { x: number; z: number }[]): number | null {
     const m = this.pending;
     if (m === null || m.kind !== "action") return null;
     if (now - m.at > FIRST_CHANGE_GIVE_UP_MS) {
       this.pending = null;
       return null;
     }
-    return this.finish(now);
+    const p = this.last;
+    if (p === null) return null;
+    const near = columns.some((c) => Math.hypot(c.x + 0.5 - p.x, c.z + 0.5 - p.z) <= ACTION_REACH_BLOCKS);
+    return near ? this.finish(now) : null;
+  }
+
+  /** The tile's answer to a drive message: a refusal ends the measurement, with no sample. */
+  observeAck(ok: boolean): void {
+    if (!ok) this.pending = null;
   }
 
   private finish(now: number): number {

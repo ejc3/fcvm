@@ -26,8 +26,8 @@ export type AckMsg = Extract<ViewMsg, { type: "drive_ack" }>;
 export interface TileEvents {
   /** A status message, at its arrival (local ms). */
   status(id: string, players: McPlayer[], at: number): void;
-  /** A delta that changed at least one column. */
-  delta(id: string, at: number): void;
+  /** A delta that changed at least one column: the changed columns, in block coordinates. */
+  delta(id: string, at: number, columns: readonly { x: number; z: number }[]): void;
   ack(id: string, ack: AckMsg): void;
 }
 
@@ -137,7 +137,9 @@ class TileSocket {
       case "delta":
         if (applyDelta(this.world, m) > 0) {
           this.dirty = true;
-          this.owner.events?.delta(this.id, at);
+          const r = this.world!.region;
+          const columns = m.cells.map(([i]) => ({ x: r.x0 + (i % r.w), z: r.z0 + Math.floor(i / r.w) }));
+          this.owner.events?.delta(this.id, at, columns);
         }
         return;
       case "status": {
