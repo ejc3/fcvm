@@ -955,6 +955,17 @@ async fn remove_tree(path: &Path) -> Undo {
 /// for a later reclaim. With the snapshots directory itself gone no link can name the file,
 /// and it is removed.
 fn undo_linked_memory(path: &Path, link: &Path) -> Undo {
+    undo_linked_memory_with(path, link, &|link| std::fs::read_link(link))
+}
+
+/// [`undo_linked_memory`] with the link's read passed in, for the tests. A link that cannot be
+/// read for another reason than being absent or not a link (a permission or I/O error) cannot
+/// rule out that it names the file, which is then kept.
+fn undo_linked_memory_with(
+    path: &Path,
+    link: &Path,
+    read_link: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Undo {
     let remove = || match std::fs::remove_file(path) {
         Ok(()) => Undo::Done,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
@@ -977,10 +988,18 @@ fn undo_linked_memory(path: &Path, link: &Path) -> Undo {
     if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
         return Undo::Kept(format!("{} is held: {error}", lock_path.display()));
     }
-    if std::fs::read_link(link).is_ok_and(|target| target == path) {
-        return Undo::Done;
+    match read_link(link) {
+        Ok(target) if target == path => Undo::Done,
+        Ok(_) => remove(),
+        // absent, or a regular file: a snapshot published without --memory-dir took the tag
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::EINVAL) =>
+        {
+            remove()
+        }
+        Err(error) => Undo::Kept(format!("reading {}: {error}", link.display())),
     }
-    remove()
 }
 
 async fn undo_temp(path: &Path) -> Undo {
@@ -1167,6 +1186,22 @@ mod tests {
         assert!(
             matches!(undo_linked_memory(&file, &link), Undo::Done),
             "a gone file is done"
+        );
+        // a link that cannot be read keeps the file: it may name it
+        std::fs::write(&file, b"m").unwrap();
+        let unreadable = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(matches!(
+            undo_linked_memory_with(&file, &link, &unreadable),
+            Undo::Kept(_)
+        ));
+        assert!(file.exists(), "removed although the link could not be read");
+        // a regular memory.bin (a later snapshot without --memory-dir) names no file of ours
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"store memory").unwrap();
+        assert!(matches!(undo_linked_memory(&file, &link), Undo::Done));
+        assert!(
+            !file.exists(),
+            "kept although the snapshot's memory is on the store"
         );
         std::fs::write(&file, b"m").unwrap();
         let gone = dir
