@@ -516,6 +516,33 @@ class PipelineTests(unittest.TestCase):
             self.assertIn(job, build)
             self.assertLess(build.index(job), env)
         self.assertLess(build.index("rm -rf \"$d\""), image, "an aging installation is removed before the build reuses it")
+        # A phase that fails before its waits stops and reaps both jobs (a retry would otherwise
+        # share the checkout and the store with them).
+        self.assertIn('BG_PIDS="$WIN_PID $BRIDGE_PID"', build)
+        self.assertLess(build.index('BG_PIDS="$WIN_PID $BRIDGE_PID"'), first_build)
+        trap = [line for line in source.splitlines() if line.startswith("trap ") and line.endswith(" EXIT")]
+        self.assertEqual(len(trap), 1)
+        self.assertIn('for p in ${BG_PIDS:-}; do kill_tree "$p"; wait "$p"', trap[0])
+
+    def test_kill_tree_stops_a_background_job_and_everything_below_it(self):
+        source = (HERE / "host/build.sh").read_text()
+        helper = re.search(r"\nkill_tree\(\) \{\n.*?\n\}\n", source, re.S).group(0)
+        script = helper + (
+            "tree() { echo $1; for c in $(pgrep -P $1); do tree $c; done; }\n"
+            # four deep: the job, a sleep, and a shell (kept by its second command) with a sleep
+            "bash -c 'sleep 307 & bash -c \"sleep 309; :\" & wait' >/dev/null 2>&1 &\n"
+            "job=$!\n"
+            "sleep 0.5\n"
+            "all=$(tree $job)\n"
+            "trap 'kill -9 $all 2>/dev/null' EXIT\n"
+            "[ $(echo $all | wc -w) -ge 4 ] || { echo \"tree too small: $all\"; exit 1; }\n"
+            "kill_tree $job\n"
+            "wait $job 2>/dev/null || true\n"
+            "sleep 0.3\n"
+            "for p in $all; do kill -0 $p 2>/dev/null && { echo \"alive $p\"; exit 1; }; done\n"
+            "echo ok\n")
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "ok"), out.stderr)
 
     def test_host_prep_runs_on_fcvms_host_kernel_too(self):
         # Revising a host image that already boots fcvm's host kernel runs prep on it, and that

@@ -28,9 +28,18 @@ install -d -m 0700 "$S"
 install -d -o root -g "$U" -m 0710 "$L"
 [ -f "$S/env" ] && . "$S/env"
 exec > >(tee -a "$L/$PHASE.log") 2>&1
+# A process and everything below it (a background job of the build phase: sudo, bash, make,
+# podman, QEMU), children first.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill -TERM "$1" 2>/dev/null || true
+}
+# The build phase's background jobs (BG_PIDS) are stopped and reaped on every way out, so a
+# failed phase leaves nothing writing to the checkout or the store while it is retried.
 # EXIT, not ERR: an ERR trap does not fire for a failure inside a function under set -e.
 # shellcheck disable=SC2154 # rc is assigned inside the trap string
-trap 'rc=$?; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
+trap 'rc=$?; for p in ${BG_PIDS:-}; do kill_tree "$p"; wait "$p" 2>/dev/null || true; done; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
 rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive
@@ -160,6 +169,7 @@ build)
   WIN_PID=$!
   as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet" > "$L/windows-bridge.log" 2>&1 &
   BRIDGE_PID=$!
+  BG_PIDS="$WIN_PID $BRIDGE_PID"
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
