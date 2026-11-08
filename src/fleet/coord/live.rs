@@ -293,12 +293,19 @@ struct Page {
 /// nothing waits this long.
 pub const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Why a late viewer's `claim_gpu`, `claim_phone` or `claim_windows` is refused: a private GPU
-/// is a direct stream too, and a borrowed phone or sandbox is shown from its direct stream.
+/// Why a late viewer's `claim_gpu`, `claim_phone`, `claim_windows` or `claim_minecraft` is
+/// refused: a private GPU is a direct stream too, a borrowed phone or sandbox is shown from its
+/// direct stream, and a borrowed server is driven over its tile's view socket, which needs a
+/// direct token.
 pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the broadcast";
 
 /// The intents a late viewer is refused with [`LATE_CLAIM`].
-pub const LATE_REFUSED: [&str; 3] = ["claim_gpu", "claim_phone", "claim_windows"];
+pub const LATE_REFUSED: [&str; 4] = [
+    "claim_gpu",
+    "claim_phone",
+    "claim_windows",
+    "claim_minecraft",
+];
 
 async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));

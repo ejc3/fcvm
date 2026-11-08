@@ -137,6 +137,7 @@ pub fn zone_of(state: &State, apex: &str) -> Zone {
         .chain(f.ec2.values())
         .chain(f.phones.values())
         .chain(f.windows.values())
+        .chain(f.minecraft.values())
         .filter_map(|s| s.published.as_ref());
     let aggregators = f
         .hosts
