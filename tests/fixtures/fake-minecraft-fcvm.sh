@@ -11,6 +11,8 @@
 #   FAKE_UP_SECS        time before a VM's tile answers (default 0.1)
 #   FAKE_SNAPSHOT_SECS  a snapshot create takes this long, then logs snapshot_done
 #   FAKE_FAIL_FORK      a VM restored from a mc-fork-* snapshot exits with status 3
+#   FAKE_STALL_FORK     a VM restored from a mc-fork-* snapshot holds that snapshot's generation
+#                       lock shared, as fcvm snapshot run does while it restores, and never comes up
 #
 # The test's fake tiles read sessions-<name> (absent while the VM is down). It logs `<event>
 # <name> <pid> <tag or -> <ns>` lines to $FAKE_FCVM_DIR/events.log and each VM's arguments, one
@@ -62,6 +64,12 @@ stop() {
     exit 0
 }
 trap stop TERM INT
+if [ -n "${FAKE_STALL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
+    exec 9>"$snaps/$tag.lock"
+    flock -s 9
+    echo "stalled $name $$ $tag $(date +%s%N)" >> "$log"
+    while true; do sleep 1 & wait $!; done
+fi
 sleep "${FAKE_UP_SECS:-0.1}" & wait $!
 # FAKE_FAIL_FORK: a restore of a fork's snapshot exits at once, as a copy that cannot run.
 if [ -n "${FAKE_FAIL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then

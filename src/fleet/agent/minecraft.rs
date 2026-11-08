@@ -863,12 +863,17 @@ impl Server {
             }
         };
         let first_chunk_at = unix_ms();
-        if let Some(f) = fork_snapshot.take() {
-            f.remove().await;
-        }
+        // A copy that is not up may still be restoring, which holds its snapshot's generation
+        // lock: it is stopped before the removal waits on that lock.
         if let Err(e) = up {
             vm.stop(self.agent.stop_grace).await;
+            if let Some(f) = fork_snapshot.take() {
+                f.remove().await;
+            }
             return Err(e);
+        }
+        if let Some(f) = fork_snapshot.take() {
+            f.remove().await;
         }
         let attempt_ms = tr.elapsed().as_millis() as u64;
         timings

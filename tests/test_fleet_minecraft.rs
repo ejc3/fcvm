@@ -569,6 +569,52 @@ async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
     f.mc.stop().await;
 }
 
+/// A copy whose restore stalls holds its snapshot's generation lock until it is stopped: the
+/// launch stops it at its ready deadline before it removes that snapshot, so the deadline still
+/// ends the launch, and the server is relaunched from the gold snapshot.
+#[tokio::test]
+async fn a_stalled_copy_is_stopped_before_its_snapshot_is_removed() {
+    let mut f = fake_with(&[("FAKE_STALL_FORK", "1")], |c| {
+        c.ready_deadline = Duration::from_secs(2)
+    })
+    .await;
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 1, None, None),
+    ]);
+    f.report("mc-1", "running", 1).await;
+    f.report("mc-2", "running", 1).await;
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 2, Some(("mc-1", 0)), None),
+    ]);
+    let end = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("the stalled copy's launch never ended")
+            .unwrap();
+        if let AgentMsg::Slot(r) = m {
+            if r.id == "mc-2" && r.generation == 2 && r.phase == "running" {
+                break;
+            }
+        }
+    }
+    let ev = f.events();
+    let stalled = ev
+        .iter()
+        .position(|e| e[0] == "stalled" && e[1] == "mc-2")
+        .unwrap_or_else(|| panic!("{ev:?}"));
+    assert!(
+        ev[stalled..]
+            .iter()
+            .any(|e| e[0] == "exit" && e[2] == ev[stalled][2]),
+        "the stalled copy was not stopped: {ev:?}"
+    );
+    assert!(!f.snaps.join("mc-fork-mc-2-2").exists());
+    f.mc.stop().await;
+}
+
 /// A snapshot create that outlives its deadline is never killed: killed after it paused the
 /// source, it would leave that server paused for good. It runs to its end.
 #[tokio::test]
