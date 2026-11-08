@@ -493,6 +493,7 @@ async fn report(
                 v4_port: None,
                 place: l.and_then(|l| place_of(&l.instance)),
                 desktop_at: None,
+                first_chunk_at: None,
             },
         })
         .await;

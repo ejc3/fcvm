@@ -344,6 +344,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     potato_players,
                     windows,
                     windows_actions,
+                    minecraft: _,
+                    minecraft_server: _,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {

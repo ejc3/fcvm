@@ -1284,6 +1284,7 @@ impl Sandbox {
             v4_port: c.public_ipv4.as_ref().and(self.place.tls_port),
             place: c.place.clone(),
             desktop_at,
+            first_chunk_at: None,
         }));
     }
 

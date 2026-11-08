@@ -194,6 +194,10 @@ pub struct SlotReport {
     /// `times_unix_ms.desktop`), Unix ms on the host's clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_at: Option<u64>,
+    /// Minecraft mode, with `running`: when the server's bots received their first chunk
+    /// after this launch, Unix ms on the host's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_chunk_at: Option<u64>,
 }
 
 /// The public label of where a slot runs: `EC2 in <region>`. The one place the wording is
@@ -294,6 +298,12 @@ pub enum AgentMsg {
         /// offers nothing else but `reset`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         windows_actions: Vec<String>,
+        /// The Minecraft servers the host runs (Minecraft mode); 0 runs none.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        minecraft: u32,
+        /// The servers' name and version, as the page's header shows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minecraft_server: Option<String>,
     },
     /// Windows mode: the host's Windows image, its age and the gold snapshot's state, sent
     /// after the hello and whenever any of it changes.
@@ -373,6 +383,38 @@ pub struct AssignSlot {
     /// and its bridge; `sbdf` is empty and `rect` null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows: Option<AssignWindows>,
+    /// A Minecraft server (Minecraft mode): the slot runs a clone of the host's gold snapshot,
+    /// or of a fork; `sbdf` is empty and `rect` null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<AssignMinecraft>,
+}
+
+/// What a Minecraft server's assignment adds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignMinecraft {
+    /// Its place among the host's servers (0-based): its address.
+    pub index: u32,
+    /// When the click that asked for this generation was made (the coordinator's clock), for
+    /// the agent's click-to-first-chunk time; absent for a launch nobody clicked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clicked_at: Option<u64>,
+    /// This generation is a copy of another server's running world (`minecraft_fork`): the
+    /// agent snapshots that server, which keeps running, and restores the copy here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkFrom>,
+    /// The viewer holding the server, the only one whose drive messages the tile accepts, and
+    /// until when (the coordinator's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_until: Option<u64>,
+}
+
+/// The server a fork copies: its slot and its index on the same host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkFrom {
+    pub slot: String,
+    pub index: u32,
 }
 
 /// What a Windows sandbox's assignment adds.
@@ -642,6 +684,7 @@ mod tests {
                 warm: false,
                 phone: None,
                 windows: None,
+                minecraft: None,
             }],
             region: None,
         };

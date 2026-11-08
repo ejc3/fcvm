@@ -522,6 +522,8 @@ where
             .as_ref()
             .map(|_| windows::actions())
             .unwrap_or_default(),
+        minecraft: 0,
+        minecraft_server: None,
     })
     .ok();
     let (potato_tx, potato_rx) = watch::channel(None);
@@ -794,6 +796,7 @@ fn assign(
                 v4_port: None,
                 place: cfg.place.clone(),
                 desktop_at: None,
+                first_chunk_at: None,
             }));
             continue;
         };

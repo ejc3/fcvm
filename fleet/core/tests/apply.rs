@@ -28,6 +28,8 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             potato_players: 0,
             windows: 0,
             windows_actions: Vec::new(),
+            minecraft: 0,
+            minecraft_server: None,
         },
     }
 }
@@ -192,6 +194,7 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 v4_port: None,
                 place: None,
                 desktop_at: None,
+                first_chunk_at: None,
             }),
         });
     }
@@ -316,6 +319,8 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             potato_players: 0,
             windows: 0,
             windows_actions: Vec::new(),
+            minecraft: 0,
+            minecraft_server: None,
         },
     }];
     later.push(running(240000, "h1", "slot-1"));
@@ -537,6 +542,8 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 potato_players: 0,
                 windows: 0,
                 windows_actions: Vec::new(),
+                minecraft: 0,
+                minecraft_server: None,
             },
         },
     );

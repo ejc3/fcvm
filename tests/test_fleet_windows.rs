@@ -351,6 +351,7 @@ impl Coord {
                     clicked_at: *clicked_at,
                     actions: actions.clone(),
                 }),
+                minecraft: None,
             })
             .collect();
         self.to_agent

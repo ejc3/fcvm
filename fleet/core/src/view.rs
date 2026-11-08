@@ -1099,6 +1099,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 warm: is_warming(state, s),
                 phone: None,
                 windows: None,
+                minecraft: None,
             });
         }
     }
@@ -1150,6 +1151,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         .unwrap_or_default(),
                 }),
                 windows: None,
+                minecraft: None,
             });
         }
     }
@@ -1186,6 +1188,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         .cloned()
                         .collect(),
                 }),
+                minecraft: None,
             });
         }
     }
@@ -1221,6 +1224,7 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             warm: false,
             phone: None,
             windows: None,
+            minecraft: None,
         })
         .collect()
 }
