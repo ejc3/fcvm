@@ -111,39 +111,43 @@ fn assert_forced_getattr_reaches_server(backing: &Path, via_mount: &Path, fd: Ra
     // The mount's attr_timeout (ATTR_TTL_SECS in fuse-pipe/src/server/passthrough.rs).
     let attr_timeout = std::time::Duration::from_secs(1);
 
-    // Both halves are only meaningful while the attributes the priming statx
-    // cached have not expired. A descheduling longer than the attr_timeout (a
-    // loaded CI host) expires them: the plain stat then reports the new mode,
-    // or the forced stat reports it through ordinary expiry, which would pass
-    // even with AT_STATX_FORCE_SYNC ignored. Either is a scheduling artifact,
-    // so the attempt is retried. A forced stat that returns the old mode is a
-    // hard failure whenever it happens.
+    // Both halves are only meaningful while the attributes the priming cached
+    // have not expired. A descheduling longer than the attr_timeout (a loaded
+    // CI host) expires them: the plain stat then reports the new mode, or the
+    // forced stat reports it through ordinary expiry, which would pass even
+    // with AT_STATX_FORCE_SYNC ignored. Either is a scheduling artifact, so the
+    // attempt is retried. A forced stat that returns the old mode is a hard
+    // failure whenever it happens.
     //
-    // A chmod moves the host file's ctime and nothing else, which the client
-    // takes as a possible rewrite that kept the size and mtime
-    // (fuse-pipe/src/client/host_change.rs): the refresh that first reports the
-    // new ctime sends FUSE_NOTIFY_INVAL_INODE ahead of its reply, and the kernel
-    // does not cache the attributes of a reply that an invalidation overtook. So
-    // the cache is primed by the second forced statx, whose reply carries the
-    // ctime the client already recorded.
+    // The priming must not rely on the flag under test: an ignored flag would
+    // return attributes cached earlier without moving their expiry, and the time
+    // measured from the priming would bound nothing. So it waits out the
+    // attr_timeout, which leaves the kernel nothing cached, and primes with plain
+    // stats of the path. Through the path, because the plain stat below resolves
+    // it: with the dentry's entry_timeout (also 1 s) run out, that stat would send
+    // a LOOKUP whose reply refreshes the attributes. The first priming stat goes
+    // to the server. A chmod moves the host file's ctime and nothing else, which
+    // the client takes as a possible rewrite that kept the size and mtime (fuse-
+    // pipe/src/client/host_change.rs): it sends FUSE_NOTIFY_INVAL_INODE ahead of
+    // that reply, and the kernel does not cache the attributes of a reply an
+    // invalidation overtook. The second stat then goes to the server too, and its
+    // reply, carrying the ctime the client already recorded, is cached. Either way
+    // the cached dentry and attributes expire no earlier than 1 s after `primed`.
     let mut saw_chmod = 0;
     let mut expired = 0;
     for _ in 0..5 {
         fs::set_permissions(backing, fs::Permissions::from_mode(before)).unwrap();
-        let agrees = |what: &str| {
+        std::thread::sleep(attr_timeout + std::time::Duration::from_millis(100));
+        let primed = std::time::Instant::now();
+        for what in ["first refresh", "priming refresh"] {
             assert_eq!(
-                forced_statx_mode(fd) as u32,
+                fs::metadata(via_mount).unwrap().permissions().mode() & 0o7777,
                 before,
                 "the mount does not agree with the backing file even before anything is \
                  changed behind its back ({what}), so neither half of this check would mean \
                  anything"
-            )
-        };
-        agrees("first refresh");
-        // Taken before the call: the cached attributes expire no earlier than
-        // attr_timeout after the request that brought them was sent.
-        let primed = std::time::Instant::now();
-        agrees("priming refresh");
+            );
+        }
 
         fs::set_permissions(backing, fs::Permissions::from_mode(after)).unwrap();
 
