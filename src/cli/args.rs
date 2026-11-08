@@ -806,6 +806,32 @@ pub struct FleetAgentArgs {
     /// podman, which runs the bridges (tests)
     #[arg(long, default_value = "podman", hide = true)]
     pub windows_podman: std::path::PathBuf,
+
+    /// Minecraft mode: run N Pumpkin servers on this host, each a clone of one gold snapshot of
+    /// a server with its world loaded and its bots joined (docs/fleet/minecraft.md); needs the
+    /// host's IPv6 prefix
+    #[arg(long, default_value_t = 0)]
+    pub minecraft: u32,
+
+    /// The tile image (make minecraft-image), in root's podman store
+    #[arg(long, default_value = "localhost/fcvm-minecraft:fleet")]
+    pub minecraft_image: String,
+
+    /// Each server VM's memory, MiB
+    #[arg(long, default_value_t = 1024)]
+    pub minecraft_mem: u32,
+
+    /// Each server VM's vCPUs
+    #[arg(long, default_value_t = 1)]
+    pub minecraft_cpus: u32,
+
+    /// Bots in each server
+    #[arg(long, default_value_t = 3)]
+    pub minecraft_bots: u32,
+
+    /// fcvm's snapshot directory, where the gold snapshot and the forks are made
+    #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
+    pub minecraft_snapshot_dir: std::path::PathBuf,
 }
 
 /// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and

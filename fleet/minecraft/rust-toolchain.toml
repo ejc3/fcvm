@@ -1,0 +1,4 @@
+# azalea (the bot client) needs nightly features; pinned so a build is reproducible.
+[toolchain]
+channel = "nightly-2026-08-20"
+profile = "minimal"

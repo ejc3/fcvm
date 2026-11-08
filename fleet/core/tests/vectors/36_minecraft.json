@@ -1,0 +1,2430 @@
+{
+  "config": {
+    "max_tiles": 2,
+    "minecraft_claim_cooldown_secs": 60,
+    "minecraft_claim_secs": 30
+  },
+  "description": "Minecraft mode: an agent's servers become mc-<n>, numbered fleet-wide, laid out in their own image of square tiles and never on the wall. minecraft_reset restores one server (once per 2 s per client) or every free one (once per 10 s per client); minecraft_fork copies a running server into the next running, unlent server on its host (once per 10 s per client), timed from the click to the copy's first chunk; claim_minecraft lends one (one per client, a cap of 2 or half the servers, a cooldown) and names its viewer as the server's driver; the end of a borrow and a viewer leaving each reset the server. Every intent refuses an argument it does not take.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "aarch64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "h1",
+        "minecraft": 3,
+        "minecraft_server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1100,
+      "host": "h2",
+      "msg": {
+        "arch": "aarch64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h2",
+        "minecraft": 1,
+        "minecraft_server": "Pumpkin 0000000 (Java Edition 26.2)",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 1990,
+        "frame_url": "wss://mc-1.fleet.example.org/view",
+        "generation": 1,
+        "id": "mc-1",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 1990,
+        "frame_url": "wss://[2001:db8::2]/view",
+        "generation": 1,
+        "id": "mc-2",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 1990,
+        "frame_url": "ws://h1:25603/view",
+        "generation": 1,
+        "id": "mc-3",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h2",
+      "msg": {
+        "first_chunk_at": 1990,
+        "frame_url": "wss://192.0.2.4/view",
+        "generation": 1,
+        "id": "mc-4",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-4"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.20",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.22",
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "slot": "mc-2"
+      },
+      "at": 3000,
+      "client": "198.51.100.20",
+      "id": "r1",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "mc-3"
+      },
+      "at": 3500,
+      "client": "198.51.100.20",
+      "id": "r2",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 3600,
+      "client": "198.51.100.21",
+      "id": "r3",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-9"
+      },
+      "at": 3700,
+      "client": "198.51.100.21",
+      "id": "r4",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "all": true,
+        "slot": "mc-3"
+      },
+      "at": 3800,
+      "client": "198.51.100.21",
+      "id": "r4b",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "keys": [
+          "forward"
+        ],
+        "slot": "mc-3"
+      },
+      "at": 3850,
+      "client": "198.51.100.21",
+      "id": "r4c",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "all": "yes"
+      },
+      "at": 3900,
+      "client": "198.51.100.21",
+      "id": "r4d",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": 2
+      },
+      "at": 3950,
+      "client": "198.51.100.21",
+      "id": "r4e",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 4000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "wss://[2001:db8::2]/view",
+        "generation": 2,
+        "id": "mc-2",
+        "phase": "restoring",
+        "timings": {},
+        "type": "slot",
+        "vm": "mc-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 6000,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 5900,
+        "frame_url": "wss://[2001:db8::2]/view",
+        "generation": 2,
+        "id": "mc-2",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "into": "mc-3",
+        "slot": "mc-1"
+      },
+      "at": 6500,
+      "client": "198.51.100.21",
+      "id": "f0",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 6600,
+      "client": "198.51.100.21",
+      "id": "f0b",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-1"
+      },
+      "at": 7000,
+      "client": "198.51.100.21",
+      "id": "f1",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-3"
+      },
+      "at": 8000,
+      "client": "198.51.100.21",
+      "id": "f2",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-2"
+      },
+      "at": 8000,
+      "client": "198.51.100.20",
+      "id": "f3",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "mc-9"
+      },
+      "at": 8100,
+      "client": "198.51.100.22",
+      "id": "f4",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 8500,
+      "host": "h1",
+      "msg": {
+        "frame_url": "wss://[2001:db8::2]/view",
+        "generation": 3,
+        "id": "mc-2",
+        "phase": "forking",
+        "timings": {},
+        "type": "slot",
+        "vm": "mc-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 10000,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 9800,
+        "frame_url": "wss://[2001:db8::2]/view",
+        "generation": 3,
+        "id": "mc-2",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 2300,
+          "restore_ms": 1100,
+          "snapshot_ms": 640,
+          "total_ms": 2800
+        },
+        "type": "slot",
+        "vm": "mc-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "mc-4"
+      },
+      "at": 10500,
+      "client": "198.51.100.22",
+      "id": "f5",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "slot": "mc-3"
+      },
+      "at": 11000,
+      "client": "198.51.100.20",
+      "id": "f6",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "mc-1"
+      },
+      "at": 11500,
+      "client": "198.51.100.22",
+      "id": "r5",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 12500,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 12400,
+        "frame_url": "wss://mc-1.fleet.example.org/view",
+        "generation": 3,
+        "id": "mc-1",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-1"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "slot": "mc-2"
+      },
+      "at": 13000,
+      "client": "198.51.100.20",
+      "id": "c1",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "mc-3",
+        "viewer": "v3"
+      },
+      "at": 13050,
+      "client": "198.51.100.22",
+      "id": "c1b",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 13100,
+      "client": "198.51.100.20",
+      "id": "c2",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "slot": "mc-2"
+      },
+      "at": 13200,
+      "client": "198.51.100.21",
+      "id": "r6",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-1"
+      },
+      "at": 17000,
+      "client": "198.51.100.21",
+      "id": "f7",
+      "name": "minecraft_fork",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-3"
+      },
+      "at": 17100,
+      "client": "198.51.100.21",
+      "id": "c3",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-2"
+      },
+      "at": 17200,
+      "client": "198.51.100.21",
+      "id": "c3b",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 17300,
+      "client": "198.51.100.21",
+      "id": "c4",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 17400,
+      "client": "198.51.100.22",
+      "id": "c5",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "all": true
+      },
+      "at": 18000,
+      "client": "198.51.100.22",
+      "id": "r7",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 19000,
+      "host": "h2",
+      "msg": {
+        "first_chunk_at": 18900,
+        "frame_url": "wss://192.0.2.4/view",
+        "generation": 2,
+        "id": "mc-4",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-4"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 19500,
+      "host": "h1",
+      "msg": {
+        "first_chunk_at": 10000,
+        "frame_url": "ws://h1:25603/view",
+        "generation": 3,
+        "id": "mc-3",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-3"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "all": true
+      },
+      "at": 20000,
+      "client": "198.51.100.22",
+      "id": "r8",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "claim": "minecraft-claim-1"
+      },
+      "at": 20100,
+      "client": "198.51.100.21",
+      "id": "x0",
+      "name": "release_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "claim": "minecraft-claim-2",
+        "now": true
+      },
+      "at": 20200,
+      "client": "198.51.100.21",
+      "id": "x0b",
+      "name": "release_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 43000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 44000,
+      "client": "198.51.100.20",
+      "id": "c6",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 45000,
+      "client": "198.51.100.21",
+      "id": "x1",
+      "name": "release_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 45100,
+      "client": "198.51.100.21",
+      "id": "x2",
+      "name": "release_minecraft",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "slot": "mc-4"
+      },
+      "at": 46000,
+      "client": "198.51.100.22",
+      "id": "c7",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 46500,
+      "type": "viewer_left",
+      "viewer": "v3"
+    },
+    {
+      "at": 46800,
+      "host": "h2",
+      "msg": {
+        "first_chunk_at": 46700,
+        "frame_url": "wss://192.0.2.4/view",
+        "generation": 3,
+        "id": "mc-4",
+        "phase": "running",
+        "timings": {
+          "first_chunk_ms": 1900,
+          "restore_ms": 410,
+          "total_ms": 1900
+        },
+        "type": "slot",
+        "vm": "mc-4"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 47000,
+      "host": "h2",
+      "msg": {
+        "reason": "spot",
+        "type": "draining"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 47100,
+      "client": "198.51.100.23",
+      "type": "viewer_joined",
+      "viewer": "v4"
+    },
+    {
+      "args": {
+        "slot": "mc-4"
+      },
+      "at": 47200,
+      "client": "198.51.100.23",
+      "id": "c8",
+      "name": "claim_minecraft",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {
+        "slot": "mc-4"
+      },
+      "at": 47300,
+      "client": "198.51.100.23",
+      "id": "r9",
+      "name": "minecraft_reset",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "at": 48000,
+      "host": "h1",
+      "msg": {
+        "arch": "aarch64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "h1",
+        "minecraft": 2,
+        "minecraft_server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 49000,
+      "host": "h1",
+      "type": "agent_gone"
+    },
+    {
+      "at": 50000,
+      "host": "h2",
+      "type": "agent_gone"
+    },
+    {
+      "at": 51000,
+      "host": "h2",
+      "msg": {
+        "arch": "aarch64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h2",
+        "minecraft": 2,
+        "minecraft_server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+        "type": "hello"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/assign/h1/0/id": "slot-1",
+        "/assign/h1/0/minecraft": null,
+        "/assign/h1/1/id": "mc-1",
+        "/assign/h1/1/minecraft": {
+          "index": 0
+        },
+        "/assign/h1/1/rect": null,
+        "/assign/h1/1/sbdf": "",
+        "/assign/h1/3/minecraft/index": 2,
+        "/view/minecraft/borrow": {
+          "cap": 2,
+          "lent": 0,
+          "next_return_at": null
+        },
+        "/view/minecraft/claim_secs": 30,
+        "/view/minecraft/image_aspect": 3.0,
+        "/view/minecraft/last_fork": null,
+        "/view/minecraft/last_reset_all": null,
+        "/view/minecraft/server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+        "/view/minecraft/tiles/0/forked_from": null,
+        "/view/minecraft/tiles/0/id": "mc:1",
+        "/view/minecraft/tiles/0/join": null,
+        "/view/minecraft/tiles/0/phase": "pending",
+        "/view/minecraft/tiles/0/slot": "mc-1",
+        "/view/minecraft/tiles/2/rect": {
+          "h": 1.0,
+          "w": 0.3333333333333333,
+          "x": 0.6666666666666666,
+          "y": 0.0
+        },
+        "/view/minecraft/tiles/3": null,
+        "/view/tiles/0/slot": "slot-1",
+        "/view/tiles/1": null
+      },
+      "note": "an agent's servers become mc-<n>, laid out in their own image of square tiles, never on the wall"
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/assign/h2/0/id": "mc-4",
+        "/assign/h2/0/minecraft/index": 0,
+        "/view/minecraft/image_aspect": 4.0,
+        "/view/minecraft/server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+        "/view/minecraft/tiles/3/rect": {
+          "h": 1.0,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.0
+        },
+        "/view/minecraft/tiles/3/slot": "mc-4"
+      },
+      "note": "servers are numbered fleet-wide; the header names the first host's server"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/minecraft/tiles/0/frame_url": "wss://mc-1.fleet.example.org/view",
+        "/view/minecraft/tiles/0/join": "mc-1.fleet.example.org",
+        "/view/minecraft/tiles/0/last_relaunch": {
+          "by": "wake",
+          "clicked_at": 90,
+          "first_frame_at": 1990,
+          "phases": {
+            "first_chunk_ms": 1900,
+            "restore_ms": 410,
+            "total_ms": 1900
+          }
+        },
+        "/view/minecraft/tiles/0/phase": "running",
+        "/view/minecraft/tiles/1/join": null,
+        "/view/minecraft/tiles/2/join": null,
+        "/view/minecraft/tiles/3/join": null
+      },
+      "note": "a server up at the start is timed from its own report, to its bots' first chunk; players join only a wss:// DNS name"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/assign/h1/1/generation": 1,
+        "/assign/h1/2/generation": 2,
+        "/assign/h1/2/minecraft/clicked_at": 3000,
+        "/receipts/r1/outcome": "committed",
+        "/view/minecraft/tiles/1/last_relaunch/by": "viewer:v1",
+        "/view/minecraft/tiles/1/phase": "relaunching"
+      }
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/assign/h1/3/generation": 1,
+        "/receipts/r2/reason": "one reset per 2 s per client"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/r3/reason": "args must name a slot or say all"
+      }
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/receipts/r4/reason": "no server \"mc-9\""
+      }
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/receipts/r4b/reason": "args must name a slot or say all"
+      }
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/receipts/r4c/reason": "args.keys is not accepted"
+      },
+      "note": "nothing rides along with a reset"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/receipts/r4d/reason": "args.all must be true or false"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/receipts/r4e/reason": "args.slot must be a server id"
+      }
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/view/minecraft/tiles/1/phase": "restoring"
+      }
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/view/minecraft/tiles/1/last_relaunch/clicked_at": 3000,
+        "/view/minecraft/tiles/1/last_relaunch/first_frame_at": 5900,
+        "/view/minecraft/tiles/1/last_relaunch/phases/first_chunk_ms": 1900
+      },
+      "note": "a reset is timed from the click to its bots' first chunk"
+    },
+    {
+      "after": 19,
+      "checks": {
+        "/receipts/f0/reason": "args.into is not accepted"
+      },
+      "note": "a fork names its source only"
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/receipts/f0b/reason": "args.slot must be a server id"
+      }
+    },
+    {
+      "after": 21,
+      "checks": {
+        "/assign/h1/1/generation": 1,
+        "/assign/h1/1/minecraft/fork": null,
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/2/minecraft/clicked_at": 7000,
+        "/assign/h1/2/minecraft/fork": {
+          "index": 0,
+          "slot": "mc-1"
+        },
+        "/receipts/f1/outcome": "committed",
+        "/view/minecraft/last_fork": null,
+        "/view/minecraft/tiles/0/forked_from": null,
+        "/view/minecraft/tiles/1/forked_from": "mc-1",
+        "/view/minecraft/tiles/1/last_relaunch/by": "fork:mc-1",
+        "/view/minecraft/tiles/1/phase": "relaunching"
+      },
+      "note": "a fork moves the next server on the source's host; the source keeps its launch"
+    },
+    {
+      "after": 22,
+      "checks": {
+        "/receipts/f2/reason": "one fork per 10 s per client"
+      }
+    },
+    {
+      "after": 23,
+      "checks": {
+        "/receipts/f3/reason": "mc-2 is not running"
+      },
+      "note": "a copy still being made is not a source"
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/receipts/f4/reason": "no server \"mc-9\""
+      }
+    },
+    {
+      "after": 25,
+      "checks": {
+        "/assign/h1/2/minecraft/fork": {
+          "index": 0,
+          "slot": "mc-1"
+        },
+        "/view/minecraft/tiles/1/phase": "forking"
+      }
+    },
+    {
+      "after": 26,
+      "checks": {
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/2/minecraft/fork": null,
+        "/view/minecraft/last_fork": {
+          "by": "viewer:v2",
+          "clicked_at": 7000,
+          "first_chunk_at": 9800,
+          "from": "mc-1",
+          "restore_ms": 1100,
+          "snapshot_ms": 640,
+          "to": "mc-2",
+          "total_ms": 2800
+        },
+        "/view/minecraft/tiles/1/forked_from": "mc-1",
+        "/view/minecraft/tiles/1/last_relaunch/first_frame_at": 9800,
+        "/view/minecraft/tiles/1/last_relaunch/phases/snapshot_ms": 640
+      },
+      "note": "the copy runs: it is the last fork, and its assignment no longer asks for one"
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/receipts/f5/reason": "no server on mc-4's host can take a copy"
+      },
+      "note": "a server alone on its host has nowhere to copy to"
+    },
+    {
+      "after": 28,
+      "checks": {
+        "/assign/h1/1/generation": 2,
+        "/assign/h1/1/minecraft/fork": {
+          "index": 2,
+          "slot": "mc-3"
+        },
+        "/receipts/f6/outcome": "committed",
+        "/view/minecraft/tiles/0/forked_from": "mc-3"
+      },
+      "note": "the next server wraps to the host's first"
+    },
+    {
+      "after": 29,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/assign/h1/1/minecraft/fork": null,
+        "/receipts/r5/outcome": "committed",
+        "/view/minecraft/tiles/0/forked_from": null,
+        "/view/minecraft/tiles/0/last_relaunch/by": "viewer:v3"
+      },
+      "note": "a reset before the copy ran drops the fork: the server restores from the gold snapshot"
+    },
+    {
+      "after": 30,
+      "checks": {
+        "/view/minecraft/last_fork/to": "mc-2",
+        "/view/minecraft/tiles/0/forked_from": null
+      }
+    },
+    {
+      "after": 31,
+      "checks": {
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/2/minecraft/driver": "v1",
+        "/assign/h1/2/minecraft/driver_until": 43000,
+        "/receipts/c1/outcome": "committed",
+        "/view/minecraft/borrow": {
+          "cap": 2,
+          "lent": 1,
+          "next_return_at": 43000
+        },
+        "/view/minecraft/tiles/1/borrowed": {
+          "session": "minecraft-claim-1",
+          "since": 13000,
+          "until": 43000,
+          "viewer": "v1"
+        },
+        "/view/minecraft/tiles/1/frame_url": "wss://[2001:db8::2]/view",
+        "/view/minecraft/tiles/1/phase": "running"
+      },
+      "note": "a borrow names its viewer as the server's driver; the server keeps its launch"
+    },
+    {
+      "after": 32,
+      "checks": {
+        "/receipts/c1b/reason": "args.viewer is not accepted"
+      },
+      "note": "no driver can be named in a claim"
+    },
+    {
+      "after": 33,
+      "checks": {
+        "/receipts/c2/reason": "one server per client at a time"
+      }
+    },
+    {
+      "after": 34,
+      "checks": {
+        "/receipts/r6/reason": "mc-2 is lent to a viewer"
+      }
+    },
+    {
+      "after": 35,
+      "checks": {
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/3/generation": 2,
+        "/assign/h1/3/minecraft/fork": {
+          "index": 0,
+          "slot": "mc-1"
+        },
+        "/receipts/f7/outcome": "committed"
+      },
+      "note": "a fork skips a lent server"
+    },
+    {
+      "after": 36,
+      "checks": {
+        "/receipts/c3/reason": "mc-3 is not running"
+      }
+    },
+    {
+      "after": 37,
+      "checks": {
+        "/receipts/c3b/reason": "mc-2 is lent to another viewer"
+      }
+    },
+    {
+      "after": 38,
+      "checks": {
+        "/assign/h1/1/minecraft/driver": "v2",
+        "/receipts/c4/outcome": "committed",
+        "/view/minecraft/tiles/0/borrowed/session": "minecraft-claim-2"
+      }
+    },
+    {
+      "after": 39,
+      "checks": {
+        "/receipts/c5/reason": "2 of 2 servers are already lent; the next comes back in 26 s"
+      }
+    },
+    {
+      "after": 40,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/3/generation": 3,
+        "/assign/h1/3/minecraft/fork": null,
+        "/assign/h2/0/generation": 2,
+        "/receipts/r7/outcome": "committed",
+        "/view/minecraft/last_reset_all": {
+          "by": "viewer:v3",
+          "clicked_at": 18000,
+          "servers": 2
+        },
+        "/view/minecraft/tiles/2/forked_from": null,
+        "/view/minecraft/tiles/2/last_relaunch/by": "reset_all"
+      },
+      "note": "reset all skips lent servers and drops a fork not yet run"
+    },
+    {
+      "after": 42,
+      "checks": {
+        "/view/minecraft/tiles/2/last_relaunch/first_frame_at": 18000
+      },
+      "note": "a host clock behind the coordinator cannot put the first chunk before the click"
+    },
+    {
+      "after": 43,
+      "checks": {
+        "/receipts/r8/reason": "one reset all per 10 s per client"
+      }
+    },
+    {
+      "after": 44,
+      "checks": {
+        "/receipts/x0/reason": "\"minecraft-claim-1\" is not this viewer's server"
+      }
+    },
+    {
+      "after": 45,
+      "checks": {
+        "/receipts/x0b/reason": "args.now is not accepted"
+      }
+    },
+    {
+      "after": 46,
+      "checks": {
+        "/assign/h1/2/generation": 4,
+        "/assign/h1/2/minecraft/driver": null,
+        "/assign/h1/2/minecraft/driver_until": null,
+        "/view/minecraft/borrow/lent": 1,
+        "/view/minecraft/tiles/1/borrowed": null,
+        "/view/minecraft/tiles/1/forked_from": null,
+        "/view/minecraft/tiles/1/last_relaunch/by": "return:minecraft-claim-1"
+      },
+      "note": "the borrow ends: the server is reset for the next viewer"
+    },
+    {
+      "after": 47,
+      "checks": {
+        "/receipts/c6/reason": "your last server was returned 1 s ago; borrow again in 59 s"
+      }
+    },
+    {
+      "after": 48,
+      "checks": {
+        "/assign/h1/1/generation": 4,
+        "/receipts/x1/outcome": "committed",
+        "/view/minecraft/tiles/0/last_relaunch/by": "return:minecraft-claim-2"
+      }
+    },
+    {
+      "after": 49,
+      "checks": {
+        "/receipts/x2/reason": "this viewer holds no server"
+      }
+    },
+    {
+      "after": 50,
+      "checks": {
+        "/receipts/c7/outcome": "committed"
+      }
+    },
+    {
+      "after": 51,
+      "checks": {
+        "/assign/h2/0/generation": 3,
+        "/view/minecraft/tiles/3/borrowed": null,
+        "/view/minecraft/tiles/3/last_relaunch/by": "return:minecraft-claim-3"
+      },
+      "note": "a viewer that leaves gives its server back"
+    },
+    {
+      "after": 55,
+      "checks": {
+        "/receipts/c8/reason": "mc-4 is leaving the fleet"
+      }
+    },
+    {
+      "after": 56,
+      "checks": {
+        "/receipts/r9/reason": "mc-4 is on a draining host"
+      }
+    },
+    {
+      "after": 57,
+      "checks": {
+        "/assign/h1/3": null,
+        "/view/minecraft/image_aspect": 3.0,
+        "/view/minecraft/tiles/1/slot": "mc-2",
+        "/view/minecraft/tiles/2/slot": "mc-4"
+      },
+      "note": "a hello with fewer servers drops the rest"
+    },
+    {
+      "after": 58,
+      "checks": {
+        "/view/minecraft/server": "Pumpkin 0000000 (Java Edition 26.2)",
+        "/view/minecraft/tiles/0/slot": "mc-4"
+      }
+    },
+    {
+      "after": 59,
+      "checks": {
+        "/view/minecraft": null
+      },
+      "note": "no servers, no minecraft in the state"
+    },
+    {
+      "after": 60,
+      "checks": {
+        "/view/minecraft/last_fork/to": "mc-2",
+        "/view/minecraft/tiles/0/phase": "pending",
+        "/view/minecraft/tiles/0/slot": "mc-1",
+        "/view/minecraft/tiles/1/slot": "mc-2"
+      },
+      "note": "a host that comes back gets the lowest free numbers"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "slot": "mc-2"
+        },
+        "at": 3000,
+        "id": "r1",
+        "name": "minecraft_reset",
+        "outcome": "committed",
+        "summary": "reset mc-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "mc-3"
+        },
+        "at": 3500,
+        "id": "r2",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "one reset per 2 s per client",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3600,
+        "id": "r3",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "args must name a slot or say all",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-9"
+        },
+        "at": 3700,
+        "id": "r4",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "no server \"mc-9\"",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "all": true,
+          "slot": "mc-3"
+        },
+        "at": 3800,
+        "id": "r4b",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "args must name a slot or say all",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "keys": [
+            "forward"
+          ],
+          "slot": "mc-3"
+        },
+        "at": 3850,
+        "id": "r4c",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "args.keys is not accepted",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "all": "yes"
+        },
+        "at": 3900,
+        "id": "r4d",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "args.all must be true or false",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": 2
+        },
+        "at": 3950,
+        "id": "r4e",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "args.slot must be a server id",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "into": "mc-3",
+          "slot": "mc-1"
+        },
+        "at": 6500,
+        "id": "f0",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "args.into is not accepted",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 6600,
+        "id": "f0b",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "args.slot must be a server id",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-1"
+        },
+        "at": 7000,
+        "id": "f1",
+        "name": "minecraft_fork",
+        "outcome": "committed",
+        "summary": "fork mc-1 into mc-2",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-3"
+        },
+        "at": 8000,
+        "id": "f2",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "one fork per 10 s per client",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-2"
+        },
+        "at": 8000,
+        "id": "f3",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "mc-2 is not running",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "mc-9"
+        },
+        "at": 8100,
+        "id": "f4",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "no server \"mc-9\"",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "slot": "mc-4"
+        },
+        "at": 10500,
+        "id": "f5",
+        "name": "minecraft_fork",
+        "outcome": "refused",
+        "summary": "no server on mc-4's host can take a copy",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "slot": "mc-3"
+        },
+        "at": 11000,
+        "id": "f6",
+        "name": "minecraft_fork",
+        "outcome": "committed",
+        "summary": "fork mc-3 into mc-1",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "mc-1"
+        },
+        "at": 11500,
+        "id": "r5",
+        "name": "minecraft_reset",
+        "outcome": "committed",
+        "summary": "reset mc-1",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "slot": "mc-2"
+        },
+        "at": 13000,
+        "id": "c1",
+        "name": "claim_minecraft",
+        "outcome": "committed",
+        "summary": "minecraft-claim-1 on mc-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "mc-3",
+          "viewer": "v3"
+        },
+        "at": 13050,
+        "id": "c1b",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "args.viewer is not accepted",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 13100,
+        "id": "c2",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "one server per client at a time",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "slot": "mc-2"
+        },
+        "at": 13200,
+        "id": "r6",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "mc-2 is lent to a viewer",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-1"
+        },
+        "at": 17000,
+        "id": "f7",
+        "name": "minecraft_fork",
+        "outcome": "committed",
+        "summary": "fork mc-1 into mc-3",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-3"
+        },
+        "at": 17100,
+        "id": "c3",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "mc-3 is not running",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-2"
+        },
+        "at": 17200,
+        "id": "c3b",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "mc-2 is lent to another viewer",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 17300,
+        "id": "c4",
+        "name": "claim_minecraft",
+        "outcome": "committed",
+        "summary": "minecraft-claim-2 on mc-1",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 17400,
+        "id": "c5",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "2 of 2 servers are already lent; the next comes back in 26 s",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "all": true
+        },
+        "at": 18000,
+        "id": "r7",
+        "name": "minecraft_reset",
+        "outcome": "committed",
+        "summary": "reset all 2 servers",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "all": true
+        },
+        "at": 20000,
+        "id": "r8",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "one reset all per 10 s per client",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "claim": "minecraft-claim-1"
+        },
+        "at": 20100,
+        "id": "x0",
+        "name": "release_minecraft",
+        "outcome": "refused",
+        "summary": "\"minecraft-claim-1\" is not this viewer's server",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "claim": "minecraft-claim-2",
+          "now": true
+        },
+        "at": 20200,
+        "id": "x0b",
+        "name": "release_minecraft",
+        "outcome": "refused",
+        "summary": "args.now is not accepted",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 44000,
+        "id": "c6",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "your last server was returned 1 s ago; borrow again in 59 s",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 45000,
+        "id": "x1",
+        "name": "release_minecraft",
+        "outcome": "committed",
+        "summary": "release server",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 45100,
+        "id": "x2",
+        "name": "release_minecraft",
+        "outcome": "refused",
+        "summary": "this viewer holds no server",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "slot": "mc-4"
+        },
+        "at": 46000,
+        "id": "c7",
+        "name": "claim_minecraft",
+        "outcome": "committed",
+        "summary": "minecraft-claim-3 on mc-4",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "slot": "mc-4"
+        },
+        "at": 47200,
+        "id": "c8",
+        "name": "claim_minecraft",
+        "outcome": "refused",
+        "summary": "mc-4 is leaving the fleet",
+        "viewer": "v4"
+      },
+      {
+        "args": {
+          "slot": "mc-4"
+        },
+        "at": 47300,
+        "id": "r9",
+        "name": "minecraft_reset",
+        "outcome": "refused",
+        "summary": "mc-4 is on a draining host",
+        "viewer": "v4"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 6,
+      "restores_last_hour": 6,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [
+      {
+        "host": "h1",
+        "kind": "host_reclaimed",
+        "retiling": true,
+        "since": 49000
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [
+        {
+          "arch": "aarch64",
+          "draining": false,
+          "gpus": [],
+          "name": "h2"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 47100,
+        "last_wake": null,
+        "sleep_without_arrival_at": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 1515,
+      "from_t": 50.5,
+      "generation": 2
+    },
+    "minecraft": {
+      "borrow": {
+        "cap": 1,
+        "lent": 0,
+        "next_return_at": null
+      },
+      "claim_secs": 30,
+      "image_aspect": 2.0,
+      "last_fork": {
+        "by": "viewer:v2",
+        "clicked_at": 7000,
+        "first_chunk_at": 9800,
+        "from": "mc-1",
+        "restore_ms": 1100,
+        "snapshot_ms": 640,
+        "to": "mc-2",
+        "total_ms": 2800
+      },
+      "last_reset_all": {
+        "by": "viewer:v3",
+        "clicked_at": 18000,
+        "servers": 2
+      },
+      "server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
+      "tiles": [
+        {
+          "borrowed": null,
+          "error": null,
+          "failure": null,
+          "forked_from": null,
+          "fps": null,
+          "frame_url": null,
+          "frame_url_v4": null,
+          "generation": 1,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h2",
+          "id": "mc:1",
+          "join": null,
+          "last_relaunch": null,
+          "phase": "pending",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "slot": "mc-1",
+          "vm": null
+        },
+        {
+          "borrowed": null,
+          "error": null,
+          "failure": null,
+          "forked_from": null,
+          "fps": null,
+          "frame_url": null,
+          "frame_url_v4": null,
+          "generation": 1,
+          "gpu": null,
+          "gpu_stats": null,
+          "half": "fcvm",
+          "host": "h2",
+          "id": "mc:2",
+          "join": null,
+          "last_relaunch": null,
+          "phase": "pending",
+          "place": null,
+          "previous_rect": null,
+          "rect": {
+            "h": 1.0,
+            "w": 0.5,
+            "x": 0.5,
+            "y": 0.0
+          },
+          "slot": "mc-2",
+          "vm": null
+        }
+      ]
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 61000,
+      "closes_at": 69000,
+      "holding": "ridges",
+      "holding_label": "Across the ridges",
+      "leading": "ridgeline",
+      "next": "peak-close",
+      "next_hold_at": 44000,
+      "next_label": "Circling the peak",
+      "opened_at": 43000,
+      "targets": [
+        {
+          "arrive_at": 95000,
+          "id": "ridgeline",
+          "label": "Along the ridgeline",
+          "votes": 0
+        },
+        {
+          "arrive_at": 81000,
+          "id": "peak-lake",
+          "label": "The peak over the lake",
+          "votes": 0
+        },
+        {
+          "arrive_at": 95000,
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -85.416255,
+            0.959022,
+            -97.319808
+          ],
+          "pos": [
+            -30.821399,
+            2.183617,
+            -71.591669
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -82.854021,
+            2.196468,
+            -107.041988
+          ],
+          "pos": [
+            -32.312498,
+            2.237366,
+            -71.390428
+          ],
+          "t": 31.0
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -78.550373,
+            2.464257,
+            -115.214027
+          ],
+          "pos": [
+            -33.503134,
+            2.327439,
+            -71.221981
+          ],
+          "t": 32.0
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -74.295133,
+            2.380238,
+            -120.639428
+          ],
+          "pos": [
+            -34.347855,
+            2.381619,
+            -71.066239
+          ],
+          "t": 33.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.3,
+            2.4,
+            -122.65
+          ],
+          "pos": [
+            -34.8,
+            2.4,
+            -70.9
+          ],
+          "t": 34.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.54,
+            2.4,
+            -122.47
+          ],
+          "pos": [
+            -35.04,
+            2.4,
+            -70.72
+          ],
+          "t": 35.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.78,
+            2.4,
+            -122.29
+          ],
+          "pos": [
+            -35.28,
+            2.4,
+            -70.54
+          ],
+          "t": 36.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.02,
+            2.4,
+            -122.11
+          ],
+          "pos": [
+            -35.52,
+            2.4,
+            -70.36
+          ],
+          "t": 37.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.26,
+            2.4,
+            -121.93
+          ],
+          "pos": [
+            -35.76,
+            2.4,
+            -70.18
+          ],
+          "t": 38.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.5,
+            2.4,
+            -121.75
+          ],
+          "pos": [
+            -36.0,
+            2.4,
+            -70.0
+          ],
+          "t": 39.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.74,
+            2.4,
+            -121.57
+          ],
+          "pos": [
+            -36.24,
+            2.4,
+            -69.82
+          ],
+          "t": 40.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.98,
+            2.4,
+            -121.39
+          ],
+          "pos": [
+            -36.48,
+            2.4,
+            -69.64
+          ],
+          "t": 41.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.22,
+            2.4,
+            -121.21
+          ],
+          "pos": [
+            -36.72,
+            2.4,
+            -69.46
+          ],
+          "t": 42.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.46,
+            2.4,
+            -121.03
+          ],
+          "pos": [
+            -36.96,
+            2.4,
+            -69.28
+          ],
+          "t": 43.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.7,
+            2.4,
+            -120.85
+          ],
+          "pos": [
+            -37.2,
+            2.4,
+            -69.1
+          ],
+          "t": 44.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.94,
+            2.4,
+            -120.67
+          ],
+          "pos": [
+            -37.44,
+            2.4,
+            -68.92
+          ],
+          "t": 45.0
+        },
+        {
+          "fov_deg": 60.327148,
+          "look": [
+            -77.11842,
+            2.23251,
+            -119.018816
+          ],
+          "pos": [
+            -38.356423,
+            2.41974,
+            -68.95036
+          ],
+          "t": 46.0
+        },
+        {
+          "fov_deg": 61.101563,
+          "look": [
+            -80.484443,
+            1.794606,
+            -116.275421
+          ],
+          "pos": [
+            -40.375662,
+            2.46264,
+            -69.454525
+          ],
+          "t": 47.0
+        },
+        {
+          "fov_deg": 62.047852,
+          "look": [
+            -83.086087,
+            1.361201,
+            -114.00113
+          ],
+          "pos": [
+            -43.152822,
+            2.501514,
+            -70.490755
+          ],
+          "t": 48.0
+        },
+        {
+          "fov_deg": 62.9375,
+          "look": [
+            -83.685348,
+            1.216783,
+            -113.450391
+          ],
+          "pos": [
+            -46.383202,
+            2.571875,
+            -72.088817
+          ],
+          "t": 49.0
+        },
+        {
+          "fov_deg": 63.588867,
+          "look": [
+            -81.223742,
+            1.264893,
+            -115.338908
+          ],
+          "pos": [
+            -49.802296,
+            2.655127,
+            -74.249985
+          ],
+          "t": 50.0
+        },
+        {
+          "fov_deg": 63.867188,
+          "look": [
+            -77.353148,
+            1.403058,
+            -117.601945
+          ],
+          "pos": [
+            -53.185795,
+            2.748047,
+            -76.947043
+          ],
+          "t": 51.0
+        },
+        {
+          "fov_deg": 63.68457,
+          "look": [
+            -73.442856,
+            1.559586,
+            -119.09856
+          ],
+          "pos": [
+            -56.349587,
+            2.847412,
+            -80.124279
+          ],
+          "t": 52.0
+        },
+        {
+          "fov_deg": 63.0,
+          "look": [
+            -69.799735,
+            1.733543,
+            -119.827188
+          ],
+          "pos": [
+            -59.149753,
+            2.95,
+            -83.697492
+          ],
+          "t": 53.0
+        },
+        {
+          "fov_deg": 61.819336,
+          "look": [
+            -66.686205,
+            1.922518,
+            -119.914012
+          ],
+          "pos": [
+            -61.482572,
+            3.052588,
+            -87.553985
+          ],
+          "t": 54.0
+        },
+        {
+          "fov_deg": 60.195313,
+          "look": [
+            -64.257083,
+            2.122113,
+            -119.574577
+          ],
+          "pos": [
+            -63.284517,
+            3.151953,
+            -91.552572
+          ],
+          "t": 55.0
+        },
+        {
+          "fov_deg": 58.227539,
+          "look": [
+            -62.526631,
+            2.325411,
+            -119.047978
+          ],
+          "pos": [
+            -64.532258,
+            3.244873,
+            -95.523573
+          ],
+          "t": 56.0
+        },
+        {
+          "fov_deg": 56.0625,
+          "look": [
+            -60.797082,
+            2.518092,
+            -118.40086
+          ],
+          "pos": [
+            -65.242659,
+            3.328125,
+            -99.268816
+          ],
+          "t": 57.0
+        },
+        {
+          "fov_deg": 53.893555,
+          "look": [
+            -58.688704,
+            2.677338,
+            -117.369439
+          ],
+          "pos": [
+            -65.472783,
+            3.398486,
+            -102.561635
+          ],
+          "t": 58.0
+        },
+        {
+          "fov_deg": 51.960938,
+          "look": [
+            -57.17625,
+            2.797557,
+            -116.165962
+          ],
+          "pos": [
+            -65.319886,
+            3.452734,
+            -105.146875
+          ],
+          "t": 59.0
+        },
+        {
+          "fov_deg": 50.551758,
+          "look": [
+            -56.363585,
+            2.874714,
+            -115.206179
+          ],
+          "pos": [
+            -64.92142,
+            3.487646,
+            -106.740885
+          ],
+          "t": 60.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -64.455034,
+            3.5,
+            -107.031523
+          ],
+          "t": 61.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -64.010994,
+            3.5,
+            -106.571585
+          ],
+          "t": 62.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -63.541972,
+            3.5,
+            -106.137151
+          ],
+          "t": 63.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -63.04943,
+            3.5,
+            -105.729576
+          ],
+          "t": 64.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.534904,
+            3.5,
+            -105.350132
+          ],
+          "t": 65.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.0,
+            3.5,
+            -105.0
+          ],
+          "t": 66.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -61.446385,
+            3.5,
+            -104.680274
+          ],
+          "t": 67.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -60.875785,
+            3.5,
+            -104.391949
+          ],
+          "t": 68.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -60.289981,
+            3.5,
+            -104.135926
+          ],
+          "t": 69.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -59.690798,
+            3.5,
+            -103.913003
+          ],
+          "t": 70.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -59.080106,
+            3.5,
+            -103.723874
+          ],
+          "t": 71.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -58.464291,
+            3.5,
+            -103.551849
+          ],
+          "t": 72.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.735,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7122,
+          "t": 44.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.6,
+          "rays": 1.0,
+          "snow_line_km": 0.7482,
+          "t": 61.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 3,
+      "count": 3
+    }
+  }
+}

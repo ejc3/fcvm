@@ -19,6 +19,7 @@ pub mod ec2_aws;
 pub mod ecs;
 pub mod hosts;
 pub mod live;
+pub mod minecraft_log;
 pub mod poster;
 pub mod potato_log;
 pub mod scene_token;
@@ -275,12 +276,14 @@ impl Actor {
         let before = self.state.version;
         let marks = wake_log::Marks::of(&self.state);
         let potato_marks = potato_log::Marks::of(&self.state);
+        let minecraft_marks = minecraft_log::Marks::of(&self.state);
         let was_asleep = self.state.fleet.power.state == "asleep";
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
         self.name_launches();
         wake_log::log(&wake_log::notes(&marks, &self.state, at));
         potato_log::log_rounds(&potato_log::notes(&potato_marks, &self.state));
+        minecraft_log::log(&minecraft_log::notes(&minecraft_marks, &self.state));
         let f = &self.state.fleet;
         if !was_asleep && f.power.state == "asleep" {
             tracing::info!(

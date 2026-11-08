@@ -1,0 +1,706 @@
+{
+ "paper": {
+  "cores": 4,
+  "bots_per_server": 3,
+  "held_servers": 10,
+  "held_servers_per_core": 2.5,
+  "held_tps_min": 19.793270288102047,
+  "held_vm_cores_used": 2.189145537086071,
+  "first_failed_servers": 11,
+  "first_failed_tps_min": 19.338203695745595,
+  "first_failed_servers_below": 3,
+  "mem_per_server_mib_cgroup": 1350.4937220982142,
+  "mem_per_server_mib_pss": 1300.8038853236608,
+  "mem_per_server_mib_anon": 1300.7179129464284,
+  "runs_per_count": {
+   "4": [
+    true
+   ],
+   "8": [
+    true,
+    true,
+    true
+   ],
+   "10": [
+    true,
+    true,
+    true
+   ],
+   "11": [
+    false,
+    false,
+    true
+   ],
+   "12": [
+    false,
+    false,
+    true
+   ]
+  },
+  "steps": [
+   {
+    "servers": 4,
+    "holds": true,
+    "tps_min": 19.957866725801086,
+    "tps_median_of_mins": 19.98001998001998,
+    "servers_below": 0,
+    "vm_cores_used": 0.8593836221971656,
+    "cgroup_mem_mib": 19222.796875,
+    "cgroup_anon_mib": 5211.7578125,
+    "firecracker_pss_mib": 5896.4853515625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 8,
+    "holds": true,
+    "tps_min": 19.739006470007677,
+    "tps_median_of_mins": 19.966722129783694,
+    "servers_below": 0,
+    "vm_cores_used": 1.9086711627448851,
+    "cgroup_mem_mib": 24679.88671875,
+    "cgroup_anon_mib": 10447.171875,
+    "firecracker_pss_mib": 11134.330078125,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 8,
+    "holds": true,
+    "tps_min": 19.968937208786333,
+    "tps_median_of_mins": 19.97780244173141,
+    "servers_below": 0,
+    "vm_cores_used": 1.5522744786015201,
+    "cgroup_mem_mib": 24548.90234375,
+    "cgroup_anon_mib": 10310.46484375,
+    "firecracker_pss_mib": 10999.8701171875,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 8,
+    "holds": true,
+    "tps_min": 19.957866725801086,
+    "tps_median_of_mins": 19.982238010657195,
+    "servers_below": 0,
+    "vm_cores_used": 1.6342509982878237,
+    "cgroup_mem_mib": 24580.2421875,
+    "cgroup_anon_mib": 10350.96875,
+    "firecracker_pss_mib": 11037.6552734375,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 10,
+    "holds": true,
+    "tps_min": 19.793270288102047,
+    "tps_median_of_mins": 19.97115277931876,
+    "servers_below": 0,
+    "vm_cores_used": 2.189145537086071,
+    "cgroup_mem_mib": 27311.98046875,
+    "cgroup_anon_mib": 13007.9296875,
+    "firecracker_pss_mib": 13692.6513671875,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 10,
+    "holds": true,
+    "tps_min": 19.81287837094111,
+    "tps_median_of_mins": 19.960079840319363,
+    "servers_below": 0,
+    "vm_cores_used": 2.625431347106648,
+    "cgroup_mem_mib": 27464.91015625,
+    "cgroup_anon_mib": 13137.41015625,
+    "firecracker_pss_mib": 13825.73046875,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 10,
+    "holds": true,
+    "tps_min": 19.957866725801086,
+    "tps_median_of_mins": 19.97780244173141,
+    "servers_below": 0,
+    "vm_cores_used": 2.297576988411329,
+    "cgroup_mem_mib": 27429.390625,
+    "cgroup_anon_mib": 13069.4140625,
+    "firecracker_pss_mib": 13755.0166015625,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 11,
+    "holds": false,
+    "tps_min": 19.45945945945946,
+    "tps_median_of_mins": 19.96229344571365,
+    "servers_below": 1,
+    "vm_cores_used": 2.355103789962962,
+    "cgroup_mem_mib": 28585.6640625,
+    "cgroup_anon_mib": 14247.1640625,
+    "firecracker_pss_mib": 14932.2822265625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 11,
+    "holds": false,
+    "tps_min": 19.338203695745595,
+    "tps_median_of_mins": 19.949019173223984,
+    "servers_below": 3,
+    "vm_cores_used": 2.554754460036785,
+    "cgroup_mem_mib": 28571.92578125,
+    "cgroup_anon_mib": 14197.93359375,
+    "firecracker_pss_mib": 14879.583984375,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 11,
+    "holds": true,
+    "tps_min": 19.54397394136808,
+    "tps_median_of_mins": 19.968937208786333,
+    "servers_below": 0,
+    "vm_cores_used": 2.4466289246876505,
+    "cgroup_mem_mib": 28628.52734375,
+    "cgroup_anon_mib": 14230.66796875,
+    "firecracker_pss_mib": 14916.4482421875,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 12,
+    "holds": false,
+    "tps_min": 19.455252918287936,
+    "tps_median_of_mins": 19.957866725801086,
+    "servers_below": 1,
+    "vm_cores_used": 2.5145129790854552,
+    "cgroup_mem_mib": 30033.19921875,
+    "cgroup_anon_mib": 15602.03515625,
+    "firecracker_pss_mib": 16285.248046875,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 12,
+    "holds": false,
+    "tps_min": 16.738152526414897,
+    "tps_median_of_mins": 19.77804636853093,
+    "servers_below": 4,
+    "vm_cores_used": 2.7428703256326186,
+    "cgroup_mem_mib": 29891.82421875,
+    "cgroup_anon_mib": 15466.98046875,
+    "firecracker_pss_mib": 16155.0712890625,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 12,
+    "holds": true,
+    "tps_min": 19.935762542917267,
+    "tps_median_of_mins": 19.975585395627565,
+    "servers_below": 0,
+    "vm_cores_used": 2.6549354327605315,
+    "cgroup_mem_mib": 29903.33203125,
+    "cgroup_anon_mib": 15457.00390625,
+    "firecracker_pss_mib": 16179.1591796875,
+    "bisect": null,
+    "confirm": 3
+   }
+  ],
+  "restore_first_chunk_ms": {
+   "n": 10,
+   "p50": 1175.0667049996082,
+   "p90": 1186.1434105004264,
+   "max": 1214.0443510006662
+  },
+  "probe_join_ms": {
+   "n": 10,
+   "p50": 444.3812399995295,
+   "p90": 487.31340200038176,
+   "max": 488.7569570000778
+  },
+  "restore_failed": 0,
+  "fork_failed": 0,
+  "fork_snapshot_ms": {
+   "n": 5,
+   "p50": 864.8019029997158,
+   "p90": 875.5274433999148,
+   "max": 880.9210489998804
+  },
+  "fork_restore_first_chunk_ms": {
+   "n": 5,
+   "p50": 1148.8854669996726,
+   "p90": 1197.033535200353,
+   "max": 1212.273558000561
+  },
+  "fork_total_ms": {
+   "n": 5,
+   "p50": 1990.5490080009258,
+   "p90": 2062.4457650001204,
+   "max": 2093.1946070004415
+  },
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 18.931426167437948
+ },
+ "pumpkin": {
+  "cores": 4,
+  "bots_per_server": 3,
+  "held_servers": 24,
+  "held_servers_per_core": 6.0,
+  "held_tps_min": 19.605707439276767,
+  "held_vm_cores_used": 3.24848995636877,
+  "first_failed_servers": 25,
+  "first_failed_tps_min": 19.03553299492386,
+  "first_failed_servers_below": 2,
+  "mem_per_server_mib_cgroup": 392.0186539989407,
+  "mem_per_server_mib_pss": 348.55021848516947,
+  "mem_per_server_mib_anon": 348.0835540254237,
+  "runs_per_count": {
+   "4": [
+    true
+   ],
+   "8": [
+    true
+   ],
+   "16": [
+    true,
+    true,
+    true
+   ],
+   "24": [
+    true,
+    true,
+    true
+   ],
+   "25": [
+    true,
+    false,
+    false
+   ],
+   "26": [
+    true,
+    true,
+    true
+   ]
+  },
+  "steps": [
+   {
+    "servers": 4,
+    "holds": true,
+    "tps_min": 19.957866725801086,
+    "tps_median_of_mins": 19.97780244173141,
+    "servers_below": 0,
+    "vm_cores_used": 0.41210149902345533,
+    "cgroup_mem_mib": 15157.34375,
+    "cgroup_anon_mib": 1285.296875,
+    "firecracker_pss_mib": 1498.9580078125,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 8,
+    "holds": true,
+    "tps_min": 19.94459833795014,
+    "tps_median_of_mins": 19.97780244173141,
+    "servers_below": 0,
+    "vm_cores_used": 0.950372969301827,
+    "cgroup_mem_mib": 16535.890625,
+    "cgroup_anon_mib": 2564.3046875,
+    "firecracker_pss_mib": 2777.8515625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 16,
+    "holds": true,
+    "tps_min": 19.907100199071003,
+    "tps_median_of_mins": 19.97115277931876,
+    "servers_below": 0,
+    "vm_cores_used": 1.9778657761740939,
+    "cgroup_mem_mib": 19455.8046875,
+    "cgroup_anon_mib": 5308.625,
+    "firecracker_pss_mib": 5516.203125,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 16,
+    "holds": true,
+    "tps_min": 19.949019173223984,
+    "tps_median_of_mins": 19.97115277931876,
+    "servers_below": 0,
+    "vm_cores_used": 1.9863464915111293,
+    "cgroup_mem_mib": 19447.44140625,
+    "cgroup_anon_mib": 5296.00390625,
+    "firecracker_pss_mib": 5506.796875,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 16,
+    "holds": true,
+    "tps_min": 19.92252351964582,
+    "tps_median_of_mins": 19.968937208786333,
+    "servers_below": 0,
+    "vm_cores_used": 2.001760123881307,
+    "cgroup_mem_mib": 19408.65234375,
+    "cgroup_anon_mib": 5260.578125,
+    "firecracker_pss_mib": 5468.6181640625,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 24,
+    "holds": true,
+    "tps_min": 19.867549668874172,
+    "tps_median_of_mins": 19.96229344571365,
+    "servers_below": 0,
+    "vm_cores_used": 3.1708574912099405,
+    "cgroup_mem_mib": 23190.0390625,
+    "cgroup_anon_mib": 8335.4921875,
+    "firecracker_pss_mib": 8581.404296875,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 24,
+    "holds": true,
+    "tps_min": 19.605707439276767,
+    "tps_median_of_mins": 19.9468085106383,
+    "servers_below": 0,
+    "vm_cores_used": 3.24848995636877,
+    "cgroup_mem_mib": 23022.23046875,
+    "cgroup_anon_mib": 8237.3671875,
+    "firecracker_pss_mib": 8462.6474609375,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 24,
+    "holds": true,
+    "tps_min": 19.904898816764348,
+    "tps_median_of_mins": 19.966722129783694,
+    "servers_below": 0,
+    "vm_cores_used": 3.116128260663087,
+    "cgroup_mem_mib": 23150.859375,
+    "cgroup_anon_mib": 8296.12109375,
+    "firecracker_pss_mib": 8531.064453125,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 25,
+    "holds": true,
+    "tps_min": 19.891700740413306,
+    "tps_median_of_mins": 19.96229344571365,
+    "servers_below": 0,
+    "vm_cores_used": 3.2942241409482604,
+    "cgroup_mem_mib": 23684.28515625,
+    "cgroup_anon_mib": 8746.2265625,
+    "firecracker_pss_mib": 8972.9814453125,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 25,
+    "holds": false,
+    "tps_min": 19.069816717872655,
+    "tps_median_of_mins": 19.949019173223984,
+    "servers_below": 1,
+    "vm_cores_used": 3.220312938718753,
+    "cgroup_mem_mib": 24242.23046875,
+    "cgroup_anon_mib": 8986.6015625,
+    "firecracker_pss_mib": 9219.6689453125,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 25,
+    "holds": false,
+    "tps_min": 19.03553299492386,
+    "tps_median_of_mins": 19.955654101995567,
+    "servers_below": 2,
+    "vm_cores_used": 3.1907742376423305,
+    "cgroup_mem_mib": 23369.08984375,
+    "cgroup_anon_mib": 8522.60546875,
+    "firecracker_pss_mib": 8748.689453125,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 26,
+    "holds": true,
+    "tps_min": 19.84345717120494,
+    "tps_median_of_mins": 19.966722129783694,
+    "servers_below": 0,
+    "vm_cores_used": 3.403563866791075,
+    "cgroup_mem_mib": 24146.9609375,
+    "cgroup_anon_mib": 9065.546875,
+    "firecracker_pss_mib": 9292.169921875,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 26,
+    "holds": true,
+    "tps_min": 19.773700977699658,
+    "tps_median_of_mins": 19.955654101995567,
+    "servers_below": 0,
+    "vm_cores_used": 3.4126255063642104,
+    "cgroup_mem_mib": 24146.67578125,
+    "cgroup_anon_mib": 9109.87109375,
+    "firecracker_pss_mib": 9337.466796875,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 26,
+    "holds": true,
+    "tps_min": 19.784568036931194,
+    "tps_median_of_mins": 19.957866725801086,
+    "servers_below": 0,
+    "vm_cores_used": 3.3241555039258706,
+    "cgroup_mem_mib": 24011.58203125,
+    "cgroup_anon_mib": 8996.75390625,
+    "firecracker_pss_mib": 9222.3466796875,
+    "bisect": null,
+    "confirm": 3
+   }
+  ],
+  "restore_first_chunk_ms": {
+   "n": 10,
+   "p50": 869.8832330005644,
+   "p90": 896.8002243003866,
+   "max": 965.4784530002871
+  },
+  "probe_join_ms": {
+   "n": 10,
+   "p50": 136.20083449995946,
+   "p90": 172.4405484998897,
+   "max": 175.40847399959603
+  },
+  "restore_failed": 0,
+  "fork_failed": 0,
+  "fork_snapshot_ms": {
+   "n": 5,
+   "p50": 372.6261309993788,
+   "p90": 377.3718469996311,
+   "max": 377.49708899991674
+  },
+  "fork_restore_first_chunk_ms": {
+   "n": 5,
+   "p50": 747.8937779997068,
+   "p90": 801.5206762001981,
+   "max": 809.6472450006331
+  },
+  "fork_total_ms": {
+   "n": 5,
+   "p50": 1116.1611169991374,
+   "p90": 1172.9695595997327,
+   "max": 1177.2727280003892
+  },
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 19.997778024663926
+ },
+ "vanilla": {
+  "cores": 4,
+  "bots_per_server": 3,
+  "held_servers": 6,
+  "held_servers_per_core": 1.5,
+  "held_tps_min": 19.874130506790326,
+  "held_vm_cores_used": 1.6015706482614651,
+  "first_failed_servers": 7,
+  "first_failed_tps_min": 16.308225461217003,
+  "first_failed_servers_below": 1,
+  "mem_per_server_mib_cgroup": 1401.740234375,
+  "mem_per_server_mib_pss": 1349.63720703125,
+  "mem_per_server_mib_anon": 1348.58203125,
+  "runs_per_count": {
+   "4": [
+    true
+   ],
+   "6": [
+    true,
+    true,
+    true
+   ],
+   "7": [
+    true,
+    true,
+    false
+   ],
+   "8": [
+    false,
+    false,
+    false
+   ]
+  },
+  "steps": [
+   {
+    "servers": 4,
+    "holds": true,
+    "tps_min": 19.815059445178335,
+    "tps_median_of_mins": 19.984456533807037,
+    "servers_below": 0,
+    "vm_cores_used": 0.9043320733859243,
+    "cgroup_mem_mib": 19229.76171875,
+    "cgroup_anon_mib": 5229.93359375,
+    "firecracker_pss_mib": 5623.806640625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 6,
+    "holds": true,
+    "tps_min": 19.957866725801086,
+    "tps_median_of_mins": 19.97336884154461,
+    "servers_below": 0,
+    "vm_cores_used": 1.5118600924222825,
+    "cgroup_mem_mib": 21964.1796875,
+    "cgroup_anon_mib": 7871.10546875,
+    "firecracker_pss_mib": 8269.306640625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 6,
+    "holds": true,
+    "tps_min": 19.929140832595216,
+    "tps_median_of_mins": 19.975585395627565,
+    "servers_below": 0,
+    "vm_cores_used": 1.5707251798063522,
+    "cgroup_mem_mib": 22038.1640625,
+    "cgroup_anon_mib": 7924.62109375,
+    "firecracker_pss_mib": 8320.439453125,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 6,
+    "holds": true,
+    "tps_min": 19.874130506790326,
+    "tps_median_of_mins": 19.964507542147295,
+    "servers_below": 0,
+    "vm_cores_used": 1.6015706482614651,
+    "cgroup_mem_mib": 22033.2421875,
+    "cgroup_anon_mib": 7927.09765625,
+    "firecracker_pss_mib": 8323.0810546875,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 7,
+    "holds": true,
+    "tps_min": 19.9468085106383,
+    "tps_median_of_mins": 19.960079840319363,
+    "servers_below": 0,
+    "vm_cores_used": 1.8870125600403918,
+    "cgroup_mem_mib": 23347.9453125,
+    "cgroup_anon_mib": 9249.75390625,
+    "firecracker_pss_mib": 9646.08203125,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 7,
+    "holds": true,
+    "tps_min": 19.904898816764348,
+    "tps_median_of_mins": 19.93134758055586,
+    "servers_below": 0,
+    "vm_cores_used": 1.969228999633159,
+    "cgroup_mem_mib": 23350.41796875,
+    "cgroup_anon_mib": 9237.69140625,
+    "firecracker_pss_mib": 9634.9443359375,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 7,
+    "holds": false,
+    "tps_min": 16.308225461217003,
+    "tps_median_of_mins": 19.968937208786333,
+    "servers_below": 1,
+    "vm_cores_used": 1.8209879697590234,
+    "cgroup_mem_mib": 23299.1953125,
+    "cgroup_anon_mib": 9154.703125,
+    "firecracker_pss_mib": 9553.796875,
+    "bisect": null,
+    "confirm": 3
+   },
+   {
+    "servers": 8,
+    "holds": false,
+    "tps_min": 12.307692307692308,
+    "tps_median_of_mins": 19.81287837094111,
+    "servers_below": 3,
+    "vm_cores_used": 2.4576383592990756,
+    "cgroup_mem_mib": 24760.08203125,
+    "cgroup_anon_mib": 10605.5546875,
+    "firecracker_pss_mib": 11000.666015625,
+    "bisect": null,
+    "confirm": 1
+   },
+   {
+    "servers": 8,
+    "holds": false,
+    "tps_min": 0.0,
+    "tps_median_of_mins": 19.204096873999788,
+    "servers_below": 6,
+    "vm_cores_used": 2.8581333254672314,
+    "cgroup_mem_mib": 24848.23046875,
+    "cgroup_anon_mib": 10671.0078125,
+    "firecracker_pss_mib": 11062.1748046875,
+    "bisect": null,
+    "confirm": 2
+   },
+   {
+    "servers": 8,
+    "holds": false,
+    "tps_min": 18.244475978106628,
+    "tps_median_of_mins": 19.966722129783694,
+    "servers_below": 1,
+    "vm_cores_used": 2.6236691868235997,
+    "cgroup_mem_mib": 24824.87109375,
+    "cgroup_anon_mib": 10632.9765625,
+    "firecracker_pss_mib": 11026.7666015625,
+    "bisect": null,
+    "confirm": 3
+   }
+  ],
+  "restore_first_chunk_ms": {
+   "n": 10,
+   "p50": 775.262713000302,
+   "p90": 807.6889282001503,
+   "max": 860.6110900000203
+  },
+  "probe_join_ms": {
+   "n": 10,
+   "p50": 347.3253349998231,
+   "p90": 385.48910760046056,
+   "max": 397.5136980006937
+  },
+  "restore_failed": 0,
+  "fork_failed": 0,
+  "fork_snapshot_ms": {
+   "n": 5,
+   "p50": 1330.9645970002748,
+   "p90": 1343.2410245997744,
+   "max": 1349.7773250001046
+  },
+  "fork_restore_first_chunk_ms": {
+   "n": 5,
+   "p50": 911.9506600000022,
+   "p90": 981.3276917997428,
+   "max": 1015.4317249998712
+  },
+  "fork_total_ms": {
+   "n": 5,
+   "p50": 2216.9774390004022,
+   "p90": 2321.300566199352,
+   "max": 2348.8682989991503
+  },
+  "fork_source_kept_its_bots": true,
+  "fork_source_tps_after_min": 19.964507542147295
+ }
+}

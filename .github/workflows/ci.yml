@@ -239,6 +239,21 @@ jobs:
   # parsing, tile geometry, wire formats, TLS), and the phone app's scene tests.
   # They need g++, OpenSSL and the NVENC API header (and podman), no GPU. The GPU seam test (test_gpu.cpp) needs a GPU and
   # does not run here.
+  # The Minecraft tile program (fleet/minecraft): its own Cargo workspace on its own pinned
+  # toolchain (rust-toolchain.toml; rustup installs it), so lint and the matrix never build it.
+  fleet-minecraft:
+    name: Fleet Minecraft
+    needs: [changes]
+    if: ${{ needs.changes.outputs.fleet == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: mctile and density harness tests
+        run: make test-minecraft MINECRAFT_TARGET="$RUNNER_TEMP/mctile-target"
+
   fleet-renderer:
     name: Fleet Renderer
     needs: [changes]
@@ -1344,7 +1359,7 @@ jobs:
   # Summary on that commit finds none.
   summary:
     name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}
-    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-web, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:

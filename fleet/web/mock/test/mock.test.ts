@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
 import { MockCoordinator } from "../coordinator.ts";
 import { MockWindows } from "../windows.ts";
+import { MATERIALS } from "../../core/minecraft.ts";
 import { gridIn, mockLayout } from "../layout.ts";
 import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
@@ -30,6 +31,7 @@ beforeAll(async () => {
     refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
     phones: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 150, zoomGapMs: 300 },
     windows: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 300 },
+    minecraft: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 300, forkSnapshotMs: 100, port: 0, publicHost: "localhost", joinZone: "example.test" },
   });
   await coord.listen();
 });
@@ -1294,6 +1296,247 @@ describe("mock windows", () => {
   });
 });
 
+describe("mock minecraft", () => {
+  type McTile = { id: string; slot: string; phase: string; rect: unknown; host: string; frame_url: string; join: string | null; forked_from: string | null; generation: number; borrowed: { session: string; viewer: string } | null; last_relaunch: { by: string; clicked_at: number; first_frame_at: number | null; phases: Record<string, number> } };
+  type McState = { server: string; image_aspect: number; claim_secs: number; borrow: { cap: number; lent: number }; last_reset_all: { servers: number; by: string } | null; last_fork: Record<string, unknown> | null; tiles: McTile[] };
+  const mcNow = () => (coord.fleetState() as unknown as { minecraft: McState }).minecraft;
+  const tile = (slot: string) => mcNow().tiles.find((t) => t.slot === slot)!;
+  let seq = 0;
+  async function send(c: Awaited<ReturnType<typeof live>>, name: string, args: Record<string, unknown> = {}) {
+    const id = `mc-${++seq}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name, args }));
+    return (await c.next((m) => m["type"] === "receipt" && m["id"] === id)) as { outcome: string; reason?: string; version?: number };
+  }
+  const settle = async () => {
+    await admin("/mock/minecraft", { release_all: true });
+    await until(() => mcNow().tiles.every((t) => t.phase === "running"), 8000);
+  };
+  const token = async (c: Awaited<ReturnType<typeof live>>) => ((await c.next((m) => m["type"] === "admission")) as { direct: { value: string } }).direct.value;
+
+  type ViewSocket = { ws: WebSocket; msgs: Record<string, unknown>[]; next: (pred: (m: Record<string, unknown>) => boolean, ms?: number, from?: number) => Promise<Record<string, unknown>>; closed: Promise<number> };
+  /** A tile's view socket, sending `first` once open. */
+  function view(url: string, first: unknown): Promise<ViewSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      const msgs: Record<string, unknown>[] = [];
+      const waiters: { pred: (m: Record<string, unknown>) => boolean; res: (m: Record<string, unknown>) => void }[] = [];
+      const closed = new Promise<number>((r) => ws.on("close", (code) => r(code)));
+      ws.on("message", (d) => {
+        const m = JSON.parse(d.toString()) as Record<string, unknown>;
+        msgs.push(m);
+        for (const w of [...waiters]) if (w.pred(m)) { waiters.splice(waiters.indexOf(w), 1); w.res(m); }
+      });
+      const next = (pred: (m: Record<string, unknown>) => boolean, ms = 5000, from = 0) =>
+        new Promise<Record<string, unknown>>((res, rej) => {
+          const hit = msgs.slice(from).find(pred);
+          if (hit) return res(hit);
+          const to = setTimeout(() => rej(new Error("no such view message in time")), ms);
+          waiters.push({ pred, res: (m) => { clearTimeout(to); res(m); } });
+        });
+      ws.on("open", () => {
+        ws.send(JSON.stringify(first));
+        resolve({ ws, msgs, next, closed });
+      });
+      ws.on("error", reject);
+    });
+  }
+  let driveSeq = 1000;
+  const drive = (v: ViewSocket, over: Record<string, unknown> = {}) => {
+    const s = (over["seq"] as number | undefined) ?? ++driveSeq;
+    const from = v.msgs.length;
+    v.ws.send(JSON.stringify({ type: "drive", seq: s, keys: [], yaw: 0, pitch: 45, action: null, ...over }));
+    return v.next((m) => m["type"] === "drive_ack" && m["seq"] === s, 5000, from) as Promise<{ ok: boolean; reason?: string }>;
+  };
+  const driven = (m: Record<string, unknown>) => (m["players"] as { x: number; z: number; yaw: number; driven: boolean }[]).find((p) => p.driven);
+
+  it("lays the servers out as one row of square tiles, each with its view socket and join address, apart from the wall", async () => {
+    await settle();
+    const m = mcNow();
+    expect(m.server).toBe("Pumpkin 3ea7d281 (Java Edition 26.3)");
+    expect(m.tiles.map((t) => [t.id, t.slot])).toEqual([["mc:1", "mc-1"], ["mc:2", "mc-2"], ["mc:3", "mc-3"]]);
+    expect(m.image_aspect).toBe(3);
+    expect(m.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
+    expect(m.tiles.map((t) => t.join)).toEqual(["mc-1.example.test", "mc-2.example.test", "mc-3.example.test"]);
+    for (const t of m.tiles) expect(t.frame_url).toMatch(new RegExp(`^ws://localhost:\\d+/${t.slot}/view$`));
+    expect(coord.fleetState().tiles.some((t) => t.id.startsWith("mc"))).toBe(false);
+  });
+
+  it("a view socket takes only a direct token, then sends the hello, the whole map and ten statuses a second", async () => {
+    await settle();
+    const bad = await view(tile("mc-1").frame_url, { viewer: "v-1" });
+    expect(await bad.closed).toBe(1008);
+    const forged = await view(tile("mc-1").frame_url, { admit: "v1.1.v-1.mock" });
+    expect(await forged.closed).toBe(1008);
+    const a = await live();
+    const v = await view(tile("mc-1").frame_url, { admit: await token(a) });
+    const hello = await v.next((m) => m["type"] === "hello");
+    expect(hello).toMatchObject({ tile: "mc-1", bots: 3, bot_names: ["fcvm_bot1", "fcvm_bot2", "fcvm_bot3"], driver: null });
+    expect(hello["viewer"]).toMatch(/^v-\d+$/);
+    expect((hello["materials"] as string[]).length).toBe(48);
+    const map = await v.next((m) => m["type"] === "map");
+    const region = map["region"] as { w: number; h: number };
+    expect([region.w, region.h]).toEqual([128, 128]);
+    const cells = Buffer.from(map["cells"] as string, "base64");
+    expect(cells.length).toBe(128 * 128 * 2);
+    // a world of more than one material, every column known
+    const mats = new Set<number>();
+    for (let i = 0; i < cells.length; i += 2) mats.add(cells[i]!);
+    expect(mats.size).toBeGreaterThan(3);
+    expect(mats.has(0)).toBe(false);
+    const t0 = Date.now();
+    await sleep(1100);
+    const statuses = v.msgs.filter((m) => m["type"] === "status" && (m["t"] as number) >= t0);
+    expect(statuses.length).toBeGreaterThanOrEqual(8);
+    expect(statuses.at(-1)!["tps"]).toBeGreaterThan(19.9);
+    expect((statuses.at(-1)!["players"] as unknown[]).length).toBe(3);
+    // the bots build: columns change, sent as deltas
+    await v.next((m) => m["type"] === "delta", 6000);
+    v.ws.close();
+    a.ws.close();
+  });
+
+  it("resets one server: restoring, then running with a new launch timed from the click, and its sockets close", async () => {
+    await settle();
+    const a = await live();
+    const v = await view(tile("mc-2").frame_url, { admit: await token(a) });
+    await v.next((m) => m["type"] === "map");
+    const gen = tile("mc-2").generation;
+    expect(await send(a, "minecraft_reset", { slot: "mc-2" })).toMatchObject({ outcome: "committed" });
+    expect(tile("mc-2")).toMatchObject({ phase: "restoring", forked_from: null });
+    expect(await v.closed).toBe(1001);
+    await until(() => tile("mc-2").phase === "running");
+    const lr = tile("mc-2").last_relaunch;
+    expect(lr.by).toMatch(/^viewer:v-\d+$/);
+    expect(lr.first_frame_at! - lr.clicked_at).toBeGreaterThanOrEqual(290);
+    expect(lr.phases["total_ms"]).toBe(lr.first_frame_at! - lr.clicked_at);
+    expect(tile("mc-2").generation).toBe(gen + 1);
+    expect(await send(a, "minecraft_reset", { slot: "mc-1" })).toMatchObject({ outcome: "refused", reason: "one reset per 2 s per client" });
+    const b = await live();
+    expect(await send(b, "minecraft_reset", {})).toMatchObject({ outcome: "refused", reason: "args must name a slot or say all" });
+    expect(await send(b, "minecraft_reset", { slot: "mc-9" })).toMatchObject({ outcome: "refused", reason: 'no server "mc-9"' });
+    expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "committed" });
+    expect(mcNow().last_reset_all).toMatchObject({ servers: 3 });
+    expect(mcNow().tiles.map((t) => t.last_relaunch.by)).toEqual(["reset_all", "reset_all", "reset_all"]);
+    expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "refused", reason: "one reset all per 10 s per client" });
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("forks a running server into the next one on its host: the copy holds the source's world, and the source keeps running", async () => {
+    await settle();
+    const a = await live();
+    const t = await token(a);
+    // build on mc-1 by hand, so the copy has something only the source had
+    expect(await send(a, "claim_minecraft", { slot: "mc-1" })).toMatchObject({ outcome: "committed" });
+    const v = await view(tile("mc-1").frame_url, { admit: t });
+    await v.next((m) => m["type"] === "map");
+    expect(await drive(v, { action: "place" })).toMatchObject({ ok: true });
+    const placed = (await v.next((m) => m["type"] === "delta" && (m["cells"] as number[][]).some((c) => c[1] === MATERIALS.indexOf("red")))) as { cells: number[][] };
+    const [col, material, height] = placed.cells.find((c) => c[1] === MATERIALS.indexOf("red"))!;
+    const before = tile("mc-1").generation;
+    expect(await send(a, "minecraft_fork", { slot: "mc-1" })).toMatchObject({ outcome: "committed" });
+    expect(tile("mc-2")).toMatchObject({ phase: "forking", forked_from: "mc-1" });
+    expect(tile("mc-2").last_relaunch.by).toBe("fork:mc-1");
+    await until(() => tile("mc-2").phase === "running");
+    const copy = coord.minecraftMock!.peek("mc-2")!;
+    expect([copy.world[col! * 2], copy.world[col! * 2 + 1]]).toEqual([material, height]);
+    // the source was never restarted, and its socket stayed open
+    expect(tile("mc-1")).toMatchObject({ phase: "running", generation: before });
+    expect(v.ws.readyState).toBe(v.ws.OPEN);
+    const f = mcNow().last_fork!;
+    expect(f).toMatchObject({ from: "mc-1", to: "mc-2", snapshot_ms: 100 });
+    expect(f["total_ms"]).toBe((f["snapshot_ms"] as number) + (f["restore_ms"] as number));
+    expect(tile("mc-2").last_relaunch.phases).toMatchObject({ snapshot_ms: 100 });
+    // one fork per 10 s per client; a target that is lent or not running is passed over
+    expect(await send(a, "minecraft_fork", { slot: "mc-2" })).toMatchObject({ outcome: "refused", reason: "one fork per 10 s per client" });
+    const b = await live();
+    expect(await send(b, "minecraft_fork", { slot: "mc-9" })).toMatchObject({ outcome: "refused", reason: 'no server "mc-9"' });
+    expect(await send(b, "claim_minecraft", { slot: "mc-3" })).toMatchObject({ outcome: "committed" });
+    expect(await send(b, "minecraft_fork", { slot: "mc-2" })).toMatchObject({ outcome: "refused", reason: "no server on mc-2's host can take a copy" });
+    // a reset clears the fork's mark
+    const c = await live();
+    expect(await send(c, "minecraft_reset", { slot: "mc-2" })).toMatchObject({ outcome: "committed" });
+    expect(tile("mc-2").forked_from).toBeNull();
+    expect(await send(c, "minecraft_fork", { slot: "mc-2" })).toMatchObject({ outcome: "refused", reason: "mc-2 is not running" });
+    v.ws.close();
+    for (const x of [a, b, c]) x.ws.close();
+  });
+
+  it("lends a server to one viewer at a time, up to the cap, with the coordinator's reasons, and resets it when it comes back", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    const c = await live();
+    expect(await send(a, "claim_minecraft", { slot: "mc-2" })).toMatchObject({ outcome: "committed" });
+    const held = tile("mc-2").borrowed!;
+    expect(held.session).toMatch(/^minecraft-claim-\d+$/);
+    expect(await send(a, "claim_minecraft")).toMatchObject({ outcome: "refused", reason: "one server per client at a time" });
+    expect(await send(b, "claim_minecraft", { slot: "mc-2" })).toMatchObject({ outcome: "refused", reason: "mc-2 is lent to another viewer" });
+    expect(await send(b, "minecraft_reset", { slot: "mc-2" })).toMatchObject({ outcome: "refused", reason: "mc-2 is lent to a viewer" });
+    expect(await send(b, "claim_minecraft", { slot: 7 })).toMatchObject({ outcome: "refused", reason: "args.slot must be a server slot" });
+    expect(await send(b, "claim_minecraft")).toMatchObject({ outcome: "committed" });
+    expect(await send(c, "claim_minecraft")).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^2 of 2 servers are already lent; the next comes back in \d+ s$/) });
+    expect(await send(b, "release_minecraft", { claim: held.session })).toMatchObject({ outcome: "refused", reason: `"${held.session}" is not this viewer's server` });
+    expect(await send(c, "release_minecraft")).toMatchObject({ outcome: "refused", reason: "this viewer holds no server" });
+    expect(await send(a, "release_minecraft", { claim: held.session })).toMatchObject({ outcome: "committed" });
+    expect(tile("mc-2").borrowed).toBeNull();
+    expect(tile("mc-2").last_relaunch.by).toBe(`return:${held.session}`);
+    expect(await send(a, "claim_minecraft")).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^your last server was returned 0 s ago; borrow again in 1 s$/) });
+    for (const x of [a, b, c]) x.ws.close();
+  });
+
+  it("refuses claim_minecraft from a viewer admitted late, and records nothing", async () => {
+    await settle();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: true });
+    const late = await live();
+    await admin("/mock/broadcast", {});
+    try {
+      expect(await send(late, "claim_minecraft", { slot: "mc-1" })).toMatchObject({ outcome: "refused", version: 0 });
+      expect(mcNow().tiles.every((t) => t.borrowed === null)).toBe(true);
+    } finally {
+      late.ws.close();
+    }
+  });
+
+  it("drives the first bot only from the holder's socket, with the tile's checks, and reports the drive it saw move", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    const va = await view(tile("mc-3").frame_url, { admit: await token(a) });
+    const vb = await view(tile("mc-3").frame_url, { admit: await token(b) });
+    await va.next((m) => m["type"] === "map");
+    await vb.next((m) => m["type"] === "map");
+    expect(await drive(va)).toMatchObject({ ok: false, reason: "nobody holds this tile; take it over first" });
+    expect(await send(a, "claim_minecraft", { slot: "mc-3" })).toMatchObject({ outcome: "committed" });
+    expect(await drive(vb)).toMatchObject({ ok: false, reason: "another viewer holds this tile" });
+    for (const [over, reason] of [
+      [{ text: "hi" }, "unknown field `text`"],
+      [{ keys: ["chat"] }, "keys must be from forward, back, left, right, jump, sprint"],
+      [{ yaw: 4000 }, "yaw must be a finite angle within 3600 degrees"],
+      [{ pitch: 120 }, "pitch must be within 90 degrees"],
+      [{ action: "explode" }, "action must be place, dig or null"],
+    ] as const) expect(await drive(va, over), reason).toMatchObject({ ok: false, reason });
+    const s0 = driven(await va.next((m) => m["type"] === "status" && driven(m) !== undefined))!;
+    const t0 = Date.now();
+    const fwd = ++driveSeq;
+    expect(await drive(va, { seq: fwd, keys: ["forward"], yaw: s0.yaw })).toMatchObject({ ok: true });
+    expect(await drive(va, { seq: fwd })).toMatchObject({ ok: false, reason: `seq ${fwd} is not after ${fwd}` });
+    const moved = await va.next((m) => m["type"] === "status" && (m["t"] as number) >= t0 && (m["drive"] as { seq: number } | null)?.seq === fwd);
+    const s1 = driven(moved)!;
+    expect(Math.hypot(s1.x - s0.x, s1.z - s0.z)).toBeGreaterThan(0.05);
+    // the keys are a lease: a second after the last message the bot stands
+    await sleep(1300);
+    const p1 = driven(va.msgs.filter((m) => m["type"] === "status").at(-1)!)!;
+    await sleep(400);
+    const p2 = driven(va.msgs.filter((m) => m["type"] === "status").at(-1)!)!;
+    expect([p2.x, p2.z]).toEqual([p1.x, p1.z]);
+    // at most 30 messages a second per socket
+    const acks = await Promise.all(Array.from({ length: 34 }, () => drive(va)));
+    expect(acks.filter((x) => !x.ok).map((x) => x.reason)).toContain("at most 30 drive messages a second");
+    for (const x of [va.ws, vb.ws, a.ws, b.ws]) x.close();
+  });
+});
+
 describe("the mock speaks the coordinator's snapshot shapes", () => {
   // The coordinator's own states (#1146, core/test/fixtures/coordinator.json): every
   // field the mock sends must be one the coordinator sends, at the same path.
@@ -1304,6 +1547,7 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
    */
   const DOCUMENTED: Record<string, string> = {
     "windows": 'PROTOCOL.md, "Windows mode": `state.windows`',
+    "minecraft": 'PROTOCOL.md, "Minecraft mode": `state.minecraft` (the coordinator PR of the stack brings its vectors)',
     "actions[].args.slot": "windows_reset and claim_windows: the sandbox, in the activity log",
     "actions[].args.all": "windows_reset: every sandbox, in the activity log",
     "actions[].args.action": "windows_action: the fixed action, in the activity log",

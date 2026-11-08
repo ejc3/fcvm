@@ -757,6 +757,8 @@ async fn the_agent_socket_answers_pings() {
         potato_players: 0,
         windows: 0,
         windows_actions: Vec::new(),
+        minecraft: 0,
+        minecraft_server: None,
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -787,14 +789,9 @@ struct FakeAgent {
 
 impl FakeAgent {
     fn connect(handle: &Handle, host: &str, gpus: usize) -> FakeAgent {
-        let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
-        let (ci, co) = tokio::io::split(coord_side);
-        let (ai, ao) = tokio::io::split(agent_side);
-        let h = handle.clone();
-        let conn = tokio::spawn(async move { agents::serve_connection(ci, co, &h).await });
-        let (to_coord, _w) = spawn_writer::<AgentMsg, _>(ao, "coordinator");
-        to_coord
-            .send(AgentMsg::Hello {
+        FakeAgent::connect_hello(
+            handle,
+            AgentMsg::Hello {
                 host: host.into(),
                 arch: "x86_64".into(),
                 gpus: (0..gpus)
@@ -811,8 +808,21 @@ impl FakeAgent {
                 potato_players: 0,
                 windows: 0,
                 windows_actions: Vec::new(),
-            })
-            .unwrap();
+                minecraft: 0,
+                minecraft_server: None,
+            },
+        )
+    }
+
+    /// Connect and send `hello` as the first message.
+    fn connect_hello(handle: &Handle, hello: AgentMsg) -> FakeAgent {
+        let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
+        let (ci, co) = tokio::io::split(coord_side);
+        let (ai, ao) = tokio::io::split(agent_side);
+        let h = handle.clone();
+        let conn = tokio::spawn(async move { agents::serve_connection(ci, co, &h).await });
+        let (to_coord, _w) = spawn_writer::<AgentMsg, _>(ao, "coordinator");
+        to_coord.send(hello).unwrap();
         FakeAgent {
             to_coord,
             from_coord: LineReader::new(ai, "coordinator"),
@@ -852,6 +862,7 @@ impl FakeAgent {
                 v4_port: None,
                 place: None,
                 desktop_at: None,
+                first_chunk_at: None,
             }))
             .unwrap();
     }
@@ -994,6 +1005,235 @@ async fn a_claims_frame_urls_are_its_launchs_published_names() {
             "wss://{}-v4.tiles.fcvm.example:20200/frames",
             host.strip_suffix(".tiles.fcvm.example").unwrap()
         )
+    );
+}
+
+/// A Minecraft host's hello: no GPU, `n` servers.
+fn minecraft_hello(host: &str, n: u32) -> AgentMsg {
+    AgentMsg::Hello {
+        host: host.into(),
+        arch: "aarch64".into(),
+        gpus: vec![],
+        capacity: 0,
+        store_ready_at: None,
+        boot: Default::default(),
+        phones: vec![],
+        phone_actions: vec![],
+        potato_players: 0,
+        windows: 0,
+        windows_actions: Vec::new(),
+        minecraft: n,
+        minecraft_server: Some("Pumpkin 3ea7d281 (Java Edition 26.3)".into()),
+    }
+}
+
+/// A server's `running` report, its bots' first chunk 100 ms before it is sent.
+fn minecraft_running(id: &str, generation: u64, timings: &[(&str, u64)]) -> AgentMsg {
+    let n: u32 = id.strip_prefix("mc-").unwrap().parse().unwrap();
+    AgentMsg::Slot(SlotReport {
+        id: id.into(),
+        phase: "running".into(),
+        generation,
+        vm: Some(format!("fleet-{id}")),
+        frame_url: Some(format!("ws://mc-host.example:{}/view", 25600 + n)),
+        timings: timings.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        first_chunk_at: Some(now_ms() - 100),
+        ..Default::default()
+    })
+}
+
+/// The Minecraft assignments, by slot.
+fn minecraft_assigned(
+    slots: &[fleet_core::protocol::AssignSlot],
+) -> BTreeMap<String, (u64, fleet_core::protocol::AssignMinecraft)> {
+    slots
+        .iter()
+        .filter_map(|s| Some((s.id.clone(), (s.generation, s.minecraft.clone()?))))
+        .collect()
+}
+
+/// Minecraft mode through the coordinator: an agent whose hello runs two servers gets them in
+/// its assignment and the page gets them in `state.minecraft`; a borrow names its viewer as
+/// the server's driver, a fork asks the next server on the host to copy a running one and is
+/// the last fork once the copy runs, and giving the server back resets it.
+#[tokio::test]
+async fn a_minecraft_hosts_servers_reach_the_snapshot_and_its_assignment() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect_hello(&handle, minecraft_hello("mc-host", 2));
+    let mc = minecraft_assigned(&agent.assign().await);
+    assert_eq!(mc.keys().collect::<Vec<_>>(), ["mc-1", "mc-2"]);
+    assert_eq!((mc["mc-1"].1.index, mc["mc-2"].1.index), (0, 1));
+    assert_eq!(mc["mc-1"].1.driver, None);
+    assert_eq!(mc["mc-1"].1.fork, None);
+    let up = [
+        ("restore_ms", 410),
+        ("first_chunk_ms", 1900),
+        ("total_ms", 1900),
+    ];
+    agent
+        .to_coord
+        .send(minecraft_running("mc-1", 1, &up))
+        .unwrap();
+    agent
+        .to_coord
+        .send(minecraft_running("mc-2", 1, &up))
+        .unwrap();
+
+    let mut v = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    let me = v.message("hello").await["viewer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let s = v
+        .until(|s| s["minecraft"]["tiles"][1]["phase"] == "running")
+        .await;
+    let m = &s["minecraft"];
+    assert_eq!(m["server"], "Pumpkin 3ea7d281 (Java Edition 26.3)");
+    assert_eq!(m["image_aspect"], 2.0);
+    assert_eq!(m["claim_secs"], 120);
+    assert_eq!(m["borrow"]["cap"], 1);
+    assert_eq!(m["tiles"][0]["id"], "mc:1");
+    assert_eq!(m["tiles"][0]["slot"], "mc-1");
+    assert_eq!(
+        m["tiles"][0]["frame_url"],
+        "ws://mc-host.example:25601/view"
+    );
+    assert_eq!(
+        m["tiles"][0]["join"],
+        Value::Null,
+        "a ws:// URL names nothing to join"
+    );
+    assert_eq!(m["tiles"][0]["forked_from"], Value::Null);
+    assert_eq!(
+        m["tiles"][0]["last_relaunch"]["phases"]["first_chunk_ms"],
+        1900
+    );
+    assert!(
+        m["tiles"][0]["last_relaunch"]["first_frame_at"].is_u64(),
+        "{m}"
+    );
+    assert_eq!(s["tiles"], json!([]), "a server is never a wall tile");
+
+    v.intent("c", "claim_minecraft", json!({"slot": "mc-1"}))
+        .await;
+    assert_eq!(v.receipt("c").await["outcome"], "committed");
+    let mc = loop {
+        let mc = minecraft_assigned(&agent.assign().await);
+        if mc["mc-1"].1.driver.is_some() {
+            break mc;
+        }
+    };
+    assert_eq!(mc["mc-1"].1.driver.as_deref(), Some(me.as_str()));
+    assert!(mc["mc-1"].1.driver_until.is_some());
+    assert_eq!(mc["mc-1"].0, 1, "a borrow keeps the server's launch");
+
+    // The only other server on the host is lent, so a fork from mc-2 has nowhere to go; a
+    // fork from the lent mc-1 copies it into mc-2.
+    v.intent("f1", "minecraft_fork", json!({"slot": "mc-2"}))
+        .await;
+    assert_eq!(
+        v.receipt("f1").await["reason"],
+        "no server on mc-2's host can take a copy"
+    );
+    v.intent("f2", "minecraft_fork", json!({"slot": "mc-1"}))
+        .await;
+    assert_eq!(v.receipt("f2").await["outcome"], "committed");
+    let mc = loop {
+        let mc = minecraft_assigned(&agent.assign().await);
+        if mc["mc-2"].1.fork.is_some() {
+            break mc;
+        }
+    };
+    assert_eq!(mc["mc-2"].0, 2);
+    let fork = mc["mc-2"].1.fork.clone().unwrap();
+    assert_eq!((fork.slot.as_str(), fork.index), ("mc-1", 0));
+    assert_eq!(mc["mc-1"].0, 1, "the source keeps running");
+    agent
+        .to_coord
+        .send(minecraft_running(
+            "mc-2",
+            2,
+            &[
+                ("snapshot_ms", 640),
+                ("restore_ms", 1100),
+                ("first_chunk_ms", 2300),
+                ("total_ms", 2800),
+            ],
+        ))
+        .unwrap();
+    let s = v.until(|s| !s["minecraft"]["last_fork"].is_null()).await;
+    let f = &s["minecraft"]["last_fork"];
+    assert_eq!((&f["from"], &f["to"]), (&json!("mc-1"), &json!("mc-2")));
+    assert_eq!(f["by"], format!("viewer:{me}"));
+    assert_eq!(
+        (&f["snapshot_ms"], &f["restore_ms"], &f["total_ms"]),
+        (&json!(640), &json!(1100), &json!(2800))
+    );
+    assert_eq!(s["minecraft"]["tiles"][1]["forked_from"], "mc-1");
+    assert_eq!(
+        s["minecraft"]["tiles"][1]["last_relaunch"]["by"],
+        "fork:mc-1"
+    );
+    let mc = loop {
+        let mc = minecraft_assigned(&agent.assign().await);
+        if mc["mc-2"].1.fork.is_none() {
+            break mc;
+        }
+    };
+    assert_eq!(mc["mc-2"].0, 2, "the copy that runs is not asked for again");
+
+    v.intent("x", "release_minecraft", json!({})).await;
+    assert_eq!(v.receipt("x").await["outcome"], "committed");
+    let mc = loop {
+        let mc = minecraft_assigned(&agent.assign().await);
+        if mc["mc-1"].1.driver.is_none() {
+            break mc;
+        }
+    };
+    assert_eq!(mc["mc-1"].0, 2, "a server given back is reset");
+}
+
+/// With published names, a server's frame URL is its launch's view socket under the subzone,
+/// and players join that name.
+#[tokio::test]
+async fn a_minecraft_servers_published_name_is_its_view_socket_and_join_address() {
+    let (names, zone) = subzone_names();
+    let c = coordinator_with(Opts {
+        dns: Some(names),
+        ..Opts::default()
+    })
+    .await;
+    let mut agent = FakeAgent::connect_hello(&c.handle, minecraft_hello("mc-host", 1));
+    agent.assign().await;
+    agent
+        .to_coord
+        .send(AgentMsg::Slot(SlotReport {
+            id: "mc-1".into(),
+            phase: "running".into(),
+            generation: 1,
+            frame_url: Some("ws://[2001:db8::21]:8080/view".into()),
+            ipv6: Some("2001:db8::21".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+    let mut v = Viewer::connect(&c.url).await;
+    let s = v
+        .until(|s| !s["minecraft"]["tiles"][0]["frame_url"].is_null())
+        .await;
+    let t = &s["minecraft"]["tiles"][0];
+    let url = t["frame_url"].as_str().unwrap();
+    let host = url
+        .strip_prefix("wss://")
+        .and_then(|u| u.strip_suffix("/view"))
+        .unwrap();
+    assert!(
+        host.starts_with("mc-1-") && host.ends_with(".tiles.fcvm.example"),
+        "{t}"
+    );
+    assert_eq!(t["join"], host);
+    assert!(
+        zone.borrow().aaaa.contains_key(host),
+        "the join name has no record: {t}"
     );
 }
 
@@ -1918,6 +2158,7 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
         warm: false,
         phone: None,
         windows: None,
+        minecraft: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -2041,6 +2282,7 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         warm: false,
         phone: None,
         windows: None,
+        minecraft: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -2152,6 +2394,7 @@ async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance
         warm: false,
         phone: None,
         windows: None,
+        minecraft: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -3514,6 +3757,7 @@ async fn a_host_running_after_the_ec2_half_woke_the_fleet_records_its_boot() {
                     v4_port: None,
                     place: None,
                     desktop_at: None,
+                    first_chunk_at: None,
                 },
             })
             .await;
@@ -6160,6 +6404,7 @@ async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
         warm: false,
         phone: None,
         windows: None,
+        minecraft: None,
     };
     let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
     let (_scene, scene_rx) = tokio::sync::watch::channel(None);
@@ -6388,6 +6633,12 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     // And a borrowed Windows sandbox, which is shown from its direct stream too.
     late.intent("sandbox", "claim_windows", json!({})).await;
     let r = late.receipt("sandbox").await;
+    assert_eq!(r["outcome"], "refused");
+    assert_eq!(r["reason"], live::LATE_CLAIM);
+    // And a borrowed Minecraft server, which is driven over its tile's view socket, whose
+    // first message is a direct token.
+    late.intent("server", "claim_minecraft", json!({})).await;
+    let r = late.receipt("server").await;
     assert_eq!(r["outcome"], "refused");
     assert_eq!(r["reason"], live::LATE_CLAIM);
     // No later admission ever gives it a token.
@@ -6663,6 +6914,7 @@ async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
                             v4_port: None,
                             place: None,
                             desktop_at: None,
+                            first_chunk_at: None,
                         },
                     })
                     .await;

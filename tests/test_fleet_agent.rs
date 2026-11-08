@@ -121,6 +121,7 @@ impl Coord {
             boot: Default::default(),
             potato: None,
             windows: None,
+            minecraft: None,
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -153,6 +154,7 @@ impl Coord {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 })
                 .collect(),
             region: None,
@@ -542,6 +544,7 @@ async fn the_grid_budget_is_posted_to_wall_tiles_after_every_scene() {
             warm: false,
             phone: None,
             windows: None,
+            minecraft: None,
         }],
         region: None,
     });
@@ -602,6 +605,7 @@ async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 }],
                 region: None,
             }
@@ -777,6 +781,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -791,6 +796,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 },
             ],
             region: None,
@@ -909,6 +915,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             warm: false,
             phone: None,
             windows: None,
+            minecraft: None,
         }],
         region: None,
     };
@@ -1041,6 +1048,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 ipv6: None,
             }),
         }),
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -1073,6 +1081,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -1087,6 +1096,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     warm: false,
                     phone: None,
                     windows: None,
+                    minecraft: None,
                 },
             ],
             region: Some(region),
@@ -1187,6 +1197,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 warm: false,
                 phone: None,
                 windows: None,
+                minecraft: None,
             }],
             region: Some(wider),
         })
@@ -1240,6 +1251,7 @@ fn standby_slot(generation: u64, standby: bool, rect: Option<Rect>) -> CoordMsg 
             warm: false,
             phone: None,
             windows: None,
+            minecraft: None,
         }],
         region: None,
     }
@@ -1393,6 +1405,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let mut from_agent = LineReader::new(coord_in, "agent");
@@ -1471,6 +1484,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(dial(
         agent,
@@ -1506,6 +1520,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
                 warm: false,
                 phone: None,
                 windows: None,
+                minecraft: None,
             }],
             region: None,
         },
@@ -1908,6 +1923,7 @@ async fn the_renderer_gets_the_layout_generation_with_its_rect() {
             warm: false,
             phone: None,
             windows: None,
+            minecraft: None,
         }],
         region: None,
     });
@@ -2024,6 +2040,7 @@ async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
             warm,
             phone: None,
             windows: None,
+            minecraft: None,
         }],
         region: None,
     };
@@ -2121,6 +2138,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -2161,6 +2179,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
                 mirror_viewer: Some("v-7".into()),
             }),
             windows: None,
+            minecraft: None,
         }],
         region: None,
     };
@@ -2308,6 +2327,7 @@ fn dial_agent(f: &Fake) -> Agent {
         boot: Default::default(),
         potato: None,
         windows: None,
+        minecraft: None,
     }
 }
 

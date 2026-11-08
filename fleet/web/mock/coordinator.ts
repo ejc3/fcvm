@@ -20,6 +20,7 @@ import { mockLayout } from "./layout.ts";
 import { MockPhones, type MockPhonesOptions } from "./phones.ts";
 import { MockPotato, type MockPotatoOptions } from "./potato.ts";
 import { MockWindows, type MockWindowsOptions } from "./windows.ts";
+import { MockMinecraft, type MockMinecraftOptions } from "./minecraft.ts";
 
 export interface CoordinatorOptions {
   port: number;
@@ -63,6 +64,8 @@ export interface CoordinatorOptions {
   potato?: MockPotatoOptions;
   /** Windows sandboxes (windows mode): none unless set. */
   windows?: MockWindowsOptions;
+  /** Minecraft servers (minecraft mode), with their view sockets on a port of their own: none unless set. */
+  minecraft?: MockMinecraftOptions;
   /** Delay of the fake text check. */
   checkMs: number;
   epochUnixMs: number;
@@ -315,6 +318,7 @@ export class MockCoordinator {
   private phones: MockPhones | null = null;
   private potato: MockPotato | null = null;
   private windows: MockWindows | null = null;
+  private minecraft: MockMinecraft | null = null;
 
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
@@ -356,6 +360,9 @@ export class MockCoordinator {
         start,
       );
     }
+    if (opts.minecraft && opts.minecraft.count > 0) {
+      this.minecraft = new MockMinecraft(opts.minecraft, { now: () => this.now(), later: (ms, fn) => this.later(ms, fn), markDirty: () => this.markDirty() }, start);
+    }
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
     this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, openedAt: start, votes: new Map() };
     const t0 = sceneT(opts.epochUnixMs, start);
@@ -387,7 +394,8 @@ export class MockCoordinator {
     return id.replace(/[^A-Za-z0-9_-]/g, "-");
   }
 
-  listen(): Promise<void> {
+  async listen(): Promise<void> {
+    await this.minecraft?.listen();
     return new Promise((resolve) => {
       this.server.listen(this.opts.port, () => {
         this.tickTimer = setInterval(() => this.tick(), 250);
@@ -395,6 +403,11 @@ export class MockCoordinator {
         resolve();
       });
     });
+  }
+
+  /** Tests: the Minecraft servers, to read a world as its view socket would send it. */
+  get minecraftMock(): MockMinecraft | null {
+    return this.minecraft;
   }
 
   get port(): number {
@@ -534,6 +547,7 @@ export class MockCoordinator {
       ...(this.phones ? { phones: this.phones.state() } : {}),
       ...(this.potato ? { potato: this.potato.state() } : {}),
       ...(this.windows ? { windows: this.windows.state() } : {}),
+      ...(this.minecraft ? { minecraft: this.minecraft.state() } : {}),
     };
   }
 
@@ -553,7 +567,9 @@ export class MockCoordinator {
     const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null, late: this.broadcast?.late ?? false };
     this.clients.add(client);
     this.sendTo(client, { type: "hello", viewer: client.viewer, ...(this.sitekey ? { turnstile: this.sitekey } : {}) });
-    if (this.broadcast) this.sendTo(client, this.admissionFor(client));
+    // The coordinator sends every connection its admission; the mock sends one when a test asks
+    // for a broadcast, and when it runs Minecraft servers, whose view sockets take only a direct token.
+    if (this.broadcast || this.minecraft) this.sendTo(client, this.admissionFor(client));
     // Publish now, to everyone: a change made since the last snapshot belongs to
     // the next version, so the newcomer must not get it under the current one.
     this.dirty = true;
@@ -601,6 +617,7 @@ export class MockCoordinator {
       if (client.claim && client.claim.phase !== "ended") this.endClaim(client.claim, "The viewer left.");
       this.phones?.left(client.viewer);
       this.windows?.left(client.viewer);
+      this.minecraft?.left(client.viewer);
       this.markDirty();
     });
     ws.on("error", () => {});
@@ -650,7 +667,7 @@ export class MockCoordinator {
     // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
     // stream: the coordinator refuses both before anything else, a repeated intent id included
     // (its receipt is not looked up), and records nothing (src/fleet/coord/live.rs, LATE_CLAIM).
-    if (client.late && (name === "claim_gpu" || name === "claim_phone" || name === "claim_windows")) {
+    if (client.late && (name === "claim_gpu" || name === "claim_phone" || name === "claim_windows" || name === "claim_minecraft")) {
       this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
       return;
     }
@@ -832,7 +849,8 @@ export class MockCoordinator {
         const phone = this.phones?.apply<Receipt>(c.viewer, name, args, reply);
         const potato = phone ?? this.potato?.apply<Receipt>(c.viewer, name, reply);
         const windows = potato ?? this.windows?.apply<Receipt>(c.viewer, name, args, reply);
-        return windows ?? this.refuse(c, `unknown intent "${name}"`);
+        const minecraft = windows ?? this.minecraft?.apply<Receipt>(c.viewer, name, args, reply);
+        return minecraft ?? this.refuse(c, `unknown intent "${name}"`);
       }
     }
   }
@@ -1555,6 +1573,10 @@ export class MockCoordinator {
       json(200, { actions: this.phones?.actions ?? [] });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/mock/minecraft-record") {
+      json(200, { intents: this.minecraft?.intents ?? [], drives: this.minecraft?.drives ?? [] });
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/mock/windows-actions") {
       json(200, { actions: this.windows?.actions ?? [], intents: this.windows?.intents ?? [] });
       return;
@@ -1581,6 +1603,13 @@ export class MockCoordinator {
             ...(b["release_all"] === true ? { release_all: true } : {}),
             ...(typeof b["image_age_days"] === "number" ? { image_age_days: b["image_age_days"] } : {}),
           });
+          return { ok: true };
+        });
+        return;
+      case "/mock/minecraft":
+        body((b) => {
+          if (!this.minecraft) throw new Error("the mock runs no Minecraft servers (FLEET_MOCK_MINECRAFT)");
+          this.minecraft.reset({ ...(b["release_all"] === true ? { release_all: true } : {}) });
           return { ok: true };
         });
         return;
@@ -1752,6 +1781,7 @@ export class MockCoordinator {
     this.phones?.close();
     this.potato?.close();
     this.windows?.close();
+    await this.minecraft?.close();
     for (const c of this.clients) c.ws.terminate();
     this.wss.close();
     await new Promise<void>((r) => this.server.close(() => r()));

@@ -168,6 +168,13 @@ build)
   as_user "podman save --format oci-archive localhost/fcvm-potato:fleet -o /mnt/fcvm-btrfs/potato.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/potato.oci.tar
   rm -f /mnt/fcvm-btrfs/potato.oci.tar
+  # Minecraft mode (docs/fleet/minecraft.md): the tile image (Pumpkin built from its pinned
+  # commit, and mctile), in root's store for the agent (--minecraft). The agent makes its gold
+  # snapshot when it starts.
+  as_user "cd $SRC && make minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet"
+  as_user "podman save --format oci-archive localhost/fcvm-minecraft:fleet -o /mnt/fcvm-btrfs/minecraft.oci.tar"
+  podman load -q -i /mnt/fcvm-btrfs/minecraft.oci.tar
+  rm -f /mnt/fcvm-btrfs/minecraft.oci.tar
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
   # system image built from source, and Robot Park, built with the AOSP build's tools.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"

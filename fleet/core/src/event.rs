@@ -210,6 +210,23 @@ pub enum Intent {
         claim: Option<String>,
         action: crate::windows::WindowsAction,
     },
+    /// Restore a Minecraft server from its host's gold snapshot (`slot`), or every server.
+    MinecraftReset {
+        slot: Option<String>,
+    },
+    /// Copy a Minecraft server's running world into the next server on its host.
+    MinecraftFork {
+        slot: String,
+    },
+    /// Borrow a Minecraft server to drive its first bot: `slot` names one (`mc-2`), or none
+    /// takes any free one.
+    ClaimMinecraft {
+        slot: Option<String>,
+    },
+    /// Give the viewer's server back; `claim`, when given, must name its session.
+    ReleaseMinecraft {
+        claim: Option<String>,
+    },
     /// A connected page asks for the GPUs: an arrival, which wakes a sleeping fleet.
     Wake,
     /// Potato mode: shorten the hold the ball carries by a fifth.
@@ -226,6 +243,20 @@ fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<Str
                 .ok_or_else(|| format!("args.{key} must be {what}"))?
                 .to_string(),
         )),
+    }
+}
+
+/// Fail closed: refuse any argument but `keys`, so nothing else can ride along.
+fn only(args: &serde_json::Value, keys: &[&str]) -> Result<(), String> {
+    if !(args.is_object() || args.is_null()) {
+        return Err("args must be an object".into());
+    }
+    match args
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !keys.contains(&k.as_str())))
+    {
+        Some(k) => Err(format!("args.{k} is not accepted")),
+        None => Ok(()),
     }
 }
 
@@ -468,6 +499,38 @@ impl Intent {
                 Ok(Intent::WindowsAction {
                     claim: opt_str(args, "claim", "a claim id")?,
                     action,
+                })
+            }
+            "minecraft_reset" => {
+                only(args, &["slot", "all"])?;
+                let slot = opt_str(args, "slot", "a server id")?;
+                let all = match args.get("all") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(v) => v.as_bool().ok_or("args.all must be true or false")?,
+                };
+                match (slot, all) {
+                    (Some(slot), false) => Ok(Intent::MinecraftReset { slot: Some(slot) }),
+                    (None, true) => Ok(Intent::MinecraftReset { slot: None }),
+                    _ => Err("args must name a slot or say all".into()),
+                }
+            }
+            "minecraft_fork" => {
+                only(args, &["slot"])?;
+                Ok(Intent::MinecraftFork {
+                    slot: opt_str(args, "slot", "a server id")?
+                        .ok_or("args.slot must be a server id")?,
+                })
+            }
+            "claim_minecraft" => {
+                only(args, &["slot"])?;
+                Ok(Intent::ClaimMinecraft {
+                    slot: opt_str(args, "slot", "a server id")?,
+                })
+            }
+            "release_minecraft" => {
+                only(args, &["claim"])?;
+                Ok(Intent::ReleaseMinecraft {
+                    claim: opt_str(args, "claim", "a claim id")?,
                 })
             }
             other => Err(format!("unknown intent {other:?}")),

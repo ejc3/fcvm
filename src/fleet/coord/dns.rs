@@ -45,6 +45,7 @@ pub fn facts(state: &State) -> Vec<Fact> {
         .chain(f.ec2.values())
         .chain(f.phones.values())
         .chain(f.windows.values())
+        .chain(f.minecraft.values())
         .map(|s| Fact {
             id: s.id.clone(),
             generation: s.observed.generation,
@@ -95,6 +96,17 @@ pub fn is_current(zone: &str, p: &Published, f: &Fact) -> bool {
     )
 }
 
+/// The path a launch's frame URL names: a Minecraft server's view socket (`mc-<n>-<token>`,
+/// fleet/PROTOCOL.md "Minecraft tile"), and every other launch's frames.
+fn frame_path(label: &str) -> &'static str {
+    let id = label.rsplit_once('-').map_or(label, |(id, _)| id);
+    if fleet_core::state::minecraft_number(id).is_some() {
+        "/view"
+    } else {
+        "/frames"
+    }
+}
+
 /// A launch's names: the label, its addresses and the frame URLs they give.
 pub fn names(
     zone: &str,
@@ -108,14 +120,15 @@ pub fn names(
         Some(p) if p != 443 => format!(":{p}"),
         _ => String::new(),
     };
+    let path = frame_path(label);
     Published {
         generation,
         label: label.into(),
         ipv6: ipv6.map(canonical),
         ipv4: ipv4.map(canonical),
         v4_port,
-        frame_url: ipv6.map(|_| format!("wss://{label}.{zone}/frames")),
-        frame_url_v4: ipv4.map(|_| format!("wss://{label}-v4.{zone}{port}/frames")),
+        frame_url: ipv6.map(|_| format!("wss://{label}.{zone}{path}")),
+        frame_url_v4: ipv4.map(|_| format!("wss://{label}-v4.{zone}{port}{path}")),
     }
 }
 
@@ -312,6 +325,30 @@ mod tests {
             t.frame_url_v4.as_deref(),
             Some("wss://ec2-2-abcdefgh-v4.fcvm.dev/frames")
         );
+    }
+
+    #[test]
+    fn a_minecraft_launch_names_its_view_socket() {
+        let p = names(
+            "fcvm.dev",
+            &mint("mc-2"),
+            1,
+            Some("2001:db8::7"),
+            None,
+            None,
+        );
+        let url = p.frame_url.as_deref().unwrap();
+        assert!(url.starts_with("wss://mc-2-"), "{url}");
+        assert!(url.ends_with(".fcvm.dev/view"), "{url}");
+        assert_eq!(
+            fleet_core::minecraft::join_host(url).as_deref(),
+            Some(&url["wss://".len()..url.len() - "/view".len()])
+        );
+        // A wall slot, a phone and a sandbox keep their frames.
+        for id in ["slot-12", "phone-1", "win-3", "ec2-4"] {
+            let p = names("fcvm.dev", &mint(id), 1, Some("2001:db8::7"), None, None);
+            assert!(p.frame_url.unwrap().ends_with("/frames"), "{id}");
+        }
     }
 
     #[test]

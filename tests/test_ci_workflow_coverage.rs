@@ -1724,6 +1724,48 @@ fn a_renderer_change_runs_the_fleet_renderer_job_and_not_the_matrix() {
     );
 }
 
+/// A change to the Minecraft tile program runs its tests (the `fleet-minecraft` job).
+///
+/// fleet/minecraft is its own Cargo workspace on a nightly toolchain, outside fcvm's, so lint
+/// and the VM matrix never build it; without this job its tests ran only inside the host
+/// image's build, after merge.
+#[test]
+fn a_minecraft_change_runs_the_fleet_minecraft_job() {
+    let outputs =
+        run_changes_step_with_files("pull_request", Some(&["fleet/minecraft/src/bots.rs"]));
+    assert!(
+        outputs.lines().any(|l| l == "fleet=true"),
+        "a fleet/minecraft change does not run the fleet jobs: {outputs:?}"
+    );
+    let ci = parse_workflow("ci.yml");
+    let job = workflow_job(&ci, "fleet-minecraft");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`fleet-minecraft` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.fleet == 'true'"),
+        "`fleet-minecraft` does not gate on `changes.outputs.fleet` ({condition:?})"
+    );
+    let script = format!("{:?}", job.get("steps"));
+    assert!(
+        script.contains("make test-minecraft"),
+        "`fleet-minecraft` no longer runs mctile's tests"
+    );
+    let summary_needs: Vec<&str> = workflow_job(&ci, "summary")
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .expect("`summary` has no needs")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        summary_needs.contains(&"fleet-minecraft"),
+        "`summary` does not depend on `fleet-minecraft`, so a failing mctile test would not fail \
+         the run's required check"
+    );
+}
+
 /// A rename must be classified by where it came FROM as well as where it went.
 ///
 /// `gh api ... --jq '.[].filename'` reports only the post-rename path, so

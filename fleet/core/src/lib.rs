@@ -12,6 +12,7 @@ pub mod budget;
 pub mod director;
 pub mod event;
 pub mod history;
+pub mod minecraft;
 pub mod phone;
 pub mod potato;
 pub mod protocol;

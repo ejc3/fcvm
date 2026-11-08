@@ -66,6 +66,12 @@ h1, h2, h3, p { margin: 0; }
 .mode-link { min-height: 32px; display: inline-flex; align-items: center; padding: 0 12px; border-radius: 6px; font: 500 14px var(--sans); color: var(--muted); text-decoration: none; }
 .mode-link:hover { color: var(--text); }
 .mode-link[aria-current="page"] { color: var(--text); background: rgba(255, 255, 255, 0.12); }
+/* Five views: the links are tighter than the stream button so the switch stays as wide as it was
+   with four (at 1024 px it must end left of the wall's top-right tiles, or it hides their
+   clocks), and tighter again on a phone so it stays one line within the screen. */
+.mode-switch { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.mode-switch .mode-link { padding: 0 8px; }
+@media (max-width: 480px) { .mode-switch .mode-link { padding: 0 7px; } }
 .stream-mode { min-height: 32px; display: inline-flex; align-items: center; margin-left: 4px; padding: 0 10px; border: 0; border-left: 1px solid var(--control); border-radius: 0 6px 6px 0; background: none; font: 500 14px var(--sans); color: var(--muted); }
 button.stream-mode { cursor: pointer; }
 button.stream-mode:hover { color: var(--text); }

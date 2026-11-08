@@ -65,6 +65,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     phones: null,
     potato: null,
     windows: null,
+    minecraft: null,
     ...over,
   };
 }

@@ -28,6 +28,10 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
     before.last_windows_reset_at = after.last_windows_reset_at.clone();
     before.last_windows_reset_all_at = after.last_windows_reset_all_at.clone();
     before.last_windows_claim_end = after.last_windows_claim_end.clone();
+    before.last_minecraft_reset_at = after.last_minecraft_reset_at.clone();
+    before.last_minecraft_reset_all_at = after.last_minecraft_reset_all_at.clone();
+    before.last_minecraft_fork_at = after.last_minecraft_fork_at.clone();
+    before.last_minecraft_claim_end = after.last_minecraft_claim_end.clone();
     before.history_ready_at = after.history_ready_at;
     before.budget.next_round_at = after.budget.next_round_at;
     before.budget.smoothed = after.budget.smoothed;
@@ -162,8 +166,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 }
             };
             // A refused word's text is never shown: its args are left out and the summary
-            // is the reason only.
-            let shown_args = if name == "word" && outcome == Outcome::Refused {
+            // is the reason only. Args that are not an object (refused, `args must be an
+            // object`) are shown as `{}` too: an intent's args are an object on the wire, and
+            // a page keeps nothing else.
+            let shown_args = if (name == "word" && outcome == Outcome::Refused) || !args.is_object()
+            {
                 serde_json::json!({})
             } else {
                 args.clone()
@@ -251,6 +258,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .chain(f.ec2.values_mut())
                 .chain(f.phones.values_mut())
                 .chain(f.windows.values_mut())
+                .chain(f.minecraft.values_mut())
                 .find(|s| s.id == *slot)
             {
                 // Only for the launch the slot is on: a slower write for an earlier launch
@@ -316,6 +324,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             for n in sandboxes {
                 release_windows(&mut state.fleet, n, at);
             }
+            let servers: Vec<u32> = state
+                .fleet
+                .minecraft
+                .iter()
+                .filter(|(_, s)| minecraft_claim(s).is_some_and(|c| c.viewer == *viewer))
+                .map(|(n, _)| *n)
+                .collect();
+            for n in servers {
+                release_minecraft(&mut state.fleet, n, at);
+            }
             None
         }
         Event::Tick { .. } => {
@@ -344,6 +362,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     potato_players,
                     windows,
                     windows_actions,
+                    minecraft,
+                    minecraft_server,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
@@ -363,9 +383,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                             h.phone_actions = phone_actions.clone();
                             h.windows_actions = windows_actions.clone();
                             h.windows_image = image.filter(|_| *windows > 0);
+                            h.minecraft_server =
+                                minecraft_server.clone().filter(|_| *minecraft > 0);
                         }
                         phone_hello(&mut state.fleet, host, gpus, phones, at);
                         windows_hello(&mut state.fleet, host, *windows, at);
+                        minecraft_hello(&mut state.fleet, host, *minecraft, at);
                         let p = &mut state.fleet.power;
                         if wake_open(p) {
                             let woke = p.woke_at;
@@ -393,6 +416,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_phone(&mut state.fleet, n, host, r, at);
                     } else if let Some(n) = windows_number(&r.id) {
                         observe_windows(&mut state.fleet, n, host, r, at);
+                    } else if let Some(n) = minecraft_number(&r.id) {
+                        observe_minecraft(&mut state.fleet, n, host, r, at);
                     }
                 }
                 AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
@@ -465,6 +490,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
             f.phones.retain(|_, s| s.host.as_deref() != Some(host));
             forget_windows(f, |s| s.host.as_deref() == Some(host.as_str()), at);
+            forget_minecraft(f, |s| s.host.as_deref() == Some(host.as_str()), at);
             // A host the coordinator scaled away is not a reclaimed one.
             if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
                 f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
@@ -566,7 +592,8 @@ fn power_step(state: &mut State, at: u64) {
     }
     let claims = f.slots.values().any(|s| s.claim.is_some())
         || f.phones.values().any(|s| phone_claim(s).is_some())
-        || f.windows.values().any(|s| windows_claim(s).is_some());
+        || f.windows.values().any(|s| windows_claim(s).is_some())
+        || f.minecraft.values().any(|s| minecraft_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
         // Connected pages do not wake it once the limit has run out: an arrival does.
@@ -841,7 +868,10 @@ fn intent_effect(
         }
         // Asleep with pages still connected (no new viewer for the limit), a claim would hold
         // a GPU the fleet is not running and keep nothing awake: refuse it, as restart_now.
-        Intent::ClaimGpu | Intent::ClaimPhone { .. } | Intent::ClaimWindows { .. }
+        Intent::ClaimGpu
+        | Intent::ClaimPhone { .. }
+        | Intent::ClaimWindows { .. }
+        | Intent::ClaimMinecraft { .. }
             if state.fleet.power.state == "asleep" =>
         {
             Err("the GPUs are asleep".into())
@@ -864,6 +894,25 @@ fn intent_effect(
         Intent::WindowsAction { claim, action } => {
             expire_windows(&mut state.fleet, at);
             windows_action(state, c, claim.as_deref(), *action)
+        }
+        Intent::MinecraftReset { slot } => {
+            expire_minecraft(&mut state.fleet, at);
+            minecraft_reset(state, c, slot.as_deref())
+        }
+        Intent::MinecraftFork { slot } => {
+            expire_minecraft(&mut state.fleet, at);
+            minecraft_fork(state, c, slot)
+        }
+        Intent::ClaimMinecraft { slot } => {
+            expire_minecraft(&mut state.fleet, at);
+            claim_minecraft(state, c, slot.as_deref())
+        }
+        Intent::ReleaseMinecraft { claim } => {
+            expire_minecraft(&mut state.fleet, at);
+            let n = own_minecraft(&state.fleet, c.viewer).ok_or("this viewer holds no server")?;
+            check_minecraft_claim(&state.fleet, n, claim.as_deref())?;
+            release_minecraft(&mut state.fleet, n, at);
+            Ok("release server".into())
         }
         Intent::ClaimGpu => claim(state, c),
         Intent::ClaimPhone { phone } => claim_phone(state, c, phone.as_deref()),
@@ -1307,6 +1356,8 @@ fn tick(state: &mut State, at: u64) {
             });
         }
     }
+    // Borrowed servers come back.
+    expire_minecraft(f, at);
     // A reclaimed host is listed for a minute after it is gone.
     let hosts = f.hosts.clone();
     f.reclaimed.retain(|h, (_, gone)| {
@@ -1337,6 +1388,22 @@ fn tick(state: &mut State, at: u64) {
     keep(
         &mut f.last_windows_claim_end,
         state.config.windows_claim_cooldown_secs * 1000,
+    );
+    keep(
+        &mut f.last_minecraft_reset_at,
+        state.config.relaunch_interval_ms,
+    );
+    keep(
+        &mut f.last_minecraft_reset_all_at,
+        crate::minecraft::RESET_ALL_INTERVAL_MS,
+    );
+    keep(
+        &mut f.last_minecraft_fork_at,
+        crate::minecraft::FORK_INTERVAL_MS,
+    );
+    keep(
+        &mut f.last_minecraft_claim_end,
+        state.config.minecraft_claim_cooldown_secs * 1000,
     );
     // Restores per minute are kept for the last hour (this minute and the 59 before).
     let minute = at / 60_000;
@@ -1404,6 +1471,7 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             phone_actions: Vec::new(),
             windows_actions: Vec::new(),
             windows_image: None,
+            minecraft_server: None,
         },
     );
     f.reclaimed.remove(host);
@@ -1431,6 +1499,7 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
         claim: None,
         phone: None,
         windows: None,
+        minecraft: None,
     }
 }
 
@@ -2602,4 +2671,440 @@ fn windows_action(
         generation,
     });
     Ok(format!("{} on {}", action.as_str(), slot.id))
+}
+
+// ---------------------------------------------------------------------------
+// Minecraft mode
+// ---------------------------------------------------------------------------
+
+fn minecraft_claim(s: &Slot) -> Option<&crate::minecraft::MinecraftClaim> {
+    s.minecraft.as_ref().and_then(|m| m.claim.as_ref())
+}
+
+fn minecraft_index(s: &Slot) -> Option<u32> {
+    s.minecraft.as_ref().map(|m| m.index)
+}
+
+/// Running the launch it is asked to run.
+fn running_current(s: &Slot) -> bool {
+    s.observed.phase == "running" && s.observed.generation >= s.generation
+}
+
+/// A server's new launch: its generation moves, timed from `at`, and any fork the old one
+/// was is over.
+fn bump_minecraft(slot: &mut Slot, by: &str, at: u64) {
+    bump(slot, by, at);
+    if let Some(m) = slot.minecraft.as_mut() {
+        m.fork = None;
+        m.forked_from = None;
+    }
+}
+
+/// The servers of a host's hello: one per index below `count`, the host's others removed. A
+/// server keeps its name and launch across a hello that keeps its index.
+fn minecraft_hello(f: &mut Fleet, host: &str, count: u32, at: u64) {
+    f.minecraft.retain(|_, s| {
+        s.host.as_deref() != Some(host) || minecraft_index(s).is_some_and(|i| i < count)
+    });
+    for index in 0..count {
+        let exists = f
+            .minecraft
+            .values()
+            .any(|s| s.host.as_deref() == Some(host) && minecraft_index(s) == Some(index));
+        if exists {
+            continue;
+        }
+        let n = (1..).find(|n| !f.minecraft.contains_key(n)).unwrap();
+        let mut s = new_slot(
+            minecraft_name(n),
+            Half::Fcvm,
+            Some(host.to_string()),
+            None,
+            at,
+        );
+        s.minecraft = Some(crate::minecraft::MinecraftSlot {
+            index,
+            ..Default::default()
+        });
+        f.minecraft.insert(n, s);
+    }
+}
+
+/// A server's report. Its launch's first frame is the time its bots got their first chunk, on
+/// the host's clock, kept between the click and this read as a sandbox's desktop time is. A
+/// fork's target that reaches `running` on the fork's generation ends the fork and becomes the
+/// last fork.
+fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
+    let Some(slot) = f.minecraft.get_mut(&n) else {
+        return;
+    };
+    if slot.host.as_deref() != Some(host) {
+        return;
+    }
+    if r.phase == "running" && slot.observed.phase != "running" {
+        count_restore(&mut f.counters, at);
+    }
+    if r.generation > slot.generation {
+        slot.generation = r.generation;
+    }
+    // The host came back running a world that was lent: reset it before anyone borrows it,
+    // and keep owing the reset until the fresh launch reports running.
+    if let Some(key) = minecraft_index(slot).map(|i| crate::minecraft::key(host, i)) {
+        if let Some(owed) = f.minecraft_to_reset.get_mut(&key) {
+            match owed.generation {
+                Some(g) if r.phase == "running" && r.generation >= g => {
+                    f.minecraft_to_reset.remove(&key);
+                }
+                Some(g) if slot.generation >= g => {}
+                _ => {
+                    slot.generation = slot
+                        .generation
+                        .max(owed.generation.unwrap_or(0).saturating_sub(1));
+                    bump_minecraft(slot, &format!("return:{}", owed.session), at);
+                    owed.generation = Some(slot.generation);
+                }
+            }
+        }
+    }
+    let timed = slot
+        .last_relaunch
+        .as_ref()
+        .is_some_and(|rl| rl.first_frame_at.is_some());
+    let clicked = slot.last_relaunch.is_some();
+    note_report(slot, r, at);
+    let running = note_running(slot, r, at);
+    if running && !timed {
+        if let (Some(rl), Some(chunk)) = (slot.last_relaunch.as_mut(), r.first_chunk_at) {
+            if rl.generation == r.generation && rl.first_frame_at == Some(at) {
+                let chunk = chunk.min(at);
+                if clicked {
+                    rl.first_frame_at = Some(chunk.max(rl.clicked_at.min(at)));
+                } else {
+                    // Nobody clicked (a launch at the host's start): the launch began
+                    // `total_ms` before its first chunk, both on the host's clock.
+                    let took = r.timings.get("total_ms").copied().unwrap_or(0);
+                    rl.clicked_at = chunk.saturating_sub(took);
+                    rl.first_frame_at = Some(chunk);
+                }
+            }
+        }
+    }
+    let generation = slot.generation;
+    let Some(m) = slot.minecraft.as_mut() else {
+        return;
+    };
+    // A copy that failed is gone: the agent relaunches the server from the gold snapshot.
+    if r.phase == "failed" && r.generation >= generation {
+        m.forked_from = None;
+    }
+    let Some(k) = m.fork.clone() else {
+        return;
+    };
+    if k.generation < generation {
+        m.fork = None;
+        return;
+    }
+    if !(running && r.generation >= k.generation) {
+        return;
+    }
+    m.fork = None;
+    // A launch whose report has no snapshot time is no copy: the agent restored the gold
+    // snapshot instead (its source was not running there, or the copy failed).
+    if !r.timings.contains_key("snapshot_ms") {
+        m.forked_from = None;
+        return;
+    }
+    let first_chunk_at = slot
+        .last_relaunch
+        .as_ref()
+        .filter(|rl| rl.generation == k.generation)
+        .and_then(|rl| rl.first_frame_at);
+    let time = |k: &str| r.timings.get(k).copied();
+    f.last_minecraft_fork = Some(crate::minecraft::LastFork {
+        from: k.slot,
+        to: slot.id.clone(),
+        clicked_at: k.clicked_at,
+        by: k.by,
+        first_chunk_at,
+        snapshot_ms: time("snapshot_ms"),
+        restore_ms: time("restore_ms"),
+        total_ms: time("total_ms"),
+    });
+}
+
+/// End every borrow whose time is up at `at`. A tick does it, and so does every Minecraft
+/// intent before it is judged, so a borrow ends at its deadline and not at the next tick.
+fn expire_minecraft(f: &mut Fleet, at: u64) {
+    let expired: Vec<u32> = f
+        .minecraft
+        .iter()
+        .filter(|(_, s)| minecraft_claim(s).is_some_and(|c| at >= c.expires_at))
+        .map(|(n, _)| *n)
+        .collect();
+    for n in expired {
+        release_minecraft(f, n, at);
+    }
+}
+
+/// Remove the servers `gone` picks. A lent one's borrow ends here (its client's cooldown
+/// starts), and it is marked to be reset when its host reports it again, as
+/// [`forget_windows`] does for a sandbox.
+pub fn forget_minecraft(f: &mut Fleet, gone: impl Fn(&Slot) -> bool, at: u64) {
+    for s in f.minecraft.values().filter(|s| gone(s)) {
+        if let (Some(c), Some(host), Some(i)) = (minecraft_claim(s), &s.host, minecraft_index(s)) {
+            f.last_minecraft_claim_end.insert(c.client.clone(), at);
+            f.minecraft_to_reset.insert(
+                crate::minecraft::key(host, i),
+                crate::minecraft::ResetOwed {
+                    session: c.session.clone(),
+                    generation: None,
+                },
+            );
+        }
+    }
+    f.minecraft.retain(|_, s| !gone(s));
+}
+
+fn own_minecraft(f: &Fleet, viewer: &str) -> Option<u32> {
+    f.minecraft
+        .iter()
+        .find(|(_, s)| minecraft_claim(s).is_some_and(|c| c.viewer == viewer))
+        .map(|(n, _)| *n)
+}
+
+fn check_minecraft_claim(f: &Fleet, n: u32, claim: Option<&str>) -> Result<(), String> {
+    let session = &minecraft_claim(&f.minecraft[&n]).unwrap().session;
+    match claim {
+        Some(k) if k != session => Err(format!("{k:?} is not this viewer's server")),
+        _ => Ok(()),
+    }
+}
+
+/// The server named `id`.
+fn minecraft_slot(f: &Fleet, id: &str) -> Result<u32, String> {
+    minecraft_number(id)
+        .filter(|n| f.minecraft.contains_key(n))
+        .ok_or_else(|| format!("no server {id:?}"))
+}
+
+/// Servers a viewer may borrow: on a host that is not draining, running their current
+/// launch, not lent.
+fn minecraft_free(f: &Fleet, s: &Slot) -> Result<(), String> {
+    if minecraft_claim(s).is_some() {
+        return Err(format!("{} is lent to another viewer", s.id));
+    }
+    if host_draining(&f.hosts, s) {
+        return Err(format!("{} is leaving the fleet", s.id));
+    }
+    if !running_current(s) {
+        return Err(format!("{} is not running", s.id));
+    }
+    Ok(())
+}
+
+/// Restore one server, or every one, from the gold snapshot: its generation moves and the
+/// launch is timed from this click.
+fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<String, String> {
+    let at = c.at;
+    if state.fleet.power.state == "asleep" {
+        return Err("the hosts are asleep".into());
+    }
+    let f = &mut state.fleet;
+    match slot {
+        Some(id) => {
+            let n = minecraft_slot(f, id)?;
+            rate(
+                &f.last_minecraft_reset_at,
+                c.client,
+                at,
+                state.config.relaunch_interval_ms,
+                "reset",
+            )?;
+            let hosts = f.hosts.clone();
+            let s = f.minecraft.get_mut(&n).unwrap();
+            if minecraft_claim(s).is_some() {
+                return Err(format!("{} is lent to a viewer", s.id));
+            }
+            if host_draining(&hosts, s) {
+                return Err(format!("{} is on a draining host", s.id));
+            }
+            bump_minecraft(s, &format!("viewer:{}", c.viewer), at);
+            f.last_minecraft_reset_at.insert(c.client.to_string(), at);
+            Ok(format!("reset {}", s.id))
+        }
+        None => {
+            rate(
+                &f.last_minecraft_reset_all_at,
+                c.client,
+                at,
+                crate::minecraft::RESET_ALL_INTERVAL_MS,
+                "reset all",
+            )?;
+            let hosts = f.hosts.clone();
+            let mut n = 0;
+            for s in f.minecraft.values_mut() {
+                if minecraft_claim(s).is_some() || host_draining(&hosts, s) {
+                    continue;
+                }
+                bump_minecraft(s, "reset_all", at);
+                n += 1;
+            }
+            if n == 0 {
+                return Err("no server can be reset now".into());
+            }
+            f.last_minecraft_reset_all_at
+                .insert(c.client.to_string(), at);
+            f.last_minecraft_reset_all = Some(crate::minecraft::ResetAll {
+                clicked_at: at,
+                by: format!("viewer:{}", c.viewer),
+                servers: n,
+            });
+            Ok(format!("reset all {n} servers"))
+        }
+    }
+}
+
+/// Copy a running server's world into the next server on its host (in index order, wrapping)
+/// that runs its current launch, is not lent and is not on a draining host. The target's
+/// generation moves with the fork set; the source is not touched.
+fn minecraft_fork(state: &mut State, c: &Ctx, id: &str) -> Result<String, String> {
+    let at = c.at;
+    if state.fleet.power.state == "asleep" {
+        return Err("the hosts are asleep".into());
+    }
+    let f = &mut state.fleet;
+    let n = minecraft_slot(f, id)?;
+    rate(
+        &f.last_minecraft_fork_at,
+        c.client,
+        at,
+        crate::minecraft::FORK_INTERVAL_MS,
+        "fork",
+    )?;
+    let source = &f.minecraft[&n];
+    if !running_current(source) {
+        return Err(format!("{} is not running", source.id));
+    }
+    let from = source.id.clone();
+    let index = minecraft_index(source).unwrap_or_default();
+    let mut peers: Vec<(u32, u32)> = f
+        .minecraft
+        .iter()
+        .filter(|(_, s)| s.host.is_some() && s.host == source.host)
+        .filter_map(|(k, s)| Some((minecraft_index(s)?, *k)))
+        .collect();
+    peers.sort();
+    let at_source = peers.iter().position(|(_, k)| *k == n).unwrap_or_default();
+    let target = (1..peers.len())
+        .map(|d| peers[(at_source + d) % peers.len()].1)
+        .find(|k| {
+            let s = &f.minecraft[k];
+            minecraft_claim(s).is_none() && running_current(s) && !host_draining(&f.hosts, s)
+        })
+        .ok_or_else(|| format!("no server on {from}'s host can take a copy"))?;
+    let t = f.minecraft.get_mut(&target).unwrap();
+    bump_minecraft(t, &format!("fork:{from}"), at);
+    let generation = t.generation;
+    let m = t.minecraft.get_or_insert_with(Default::default);
+    m.fork = Some(crate::minecraft::PendingFork {
+        generation,
+        slot: from.clone(),
+        index,
+        clicked_at: at,
+        by: format!("viewer:{}", c.viewer),
+    });
+    m.forked_from = Some(crate::minecraft::ForkedFrom {
+        generation,
+        slot: from.clone(),
+    });
+    let to = t.id.clone();
+    f.last_minecraft_fork_at.insert(c.client.to_string(), at);
+    Ok(format!("fork {from} into {to}"))
+}
+
+fn claim_minecraft(state: &mut State, c: &Ctx, want: Option<&str>) -> Result<String, String> {
+    let at = c.at;
+    let cfg = &state.config;
+    let f = &mut state.fleet;
+    if f.minecraft
+        .values()
+        .any(|s| minecraft_claim(s).is_some_and(|k| k.client == c.client))
+    {
+        return Err("one server per client at a time".into());
+    }
+    if let Some(end) = f.last_minecraft_claim_end.get(c.client) {
+        let free_at = end + cfg.minecraft_claim_cooldown_secs * 1000;
+        if at < free_at {
+            return Err(format!(
+                "your last server was returned {} s ago; borrow again in {} s",
+                (at - end) / 1000,
+                (free_at - at).div_ceil(1000)
+            ));
+        }
+    }
+    let lent: Vec<u64> = f
+        .minecraft
+        .values()
+        .filter_map(minecraft_claim)
+        .map(|k| k.expires_at)
+        .collect();
+    let cap = cfg.minecraft_lend_cap(f.minecraft.len());
+    if lent.len() >= cap {
+        let back = lent
+            .iter()
+            .min()
+            .map_or(0, |t| t.saturating_sub(at).div_ceil(1000));
+        return Err(format!(
+            "{} of {cap} servers are already lent; the next comes back in {back} s",
+            lent.len()
+        ));
+    }
+    let n = match want {
+        Some(id) => {
+            let n = minecraft_slot(f, id)?;
+            minecraft_free(f, &f.minecraft[&n])?;
+            n
+        }
+        None => *f
+            .minecraft
+            .iter()
+            .find(|(_, s)| minecraft_free(f, s).is_ok())
+            .map(|(n, _)| n)
+            .ok_or("no server can be lent now: none is running and free")?,
+    };
+    f.minecraft_claim_count += 1;
+    let session = format!("minecraft-claim-{}", f.minecraft_claim_count);
+    let slot = f.minecraft.get_mut(&n).unwrap();
+    slot.minecraft.get_or_insert_with(Default::default).claim =
+        Some(crate::minecraft::MinecraftClaim {
+            session: session.clone(),
+            viewer: c.viewer.to_string(),
+            client: c.client.to_string(),
+            claimed_at: at,
+            expires_at: at + cfg.minecraft_claim_secs * 1000,
+        });
+    Ok(format!("{session} on {}", slot.id))
+}
+
+/// Give a server back: it is restored from the gold snapshot, so nothing the viewer built
+/// survives them. The reset is owed until a launch of its generation reports running
+/// (`observe_minecraft`), as `release_windows` owes a sandbox's.
+fn release_minecraft(f: &mut Fleet, n: u32, at: u64) {
+    let Some(slot) = f.minecraft.get_mut(&n) else {
+        return;
+    };
+    let Some(claim) = slot.minecraft.as_mut().and_then(|m| m.claim.take()) else {
+        return;
+    };
+    bump_minecraft(slot, &format!("return:{}", claim.session), at);
+    if let (Some(host), Some(i)) = (slot.host.clone(), minecraft_index(slot)) {
+        f.minecraft_to_reset.insert(
+            crate::minecraft::key(&host, i),
+            crate::minecraft::ResetOwed {
+                session: claim.session.clone(),
+                generation: Some(slot.generation),
+            },
+        );
+    }
+    f.last_minecraft_claim_end.insert(claim.client, at);
 }

@@ -1,0 +1,40 @@
+# The Minecraft mode's tile (docs/fleet/minecraft.md): Pumpkin, the Rust Minecraft server, run
+# unmodified from a pinned upstream commit, and mctile beside it. Build: make minecraft-image
+#
+# Pumpkin is GPL-3.0: the image carries its licence and a notice naming the exact source it was
+# built from (/usr/share/doc/pumpkin). No Mojang asset is in the image or fetched by it.
+FROM docker.io/library/debian:trixie-slim AS build
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl git gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+ARG RUST_STABLE=1.99.1
+ARG RUST_NIGHTLY=nightly-2026-08-20
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none \
+    && rustup toolchain install --profile minimal "$RUST_STABLE" "$RUST_NIGHTLY"
+ARG PUMPKIN_REPO=https://github.com/Pumpkin-MC/Pumpkin.git
+ARG PUMPKIN_COMMIT
+RUN test -n "$PUMPKIN_COMMIT" && git init -q /pumpkin && cd /pumpkin \
+    && git fetch -q --depth 1 "$PUMPKIN_REPO" "$PUMPKIN_COMMIT" && git checkout -q FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$PUMPKIN_COMMIT"
+# The upstream toolchain file floats ("stable"); the build uses the pinned one.
+RUN cd /pumpkin && RUSTUP_TOOLCHAIN="$RUST_STABLE" cargo build --locked --release --bin pumpkin
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src ./src
+RUN RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" cargo test --locked --release && RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" cargo build --locked --release
+
+FROM docker.io/library/debian:trixie-slim
+ARG PUMPKIN_REPO=https://github.com/Pumpkin-MC/Pumpkin.git
+ARG PUMPKIN_COMMIT
+ARG MINECRAFT_JAVA_VERSION
+ARG PUMPKIN_SHORT
+# The agent names the servers from this label (the page's header).
+LABEL fcvm.minecraft.server="Pumpkin ${PUMPKIN_SHORT} (Java Edition ${MINECRAFT_JAVA_VERSION})"
+COPY --from=build /pumpkin/target/release/pumpkin /src/target/release/mctile /usr/local/bin/
+COPY --from=build /pumpkin/LICENSE /usr/share/doc/pumpkin/LICENSE
+RUN printf 'Pumpkin, built unmodified from %s at commit %s.\nLicensed under the GNU General Public License v3.0 (LICENSE beside this file).\nThe source is at that repository and commit.\n' \
+      "$PUMPKIN_REPO" "$PUMPKIN_COMMIT" > /usr/share/doc/pumpkin/NOTICE \
+    && mkdir -p /srv/pumpkin
+ENV PORT=8080 MC_PORT=25565
+EXPOSE 8080 443 25565
+ENTRYPOINT ["/usr/local/bin/mctile", "tile"]

@@ -319,6 +319,7 @@ impl Coord {
             boot: Default::default(),
             potato: None,
             windows: Some(windows),
+            minecraft: None,
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -351,6 +352,7 @@ impl Coord {
                     clicked_at: *clicked_at,
                     actions: actions.clone(),
                 }),
+                minecraft: None,
             })
             .collect();
         self.to_agent
