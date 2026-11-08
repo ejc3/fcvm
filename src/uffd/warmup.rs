@@ -709,29 +709,25 @@ fn request_read(image: &File, request: Request) -> std::io::Result<()> {
 /// One warm-up from start to finish, on whatever thread calls it: read the recorded set,
 /// issue the requests, and log one line for each pass. A pass that a new group of replays
 /// interrupts ([`Pace::Restart`]) is followed by another over the set as it is then, with
-/// the free memory measured again.
+/// the free memory measured again. `shared` is the serve's: its stop flag, its clones'
+/// replay progress and its free-memory budget.
 fn warm_up_once(
     snapshot: &str,
     trigger: &'static str,
     recorded: &dyn Fn() -> PageSet,
     mem_len: u64,
-    stop: &AtomicBool,
-    progress: Option<&ReplayProgress>,
+    shared: &Shared,
     mut advise: impl FnMut(Request) -> std::io::Result<()>,
 ) {
-    // With no replay to follow, nothing is paced.
-    let mut budget = || match progress {
-        Some(_) => unpaced_budget(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default()),
-        None => u64::MAX,
-    };
-    let mut replay_at = || progress.map(ReplayProgress::state).unwrap_or_default();
+    let mut budget = || shared.budget();
+    let mut replay_at = || shared.progress.state();
     warm_passes(
         recorded,
         &mut budget,
         &mut replay_at,
         mem_len,
         host_page_size(),
-        stop,
+        &shared.stop,
         &mut advise,
         &mut |pass, stats, budget, elapsed| match stats {
             None => info!(
@@ -809,19 +805,24 @@ struct Shared {
     running: AtomicBool,
     stop: AtomicBool,
     progress: ReplayProgress,
-    /// Test only: warm-ups ignore free memory and replay, so a test's requests never wait on
-    /// the host's state.
+    /// Test only: the free memory a warm-up takes as its budget, in place of the host's.
     #[cfg(test)]
-    unpaced: AtomicBool,
+    test_budget: testing::Budget,
 }
 
 impl Shared {
-    fn pacing_progress(&self) -> Option<&ReplayProgress> {
-        #[cfg(test)]
-        if self.unpaced.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some(&self.progress)
+    /// The free memory a warm-up may fill before it paces itself to replay: the host's
+    /// ([`unpaced_budget`]), read when a pass begins.
+    #[cfg(not(test))]
+    fn budget(&self) -> u64 {
+        unpaced_budget(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
+    }
+
+    /// In a test, the warmer's [`testing::Budget`], so no test waits on the memory its host
+    /// happens to have free.
+    #[cfg(test)]
+    fn budget(&self) -> u64 {
+        self.test_budget.get()
     }
 }
 
@@ -951,15 +952,7 @@ impl Warmer {
             .name("fcvm-ws-warm".to_string())
             .spawn(move || {
                 let _claim = claim;
-                warm_up_once(
-                    &snapshot,
-                    trigger,
-                    &recorded,
-                    mem_len,
-                    &shared.stop,
-                    shared.pacing_progress(),
-                    advise,
-                );
+                warm_up_once(&snapshot, trigger, &recorded, mem_len, &shared, advise);
             });
         match worker {
             // Detached on purpose, like the working-set writer: nothing joins this thread,
@@ -1025,6 +1018,32 @@ pub(crate) mod testing {
     use std::time::{Duration, Instant};
 
     pub(crate) const MIB: u64 = 1024 * 1024;
+
+    /// The free memory a test's warm-ups take as their budget, in place of the host's.
+    ///
+    /// Unlimited unless the test sets it. That holds for the warmer a server builds as
+    /// well, whose first warm-up starts inside `UffdServer::new`, before a test can reach
+    /// it. Read from the host, the budget is `MemFree` less a sixteenth of `MemTotal`, and
+    /// on a host with less free than that a warm-up asks for nothing until a replay runs:
+    /// the server's tests that wait for the recorded runs with no clone replaying then
+    /// failed with "0 of 64 pages resident after 30s".
+    pub(crate) struct Budget(std::sync::atomic::AtomicU64);
+
+    impl Default for Budget {
+        fn default() -> Self {
+            Self(std::sync::atomic::AtomicU64::new(u64::MAX))
+        }
+    }
+
+    impl Budget {
+        pub(crate) fn get(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        pub(crate) fn set(&self, bytes: u64) {
+            self.0.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     /// How long the kernel gets to finish the reads a warm-up requested. They are
     /// asynchronous, so the tests poll. Measured at about 6 ms for 16 MiB on an idle
@@ -1894,9 +1913,7 @@ mod tests {
     /// A warmer over an empty scratch file. These tests pass their own `advise`, so the file
     /// is never read.
     fn scratch_warmer(mem_len: u64) -> Warmer {
-        let warmer = Warmer::new("test", Arc::new(tempfile::tempfile().unwrap()), mem_len);
-        warmer.shared.unpaced.store(true, Ordering::Relaxed);
-        warmer
+        Warmer::new("test", Arc::new(tempfile::tempfile().unwrap()), mem_len)
     }
 
     /// An `advise` that reports each request on `entered` and then parks until `release`
@@ -2048,8 +2065,7 @@ mod tests {
                     "clone admission",
                     &move || recorded.clone(),
                     mem_len,
-                    &AtomicBool::new(false),
-                    None,
+                    &Shared::default(),
                     |_| Ok(()),
                 );
             });
@@ -2130,6 +2146,65 @@ mod tests {
         assert!(third, "the earlier warm-up had ended");
         wait_until_idle(&warmer);
         assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// A warmer built in a test has free memory to spare, whatever its host has. A warm-up
+    /// with no budget asks for nothing until a replay runs, and a server's first warm-up
+    /// starts inside `UffdServer::new`, before a test can set anything on its warmer, so
+    /// this is the default and not a call each test makes. With the budget read from the
+    /// host, `a_copy_mode_server_warms_its_recorded_set_when_it_starts` and
+    /// `admitting_a_clone_warms_the_recorded_set_again` failed with "0 of 64 pages resident
+    /// after 30s" whenever the host's MemFree was under a sixteenth of its MemTotal.
+    #[test]
+    fn a_test_s_warmer_takes_no_budget_from_the_host() {
+        assert_eq!(scratch_warmer(64 * G).shared.budget(), u64::MAX);
+    }
+
+    /// A warmer's warm-up takes the warmer's own budget and follows the warmer's own
+    /// clones: with no free memory it asks for nothing until one of them replays (#1066).
+    #[test]
+    fn a_warmer_with_no_free_memory_waits_for_a_replay() {
+        let page = host_page_size();
+        let mem_len = 64 * page;
+        let warmer = scratch_warmer(mem_len);
+        warmer.shared.test_budget.set(0);
+        let (reading_tx, reading_rx) = mpsc::channel();
+        let (asked_tx, asked_rx) = mpsc::channel();
+
+        let set = set_of(mem_len, &[(page, page)]);
+        assert!(warmer.warm_if_idle_with(
+            "serve start",
+            move || {
+                reading_tx.send(()).ok();
+                set.clone()
+            },
+            move |request| {
+                asked_tx.send(request).ok();
+                Ok(())
+            },
+        ));
+        // A pass reads the recorded set first, so from here the warm-up is pacing itself.
+        reading_rx
+            .recv_timeout(PARKED_FOR)
+            .expect("the warm-up never read the recorded set");
+        assert_eq!(
+            asked_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a warm-up with no free memory asked for a run before any replay ran"
+        );
+
+        let progress = warmer.progress();
+        progress.begin();
+        assert_eq!(
+            asked_rx.recv_timeout(PARKED_FOR),
+            Ok(Request {
+                offset: page,
+                len: page
+            }),
+            "the warm-up did not follow its own warmer's replay"
+        );
+        progress.end();
+        wait_until_idle(&warmer);
     }
 
     /// A fresh snapshot has nothing recorded, and a stopping serve starts nothing new.
@@ -2288,7 +2363,6 @@ mod tests {
         let image = image_on_disk(len);
         let mmap = cold_mapping(&image, len, &recorded);
         let warmer = Warmer::new("test", Arc::new(image), len);
-        warmer.shared.unpaced.store(true, Ordering::Relaxed);
 
         let set = set_of(len, &recorded);
         assert!(warmer.warm_if_idle("serve start", move || set.clone()));

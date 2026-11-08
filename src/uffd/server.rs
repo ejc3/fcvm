@@ -6807,7 +6807,9 @@ mod tests {
     }
 
     /// A copy-mode server that loads a recorded set starts reading it from `new()`, before
-    /// it has bound its socket or admitted a clone.
+    /// it has bound its socket or admitted a clone. That is with free memory to spare, which
+    /// a test's warmer has whatever the host has (`warmup::testing::Budget`); short of it, a
+    /// warm-up waits for a replay.
     #[tokio::test]
     async fn a_copy_mode_server_warms_its_recorded_set_when_it_starts() {
         use crate::uffd::warmup::testing::wait_until_resident;
