@@ -68,7 +68,7 @@ pub const GRANULE: u64 = 4096;
 /// granule order.
 const HEADER_LEN: usize = 8 + 8 + 8 + 8 + 8 + 32;
 const MAGIC: &[u8; 8] = b"FCVMWSET";
-const VERSION: u64 = 2;
+pub(crate) const VERSION: u64 = 2;
 
 /// When a granule was first touched: tenths of a second after the handshake of the clone that
 /// touched it, plus one, saturating at `u16::MAX`. 0 means no time is known. Merging two

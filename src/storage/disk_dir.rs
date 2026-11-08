@@ -382,7 +382,7 @@ fn carried_xattr(name: &[u8], keep_owners: bool) -> bool {
 }
 
 /// An `io::copy` target that feeds a hasher: sha2 0.11 hashers do not implement `io::Write`.
-struct HashWriter<'a>(&'a mut Sha256);
+pub(crate) struct HashWriter<'a>(pub(crate) &'a mut Sha256);
 
 impl std::io::Write for HashWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
