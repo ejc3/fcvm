@@ -2982,15 +2982,22 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
   null}`. `seq` increases; `yaw` is degrees in the game's convention (0 faces +z, 90 faces -x),
   within 3600 of 0; `pitch` within 90; at most 6 keys from that set; any other field is refused.
   Only the scene's `driver` may drive (`another viewer holds this tile`, `nobody holds this
-  tile; take it over first`); the held keys end 1 s after the last message; at most 30 messages
-  a second per socket.
+  tile; take it over first`), and only until its `driver_until` (`the borrow has ended`), even
+  when no new scene comes; the held keys end 1 s after the last message and at `driver_until`;
+  at most 30 messages a second per socket.
 - `POST /scene` (the agent; the scene token when one is configured): `{"tile": "mc-2",
   "generation": 7, "admit_keys": ["<hex>", ...], "driver": "v-12" | null, "driver_until":
   <unix ms> | null}`. `driver` and `driver_until` are the assignment's (Minecraft mode, above).
   `400` names a refused field; any other field is refused.
+- `POST /restored` (plain `PORT` only, never TLS): the restore hook, `mctile restored`, which
+  the agent's `fcvm snapshot run --on-restore` runs in the container before the clone takes
+  connections. The tile drops the scene it was copied with: no driver, and in a fleet run no
+  view opens (`503`) until the agent posts the tile's own scene. It only takes access away.
 - `GET /health`: `ready` (the server listens, every bot spawned, every column known), `tile`,
   `generation`, `scene`, `tps`, `bots` (`wanted`, `online`), `players`, `sessions` (how many
   times the first bot joined; a restore makes it rejoin), `chunks` (in the current session),
   `map` (`known`, `cells`), `viewers`, `driver`, `times_unix_ms` (`start`,
   `server_listening`, `first_chunk` of the current session, `bots_spawned`, `map_ready`),
-  `top_blocks` (the commonest top blocks of the map), `tls` (`loaded`, `loads`) and `error`.
+  `top_blocks` (the commonest top blocks of the map), `tls` (`loaded`, `loads`), `tps_age_ms`
+  (how long ago the last game time behind `tps` arrived; a rate that old says nothing about
+  the server now) and `error`.
