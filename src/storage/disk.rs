@@ -1448,6 +1448,7 @@ mod snapshot_dir_tests {
         let root = private_tempdir();
         let snapshots = root.path().join("snapshots");
         std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(0o700)).unwrap();
         let fresh = prepare_memory_dir(&root.path().join("a/b"), &snapshots).unwrap();
         assert_eq!(
             std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
