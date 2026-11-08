@@ -24,3 +24,5 @@ pub(crate) use warmup::testing as page_cache_testing;
 pub use working_set::WorkingSetStore;
 pub(crate) use working_set::GRANULE;
 pub(crate) use working_set::VERSION as WORKING_SET_VERSION;
+/// What `snapshot import` needs to move an archived working set to the installed image's key.
+pub(crate) use working_set::{max_recorded_len, ImageKey, PageSet};

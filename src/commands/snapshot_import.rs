@@ -54,21 +54,47 @@
 //! `memory.bin` as a link to a file elsewhere, an export archives the file, and an import
 //! never makes the link again.
 //!
-//! The working-set sidecar (`memory.bin.working-set`) is dropped. Its key is the digest of
-//! the exporting host's `config.json` and the memory image's modification time there, and
-//! the imported snapshot has neither, so a memory server would read it as another
-//! snapshot's and ignore it.
-//!
 //! Once the reader has verified the trailer, the staged directory is checked for the files
 //! a restore opens (`check_generation_files`, as `podman prepare` checks a generation; the
 //! config is not among them and is not written yet), the external files are published,
-//! `config.json` is written, and the directory is synced and renamed to `<tag>`. The config
-//! is the archived one with a new generation id, no parent snapshot and each pmem device's
-//! identity as its entry has it on this host, and every other field as it was. That rename is
-//! the only step that makes the tag exist, and it replaces nothing: it is made with
-//! `RENAME_NOREPLACE`, which the kernel refuses when anything has the name. A cut stream, a
-//! digest that does not match, or any other failure removes the staging directory. A killed
-//! import leaves it to the next import or the next VM launch, both of which reclaim first.
+//! `config.json` is written, the working set is written under the installed snapshot's key
+//! (below), and the directory is synced and renamed to `<tag>`. The config is the archived
+//! one with a new generation id, no parent snapshot and each pmem device's identity as its
+//! entry has it on this host, and every other field as it was. That rename is the only step
+//! that makes the tag exist, and it replaces nothing: it is made with `RENAME_NOREPLACE`,
+//! which the kernel refuses when anything has the name. A cut stream, a digest that does
+//! not match, or any other failure removes the staging directory. A killed import leaves it
+//! to the next import or the next VM launch, both of which reclaim first.
+//!
+//! # The working set
+//!
+//! The working-set sidecar (`memory.bin.working-set`) is, with `config.json`, a file the
+//! import writes anew. Its header holds a key: a digest of the snapshot's `config.json` and
+//! of the memory image's length and modification time (`uffd::ImageKey`). The import writes
+//! a config with a new generation id and a memory image with a new modification time, so a
+//! memory server would read the archived sidecar as another snapshot's and ignore it.
+//!
+//! An export writes the sidecar after the memory image. When the import reaches it, the
+//! staged memory image has to have the length the manifest gives for it; otherwise nothing
+//! of the sidecar is held. The import then holds the sidecar's bytes in memory, at most what
+//! a working set of the staged image's length takes (`uffd::max_recorded_len`), and writes
+//! no file for them while it reads the archive. Once the trailer has verified and the
+//! imported `config.json` is written, it decodes them under the key the exporting host gave
+//! the snapshot, which it builds from the archive alone: the digest of the archived
+//! `config.json` and the manifest's `memory` (the image's length and modification time
+//! there). A set that decodes is written into the staging directory under the key of the
+//! staged `config.json` and the staged `memory.bin`
+//! (`WorkingSetStore::seed_staged_generation`), which is the key a memory server derives
+//! once the directory has the tag's name. It is synced with the directory and published by
+//! the same rename, so a memory server never sees the snapshot without it or the sidecar
+//! half-written, and the sidecar needs no lock of its own.
+//!
+//! The set is a hint, and none of this fails an import. An archive without a sidecar
+//! installs a snapshot without a working set. A sidecar that is not installed leaves the
+//! snapshot without one too, and the command warns in one line that says why; the reasons
+//! are listed in DESIGN.md (`fcvm snapshot import`). The page set itself is taken as the
+//! archive carries it, like the memory image. The sidecar's `.lock` and `.tmp` files are
+//! not in an archive.
 //!
 //! # External files
 //!
@@ -133,7 +159,7 @@ use crate::storage::snapshot::{
 };
 use crate::storage::snapshot_archive::{
     ArchiveEntry, ArchiveManifest, ArchiveReader, ContentSha256, EntryName, ExternalRole,
-    ManifestExternal,
+    ManifestExternal, ManifestMemory,
 };
 use crate::storage::{validate_snapshot_name, SnapshotConfig, SnapshotKind};
 
@@ -177,13 +203,28 @@ impl ImportHost {
 #[derive(Debug)]
 pub(crate) struct Imported {
     pub tag: String,
-    /// One per file installed, `config.json` first, as the archive describes it.
+    /// One per archived file the import installed, `config.json` first, each as the archive
+    /// describes it. The working set is not among them (`working_set`).
     pub files: Vec<ArchiveEntry>,
     /// One per external file of the archive, in its order.
     pub externals: Vec<ImportedExternal>,
     /// What a restore of the installed snapshot reads that the archive did not carry, one
     /// sentence each, from the installed config.
     pub not_shipped: Vec<String>,
+    /// What became of the archive's working set.
+    pub working_set: ImportedWorkingSet,
+}
+
+/// What an import did with the working set of its archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImportedWorkingSet {
+    /// The archive carries no working set, so the snapshot is installed without one.
+    NotCarried,
+    /// Written beside the installed memory image, under the installed snapshot's key.
+    Installed { pages: u64, bytes: u64 },
+    /// The archive carries one and it was not installed: why, as the clause that ends the
+    /// command's warning. The snapshot is installed without a working set.
+    NotInstalled(String),
 }
 
 /// What an import did with one external file of its archive.
@@ -241,6 +282,22 @@ pub async fn cmd_snapshot_import(args: SnapshotImportArgs) -> Result<()> {
             "the archive does not carry something a restore of the snapshot reads on this \
              host: {sentence}"
         );
+    }
+    match &imported.working_set {
+        ImportedWorkingSet::NotCarried => info!(
+            snapshot = %imported.tag,
+            "the archive carries no restore working set"
+        ),
+        ImportedWorkingSet::Installed { pages, bytes } => info!(
+            snapshot = %imported.tag,
+            pages,
+            mib = bytes / (1024 * 1024),
+            "installed the archive's restore working set under the imported snapshot's key"
+        ),
+        ImportedWorkingSet::NotInstalled(why) => warn!(
+            snapshot = %imported.tag,
+            "the archive's working set was not installed: {why}"
+        ),
     }
     Ok(())
 }
@@ -378,7 +435,11 @@ where
 
     let tag = archive.manifest.tag.clone();
     let config = archive.config.clone();
-    let Staged { files, externals } = {
+    let Staged {
+        files,
+        externals,
+        working_set,
+    } = {
         let (staging, generation_lock) = (staging.to_path_buf(), generation_lock.clone());
         let host = host.clone();
         tokio::task::spawn_blocking(move || {
@@ -410,6 +471,7 @@ where
         files,
         externals,
         not_shipped: not_shipped(&config),
+        working_set,
     })
 }
 
@@ -568,12 +630,22 @@ fn read_config_entry<R: Read>(reader: &mut ArchiveReader<R>) -> Result<(ArchiveE
         "the archive's {CONFIG_FILE} is {} bytes long (the limit is {MAX_CONFIG_BYTES})",
         entry.len
     );
-    let mut json = vec![0u8; usize::try_from(entry.len)?];
-    while let Some((offset, bytes)) = reader.next_run()? {
-        let start = usize::try_from(offset)?;
-        json[start..start + bytes.len()].copy_from_slice(bytes);
-    }
+    let json = read_entry_bytes(reader, &entry)?;
     Ok((entry, json))
+}
+
+/// Read the current entry of `reader`, which is unread, whole into memory: each data run
+/// at its offset, and zeros where the entry has a hole. The caller has bounded `entry.len`.
+fn read_entry_bytes<R: Read>(
+    reader: &mut ArchiveReader<R>,
+    entry: &ArchiveEntry,
+) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; usize::try_from(entry.len)?];
+    while let Some((offset, piece)) = reader.next_run()? {
+        let start = usize::try_from(offset)?;
+        bytes[start..start + piece.len()].copy_from_slice(piece);
+    }
+    Ok(bytes)
 }
 
 /// Check the archived `config.json` against the manifest and this host, and parse it.
@@ -868,6 +940,7 @@ struct Staged {
     /// One per file written into the staging directory, the config's first.
     files: Vec<ArchiveEntry>,
     externals: Vec<ImportedExternal>,
+    working_set: ImportedWorkingSet,
 }
 
 /// An external file in its temporary, whole and not yet published. Dropping it removes the
@@ -1129,9 +1202,10 @@ fn pmem_identities(host: &ImportHost, config: &SnapshotConfig) -> Result<Vec<(St
 }
 
 /// Write every file left in the archive: the snapshot's into `staging`, and the external
-/// ones this host lacks into temporaries of their stores. Read the archive to its verified
-/// end, check that the directory holds every file a restore opens, publish the external
-/// files, write the imported `config.json`, and sync the directory.
+/// ones this host lacks into temporaries of their stores. The working-set sidecar is held
+/// in memory. Read the archive to its verified end, check that the directory holds every
+/// file a restore opens, publish the external files, write the imported `config.json`,
+/// write the working set under the staged snapshot's key, and sync the directory.
 /// Runs on a blocking thread of the runtime.
 fn stage_files<R: Read>(
     mut reader: ArchiveReader<R>,
@@ -1139,8 +1213,8 @@ fn stage_files<R: Read>(
     archive: &CheckedArchive,
     host: &ImportHost,
 ) -> Result<Staged> {
-    let working_set = crate::uffd::WorkingSetStore::path_for(Path::new(SNAPSHOT_MEMORY_FILE));
     let memory = Path::new(SNAPSHOT_MEMORY_FILE);
+    let sidecar = crate::uffd::WorkingSetStore::path_for(memory);
     let owners = crate::reclaim::owner_dir_in(&host.data_dir)?;
     // Opened, and so created where this host has none, only for an entry to install.
     let store = archive
@@ -1152,6 +1226,8 @@ fn stage_files<R: Read>(
         .context("opening the pmem image store")?;
     // Dropped with their temporaries if anything below fails before they are published.
     let mut staged_externals = Vec::new();
+    // What is held of the archive's working set until the archive has verified.
+    let mut archived_set = ArchivedSet::NotCarried;
     let mut files = vec![archive.config_entry.clone()];
     while let Some(entry) = reader.next_entry()? {
         let relative = match &entry.name {
@@ -1173,14 +1249,16 @@ fn stage_files<R: Read>(
                 continue;
             }
         };
-        if *relative == working_set {
-            // Not written: its key is the exporting host's config digest and the memory
-            // image's modification time there, and the imported snapshot has neither. The
-            // reader still reads and verifies it.
-            info!(
-                bytes = entry.len,
-                "dropped the archive's working set; the first restores record a new one"
-            );
+        if *relative == sidecar {
+            // No file is written for it here: its key names the exporting host's config
+            // and memory image, so it is written under the staged snapshot's key once the
+            // archive has verified and that config exists ([`install_working_set`]).
+            archived_set = read_working_set_entry(
+                &mut reader,
+                &entry,
+                &archive.manifest,
+                &staging.join(memory),
+            )?;
             continue;
         }
         let path = staging.join(relative);
@@ -1230,6 +1308,10 @@ fn stage_files<R: Read>(
         .and_then(|mut file| file.write_all(&config_json))
         .with_context(|| format!("writing {}", config_path.display()))?;
 
+    // After the config, whose bytes are half of the key, and before the sync, which covers
+    // the sidecar with the rest of the directory.
+    let working_set = install_working_set(staging, archive, archived_set);
+
     super::podman::sync_generation(staging).context("syncing the staged snapshot")?;
     let externals = archive
         .externals
@@ -1241,7 +1323,168 @@ fn stage_files<R: Read>(
             installed: plan.install && !kept.contains(&plan.described.path),
         })
         .collect();
-    Ok(Staged { files, externals })
+    Ok(Staged {
+        files,
+        externals,
+        working_set,
+    })
+}
+
+/// What an import holds of its archive's working-set sidecar from the entry's place in the
+/// archive until the archive has verified.
+enum ArchivedSet {
+    /// The archive has no sidecar.
+    NotCarried,
+    /// The sidecar's bytes, and the manifest's record of the memory image they are keyed
+    /// to, which is the length of the staged image.
+    Held {
+        bytes: Vec<u8>,
+        memory: ManifestMemory,
+    },
+    /// Nothing of the sidecar is held, and why it cannot be the snapshot's working set. The
+    /// reader reads and verifies the entry with the rest of the archive.
+    NotHeld(String),
+}
+
+/// Why a working set is not installed when the manifest gives the memory image another
+/// length than the staged image has: the set's offsets, and the bound on its bytes, are
+/// those of an image of the manifest's length.
+fn another_image_length(manifest_len: u64, staged_len: u64) -> String {
+    format!(
+        "the archive's manifest gives the memory image {manifest_len} bytes and the \
+         archive's memory image is {staged_len} bytes long"
+    )
+}
+
+/// Decide what to hold of the archive's working-set sidecar, the current entry of `reader`,
+/// and read it into memory if it can be the snapshot's working set. The error is the
+/// reader's.
+///
+/// Nothing is held unless the snapshot has a memory image, the manifest gives the sidecar
+/// this build's format version, `staged_memory` is staged whole (an export writes the
+/// memory image ahead of its sidecar) with the length the manifest gives for it, and the
+/// entry is no longer than a working set of that length can be (`max_recorded_len`). So
+/// the bytes held are bounded by the length of the image that is installed, not by a
+/// length the manifest claims.
+fn read_working_set_entry<R: Read>(
+    reader: &mut ArchiveReader<R>,
+    entry: &ArchiveEntry,
+    manifest: &ArchiveManifest,
+    staged_memory: &Path,
+) -> Result<ArchivedSet> {
+    let not_held = |why: String| Ok(ArchivedSet::NotHeld(why));
+    let Some(memory) = &manifest.memory else {
+        return not_held("the snapshot has no memory image".to_string());
+    };
+    let ours = crate::uffd::WORKING_SET_VERSION;
+    if manifest.working_set_version != ours {
+        return not_held(format!(
+            "the archive's manifest gives it format version {} and this build reads version \
+             {ours}",
+            manifest.working_set_version
+        ));
+    }
+    let staged_len = match std::fs::metadata(staged_memory) {
+        Ok(staged) => staged.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return not_held(
+                "the archive has it ahead of the memory image, and an export writes it after"
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return not_held(format!(
+                "reading the size of the staged memory image failed: {error}"
+            ))
+        }
+    };
+    if staged_len != memory.len {
+        return not_held(another_image_length(memory.len, staged_len));
+    }
+    let Some(limit) = crate::uffd::max_recorded_len(staged_len) else {
+        return not_held(format!(
+            "the memory image is {staged_len} bytes long, more than a working set is recorded \
+             for"
+        ));
+    };
+    if entry.len > limit {
+        return not_held(format!(
+            "it is {} bytes long, and the working set of a {staged_len}-byte memory image \
+             takes {limit} at most",
+            entry.len
+        ));
+    }
+    Ok(ArchivedSet::Held {
+        bytes: read_entry_bytes(reader, entry)?,
+        memory: memory.clone(),
+    })
+}
+
+/// Write the archive's working set beside the staged memory image, under the staged
+/// snapshot's key, and say what became of it. Never an error: a working set is a hint, and
+/// a snapshot without one is whole.
+///
+/// `archived` is what [`read_working_set_entry`] held. The archive has verified by now, so
+/// held bytes are the ones the export read. The staged memory image is held against the
+/// manifest's length again before a byte is decoded. The bytes are then decoded under the
+/// key the exporting host gave the snapshot, built from the archive's own facts: the digest
+/// of the archived `config.json` (what `ImageKey::of_generation` hashes there) and the
+/// manifest's length and modification time of the memory image. That is the check that the
+/// sidecar belongs to this archive's snapshot. The set is then written under the key of the
+/// staged `config.json` and the staged `memory.bin`.
+fn install_working_set(
+    staging: &Path,
+    archive: &CheckedArchive,
+    archived: ArchivedSet,
+) -> ImportedWorkingSet {
+    use ImportedWorkingSet::{Installed, NotCarried, NotInstalled};
+    let (bytes, memory) = match archived {
+        ArchivedSet::NotCarried => return NotCarried,
+        ArchivedSet::NotHeld(why) => return NotInstalled(why),
+        ArchivedSet::Held { bytes, memory } => (bytes, memory),
+    };
+    let staged_memory = staging.join(SNAPSHOT_MEMORY_FILE);
+    let installed_len = match std::fs::metadata(&staged_memory) {
+        Ok(installed) => installed.len(),
+        Err(error) => {
+            return NotInstalled(format!(
+                "reading the size of the staged memory image failed: {error}"
+            ))
+        }
+    };
+    if installed_len != memory.len {
+        return NotInstalled(another_image_length(memory.len, installed_len));
+    }
+    let archived_key = crate::uffd::ImageKey::from_parts(
+        &Sha256::digest(&archive.config_json).into(),
+        memory.len,
+        memory.mtime_sec,
+        memory.mtime_nsec,
+    );
+    let decoded = crate::uffd::PageSet::decode_recorded(&bytes, &archived_key, memory.len);
+    // The set is the second copy of the sidecar, and its encoding below a third.
+    drop(bytes);
+    let set = match decoded {
+        Ok(set) => set,
+        Err(why) => return NotInstalled(format!("it {why}")),
+    };
+    if set.is_empty() {
+        return NotInstalled("it records no pages".to_string());
+    }
+    match crate::uffd::WorkingSetStore::seed_staged_generation(
+        &staged_memory,
+        installed_len,
+        &staging.join(CONFIG_FILE),
+        &set,
+    ) {
+        Ok(()) => Installed {
+            pages: set.len(),
+            bytes: set.bytes(),
+        },
+        Err(error) => NotInstalled(format!(
+            "writing it beside the installed memory image failed: {error:#}"
+        )),
+    }
 }
 
 /// The `config.json` an import writes: the archived one as a generation of its own, with
@@ -1294,7 +1537,7 @@ mod tests {
     use crate::commands::snapshot_export::export_snapshot;
     use crate::commands::snapshot_export::tests::{
         data_runs, fake_snapshot, fake_snapshot_with, fake_snapshot_with_externals, names_in,
-        pattern, Externals, Fake, IMAGE_DISK_LEN, MIB, PMEM_LEN, TAG,
+        pattern, Externals, Fake, IMAGE_DISK_LEN, MEMORY_LEN, MIB, PAGE, PMEM_LEN, TAG,
     };
     use crate::storage::snapshot_archive::ArchiveWriter;
     use crate::storage::SnapshotManager;
@@ -1527,7 +1770,8 @@ mod tests {
     }
 
     /// Export, delete, import: the directory comes back with the same names, lengths, hole
-    /// maps and bytes, and without the working set. Nothing else is left of the import.
+    /// maps and bytes. The fake's working-set file is not a working set, so the snapshot
+    /// comes back without one, and the import says why. Nothing else is left of the import.
     #[tokio::test]
     async fn an_import_installs_what_the_export_read() {
         let fake = fake_snapshot();
@@ -1548,6 +1792,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(imported.tag, TAG);
+        assert_eq!(
+            imported.working_set,
+            ImportedWorkingSet::NotInstalled("it does not decode (bad magic)".to_string())
+        );
         let names = [
             "config.json",
             "disk/disk.raw",
@@ -1562,7 +1810,8 @@ mod tests {
                 .map(|file| file.name.to_str().unwrap())
                 .collect::<Vec<_>>(),
             names,
-            "the installed files (the working set, its lock and its temporary stay out)"
+            "the installed files (the fake's working-set file is not a working set and is \
+             not installed; its lock and its temporary are not in the archive)"
         );
         assert_eq!(
             imported
@@ -1699,11 +1948,9 @@ mod tests {
             .clone()
     }
 
-    /// A disk-only snapshot has no memory image, no VM state and no inode table for a
-    /// volume: a create writes none of them for it, and its clones boot from the disk. It
-    /// imports without them.
-    #[tokio::test]
-    async fn a_disk_only_snapshot_imports_without_a_memory_image() {
+    /// A fake disk-only snapshot: no memory image, no VM state and no inode table for its
+    /// volume.
+    fn disk_only_fake() -> Fake {
         let fake = fake_snapshot_with(|config| {
             config.kind = SnapshotKind::DiskOnly;
             config.metadata.volumes = vec![crate::storage::snapshot::SnapshotVolumeConfig {
@@ -1718,16 +1965,30 @@ mod tests {
         for name in ["vmstate.bin", "volume-5000-inode-table.json"] {
             std::fs::remove_file(fake.dir().join(name)).unwrap();
         }
+        fake
+    }
+
+    /// A disk-only snapshot has no memory image, no VM state and no inode table for a
+    /// volume: a create writes none of them for it, and its clones boot from the disk. It
+    /// imports without them.
+    #[tokio::test]
+    async fn a_disk_only_snapshot_imports_without_a_memory_image() {
+        let fake = disk_only_fake();
         let archive = export_of(&fake).await;
         std::fs::remove_dir_all(fake.dir()).unwrap();
 
-        import_snapshot(&host_of(&fake), Cursor::new(archive))
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
             .await
             .unwrap();
 
         assert_eq!(
             files_under(&fake.dir()),
             ["config.json", "disk/disk.raw"].map(PathBuf::from)
+        );
+        // The fake's directory still holds a working-set file, which has no image to be of.
+        assert_eq!(
+            imported.working_set,
+            ImportedWorkingSet::NotInstalled("the snapshot has no memory image".to_string())
         );
         let config = SnapshotManager::new(fake.host.snapshots_dir.clone())
             .load_snapshot(TAG)
@@ -3402,6 +3663,498 @@ mod tests {
         remove_snapshot_dir(&fake.dir()).await.unwrap();
     }
 
+    const SIDECAR: &str = "memory.bin.working-set";
+
+    /// What a memory server of the fake's snapshot would have recorded: pages of its memory
+    /// image in four first-touch tiers.
+    fn recorded_set() -> crate::uffd::PageSet {
+        let mut set = crate::uffd::PageSet::empty(MEMORY_LEN);
+        set.insert_range_at(0, 3 * PAGE, 1);
+        set.insert_range_at(MIB, 2 * PAGE, 30);
+        set.insert_range_at(3 * MIB, PAGE, 100);
+        set.insert_range(MEMORY_LEN - PAGE, PAGE);
+        assert_eq!(
+            set.by_first_touch()
+                .iter()
+                .filter(|tier| !tier.is_empty())
+                .count(),
+            4,
+            "control: the set spans four first-touch tiers"
+        );
+        set
+    }
+
+    /// Give the fake snapshot `set` as its recorded working set, in place of the file that
+    /// is not one: written by the store, under the key of the fake's config and memory
+    /// image. Returns the sidecar's bytes.
+    fn record_working_set(fake: &Fake, set: &crate::uffd::PageSet) -> Vec<u8> {
+        crate::uffd::WorkingSetStore::seed_held_generation(
+            &fake.memory(),
+            MEMORY_LEN,
+            &fake.dir().join(CONFIG_FILE),
+            set,
+        )
+        .unwrap();
+        std::fs::read(fake.dir().join(SIDECAR)).unwrap()
+    }
+
+    /// The working set a memory server of the installed snapshot loads.
+    fn served_set(fake: &Fake) -> crate::uffd::WorkingSetStore {
+        crate::commands::snapshot::open_snapshot_working_set(&fake.dir())
+            .unwrap()
+            .0
+    }
+
+    /// The names under the snapshot's directory that belong to a working set: the sidecar,
+    /// its lock, a writer's temporary.
+    fn working_set_files(dir: &Path) -> Vec<PathBuf> {
+        files_under(dir)
+            .into_iter()
+            .filter(|name| name.to_str().unwrap().starts_with(SIDECAR))
+            .collect()
+    }
+
+    /// A fake snapshot with [`recorded_set`] as its working set, exported and deleted, as
+    /// the archive's files for a test to change.
+    async fn unpacked_with_working_set() -> (Fake, Unpacked) {
+        let fake = fake_snapshot();
+        record_working_set(&fake, &recorded_set());
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        (fake, Unpacked::of(&archive))
+    }
+
+    impl Unpacked {
+        /// The bytes of one file of the archive.
+        fn file_mut(&mut self, name: &str) -> &mut Vec<u8> {
+            &mut self
+                .files
+                .iter_mut()
+                .find(|(file, _)| file == Path::new(name))
+                .unwrap_or_else(|| panic!("the archive has no {name}"))
+                .1
+        }
+    }
+
+    /// Import an archive whose working set the import does not take. The import succeeds,
+    /// the snapshot loads, nothing of a working set is in its directory, and a memory
+    /// server of it starts with an empty set. Returns the reason the import gives.
+    async fn reason_the_working_set_is_dropped(fake: &Fake, archive: Vec<u8>) -> String {
+        let imported = import_snapshot(&host_of(fake), Cursor::new(archive))
+            .await
+            .expect("the import failed over its working set");
+        let ImportedWorkingSet::NotInstalled(why) = imported.working_set else {
+            panic!(
+                "the import did not drop the working set: {:?}",
+                imported.working_set
+            );
+        };
+        assert_eq!(
+            working_set_files(&fake.dir()),
+            Vec::<PathBuf>::new(),
+            "a working set that was dropped ({why}) left a file"
+        );
+        SnapshotManager::new(fake.host.snapshots_dir.clone())
+            .load_snapshot(TAG)
+            .await
+            .unwrap();
+        assert!(served_set(fake).to_prefetch().is_empty());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+        why
+    }
+
+    /// The archive's working set comes back as the installed snapshot's: a memory server of
+    /// the imported snapshot loads the pages and the first-touch tiers the exporting host
+    /// recorded. The sidecar is written anew under the installed snapshot's key, so its
+    /// bytes are not the archived ones, and no lock file or temporary comes with it.
+    #[tokio::test]
+    async fn an_import_installs_the_working_set_under_the_installed_snapshots_key() {
+        let fake = fake_snapshot();
+        let set = recorded_set();
+        let exported = record_working_set(&fake, &set);
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            imported.working_set,
+            ImportedWorkingSet::Installed {
+                pages: set.len(),
+                bytes: set.bytes(),
+            }
+        );
+        assert_eq!(
+            working_set_files(&fake.dir()),
+            [PathBuf::from(SIDECAR)],
+            "the working-set files of the installed snapshot"
+        );
+        let installed = std::fs::read(fake.dir().join(SIDECAR)).unwrap();
+        assert_eq!(installed.len(), exported.len());
+        assert!(
+            installed != exported,
+            "the installed sidecar has the exporting host's key"
+        );
+        let store = served_set(&fake);
+        assert_eq!(
+            store.to_prefetch(),
+            set,
+            "the pages and first-touch times a memory server of the imported snapshot loads"
+        );
+        assert!(
+            *store.to_prefetch_ordered() == set.by_first_touch(),
+            "the first-touch tiers a memory server of the imported snapshot replays in"
+        );
+        assert!(!staging_of(&fake).exists());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// A sidecar whose key is not the one the archive's own facts give is not installed:
+    /// the manifest gives the memory image another modification time than the sidecar was
+    /// recorded against, or the archived config is not the one it was recorded against.
+    #[tokio::test]
+    async fn a_working_set_keyed_to_another_image_is_dropped_and_the_import_succeeds() {
+        let another = "it was recorded against another memory image or another config";
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.manifest.memory.as_mut().unwrap().mtime_nsec += 1;
+        let why = reason_the_working_set_is_dropped(&fake, unpacked.pack()).await;
+        assert!(why.starts_with(another), "{why}");
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.manifest.memory.as_mut().unwrap().mtime_sec -= 1;
+        let why = reason_the_working_set_is_dropped(&fake, unpacked.pack()).await;
+        assert!(why.starts_with(another), "{why}");
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.edit_config(|config| config.parent_snapshot = Some("example-parent".to_string()));
+        let why = reason_the_working_set_is_dropped(&fake, unpacked.pack()).await;
+        assert!(why.starts_with(another), "{why}");
+    }
+
+    /// A working set in another format version than this build's is not installed, whether
+    /// the manifest says so or the sidecar's own header does.
+    #[tokio::test]
+    async fn a_working_set_of_another_format_version_is_dropped_and_the_import_succeeds() {
+        let ours = crate::uffd::WORKING_SET_VERSION;
+        let theirs = ours + 1;
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.manifest.working_set_version = theirs;
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            format!(
+                "the archive's manifest gives it format version {theirs} and this build reads \
+                 version {ours}"
+            )
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.file_mut(SIDECAR)[8..16].copy_from_slice(&theirs.to_le_bytes());
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            format!("it has format version {theirs} and this build reads version {ours}")
+        );
+    }
+
+    /// A sidecar that is cut, or longer than a working set of the image can be, is not
+    /// installed. The long one is not held in memory: it is refused by its length.
+    #[tokio::test]
+    async fn a_working_set_that_does_not_decode_is_dropped_and_the_import_succeeds() {
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.file_mut(SIDECAR).pop();
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            "it does not decode (truncated first-touch times)"
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.file_mut(SIDECAR).truncate(100);
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            "it does not decode (truncated bitmap)"
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        let limit = crate::uffd::max_recorded_len(MEMORY_LEN).unwrap();
+        unpacked.file_mut(SIDECAR).resize(limit as usize + 1, 0);
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            format!(
+                "it is {} bytes long, and the working set of a {MEMORY_LEN}-byte memory image \
+                 takes {limit} at most",
+                limit + 1
+            )
+        );
+    }
+
+    /// A working set for a memory image of another length is not installed: the manifest
+    /// gives the memory image a length the archive's image does not have, in either
+    /// direction, or the sidecar's own header describes another length than both.
+    #[tokio::test]
+    async fn a_working_set_for_another_image_length_is_dropped_and_the_import_succeeds() {
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.manifest.memory.as_mut().unwrap().len = MEMORY_LEN + PAGE;
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            another_image_length(MEMORY_LEN + PAGE, MEMORY_LEN)
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked
+            .file_mut("memory.bin")
+            .truncate((MEMORY_LEN - PAGE) as usize);
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            another_image_length(MEMORY_LEN, MEMORY_LEN - PAGE)
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.file_mut(SIDECAR)[24..32].copy_from_slice(&(MEMORY_LEN + PAGE).to_le_bytes());
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            format!(
+                "it describes a memory image of {} bytes, which is not the length it was \
+                 checked against",
+                MEMORY_LEN + PAGE
+            )
+        );
+    }
+
+    /// A staging directory as an import has it when the archive has verified and the
+    /// imported config is written: a memory image of `memory_len` bytes and a config.
+    fn staged_for_working_set(fake: &Fake, memory_len: u64) -> PathBuf {
+        let staging = staging_of(fake);
+        std::fs::create_dir_all(&staging).unwrap();
+        File::create(staging.join(SNAPSHOT_MEMORY_FILE))
+            .unwrap()
+            .set_len(memory_len)
+            .unwrap();
+        std::fs::write(staging.join(CONFIG_FILE), b"imported generation").unwrap();
+        staging
+    }
+
+    /// The length the manifest gives for the memory image is a claim until it is held
+    /// against the staged image, and nothing of the sidecar is held or decoded on a claim.
+    ///
+    /// - A manifest that gives the image 1 TiB bounds a sidecar at 544 MiB. With a staged
+    ///   image of 8 MiB, a sidecar one byte longer than a working set of 8 MiB can be is
+    ///   not held: the reason is the image's length, not the sidecar's.
+    /// - Bytes that are held for an image of another length than the staged one are not
+    ///   decoded: bytes that do not decode are refused for the length.
+    /// - Through an import, a sidecar that does not decode beside a memory image shorter
+    ///   than the manifest's is refused for the length.
+    /// - A sidecar ahead of the memory image, which no export writes, is not held: there is
+    ///   no staged image to hold the manifest's length against yet.
+    #[tokio::test]
+    async fn a_working_set_is_not_held_or_decoded_for_a_memory_image_of_another_length() {
+        const CLAIMED: u64 = 1 << 40;
+        let sidecar_entry = EntryName::Snapshot(PathBuf::from(SIDECAR));
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked.manifest.memory.as_mut().unwrap().len = CLAIMED;
+        let longest = crate::uffd::max_recorded_len(MEMORY_LEN).unwrap() as usize;
+        unpacked.file_mut(SIDECAR).resize(longest + 1, 0);
+        let mut reader = ArchiveReader::new(Cursor::new(unpacked.pack())).unwrap();
+        let manifest = reader.manifest().clone();
+        let entry = loop {
+            let entry = reader.next_entry().unwrap().expect("the archive's sidecar");
+            if entry.name == sidecar_entry {
+                break entry;
+            }
+        };
+        let staging = staged_for_working_set(&fake, MEMORY_LEN);
+        let staged_memory = staging.join(SNAPSHOT_MEMORY_FILE);
+        match read_working_set_entry(&mut reader, &entry, &manifest, &staged_memory).unwrap() {
+            ArchivedSet::NotHeld(why) => {
+                assert_eq!(why, another_image_length(CLAIMED, MEMORY_LEN))
+            }
+            ArchivedSet::Held { bytes, .. } => panic!(
+                "{} bytes of the sidecar were held on the manifest's claim of a {CLAIMED}-byte \
+                 memory image, and the staged image is {MEMORY_LEN} bytes long",
+                bytes.len()
+            ),
+            ArchivedSet::NotCarried => panic!("the sidecar's entry was read as no sidecar"),
+        }
+        std::fs::remove_dir_all(&staging).unwrap();
+
+        let (fake, archive) = exported().await;
+        let (_, checked) = read_and_check(&host_of(&fake), Cursor::new(archive)).unwrap();
+        let staging = staged_for_working_set(&fake, MEMORY_LEN - PAGE);
+        let held = ArchivedSet::Held {
+            bytes: b"not a working set".to_vec(),
+            memory: checked.manifest.memory.clone().unwrap(),
+        };
+        assert_eq!(
+            install_working_set(&staging, &checked, held),
+            ImportedWorkingSet::NotInstalled(another_image_length(MEMORY_LEN, MEMORY_LEN - PAGE)),
+            "held bytes were decoded before the staged image's length was checked"
+        );
+        std::fs::remove_dir_all(&staging).unwrap();
+
+        // The fake's working-set file is not a working set.
+        let (fake, archive) = exported().await;
+        let mut unpacked = Unpacked::of(&archive);
+        unpacked
+            .file_mut("memory.bin")
+            .truncate((MEMORY_LEN - PAGE) as usize);
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            another_image_length(MEMORY_LEN, MEMORY_LEN - PAGE)
+        );
+
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        let at = unpacked
+            .files
+            .iter()
+            .position(|(name, _)| name == Path::new(SIDECAR))
+            .unwrap();
+        let sidecar = unpacked.files.remove(at);
+        // After the config, which an import reads first, and ahead of the memory image.
+        unpacked.files.insert(1, sidecar);
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, unpacked.pack()).await,
+            "the archive has it ahead of the memory image, and an export writes it after"
+        );
+    }
+
+    /// A working set that cannot be written is not installed, and the import goes on: the
+    /// sidecar's name is taken by a directory, so the rename that publishes the set fails.
+    /// The temporary the write made is gone.
+    #[tokio::test]
+    async fn a_working_set_that_cannot_be_written_is_not_installed() {
+        let (fake, unpacked) = unpacked_with_working_set().await;
+        let bytes = unpacked
+            .files
+            .iter()
+            .find(|(name, _)| name == Path::new(SIDECAR))
+            .unwrap()
+            .1
+            .clone();
+        let (_, checked) = read_and_check(&host_of(&fake), Cursor::new(unpacked.pack())).unwrap();
+        let staging = staged_for_working_set(&fake, MEMORY_LEN);
+        std::fs::create_dir(staging.join(SIDECAR)).unwrap();
+        let held = ArchivedSet::Held {
+            bytes,
+            memory: checked.manifest.memory.clone().unwrap(),
+        };
+
+        let ImportedWorkingSet::NotInstalled(why) = install_working_set(&staging, &checked, held)
+        else {
+            panic!("a working set was installed over a directory");
+        };
+
+        assert!(
+            why.starts_with("writing it beside the installed memory image failed: "),
+            "{why}"
+        );
+        assert_eq!(
+            names_in(&staging),
+            [CONFIG_FILE, SNAPSHOT_MEMORY_FILE, SIDECAR],
+            "the staging directory after the failed write"
+        );
+    }
+
+    /// An archive without a working set installs the snapshot without one, a disk-only
+    /// snapshot's included, and that is not a working set that was dropped. A working set
+    /// that records no pages is dropped.
+    #[tokio::test]
+    async fn an_archive_without_a_working_set_installs_a_snapshot_without_one() {
+        let (fake, mut unpacked) = unpacked_with_working_set().await;
+        unpacked
+            .files
+            .retain(|(name, _)| name != Path::new(SIDECAR));
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(unpacked.pack()))
+            .await
+            .unwrap();
+        assert_eq!(imported.working_set, ImportedWorkingSet::NotCarried);
+        assert_eq!(working_set_files(&fake.dir()), Vec::<PathBuf>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+
+        let fake = fake_snapshot();
+        record_working_set(&fake, &crate::uffd::PageSet::empty(MEMORY_LEN));
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        assert_eq!(
+            reason_the_working_set_is_dropped(&fake, archive).await,
+            "it records no pages"
+        );
+
+        let fake = disk_only_fake();
+        for name in working_set_files(&fake.dir()) {
+            std::fs::remove_file(fake.dir().join(name)).unwrap();
+        }
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        assert_eq!(imported.working_set, ImportedWorkingSet::NotCarried);
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// No file of the working set is written before the archive has verified, and none is
+    /// installed from an archive that does not verify. One bit of a first-touch time
+    /// differs from what the export hashed, so the sidecar still decodes under its key. The
+    /// input stops inside the VM state, which follows the sidecar in the archive: the
+    /// memory image is staged and the working set is not. Let go, the import fails on the
+    /// sidecar's digest and leaves nothing.
+    #[tokio::test]
+    async fn no_working_set_is_written_before_the_archive_has_verified() {
+        let fake = fake_snapshot();
+        let exported = record_working_set(&fake, &recorded_set());
+        // Longer than the input buffer, so the import reads again inside it.
+        std::fs::write(
+            fake.dir().join("vmstate.bin"),
+            pattern(5, 4 * INPUT_BUFFER as u64),
+        )
+        .unwrap();
+        let mut archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        let sidecar_at = position_of(&archive, &exported);
+        archive[sidecar_at + exported.len() - 1] ^= 0x01;
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let input = Parked {
+            park_after: position_of(&archive, &pattern(5, 64)) as u64,
+            archive: Cursor::new(archive),
+            entered: entered_tx,
+            release: release_rx,
+            parked: false,
+        };
+        let host = host_of(&fake);
+        let import = tokio::spawn(async move { import_snapshot(&host, input).await });
+        tokio::time::timeout(Duration::from_secs(60), entered_rx.recv())
+            .await
+            .expect("the import never read past the working set")
+            .unwrap();
+
+        let staged = files_under(&staging_of(&fake));
+        assert!(
+            staged.contains(&PathBuf::from("memory.bin")),
+            "control: the memory image is staged when the input stops: {staged:?}"
+        );
+        assert_eq!(
+            working_set_files(&staging_of(&fake)),
+            Vec::<PathBuf>::new(),
+            "a file of the working set was written before the archive had verified"
+        );
+
+        release_tx.send(()).unwrap();
+        let message = match import.await.unwrap() {
+            Ok(imported) => panic!("the import installed {}", imported.tag),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.contains("snapshot/memory.bin.working-set is corrupt"),
+            "{message}"
+        );
+        assert!(!fake.dir().exists() && !staging_of(&fake).exists());
+    }
+
     /// `needles` appear in `body` in this order.
     fn assert_in_order(what: &str, body: &str, needles: &[&str]) {
         let mut from = 0;
@@ -3467,9 +4220,10 @@ mod tests {
     }
 
     /// Once the archive has verified, the staged files are checked, the external files are
-    /// published and the config is written with what they are on this host, and the
-    /// directory is synced and only then renamed. A test cannot see a sync from outside, so
-    /// the order is pinned by the source.
+    /// published and the config is written with what they are on this host, the working
+    /// set is written under the key that config gives it, and the directory is synced and
+    /// only then renamed. A test cannot see a sync from outside, so the order is pinned by
+    /// the source.
     #[test]
     fn the_staged_files_are_synced_before_they_are_published() {
         let source = include_str!("snapshot_import.rs");
@@ -3483,6 +4237,8 @@ mod tests {
                 "publish_externals(",
                 "pmem_identities(",
                 "imported_config_json(",
+                // After the config it is keyed on, and before the sync that covers it.
+                "install_working_set(",
                 "sync_generation(",
             ],
         );
