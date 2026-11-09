@@ -1033,7 +1033,10 @@ enum BuildTree {
     /// named only by profile and SHA would let one remove the other's mid-compile.
     /// `<tree>.owner` is held locked by this process and, inherited, by the build child,
     /// so a later build reclaims the tree of a setup killed mid-compile once both are gone.
-    Owned { path: PathBuf, owner: std::fs::File },
+    Owned {
+        path: PathBuf,
+        _owner: std::fs::File,
+    },
 }
 
 impl BuildTree {
@@ -1048,7 +1051,10 @@ impl BuildTree {
             uuid::Uuid::new_v4().simple()
         ));
         let owner = lock_build_tree_owner(&path)?;
-        Ok(Self::Owned { path, owner })
+        Ok(Self::Owned {
+            path,
+            _owner: owner,
+        })
     }
 
     fn path(&self) -> &Path {
@@ -1124,14 +1130,19 @@ fn reclaim_abandoned_build_trees(dir: &Path) {
     }
 }
 
-/// Remove a kernel build tree. A failure is logged, not returned: the kernel is already
-/// built or the build already failed, and a leftover tree costs disk, not correctness.
-async fn remove_kernel_build_dir(build_dir: &Path) {
+/// Remove a kernel build tree, returning whether it is gone. A failure is logged, not
+/// returned as an error: the kernel is already built or the build already failed, and a
+/// leftover tree costs disk, not correctness.
+async fn remove_kernel_build_dir(build_dir: &Path) -> bool {
     match tokio::fs::remove_dir_all(build_dir).await {
-        Ok(()) => info!(dir = %build_dir.display(), "removed kernel build tree"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(()) => {
+            info!(dir = %build_dir.display(), "removed kernel build tree");
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
-            warn!(dir = %build_dir.display(), error = %e, "could not remove kernel build tree")
+            warn!(dir = %build_dir.display(), error = %e, "could not remove kernel build tree");
+            false
         }
     }
 }
@@ -1147,9 +1158,12 @@ async fn run_kernel_build(
 ) -> Result<std::process::ExitStatus> {
     cmd.env("BUILD_DIR", tree.path());
     let status = run_streaming(cmd, label).await;
+    // The owner file goes only with the tree: a tree left behind keeps it, so a later
+    // build's reclaim pass still finds the tree.
     if let BuildTree::Owned { path, .. } = tree {
-        remove_kernel_build_dir(path).await;
-        let _ = tokio::fs::remove_file(build_tree_owner(path)).await;
+        if remove_kernel_build_dir(path).await {
+            let _ = tokio::fs::remove_file(build_tree_owner(path)).await;
+        }
     }
     status
 }
@@ -3260,6 +3274,36 @@ mod tests {
         );
     }
 
+    /// A tree the cleanup could not remove keeps its owner file, so a later build's reclaim
+    /// pass still finds it. A regular file at the tree's path makes the removal fail as any
+    /// user, root included.
+    #[tokio::test]
+    async fn a_tree_that_could_not_be_removed_keeps_its_owner_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("kernel-build-nested-0123456789ab-cccc");
+        std::fs::write(&tree, b"not a directory").unwrap();
+        let script = dir.path().join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_kernel_build(
+            Command::new(&script),
+            &BuildTree::Owned {
+                path: tree.clone(),
+                _owner: lock_build_tree_owner(&tree).unwrap(),
+            },
+            "test_build",
+        )
+        .await
+        .unwrap();
+
+        assert!(tree.exists(), "the test needs the removal to fail");
+        assert!(
+            build_tree_owner(&tree).exists(),
+            "a tree that is still there lost its owner file"
+        );
+    }
+
     /// The host build dir is shared by every host kernel build. Cleaning up after one
     /// install must leave another build's source and packages in place.
     #[tokio::test]
@@ -3317,7 +3361,7 @@ mod tests {
                 Command::new(&script),
                 &BuildTree::Owned {
                     path: build_dir.clone(),
-                    owner: lock_build_tree_owner(&build_dir).unwrap(),
+                    _owner: lock_build_tree_owner(&build_dir).unwrap(),
                 },
                 "test_build",
             )
