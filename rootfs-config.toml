@@ -95,7 +95,10 @@ branch = "fcvm-v52-sve-fix"
 
 [base]
 # Ubuntu 24.04 LTS (Noble Numbat) cloud images
-# Using "current" for latest updates - URL changes trigger plan SHA change
+# Using "current" for latest updates. A URL change triggers a plan SHA change; the
+# image behind "current" changes without one, and a host keeps the image it cached.
+# The package download resolves against the cached image's own dpkg status, so an
+# old cached image still gets every upgrade its packages need (#1759).
 version = "24.04"
 # Codename used to download packages from correct Ubuntu release
 codename = "noble"

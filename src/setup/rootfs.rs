@@ -427,6 +427,16 @@ echo 'FCVM: Packages installed successfully'
     .to_string()
 }
 
+/// Where the download container sees the cloud image's `/var/lib/dpkg/status`.
+///
+/// apt in the container resolves the download against that file, not against
+/// the container's own packages, so the set holds everything a `dpkg -i` into
+/// the cloud image needs. Resolved against the container, a package both images
+/// carry and the archive has updated since the cloud image was built (gpgv) was
+/// never downloaded, its dependents were, and dpkg stopped on the dependency
+/// (#1759).
+const IMAGE_DPKG_STATUS: &str = "/fcvm-image-dpkg-status";
+
 /// Generate the bash script that runs INSIDE the ubuntu container to download packages.
 /// This script is included in the hash to ensure cache invalidation when the
 /// download method or package list changes. The same script is used for execution
@@ -477,7 +487,10 @@ conmon_source_clean() {{
     rm -rf -- "$conmon_build_dir"/conmon-*/ "$conmon_build_dir"/conmon_*
 }}
 apt_retry apt-get update -qq
-apt_retry apt-get install --download-only --yes --no-install-recommends {packages}
+# Resolve against the cloud image's installed set ({IMAGE_DPKG_STATUS}), not the
+# container's: the packages are installed into the cloud image.
+apt_retry apt-get install --download-only --yes --no-install-recommends \
+    -o Dir::State::status={IMAGE_DPKG_STATUS} {packages}
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
 
 # Rebuild conmon from the same archive's source with fcvm's fix for its
@@ -2093,6 +2106,10 @@ async fn create_layer2_rootless(
         );
     }
 
+    // Step 4a: Read the cloud image's dpkg status while it is still ext4, so the
+    // package download resolves against what the image has installed (#1759).
+    let image_dpkg_status = read_image_dpkg_status(partition_path).await?;
+
     // Step 4b: Convert ext4 to btrfs if requested (before setup VM boot)
     if rootfs_type == Some("btrfs") {
         info!("converting rootfs from ext4 to btrfs");
@@ -2100,7 +2117,7 @@ async fn create_layer2_rootless(
     }
 
     // Step 5: Download packages on host (host has network!)
-    let packages_dir = download_packages(plan, script_sha_short).await?;
+    let packages_dir = download_packages(plan, script_sha_short, &image_dpkg_status).await?;
 
     // Step 6: Create initrd for Layer 2 setup with embedded packages
     // The initrd runs before systemd and:
@@ -2337,9 +2354,16 @@ fn apt_transport(
 /// Packages will be embedded directly in the initrd.
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
-async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
+async fn download_packages(
+    plan: &Plan,
+    script_sha_short: &str,
+    image_dpkg_status: &[u8],
+) -> Result<PathBuf> {
     let cache_dir = paths::cache_dir();
-    let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
+    // The set depends on the cloud image it is resolved against as well as on
+    // the script, so a newer cached image never reuses an older image's set.
+    let status_sha = &compute_sha256(image_dpkg_status)[..12];
+    let packages_dir = cache_dir.join(format!("packages-{script_sha_short}-{status_sha}"));
 
     // If packages directory already exists with .deb files, use it.
     // The directory is populated under a temp name and renamed into place only
@@ -2376,6 +2400,11 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let download_dir = download.path();
     tokio::fs::create_dir_all(download_dir).await?;
     super::give_store_entry_to_invoker(&cache_dir);
+    // The status file the container reads, removed when it drops.
+    let status_file = super::StoreTemp::new(&cache_dir.join(format!("dpkg-status-{status_sha}")))?;
+    tokio::fs::write(status_file.path(), image_dpkg_status)
+        .await
+        .context("writing the cloud image's dpkg status for the package download")?;
 
     let codename = &plan.base.codename;
     let container_image = format!("ubuntu:{}", codename);
@@ -2409,6 +2438,8 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         podman_args.extend(["-v".to_string(), format!("{}:{guest}:ro", host.display())]);
     }
     podman_args.extend([
+        "-v".to_string(),
+        format!("{}:{IMAGE_DPKG_STATUS}:ro", status_file.path().display()),
         "-v".to_string(),
         format!("{}:/packages", download_dir.display()),
         container_image.clone(),
@@ -2471,6 +2502,31 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
     Ok(packages_dir)
+}
+
+/// The cloud image's `/var/lib/dpkg/status`, read from its ext4 root partition
+/// with debugfs (no mount, no root).
+async fn read_image_dpkg_status(partition: &Path) -> Result<Vec<u8>> {
+    let output = Command::new("debugfs")
+        .args(["-R", "cat /var/lib/dpkg/status", path_to_str(partition)?])
+        .output()
+        .await
+        .context("running debugfs to read the cloud image's dpkg status")?;
+    check_image_dpkg_status(output.status.success(), output.stdout, &output.stderr)
+}
+
+/// debugfs exits 0 when the path is missing and says so only on stderr, so the
+/// content itself has to show it is a dpkg status file.
+fn check_image_dpkg_status(success: bool, stdout: Vec<u8>, stderr: &[u8]) -> Result<Vec<u8>> {
+    if !success || !stdout.starts_with(b"Package: ") {
+        bail!(
+            "could not read /var/lib/dpkg/status from the cloud image (debugfs exit ok={success}, \
+             {} bytes read): {}",
+            stdout.len(),
+            String::from_utf8_lossy(stderr).trim()
+        );
+    }
+    Ok(stdout)
 }
 
 /// Download cloud image (cached by URL hash)
@@ -2956,6 +3012,87 @@ mod tests {
         assert!(
             source.starts_with("APT_RETRY_CLEAN=conmon_source_clean "),
             "a retried apt-get source must clear the partial tree first: {source}"
+        );
+    }
+
+    /// The package download resolves against the cloud image's dpkg status, not
+    /// the container's (#1759). The status here is the container's own with gpgv
+    /// at noble's release version, as in a cloud image built before the archive
+    /// updated gpgv; the container holds the archive's gpgv. gnupg depends on the
+    /// archive's gpgv, so a download for that image has to include gpgv. Runs the
+    /// generated script's download step in `ubuntu:<codename>` (podman, network).
+    #[cfg(feature = "integration-fast")]
+    #[test]
+    fn the_package_download_resolves_against_the_cloud_images_dpkg_status() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        plan.packages = PackagesConfig {
+            runtime: vec!["gnupg".to_string()],
+            fuse: vec![],
+            nfs: vec![],
+            system: vec![],
+            debug: vec![],
+        };
+        let script = generate_download_script(&plan);
+        let (download_step, _) = script
+            .split_once("\n# Rebuild conmon")
+            .expect("the download script builds conmon after the download step");
+        let packages = tempfile::tempdir().unwrap();
+        let transport = apt_transport(
+            std::env::var("http_proxy")
+                .or_else(|_| std::env::var("HTTP_PROXY"))
+                .ok()
+                .as_deref(),
+            std::env::var("https_proxy")
+                .or_else(|_| std::env::var("HTTPS_PROXY"))
+                .ok()
+                .as_deref(),
+            host_ca_bundle(),
+        );
+        let mut args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network=host".to_string(),
+        ];
+        for (name, value) in &transport.env {
+            args.extend(["-e".to_string(), format!("{name}={value}")]);
+        }
+        for (host, guest) in &transport.mounts {
+            args.extend(["-v".to_string(), format!("{}:{guest}:ro", host.display())]);
+        }
+        args.extend([
+            "-v".to_string(),
+            format!("{}:/packages", packages.path().display()),
+            format!("ubuntu:{}", plan.base.codename),
+            "bash".to_string(),
+            "-c".to_string(),
+            format!(
+                "{}sed '/^Package: gpgv$/,/^$/ s/^Version: .*/Version: 2.4.4-2ubuntu17/' \
+                 /var/lib/dpkg/status > {IMAGE_DPKG_STATUS}\n\
+                 grep -qx 'Version: 2.4.4-2ubuntu17' {IMAGE_DPKG_STATUS}\n{download_step}\n",
+                transport.prelude
+            ),
+        ]);
+        let out = std::process::Command::new("podman")
+            .args(&args)
+            .output()
+            .expect("running podman");
+        assert!(
+            out.status.success(),
+            "download step failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let names: Vec<String> = std::fs::read_dir(packages.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("gnupg_")),
+            "gnupg itself was not downloaded: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("gpgv_")),
+            "gpgv is older in the image than gnupg needs and was not downloaded: {names:?}"
         );
     }
 
