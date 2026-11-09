@@ -26,9 +26,8 @@
 //! then the one its [`After`] names, and checks the oracles listed on [`run_scenario`].
 //!
 //! What a clone keeps is per hold ([`Expect`]): everything works, except a file the
-//! host renamed or deleted before the restore, and files held open on a `--map`
-//! without `--portable-volumes`; those must read correct content or fail, never read
-//! wrong content.
+//! host renamed or deleted before the restore, which must read correct content or
+//! fail, never read wrong content.
 //!
 //! What the gym found when it first ran (each now a deterministic test):
 //! - `--pmem` on the 6.18.50 guest kernel: a page fault on a DAX mapping (running a
@@ -37,9 +36,10 @@
 //! - `--nfs` with rootless or routed networking booted and then failed to mount;
 //!   fcvm now refuses it before boot
 //!   (`nfs_without_bridged_networking_is_refused_before_boot`).
-//! - A restore of a VM with a `--map` without `--portable-volumes` answers EBADF for
+//! - A restore of a VM with a `--map` without `--portable-volumes` answered EBADF for
 //!   every inode the guest took before the snapshot, directories included (#1684).
-//!   The gym holds those to "correct or error" until that is fixed.
+//!   Every snapshot now records each volume's inode table
+//!   (`test_clone_serves_inodes_held_in_a_plain_map`).
 //!
 //! Per PR: `gym_pairs_NN`, one test per scenario of a deterministic all-pairs covering
 //! set ([`all_pairs`]), and `gym_hugepage_pairs_NN` for its hugepage scenarios, which
@@ -417,9 +417,8 @@ enum Expect {
     Works,
     /// Each check either passes or fails with an error, and none reads wrong content:
     /// what a clone cannot keep, it refuses. For a file the host renamed or deleted
-    /// before the restore (a path-named volume cannot find it again, and the guest may
-    /// still serve pages it cached), and for a file held open on a `--map` without
-    /// `--portable-volumes`, whose handles the restored volume server never issued.
+    /// before the restore: a path-named volume cannot find it again, and the guest may
+    /// still serve pages it cached.
     CorrectOrError,
 }
 
@@ -488,18 +487,6 @@ fn holds(storage: Storage, hardware_perf: bool) -> Vec<Hold> {
         // the share afterwards raise nothing on it.
         for h in &mut all {
             if h.kind == "notify" {
-                h.expect = Expect::CorrectOrError;
-            }
-        }
-    }
-    if storage == Storage::Map {
-        // A --map without --portable-volumes names inodes by host inode number and
-        // keeps no table of them, so a restored volume server answers EBADF for every
-        // inode and handle the guest took before the snapshot, directories included:
-        // a fresh exec or create under a directory the guest had looked up fails too.
-        // Only the flock (local to the guest), the socket and the counter keep working.
-        for h in &mut all {
-            if !matches!(h.kind, "flock" | "listen" | "swperf" | "hwperf") {
                 h.expect = Expect::CorrectOrError;
             }
         }
@@ -1281,15 +1268,7 @@ async fn start_holds(pid: u32, storage: Storage, holds: &[Hold]) -> Result<()> {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    // On a --map without --portable-volumes the clone cannot serve pages of a file the
-    // guest held open, gymhold's own text among them, so there it runs from a copy in
-    // the container: its checks can then report what the volume does.
-    let bin = if storage == Storage::Map {
-        copy_into(pid, &gymhold_binary().await?, CONTAINER_GYMHOLD, false).await?;
-        CONTAINER_GYMHOLD.to_string()
-    } else {
-        format!("{g}/bin/gymhold")
-    };
+    let bin = format!("{g}/bin/gymhold");
     common::exec_in_container(pid, &[&script(false, &bin)]).await?;
     if holds.iter().any(|h| h.in_vm) {
         copy_into(pid, &gymhold_binary().await?, GUEST_GYMHOLD, true).await?;
@@ -1300,8 +1279,6 @@ async fn start_holds(pid: u32, storage: Storage, holds: &[Hold]) -> Result<()> {
 
 /// Where the guest-OS holds run gymhold from: copied in over exec.
 const GUEST_GYMHOLD: &str = "/tmp/gymhold";
-/// Where the container's holds run gymhold from on a `--map` without portable volumes.
-const CONTAINER_GYMHOLD: &str = "/tmp/gymhold";
 
 /// Whether a Firecracker guest on this host gets a hardware PMU: only on an AMD
 /// x86_64 host (bug 4 above). In an arm64 guest perf_event_open of
@@ -1683,17 +1660,14 @@ async fn common_afters(clone: u32, s: &Scenario, layout: &Layout) -> Result<()> 
             "a file opened after the restore read {got:?} at block {block}, want {want:?}"
         );
     }
-    // bin/ is a directory the guest looked up before the snapshot, which a --map
-    // without portable volumes no longer serves (see holds()).
-    if s.storage != Storage::Map {
-        let probe =
-            common::exec_in_container(clone, &[&format!("{g}/bin/gymhold - probe - && echo ran")])
-                .await?;
-        ensure!(
-            probe.trim().ends_with("ran"),
-            "exec of {g}/bin/gymhold after the restore: {probe:?}"
-        );
-    }
+    // bin/ is a directory the guest looked up before the snapshot.
+    let probe =
+        common::exec_in_container(clone, &[&format!("{g}/bin/gymhold - probe - && echo ran")])
+            .await?;
+    ensure!(
+        probe.trim().ends_with("ran"),
+        "exec of {g}/bin/gymhold after the restore: {probe:?}"
+    );
     if s.storage.writable() {
         let out = common::exec_in_container(
             clone,

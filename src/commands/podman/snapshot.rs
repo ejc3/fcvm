@@ -172,8 +172,8 @@ pub struct CreateSnapshotParams<'a> {
     pub vm_state: &'a VmState,
     pub disk_path: &'a Path,
     pub volume_configs: &'a [VolumeConfig],
-    /// RemapFs references for portable volumes — used to serialize inode tables at snapshot time.
-    pub remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+    /// Each volume's server, for its inode table at snapshot time.
+    pub volume_tables: &'a [crate::volume::TableSource],
 }
 
 impl CreateSnapshotParams<'_> {
@@ -187,7 +187,7 @@ impl CreateSnapshotParams<'_> {
         vm_state: &'a VmState,
         disk_path: &'a Path,
         volume_configs: &'a [VolumeConfig],
-        remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+        volume_tables: &'a [crate::volume::TableSource],
     ) -> CreateSnapshotParams<'a> {
         CreateSnapshotParams {
             vm_manager,
@@ -199,7 +199,7 @@ impl CreateSnapshotParams<'_> {
             vm_state,
             disk_path,
             volume_configs,
-            remap_refs,
+            volume_tables,
         }
     }
 }
@@ -256,7 +256,7 @@ pub async fn create_podman_snapshot(
         vm_state,
         disk_path,
         volume_configs,
-        remap_refs,
+        volume_tables,
     } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
@@ -390,24 +390,25 @@ pub async fn create_podman_snapshot(
     // The only record of which content a caller-named generation holds.
     snapshot_config.content_key = Some(content_key.to_string());
 
-    // Inode tables for portable volumes are written into the temp (.creating) directory
-    // by create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never
-    // exist without them. They are loaded by clone VolumeServers via restore_from_table()
-    // to preserve inode numbering across snapshot/restore — eliminating the TTL glitch window.
-    let portable: Vec<_> = remap_refs
+    // Every volume's inode table is written into the temp (.creating) directory by
+    // create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never exist
+    // without them. A clone's volume servers load them with restore_from_table(), so the inodes
+    // and handles the guest held at the snapshot keep naming the same files (#1684).
+    let tables: Vec<_> = volume_tables
         .iter()
         .enumerate()
-        .filter_map(|(idx, remap)| {
-            remap.as_ref().map(|r| {
-                (
-                    volume_configs.get(idx).map(|c| c.port).unwrap_or(0),
-                    std::sync::Arc::clone(r),
-                )
-            })
+        .map(|(idx, source)| {
+            (
+                volume_configs.get(idx).map(|c| c.port).unwrap_or(0),
+                source.clone(),
+            )
         })
         .collect();
-    let extra_files = || -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-        Ok(crate::volume::inode_table_files(&portable))
+    let extra_files = || -> anyhow::Result<crate::commands::common::ExtraFilesReader> {
+        let captured = crate::volume::capture_inode_tables(&tables);
+        Ok(Box::new(move || {
+            Ok(crate::volume::inode_table_files(captured))
+        }))
     };
 
     // Use shared core function for snapshot creation

@@ -64,6 +64,13 @@ pub struct PassthroughFs {
     mount_points: Option<MountPoints>,
 }
 
+/// What [`PassthroughFs::capture_inodes`] took while the guest was paused: the held inodes,
+/// each kept open so its path can be read after the guest forgets it, and the highest handle.
+pub struct CapturedInodes {
+    pins: Vec<fuse_backend_rs::passthrough::PinnedInode>,
+    max_handle: u64,
+}
+
 /// The directories inside a volume that the guest mounts other filesystems over, and the
 /// directories on the way to them (`PassthroughFs::with_mount_points`).
 struct MountPoints {
@@ -454,6 +461,63 @@ impl PassthroughFs {
     /// Get the root path.
     pub fn root_path(&self) -> &PathBuf {
         &self.root_path
+    }
+
+    /// The inodes the backend holds, pinned, and the highest handle given out: what
+    /// [`Self::inode_table`] needs, taken while the guest is paused for a snapshot (#1684).
+    ///
+    /// The backend drops an inode only at the guest's FORGET, and a paused guest sends none, so
+    /// these are every inode the saved guest can name. Taking them costs one reference count per
+    /// inode; the paths are read later, after the guest runs again, so the pause does not grow
+    /// with the number of inodes it holds.
+    pub fn capture_inodes(&self) -> CapturedInodes {
+        CapturedInodes {
+            pins: self.inner.pin_held_inodes(),
+            max_handle: self.inner.max_handle(),
+        }
+    }
+
+    /// This volume's inode table for a snapshot, in the form `RemapFs::restore_from_table` reads.
+    ///
+    /// The guest names files by the inode numbers this server gave it, and a server started for
+    /// a clone gives out its own. The table lists each captured inode by the path it has now,
+    /// and the highest handle given out, so the clone's server can resolve the guest's inodes by
+    /// path and reopen its handles. An inode whose file was deleted, or that now lies outside the
+    /// volume, is recorded as gone: a request on it is refused, never served from another file.
+    pub fn inode_table(&self, captured: CapturedInodes) -> String {
+        let mut paths = std::collections::BTreeMap::new();
+        let mut gone = std::collections::BTreeMap::new();
+        let root = self
+            .inner
+            .readlinkat_proc_file(fuse_backend_rs::api::filesystem::ROOT_ID);
+        for pinned in &captured.pins {
+            let ino = pinned.inode();
+            if ino == fuse_backend_rs::api::filesystem::ROOT_ID {
+                continue;
+            }
+            let path = self.inner.pinned_path(pinned);
+            let live = self
+                .inner
+                .pinned_stat(pinned)
+                .is_ok_and(|st| st.st_nlink > 0);
+            let relative = match (&root, &path) {
+                (Ok(root), Ok(path)) => path.strip_prefix(root).ok().and_then(|p| p.to_str()),
+                _ => None,
+            };
+            match relative {
+                Some(relative) if live => {
+                    paths.insert(ino, relative.to_string());
+                }
+                _ => {
+                    let shown = path.map_or_else(
+                        |error| format!("<path unreadable: {error}>"),
+                        |path| path.to_string_lossy().into_owned(),
+                    );
+                    gone.insert(ino, shown);
+                }
+            }
+        }
+        super::remap::table_json(captured.max_handle, &paths, &gone)
     }
 
     /// Create a Context from uid/gid/pid with optional supplementary groups.

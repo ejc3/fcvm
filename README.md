@@ -525,7 +525,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --free-page-reporting Guest reports freed memory and the host takes it back (needs --balloon, Firecracker only, not with --hugepages; the run fails if the guest refuses it; in the snapshot key)
 --privileged          Allow device access and mknod in container
 --image-mode <MODE>   overlay (default), btrfs, or archive
---portable-volumes    Path-hash inodes for cross-machine snapshot/restore
+--portable-volumes    Path-hash inode numbers in the guest (snapshots restore held inodes by path either way)
 --rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
 --no-snapshot         Disable automatic snapshot creation
 --hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)

@@ -967,7 +967,7 @@ pub(crate) async fn run_until_exit(
         crate::commands::common::CleanupContext {
             vm_id: vm.vm_id,
             volume_server_handles: Vec::new(),
-            remap_refs: Vec::new(),
+            volume_tables: Vec::new(),
             data_dir: vm.data_dir,
             health_cancel_token: Some(health_cancel),
             health_monitor_handle: Some(health),
