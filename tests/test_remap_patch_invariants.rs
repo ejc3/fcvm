@@ -402,6 +402,7 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         "kernel_profiles.nested.arm64.host_kernel",
         "kernel_profiles.btrfs.arm64",
         "kernel_profiles.btrfs.amd64",
+        "kernel_profiles.nested.amd64.host_kernel",
     ] {
         assert!(
             toml_section(&config, profile)
@@ -415,7 +416,6 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
     for profile in [
         "kernel_profiles.default.amd64",
         "kernel_profiles.nested.amd64",
-        "kernel_profiles.nested.amd64.host_kernel",
     ] {
         let section = toml_section(&config, profile);
         assert!(

@@ -527,15 +527,15 @@ firecracker_commit = "ddc1969f8dba126a1c771aa7be9d4ec09ffc177c"
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
 # then applies FUSE remap_file_range patch for reflink support in nested VMs
 [kernel_profiles.nested.amd64.host_kernel]
-kernel_version = "6.18.60"
-patches_dir = "kernel/patches-x86"
+kernel_version = "7.3.3"
+patches_dir = "kernel/patches-x86-host"
 # Kconfig lines set on top of the running kernel's config and checked after olddefconfig:
 # ENA built in, so cloud-init finds the NIC at boot (ejc3/aws#823).
 config_fragment = "kernel/host-x86.conf"
 
 # Build inputs for SHA calculation
 build_inputs = [
-    "kernel/patches-x86/*.patch",
+    "kernel/patches-x86-host/*.patch",
     "kernel/host-x86.conf",
 ]
 
