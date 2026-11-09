@@ -10,6 +10,9 @@ publish = false
 [workspace]
 
 [dependencies]
+# The ejc3/azalea fork (branch fcvm-26.3) is upstream's 26.3 branch plus one fix: the swing
+# animation packet's entity id is a VarInt. Reported upstream as azalea-rs/azalea#404; once
+# upstream fixes it, move back to azalea-rs/azalea.
 azalea = { git = "https://github.com/ejc3/azalea", rev = "070ad4a4a7e321a5b98ceac1dc1d920defb5d9b2", default-features = false, features = ["packet-event"] }
 anyhow = "1"
 parking_lot = "0.12"
