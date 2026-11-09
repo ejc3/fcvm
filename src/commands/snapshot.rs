@@ -875,6 +875,15 @@ where
                             guest_phases = %guest_phases.as_deref().unwrap_or("<none>"),
                             "fc-agent acknowledged exact restore generation"
                         );
+                        if guest_nfs_renew_failed(guest_phases.as_deref()) {
+                            warn!(
+                                vm_id = %vm_id,
+                                restore_epoch = %expected_epoch,
+                                "the clone's NFS clients kept the snapshot's identity (the renewal \
+                                 failed or timed out): files it held across the snapshot share \
+                                 their server state with every other clone of it (#1737)"
+                            );
+                        }
                         return Ok(RestoreAck::Acked { guest_phases });
                     }
                     Ok(Err(error)) => {
@@ -2383,6 +2392,14 @@ fn volume_state_from_snapshot(
         .collect();
     let portable = volumes.iter().any(|vol| vol.portable);
     (specs, portable)
+}
+
+/// Whether the guest's restore telemetry says its NFS identity renewal failed.
+fn guest_nfs_renew_failed(guest_phases: Option<&str>) -> bool {
+    guest_phases
+        .and_then(|phases| serde_json::from_str::<serde_json::Value>(phases).ok())
+        .and_then(|phases| phases.get("nfs_renew_failed").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
 }
 
 /// Run clone from snapshot
@@ -6703,6 +6720,20 @@ mod tests {
             chosen[1], snapshot[1],
             "an unnamed mapping keeps the snapshot's directory"
         );
+    }
+
+    /// A restore whose NFS renewal failed is visible on the host: the guest reports it in its
+    /// ACK telemetry, and the host warns (#1737).
+    #[test]
+    fn a_failed_nfs_renewal_in_the_ack_is_seen() {
+        assert!(guest_nfs_renew_failed(Some(
+            r#"{"nfs_ms":10.0,"nfs_renew_failed":true}"#
+        )));
+        assert!(!guest_nfs_renew_failed(Some(
+            r#"{"nfs_renew_failed":false}"#
+        )));
+        assert!(!guest_nfs_renew_failed(Some(r#"{"nfs_ms":1.0}"#)));
+        assert!(!guest_nfs_renew_failed(None));
     }
 
     /// --map cannot add a mount, change one's read-only flag, move a read-write map, or

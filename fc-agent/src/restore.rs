@@ -216,6 +216,11 @@ pub struct RestorePhases {
     /// The inherited neighbours' flush and the pins that follow it.
     pub neighbour_pin_ms: f64,
     pub nfs_ms: f64,
+    /// The NFS clients' identity renewal, part of `nfs_ms`: how long the kernel took, and
+    /// whether it failed or ran past `NFS_RENEW_LIMIT`. A failed renewal leaves the restored
+    /// clients on the snapshot's identity, which a twin clone shares (#1737).
+    pub nfs_renew_ms: f64,
+    pub nfs_renew_failed: bool,
     pub exec_wait_ms: f64,
     pub egress_wait_ms: f64,
     pub total_ms: f64,
@@ -629,6 +634,7 @@ pub async fn handle_clone_restore(
         // identities stay apart from the clients the remount below creates.
         // The kernel waits for each client's state manager to finish what it is doing, so
         // the write runs off the async workers and the restore waits for it a bounded time.
+        let renew_started = std::time::Instant::now();
         let renewed = tokio::time::timeout(
             NFS_RENEW_LIMIT,
             tokio::task::spawn_blocking({
@@ -643,6 +649,8 @@ pub async fn handle_clone_restore(
             Ok(Err(error)) => Some(format!("the renewal task failed: {error}")),
             Err(_) => Some(format!("no answer within {NFS_RENEW_LIMIT:?}")),
         };
+        phases.nfs_renew_ms = elapsed_ms(renew_started);
+        phases.nfs_renew_failed = failure.is_some();
         if let Some(failure) = failure {
             eprintln!(
                 "[fc-agent] WARNING: the NFS clients restored from the snapshot keep its identity, \
@@ -1145,6 +1153,8 @@ mod tests {
         phases.tcp_gate_ingress_commit_ms = 99_999.999;
         phases.neighbor_ms = 99_999.999;
         phases.nfs_ms = 99_999.999;
+        phases.nfs_renew_ms = 99_999.999;
+        phases.nfs_renew_failed = true;
         phases.exec_wait_ms = 99_999.999;
         phases.egress_wait_ms = 99_999.999;
         phases.total_ms = 99_999.999;
@@ -1161,7 +1171,8 @@ mod tests {
         );
         assert!(
             frame.contains("\"ack_connect_ms\":99999.999")
-                && frame.contains("\"scrub_ms\":99999.999"),
+                && frame.contains("\"scrub_ms\":99999.999")
+                && frame.contains("\"nfs_renew_failed\":true"),
             "the ACK telemetry was dropped from the frame: {frame}"
         );
     }

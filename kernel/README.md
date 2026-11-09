@@ -58,7 +58,9 @@ write to it failed with EIO (#1737). Writing a salt in hex to
 values for further clients) on its owner identifier, a new client ID and its opens and locks
 again under it. fc-agent writes it in every restore of a guest with NFS shares, with a salt
 from the restore epoch the host makes for that restore, since twin clones resume with the
-same random state. Linux has no such interface.
+same random state. A renewal that fails or runs past 10 s leaves the clients on the snapshot's
+identity; the restore's `guest_phases` then carry `"nfs_renew_failed":true` beside
+`nfs_renew_ms`, and the host logs a warning. Linux has no such interface.
 
 x86 patches live in `kernel/patches-default-x86`, which the x86 default profile
 applies in place of `kernel/patches-default` and which links the shared patches.
