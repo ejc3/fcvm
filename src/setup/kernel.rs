@@ -1041,11 +1041,24 @@ enum BuildTree {
 
 impl BuildTree {
     fn for_build(profile_name: &str, sha: &str) -> Result<Self> {
-        if let Some(dir) = std::env::var_os("BUILD_DIR").filter(|d| !d.is_empty()) {
+        Self::for_build_in(
+            &std::env::temp_dir(),
+            std::env::var_os("BUILD_DIR"),
+            profile_name,
+            sha,
+        )
+    }
+
+    fn for_build_in(
+        temp: &Path,
+        caller_dir: Option<std::ffi::OsString>,
+        profile_name: &str,
+        sha: &str,
+    ) -> Result<Self> {
+        if let Some(dir) = caller_dir.filter(|d| !d.is_empty()) {
             return Ok(Self::Caller(PathBuf::from(dir)));
         }
-        let temp = std::env::temp_dir();
-        reclaim_abandoned_build_trees(&temp);
+        reclaim_abandoned_build_trees(temp);
         let path = temp.join(format!(
             "kernel-build-{profile_name}-{sha}-{}",
             uuid::Uuid::new_v4().simple()
@@ -1096,24 +1109,45 @@ fn lock_build_tree_owner(tree: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Whether `name` is an owner file `for_build_in` creates:
+/// `kernel-build-<profile>-<12 hex sha>-<32 hex id>.owner`. Returns the tree's name.
+fn owned_build_tree_name(name: &str) -> Option<&str> {
+    let tree = name.strip_suffix(".owner")?;
+    let rest = tree.strip_prefix("kernel-build-")?;
+    let (head, id) = rest.rsplit_once('-')?;
+    let (_, sha) = head.rsplit_once('-')?;
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(id, 32) && hex(sha, 12)).then_some(tree)
+}
+
 /// Remove every kernel build tree under `dir` whose owner lock nobody holds: its setup and
-/// build child are gone (a setup killed mid-compile skips its own cleanup).
+/// build child are gone (a setup killed mid-compile skips its own cleanup). Only owner files
+/// this code names are considered, opened without blocking or following a link, and only a
+/// regular file the current user owns counts, so nothing planted in a shared temp dir can
+/// stall the pass or point it at another tree.
 fn reclaim_abandoned_build_trees(dir: &Path) {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let euid = nix::unistd::geteuid().as_raw();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(tree) = name
-            .strip_prefix("kernel-build-")
-            .and_then(|_| name.strip_suffix(".owner"))
+        let Some(tree) = owned_build_tree_name(&name) else {
+            continue;
+        };
+        let Ok(owner) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(entry.path())
         else {
             continue;
         };
-        let Ok(owner) = std::fs::File::open(entry.path()) else {
-            continue;
-        };
+        match owner.metadata() {
+            Ok(m) if m.file_type().is_file() && m.uid() == euid => {}
+            _ => continue,
+        }
         if unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
@@ -3208,8 +3242,9 @@ mod tests {
     /// $BUILD_DIR stays the caller's.
     #[tokio::test]
     async fn two_builds_of_one_kernel_never_share_a_tree_and_a_callers_tree_stays() {
-        let a = BuildTree::for_build("nested", "0123456789ab").unwrap();
-        let b = BuildTree::for_build("nested", "0123456789ab").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let a = BuildTree::for_build_in(temp.path(), None, "nested", "0123456789ab").unwrap();
+        let b = BuildTree::for_build_in(temp.path(), None, "nested", "0123456789ab").unwrap();
         assert!(matches!(a, BuildTree::Owned { .. }) && matches!(b, BuildTree::Owned { .. }));
         assert_ne!(
             a.path(),
@@ -3217,9 +3252,6 @@ mod tests {
             "two builds of one kernel share {}",
             a.path().display()
         );
-        for tree in [&a, &b] {
-            let _ = std::fs::remove_file(build_tree_owner(tree.path()));
-        }
 
         let dir = tempfile::tempdir().unwrap();
         let caller = dir.path().join("pre-seeded");
@@ -3246,8 +3278,12 @@ mod tests {
     #[test]
     fn an_abandoned_build_tree_is_reclaimed_and_a_live_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("kernel-build-nested-0123456789ab-aaaa");
-        let live = dir.path().join("kernel-build-nested-0123456789ab-bbbb");
+        let stale = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let live = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         for tree in [&stale, &live] {
             std::fs::create_dir_all(tree.join("linux-x")).unwrap();
             std::fs::write(tree.join("linux-x/vmlinux.o"), b"o").unwrap();
@@ -3264,6 +3300,44 @@ mod tests {
         assert!(
             live.join("linux-x/vmlinux.o").exists() && build_tree_owner(&live).exists(),
             "a tree whose owner lock is held was reclaimed"
+        );
+    }
+
+    /// The reclaim pass scans a shared temp dir. A FIFO with an owner file's name must not
+    /// stall it, and a name it did not create must not lead it to another tree.
+    #[test]
+    fn the_reclaim_pass_ignores_what_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_tree = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-cccccccccccccccccccccccccccccccc");
+        std::fs::create_dir(&fifo_tree).unwrap();
+        nix::unistd::mkfifo(
+            &build_tree_owner(&fifo_tree),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let foreign = dir.path().join("kernel-build-host");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(build_tree_owner(&foreign), b"").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let scan = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            reclaim_abandoned_build_trees(&scan);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "the reclaim pass blocked on a FIFO"
+        );
+        assert!(
+            fifo_tree.exists(),
+            "a FIFO owner file led to its tree being removed"
+        );
+        assert!(
+            foreign.exists(),
+            "a tree the pass did not create was removed"
         );
     }
 
