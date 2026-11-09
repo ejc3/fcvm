@@ -546,16 +546,16 @@ build_inputs = [
 [kernel_profiles.btrfs.arm64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage"
-kernel_version = "6.18.60"
+kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "81a23c24a0a4"
+kernel_sha = "b1dd099392e5"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
 build_inputs = [
     "kernel/btrfs-arm64.build.toml",
     "kernel/btrfs.conf",
-    "kernel/patches/*.patch",
+    "kernel/patches-7.3/*.patch",
 ]
 
 kernel_config = "kernel/btrfs.conf"
@@ -563,7 +563,7 @@ kernel_config = "kernel/btrfs.conf"
 # utimensat fix. Keep this line. The build applies kernel/patches when it is
 # omitted, but scripts/kernel-patch.sh falls back to kernel/patches-arm64 on
 # arm64, so `make kernel-patch-validate PROFILE=btrfs` would check other patches.
-patches_dir = "kernel/patches"
+patches_dir = "kernel/patches-7.3"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
@@ -571,22 +571,22 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 [kernel_profiles.btrfs.amd64]
 rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
-kernel_version = "6.18.60"
+kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "fd5dea90d206"
+kernel_sha = "e710148cf2c4"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
 build_inputs = [
     "kernel/btrfs-amd64.build.toml",
     "kernel/btrfs-x86.conf",
-    "kernel/patches-btrfs-x86/*.patch",
+    "kernel/patches-7.3/*.patch",
 ]
 
 kernel_config = "kernel/btrfs-x86.conf"
 # kernel/patches (the FUSE patches and the virtio_ring fix), linked. Keep
 # this line: the build applies kernel/patches when it is omitted.
-patches_dir = "kernel/patches-btrfs-x86"
+patches_dir = "kernel/patches-7.3"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
