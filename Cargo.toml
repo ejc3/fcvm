@@ -41,7 +41,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 ring = "0.17"  # ES384 playback tokens and HMAC direct tokens (fleet coordinator)
 hex = "0.4"
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
@@ -56,7 +56,7 @@ libc = "0.2"
 nix = { version = "0.30", features = ["sched", "net", "fs", "dir", "user", "mount", "signal", "term", "inotify"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
-rand = "0.8"
+rand = "0.9"
 async-trait = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
@@ -81,7 +81,7 @@ x509-parser = "0.18"
 failpoint = { path = "failpoint" }
 url = "2"
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 percent-encoding = "2"
 tokio-util = "0.7"
 regex = "1.12.2"
@@ -116,11 +116,11 @@ tokio = { version = "1.51.6", features = ["test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # small_rng: SmallRng for the seeded chaos harness (tests/test_fuzz_chaos.rs)
-rand = { version = "0.8", features = ["small_rng"] }
+rand = { version = "0.9", features = ["small_rng"] }
 serde_norway = "0.9.42"
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 [[bench]]

@@ -853,7 +853,7 @@ pub fn throttle_wait(base: Duration, attempt: u32) -> Duration {
         .saturating_mul(1 << attempt.saturating_sub(1).min(16))
         .min(THROTTLE_MAX_WAIT);
     let half = full / 2;
-    half + rand::thread_rng().gen_range(Duration::ZERO..=half)
+    half + rand::rng().random_range(Duration::ZERO..=half)
 }
 
 /// `<region>/<instance id>`, how a launched tile's instance is named.

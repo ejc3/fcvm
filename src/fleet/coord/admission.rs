@@ -49,9 +49,11 @@ pub struct AdmitKey(pub [u8; 32]);
 
 impl AdmitKey {
     pub fn random() -> Self {
-        use rand::RngCore;
+        use rand::TryRngCore;
         let mut k = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut k);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut k)
+            .expect("the OS random source failed");
         AdmitKey(k)
     }
 

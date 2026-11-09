@@ -1087,15 +1087,15 @@ mod tests {
         ];
         for round in 0..200_000 {
             let m: Vec<u8> = if round % 2 == 0 {
-                let len = rng.gen_range(0..80);
-                (0..len).map(|_| rng.gen()).collect()
+                let len = rng.random_range(0..80);
+                (0..len).map(|_| rng.random()).collect()
             } else {
                 let mut m = seeds[round % seeds.len()].clone();
-                for _ in 0..rng.gen_range(1..4) {
-                    let i = rng.gen_range(0..m.len());
-                    m[i] = rng.gen();
+                for _ in 0..rng.random_range(1..4) {
+                    let i = rng.random_range(0..m.len());
+                    m[i] = rng.random();
                 }
-                m.truncate(rng.gen_range(0..=m.len()));
+                m.truncate(rng.random_range(0..=m.len()));
                 m
             };
             for tcp in [false, true] {

@@ -706,11 +706,11 @@ impl<'a> Run<'a> {
         // the drops).
         let mut priority: Vec<i64> = (0..n as i64).map(|p| p + depth as i64).collect();
         for k in (1..n).rev() {
-            let s = rng.gen_range(0..=k);
+            let s = rng.random_range(0..=k);
             priority.swap(k, s);
         }
         let hint = steps_hint.max(1);
-        let mut drops: Vec<usize> = (1..depth).map(|_| rng.gen_range(1..=hint)).collect();
+        let mut drops: Vec<usize> = (1..depth).map(|_| rng.random_range(1..=hint)).collect();
         drops.sort_unstable();
         let mut next_low = depth as i64 - 1;
         let mut count = 0usize;
