@@ -1024,6 +1024,184 @@ fi"#
     Ok(script)
 }
 
+/// Where a guest kernel builds.
+enum BuildTree {
+    /// `$BUILD_DIR`, set by the caller (a pre-seeded source archive): used, never removed.
+    Caller(PathBuf),
+    /// A tree of this invocation's own, removed after the build. Two setups building the
+    /// same profile and SHA into different stores hold different store locks, so a tree
+    /// named only by profile and SHA would let one remove the other's mid-compile.
+    /// `<tree>.owner` is held locked by this process and, inherited, by the build child,
+    /// so a later build reclaims the tree of a setup killed mid-compile once both are gone.
+    Owned {
+        path: PathBuf,
+        _owner: std::fs::File,
+    },
+}
+
+impl BuildTree {
+    fn for_build(profile_name: &str, sha: &str) -> Result<Self> {
+        Self::for_build_in(
+            &std::env::temp_dir(),
+            std::env::var_os("BUILD_DIR"),
+            profile_name,
+            sha,
+        )
+    }
+
+    fn for_build_in(
+        temp: &Path,
+        caller_dir: Option<std::ffi::OsString>,
+        profile_name: &str,
+        sha: &str,
+    ) -> Result<Self> {
+        if let Some(dir) = caller_dir.filter(|d| !d.is_empty()) {
+            return Ok(Self::Caller(PathBuf::from(dir)));
+        }
+        reclaim_abandoned_build_trees(temp);
+        let path = temp.join(format!(
+            "kernel-build-{profile_name}-{sha}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let owner = lock_build_tree_owner(&path)?;
+        Ok(Self::Owned {
+            path,
+            _owner: owner,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Caller(p) | Self::Owned { path: p, .. } => p,
+        }
+    }
+}
+
+fn build_tree_owner(tree: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.owner", tree.display()))
+}
+
+/// Create `<tree>.owner` already locked: the lock is taken under a temporary name and the
+/// file renamed into place, so a reclaim pass never sees an owner file it could lock before
+/// its creator does. The descriptor is left inheritable, so the build child keeps the lock
+/// if this process is killed first.
+fn lock_build_tree_owner(tree: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let staged = PathBuf::from(format!("{}.owner.tmp", tree.display()));
+    let file =
+        std::fs::File::create(&staged).with_context(|| format!("creating {}", staged.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "locking {}: {}",
+            staged.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    std::fs::rename(&staged, build_tree_owner(tree))
+        .with_context(|| format!("publishing the owner of {}", tree.display()))?;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+        bail!(
+            "making the owner of {} inheritable: {}",
+            tree.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(file)
+}
+
+/// Whether `name` is an owner file `for_build_in` creates:
+/// `kernel-build-<profile>-<12 hex sha>-<32 hex id>.owner`. Returns the tree's name.
+fn owned_build_tree_name(name: &str) -> Option<&str> {
+    let tree = name.strip_suffix(".owner")?;
+    let rest = tree.strip_prefix("kernel-build-")?;
+    let (head, id) = rest.rsplit_once('-')?;
+    let (_, sha) = head.rsplit_once('-')?;
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(id, 32) && hex(sha, 12)).then_some(tree)
+}
+
+/// Remove every kernel build tree under `dir` whose owner lock nobody holds: its setup and
+/// build child are gone (a setup killed mid-compile skips its own cleanup). Only owner files
+/// this code names are considered, opened without blocking or following a link, and only a
+/// regular file the current user owns counts, so nothing planted in a shared temp dir can
+/// stall the pass or point it at another tree.
+fn reclaim_abandoned_build_trees(dir: &Path) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let euid = nix::unistd::geteuid().as_raw();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(tree) = owned_build_tree_name(&name) else {
+            continue;
+        };
+        let Ok(owner) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        match owner.metadata() {
+            Ok(m) if m.file_type().is_file() && m.uid() == euid => {}
+            _ => continue,
+        }
+        if unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        let tree = dir.join(tree);
+        match std::fs::remove_dir_all(&tree) {
+            Ok(()) => info!(dir = %tree.display(), "reclaimed an abandoned kernel build tree"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(dir = %tree.display(), error = %e, "could not reclaim a kernel build tree");
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// Remove a kernel build tree, returning whether it is gone. A failure is logged, not
+/// returned as an error: the kernel is already built or the build already failed, and a
+/// leftover tree costs disk, not correctness.
+async fn remove_kernel_build_dir(build_dir: &Path) -> bool {
+    match tokio::fs::remove_dir_all(build_dir).await {
+        Ok(()) => {
+            info!(dir = %build_dir.display(), "removed kernel build tree");
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn!(dir = %build_dir.display(), error = %e, "could not remove kernel build tree");
+            false
+        }
+    }
+}
+
+/// Run a guest kernel build script in `tree` and, when the tree is this build's own, remove
+/// it afterwards, whether the build succeeded or not. It holds the source archive, the
+/// extracted source and every object (several GiB); a built kernel is published to the
+/// store, and a rebuild after a failure downloads again, so nothing reads it after this.
+async fn run_kernel_build(
+    mut cmd: Command,
+    tree: &BuildTree,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    cmd.env("BUILD_DIR", tree.path());
+    let status = run_streaming(cmd, label).await;
+    // The owner file goes only with the tree: a tree left behind keeps it, so a later
+    // build's reclaim pass still finds the tree.
+    if let BuildTree::Owned { path, .. } = tree {
+        if remove_kernel_build_dir(path).await {
+            let _ = tokio::fs::remove_file(build_tree_owner(path)).await;
+        }
+    }
+    status
+}
+
 async fn build_kernel_locally(
     profile: &KernelProfile,
     profile_name: &str,
@@ -1073,9 +1251,13 @@ async fn build_kernel_locally(
     // and the staging path's record must stay live until it exits.
     let mut cmd = staging.command(&script_path)?;
     super::run_build_as_sudo_invoker(&mut cmd);
-    let status = run_streaming(cmd, "kernel_build")
-        .await
-        .context("running build script")?;
+    let status = run_kernel_build(
+        cmd,
+        &BuildTree::for_build(profile_name, &sha)?,
+        "kernel_build",
+    )
+    .await
+    .context("running build script")?;
 
     // Clean up script
     let _ = std::fs::remove_file(&script_path);
@@ -3032,6 +3214,179 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two setups building the same profile and SHA into different stores hold different
+    /// store locks, so each needs a tree of its own: a shared one would let the first to
+    /// finish remove the other's source and objects mid-compile. A tree the caller names in
+    /// $BUILD_DIR stays the caller's.
+    #[tokio::test]
+    async fn two_builds_of_one_kernel_never_share_a_tree_and_a_callers_tree_stays() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = BuildTree::for_build_in(temp.path(), None, "nested", "0123456789ab").unwrap();
+        let b = BuildTree::for_build_in(temp.path(), None, "nested", "0123456789ab").unwrap();
+        assert!(matches!(a, BuildTree::Owned { .. }) && matches!(b, BuildTree::Owned { .. }));
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two builds of one kernel share {}",
+            a.path().display()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let caller = dir.path().join("pre-seeded");
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::write(caller.join("linux-x.tar.xz"), b"archive").unwrap();
+        let script = dir.path().join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_kernel_build(
+            Command::new(&script),
+            &BuildTree::Caller(caller.clone()),
+            "test_build",
+        )
+        .await
+        .unwrap();
+        assert!(
+            caller.join("linux-x.tar.xz").exists(),
+            "the caller's tree was removed"
+        );
+    }
+
+    /// A setup killed mid-compile skips its own cleanup. The next build reclaims that tree
+    /// once nobody holds its owner lock, and leaves a tree whose build is still running.
+    #[test]
+    fn an_abandoned_build_tree_is_reclaimed_and_a_live_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let live = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        for tree in [&stale, &live] {
+            std::fs::create_dir_all(tree.join("linux-x")).unwrap();
+            std::fs::write(tree.join("linux-x/vmlinux.o"), b"o").unwrap();
+        }
+        drop(lock_build_tree_owner(&stale).unwrap());
+        let _held = lock_build_tree_owner(&live).unwrap();
+
+        reclaim_abandoned_build_trees(dir.path());
+
+        assert!(
+            !stale.exists() && !build_tree_owner(&stale).exists(),
+            "the abandoned tree was not reclaimed"
+        );
+        assert!(
+            live.join("linux-x/vmlinux.o").exists() && build_tree_owner(&live).exists(),
+            "a tree whose owner lock is held was reclaimed"
+        );
+    }
+
+    /// The reclaim pass scans a shared temp dir. A FIFO with an owner file's name must not
+    /// stall it, and a name it did not create must not lead it to another tree.
+    #[test]
+    fn the_reclaim_pass_ignores_what_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_tree = dir
+            .path()
+            .join("kernel-build-nested-0123456789ab-cccccccccccccccccccccccccccccccc");
+        std::fs::create_dir(&fifo_tree).unwrap();
+        nix::unistd::mkfifo(
+            &build_tree_owner(&fifo_tree),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let foreign = dir.path().join("kernel-build-host");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(build_tree_owner(&foreign), b"").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let scan = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            reclaim_abandoned_build_trees(&scan);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "the reclaim pass blocked on a FIFO"
+        );
+        assert!(
+            fifo_tree.exists(),
+            "a FIFO owner file led to its tree being removed"
+        );
+        assert!(
+            foreign.exists(),
+            "a tree the pass did not create was removed"
+        );
+    }
+
+    /// A tree the cleanup could not remove keeps its owner file, so a later build's reclaim
+    /// pass still finds it. A regular file at the tree's path makes the removal fail as any
+    /// user, root included.
+    #[tokio::test]
+    async fn a_tree_that_could_not_be_removed_keeps_its_owner_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("kernel-build-nested-0123456789ab-cccc");
+        std::fs::write(&tree, b"not a directory").unwrap();
+        let script = dir.path().join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_kernel_build(
+            Command::new(&script),
+            &BuildTree::Owned {
+                path: tree.clone(),
+                _owner: lock_build_tree_owner(&tree).unwrap(),
+            },
+            "test_build",
+        )
+        .await
+        .unwrap();
+
+        assert!(tree.exists(), "the test needs the removal to fail");
+        assert!(
+            build_tree_owner(&tree).exists(),
+            "a tree that is still there lost its owner file"
+        );
+    }
+
+    /// A guest kernel build left /tmp/kernel-build-<profile>-<sha> (several GiB each) behind
+    /// after it finished, and a run of campaign builds filled a box's root disk with them.
+    /// The tree must be gone after the build, whether it succeeded or failed.
+    #[tokio::test]
+    async fn a_kernel_build_removes_its_build_tree_whatever_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        for (exit, name) in [(0, "ok"), (1, "failed")] {
+            let build_dir = dir.path().join(format!("kernel-build-{name}"));
+            let script = dir.path().join(format!("build-{name}.sh"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nmkdir -p \"$BUILD_DIR/linux-x\"\n\
+                     head -c 4096 /dev/zero > \"$BUILD_DIR/linux-x/vmlinux.o\"\nexit {exit}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let status = run_kernel_build(
+                Command::new(&script),
+                &BuildTree::Owned {
+                    path: build_dir.clone(),
+                    _owner: lock_build_tree_owner(&build_dir).unwrap(),
+                },
+                "test_build",
+            )
+            .await
+            .unwrap();
+            assert_eq!(status.code(), Some(exit), "the stub build ran");
+            assert!(
+                !build_dir.exists() && !build_tree_owner(&build_dir).exists(),
+                "the {name} build left its tree or owner file at {}",
+                build_dir.display()
+            );
+        }
+    }
 
     /// `install-host-kernel` on a box where the package is already installed (a host
     /// kernel built earlier, then another one installed over it) only selected the
