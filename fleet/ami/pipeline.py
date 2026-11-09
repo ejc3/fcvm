@@ -390,11 +390,11 @@ class Pipeline:
         finally:
             if first:
                 self.cancelled.set()
+        if first:
+            raise first[0]
         if pending:
             self.cancelled.set()
             raise RuntimeError("the image build reached its fixed deadline")
-        if first:
-            raise first[0]
         renderer, host_image = built["host"].result()
         return renderer, host_image, built["tile"].result()
 

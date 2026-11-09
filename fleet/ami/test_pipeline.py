@@ -816,6 +816,21 @@ print("warm-log-permissions-pass")
             self.assertLess(time.monotonic() - started, 10)
         stall.set()
 
+    def test_a_failure_beside_a_stalled_side_is_the_one_raised(self):
+        # Codex on #1802: the tile's prep failed while the host stalled, and the deadline error
+        # hid the failure.
+        stall = threading.Event()
+        def stalled(renderer_ready=None):
+            stall.wait(30)
+        def broken():
+            raise ValueError("tile prep failed")
+        with patch.object(self.driver, "build_host", side_effect=stalled), \
+                patch.object(self.driver, "build_tile_prep", side_effect=broken), \
+                patch.object(self.driver, "remaining", side_effect=lambda cleanup=False: 1):
+            with self.assertRaisesRegex(ValueError, "tile prep failed"):
+                self.driver.build_pair()
+        stall.set()
+
     def test_failed_phase_archives_metadata_before_cleanup_without_repeating_the_phase(self):
         self.worker.fail_phase = "host/build.sh build"
         original = self.driver.guest
