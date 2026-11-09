@@ -2005,11 +2005,9 @@ impl Default for LifecycleReadyGate {
 pub struct CleanupContext {
     pub vm_id: String,
     pub volume_server_handles: Vec<JoinHandle<()>>,
-    /// RemapFs references for portable volumes (for inode table serialization).
-    /// One entry per volume; `Some` for portable volumes, `None` for plain.
-    /// Dropped during cleanup — the Arc prevents the RemapFs from being freed
-    /// while the VolumeServer task still holds a reference.
-    pub remap_refs: Vec<Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>>,
+    /// Each volume's server, for its inode table at snapshot time, one entry per volume.
+    /// Dropped during cleanup.
+    pub volume_tables: Vec<crate::volume::TableSource>,
     pub data_dir: PathBuf,
     pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub health_monitor_handle: Option<JoinHandle<()>>,
@@ -2330,7 +2328,7 @@ async fn cleanup_vm_inner(
     let CleanupContext {
         vm_id,
         mut volume_server_handles,
-        remap_refs: _,
+        volume_tables: _,
         data_dir,
         health_cancel_token,
         health_monitor_handle,
@@ -5291,35 +5289,59 @@ pub(crate) fn validate_snapshot_vm_identity(
 
 /// Extra files to write into the snapshot directory before it is atomically finalized.
 ///
-/// Returns (filename, contents) pairs. [`publish_snapshot_dir`] invokes it after the VM's
-/// memory and disks are captured and the VM resumed, on every backend, so contents reflect
-/// host-side state at snapshot time, e.g. portable-volume inode tables.
-pub type SnapshotExtraFiles<'a> =
-    Option<&'a (dyn Fn() -> Result<Vec<(String, Vec<u8>)>> + Send + Sync)>;
+/// Every backend's creator calls it with the VM still paused, after its memory and disks are
+/// captured ([`extra_files_while_paused`]), and calls what it returns once the VM runs again,
+/// for (filename, contents) pairs. The volumes' inode tables must describe the inodes the saved
+/// guest holds, and a resumed guest closes and forgets files at once (#1684), so the capture
+/// happens inside the pause; reading each held inode's path takes a system call per inode, so
+/// it happens after.
+pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Result<ExtraFilesReader> + Send + Sync)>;
+
+/// Reads a snapshot's extra files after the VM resumed: what [`SnapshotExtraFiles`] returns.
+pub type ExtraFilesReader = Box<dyn FnOnce() -> Result<Vec<(String, Vec<u8>)>> + Send>;
+
+/// Capture the snapshot's extra files while the VM is paused, or nothing when the save or the
+/// disk copy already failed.
+fn extra_files_while_paused(
+    extra_files: SnapshotExtraFiles<'_>,
+    captured: bool,
+) -> Result<Option<ExtraFilesReader>> {
+    match extra_files {
+        Some(extra_files) if captured => extra_files()
+            .map(Some)
+            .context("capturing snapshot extra files"),
+        _ => Ok(None),
+    }
+}
+
+/// Read the extra files [`extra_files_while_paused`] captured, after the resume.
+fn read_extra_files(reader: Option<ExtraFilesReader>) -> Result<Vec<(String, Vec<u8>)>> {
+    reader.map_or_else(
+        || Ok(Vec::new()),
+        |read| read().context("reading snapshot extra files"),
+    )
+}
 
 /// Publish a snapshot built in `temp_snapshot_dir` as `snapshot_dir`: write the caller's
-/// extra files (the portable volumes' inode tables) and fcvm's `config.json` into it, then
-/// atomically replace `snapshot_dir` with it.
+/// extra files (the volumes' inode tables, gathered while the VM was paused) and fcvm's
+/// `config.json` into it, then atomically replace `snapshot_dir` with it.
 ///
 /// Every backend's creator publishes through this, so no backend can finalize a snapshot
-/// (config.json present) without its extra files: a clone restored without a portable
-/// volume's inode table answers EIO for every file the guest held open through it. A
-/// failure removes the temp directory and fails the snapshot.
+/// (config.json present) without its extra files: a clone restored without a volume's inode
+/// table answers an error for every inode the guest held through it. A failure removes the
+/// temp directory and fails the snapshot.
 async fn publish_snapshot_dir(
     temp_snapshot_dir: &Path,
     snapshot_dir: &Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
-    extra_files: SnapshotExtraFiles<'_>,
+    extra_files: Vec<(String, Vec<u8>)>,
     memory_file: Option<(&crate::reclaim::Owner, &Path)>,
 ) -> Result<()> {
     let written: Result<()> = async {
-        if let Some(extra_files) = extra_files {
-            let files = extra_files().context("gathering snapshot extra files")?;
-            for (filename, contents) in files {
-                tokio::fs::write(temp_snapshot_dir.join(&filename), &contents)
-                    .await
-                    .with_context(|| format!("writing snapshot extra file {}", filename))?;
-            }
+        for (filename, contents) in extra_files {
+            tokio::fs::write(temp_snapshot_dir.join(&filename), &contents)
+                .await
+                .with_context(|| format!("writing snapshot extra file {}", filename))?;
         }
         let config_json =
             serde_json::to_string_pretty(snapshot_config).context("serializing snapshot config")?;
@@ -6377,6 +6399,12 @@ pub async fn create_snapshot_core(
     } else {
         Ok(()) // Skip disk copy if snapshot failed
     };
+    // The volumes' inode tables describe the inodes the saved guest holds only while it stays
+    // paused: once resumed it closes and forgets files (#1684).
+    let extra_files_result = extra_files_while_paused(
+        extra_files,
+        snapshot_result.is_ok() && disk_copy_result.is_ok(),
+    );
 
     // The pause/save silently orphans in-flight host↔guest vsock connections
     // (exec sessions block forever with no error on either side). Record it by
@@ -6428,7 +6456,10 @@ pub async fn create_snapshot_core(
             "CRITICAL: failed to reopen guest network after snapshot!");
     }
 
-    let operation_result = snapshot_result.and(disk_copy_result);
+    let (operation_result, extra_files_reader) = match extra_files_result {
+        Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
+        Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
+    };
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,
@@ -6437,6 +6468,14 @@ pub async fn create_snapshot_core(
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(error);
     }
+    // The VM runs again; read the paths of the inodes the tables captured.
+    let extra_files = match read_extra_files(extra_files_reader) {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(error);
+        }
+    };
 
     boundary.resume_ms = boundary.lap(boundary_started);
     info!(
@@ -6866,6 +6905,11 @@ pub async fn create_snapshot_ch(
     } else {
         Ok(())
     };
+    // As on the Firecracker path: read the inode tables before the guest runs again (#1684).
+    let extra_files_result = extra_files_while_paused(
+        extra_files,
+        snapshot_result.is_ok() && disk_copy_result.is_ok(),
+    );
 
     // Same as the Firecracker path: record the vsock reset caused by the
     // pause/save BEFORE resuming, so blocked exec sessions abort loudly.
@@ -6899,7 +6943,10 @@ pub async fn create_snapshot_ch(
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
     }
 
-    let operation_result = snapshot_result.and(disk_copy_result);
+    let (operation_result, extra_files_reader) = match extra_files_result {
+        Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
+        Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
+    };
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,
@@ -6908,6 +6955,14 @@ pub async fn create_snapshot_ch(
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(error);
     }
+    // The VM runs again; read the paths of the inodes the tables captured.
+    let extra_files = match read_extra_files(extra_files_reader) {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(error);
+        }
+    };
 
     match source_disposition {
         SnapshotSourceDisposition::Resume => {
@@ -8434,7 +8489,7 @@ mod tests {
             "publish_snapshot_dir",
             body_of(source, "async fn publish_snapshot_dir("),
             &[
-                "extra_files()",
+                "in extra_files",
                 "\"config.json\"",
                 "hand_memory_file_to_publication(",
                 "atomic_replace_dir(",
@@ -8714,15 +8769,15 @@ mod tests {
         );
     }
 
-    /// A memory snapshot of a VM with portable volumes carries their inode tables on every
-    /// backend (#1200): a clone restored without them answers EIO for every file the guest
-    /// held open through a portable volume. `cmd_snapshot_create` hands each backend's
-    /// creator the hook that fetches the tables from the VM's fcvm process, and each creator
-    /// publishes its directory only through `publish_snapshot_dir`, with that hook, which
-    /// writes the tables before the rename that makes the snapshot visible. No fake VMM can
+    /// A memory snapshot of a VM with volumes carries their inode tables on every backend
+    /// (#1200, #1684): a clone restored without them answers an error for every inode the
+    /// guest held through a volume. `cmd_snapshot_create` hands each backend's creator the
+    /// hook that fetches the tables from the VM's fcvm process, each creator calls it while the
+    /// VM is paused, and publishes its directory only through `publish_snapshot_dir`, with the
+    /// tables it read, which writes them before the rename that makes the snapshot visible. No fake VMM can
     /// drive these functions, so the wiring is pinned by their source.
     #[test]
-    fn every_memory_snapshot_backend_saves_the_portable_volume_inode_tables() {
+    fn every_memory_snapshot_backend_saves_the_volume_inode_tables_while_paused() {
         /// The text of the first call to `callee` in `body`, through its `.await`.
         fn call<'a>(name: &str, body: &'a str, callee: &str) -> &'a str {
             let start = body
@@ -8743,7 +8798,7 @@ mod tests {
             .collect();
         assert!(
             without_tables.is_empty(),
-            "cmd_snapshot_create does not hand the portable volumes' inode tables to {without_tables:?}"
+            "cmd_snapshot_create does not hand the volumes' inode tables to {without_tables:?}"
         );
 
         let source = include_str!("common.rs");
@@ -8760,11 +8815,27 @@ mod tests {
                 call(signature, body, "publish_snapshot_dir(").contains("extra_files"),
                 "{signature} does not hand its extra files to `publish_snapshot_dir`"
             );
+            // The tables must describe the inodes the saved guest holds, so they are captured
+            // before the guest runs again: a resumed guest closes and forgets files at once
+            // (#1684, gym_pairs_20: a clone's FLUSH named an inode the resumed source had
+            // forgotten before its table was read). Their paths are read after the resume, so
+            // the pause does not grow with the number of inodes held.
+            assert_in_order(
+                signature,
+                body,
+                &[
+                    "reflink_disks_to_snapshot(",
+                    "extra_files_while_paused(",
+                    "let hypervisor_resume_result = match source_disposition",
+                    "read_extra_files(extra_files_reader)",
+                    "publish_snapshot_dir(",
+                ],
+            );
         }
         assert_in_order(
             "publish_snapshot_dir",
             body_of(source, "async fn publish_snapshot_dir("),
-            &["extra_files()", "\"config.json\"", "atomic_replace_dir("],
+            &["in extra_files", "\"config.json\"", "atomic_replace_dir("],
         );
     }
 

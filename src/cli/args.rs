@@ -1047,9 +1047,9 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub map: Vec<String>,
 
-    /// Use portable inode numbering for FUSE volumes.
-    /// Enables deterministic inodes based on file paths instead of host inodes,
-    /// allowing snapshots with volumes to be restored on different machines.
+    /// Use portable inode numbering for FUSE volumes: the guest sees inode numbers derived
+    /// from file paths instead of the server's own, the same on every machine. Snapshots
+    /// restore the guest's inodes by path either way.
     #[arg(long)]
     pub portable_volumes: bool,
 
@@ -1618,11 +1618,9 @@ pub struct SnapshotRunArgs {
 
     /// Serve a directory the snapshot mapped read-only from this host directory instead of
     /// the one it recorded. Grammar: HOST:GUEST:ro, as for `podman run --map`, repeated.
-    /// Each GUEST must be a path the snapshot mapped read-only with --portable-volumes:
-    /// the guest mounted it when it booted and the restore keeps that mount. A read-write
-    /// map cannot be moved, since the guest treats the sizes and pages it cached from one
-    /// as its own, and neither can one without portable volumes, whose open files the guest
-    /// names by host inode numbers. Files the guest
+    /// Each GUEST must be a path the snapshot mapped read-only: the guest mounted it when
+    /// it booted and the restore keeps that mount. A read-write map cannot be moved, since
+    /// the guest treats the sizes and pages it cached from one as its own. Files the guest
     /// held open are found again by their path under the mount, so the new directory
     /// should hold the same tree. What the guest cached from the recorded directory it
     /// checks against the new one once the map's attribute timeout (1 s of guest time)

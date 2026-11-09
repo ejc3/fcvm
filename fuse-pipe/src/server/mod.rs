@@ -27,5 +27,5 @@ mod zerocopy;
 
 pub use config::ServerConfig;
 pub use handler::FilesystemHandler;
-pub use passthrough::PassthroughFs;
+pub use passthrough::{CapturedInodes, PassthroughFs};
 pub use pipelined::AsyncServer;

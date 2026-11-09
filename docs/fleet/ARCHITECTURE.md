@@ -760,9 +760,9 @@ names the hook, and unpark runs `retake` once the GPUs are up and the CUDA proce
 restored, in the source VM after the snapshot and in a clone inside the restore's GPU attach,
 before the clone is acknowledged; a failed retake fails the clone. The hook's `retake`
 returns once the phone has posted a frame on the new GPU, so the acknowledgement follows
-the app's first frame. The phone VM maps its volumes with `--portable-volumes`: the
-emulator holds its system image and libraries open on them, and only portable inodes let a
-clone find those files again.
+the app's first frame. The phone VM maps its volumes with `--portable-volumes`. The
+emulator holds its system image and libraries open on them, and a clone finds those files
+again by the paths in the snapshot's inode tables.
 
 On a g4dn.metal (T4, driver 580.196.07), a 6 GiB phone VM (2 GiB phone, the app drawing
 25,600 cubes at 60 fps), one warm snapshot and three clones restored one at a time onto

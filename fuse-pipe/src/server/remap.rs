@@ -60,6 +60,19 @@ const LEGACY_HANDLE_BASE: u64 = 1 << 32;
 /// above it for the handles this server gives out.
 const MAX_HANDLE_BASE: u64 = 1 << 62;
 
+/// An inode table as [`RemapFs::restore_from_table`] reads it: the highest handle the guest was
+/// given, the path of each inode the guest may hold, and the inodes whose files were gone.
+pub(crate) fn table_json(
+    handle_base: u64,
+    paths: &std::collections::BTreeMap<u64, String>,
+    gone: &std::collections::BTreeMap<u64, String>,
+) -> String {
+    serde_json::to_string(
+        &serde_json::json!({ "handle_base": handle_base, "paths": paths, "gone": gone }),
+    )
+    .unwrap_or_default()
+}
+
 impl<T: FilesystemHandler> RemapFs<T> {
     /// Create a new RemapFs wrapping the given handler.
     ///
@@ -589,10 +602,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             .max_guest_handle
             .load(std::sync::atomic::Ordering::SeqCst)
             .max(self.handle_base);
-        serde_json::to_string(
-            &serde_json::json!({ "handle_base": handle_base, "paths": paths, "gone": gone }),
-        )
-        .unwrap_or_default()
+        table_json(handle_base, &paths, &gone)
     }
 
     /// Parse a serialized table into its handle base and paths. A table from before the handle base
@@ -1008,6 +1018,92 @@ mod tests {
                 other => Err(other),
             }
         }
+    }
+
+    /// A server restored from the table of a plain volume (one served without RemapFs) serves the
+    /// inodes and handles the guest got from the source: a directory it holds, a name below it,
+    /// and a file it holds open. A file deleted on the host is refused, not served (#1684).
+    ///
+    /// RED BEFORE THE FIX: a plain volume recorded no table, and a fresh server answered EBADF for
+    /// every inode and handle from the source.
+    #[test]
+    fn a_plain_volume_table_restores_the_guests_inodes_and_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/held"), b"H").unwrap();
+        std::fs::write(dir.path().join("sub/other"), b"O").unwrap();
+        std::fs::write(dir.path().join("deleted"), b"D").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let lookup = |fs: &dyn FilesystemHandler, parent: u64, name: &str| {
+            fs.handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent,
+                    name: name.as_bytes().to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            )
+        };
+        let read = |fs: &dyn FilesystemHandler, ino: u64, fh: u64| {
+            fs.handle_request_with_groups(
+                &VolumeRequest::Read {
+                    ino,
+                    fh,
+                    offset: 0,
+                    size: 1,
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            )
+        };
+
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let sub = lookup(&source, 1, "sub").attr().unwrap().ino;
+        let held = lookup(&source, sub, "held").attr().unwrap().ino;
+        let deleted = lookup(&source, 1, "deleted").attr().unwrap().ino;
+        let held_fh = match source.handle_request_with_groups(
+            &VolumeRequest::Open {
+                ino: held,
+                flags: libc::O_RDONLY as u32,
+                uid,
+                gid,
+                pid: 0,
+            },
+            &[],
+        ) {
+            VolumeResponse::Opened { fh, .. } => fh,
+            other => panic!("open: {other:?}"),
+        };
+        std::fs::remove_file(dir.path().join("deleted")).unwrap();
+        let table = source.inode_table(source.capture_inodes());
+
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &table,
+        );
+        let below = lookup(&clone, sub, "other");
+        assert!(
+            below.attr().is_some(),
+            "lookup below a held directory: {below:?}"
+        );
+        assert_eq!(
+            read(&clone, held, held_fh),
+            VolumeResponse::Data {
+                data: b"H".to_vec()
+            },
+            "a read through the held handle {held_fh}"
+        );
+        let refused =
+            clone.handle_request_with_groups(&VolumeRequest::Getattr { ino: deleted }, &[]);
+        assert!(
+            refused.errno().is_some(),
+            "a file deleted before the restore is refused, got {refused:?}"
+        );
     }
 
     /// A restored server of a read-only volume reads with file handle 0. Its inner server answers

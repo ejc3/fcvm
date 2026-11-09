@@ -851,7 +851,7 @@ async fn verify_prepared_snapshot_in(
     }
 
     // The three core artifacts are not the whole generation. A clone also opens every
-    // extra disk and, for a portable volume, its inode table — so a generation missing
+    // extra disk and every volume's inode table, so a generation missing
     // one of those would report `prepared` here and fail (or silently renumber inodes)
     // at restore, after the cache entry is already durable and shared.
     for disk in &config.metadata.extra_disks {
@@ -883,14 +883,15 @@ async fn verify_prepared_snapshot_in(
         );
     }
 
-    // Portable volumes restore their inode numbering from a table written into the
-    // generation before its atomic rename (see create_podman_snapshot). A clone that
-    // finds no table renumbers inodes, which is exactly the glitch the table prevents.
-    for volume in config.metadata.volumes.iter().filter(|v| v.portable) {
+    // Every volume restores the guest's inodes from a table written into the generation
+    // before its atomic rename (see create_podman_snapshot). A clone that finds no table
+    // answers EBADF or EIO for every inode the guest held at the snapshot (#1684), so a
+    // generation without one is rebuilt rather than reused.
+    for volume in &config.metadata.volumes {
         let path = snapshot_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
         let metadata = tokio::fs::metadata(&path).await.with_context(|| {
             format!(
-                "reading prepared snapshot {} portable volume {} inode table {}",
+                "reading prepared snapshot {} volume {} inode table {}",
                 snapshot_key,
                 volume.guest_path,
                 path.display()
@@ -898,7 +899,7 @@ async fn verify_prepared_snapshot_in(
         })?;
         anyhow::ensure!(
             metadata.is_file() && metadata.len() > 0,
-            "prepared snapshot {} portable volume {} inode table is not a non-empty regular file: {}",
+            "prepared snapshot {} volume {} inode table is not a non-empty regular file: {}",
             snapshot_key,
             volume.guest_path,
             path.display()
@@ -3223,7 +3224,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         &ctx.vm_state,
                         &ctx.disk_path,
                         &ctx.volume_configs,
-                        &ctx.volume_servers.remap_refs,
+                        &ctx.volume_servers.tables,
                     );
                     match create_snapshot_interruptible(
                         &snap,
@@ -3389,7 +3390,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             &ctx.vm_state,
                             &ctx.disk_path,
                             &ctx.volume_configs,
-                            &ctx.volume_servers.remap_refs,
+                            &ctx.volume_servers.tables,
                         );
                         tokio::select! {
                             outcome = create_snapshot_interruptible(
@@ -3659,7 +3660,7 @@ async fn run_prepare_loop(
         &ctx.vm_state,
         &ctx.disk_path,
         &ctx.volume_configs,
-        &ctx.volume_servers.remap_refs,
+        &ctx.volume_servers.tables,
         cancel,
     )
     .await?;
@@ -3682,7 +3683,7 @@ pub(crate) async fn install_prepared_startup_snapshot(
     vm_state: &VmState,
     disk_path: &Path,
     volume_configs: &[VolumeConfig],
-    remap_refs: &[Option<Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+    volume_tables: &[crate::volume::TableSource],
     cancel: &CancellationToken,
 ) -> Result<PreparedSnapshot> {
     info!(
@@ -3702,7 +3703,7 @@ pub(crate) async fn install_prepared_startup_snapshot(
         vm_state,
         disk_path,
         volume_configs,
-        remap_refs,
+        volume_tables,
     };
     let install = match snapshot::create_podman_snapshot(
         &snap,
@@ -3773,7 +3774,7 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
         super::common::CleanupContext {
             vm_id: ctx.vm_id,
             volume_server_handles: ctx.volume_servers.handles,
-            remap_refs: ctx.volume_servers.remap_refs,
+            volume_tables: ctx.volume_servers.tables,
             data_dir: ctx.data_dir,
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
@@ -3819,7 +3820,7 @@ async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
         super::common::CleanupContext {
             vm_id: ctx.vm_id,
             volume_server_handles: ctx.volume_servers.handles,
-            remap_refs: ctx.volume_servers.remap_refs,
+            volume_tables: ctx.volume_servers.tables,
             data_dir: ctx.data_dir,
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
@@ -7309,24 +7310,18 @@ mod tests {
             "unexpected error: {error:#}"
         );
 
-        // A portable volume with no inode table renumbers inodes on the clone.
-        let temp = tempfile::tempdir().unwrap();
-        let error = verify_with(temp.path(), Vec::new(), vec![volume(true)], &[])
-            .await
-            .expect_err("a missing inode table must not verify");
-        assert!(
-            format!("{error:#}").contains("portable volume /data inode table"),
-            "unexpected error: {error:#}"
-        );
-
-        // A non-portable volume writes no table, so its absence is correct.
-        let temp = tempfile::tempdir().unwrap();
-        assert!(
-            verify_with(temp.path(), Vec::new(), vec![volume(false)], &[])
+        // A volume with no inode table, portable or not, loses the guest's inodes on the
+        // clone (#1684).
+        for portable in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let error = verify_with(temp.path(), Vec::new(), vec![volume(portable)], &[])
                 .await
-                .unwrap(),
-            "a non-portable volume needs no inode table"
-        );
+                .expect_err("a missing inode table must not verify");
+            assert!(
+                format!("{error:#}").contains("volume /data inode table"),
+                "portable={portable}: unexpected error: {error:#}"
+            );
+        }
 
         // Complete generation: both artifacts present and non-empty.
         let temp = tempfile::tempdir().unwrap();

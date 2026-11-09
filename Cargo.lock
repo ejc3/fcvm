@@ -927,7 +927,7 @@ dependencies = [
 [[package]]
 name = "fuse-backend-rs"
 version = "0.13.1"
-source = "git+https://github.com/ejc3/fuse-backend-rs.git?branch=master#77ee1d0e51f2faf88de356a7a1ad7aec15f3f1a6"
+source = "git+https://github.com/ejc3/fuse-backend-rs.git?branch=master#60364425ae45ac64e26d784c99ebf850544530b1"
 dependencies = [
  "arc-swap",
  "bitflags 1.3.2",

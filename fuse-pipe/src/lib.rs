@@ -72,7 +72,7 @@ pub use transport::{VsockListener, VsockTransport};
 
 // Re-export server types
 pub use server::remap::RemapFs;
-pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
+pub use server::{AsyncServer, CapturedInodes, FilesystemHandler, PassthroughFs, ServerConfig};
 
 // Re-export telemetry types
 pub use telemetry::{SpanCollector, SpanSummary};

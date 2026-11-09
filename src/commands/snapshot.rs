@@ -1338,13 +1338,17 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await?;
         None
     } else {
-        // The VM's own fcvm process holds the portable volumes' inode tables; without them
-        // every inode the guest held at the snapshot answers EIO in a clone. Every backend's
-        // creator takes the same hook.
-        let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
+        // The VM's own fcvm process holds its volumes' inode tables; without them every inode
+        // the guest held at the snapshot answers EBADF or EIO in a clone (#1684). Every
+        // backend's creator takes the same hook.
+        let has_volumes = !snapshot_config.metadata.volumes.is_empty();
         let table_vsock = vsock_socket_path.clone();
-        let fetch_tables = move || crate::volume::fetch_inode_tables(fc_agent_vsock(&table_vsock)?);
-        let inode_tables: super::common::SnapshotExtraFiles<'_> = if has_portable {
+        let fetch_tables = move || -> Result<super::common::ExtraFilesReader> {
+            let captured =
+                crate::volume::capture_remote_inode_tables(fc_agent_vsock(&table_vsock)?)?;
+            Ok(Box::new(move || captured.read()))
+        };
+        let inode_tables: super::common::SnapshotExtraFiles<'_> = if has_volumes {
             Some(&fetch_tables)
         } else {
             None
@@ -1729,12 +1733,11 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
 /// The directories a clone serves to the guest's mounts.
 ///
 /// Without `--map` they are the snapshot's. With it, each requested `HOST:GUEST:ro`
-/// replaces the host side of the snapshot's mapping of GUEST, which must be a read-only,
-/// portable map: the guest mounted every mapping when it booted, the restore keeps those
-/// mounts, and a clone cannot add or drop one. The vsock port stays the snapshot's. A
-/// portable volume's inode table names files by their path under the mount, so the guest's
-/// open files are found again in the new directory when it holds the same tree; a
-/// non-portable one holds host inode numbers, which name nothing there.
+/// replaces the host side of the snapshot's mapping of GUEST, which must be a read-only
+/// map: the guest mounted every mapping when it booted, the restore keeps those mounts, and
+/// a clone cannot add or drop one. The vsock port stays the snapshot's. A volume's inode
+/// table names files by their path under the mount, so the guest's open files are found
+/// again in the new directory when it holds the same tree.
 fn clone_volumes(
     snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
     requested: &[String],
@@ -1773,14 +1776,6 @@ fn clone_volumes(
         if !mapping.read_only {
             bail!(
                 "--map {spec}: the snapshot mapped {} read-only; give :ro",
-                volume.guest_path
-            );
-        }
-        if !volume.portable {
-            bail!(
-                "--map {spec}: the snapshot did not map {} with --portable-volumes. Its guest \
-                 holds the recorded directory's host inode numbers, which name nothing in \
-                 another directory, so files it has open would answer EIO.",
                 volume.guest_path
             );
         }
@@ -2989,32 +2984,28 @@ async fn cmd_snapshot_run_inner(
         })
         .collect();
 
-    // Load serialized inode tables from snapshot (if available) for portable volumes.
-    // This restores the RemapFs inode mappings so clones see the same inodes as the baseline,
-    // avoiding the 1s TTL glitch window where old inodes return EIO.
+    // Load each volume's serialized inode table from the snapshot. The clone's volume servers
+    // restore from it, so the inodes and handles the guest held at the snapshot keep naming the
+    // same files (#1684).
     let snap_dir = snapshot_config
         .memory_path
         .parent()
         .expect("snapshot memory_path must have parent");
     let mut inode_tables: Vec<Option<String>> = Vec::with_capacity(volume_configs.len());
     for vol in &snapshot_config.metadata.volumes {
-        if vol.portable {
-            let table_path = snap_dir.join(crate::volume::inode_table_file_name(vol.vsock_port));
-            let table = tokio::fs::read_to_string(&table_path).await.ok();
-            if table.is_some() {
-                info!(port = vol.vsock_port, "loaded inode table from snapshot");
-            } else {
-                warn!(
-                    port = vol.vsock_port,
-                    path = %table_path.display(),
-                    "snapshot has no inode table for this portable volume; files the guest held open \
-                     at the snapshot will answer EIO in this clone"
-                );
-            }
-            inode_tables.push(table);
+        let table_path = snap_dir.join(crate::volume::inode_table_file_name(vol.vsock_port));
+        let table = tokio::fs::read_to_string(&table_path).await.ok();
+        if table.is_some() {
+            info!(port = vol.vsock_port, "loaded inode table from snapshot");
         } else {
-            inode_tables.push(None);
+            warn!(
+                port = vol.vsock_port,
+                path = %table_path.display(),
+                "snapshot has no inode table for this volume; inodes the guest held at the \
+                 snapshot will answer an error in this clone"
+            );
         }
+        inode_tables.push(table);
     }
 
     setup.volume_servers = Some(setup_try!(crate::volume::spawn_volume_servers_with_tables(
@@ -4002,7 +3993,7 @@ async fn cmd_snapshot_run_inner(
             super::common::CleanupContext {
                 vm_id: vm_id.clone(),
                 volume_server_handles: volume_servers.handles,
-                remap_refs: volume_servers.remap_refs,
+                volume_tables: volume_servers.tables,
                 data_dir: data_dir.clone(),
                 health_cancel_token: None, // no health monitor in exec path
                 health_monitor_handle: None,
@@ -4307,7 +4298,7 @@ async fn cmd_snapshot_run_inner(
                 &vm_state,
                 &disk_path,
                 &volume_configs,
-                &volume_servers.remap_refs,
+                &volume_servers.tables,
             )
             .await;
             // As a cold prepare does: a source that stopped says what its container exited with.
@@ -4687,7 +4678,7 @@ async fn cmd_snapshot_run_inner(
                                 &vm_state,
                                 &disk_path,
                                 &volume_configs,
-                                &volume_servers.remap_refs,
+                                &volume_servers.tables,
                             );
                             tokio::select! {
                                 outcome = create_snapshot_interruptible(
@@ -4793,7 +4784,7 @@ async fn cmd_snapshot_run_inner(
     let cleanup_context = super::common::CleanupContext {
         vm_id: vm_id.clone(),
         volume_server_handles: volume_servers.handles,
-        remap_refs: volume_servers.remap_refs,
+        volume_tables: volume_servers.tables,
         data_dir: data_dir.clone(),
         health_cancel_token: Some(health_cancel_token),
         health_monitor_handle,
@@ -4896,7 +4887,7 @@ async fn restored_prepare(
     vm_state: &VmState,
     disk_path: &Path,
     volume_configs: &[VolumeConfig],
-    remap_refs: &[Option<Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
+    volume_tables: &[crate::volume::TableSource],
 ) -> Result<super::podman::PreparedSnapshot> {
     let startup_rx = startup_rx.context("prepare restore has no startup health trigger")?;
     let startup_ack = super::podman::await_prepare_healthy(
@@ -4917,7 +4908,7 @@ async fn restored_prepare(
         vm_state,
         disk_path,
         volume_configs,
-        remap_refs,
+        volume_tables,
         cancel,
     )
     .await?;
@@ -6731,15 +6722,6 @@ mod tests {
         let flag = clone_volumes(&snapshot, &requested(&[&format!("{h}:/var/creds")])).unwrap_err();
         assert!(format!("{flag:#}").contains("read-only"), "{flag:#}");
         let writable = vec![volume(recorded.path(), "/data", false, 5001)];
-        let mut nonportable = volume(recorded.path(), "/var/creds", true, 5000);
-        nonportable.portable = false;
-        let host_inodes =
-            clone_volumes(&[nonportable], &requested(&[&format!("{h}:/var/creds:ro")]))
-                .unwrap_err();
-        assert!(
-            format!("{host_inodes:#}").contains("--portable-volumes"),
-            "{host_inodes:#}"
-        );
         for spec in [format!("{h}:/data"), format!("{h}:/data:ro")] {
             let rw = clone_volumes(&writable, &requested(&[&spec])).unwrap_err();
             assert!(
