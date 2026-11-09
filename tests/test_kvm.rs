@@ -1328,6 +1328,103 @@ echo "MARKER_LARGE_L${LEVEL}_OK"
 "#
 }
 
+/// Per-hop network measurement for nested chains (#659). Each level that starts a
+/// child serves iperf3 on its own address and samples its busiest threads while the
+/// child transfers; each level below L1 measures to its parent. The L1 to host hop is
+/// what `network_script` measures. Rates and CPU are reported, not judged.
+///
+/// `hop.sh serve N` (before L(N+1) starts) and `hop.sh measure N` (in L(N), N >= 2).
+fn hop_script(dir: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+set -e
+MODE=$1
+LEVEL=$2
+DIR="{dir}"
+PORT_BASE=5300
+busy() {{ awk '/^cpu /{{print $2+$3+$4+$7+$8, $2+$3+$4+$5+$6+$7+$8}}' /proc/stat; }}
+# This level's KVM exit counters, summed over its VMs (the child), from debugfs.
+kvm_stats() {{
+    mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+    for c in exits mmio_exit_user mmio_exit_kernel wfi_exit_stat hvc_exit_stat halt_wakeup; do
+        printf '%s %s\n' "$c" "$(cat /sys/kernel/debug/kvm/$c 2>/dev/null || echo NA)"
+    done
+    date +%s.%N
+    # Packet and drop counters of every interface, the child's namespaces included.
+    ip -s -s -o link 2>/dev/null | awk '{{print "root", $0}}'
+    for ns in $(ip netns list 2>/dev/null | awk '{{print $1}}'); do
+        ip netns exec "$ns" ip -s -s -o link 2>/dev/null | awk -v ns="$ns" '{{print ns, $0}}'
+    done
+    nstat -az 2>/dev/null | grep -iE "drop|retrans|overflow|prune|collapse" | grep -v " 0 "
+}}
+case "$MODE" in
+serve)
+    ip -4 -o addr show eth0 | awk '{{print $4}}' | cut -d/ -f1 > "$DIR/ip-L$LEVEL"
+    iperf3 -s -p $((PORT_BASE + LEVEL)) -D
+    rm -f "$DIR"/go-L$LEVEL-* "$DIR"/kvm-L$LEVEL-* "$DIR"/top-L$LEVEL-*
+    # Sample the busiest threads here while the child transfers. Not under set -e:
+    # a sample that finds nothing must not end the sampler.
+    (
+        set +e
+        while :; do
+            for f in "$DIR"/go-L$LEVEL-*; do
+                [ -e "$f" ] || continue
+                tag=${{f##*/go-}}
+                rm -f "$f"
+                kvm_stats > "$DIR/kvm-$tag.before"
+                top -b -H -d 1 -n 6 -w 200 -o %CPU \
+                    | awk '/^top -/{{c=0}} {{c++; if (c <= 22) print}}' > "$DIR/top-$tag.txt"
+                kvm_stats > "$DIR/kvm-$tag.after"
+            done
+            sleep 0.2
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    ;;
+measure)
+    PARENT=$((LEVEL - 1))
+    IP=$(cat "$DIR/ip-L$PARENT")
+    # egress-mss1200 caps the TCP segment size, so no GSO segment is larger than
+    # the path MTU: if it moves data where plain egress does not, large segments
+    # are lost on the way, rather than the hop being slow.
+    # egress-tso44 raises tcp_min_tso_segs for one run: a sender this slow sizes
+    # its TSO segments by its pacing rate, so each one is a packet or two, and
+    # each costs this level a virtio-net kick.
+    for dirn in egress ingress egress-mss1200 egress-tso44; do
+        flag=""
+        [ "$dirn" = ingress ] && flag="-R"
+        [ "$dirn" = egress-mss1200 ] && flag="-M 1200"
+        tso=$(sysctl -n net.ipv4.tcp_min_tso_segs)
+        [ "$dirn" = egress-tso44 ] && sysctl -qw net.ipv4.tcp_min_tso_segs=44
+        touch "$DIR/go-L$PARENT-$LEVEL-$dirn"
+        sleep 0.5
+        read -r b0 t0 < <(busy)
+        result=$(timeout 60 iperf3 -c "$IP" -p $((PORT_BASE + PARENT)) -t 5 -l 1M -P 1 $flag -J 2>/dev/null || echo '{{"error":"failed"}}')
+        read -r b1 t1 < <(busy)
+        sysctl -qw net.ipv4.tcp_min_tso_segs="$tso"
+        rate=$(echo "$result" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    e = d['end']
+    s = e['sum_received'] if '$dirn' == 'ingress' else e['sum_sent']
+    print(f\"retransmits={{e['sum_sent'].get('retransmits', 'NA')}}\", file=sys.stderr)
+    print(f\"{{s['bits_per_second'] / 1e6:.0f}}\")
+except Exception:
+    print('FAIL')
+")
+        echo "NET_HOP_L${{PARENT}}_L${{LEVEL}}_$dirn=${{rate}}Mbps child_cpu_busy=$(( (b1 - b0) * 100 / (t1 - t0 + 1) ))%"
+        sleep 6
+        echo "--- L$PARENT threads during the L$PARENT-L$LEVEL $dirn transfer"
+        cat "$DIR/top-L$PARENT-$LEVEL-$dirn.txt" 2>/dev/null || echo "(no sample)"
+        echo "--- L$PARENT KVM exits during it (before, after)"
+        paste "$DIR/kvm-L$PARENT-$LEVEL-$dirn.before" "$DIR/kvm-L$PARENT-$LEVEL-$dirn.after" 2>/dev/null || echo "(no counters)"
+    done
+    ;;
+esac
+"#
+    )
+}
+
 /// Network benchmark script using iperf3
 /// Tests egress/ingress throughput at various block sizes and parallelism
 fn network_script(server_ip: &str, port: u16) -> String {
@@ -1601,8 +1698,10 @@ async fn run_nested_n_levels(
     tokio::fs::write(&bench_path, benchmark_script()).await?;
     tokio::fs::write(&basic_path, basic_script()).await?;
     tokio::fs::write(&large_path, large_file_script()).await?;
+    let hop_path = format!("{}/hop.sh", scripts_dir);
     if mode == BenchmarkMode::WithNetwork {
         tokio::fs::write(&net_path, network_script(&host_ip, iperf_port)).await?;
+        tokio::fs::write(&hop_path, hop_script(&scripts_dir)).await?;
     }
 
     // Chmod only files that were actually created
@@ -1615,7 +1714,7 @@ async fn run_nested_n_levels(
     // net.sh only exists for WithNetwork mode
     if mode == BenchmarkMode::WithNetwork {
         tokio::process::Command::new("chmod")
-            .args(["+x", &net_path])
+            .args(["+x", &net_path, &hop_path])
             .status()
             .await?;
     }
@@ -1652,9 +1751,10 @@ async fn run_nested_n_levels(
             marker = marker
         ),
         BenchmarkMode::WithNetwork => format!(
-            "#!/bin/bash\nset -ex\n{level_script} {n}\n{net_script_call} {n}\necho {marker}\n",
+            "#!/bin/bash\nset -ex\n{level_script} {n}\n{net_script_call} {n}\n{hop} measure {n}\necho {marker}\n",
             level_script = level_script,
             net_script_call = net_script_call,
+            hop = hop_path,
             n = n,
             marker = marker
         ),
@@ -1774,6 +1874,8 @@ set -ex
 # Run script for this level
 {level_script} {level}
 {net_script_call} {level}
+[ {level} -ge 2 ] && {hop} measure {level}
+{hop} serve {level}
 
 echo "L{level}: Importing image from shared cache..."
 podman load -i {image_cache}/{digest}.oci.tar
@@ -1820,6 +1922,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
 "#,
                 level_script = level_script,
                 net_script_call = net_script_call,
+                hop = hop_path,
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
