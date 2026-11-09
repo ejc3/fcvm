@@ -504,6 +504,40 @@ class MemoryFitPublication(unittest.TestCase):
                 self.assertIn("cross-basis", str(caught.exception))
                 self.assertIn("2x", str(caught.exception))
 
+    def _served_cells(self, pss_scale=1.0):
+        """fcvm-clone cells shaped like campaign 9182bb98's m8: little private
+        memory per clone, and a serve whose memfd the cgroup basis charges to
+        the serve (838 MiB) and PSS to the clones that map it (17 MiB left)."""
+        cells = []
+        for n in (2, 8, 16, 32, 48):
+            for rep, jitter in enumerate((-6.0, -2.0, 0.0, 3.0, 7.0), 1):
+                cg = 200.0 * n + 5.0 + jitter
+                pss = (130.0 * n + 603.0 + jitter) * pss_scale
+                steady = {"clones": n, "clone_cgroup_kb": cg * 1024, "clone_pss_kb": pss * 1024,
+                          "mem_available_kb": 10_000_000, "serve_cgroup_kb": 838 * 1024,
+                          "serve_pss_kb": 17 * 1024}
+                cells.append({"side": "fcvm-clone", "n": n, "rep": rep,
+                              "pre": {"mem_available_kb": 10_000_000},
+                              "steady": [dict(steady), dict(steady), dict(steady)], "post": {}})
+        return cells
+
+    def test_a_clone_set_beside_its_serve_reconciles_over_both(self):
+        """RED BEFORE THE FIX: m8 of campaign 9182bb98 stopped with "fcvm-clone
+        cross-basis observed N=2 estimates differ by 2.07x" (cgroup 416.6 MiB,
+        PSS 863.2 MiB): the memfd the clones map is in the serve's cgroup but
+        in the clones' PSS, so clone-only totals differ by it. Over the clones
+        and the serve the bases agree, and a basis that reads three times the
+        memory is still refused."""
+        fits = corpus_mem.summarize_memory_fits(self._served_cells(), seed=9182, bootstrap_resamples=200)
+        reconciliation = fits["fcvm-clone"]["cross_basis_reconciliation"]
+        self.assertEqual(reconciliation["status"], "accepted")
+        self.assertLess(reconciliation["observed_per_n"]["2"]["maximum_pairwise_ratio"], 1.5)
+        self.assertIn("serve", reconciliation["scope"])
+        with self.assertRaises(RuntimeError) as caught:
+            corpus_mem.summarize_memory_fits(self._served_cells(pss_scale=3.0), seed=9182,
+                                             bootstrap_resamples=200)
+        self.assertIn("cross-basis", str(caught.exception))
+
     def test_fewer_than_five_repetition_blocks_cannot_publish_a_ci(self):
         cells = [cell for cell in self.cells() if cell["rep"] <= 2]
         with self.assertRaises(RuntimeError) as caught:
@@ -6265,6 +6299,24 @@ os.fsync = _fsync
                     )
             with open(completion_path) as handle:
                 self.assertEqual(handle.read(), f"armed {token}\n")
+
+    def test_the_cleanup_owner_writes_no_bytecode_into_the_bundle(self):
+        """RED BEFORE THE FIX: run as root from the sealed runtime bundle, the
+        cleanup owner's import of phase_supervisor left __pycache__ in the
+        bundle, and corpus_extra's end-of-campaign mode check withdrew every
+        corpus-extra run ("runtime directory './__pycache__' has mode 0755,
+        expected 0555"). sudo drops PYTHONDONTWRITEBYTECODE, so the owner must
+        not rely on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("cleanup_owner.py", "phase_supervisor.py"):
+                shutil.copy(os.path.join(HERE, name), tmp)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+            done = subprocess.run([sys.executable, os.path.join(tmp, "cleanup_owner.py"), "--help"],
+                                  env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(sorted(os.listdir(tmp)), ["cleanup_owner.py", "phase_supervisor.py"])
+        with open(EXTRA) as handle:
+            self.assertIn('exec python3 -B "${supervisor%/*}/cleanup_owner.py"', handle.read())
 
     @staticmethod
     def _replay_root_script():
