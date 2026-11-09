@@ -5,16 +5,46 @@
 #   make apk AOSP_TOOLS=<dir>   the app (build-apk.sh), with the AOSP build's tools
 #                               (<scripts/phone/aosp.sh --root-path>/tools); prints the APK path
 #
-# Gradle's caches live in GRADLE_HOME (default /mnt/fcvm-btrfs/phone-app/gradle-home). The app
+# Gradle's caches live in GRADLE_HOME (default /mnt/fcvm-btrfs/phone-app/gradle-home), and its
+# distribution in GRADLE_DIST (make gradle-dist). The app
 # needs an x86_64 host: the AOSP build's aapt2 and zipalign are x86_64 binaries.
 GRADLE_HOME ?= /mnt/fcvm-btrfs/phone-app/gradle-home
+# The Gradle distribution the image installs, at the Containerfile's version and checksum. It is
+# downloaded once into GRADLE_DIST and copied into the build context, so a cached GRADLE_DIST
+# (CI keeps one) builds the image without a download.
+GRADLE_DIST ?= /mnt/fcvm-btrfs/phone-app/gradle-dist
+GRADLE_VERSION := $(shell sed -n 's/^ARG GRADLE_VERSION=//p' Containerfile)
+GRADLE_SHA256 := $(shell sed -n 's/^ARG GRADLE_SHA256=//p' Containerfile)
+GRADLE_ZIP := gradle-$(GRADLE_VERSION)-bin.zip
 IMAGE := localhost/fcvm-phone-app-build:$(shell sha256sum Containerfile | cut -c1-16)
 PODMAN ?= podman
 RUN = $(PODMAN) run --rm -v "$(CURDIR):/src" -v "$(GRADLE_HOME):/gradle-home" $(IMAGE)
 
-.PHONY: image test apk verification-metadata
+.PHONY: image gradle-dist test apk verification-metadata
+# The staged copy is published by rename too: another `make image` in this checkout may be
+# building from the archive already there, and copying onto it would rewrite the file under it.
 image:
-	@$(PODMAN) image exists $(IMAGE) || $(PODMAN) build -q -t $(IMAGE) . > /dev/null
+	@$(PODMAN) image exists $(IMAGE) || { \
+	  $(MAKE) --no-print-directory gradle-dist && \
+	  mkdir -p .gradle-dist && tmp=$$(mktemp ".gradle-dist/.$(GRADLE_ZIP).XXXXXX") && \
+	  { cp "$(GRADLE_DIST)/$(GRADLE_ZIP)" "$$tmp" && chmod 644 "$$tmp" && \
+	    mv "$$tmp" ".gradle-dist/$(GRADLE_ZIP)"; } || { rm -f "$$tmp"; exit 1; }; \
+	  $(PODMAN) build -q -t $(IMAGE) . > /dev/null; }
+
+# A unique temporary name and a rename, so concurrent fetches into one GRADLE_DIST cannot
+# publish a partial file; the checksum is checked before the rename and again in the image.
+gradle-dist:
+	@test -n "$(GRADLE_VERSION)" && test -n "$(GRADLE_SHA256)" || { echo "Containerfile names no GRADLE_VERSION or GRADLE_SHA256" >&2; exit 2; }
+	@if echo "$(GRADLE_SHA256)  $(GRADLE_DIST)/$(GRADLE_ZIP)" | sha256sum -c --status - 2>/dev/null; then \
+	  echo "gradle distribution: using $(GRADLE_DIST)/$(GRADLE_ZIP), no download"; \
+	else \
+	  echo "gradle distribution: downloading $(GRADLE_ZIP)"; \
+	  mkdir -p "$(GRADLE_DIST)" && \
+	  tmp=$$(mktemp "$(GRADLE_DIST)/.$(GRADLE_ZIP).XXXXXX") && \
+	  { curl -fsSL --retry 5 --retry-all-errors -o "$$tmp" "https://services.gradle.org/distributions/$(GRADLE_ZIP)" && \
+	    echo "$(GRADLE_SHA256)  $$tmp" | sha256sum -c --quiet - && \
+	    chmod 644 "$$tmp" && mv "$$tmp" "$(GRADLE_DIST)/$(GRADLE_ZIP)"; } || { rm -f "$$tmp"; exit 1; }; \
+	fi
 
 test: image
 	@mkdir -p "$(GRADLE_HOME)"

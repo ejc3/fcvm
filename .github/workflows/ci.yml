@@ -163,6 +163,8 @@ jobs:
       FLEET_E2E_VIEW: "960x600"
       FLEET_MOCK_FPS: "10"
       FLEET_MOCK_THREADS: "3"
+      # The ffmpeg-static package whose binary the ffmpeg steps cache.
+      FFMPEG_STATIC_VERSION: "5.3.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -171,15 +173,35 @@ jobs:
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 12.15.0
-      # ffmpeg from the ffmpeg-static package (a static build with libx264,
-      # downloaded from GitHub), not apt (see the container above).
-      - name: Install ffmpeg
+      # ffmpeg from the ffmpeg-static package (a static build with libx264), not apt
+      # (see the container above). The package's install script downloads the binary
+      # from a GitHub release, so the binary is cached by package version and saved as
+      # soon as it is fetched; a warm cache runs no npm install and makes no request.
+      - name: Restore ffmpeg
+        id: ffmpeg
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: /opt/ffmpeg-static
+          key: ffmpeg-static-${{ env.FFMPEG_STATIC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Download ffmpeg (cache miss)
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
         working-directory: /tmp
         run: |
           set -euo pipefail
           mkdir ffmpeg && cd ffmpeg
-          npm install --no-audit --no-fund --no-save ffmpeg-static@5.3.0
-          bin="$PWD/node_modules/ffmpeg-static/ffmpeg"
+          npm install --no-audit --no-fund --no-save "ffmpeg-static@$FFMPEG_STATIC_VERSION"
+          mkdir -p /opt/ffmpeg-static
+          cp node_modules/ffmpeg-static/ffmpeg /opt/ffmpeg-static/ffmpeg
+      - name: Save ffmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: /opt/ffmpeg-static
+          key: ffmpeg-static-${{ env.FFMPEG_STATIC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Check ffmpeg
+        run: |
+          set -euo pipefail
+          bin=/opt/ffmpeg-static/ffmpeg
           "$bin" -hide_banner -encoders | grep libx264 > /dev/null
           echo "FLEET_FFMPEG=$bin" >> "$GITHUB_ENV"
       - name: Install dependencies
@@ -276,8 +298,31 @@ jobs:
         run: python3 -B fleet/windows/test_image.py
       # Robot Park's scene model, control protocol and shader check (fleet/phone-app), in
       # its build container. The app itself needs the AOSP build's tools and is built by phone-test.
+      # The Gradle distribution is a GitHub release download (services.gradle.org redirects
+      # there), so it is cached by the Containerfile that pins its version and checksum, and
+      # saved as soon as it is fetched; a warm cache fetches nothing (make gradle-dist says so).
+      # Gradle's dependency cache is keyed on the build files and saved after the tests pass.
+      - name: Restore the Gradle distribution
+        id: gradle-dist
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/gradle-dist
+          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile') }}
+      - name: Fetch the Gradle distribution
+        run: make -C fleet/phone-app gradle-dist GRADLE_DIST="$RUNNER_TEMP/gradle-dist"
+      - name: Save the Gradle distribution
+        if: steps.gradle-dist.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/gradle-dist
+          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile') }}
+      - name: Restore Gradle's dependency cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/gradle-home/caches
+          key: phone-app-gradle-home-${{ hashFiles('fleet/phone-app/Containerfile', 'fleet/phone-app/**/*.gradle.kts', 'fleet/phone-app/gradle.properties', 'fleet/phone-app/gradle/verification-metadata.xml') }}
       - name: Phone app scene tests (fleet/phone-app)
-        run: make -C fleet/phone-app test GRADLE_HOME="$RUNNER_TEMP/gradle-home"
+        run: make -C fleet/phone-app test GRADLE_HOME="$RUNNER_TEMP/gradle-home" GRADLE_DIST="$RUNNER_TEMP/gradle-dist"
       - name: Renderer host tests
         run: |
           set -euo pipefail
@@ -316,6 +361,7 @@ jobs:
           bash scripts/phone/test-app-sh.sh
           bash scripts/phone/test-held-check.sh
           bash fleet/phone-app/test-build-apk.sh
+          bash fleet/phone-app/test-gradle-dist.sh
 
   # Plans which self-hosted jobs this run needs.
   #
