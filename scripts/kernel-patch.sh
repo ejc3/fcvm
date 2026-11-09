@@ -362,6 +362,8 @@ cmd_edit() {
     # Find the patch file
     local patch_file=$(ls "$patches_dir"/${patch_num}*.patch 2>/dev/null | head -1)
     [[ -f "$patch_file" ]] || error "No patch found matching: ${patch_num}*.patch"
+    skips_patch "$profile" "$patch_file" && error \
+        "$(basename "$patch_file") is guest-only (*.vm.patch); the host build never applies it"
 
     local patch_name=$(basename "$patch_file")
 

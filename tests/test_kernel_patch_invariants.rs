@@ -512,4 +512,21 @@ fn kernel_patch_resolves_a_host_kernel_profile_from_its_own_table() {
         resolve("nested"),
         format!("version=6.18.60\npatches_dir={root}/kernel/patches-arm64\n")
     );
+
+    // A guest-only patch is not the host's to edit: the host build never applies it.
+    let patches = std::path::Path::new(&root.to_string()).join("kernel/patches-arm64-host");
+    fs::create_dir_all(&patches).unwrap();
+    fs::write(patches.join("0006-guest-only.vm.patch"), "").unwrap();
+    let edit = Command::new("bash")
+        .arg(&script)
+        .args(["edit", "nested.host_kernel", "0006"])
+        .env("KERNEL_PATCH_ARCH", "aarch64")
+        .output()
+        .expect("run kernel-patch.sh edit");
+    assert!(
+        !edit.status.success() && String::from_utf8_lossy(&edit.stderr).contains("guest-only"),
+        "edit on the host profile took a *.vm.patch: {}{}",
+        String::from_utf8_lossy(&edit.stdout),
+        String::from_utf8_lossy(&edit.stderr)
+    );
 }
