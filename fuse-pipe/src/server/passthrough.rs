@@ -486,6 +486,7 @@ impl PassthroughFs {
     /// volume, or whose reported path leads to another inode, is recorded as gone: a request on
     /// it is refused, never served from another file.
     pub fn inode_table(&self, captured: CapturedInodes) -> String {
+        use std::os::unix::ffi::OsStrExt;
         let mut paths = std::collections::BTreeMap::new();
         let mut gone = std::collections::BTreeMap::new();
         let root = self
@@ -499,13 +500,13 @@ impl PassthroughFs {
             let path = self.inner.pinned_path(pinned);
             let stat = self.inner.pinned_stat(pinned);
             let relative = match (&root, &path) {
-                (Ok(root), Ok(path)) => path.strip_prefix(root).ok().and_then(|p| p.to_str()),
+                (Ok(root), Ok(path)) => path.strip_prefix(root).ok(),
                 _ => None,
             };
             // The path the kernel reports for a descriptor is only a name: an inode whose name
             // was removed while another link keeps it reads "<name> (deleted)", which another
             // file can have. The table names the inode only while that path still leads to it.
-            let names_the_inode = |relative: &str| {
+            let names_the_inode = |relative: &std::path::Path| {
                 let (Ok(root), Ok(stat)) = (&root, &stat) else {
                     return false;
                 };
@@ -516,12 +517,12 @@ impl PassthroughFs {
             };
             match relative {
                 Some(relative) if names_the_inode(relative) => {
-                    paths.insert(ino, relative.to_string());
+                    paths.insert(ino, relative.as_os_str().as_bytes().to_vec());
                 }
                 _ => {
-                    let shown = path.map_or_else(
-                        |error| format!("<path unreadable: {error}>"),
-                        |path| path.to_string_lossy().into_owned(),
+                    let shown = path.as_ref().map_or_else(
+                        |error| format!("<path unreadable: {error}>").into_bytes(),
+                        |path| path.as_os_str().as_bytes().to_vec(),
                     );
                     gone.insert(ino, shown);
                 }
