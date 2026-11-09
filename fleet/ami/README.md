@@ -15,8 +15,9 @@ or a manual `critical` request, bypasses the batch delay. Critical requests may
 preempt a routine build after its exact builders have been terminated.
 
 GitHub's short-lived role can only request work and read its status. The AWS factory
-owns the build: one job, a 240-minute deadline, at most one GPU host and one tile
-running together, and four deterministic instance slots across build and fresh-image
+owns the build: one job, a 360-minute deadline, at most one GPU host and one tile
+running together (the tile builder starts beside the host builder and waits only for
+its renderer export), and four deterministic instance slots across build and fresh-image
 validation. It does not retry uncertain launches or replace failed builders. An
 independent expiry reaper handles a lost or cancelled job. The compute envelope is
 bounded separately from EBS, snapshot storage and transfer charges.
@@ -38,7 +39,7 @@ the Fleet's existing asset bucket before activating the pair.
 The executor saves the complete validation manifest before requesting final cleanup.
 It can finish while EC2 reports `shutting-down`; the publisher waits for all four
 actual termination receipts before promotion. This metadata wait uses the separate
-publication lease and cannot authorize new compute or commands after 240 minutes.
+publication lease and cannot authorize new compute or commands after 360 minutes.
 
 The coordinator consumes `$Default`, so creating a candidate version cannot deploy
 it. The fixed publisher changes only the four template image fields and their
