@@ -543,7 +543,11 @@ class PipelineTests(unittest.TestCase):
         start = build.index("bg_start fleet-ami-minecraft-image")
         self.assertLess(build.index("git checkout -q -f --detach $FCVM_COMMIT"), start)
         self.assertLess(start, build.index('as_user "cd $SRC && make build"'))
-        self.assertIn("make -s -n minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet", build[:start])
+        unit = build[start:build.index("\n", build.index("\n", start) + 1)]
+        self.assertIn("make minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet MINECRAFT_PODMAN='sudo podman'", unit)
+        self.assertIn('sudo -u "$U"', unit, "make refuses to run as root")
+        recipe = (HERE.parents[1] / "Makefile").read_text().split("\nminecraft-image:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertTrue(recipe.lstrip().startswith("$(MINECRAFT_PODMAN) build "), recipe)
         wait = build.index('bg_wait fleet-ami-minecraft-image "$L/minecraft-image.log"')
         self.assertLess(wait, build.index("make setup-phone"))
         self.assertLess(wait, build.index("podman image exists localhost/fcvm-minecraft:fleet"))

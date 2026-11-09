@@ -205,10 +205,9 @@ build)
   # the rest and the phase waits for it where it used to build it. It is built as root, straight
   # into root's store, the agent's: a rootful build runs inside its unit's cgroup, so stopping
   # the unit stops it (rootless podman's would not, see the bridge below). make refuses to run as
-  # root, so the build user's make prints the recipe's command and root runs it.
-  mc_build=$(as_user "cd $SRC && make -s -n minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet" | sed -n '/^podman build /,$p')
-  [ -n "$mc_build" ] || { echo "make minecraft-image printed no podman build"; exit 1; }
-  bg_start fleet-ami-minecraft-image "$L/minecraft-image.log" -- bash -c "cd $SRC && $mc_build"
+  # root: the build user's make runs the recipe with MINECRAFT_PODMAN="sudo podman".
+  bg_start fleet-ami-minecraft-image "$L/minecraft-image.log" -- sudo -u "$U" -H env PATH="$UH/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash -c "cd $SRC && make minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet MINECRAFT_PODMAN='sudo podman'"
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"

@@ -624,9 +624,12 @@ MINECRAFT_IMAGE ?= localhost/fcvm-minecraft:dev
 PUMPKIN_COMMIT ?= 3ea7d281654a03fdc4f4fee43734c098acd1fb52
 # The one Java Edition version that commit speaks (its pumpkin-data CURRENT_MC_VERSION).
 MINECRAFT_JAVA_VERSION ?= 26.3
+# The podman that builds it. The fleet host recipe builds into root's store with
+# MINECRAFT_PODMAN="sudo podman" (fleet/ami/host/build.sh).
+MINECRAFT_PODMAN ?= podman
 .PHONY: minecraft-image test-minecraft
 minecraft-image:
-	podman build --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
+	$(MINECRAFT_PODMAN) build --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
 	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
 
 # mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's), and the
