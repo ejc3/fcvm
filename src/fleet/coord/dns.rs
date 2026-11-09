@@ -159,9 +159,9 @@ pub fn needs_names(zone: &str, f: &Fact) -> bool {
 pub fn mint(id: &str) -> String {
     use rand::Rng;
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut r = rand::thread_rng();
+    let mut r = rand::rng();
     let token: String = (0..8)
-        .map(|_| ALPHABET[r.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[r.random_range(0..ALPHABET.len())] as char)
         .collect();
     format!("{id}-{token}")
 }

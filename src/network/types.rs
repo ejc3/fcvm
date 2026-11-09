@@ -409,16 +409,16 @@ enum ListenAddress<'a> {
 /// Generate a random MAC address for the guest
 pub fn generate_mac() -> String {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Use locally administered unicast MAC (first byte is 0x02)
     format!(
         "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        rng.gen::<u8>(),
-        rng.gen::<u8>(),
-        rng.gen::<u8>(),
-        rng.gen::<u8>(),
-        rng.gen::<u8>()
+        rng.random::<u8>(),
+        rng.random::<u8>(),
+        rng.random::<u8>(),
+        rng.random::<u8>(),
+        rng.random::<u8>()
     )
 }
 

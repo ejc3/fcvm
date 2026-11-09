@@ -313,7 +313,7 @@ fn hash_tree_with(root: &Path, keep_owners: bool) -> Result<String> {
         &mut HashMap::new(),
         &mut hasher,
     )?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// The extended attributes of `path` (not following a symlink) that this process can
@@ -381,6 +381,20 @@ fn carried_xattr(name: &[u8], keep_owners: bool) -> bool {
         || name == b"system.posix_acl_default"
 }
 
+/// An `io::copy` target that feeds a hasher: sha2 0.11 hashers do not implement `io::Write`.
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
@@ -440,7 +454,7 @@ fn hash_entry(
             hasher.update(md.len().to_le_bytes());
             let mut file =
                 std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let copied = std::io::copy(&mut file, hasher)
+            let copied = std::io::copy(&mut file, &mut HashWriter(hasher))
                 .with_context(|| format!("read {}", path.display()))?;
             if copied != md.len() {
                 bail!("{} changed size while it was hashed", path.display());

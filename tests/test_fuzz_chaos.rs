@@ -186,7 +186,7 @@ const OP_WEIGHTS: &[(Op, u32)] = &[
 
 fn sample_op(rng: &mut SmallRng) -> Op {
     let total: u32 = OP_WEIGHTS.iter().map(|(_, w)| w).sum();
-    let mut x = rng.gen_range(0..total);
+    let mut x = rng.random_range(0..total);
     for &(op, w) in OP_WEIGHTS {
         if x < w {
             return op;
@@ -932,7 +932,7 @@ fn ending_for(seed: u64, total_ops: usize) -> (Ending, usize) {
         2 => Ending::KillCompanion(Companion::Pasta),
         _ => Ending::KillCompanion(Companion::NamespaceHolder),
     };
-    (ending, stream.gen_range(0..=total_ops))
+    (ending, stream.random_range(0..=total_ops))
 }
 
 /// The attribution oracle for a companion death: SIGKILL the companion, and
@@ -1363,7 +1363,7 @@ async fn run_seed_body(
         let mut op = sample_op(rng);
         // One uniform draw per op keeps rng consumption identical whatever
         // the op does with it (nonce, jitter ms, or nothing).
-        let draw: u64 = rng.gen();
+        let draw: u64 = rng.random();
         if op == Op::SnapshotCreate && snapshots.len() >= MAX_SNAPSHOTS_PER_SEED {
             // Deterministic downgrade: pure function of the schedule so far.
             op = Op::JitterSleep;

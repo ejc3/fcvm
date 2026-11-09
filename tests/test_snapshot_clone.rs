@@ -4442,7 +4442,7 @@ async fn sha256_of(path: &std::path::Path) -> Result<String> {
         }
         hasher.update(&buf[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn working_set_serve_args<'a>(snapshot_name: &'a str, uffd_mode: &'a str) -> Vec<&'a str> {
@@ -5625,7 +5625,7 @@ async fn test_snapshot_clone_serves_snapshot_holes_as_zeros() -> Result<()> {
             for _ in 0..ZERO_BYTES >> 20 {
                 hasher.update(&chunk);
             }
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
         anyhow::ensure!(
             source_sums[0] == zeros_sum,
@@ -6975,7 +6975,7 @@ async fn test_async_pf_inside_nmi_does_not_panic_a_restored_guest() -> Result<()
     // of the pre-start snapshot cache key, so a fresh path every run would miss the cache every run.
     let digest = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(std::fs::read(&binary)?))
+        hex::encode(Sha256::digest(std::fs::read(&binary)?))
     };
     let map_dir = std::env::temp_dir().join(format!("fcvm-apfnmi-{}", &digest[..16]));
     std::fs::create_dir_all(&map_dir)?;

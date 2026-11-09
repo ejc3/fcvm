@@ -104,7 +104,7 @@ fn default_release_manifest_matches_immutable_build_recipe_on_both_arches() {
             );
             bytes.extend(std::fs::read(root.join(relative)).unwrap());
         }
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = hex::encode(Sha256::digest(&bytes));
         assert_eq!(
             profile["kernel_sha"].as_str(),
             Some(&actual[..12]),
@@ -1328,7 +1328,7 @@ fn run_identity_script(root: &Path, profile: &str, config_arch: &str, machine: &
 }
 
 fn sha256_short(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))[..12].to_string()
+    hex::encode(Sha256::digest(bytes))[..12].to_string()
 }
 
 /// The script is Python and the client is Rust, and their globs differ in two

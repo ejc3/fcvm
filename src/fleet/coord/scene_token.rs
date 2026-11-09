@@ -7,7 +7,7 @@
 
 use super::secrets::Secrets;
 use anyhow::{Context, Result};
-use rand::RngCore;
+use rand::TryRngCore;
 use std::sync::{Arc, RwLock};
 
 /// The token a client holds, shared between the task that keeps it current and the ones that
@@ -48,7 +48,9 @@ impl SceneToken {
 /// A new token: 32 random bytes, hex.
 pub fn generate() -> String {
     let mut b = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut b)
+        .expect("the OS random source failed");
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
