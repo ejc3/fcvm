@@ -653,8 +653,10 @@ mod tests {
         }
     }
 
-    /// The capture returns only after the VM's server has captured the tables, and before it has
-    /// read them: the creator resumes the VM between the two (#1684).
+    /// The capture returns once the VM's server has captured the tables, without waiting for it to
+    /// read their paths: the creator calls it while the VM is paused and resumes the VM before
+    /// reading (#1684). The serializer here blocks until the test releases it, so a capture that
+    /// waited for it would never return.
     #[tokio::test]
     async fn the_capture_returns_after_the_capture_and_before_the_read() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -695,7 +697,7 @@ mod tests {
         );
         assert!(
             !serialized.load(Ordering::SeqCst),
-            "the tables were read before the capture returned"
+            "the serializer finished before it was released"
         );
         release.send(()).unwrap();
         let files = tokio::task::spawn_blocking(move || remote.read())
