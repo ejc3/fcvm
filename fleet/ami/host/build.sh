@@ -148,6 +148,9 @@ X
   [ -x "$UH/.cargo/bin/cargo" ] || as_user 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
   [ -d "$SRC/.git" ] || as_user "git clone -q https://github.com/ejc3/fcvm.git $SRC"
   as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
+  # store.sh mounted the store as root's: hand it to the user before the first cargo build,
+  # or the build falls back to a target beside the checkout (see the build phase).
+  as_user "cd $SRC && make setup-btrfs"
   as_user "cd $SRC && make install-host-kernel"
   ;;
 build)
@@ -187,6 +190,13 @@ build)
       rm -rf "$d"
     fi
   done
+  # store.sh mounted the store as root's, and make build's target lives on it: with the store
+  # still root's, the first build fell back to a target beside the checkout and setup-gpu's
+  # build compiled fcvm and fc-agent again on the store (6 min 1 s and 1 min 0 s on 2026-11-07,
+  # cargo's own figures, in every build phase from fb2f5c36's on). setup-btrfs hands the store
+  # to the user first, so each is compiled once. It runs before the Windows job, which writes
+  # into the store as root, so setup-btrfs's ownership pass cannot meet that job's files.
+  as_user "cd $SRC && make setup-btrfs"
   # build-image.sh prints the image directory last on stdout, after its log lines on stderr.
   bg_start fleet-ami-windows-image "$L/windows-image.log" -- bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows
   as_user "cd $SRC && make build"

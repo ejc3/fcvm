@@ -516,6 +516,24 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(build.index("make -C fleet/windows bridge-image TAG=fleet"), env)
         self.assertLess(build.index("rm -rf \"$d\""), image, "an aging installation is removed before the build reuses it")
 
+    def test_the_store_is_the_users_before_the_first_cargo_build_of_each_phase(self):
+        # store.sh mounts the store as root's. A make build with the store still root's puts its
+        # target beside the checkout (scripts/cargo-target-link.sh's fallback), and the next make
+        # after setup-btrfs compiled fcvm and fc-agent again on the store: two full compiles of
+        # each in every build phase, logged on 2026-11-07 (6 min 1 s and 1 min 0 s the second time).
+        source = (HERE / "host/build.sh").read_text()
+        phases = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+        for name, first in (("prep", 'as_user "cd $SRC && make install-host-kernel"'),
+                            ("build", 'as_user "cd $SRC && make build"')):
+            with self.subTest(phase=name):
+                phase = phases[name]
+                setup = phase.index('as_user "cd $SRC && make setup-btrfs"')
+                self.assertLess(phase.index("/usr/local/lib/fcvm-fleet/store.sh"), setup)
+                self.assertLess(phase.index("git checkout -q -f --detach $FCVM_COMMIT"), setup)
+                self.assertLess(setup, phase.index(first))
+                if name == "build":
+                    self.assertLess(setup, phase.index("bg_start fleet-ami-windows-image"))
+
     def test_background_jobs_are_named_units_stopped_on_every_way_out(self):
         # A failed phase must not leave a job writing to the checkout or the store while it is
         # retried (Codex on #1778): the jobs are transient systemd units of fixed names, the
