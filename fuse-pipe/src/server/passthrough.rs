@@ -516,17 +516,23 @@ impl PassthroughFs {
                     continue;
                 }
                 let path = self.inner.pinned_path(pinned);
-                let stat = self.inner.pinned_stat(pinned);
                 let relative = match (&root, &path) {
                     (Ok(root), Ok(path)) => path.strip_prefix(root).ok(),
                     _ => None,
                 };
-                // The path the kernel reports for a descriptor is only a name: an inode whose
-                // name was removed while another link keeps it reads "<name> (deleted)", which
-                // another file can have. The table names the inode only while that path still
-                // leads to it.
+                // The path the kernel reports for a descriptor is where its dentry is now, unless
+                // the dentry was removed: then it reads "<name> (deleted)", which another file
+                // can have, also when another link keeps the inode. Such a path names the inode
+                // only while it still leads to it. Checking every path would cost two more
+                // system calls per inode.
+                let removed = path
+                    .as_ref()
+                    .is_ok_and(|path| path.as_os_str().as_bytes().ends_with(b" (deleted)"));
                 let names_the_inode = |relative: &std::path::Path| {
-                    let (Ok(root), Ok(stat)) = (&root, &stat) else {
+                    if !removed {
+                        return true;
+                    }
+                    let (Ok(root), Ok(stat)) = (&root, &self.inner.pinned_stat(pinned)) else {
                         return false;
                     };
                     std::fs::symlink_metadata(root.join(relative)).is_ok_and(|found| {
