@@ -493,6 +493,97 @@ fn every_hand_built_export_command_dies_with_its_test() {
     }
 }
 
+/// `snapshot import` stages into `<tag>.creating`. An import killed before the rename that
+/// publishes it leaves that directory, with the memory image in it, and no tag. The next
+/// import removes it before it stages its own. The next import is of another tag, so what
+/// removes the directory is the reclaim and not the staging of the same name.
+#[tokio::test]
+async fn a_sigkilled_import_leaves_its_staging_directory_to_the_next_import() -> Result<()> {
+    let data = tempfile::tempdir()?;
+    let archives = tempfile::tempdir()?;
+    let snapshots = data.path().join("snapshots");
+    let (killed_tag, next_tag) = ("reclaim-import-killed", "reclaim-import-next");
+    let archive_of = |tag: &str| archives.path().join(format!("{tag}.archive"));
+    let fcvm = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
+        command.args(args).env("FCVM_DATA_DIR", data.path());
+        // An import parked at its failpoint must not outlive a test that nextest killed.
+        common::set_test_pdeathsig(&mut command);
+        command
+    };
+    for tag in [killed_tag, next_tag] {
+        snapshot_without_a_vm(data.path(), tag)?;
+        let status = fcvm(&["snapshot", "export", tag, "--output"])
+            .arg(archive_of(tag))
+            .status()
+            .await
+            .context("exporting a snapshot to import")?;
+        anyhow::ensure!(status.success(), "the export of {tag} failed: {status}");
+        std::fs::remove_dir_all(snapshots.join(tag))?;
+    }
+    let import = |tag: &str| {
+        let mut command = fcvm(&["snapshot", "import", "--input"]);
+        command.arg(archive_of(tag));
+        command
+    };
+    let staging = snapshots.join(format!("{killed_tag}.creating"));
+
+    // Killed with the snapshot whole in its staging directory, verified and synced, before
+    // the rename that publishes it.
+    let park = tempfile::tempdir()?;
+    let spec = format!("snapshot.import.pre_publish:park:{}", park.path().display());
+    let mut killed = import(killed_tag)
+        .env("FCVM_FAILPOINT", &spec)
+        .spawn()
+        .context("spawning the import to kill")?;
+    let killed_pid = killed.id().context("the import has no pid")?;
+    let observed = async {
+        wait_for(
+            "the import did not park at snapshot.import.pre_publish",
+            Duration::from_secs(120),
+            || parked(park.path()),
+        )
+        .await?;
+        anyhow::ensure!(
+            staging.join("memory.bin").is_file() && staging.join("config.json").is_file(),
+            "the parked import has not staged its snapshot in {}",
+            staging.display()
+        );
+        anyhow::ensure!(
+            !snapshots.join(killed_tag).exists(),
+            "the parked import has published its tag before the rename"
+        );
+        Ok(())
+    }
+    .await;
+    sigkill(&mut killed, killed_pid).await?;
+    observed?;
+    anyhow::ensure!(
+        staging.exists(),
+        "the killed import's staging directory is already gone, so the kill ran its cleanup"
+    );
+
+    let status = import(next_tag)
+        .status()
+        .await
+        .context("running the next import")?;
+    anyhow::ensure!(status.success(), "the next import failed: {status}");
+    anyhow::ensure!(
+        !staging.exists(),
+        "the killed import's staging directory survived the next import: {}",
+        staging.display()
+    );
+    anyhow::ensure!(
+        !snapshots.join(killed_tag).exists(),
+        "the killed import's tag exists"
+    );
+    anyhow::ensure!(
+        snapshots.join(next_tag).join("config.json").is_file(),
+        "the next import did not install its snapshot"
+    );
+    Ok(())
+}
+
 /// Build a localhost image whose content, and so whose digest, is this test's own, and
 /// return its image-cache key (the manifest digest, or the image id when there is none).
 async fn unique_localhost_image(name: &str) -> Result<String> {

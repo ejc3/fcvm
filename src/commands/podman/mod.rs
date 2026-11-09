@@ -664,19 +664,19 @@ async fn verify_prepared_snapshot(
     verify_prepared_snapshot_in(&paths::data_dir(), &paths::snapshot_dir(), target, cache).await
 }
 
-/// Flush a prepared generation to disk: every file under `dir`, each directory
+/// Flush a snapshot generation to disk: every file under `dir`, each directory
 /// after its files, then `dir` itself. The disks sit in the `disk/` subvolume,
 /// so the walk descends. Returns the paths it synced in that order.
-fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+pub(crate) fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let mut synced = Vec::new();
     for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading prepared generation {}", dir.display()))?
+        .with_context(|| format!("reading snapshot generation {}", dir.display()))?
     {
-        let entry = entry.context("reading prepared generation entry")?;
+        let entry = entry.context("reading snapshot generation entry")?;
         let path = entry.path();
         let file_type = entry
             .file_type()
-            .context("reading prepared generation entry type")?;
+            .context("reading snapshot generation entry type")?;
         if file_type.is_dir() {
             synced.extend(sync_generation(&path)?);
         } else if file_type.is_file() {
@@ -688,18 +688,19 @@ fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
             sync_hooks::before_open(&path);
             let file = match std::fs::File::open(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                opened => opened
-                    .with_context(|| format!("opening prepared artifact {}", path.display()))?,
+                opened => {
+                    opened.with_context(|| format!("opening snapshot file {}", path.display()))?
+                }
             };
             file.sync_all()
-                .with_context(|| format!("syncing prepared artifact {}", path.display()))?;
+                .with_context(|| format!("syncing snapshot file {}", path.display()))?;
             synced.push(path);
         }
     }
     std::fs::File::open(dir)
-        .with_context(|| format!("opening prepared generation {}", dir.display()))?
+        .with_context(|| format!("opening snapshot generation {}", dir.display()))?
         .sync_all()
-        .with_context(|| format!("syncing prepared generation {}", dir.display()))?;
+        .with_context(|| format!("syncing snapshot generation {}", dir.display()))?;
     synced.push(dir.to_path_buf());
     Ok(synced)
 }
@@ -833,78 +834,18 @@ async fn verify_prepared_snapshot_in(
             expected.display(),
             configured.display()
         );
-        let metadata = tokio::fs::metadata(configured).await.with_context(|| {
-            format!(
-                "reading prepared snapshot {} {} artifact {}",
-                snapshot_key,
-                label,
-                configured.display()
-            )
-        })?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() > 0,
-            "prepared snapshot {} {} artifact is not a non-empty regular file: {}",
-            snapshot_key,
-            label,
-            configured.display()
-        );
     }
 
     // The three core artifacts are not the whole generation. A clone also opens every
     // extra disk and every volume's inode table, so a generation missing
     // one of those would report `prepared` here and fail (or silently renumber inodes)
     // at restore, after the cache entry is already durable and shared.
-    for disk in &config.metadata.extra_disks {
-        let mut components = std::path::Path::new(&disk.filename).components();
-        let contained = matches!(components.next(), Some(std::path::Component::Normal(_)))
-            && components.next().is_none();
-        anyhow::ensure!(
-            contained,
-            "prepared snapshot {} extra disk {} names a path outside its generation: {}",
-            snapshot_key,
-            disk.drive_id,
-            disk.filename
-        );
-        let path = crate::storage::snapshot::snapshot_disk_dir(&snapshot_dir).join(&disk.filename);
-        let metadata = tokio::fs::metadata(&path).await.with_context(|| {
-            format!(
-                "reading prepared snapshot {} extra disk {} artifact {}",
-                snapshot_key,
-                disk.drive_id,
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() > 0,
-            "prepared snapshot {} extra disk {} artifact is not a non-empty regular file: {}",
-            snapshot_key,
-            disk.drive_id,
-            path.display()
-        );
-    }
-
-    // Every volume restores the guest's inodes from a table written into the generation
-    // before its atomic rename (see create_podman_snapshot). A clone that finds no table
-    // answers EBADF or EIO for every inode the guest held at the snapshot (#1684), so a
-    // generation without one is rebuilt rather than reused.
-    for volume in &config.metadata.volumes {
-        let path = snapshot_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
-        let metadata = tokio::fs::metadata(&path).await.with_context(|| {
-            format!(
-                "reading prepared snapshot {} volume {} inode table {}",
-                snapshot_key,
-                volume.guest_path,
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() > 0,
-            "prepared snapshot {} volume {} inode table is not a non-empty regular file: {}",
-            snapshot_key,
-            volume.guest_path,
-            path.display()
-        );
-    }
+    crate::storage::snapshot::check_generation_files(
+        &snapshot_dir,
+        &config,
+        &format!("prepared snapshot {snapshot_key}"),
+    )
+    .await?;
 
     // The memory snapshot holds the guest's view of each pmem image as it was, and Firecracker
     // reopens the recorded path at restore, so a generation whose image changed can never be

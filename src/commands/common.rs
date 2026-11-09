@@ -924,7 +924,7 @@ fn memory_file_refuses_in_place_diff(
 /// 47 GiB compressed and takes 128 GiB uncompressed. Firecracker opens the file without
 /// truncating it, so the empty inode it finds keeps the flag. A file that already exists is
 /// left as it is.
-fn create_memory_file_nodatacow(path: &Path, snapshot: &str) -> Result<()> {
+pub(crate) fn create_memory_file_nodatacow(path: &Path, snapshot: &str) -> Result<()> {
     let file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -5145,7 +5145,18 @@ pub(crate) fn snapshot_sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
 pub(crate) fn record_snapshot_staging(
     snapshot_dir: &Path,
 ) -> Result<crate::reclaim::SnapshotStagingRecord> {
-    crate::reclaim::record_snapshot_staging(
+    let owners = crate::reclaim::owner_dir().context("recording the snapshot staging directory")?;
+    record_snapshot_staging_in(&owners, snapshot_dir)
+}
+
+/// [`record_snapshot_staging`] with its record in the owner directory `owners`, for a
+/// caller that is told where its data directory is (`snapshot import`).
+pub(crate) fn record_snapshot_staging_in(
+    owners: &Path,
+    snapshot_dir: &Path,
+) -> Result<crate::reclaim::SnapshotStagingRecord> {
+    crate::reclaim::record_snapshot_staging_in(
+        owners,
         &snapshot_sibling(snapshot_dir, "creating"),
         &snapshot_sibling(snapshot_dir, "lock"),
     )
@@ -8898,7 +8909,7 @@ mod tests {
         assert_eq!(
             production.matches(", \"creating\")").count(),
             4,
-            "a function other than record_snapshot_staging and the three creators names a \
+            "a function other than record_snapshot_staging_in and the three creators names a \
              snapshot's staging directory: record it there and list it here"
         );
     }

@@ -9,6 +9,7 @@ pub mod serve;
 pub mod setup;
 pub mod snapshot;
 pub mod snapshot_export;
+pub mod snapshot_import;
 pub mod snapshots;
 pub mod tty;
 pub mod vm;

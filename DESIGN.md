@@ -51,6 +51,7 @@
    - `fcvm snapshot serve`: Start UFFD memory server for cloning
    - `fcvm snapshot run`: Spawn clone from memory server
    - `fcvm snapshot export`: Write a snapshot's directory as one archive
+   - `fcvm snapshot import`: Install the snapshot in such an archive
    - Lightning-fast clone startup (<1 second)
    - Serves guest memory through a UFFD page fault handler; clones share clean pages only in minor mode (`--uffd-mode minor`)
    - Creates independent VM with its own networking
@@ -1463,6 +1464,7 @@ One async session per connection:
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
 | `fcvm snapshot export` | Write a snapshot's directory as one archive |
+| `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote |
 | `fcvm snapshots ls` | List stored snapshots (also: `delete <NAME>`, `prune`) |
 
 ### Key CLI Design Decisions
@@ -1736,6 +1738,57 @@ temporaries are left out.
   export asks the kernel to drop it from the page cache, as a memory server does for idle
   snapshots when it starts. Every other file is dropped once it is written, so a large disk
   does not hold the page cache while the memory image is read.
+
+#### `fcvm snapshot import`
+
+**Purpose**: Install the snapshot that an archive from `fcvm snapshot export` carries.
+
+```bash
+fcvm snapshot import [--input <FILE>]
+
+# Over a pipe
+ssh other-host 'fcvm snapshot export nginx-warm' | fcvm snapshot import
+```
+
+The snapshot is installed under the tag it was exported from. Without `--input` the archive
+is read from stdin, and a terminal is refused.
+
+Before it writes anything the import reads the archive's manifest and its `config.json`,
+and refuses the archive unless:
+
+- it is this fcvm's archive version, and the snapshot has the versions this fcvm restores;
+- the snapshot was taken on this architecture, with Firecracker;
+- it was taken under a data directory with this host's path (`paths.data_dir`): the VM state
+  embeds paths under it;
+- the Firecracker binary it was taken on is at the recorded path, with the same SHA-256;
+- its kernel profile is configured;
+- the tag does not exist here;
+- the archive lists no files from outside the snapshot's directory, which this version does
+  not install;
+- the image disk the snapshot attaches, which the archive does not carry, is a file on this
+  host, with the digest the snapshot recorded if it recorded one;
+- the pmem images the snapshot maps, which the archive does not carry either, are the store
+  entries the snapshot recorded. A snapshot records each entry by inode, length and
+  modification time, so a snapshot with pmem images imports only on the host that took it.
+
+The import then stages the snapshot the way `snapshot create` does: under the tag's lock,
+in `<tag>.creating`, which is recorded for reclaim before it is made, with the directory
+and its `disk/` as btrfs subvolumes where the store can make them. Every file is written at
+the offsets of its data runs, so holes stay holes. The staged directory is renamed to
+`<tag>` only after the archive's trailer has verified every file, the directory holds every
+file a restore opens, and the files are synced. The rename replaces nothing
+(`RENAME_NOREPLACE`): a tag that appeared in the meantime is kept and the import fails. A
+cut stream or a digest that does not match installs nothing and removes the staging
+directory; a killed import leaves it to the next import or VM launch.
+
+- The memory image is always a file in the snapshot's directory, also when the exported
+  snapshot was made with `--memory-dir`.
+- `config.json` gets a new generation id and no parent snapshot. Every other field is
+  kept as the export wrote it.
+- The working set recorded beside the memory image is not installed: its key names the
+  exporting host's files. The first restores record a new one.
+- What a restore of the snapshot reads outside its directory (mapped directories, NFS
+  shares, firmware, the image disk, pmem images) is logged as a warning, one line each.
 
 #### `fcvm ls`
 
