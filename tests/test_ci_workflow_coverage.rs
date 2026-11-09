@@ -2878,17 +2878,53 @@ fn store_warm_up_wait_reports_how_the_reader_ended() {
 /// Firecracker release download got a 92-byte error body from GitHub and the job died in
 /// `tar` with "gzip: stdin: not in gzip format". A curl that writes to /dev/null is reading
 /// a status code on purpose and is exempt.
+///
+/// The scan covers the workflows and every script under `scripts/` that a workflow runs,
+/// directly or through another such script: the release downloads moved out of the workflows
+/// into `scripts/cached-download.sh`, and a scan of the workflows alone would find none.
+/// Continuation lines are joined first, so a curl whose `-o` sits on a later line is counted.
 #[test]
 fn workflow_downloads_fail_on_http_errors() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
-    let mut downloads = 0usize;
-    let mut missing = Vec::new();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join(".github/workflows");
+    let mut files = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("workflows dir must be readable") {
         let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
-            continue;
+        if path.extension().and_then(|e| e.to_str()) == Some("yml") {
+            files.push(path);
         }
-        let text = std::fs::read_to_string(&path).expect("workflow must be readable");
+    }
+    files.sort();
+    // Scripts the workflows run: every `<name>.sh` a scanned file names that exists in
+    // scripts/, followed transitively.
+    let mut scripts: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    let mut queue = files.clone();
+    while i < queue.len() {
+        let text = std::fs::read_to_string(&queue[i]).expect("file must be readable");
+        i += 1;
+        for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || "._-/".contains(c))) {
+            let Some(name) = word.rsplit('/').next().filter(|n| n.ends_with(".sh")) else {
+                continue;
+            };
+            let candidate = root.join("scripts").join(name);
+            if candidate.is_file() && !scripts.contains(&candidate) {
+                scripts.push(candidate.clone());
+                queue.push(candidate);
+            }
+        }
+    }
+    assert!(
+        scripts.contains(&root.join("scripts/cached-download.sh")),
+        "the scan did not reach scripts/cached-download.sh through the workflows: {scripts:?}"
+    );
+    files.extend(scripts);
+    let mut downloads = 0usize;
+    let mut missing = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path)
+            .expect("file must be readable")
+            .replace("\\\n", " ");
         for (i, line) in text.lines().enumerate() {
             let words: Vec<&str> = line.split_whitespace().collect();
             let Some(at) = words.iter().position(|w| *w == "curl") else {
@@ -2917,7 +2953,7 @@ fn workflow_downloads_fail_on_http_errors() {
     }
     assert!(
         downloads >= 6,
-        "found only {downloads} curl downloads; the scan is not reading the workflows"
+        "found only {downloads} curl downloads; the scan is not reading the workflows and their scripts"
     );
     assert!(
         missing.is_empty(),
