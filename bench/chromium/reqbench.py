@@ -2179,6 +2179,10 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
         entry_mode = os.lstat(os.path.abspath(os.path.normpath(data_dir))).st_mode
     except FileNotFoundError:
         entry_mode = None
+    except OSError:
+        # An entry that cannot be examined is not one to remove; the caller
+        # records the refusal and releases the state lock.
+        return ""
     raw = os.path.abspath(os.path.normpath(data_dir))
     head, vm_id = os.path.split(raw)
     expected = os.path.join(trusted, vm_id)

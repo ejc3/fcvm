@@ -1198,6 +1198,37 @@ class ReapExcludesReclaim(unittest.TestCase):
             self.assertEqual(reaped, [state])
             self.assertEqual(reqbench.left_on_disk(state, vm_dir), [])
 
+    def test_an_unreadable_directory_is_refused_and_the_state_lock_released(self):
+        """Review of #1816: an lstat error other than "gone" escaped reap_disk
+        with the state lock still held. It is now a refusal like any unsafe
+        target: recorded, the state kept, the lock released."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            state, vm_dir = self._clone(root)
+            # The exact owner, so the reap takes the state lock first.
+            with open(state, "w") as f:
+                json.dump({"vm_id": self.VM_ID, "pid": 4242, "pid_start_time": 99}, f)
+            open(f"{state}.lock", "w").close()
+            real_lstat = os.lstat
+
+            def denied(path, *args, **kwargs):
+                if os.fspath(path) == vm_dir:
+                    raise PermissionError(13, "Permission denied", path)
+                return real_lstat(path, *args, **kwargs)
+
+            out: dict = {}
+            with mock.patch.object(os, "lstat", denied):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            self.assertEqual(reaped, [])
+            self.assertIn("refusing to remove", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.lexists(state))
+            lock = f"{state}.lock"
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
     def test_a_lock_held_past_the_wait_keeps_the_state(self):
         """A holder that does not let go is not a reclaim: the reap records the
         error and keeps the state, the only pointer to the clone's disk."""
