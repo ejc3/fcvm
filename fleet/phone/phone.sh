@@ -67,7 +67,8 @@ RUN=${PHONE_RUN:-/tmp}
 # renders on the VM's GPU, so a phone rendering in software is never shown.
 export PHONE_GO_FILE=${PHONE_GO_FILE:-/run/phone-verified}
 AVD=$ANDROID_AVD_HOME/phone.avd
-ms() { date +%s%3N; }
+# Every use of ms() is an interval or a deadline, so it is phone-proc.sh's monotonic clock.
+ms() { mono_ms; }
 # Milliseconds as seconds for timeout(1).
 secs() { printf '%d.%03d' $(( $1 / 1000 )) $(( $1 % 1000 )); }
 # The activity in front as the activity manager has it (package/class), or nothing; the adb

@@ -71,15 +71,15 @@ retake)
   held) echo "the emulator holds the GPU"; free_streamer; exit 0 ;;
   *) echo "unexpected 'gpu status' answer: $status"; exit 1 ;;
   esac
-  t0=$(ms)
+  t0=$(mono_ms)
   out=$(console gpu retake)
   echo "$out"
   grep -q '^retaken_ms=' <<< "$out"
   deadline=$(( t0 + ${FRAME_TIMEOUT_MS:-10000} ))
-  while [ "$(ms)" -lt "$deadline" ]; do
+  while [ "$(mono_ms)" -lt "$deadline" ]; do
     if [ "$(console gpu frame | head -1)" = posted ]; then
-      now=$(ms)
-      echo "first_frame_ms=$(( now - t0 )) first_frame_at_ms=$now"
+      now=$(mono_ms)
+      echo "first_frame_ms=$(( now - t0 )) first_frame_at_ms=$(ms)"
       free_streamer
       exit 0
     fi

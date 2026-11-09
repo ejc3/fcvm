@@ -1,6 +1,12 @@
 # Process helpers that phone.sh and the GPU hook share; both source this file from their own
 # directory (/usr/local/bin in the phone container, fleet/phone in their tests).
 
+# Milliseconds on the monotonic clock (/proc/uptime, 10 ms steps), for intervals and
+# deadlines: the wall clock can step back under an NTP correction, which once made phone.sh's
+# time to the front negative (shown_ms=-858). A wall-clock time (gpu-hook's
+# first_frame_at_ms) is date's, not this.
+mono_ms() { local up; read -r up _ < /proc/uptime; echo $(( ${up%.*} * 1000 + 10#${up#*.} * 10 )); }
+
 # A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
 # a container whose first process reaps nothing) is not.
 alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
@@ -15,9 +21,9 @@ stop_procs() {
   local pid=$1 name=$2 t0 now killed=0 p left
   if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
   pkill -x "$name" 2>/dev/null || true
-  t0=$(date +%s%3N)
+  t0=$(mono_ms)
   while { [ -n "$pid" ] && alive "$pid"; } || any_alive "$name"; do
-    now=$(date +%s%3N)
+    now=$(mono_ms)
     if [ "$killed" = 0 ] && [ $(( now - t0 )) -ge "${STOP_TERM_MS:-5000}" ]; then
       echo "$name did not exit within ${STOP_TERM_MS:-5000} ms of SIGTERM: sending SIGKILL" >&2
       if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
