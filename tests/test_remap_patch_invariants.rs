@@ -396,19 +396,22 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         );
     }
 
-    let host = "kernel_profiles.nested.arm64.host_kernel";
-    assert!(
-        toml_section(&config, host)
-            .lines()
-            .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
-        "[{host}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest wedges L2 \
-         (#659), and 7.3.1 hosts passed every nested check with 7.3.1 and 6.18.60 guests"
-    );
-
     for profile in [
         "kernel_profiles.default.arm64",
-        "kernel_profiles.default.amd64",
         "kernel_profiles.nested.arm64",
+        "kernel_profiles.nested.arm64.host_kernel",
+    ] {
+        assert!(
+            toml_section(&config, profile)
+                .lines()
+                .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
+            "[{profile}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest \
+             wedges L2 (#659), and 7.3.1 hosts passed every nested check with 7.3.1 guests"
+        );
+    }
+
+    for profile in [
+        "kernel_profiles.default.amd64",
         "kernel_profiles.nested.amd64",
         "kernel_profiles.nested.amd64.host_kernel",
         "kernel_profiles.btrfs.arm64",

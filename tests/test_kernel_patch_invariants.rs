@@ -261,7 +261,10 @@ fn extract_block(text: &str, start: &str, end: &str) -> Option<String> {
 #[test]
 fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     let mut failures = Vec::new();
-    for port in s2_ports() {
+    let mut ports = s2_ports();
+    // The guest and host can share one patch set and release; run each once.
+    ports.dedup_by(|a, b| a.patch == b.patch && a.fixture == b.fixture);
+    for port in ports {
         failures.extend(
             run_s2_tracking_harness(&port)
                 .into_iter()
@@ -272,23 +275,17 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
 }
 
 /// The kernel functions the harness compiles, in source order:
-/// (file, first line, last line, present only with the patch). The 6.18
-/// backport frees records in kvm_destroy_guest_s2_mappings(); the 7.3 port
-/// (upstream's series from v7.4-rc1) frees them in guest_s2_tracking_destroy()
+/// (file, first line, last line, present only with the patch). The 7.3 port
+/// (upstream's series from v7.4-rc1) frees records in guest_s2_tracking_destroy()
 /// when kvm_free_stage2_pgd() tears down the canonical MMU.
-fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static str, bool)> {
+fn s2_tracking_blocks() -> Vec<(&'static str, &'static str, &'static str, bool)> {
     const HOST_H: &str = "arch/arm64/include/asm/kvm_host.h";
     const MMU_C: &str = "arch/arm64/kvm/mmu.c";
     const NESTED_C: &str = "arch/arm64/kvm/nested.c";
-    let upstream = series != "6.18";
-    let mut blocks = vec![
+    vec![
         (HOST_H, "struct kvm_guest_s2_mapping {", "};", true),
         (NESTED_C, "#define S2_MMU_PER_VCPU", "", false),
-    ];
-    if upstream {
-        blocks.push((NESTED_C, "#define S2_MMU_PER_VM", "", true));
-    }
-    blocks.extend([
+        (NESTED_C, "#define S2_MMU_PER_VM", "", true),
         (NESTED_C, "int kvm_init_nested(", "}", false),
         (NESTED_C, "void kvm_destroy_nested(", "}", false),
         (NESTED_C, "static int init_nested_s2_mmu(", "}", false),
@@ -309,11 +306,6 @@ fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static
         ),
         (NESTED_C, "void kvm_record_guest_s2_mapping(", "}", true),
         (NESTED_C, "void kvm_remove_guest_s2_mappings(", "}", true),
-    ]);
-    if !upstream {
-        blocks.push((NESTED_C, "void kvm_destroy_guest_s2_mappings(", "}", true));
-    }
-    blocks.extend([
         (NESTED_C, "void kvm_init_nested_s2_mmu(", "}", false),
         (
             NESTED_C,
@@ -347,22 +339,16 @@ fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static
         (MMU_C, "void kvm_stage2_unmap_range(", "}", false),
         (MMU_C, "int kvm_init_stage2_mmu(", "}", false),
         (MMU_C, "void kvm_uninit_stage2_mmu(", "}", false),
-    ]);
-    if upstream {
-        blocks.push((MMU_C, "static void guest_s2_tracking_destroy(", "}", true));
-    }
-    blocks.extend([
+        (MMU_C, "static void guest_s2_tracking_destroy(", "}", true),
         (MMU_C, "void kvm_free_stage2_pgd(", "}", false),
         (MMU_C, "bool kvm_unmap_gfn_range(", "}", false),
         (MMU_C, "void kvm_arch_flush_shadow_memslot(", "}", false),
-    ]);
-    blocks
+    ]
 }
 
 /// Build the harness for one port and run its scenarios; returns the failures.
 fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     let release = port.release.as_str();
-    let series = release.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
     let temp = tempfile::tempdir().expect("create the shadow stage-2 fixture directory");
     for file in S2_TRACKING_FILES {
         let dest = temp.path().join(file);
@@ -394,7 +380,7 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     if patched {
         extracted.push_str("#define HAVE_GUEST_S2_TRACKING 1\n");
     }
-    for (file, start, end, with_patch) in s2_tracking_blocks(&series) {
+    for (file, start, end, with_patch) in s2_tracking_blocks() {
         let source = fs::read_to_string(temp.path().join(file)).unwrap();
         match extract_block(&source, start, end) {
             Some(block) => extracted.push_str(&block),

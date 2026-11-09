@@ -3,11 +3,12 @@
  * Author: Jintack Lim <jintack.lim@linaro.org>
  */
 /*
- * Verbatim function excerpts from Linux v6.18.60 arch/arm64/kvm/nested.c:
- * https://raw.githubusercontent.com/gregkh/linux/v6.18.60/arch/arm64/kvm/nested.c
- * Complete source SHA256: 725634c89893a145c50c1aa1fee97e76d53eed9f65c428041b5ca5ddb5ddb93f
- * kvm_vcpu_load_hw_mmu is retained as context. unmap_l1_vncr and
- * this_cpu_reset_vncr_fixmap are what the put and translation paths call.
+ * Verbatim function excerpts from Linux v7.3.3 arch/arm64/kvm/nested.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/nested.c
+ * Complete source SHA256: 2821d3f5d50bc1d41e3e08f7556774cf1a4b9e0f2834c0274aca7d099a2962c5
+ * kvm_vcpu_load_hw_mmu is retained as context. unmap_l1_vncr,
+ * this_cpu_reset_vncr_fixmap and invalidate_vncr are what the put and
+ * translation paths call.
  * The pinned release carries upstream 5949004d7032 itself, so the test
  * executes this C unpatched.
  */
@@ -88,6 +89,14 @@ void kvm_vcpu_put_hw_mmu(struct kvm_vcpu *vcpu)
 	vcpu->arch.hw_mmu = NULL;
 }
 
+static void invalidate_vncr(struct kvm *kvm, struct vncr_tlb *vt)
+{
+	BUG_ON(!vt->valid);
+	vt->valid = false;
+	unmap_l1_vncr(vt);
+	atomic_dec(&kvm->arch.vncr_tlb_count);
+}
+
 static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 {
 	struct kvm_memory_slot *memslot;
@@ -110,7 +119,8 @@ static int kvm_translate_vncr(struct kvm_vcpu *vcpu, bool *is_gmem)
 	 */
 	scoped_guard(write_lock, &vcpu->kvm->mmu_lock) {
 		this_cpu_reset_vncr_fixmap(vcpu);
-		vt->valid = false;
+		if (vt->valid)
+			invalidate_vncr(vcpu->kvm, vt);
 
 		vt->wi = (struct s1_walk_info) {
 			.regime	= TR_EL20,

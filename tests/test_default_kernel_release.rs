@@ -46,32 +46,18 @@ fn default_profile<'a>(config: &'a toml::Value, arch: &str) -> &'a toml::Value {
     &config["kernel_profiles"]["default"][arch]
 }
 
-/// The one kernel version every deployable profile is pinned to.
+/// The kernel version the default profile of `arch` must ship: its nested profile's.
 ///
-/// `default`, `nested`, and `btrfs` all ship to users, so they move together;
-/// `mountinfo-*` are test-only reproductions of a specific kernel bug and are
-/// deliberately excluded. Deriving the expectation instead of writing a literal
-/// means a future bump cannot silently leave one profile behind on an unpinned
-/// or end-of-life release, which is the drift the deployable-pin rule in
-/// rootfs-config.toml exists to prevent.
-fn deployable_kernel_version(config: &toml::Value) -> String {
-    let mut versions: Vec<String> = Vec::new();
-    for profile in ["nested", "btrfs"] {
-        for arch in ["arm64", "amd64"] {
-            let version = config["kernel_profiles"][profile][arch]["kernel_version"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{profile}.{arch} has no kernel_version"));
-            versions.push(version.to_string());
-        }
-    }
-    versions.sort();
-    versions.dedup();
-    assert_eq!(
-        versions.len(),
-        1,
-        "deployable profiles disagree on their kernel pin: {versions:?}"
-    );
-    versions.remove(0)
+/// The default and nested guests move together. #659 moved the arm64 pair to 7.3
+/// once the arm64 nested host ran 7.3, ahead of btrfs, gpu and phone, which follow
+/// as their own layer; `deployable_kernel_profiles_pin_a_supported_working_kernel`
+/// pins each table's exact release. Deriving the expectation instead of writing a
+/// literal means a bump cannot leave the default guest behind its nested one.
+fn deployable_kernel_version(config: &toml::Value, arch: &str) -> String {
+    config["kernel_profiles"]["nested"][arch]["kernel_version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("nested.{arch} has no kernel_version"))
+        .to_string()
 }
 
 #[test]
@@ -83,8 +69,8 @@ fn default_release_manifest_matches_immutable_build_recipe_on_both_arches() {
         "the retired Kata [kernel] path must not coexist with the explicit default profile"
     );
 
-    let deployable_version = deployable_kernel_version(&config);
     for arch in ["arm64", "amd64"] {
+        let deployable_version = deployable_kernel_version(&config, arch);
         let profile = default_profile(&config, arch);
         assert_eq!(
             profile["kernel_version"].as_str(),
@@ -2495,24 +2481,44 @@ fn the_release_check_exits_2_whenever_it_cannot_check() {
 /// release. Without it about one guest shutdown in 200 never finishes:
 /// device_shutdown() breaks the virtio-net TX queue while completions are still
 /// unreclaimed, virtnet_poll_cleantx() then spins in softirq holding the TX queue
-/// lock, and the guest never reaches its power-off call. Every kernel fcvm ships as
-/// a guest has to carry the backport until the pinned release does.
+/// lock, and the guest never reaches its power-off call. Every 6.18 kernel fcvm ships
+/// as a guest has to carry the backport. 7.3 carries the commit (v7.3-rc1), so a
+/// table pinning 7.3 or later must not: the backport no longer applies.
 #[test]
 fn every_shipped_guest_kernel_applies_the_virtio_ring_shutdown_fix() {
+    let config = rootfs_config();
     let applies = shipped_guest_kernels_applying("the backend will never update it");
     assert_eq!(
         applies.len(),
         6,
         "expected default, nested and btrfs tables for both arches"
     );
-    let missing: Vec<_> = applies
-        .iter()
-        .filter(|(_, applied)| !applied)
-        .map(|(table, _)| table)
-        .collect();
+    let mut wrong = Vec::new();
+    for (table, applied) in &applies {
+        let (profile, arch) = table.split_once('.').unwrap();
+        let version = config["kernel_profiles"][profile][arch]["kernel_version"]
+            .as_str()
+            .unwrap();
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect();
+        let upstream = matches!(parts[..], [major, minor, ..] if (major, minor) >= (7, 3));
+        if *applied == upstream {
+            wrong.push(format!(
+                "{table} pins {version} and {} the backport",
+                if *applied {
+                    "applies"
+                } else {
+                    "does not apply"
+                }
+            ));
+        }
+    }
     assert!(
-        missing.is_empty(),
-        "these guest kernels do not apply the virtio_ring broken-queue fix: {missing:?}"
+        wrong.is_empty(),
+        "the virtio_ring broken-queue fix must come from the backport before 7.3 and from \
+         the release from 7.3 on: {wrong:?}"
     );
 }
 
