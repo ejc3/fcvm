@@ -21,10 +21,14 @@ PODMAN ?= podman
 RUN = $(PODMAN) run --rm -v "$(CURDIR):/src" -v "$(GRADLE_HOME):/gradle-home" $(IMAGE)
 
 .PHONY: image gradle-dist test apk verification-metadata
+# The staged copy is published by rename too: another `make image` in this checkout may be
+# building from the archive already there, and copying onto it would rewrite the file under it.
 image:
 	@$(PODMAN) image exists $(IMAGE) || { \
 	  $(MAKE) --no-print-directory gradle-dist && \
-	  mkdir -p .gradle-dist && cp "$(GRADLE_DIST)/$(GRADLE_ZIP)" .gradle-dist/ && \
+	  mkdir -p .gradle-dist && tmp=$$(mktemp ".gradle-dist/.$(GRADLE_ZIP).XXXXXX") && \
+	  { cp "$(GRADLE_DIST)/$(GRADLE_ZIP)" "$$tmp" && chmod 644 "$$tmp" && \
+	    mv "$$tmp" ".gradle-dist/$(GRADLE_ZIP)"; } || { rm -f "$$tmp"; exit 1; }; \
 	  $(PODMAN) build -q -t $(IMAGE) . > /dev/null; }
 
 # A unique temporary name and a rename, so concurrent fetches into one GRADLE_DIST cannot

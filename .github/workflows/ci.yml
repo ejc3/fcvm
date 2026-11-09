@@ -361,6 +361,7 @@ jobs:
           bash scripts/phone/test-app-sh.sh
           bash scripts/phone/test-held-check.sh
           bash fleet/phone-app/test-build-apk.sh
+          bash fleet/phone-app/test-gradle-dist.sh
 
   # Plans which self-hosted jobs this run needs.
   #
