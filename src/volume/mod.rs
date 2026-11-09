@@ -588,9 +588,7 @@ mod tests {
     }
 
     /// `fcvm snapshot create` gets exactly the tables the VM's volume servers hold, a portable one's
-    /// and a plain one's, under the file names the restore path reads. The tables are captured
-    /// when the capture returns, before the paths are read: a plain volume's file that the guest
-    /// forgets in between, as a resumed guest does, is still in its table (#1684).
+    /// and a plain one's, under the file names the restore path reads.
     #[tokio::test]
     async fn inode_tables_round_trip_through_the_socket() {
         use fuse_pipe::{FilesystemHandler, VolumeRequest, VolumeResponse};
@@ -617,7 +615,7 @@ mod tests {
         ));
         let plain = Arc::new(fuse_pipe::PassthroughFs::for_volume(dir.path(), false));
         lookup(remap.as_ref());
-        let held = lookup(plain.as_ref());
+        lookup(plain.as_ref());
 
         let vsock = dir.path().join("vsock.sock");
         let server = spawn_inode_table_server(
@@ -635,13 +633,6 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        plain.handle_request_with_groups(
-            &VolumeRequest::Forget {
-                ino: held,
-                nlookup: 1,
-            },
-            &[],
-        );
         let files = tokio::task::spawn_blocking(move || captured.read())
             .await
             .unwrap()
@@ -660,6 +651,60 @@ mod tests {
                 "{name} does not name the file the guest held: {table}"
             );
         }
+    }
+
+    /// The capture returns only after the VM's server has captured the tables, and before it has
+    /// read them: the creator resumes the VM between the two (#1684).
+    #[tokio::test]
+    async fn the_capture_returns_after_the_capture_and_before_the_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let vsock = dir.path().join("vsock.sock");
+        let socket = inode_table_socket_path(&vsock);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let captured = Arc::new(AtomicBool::new(false));
+        let serialized = Arc::new(AtomicBool::new(false));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let server = tokio::spawn(serve_inode_tables(
+            listener,
+            socket,
+            {
+                let captured = Arc::clone(&captured);
+                move || captured.store(true, Ordering::SeqCst)
+            },
+            {
+                let serialized = Arc::clone(&serialized);
+                move |()| {
+                    released.lock().unwrap().recv().unwrap();
+                    serialized.store(true, Ordering::SeqCst);
+                    vec![("volume-5000-inode-table.json".to_string(), "{}".to_string())]
+                }
+            },
+        ));
+        let remote = {
+            let vsock = vsock.clone();
+            tokio::task::spawn_blocking(move || capture_remote_inode_tables(&vsock))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            captured.load(Ordering::SeqCst),
+            "returned before the capture"
+        );
+        assert!(
+            !serialized.load(Ordering::SeqCst),
+            "the tables were read before the capture returned"
+        );
+        release.send(()).unwrap();
+        let files = tokio::task::spawn_blocking(move || remote.read())
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        assert!(serialized.load(Ordering::SeqCst));
+        assert_eq!(files.len(), 1);
     }
 
     /// With no server, the fetch fails instead of returning no tables, so a snapshot of a VM with

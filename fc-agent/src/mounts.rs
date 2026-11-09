@@ -601,26 +601,37 @@ pub fn mount_extra_disks(
 /// (kernel/patches-arm64/0006-nfs-give-restored-clients-identities-of-their-own.vm.patch).
 const NFS_RENEW_IDENTITIES: &str = "/sys/fs/nfs/net/nfs_client/renew_identities";
 
-/// Give every NFSv4 client this guest holds a new identity and have it set up its opens and
-/// locks again under it (#1737).
+/// Give every NFSv4.0 client this guest holds (the version fc-agent mounts) a new identity and
+/// have it set up its opens and locks again under it (#1737).
 ///
 /// A restored guest's clients carry the snapshot's identity, and with it the client ID, opens
 /// and locks the server gave the snapshot's VM. A second clone of the same snapshot carries the
 /// same, and the server keeps one copy of that state: when one clone closed a file it held
 /// across the snapshot, the other clone's open of it was gone and its next write failed with
-/// EIO. The kernel appends a random salt to each client's owner identifier, takes a new client
-/// ID and re-opens each held file, so every clone holds its own opens.
-pub fn renew_nfs_client_identities() -> Result<()> {
-    std::fs::write(NFS_RENEW_IDENTITIES, "1")
+/// EIO. The kernel appends `salt` (and the next values, one per client) to each client's owner
+/// identifier, takes a new client ID and re-opens each held file, so every clone holds its own
+/// opens. The salt comes from the host, since twin clones resume with the same random state.
+pub fn renew_nfs_client_identities(salt: u32) -> Result<()> {
+    std::fs::write(NFS_RENEW_IDENTITIES, format!("{salt:08x}"))
         .with_context(|| format!("writing {NFS_RENEW_IDENTITIES}"))
 }
 
-/// Set this guest's NFSv4 client identity (the uuid in its co_ownerid) to a new one,
-/// for the NFS clients created after it.
-pub fn fresh_nfs_client_identity() -> Result<()> {
-    let uuid =
-        std::fs::read_to_string("/proc/sys/kernel/random/uuid").context("reading a new uuid")?;
-    std::fs::write("/sys/fs/nfs/net/nfs_client/identifier", uuid.trim())
+/// A salt for [`renew_nfs_client_identities`] from a restore epoch, the UUID the host gives
+/// each restore: its first eight hex digits, never 0.
+pub fn nfs_owner_salt(restore_epoch: &str) -> u32 {
+    let hex: String = restore_epoch
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    u32::from_str_radix(&hex, 16).unwrap_or(0).max(1)
+}
+
+/// Set this guest's NFSv4 client identity (the uniquifier in its co_ownerid) to `identity`, for
+/// the NFS clients created after it. A restore passes its epoch, which the host makes for each
+/// restore: twin clones resume with the same random state, so the guest cannot make its own.
+pub fn fresh_nfs_client_identity(identity: &str) -> Result<()> {
+    std::fs::write("/sys/fs/nfs/net/nfs_client/identifier", identity)
         .context("writing /sys/fs/nfs/net/nfs_client/identifier")?;
     Ok(())
 }

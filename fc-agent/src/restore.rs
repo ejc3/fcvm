@@ -315,6 +315,9 @@ fn round_timings(value: &mut serde_json::Value) {
     }
 }
 
+/// How long a restore waits for the kernel to give the snapshot's NFS clients new identities.
+const NFS_RENEW_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
@@ -624,10 +627,26 @@ pub async fn handle_clone_restore(
         // snapshot's identity and state, which a twin clone shares. Give them identities of
         // their own first, so each clone re-opens those files as its own (#1737). The salted
         // identities stay apart from the clients the remount below creates.
-        if let Err(error) = crate::mounts::renew_nfs_client_identities() {
+        // The kernel waits for each client's state manager to finish what it is doing, so
+        // the write runs off the async workers and the restore waits for it a bounded time.
+        let renewed = tokio::time::timeout(
+            NFS_RENEW_LIMIT,
+            tokio::task::spawn_blocking({
+                let salt = crate::mounts::nfs_owner_salt(restore_epoch);
+                move || crate::mounts::renew_nfs_client_identities(salt)
+            }),
+        )
+        .await;
+        let failure = match renewed {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(error))) => Some(format!("{error:#}")),
+            Ok(Err(error)) => Some(format!("the renewal task failed: {error}")),
+            Err(_) => Some(format!("no answer within {NFS_RENEW_LIMIT:?}")),
+        };
+        if let Some(failure) = failure {
             eprintln!(
                 "[fc-agent] WARNING: the NFS clients restored from the snapshot keep its identity, \
-                 shared with any other clone of it: {error:#}"
+                 shared with any other clone of it: {failure}"
             );
         }
         // Each share is remounted at the mount point of the mount the boot made, found by
@@ -658,7 +677,7 @@ pub async fn handle_clone_restore(
         // through the lazy unmount. So the shares are remounted at the other server
         // port (`nfs_remounts`), which every clone namespace forwards to the host's nfsd,
         // as it does the port the snapshot's mounts use.
-        if let Err(error) = crate::mounts::fresh_nfs_client_identity() {
+        if let Err(error) = crate::mounts::fresh_nfs_client_identity(restore_epoch) {
             eprintln!("[fc-agent] WARNING: could not give the clone its own NFS client identity: {error:#}");
         }
         // No mount record: the boot's check passed the mounts this restore reproduces.
@@ -924,11 +943,37 @@ mod restore_map_attribute_tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("handle_clone_restore does not call {needle}"))
         };
-        let renew = at("crate::mounts::renew_nfs_client_identities()");
+        let renew = at("crate::mounts::renew_nfs_client_identities");
         assert!(renew < at("\"-l\""), "renewed after the lazy unmount");
         assert!(
-            renew < at("crate::mounts::fresh_nfs_client_identity()"),
+            renew < at("crate::mounts::fresh_nfs_client_identity(restore_epoch)"),
             "renewed after the fresh identity"
+        );
+    }
+
+    /// Twin clones resume with the same random state, so the NFS owner salt and the fresh
+    /// identity come from the restore epoch the host makes for each restore, never from the
+    /// guest's own randomness (#1737).
+    #[test]
+    fn a_restore_takes_its_nfs_identities_from_the_host_epoch() {
+        let restore = super::handle_clone_restore_source();
+        assert!(
+            restore.contains("crate::mounts::nfs_owner_salt(restore_epoch)")
+                && restore.contains("crate::mounts::fresh_nfs_client_identity(restore_epoch)"),
+            "handle_clone_restore takes an NFS identity from somewhere other than its epoch"
+        );
+        assert_eq!(
+            crate::mounts::nfs_owner_salt("c321a28e-040d-4d74-8f3c-8e6ce04a3491"),
+            0xc321_a28e
+        );
+        assert_ne!(
+            crate::mounts::nfs_owner_salt("c321a28e-040d-4d74-8f3c-8e6ce04a3491"),
+            crate::mounts::nfs_owner_salt("9e02ebde-e8bf-4f3a-bf11-9e8a8134a12b"),
+        );
+        assert_eq!(
+            crate::mounts::nfs_owner_salt("00000000-0000-4000-8000-000000000000"),
+            1,
+            "a salt is never 0, which means no salt"
         );
     }
 

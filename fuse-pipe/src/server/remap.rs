@@ -1106,6 +1106,96 @@ mod tests {
         );
     }
 
+    /// A plain volume's table names an inode the guest forgot after the capture: the capture is
+    /// what the paused guest held, and a resumed guest forgets files at once (#1684).
+    ///
+    /// RED BEFORE THE FIX: the table listed the inodes held when it was read, after the resume,
+    /// and the clone's server answered "unknown inode" for the forgotten one.
+    #[test]
+    fn a_plain_volume_table_keeps_an_inode_forgotten_after_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("held"), b"H").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let held = source
+            .handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent: 1,
+                    name: b"held".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            )
+            .attr()
+            .unwrap()
+            .ino;
+        let captured = source.capture_inodes();
+        source.handle_request_with_groups(
+            &VolumeRequest::Forget {
+                ino: held,
+                nlookup: 1,
+            },
+            &[],
+        );
+        let table = source.inode_table(captured);
+
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &table,
+        );
+        let attr = clone.handle_request_with_groups(&VolumeRequest::Getattr { ino: held }, &[]);
+        assert!(
+            attr.attr().is_some(),
+            "getattr of the forgotten inode: {attr:?}, table {table}"
+        );
+    }
+
+    /// The path the kernel reports for a held file whose name was removed, while another link
+    /// keeps it, is "<name> (deleted)", which another file may have. The table must not send
+    /// the guest's inode to that file (#1684).
+    ///
+    /// RED BEFORE THE FIX: the table recorded "held (deleted)" as the held inode's path, and the
+    /// clone answered the guest's inode with the other file's attributes.
+    #[test]
+    fn a_removed_link_is_not_restored_as_the_file_that_took_its_reported_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("held"), b"H").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let held = source
+            .handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent: 1,
+                    name: b"held".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            )
+            .attr()
+            .unwrap()
+            .ino;
+        std::fs::hard_link(dir.path().join("held"), dir.path().join("alias")).unwrap();
+        std::fs::remove_file(dir.path().join("held")).unwrap();
+        std::fs::write(dir.path().join("held (deleted)"), b"O").unwrap();
+        let table = source.inode_table(source.capture_inodes());
+
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &table,
+        );
+        let attr = clone.handle_request_with_groups(&VolumeRequest::Getattr { ino: held }, &[]);
+        assert!(
+            attr.errno().is_some(),
+            "the held inode is served from another file: {attr:?}; table {table}"
+        );
+    }
+
     /// A restored server of a read-only volume reads with file handle 0. Its inner server answers
     /// OPEN with ENOSYS (zero-message open), so the guest kernel opens nothing and reads with handle
     /// 0; that is no handle at all, not one from before the snapshot to reopen. FLUSH with handle 0

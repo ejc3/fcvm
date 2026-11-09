@@ -482,8 +482,9 @@ impl PassthroughFs {
     /// The guest names files by the inode numbers this server gave it, and a server started for
     /// a clone gives out its own. The table lists each captured inode by the path it has now,
     /// and the highest handle given out, so the clone's server can resolve the guest's inodes by
-    /// path and reopen its handles. An inode whose file was deleted, or that now lies outside the
-    /// volume, is recorded as gone: a request on it is refused, never served from another file.
+    /// path and reopen its handles. An inode whose file was deleted, that now lies outside the
+    /// volume, or whose reported path leads to another inode, is recorded as gone: a request on
+    /// it is refused, never served from another file.
     pub fn inode_table(&self, captured: CapturedInodes) -> String {
         let mut paths = std::collections::BTreeMap::new();
         let mut gone = std::collections::BTreeMap::new();
@@ -496,16 +497,25 @@ impl PassthroughFs {
                 continue;
             }
             let path = self.inner.pinned_path(pinned);
-            let live = self
-                .inner
-                .pinned_stat(pinned)
-                .is_ok_and(|st| st.st_nlink > 0);
+            let stat = self.inner.pinned_stat(pinned);
             let relative = match (&root, &path) {
                 (Ok(root), Ok(path)) => path.strip_prefix(root).ok().and_then(|p| p.to_str()),
                 _ => None,
             };
+            // The path the kernel reports for a descriptor is only a name: an inode whose name
+            // was removed while another link keeps it reads "<name> (deleted)", which another
+            // file can have. The table names the inode only while that path still leads to it.
+            let names_the_inode = |relative: &str| {
+                let (Ok(root), Ok(stat)) = (&root, &stat) else {
+                    return false;
+                };
+                std::fs::symlink_metadata(root.join(relative)).is_ok_and(|found| {
+                    use std::os::unix::fs::MetadataExt;
+                    found.dev() == stat.st_dev && found.ino() == stat.st_ino && stat.st_nlink > 0
+                })
+            };
             match relative {
-                Some(relative) if live => {
+                Some(relative) if names_the_inode(relative) => {
                     paths.insert(ino, relative.to_string());
                 }
                 _ => {
