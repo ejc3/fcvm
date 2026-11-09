@@ -105,7 +105,7 @@ impl Drop for Relay {
 
 /// How many connections the relays of one call may hold at once: those relaying and
 /// those whose upstream dial is still in progress. Each holds two descriptors (fcvm
-/// raises RLIMIT_NOFILE to 65536 at startup) and a task. At the limit a relay stops
+/// raises RLIMIT_NOFILE to the hard limit, at least 65536, at startup) and a task. At the limit a relay stops
 /// accepting, so a new client waits in its listener's accept queue (capped by
 /// net.core.somaxconn), and once that is full the kernel stops answering its SYN and
 /// the client retries. A relay accepts again as soon as one of its connections ends.

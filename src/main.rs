@@ -6,18 +6,45 @@ use tracing::error;
 use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
-/// Raise file descriptor limit for high-parallelism workloads.
-/// The fuse-pipe server can have many open files when serving parallel tests.
+/// The file descriptor limits fcvm runs with, from the limits it was started with: both at the
+/// hard limit, and at least 65536 (which only a privileged process can raise a lower hard limit
+/// to).
+///
+/// A volume server holds one descriptor for every inode the guest holds on a `--map`, so the
+/// soft limit is how many files a guest can hold there: at 65536 a guest that looked up 100k
+/// files got EMFILE from the server. The hard limit is the most the host allows, and fcvm used to
+/// lower it to 65536 as well.
+fn nofile_limits(hard: libc::rlim_t) -> libc::rlim_t {
+    hard.max(65536)
+}
+
+/// Raise the file descriptor limit (see [`nofile_limits`]).
 fn raise_resource_limits() {
-    use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+    use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
 
-    let new_limit = rlimit {
-        rlim_cur: 65536,
-        rlim_max: 65536,
+    let mut current = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
-
-    let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_limit) };
-    if result != 0 {
+    // Safe: getrlimit only writes the struct it is given.
+    if unsafe { getrlimit(RLIMIT_NOFILE, &mut current) } != 0 {
+        current.rlim_max = 65536;
+    }
+    let target = nofile_limits(current.rlim_max);
+    let raised = rlimit {
+        rlim_cur: target,
+        rlim_max: target,
+    };
+    // Safe: setrlimit only reads the struct it is given.
+    if unsafe { setrlimit(RLIMIT_NOFILE, &raised) } == 0 {
+        return;
+    }
+    // Unprivileged with a hard limit below 65536: take the hard limit itself.
+    let soft_at_hard = rlimit {
+        rlim_cur: current.rlim_max,
+        rlim_max: current.rlim_max,
+    };
+    if unsafe { setrlimit(RLIMIT_NOFILE, &soft_at_hard) } != 0 {
         eprintln!(
             "[fcvm] warning: failed to raise RLIMIT_NOFILE: {}",
             std::io::Error::last_os_error()
@@ -171,4 +198,15 @@ async fn run() -> Result<()> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    /// fcvm runs at the host's hard descriptor limit, never below it: a guest holding more
+    /// than 65536 files on a `--map` needs that many descriptors in the volume server.
+    #[test]
+    fn the_descriptor_limit_is_the_hard_limit() {
+        assert_eq!(super::nofile_limits(1_048_576), 1_048_576);
+        assert_eq!(super::nofile_limits(4096), 65536);
+    }
 }
