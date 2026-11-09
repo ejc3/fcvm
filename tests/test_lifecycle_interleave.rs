@@ -3247,3 +3247,99 @@ async fn test_lifecycle_interleave_cloud_hypervisor_restore_never_recreates_a_so
 ) -> Result<()> {
     restore_never_recreates_the_source_dir("ilv-ch-recreated", "cloud-hypervisor").await
 }
+
+/// A create of a tag takes the tag's lock exclusively, and an export holds it shared until
+/// its last byte is written. The export here writes into a pipe nobody reads, so it stops
+/// mid-archive with the lock held: a create of the same tag waits, and it finishes once the
+/// pipe has been read to its end and the export has exited.
+#[tokio::test]
+async fn test_lifecycle_interleave_snapshot_create_waits_behind_an_export_of_the_tag() -> Result<()>
+{
+    use tokio::io::AsyncReadExt;
+
+    let (vm_name, _, snapshot, _) = common::unique_names("ilv-export");
+    let (mut vm, vm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+
+    let result = async {
+        common::poll_health_by_pid(vm_pid, 120).await?;
+        common::create_snapshot_by_pid(vm_pid, &snapshot).await?;
+
+        let mut export = tokio::process::Command::new(common::find_fcvm_binary()?);
+        export
+            .args(["snapshot", "export", &snapshot])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        common::set_test_pdeathsig(&mut export);
+        let mut export = export.spawn().context("spawning the export")?;
+        let mut archive = export.stdout.take().context("the export has no stdout")?;
+        // The first block of the archive: the export holds the lock and is writing. The
+        // memory image is far larger than the pipe and the export's buffer together, so
+        // the export cannot finish until the rest is read.
+        let mut first = [0u8; 512];
+        archive
+            .read_exact(&mut first)
+            .await
+            .context("reading the start of the archive")?;
+
+        let (mut create, _, create_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &vm_pid.to_string(),
+                "--tag",
+                &snapshot,
+            ],
+            &[],
+        )
+        .await?;
+        wait_for_marker(
+            &create_log,
+            "waiting for per-snapshot lock",
+            0,
+            Duration::from_secs(60),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        anyhow::ensure!(
+            create.try_wait()?.is_none(),
+            "the create finished while the export of its tag was still writing; log tail:\n{}",
+            log_tail(&create_log, 40)
+        );
+        anyhow::ensure!(
+            export.try_wait()?.is_none(),
+            "the export finished with its output unread, so it held no lock for the create \
+             to wait on"
+        );
+
+        tokio::io::copy(&mut archive, &mut tokio::io::sink())
+            .await
+            .context("reading the rest of the archive")?;
+        let exported = wait_exit(&mut export, Duration::from_secs(300)).await?;
+        anyhow::ensure!(exported.success(), "the export failed: {exported}");
+        let created = wait_exit(&mut create, Duration::from_secs(180)).await?;
+        anyhow::ensure!(
+            created.success(),
+            "the create that waited behind the export failed: {created}; log tail:\n{}",
+            log_tail(&create_log, 40)
+        );
+        Ok(())
+    }
+    .await;
+
+    sigterm(vm_pid).await;
+    let _ = wait_exit(&mut vm, Duration::from_secs(60)).await;
+    common::delete_snapshot(&snapshot).await.ok();
+    result
+}

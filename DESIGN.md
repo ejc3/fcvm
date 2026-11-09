@@ -50,6 +50,7 @@
    - `fcvm snapshot create`: Create snapshot from running VM
    - `fcvm snapshot serve`: Start UFFD memory server for cloning
    - `fcvm snapshot run`: Spawn clone from memory server
+   - `fcvm snapshot export`: Write a snapshot's directory as one archive
    - Lightning-fast clone startup (<1 second)
    - Serves guest memory through a UFFD page fault handler; clones share clean pages only in minor mode (`--uffd-mode minor`)
    - Creates independent VM with its own networking
@@ -1461,6 +1462,7 @@ One async session per connection:
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
+| `fcvm snapshot export` | Write a snapshot's directory as one archive |
 | `fcvm snapshots ls` | List stored snapshots (also: `delete <NAME>`, `prune`) |
 
 ### Key CLI Design Decisions
@@ -1688,6 +1690,52 @@ wait  # Lightning fast: all start in <1 second each
 ```bash
 fcvm snapshot ls
 ```
+
+#### `fcvm snapshot export`
+
+**Purpose**: Write one snapshot as an archive, to copy it to another host.
+
+```bash
+fcvm snapshot export <TAG> [--output <FILE>]
+
+# Over a pipe
+fcvm snapshot export nginx-warm | ssh other-host 'cat > nginx-warm.archive'
+```
+
+The archive is one pax tar stream that GNU tar lists and extracts
+(`src/storage/snapshot_archive.rs`): a manifest, every regular file of the snapshot's
+directory with its holes kept as holes, and a trailer of digests that a reader checks before
+it accepts the archive. The memory image is read from where the snapshot's config says it
+is, so a snapshot made with `--memory-dir` exports like any other. Lock files and
+temporaries are left out.
+
+- Without `--output` the archive goes to stdout, and a terminal is refused. With it, the
+  archive is written under a temporary name beside FILE and renamed over FILE once it is
+  whole and synced; the file is readable by its owner only, because it holds the guest's
+  memory. A FILE that exists and is not a regular file is refused, before the stream and
+  again before the rename.
+- The export holds the snapshot's lock shared until the last byte is written, as
+  `snapshot serve` does, so a `snapshot create` or a delete of the same tag waits for it. A
+  tag that ends in `.creating` or `.old` is refused: a create of the tag without the suffix
+  works in a directory of that name, under its own lock.
+- Firecracker snapshots only. A Cloud Hypervisor snapshot is refused.
+- What a restore reads outside the snapshot's directory is not in the archive. The manifest
+  lists, by path, what the snapshot's config records: the image disk, pmem images, mapped
+  directories, NFS shares and firmware. It cannot list a read-only `--disk` file outside the
+  VM's directory or a kernel profile's NVIDIA driver image, because a snapshot's config does
+  not record them; Firecracker reopens them from the paths in its VM state.
+- The manifest describes the Firecracker binary that is at the snapshot's recorded path when
+  the export runs (its `--version` output and SHA-256), not the binary as it was when the
+  snapshot was taken.
+- An export that fails while it streams writes no trailer, so what it wrote is not an
+  archive. With `--output`, a failure after the stream (the temporary's sync, the second
+  check of FILE, the rename) removes the temporary, and FILE keeps what it held. The
+  exception is a failed sync of FILE's directory
+  after the rename: FILE then holds the whole archive, and the error says so.
+- When the memory image has been written and no memory server or VM holds it in use, the
+  export asks the kernel to drop it from the page cache, as a memory server does for idle
+  snapshots when it starts. Every other file is dropped once it is written, so a large disk
+  does not hold the page cache while the memory image is read.
 
 #### `fcvm ls`
 

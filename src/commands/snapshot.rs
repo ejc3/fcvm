@@ -249,6 +249,9 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
         SnapshotCommands::Serve(serve_args) => cmd_snapshot_serve(serve_args).await,
         SnapshotCommands::Run(run_args) => cmd_snapshot_run(*run_args).await,
         SnapshotCommands::Ls => cmd_snapshot_ls().await,
+        SnapshotCommands::Export(export_args) => {
+            super::snapshot_export::cmd_snapshot_export(export_args).await
+        }
     }
 }
 

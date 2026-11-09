@@ -36,6 +36,11 @@
 //! (`firecracker::vm::VmManager::mark_memory_in_use`), so a relaunch after a guest reboot or
 //! a cold boot after a rejected load does not keep it.
 //!
+//! `snapshot export` reads a whole memory file through the page cache. It holds the mark
+//! while it reads, and when it has read the file it gives it back itself
+//! ([`release_unless_in_use`]): dropped at once unless a server or a VM holds the mark, not
+//! left for the next server that starts.
+//!
 //! A snapshot create works in two directories beside the snapshot it writes: `<tag>.creating`
 //! holds the next generation and `<tag>.old` the one it replaces. Its creator holds the tag's
 //! lock (`<tag>.lock`) exclusively, not a lock on their memory files, and a drop there would
@@ -66,7 +71,7 @@ use crate::storage::snapshot::SNAPSHOT_MEMORY_FILE as MEMORY_FILE;
 const STAGING_SUFFIXES: [&str; 2] = ["creating", "old"];
 
 /// The tag a directory named `name` would be the staging directory of, if any.
-fn staging_tag(name: &str) -> Option<&str> {
+pub(crate) fn staging_tag(name: &str) -> Option<&str> {
     STAGING_SUFFIXES
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix)?.strip_suffix('.'))
@@ -112,6 +117,39 @@ pub async fn mark_in_use(file: &File) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Ask the kernel to drop `file` from the page cache unless a reader holds it in use, which
+/// is what a release pass does to each memory file it finds. `Ok(true)` when the request was
+/// made, `Ok(false)` when a reader's mark refused it.
+///
+/// `file` may carry the caller's own mark, so a reader that has finished can give its file
+/// back: `flock` converts the lock of the one open file description, so the caller's shared
+/// lock does not refuse the exclusive one, and any other reader's does. The caller's mark is
+/// released on return, whatever the outcome.
+pub fn release_unless_in_use(file: &File) -> std::io::Result<bool> {
+    drop_unless_in_use(file, &mut |file| {
+        posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED)
+            .map_err(std::io::Error::from)
+    })
+}
+
+/// Hold `file` exclusively, without waiting, around one `advise` call: a reader's shared lock
+/// refuses it (`Ok(false)`), and while it is held a reader that starts waits in
+/// [`mark_in_use`]. No lock of this open file description is left behind.
+fn drop_unless_in_use(
+    file: &File,
+    advise: &mut dyn FnMut(&File) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let outcome = match fs2::FileExt::try_lock_exclusive(file) {
+        Ok(()) => advise(file).map(|()| true),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    };
+    // A refused conversion may or may not have dropped the lock it was converting
+    // (flock(2)), so the unlock is unconditional.
+    let _ = fs2::FileExt::unlock(file);
+    outcome
 }
 
 /// What one pass over the snapshot directory did.
@@ -187,23 +225,11 @@ fn release_with(
         };
         let outcome = match no_create {
             Err(error) => Err(error),
-            // Exclusive and without waiting: a reader's shared lock refuses it, and while
-            // this pass holds it a reader that starts waits in `mark_in_use`.
-            Ok(_no_create) => match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => {
-                    let outcome = advise(&file);
-                    let _ = fs2::FileExt::unlock(&file);
-                    outcome
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    done.in_use += 1;
-                    continue;
-                }
-                Err(error) => Err(error),
-            },
+            Ok(_no_create) => drop_unless_in_use(&file, &mut advise),
         };
         match outcome {
-            Ok(()) => done.released += 1,
+            Ok(true) => done.released += 1,
+            Ok(false) => done.in_use += 1,
             Err(error) => {
                 done.failed += 1;
                 if done.failed == 1 {
@@ -501,5 +527,42 @@ mod tests {
                 failed: 1
             }
         );
+    }
+
+    /// A reader that has finished gives its own file back (`release_unless_in_use`): the
+    /// file stays when another reader holds it and leaves the page cache when none does.
+    /// The reader's own mark never refuses the request and is gone afterwards either way.
+    #[tokio::test]
+    async fn a_finished_reader_drops_its_file_unless_another_reader_holds_it() {
+        let root = tempfile::tempdir_in(disk_dir()).unwrap();
+        let cached = cached_snapshot(root.path(), "read");
+        let path = root.path().join("read").join(MEMORY_FILE);
+        let finished = File::open(&path).unwrap();
+        mark_in_use(&finished).await.unwrap();
+        let other = File::open(&path).unwrap();
+        mark_in_use(&other).await.unwrap();
+        let before = resident_pages(&cached, 0, LEN);
+
+        assert!(!release_unless_in_use(&finished).unwrap());
+        assert_eq!(
+            resident_pages(&cached, 0, LEN),
+            before,
+            "a file another reader holds in use lost pages"
+        );
+
+        // The other reader is gone. `finished` is still open and its mark went with the
+        // refused request, or it would refuse this reader's request too.
+        drop(other);
+        let last = File::open(&path).unwrap();
+        mark_in_use(&last).await.unwrap();
+        assert!(release_unless_in_use(&last).unwrap());
+        assert_eq!(
+            resident_pages(&cached, 0, LEN),
+            0,
+            "a file no reader holds is still in the page cache"
+        );
+        let pass = File::open(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&pass)
+            .expect("a reader that gave its file back still holds its mark");
     }
 }

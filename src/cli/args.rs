@@ -22,7 +22,7 @@ pub enum Commands {
     Ls(LsArgs),
     /// Podman-compatible container operations
     Podman(Box<PodmanArgs>),
-    /// Snapshot operations (create, serve, run)
+    /// Snapshot operations (create, serve, run, export)
     Snapshot(SnapshotArgs),
     /// Manage stored snapshots (list, delete, prune)
     Snapshots(SnapshotsArgs),
@@ -1385,6 +1385,20 @@ pub enum SnapshotCommands {
     Run(Box<SnapshotRunArgs>),
     /// List running snapshot servers
     Ls,
+    /// Write a snapshot as one archive, to a file or to stdout
+    Export(SnapshotExportArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotExportArgs {
+    /// Snapshot name to export
+    pub tag: String,
+
+    /// Write the archive to FILE, which is replaced only once the whole archive is written
+    /// and synced, and is readable by its owner alone (it holds the guest's memory). Without
+    /// this the archive goes to stdout, which must not be a terminal.
+    #[arg(long, value_name = "FILE")]
+    pub output: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
