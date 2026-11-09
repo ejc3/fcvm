@@ -8843,6 +8843,17 @@ mod tests {
                 ],
             );
         }
+        // The boundary times the guest's pause; the tables' paths are read after the resume, so
+        // their read is timed apart (a pbox run once charged 3.6 s of path reading to resume_ms).
+        assert_in_order(
+            "create_snapshot_core",
+            body_of(source, "pub async fn create_snapshot_core("),
+            &[
+                "boundary.resume_ms = boundary.lap(boundary_started);",
+                "\"snapshot boundary timings\"",
+                "read_extra_files(extra_files_reader)",
+            ],
+        );
         assert_in_order(
             "publish_snapshot_dir",
             body_of(source, "async fn publish_snapshot_dir("),
