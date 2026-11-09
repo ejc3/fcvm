@@ -2543,9 +2543,10 @@ fn every_x86_guest_kernel_pins_a_release_with_the_async_pf_nmi_fix() {
 /// RTNL from a bridge's uninit, so a namespace teardown that removes many bridges holds RTNL for
 /// one rcu_barrier per bridge and every namespace creation on the host waits behind it (#1563:
 /// 1.5 s with 100 rootless clones torn down on a fleet host, 4 to 6 s on a CI runner). Linux
-/// removed the barrier in 25ae123db10b, which 6.18.60 carries as 39679927fa7a. fcvm carried it as a
-/// host patch until the pin reached 6.18.60, so every host kernel fcvm builds has to pin 6.18.60 or
-/// later, and none may carry the old patch, which no longer applies.
+/// removed the barrier in 25ae123db10b (v7.2-rc1), which 6.18.60 carries as 39679927fa7a. fcvm
+/// carried it as a host patch until the pin reached 6.18.60, so every host kernel fcvm builds has to
+/// pin 6.18.60 or a later 6.18 release, or 7.2 or later, and none may carry the old patch, which no
+/// longer applies.
 #[test]
 fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
     const OLD_FIX: &str = " \tcancel_work_sync(&br->mcast_gc_work);\n-\n-\trcu_barrier();\n }";
@@ -2560,11 +2561,19 @@ fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
             };
             let name = format!("{profile_name}.{arch}");
             let version = host["kernel_version"].as_str().unwrap();
-            let release = version
-                .strip_prefix("6.18.")
-                .and_then(|release| release.parse::<u32>().ok());
-            if release.is_none_or(|release| release < 60) {
-                wrong.push(format!("{name} pins {version}, before 6.18.60"));
+            let parts: Vec<u32> = version
+                .split('.')
+                .map(|part| part.parse().unwrap_or(0))
+                .collect();
+            let without_barrier = match parts[..] {
+                [6, 18, release, ..] => release >= 60,
+                [major, minor, ..] => (major, minor) >= (7, 2),
+                _ => false,
+            };
+            if !without_barrier {
+                wrong.push(format!(
+                    "{name} pins {version}, which still calls rcu_barrier() in br_multicast_dev_del()"
+                ));
             }
             if let Some(dir) = host.get("patches_dir").and_then(|dir| dir.as_str()) {
                 for patch in applied_patches(&root, dir) {

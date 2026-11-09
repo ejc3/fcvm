@@ -321,13 +321,17 @@ fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, Str
 
 /// These profiles are user-deployable, so they must pin a kernel that is both
 /// kernel.org-supported and actually works as an NV2 L1. Linux 7.0.14 reached
-/// EOL on 2026-06-27. Worse, every 7.x kernel probed to date (7.0.14, 7.1.7,
-/// 7.1.8) wedges nested guests: the L2 kernel boots and stays scheduled, but
-/// its userspace freezes at the first burst of virtio-blk reads against the
-/// FUSE-backed root disk, while the same test is green on 6.18.x with every
-/// other variable held fixed (same host kernel, same Firecracker, same box).
-/// Until a fixed 7.x release is verified, the pin stays on the 6.18 longterm
-/// line.
+/// EOL on 2026-06-27. The 7.x guests probed on 6.18 hosts (7.0.14, 7.1.7,
+/// 7.1.8) wedge nested guests: the L2 kernel boots and stays scheduled, but its
+/// userspace freezes at the first burst of virtio-blk reads against the
+/// FUSE-backed root disk. #659 found the condition is an L1 guest kernel newer
+/// than its L0 host: from 6.19 the guest's vGIC stops clearing ICH_HCR_EL2.UIE
+/// on fold (438e47b6) and keeps active interrupts out of the list registers
+/// (05984ba6), which a 6.18 host does not emulate. On one c8g.metal, host 7.3.1
+/// with guest 7.3.1 passed 15 of 15 nested checks and host 7.3.1 with guest
+/// 6.18.60 passed 9 of 9, while host 6.18.60 with any guest from 6.19 wedged.
+/// So the arm64 nested host kernel moves to 7.3.3 first, and the guests stay on
+/// the 6.18 longterm line until the hosts that run them are on 7.3.
 ///
 /// Within that line the pin has a floor.
 ///
@@ -339,9 +343,9 @@ fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, Str
 /// worker among them, no CPU for as long as the flood lasts.
 /// `tests/test_exec_flood.rs` holds the behaviour.
 ///
-/// The exact pin is 6.18.60. The arm64 patches that touch
+/// The exact guest pin is 6.18.60. The arm64 patches that touch
 /// `arch/arm64/kvm/nested.c` are verified against excerpts of the pinned
-/// release (`tests/fixtures/vncr/`, `tests/fixtures/nv2-s2-tracking/`), and
+/// release (`tests/fixtures/vncr/`, `tests/fixtures/nv2-s2-tracking-<series>/`), and
 /// each fixture's test fails when its header names another release, so a pin
 /// move has to cut them again. 6.18.52 took upstream's VNCR fixmap fix
 /// (5949004d7032 and two follow-ups), which replaced the patch fcvm carried for
@@ -392,11 +396,19 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         );
     }
 
+    let host = "kernel_profiles.nested.arm64.host_kernel";
+    assert!(
+        toml_section(&config, host)
+            .lines()
+            .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
+        "[{host}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest wedges L2 \
+         (#659), and 7.3.1 hosts passed every nested check with 7.3.1 and 6.18.60 guests"
+    );
+
     for profile in [
         "kernel_profiles.default.arm64",
         "kernel_profiles.default.amd64",
         "kernel_profiles.nested.arm64",
-        "kernel_profiles.nested.arm64.host_kernel",
         "kernel_profiles.nested.amd64",
         "kernel_profiles.nested.amd64.host_kernel",
         "kernel_profiles.btrfs.arm64",

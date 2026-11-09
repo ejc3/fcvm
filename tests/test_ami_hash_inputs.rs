@@ -369,7 +369,8 @@ fn make_fixture() -> tempfile::TempDir {
          [kernel_profiles.btrfs.arm64]\n\
          kernel_version = \"6.16.1\"\n\
          [kernel_profiles.nested.arm64.host_kernel]\n\
-         kernel_version = \"6.18.3\"\n",
+         kernel_version = \"6.18.3\"\n\
+         patches_dir = \"kernel/patches-arm64\"\n",
     );
     w("scripts/build-passt.sh", "#!/bin/sh\n");
     // A carried passt patch: build-ami.sh folds scripts/passt-*.patch into the
@@ -430,6 +431,47 @@ fn ami_hash_changes_when_a_host_kernel_patch_changes() {
              shipping a host kernel without the DSB cache-coherency fix."
         );
     }
+}
+
+/// The host kernel can carry its own patch set (#659: 7.3 host patches in
+/// `kernel/patches-arm64-host` under 6.18 guests patched from
+/// `kernel/patches-arm64`). The key must read the directory the host table
+/// names: a host patch must move it, and a guest-only patch must not.
+#[test]
+fn ami_hash_reads_the_host_kernels_own_patches_dir() {
+    let fx = make_fixture();
+    let cfg = fx.path().join("rootfs-config.toml");
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        original.replace("kernel/patches-arm64\"", "kernel/patches-arm64-host\""),
+    )
+    .unwrap();
+    let host = fx.path().join("kernel/patches-arm64-host");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::write(host.join("0001-fuse.patch"), "fuse patch for 7.3\n").unwrap();
+    let base = run_compute_hash(fx.path());
+
+    let host_patch = host.join("0001-fuse.patch");
+    std::fs::write(&host_patch, "fuse patch for 7.3\nMUTATED\n").unwrap();
+    let host_mutated = run_compute_hash(fx.path());
+    std::fs::write(&host_patch, "fuse patch for 7.3\n").unwrap();
+    assert_ne!(
+        base, host_mutated,
+        "editing a patch in the host kernel's patches_dir left the AMI hash at {base}, so \
+         build-ami.sh would reuse an image built from the old host patch"
+    );
+
+    let guest_patch = fx
+        .path()
+        .join("kernel/patches-arm64/nv2-vsock-cache-sync.patch");
+    std::fs::write(&guest_patch, "dsb sy\nMUTATED\n").unwrap();
+    let guest_mutated = run_compute_hash(fx.path());
+    assert_eq!(
+        base, guest_mutated,
+        "editing a patch outside the host kernel's patches_dir moved the AMI hash, so a guest \
+         patch change rebuilds the runner image for a host kernel it does not touch"
+    );
 }
 
 /// Bumping the host kernel version must move the hash.
