@@ -8,3 +8,4 @@ playwright-report/
 *.tsbuildinfo
 next-env.d.ts
 .wrangler/
+
