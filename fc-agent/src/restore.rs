@@ -620,6 +620,16 @@ pub async fn handle_clone_restore(
             "[fc-agent] remounting {} NFS share(s) after restore",
             mounted_nfs.len()
         );
+        // The snapshot's clients keep the files the restored workload holds open, with the
+        // snapshot's identity and state, which a twin clone shares. Give them identities of
+        // their own first, so each clone re-opens those files as its own (#1737). The salted
+        // identities stay apart from the clients the remount below creates.
+        if let Err(error) = crate::mounts::renew_nfs_client_identities() {
+            eprintln!(
+                "[fc-agent] WARNING: the NFS clients restored from the snapshot keep its identity, \
+                 shared with any other clone of it: {error:#}"
+            );
+        }
         // Each share is remounted at the mount point of the mount the boot made, found by
         // its mount ID, not by resolving its guest path again (#1086).
         let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
@@ -903,6 +913,25 @@ mod restore_map_attribute_tests {
     /// else, so a clone reads a file the host rewrote since the snapshot (#1049). Without it
     /// test_read_only_map_reads_a_rewrite_that_keeps_size_and_mtime read the old bytes in a
     /// clone that looked within the attribute timeout it inherited.
+    /// The snapshot's NFS clients get identities of their own before the shares are unmounted
+    /// and mounted again under the clone's fresh identity (#1737): the clients still exist
+    /// then, and the remount's new clients are not renewed for nothing.
+    #[test]
+    fn a_restore_renews_the_snapshots_nfs_clients_before_the_remount() {
+        let restore = super::handle_clone_restore_source();
+        let at = |needle: &str| {
+            restore
+                .find(needle)
+                .unwrap_or_else(|| panic!("handle_clone_restore does not call {needle}"))
+        };
+        let renew = at("crate::mounts::renew_nfs_client_identities()");
+        assert!(renew < at("\"-l\""), "renewed after the lazy unmount");
+        assert!(
+            renew < at("crate::mounts::fresh_nfs_client_identity()"),
+            "renewed after the fresh identity"
+        );
+    }
+
     #[test]
     fn a_restore_drops_the_mapped_files_cached_attributes() {
         let restore = super::handle_clone_restore_source();

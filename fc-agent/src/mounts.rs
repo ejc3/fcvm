@@ -597,6 +597,24 @@ pub fn mount_extra_disks(
     Ok(mounted_paths)
 }
 
+/// Where the guest kernel takes the request to give every NFSv4 client a new identity
+/// (kernel/patches-arm64/0006-nfs-give-restored-clients-identities-of-their-own.vm.patch).
+const NFS_RENEW_IDENTITIES: &str = "/sys/fs/nfs/net/nfs_client/renew_identities";
+
+/// Give every NFSv4 client this guest holds a new identity and have it set up its opens and
+/// locks again under it (#1737).
+///
+/// A restored guest's clients carry the snapshot's identity, and with it the client ID, opens
+/// and locks the server gave the snapshot's VM. A second clone of the same snapshot carries the
+/// same, and the server keeps one copy of that state: when one clone closed a file it held
+/// across the snapshot, the other clone's open of it was gone and its next write failed with
+/// EIO. The kernel appends a random salt to each client's owner identifier, takes a new client
+/// ID and re-opens each held file, so every clone holds its own opens.
+pub fn renew_nfs_client_identities() -> Result<()> {
+    std::fs::write(NFS_RENEW_IDENTITIES, "1")
+        .with_context(|| format!("writing {NFS_RENEW_IDENTITIES}"))
+}
+
 /// Set this guest's NFSv4 client identity (the uuid in its co_ownerid) to a new one,
 /// for the NFS clients created after it.
 pub fn fresh_nfs_client_identity() -> Result<()> {

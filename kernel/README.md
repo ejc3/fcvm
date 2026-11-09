@@ -48,6 +48,15 @@ at the old size (#1041). The patch keeps them only while the file is open for wr
 Every guest patch directory links it; the nested ones link it as a `.vm.patch`, so the
 host kernel built from the same directory does not apply it.
 
+The nested profiles, the only ones with an NFS client, also apply
+`kernel/patches-arm64/0006-nfs-give-restored-clients-identities-of-their-own.vm.patch`
+(linked from `kernel/patches-x86`). Two clones restored from one snapshot hold the
+snapshot's NFSv4 clients, identity and server state included, and the server keeps one copy
+of that state: when one clone closed a file it held across the snapshot, the other's next
+write to it failed with EIO (#1737). Writing `/sys/fs/nfs/net/nfs_client/renew_identities`,
+which fc-agent does in every restore, gives each client a random salt on its owner identifier,
+a new client ID and its opens and locks again under it. Linux has no such interface.
+
 x86 patches live in `kernel/patches-default-x86`, which the x86 default profile
 applies in place of `kernel/patches-default` and which links the shared patches.
 `kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for the btrfs and
