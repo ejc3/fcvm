@@ -48,7 +48,10 @@ fi
 # first_frame_at_ms is the wall clock (ms since the epoch), which the restore record compares
 # with the host's; first_frame_ms is an interval on the monotonic clock.
 at=$(sed -n 's/.*first_frame_at_ms=\([0-9]*\).*/\1/p' "$dir/out" | tail -1)
-if [ -n "$at" ] && [ $(( $(date +%s%3N) - at )) -ge 0 ] && [ $(( $(date +%s%3N) - at )) -lt 60000 ]; then
+# Within a minute either way, so a wall-clock step meanwhile does not fail it; an uptime is
+# decades away.
+d=$(( $(date +%s%3N) - ${at:-0} )); d=${d#-}
+if [ -n "$at" ] && [ "$d" -lt 60000 ]; then
   ok "first_frame_at_ms is the wall clock"
 else
   bad "first_frame_at_ms is not the wall clock: '$at', now $(date +%s%3N)"
