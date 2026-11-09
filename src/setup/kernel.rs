@@ -1516,12 +1516,47 @@ fn compute_host_kernel_sha(config: &HostKernelConfig, repo_root: &Path) -> Resul
     Ok(compute_sha256_short(&content))
 }
 
+/// Run a host kernel build in `tree`, then `install` the package it built, and remove the
+/// tree whatever the outcome. The tree is this install's own, so no other install can be
+/// compiling in it, and a later install builds a fresh tree rather than reuse this one's debs.
+async fn run_host_kernel_install<F, Fut>(
+    mut cmd: Command,
+    tree: &BuildTree,
+    install: F,
+) -> Result<()>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    cmd.env("BUILD_DIR", tree.path());
+    let result = async {
+        let status = run_streaming(cmd, "host_kernel_build")
+            .await
+            .context("running host kernel build script")?;
+        if !status.success() {
+            bail!(
+                "Host kernel build failed with exit code: {:?}",
+                status.code()
+            );
+        }
+        install(tree.path().to_path_buf()).await
+    }
+    .await;
+    if let BuildTree::Owned { path, .. } = tree {
+        if remove_kernel_build_dir(path).await {
+            let _ = tokio::fs::remove_file(build_tree_owner(path)).await;
+        }
+    }
+    result
+}
+
 /// Environment variable naming the host kernel build directory.
 /// `scripts/check-host-kernel-build.sh` (run by `make install-host-kernel`)
 /// picks it: a directory on the scratch disk when `/tmp` is on the root disk.
 const HOST_KERNEL_BUILD_DIR_ENV: &str = "FCVM_HOST_KERNEL_BUILD_DIR";
 
-/// Where the host kernel is built when nothing names a directory.
+/// The directory host kernel builds make their trees in, when nothing names one. Each install
+/// builds in a tree of its own beneath it, `kernel-build-host-<sha>-<id>`.
 const DEFAULT_HOST_KERNEL_BUILD_DIR: &str = "/tmp/kernel-build-host";
 
 /// The build directory, made absolute: the build script changes into it before it changes
@@ -1565,6 +1600,12 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
              Host kernel builds require the fcvm git repository."
         )
     })?;
+
+    // Reclaim the trees of installs killed part way, on every path, the installed one too.
+    let build_base = host_kernel_build_dir();
+    std::fs::create_dir_all(&build_base)
+        .with_context(|| format!("creating {}", build_base.display()))?;
+    reclaim_abandoned_build_trees(&build_base);
 
     // Compute SHA from build inputs
     let sha = compute_host_kernel_sha(host_config, &repo_root)?;
@@ -1615,67 +1656,59 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Stays root by design: this interactive EC2 flow pairs the build with
     // dpkg -i and update-grub, which require root anyway.
-    let build_dir = host_kernel_build_dir();
-    let mut cmd = Command::new(&script_path);
-    cmd.env("BUILD_DIR", &build_dir);
-    let status = run_streaming(cmd, "host_kernel_build")
-        .await
-        .context("running host kernel build script")?;
+    let tree = BuildTree::for_build_in(&build_base, None, "host", &sha)?;
+    let expected_pkg_ref = &expected_pkg;
+    let result =
+        run_host_kernel_install(Command::new(&script_path), &tree, |build_dir| async move {
+            let expected_pkg = expected_pkg_ref;
+            // Find the linux-image deb for THIS build (exclude dbg packages).
+            let pattern = format!("{}/{}_*.deb", build_dir.display(), expected_pkg);
+            let debs: Vec<_> = glob::glob(&pattern)
+                .context("globbing for deb files")?
+                .filter_map(|r| r.ok())
+                .filter(|p| !p.to_string_lossy().contains("-dbg"))
+                .collect();
+
+            if debs.is_empty() {
+                bail!(
+                    "No {} deb found in {} after build",
+                    expected_pkg,
+                    build_dir.display()
+                );
+            }
+
+            let deb_path = &debs[0];
+            println!("  → Installing {}", deb_path.display());
+
+            // Install deb package
+            let output = Command::new("dpkg")
+                .args(["-i"])
+                .arg(deb_path)
+                .output()
+                .await
+                .context("running dpkg -i")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("dpkg -i failed: {}", stderr);
+            }
+
+            // Extract kernel name from deb filename for GRUB config
+            // e.g., linux-image-6.18.3-fcvm-abc123_6.18.3-1_arm64.deb -> 6.18.3-fcvm-abc123
+            let deb_name = deb_path.file_name().unwrap().to_string_lossy();
+            let kernel_name = deb_name
+                .strip_prefix("linux-image-")
+                .and_then(|s| s.split('_').next())
+                .unwrap_or("unknown");
+
+            // Update GRUB with boot args
+            update_grub_config(kernel_name, boot_args).await
+        })
+        .await;
 
     // Clean up script
     let _ = std::fs::remove_file(&script_path);
-
-    if !status.success() {
-        bail!(
-            "Host kernel build failed with exit code: {:?}",
-            status.code()
-        );
-    }
-
-    // Find the linux-image deb for THIS build (exclude dbg packages). The build
-    // dir is shared across builds and may still hold debs from older SHAs, so
-    // filter by the expected package name instead of taking any linux-image-*.deb.
-    let pattern = format!("{}/{}_*.deb", build_dir.display(), expected_pkg);
-    let debs: Vec<_> = glob::glob(&pattern)
-        .context("globbing for deb files")?
-        .filter_map(|r| r.ok())
-        .filter(|p| !p.to_string_lossy().contains("-dbg"))
-        .collect();
-
-    if debs.is_empty() {
-        bail!(
-            "No {} deb found in {} after build",
-            expected_pkg,
-            build_dir.display()
-        );
-    }
-
-    let deb_path = &debs[0];
-    println!("  → Installing {}", deb_path.display());
-
-    // Install deb package
-    let output = Command::new("dpkg")
-        .args(["-i"])
-        .arg(deb_path)
-        .output()
-        .await
-        .context("running dpkg -i")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("dpkg -i failed: {}", stderr);
-    }
-
-    // Extract kernel name from deb filename for GRUB config
-    // e.g., linux-image-6.18.3-fcvm-abc123_6.18.3-1_arm64.deb -> 6.18.3-fcvm-abc123
-    let deb_name = deb_path.file_name().unwrap().to_string_lossy();
-    let kernel_name = deb_name
-        .strip_prefix("linux-image-")
-        .and_then(|s| s.split('_').next())
-        .unwrap_or("unknown");
-
-    // Update GRUB with boot args
-    update_grub_config(kernel_name, boot_args).await?;
+    result?;
 
     println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
@@ -3386,6 +3419,71 @@ mod tests {
                 build_dir.display()
             );
         }
+    }
+
+    /// `install-host-kernel` left its build tree (the kernel source, every object and the
+    /// debs, about 20 GiB) in one fixed directory after every build. Each install now builds
+    /// in a tree of its own and removes it whether the build, the install or neither failed,
+    /// and an install killed part way leaves a tree the next one reclaims.
+    #[tokio::test]
+    async fn a_host_kernel_install_removes_its_build_tree_whatever_the_outcome() {
+        let base = tempfile::tempdir().unwrap();
+        let sha = "0123456789ab";
+        for (exit, install_ok, name) in [
+            (0, true, "installed"),
+            (0, false, "install failed"),
+            (1, true, "build failed"),
+        ] {
+            let script = base.path().join("build.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh
+mkdir -p \"$BUILD_DIR/linux-x\"\n\
+                     head -c 4096 /dev/zero > \"$BUILD_DIR/linux-x/vmlinux.o\"\n\
+                     : > \"$BUILD_DIR/linux-image-x_1_arm64.deb\"\nexit {exit}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tree = BuildTree::for_build_in(base.path(), None, "host", sha).unwrap();
+            let path = tree.path().to_path_buf();
+            let result = run_host_kernel_install(Command::new(&script), &tree, |dir| async move {
+                assert!(
+                    dir.join("linux-image-x_1_arm64.deb").exists(),
+                    "the install did not get the build's tree"
+                );
+                if install_ok {
+                    Ok(())
+                } else {
+                    bail!("dpkg -i failed")
+                }
+            })
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                exit == 0 && install_ok,
+                "{name}: wrong outcome {result:?}"
+            );
+            assert!(
+                !path.exists() && !build_tree_owner(&path).exists(),
+                "the {name} install left its tree or owner file at {}",
+                path.display()
+            );
+        }
+
+        // An install killed part way: its tree stays, and nothing holds the owner lock.
+        let killed = match BuildTree::for_build_in(base.path(), None, "host", sha).unwrap() {
+            BuildTree::Owned { path, .. } => path,
+            BuildTree::Caller(_) => unreachable!("no caller directory was given"),
+        };
+        std::fs::create_dir_all(killed.join("linux-x")).unwrap();
+        let next = BuildTree::for_build_in(base.path(), None, "host", sha).unwrap();
+        assert!(
+            !killed.exists() && !build_tree_owner(&killed).exists(),
+            "the next install did not reclaim the tree of one killed part way"
+        );
+        assert!(next.path().starts_with(base.path()));
     }
 
     /// `install-host-kernel` on a box where the package is already installed (a host

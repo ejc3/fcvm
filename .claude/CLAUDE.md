@@ -1192,17 +1192,22 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
-- **Host kernel**: 6.18+ with `kvm-arm.mode=nested`, built from `kernel/patches-arm64`
+- **Host kernel**: 7.3.3 with `kvm-arm.mode=nested`, built from `kernel/patches-arm64-host`.
+  The host must not be older than the L1 guest kernel: a 6.19 or later L1 on a 6.18 host
+  wedges L2 (#659)
 - **Nested kernel**: Custom kernel with CONFIG_KVM=y (use `--kernel-profile nested`)
 
 ### Host Kernel
 
 **Install host kernel**: `make install-host-kernel` (builds kernel, installs to /boot, updates GRUB).
-Patches from `kernel/patches-arm64/` are applied automatically during the build.
+Patches from `kernel/patches-arm64-host/` are applied automatically during the build. The
+6.18 nested guest kernel takes `kernel/patches-arm64/`.
 
-**Current patches** (all apply to both host and guest kernels, except `.vm.patch`, guest only):
-- `nv2-targeted-shadow-s2-unmap.patch`: backport of upstream e6084aecaeef and its series, so an
-  MMU notifier invalidation unmaps only the shadow stage-2 mappings of the invalidated range (#1274)
+**Current patches**:
+- `nv2-targeted-shadow-s2-unmap.patch` (both sets): upstream e6084aecaeef and its series, so an
+  MMU notifier invalidation unmaps only the shadow stage-2 mappings of the invalidated range
+  (#1274). The host set cherry-picks the v7.4-rc1 series onto 7.3.3 and adds one record per
+  shadow block; the guest set is the 6.18 backport
 - `mmfr4-override.vm.patch`: ID register override for recursive nesting (guest only)
 
 **VM Graceful Shutdown (PSCI)**:
@@ -1414,14 +1419,16 @@ userfaultfd, of file-backed memory, and of a memory file it overwrites in place.
 zero-page pages across one snapshot.
 
 **Targeted shadow stage-2 unmap (#1274).** `kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch`
-backports upstream e6084aecaeef and its series to the 6.18 host and nested kernels: KVM records
+backports upstream e6084aecaeef and its series to the 6.18 nested kernel, and
+`kernel/patches-arm64-host/` carries the 7.3 port for the host: KVM records
 each shadow mapping's canonical and nested IPA ranges, and an MMU-notifier invalidation unmaps
 only the shadow mappings that overlap the invalidated canonical range. With the host compacting
 memory every second, `test_nested_l2_with_large_files` passed in 32 s on the patched host
 (206,243 invalidations, none through `kvm_nested_s2_unmap`); on the unpatched host its first try
 failed after 849 s. The hand port's differences from upstream are in the patch description;
 `nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range`
-(tests/test_kernel_patch_invariants.rs) runs the patched 6.18 functions in a C harness. CI
+(tests/test_kernel_patch_invariants.rs) runs each pinned kernel's patched functions in a C
+harness, against excerpts in `tests/fixtures/nv2-s2-tracking-<series>/`. CI
 runners get the patched host kernel only from a runner AMI built after the patch reaches main.
 
 **Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on

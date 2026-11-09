@@ -105,16 +105,32 @@ compute_hash() {
   # symlink produced a valid-looking hash computed over FEWER inputs. That is the
   # stale-AMI bug this function exists to prevent, wearing a different hat:
   # check_existing_ami would match an image built from a different kernel.
+  # The host kernel's patch set is the patches_dir its own table names (#659: the 7.3
+  # host builds from kernel/patches-arm64-host while 6.18 guests build from
+  # kernel/patches-arm64), so read it from that table rather than assume a directory.
+  local host_patches_dir
+  if ! host_patches_dir=$(awk '
+      /^\[/ { in_section = ($0 == "[kernel_profiles.nested.arm64.host_kernel]") }
+      in_section && /^patches_dir[[:space:]]*=/ {
+        v = $0; sub(/^[^=]*=[[:space:]]*"/, "", v); sub(/".*$/, "", v); print v; found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$repo_root/rootfs-config.toml") || [ -z "$host_patches_dir" ]; then
+    echo "ERROR: [kernel_profiles.nested.arm64.host_kernel] has no patches_dir;" >&2
+    echo "       the AMI cache key cannot find the host kernel's patches." >&2
+    return 1
+  fi
+
   local -a host_patches=()
   local p
   shopt -s nullglob
-  for p in "$KERNEL_DIR/patches-arm64/"*.patch; do
+  for p in "$repo_root/$host_patches_dir/"*.patch; do
     case "$p" in *.vm.patch) continue ;; esac
     host_patches+=("$p")
   done
   shopt -u nullglob
   if [ ${#host_patches[@]} -eq 0 ]; then
-    echo "ERROR: no host-kernel patches matched $KERNEL_DIR/patches-arm64/*.patch;" >&2
+    echo "ERROR: no host-kernel patches matched $repo_root/$host_patches_dir/*.patch;" >&2
     echo "       the AMI cache key would silently omit them." >&2
     return 1
   fi
@@ -171,9 +187,8 @@ compute_hash() {
 
   {
     cat "$KERNEL_DIR/nested.conf"
-    # The HOST kernel baked into this AMI is built from the arm64 patch set —
-    # [kernel_profiles.nested.arm64.host_kernel] build_inputs is
-    # "kernel/patches-arm64/*.patch" — NOT kernel/patches. Most of the files
+    # The HOST kernel baked into this AMI is built from the patches_dir of
+    # [kernel_profiles.nested.arm64.host_kernel], NOT kernel/patches. Most of the files
     # there were never in kernel/patches (the NV2 and debug patches of the time),
     # so they were invisible to this hash, so changing one produced an identical AMI hash and the
     # builder reused a stale image carrying the OLD host kernel.
