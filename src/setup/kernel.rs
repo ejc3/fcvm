@@ -1168,22 +1168,12 @@ async fn run_kernel_build(
     status
 }
 
-/// Remove one host kernel build's entries from the shared host build dir: its source tree
-/// `linux-<version>` and every file named for its release (`<version>-fcvm-<sha>`: the
-/// packages, .buildinfo and .changes). Other builds' entries stay.
-async fn remove_host_build_entries(build_dir: &Path, kernel_version: &str, release: &str) {
-    remove_kernel_build_dir(&build_dir.join(format!("linux-{kernel_version}"))).await;
-    let Ok(mut entries) = tokio::fs::read_dir(build_dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().contains(release) {
-            let path = entry.path();
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!(path = %path.display(), error = %e, "could not remove host kernel build file");
-            }
-        }
-    }
+/// The build tree of one host kernel release: a subdirectory of the host build dir named
+/// for the release (`<version>-fcvm-<sha>`). Builds of other releases, including other SHAs
+/// of the same version, have trees of their own, so removing this one never touches them,
+/// and a retry of the same release still finds its packages ("Deb already built").
+fn host_kernel_release_tree(base: &Path, release: &str) -> PathBuf {
+    base.join(release)
 }
 
 async fn build_kernel_locally(
@@ -1574,6 +1564,12 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
             // Still select it for the next boot: another kernel may have been installed
             // since, and boot_args may have changed.
             let kernel_name = format!("{}{}", kernel_version, localversion);
+            // A run whose GRUB step failed after installing the package left its tree.
+            remove_kernel_build_dir(&host_kernel_release_tree(
+                &host_kernel_build_dir(),
+                &kernel_name,
+            ))
+            .await;
             update_grub_config(&kernel_name, boot_args).await?;
 
             println!("  ⚠️  Reboot if not already running this kernel: sudo reboot");
@@ -1599,7 +1595,10 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Stays root by design: this interactive EC2 flow pairs the build with
     // dpkg -i and update-grub, which require root anyway.
-    let build_dir = host_kernel_build_dir();
+    let build_dir = host_kernel_release_tree(
+        &host_kernel_build_dir(),
+        &format!("{kernel_version}{localversion}"),
+    );
     let mut cmd = Command::new(&script_path);
     cmd.env("BUILD_DIR", &build_dir);
     let status = run_streaming(cmd, "host_kernel_build")
@@ -1650,6 +1649,10 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
         bail!("dpkg -i failed: {}", stderr);
     }
 
+    // The package is installed, so this release's tree (source, objects and packages) is not
+    // read again. A failed build or install keeps it, for the "Deb already built" retry.
+    remove_kernel_build_dir(&build_dir).await;
+
     // Extract kernel name from deb filename for GRUB config
     // e.g., linux-image-6.18.3-fcvm-abc123_6.18.3-1_arm64.deb -> 6.18.3-fcvm-abc123
     let deb_name = deb_path.file_name().unwrap().to_string_lossy();
@@ -1660,16 +1663,6 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Update GRUB with boot args
     update_grub_config(kernel_name, boot_args).await?;
-
-    // The package is installed, so this build's source tree and packages are not read
-    // again. The build dir itself is shared by every host build, so only this build's own
-    // entries go. A failed build or install keeps them, for the "Deb already built" retry.
-    remove_host_build_entries(
-        &build_dir,
-        kernel_version,
-        &format!("{kernel_version}{localversion}"),
-    )
-    .await;
 
     println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
@@ -3304,37 +3297,61 @@ mod tests {
         );
     }
 
-    /// The host build dir is shared by every host kernel build. Cleaning up after one
-    /// install must leave another build's source and packages in place.
+    /// A GRUB step that fails after `dpkg -i` must not strand the release's tree: the install
+    /// removes it before the GRUB step, and the retry (which takes the already-installed
+    /// path) removes a tree an earlier run left.
+    #[test]
+    fn host_install_removes_its_tree_before_grub_and_on_the_installed_path() {
+        let source = include_str!("kernel.rs");
+        let start = source
+            .find("pub async fn install_host_kernel(")
+            .expect("install_host_kernel");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("end of install_host_kernel")];
+        let installed = body
+            .find("Host kernel already installed")
+            .expect("installed path");
+        let installed_return = installed + body[installed..].find("return Ok(());").unwrap();
+        let installed_path = &body[installed..installed_return];
+        assert!(
+            installed_path.contains("remove_kernel_build_dir(&host_kernel_release_tree("),
+            "the already-installed path does not remove a tree an earlier run left"
+        );
+        let dpkg = body.find("bail!(\"dpkg -i failed").expect("dpkg step");
+        let removal = dpkg
+            + body[dpkg..]
+                .find("remove_kernel_build_dir(&build_dir)")
+                .expect("removal");
+        let grub = dpkg
+            + body[dpkg..]
+                .find("update_grub_config(kernel_name")
+                .expect("grub step");
+        assert!(
+            removal < grub,
+            "the install removes its tree only after the GRUB step"
+        );
+    }
+
+    /// Two host builds of different releases, including two SHAs of one kernel version,
+    /// must not share a tree: removing one after its install must leave the other's source
+    /// and packages in place.
     #[tokio::test]
-    async fn a_host_install_removes_only_its_own_build_entries() {
+    async fn host_builds_of_different_releases_never_share_a_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let b = dir.path();
-        for path in ["linux-7.3.3/vmlinux.o", "linux-6.18.60/vmlinux.o"] {
-            std::fs::create_dir_all(b.join(path).parent().unwrap()).unwrap();
-            std::fs::write(b.join(path), b"o").unwrap();
-        }
-        for file in [
-            "linux-image-7.3.3-fcvm-aaaa_7.3.3-1_arm64.deb",
-            "linux-headers-7.3.3-fcvm-aaaa_7.3.3-1_arm64.deb",
-            "linux-image-6.18.60-fcvm-bbbb_6.18.60-1_arm64.deb",
-        ] {
-            std::fs::write(b.join(file), b"d").unwrap();
+        let mine = host_kernel_release_tree(dir.path(), "7.3.3-fcvm-aaaa");
+        let other = host_kernel_release_tree(dir.path(), "7.3.3-fcvm-bbbb");
+        assert_ne!(mine, other);
+        for tree in [&mine, &other] {
+            std::fs::create_dir_all(tree.join("linux-7.3.3")).unwrap();
+            std::fs::write(tree.join("linux-7.3.3/vmlinux.o"), b"o").unwrap();
         }
 
-        remove_host_build_entries(b, "7.3.3", "7.3.3-fcvm-aaaa").await;
+        assert!(remove_kernel_build_dir(&mine).await);
 
-        let mut left: Vec<String> = std::fs::read_dir(b)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(
-            left,
-            [
-                "linux-6.18.60",
-                "linux-image-6.18.60-fcvm-bbbb_6.18.60-1_arm64.deb"
-            ]
+        assert!(!mine.exists());
+        assert!(
+            other.join("linux-7.3.3/vmlinux.o").exists(),
+            "removing one release's tree removed another's"
         );
     }
 
