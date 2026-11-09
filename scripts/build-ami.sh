@@ -241,7 +241,7 @@ INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.2
 # Install AWS CLI first (needed for tagging)
 apt-get update
 apt-get install -y unzip curl
-curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
+curl --fail "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 
@@ -327,7 +327,7 @@ aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nest
 
 # Firecracker
 FIRECRACKER_VERSION="v1.14.0"
-curl -L -o /tmp/firecracker.tgz \
+curl --fail -L -o /tmp/firecracker.tgz \
   "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-aarch64.tgz"
 tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
   "release-${FIRECRACKER_VERSION}-aarch64/firecracker-${FIRECRACKER_VERSION}-aarch64" \
@@ -345,7 +345,7 @@ echo "user_allow_other" > /etc/fuse.conf
 # GitHub Actions Runner
 mkdir -p /opt/actions-runner
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
-curl -o /tmp/actions-runner.tar.gz -L \
+curl --fail -o /tmp/actions-runner.tar.gz -L \
   "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"
 tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner
 chown -R ubuntu:ubuntu /opt/actions-runner

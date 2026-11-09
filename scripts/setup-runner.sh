@@ -106,7 +106,7 @@ cd /
 # and installs the custom binary. This baseline is only used during initial setup.
 FIRECRACKER_VERSION="v1.14.0"
 ARCH=$(uname -m)
-curl -L -o /tmp/firecracker.tgz \
+curl --fail -L -o /tmp/firecracker.tgz \
   "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${ARCH}.tgz"
 tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
   "release-${FIRECRACKER_VERSION}-${ARCH}/firecracker-${FIRECRACKER_VERSION}-${ARCH}" \
@@ -133,7 +133,7 @@ echo "user_allow_other" > /etc/fuse.conf
 # GitHub Actions Runner
 mkdir -p /opt/actions-runner && cd /opt/actions-runner
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
-curl -o actions-runner-linux-arm64.tar.gz -L \
+curl --fail -o actions-runner-linux-arm64.tar.gz -L \
   "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"
 tar xzf actions-runner-linux-arm64.tar.gz && rm actions-runner-linux-arm64.tar.gz
 chown -R ubuntu:ubuntu /opt/actions-runner
