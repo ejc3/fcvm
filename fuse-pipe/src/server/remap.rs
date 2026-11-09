@@ -26,7 +26,7 @@ pub struct RemapFs<T: FilesystemHandler> {
     /// stable_ino → inner_ino (reverse mapping for request remapping)
     stable_to_inner: DashMap<u64, u64>,
     /// stable_ino → relative path from mount root (for serialization)
-    paths: DashMap<u64, String>,
+    paths: DashMap<u64, Vec<u8>>,
     /// old_fh → new_fh (stale handles lazily reopened after snapshot restore)
     handle_remap: DashMap<u64, u64>,
     /// Held for writing across a rename, from the host rename through the path updates of the
@@ -43,7 +43,7 @@ pub struct RemapFs<T: FilesystemHandler> {
     /// Stable inodes of the restored table whose paths no longer resolved: the host
     /// renamed or removed them while no server ran. A request on one is refused like
     /// an unknown inode, but logged as what it is.
-    gone: DashMap<u64, String>,
+    gone: DashMap<u64, Vec<u8>>,
 }
 
 std::thread_local! {
@@ -62,15 +62,68 @@ const MAX_HANDLE_BASE: u64 = 1 << 62;
 
 /// An inode table as [`RemapFs::restore_from_table`] reads it: the highest handle the guest was
 /// given, the path of each inode the guest may hold, and the inodes whose files were gone.
+///
+/// Paths are bytes, as Linux names are. A path that is valid UTF-8 is a JSON string under
+/// `paths` (or `gone`); any other goes, as an array of its bytes, under `raw_paths` (or
+/// `raw_gone`), so a name that is not UTF-8 survives the table unchanged (#1789).
 pub(crate) fn table_json(
     handle_base: u64,
-    paths: &std::collections::BTreeMap<u64, String>,
-    gone: &std::collections::BTreeMap<u64, String>,
+    paths: &std::collections::BTreeMap<u64, Vec<u8>>,
+    gone: &std::collections::BTreeMap<u64, Vec<u8>>,
 ) -> String {
-    serde_json::to_string(
-        &serde_json::json!({ "handle_base": handle_base, "paths": paths, "gone": gone }),
-    )
-    .unwrap_or_default()
+    fn split(
+        all: &std::collections::BTreeMap<u64, Vec<u8>>,
+    ) -> (
+        std::collections::BTreeMap<u64, &str>,
+        std::collections::BTreeMap<u64, &[u8]>,
+    ) {
+        let mut text = std::collections::BTreeMap::new();
+        let mut raw = std::collections::BTreeMap::new();
+        for (ino, path) in all {
+            match std::str::from_utf8(path) {
+                Ok(path) => {
+                    text.insert(*ino, path);
+                }
+                Err(_) => {
+                    raw.insert(*ino, path.as_slice());
+                }
+            }
+        }
+        (text, raw)
+    }
+    let (paths, raw_paths) = split(paths);
+    let (gone, raw_gone) = split(gone);
+    let mut table = serde_json::json!({ "handle_base": handle_base, "paths": paths, "gone": gone });
+    if !raw_paths.is_empty() {
+        table["raw_paths"] = serde_json::json!(raw_paths);
+    }
+    if !raw_gone.is_empty() {
+        table["raw_gone"] = serde_json::json!(raw_gone);
+    }
+    serde_json::to_string(&table).unwrap_or_default()
+}
+
+/// The paths of a table's `text` map (JSON strings) and `raw` map (byte arrays) together.
+fn table_paths(
+    value: &serde_json::Value,
+    text: &str,
+    raw: &str,
+) -> Result<std::collections::BTreeMap<u64, Vec<u8>>, serde_json::Error> {
+    let mut paths: std::collections::BTreeMap<u64, Vec<u8>> = match value.get(text) {
+        Some(text) => {
+            serde_json::from_value::<std::collections::BTreeMap<u64, String>>(text.clone())?
+                .into_iter()
+                .map(|(ino, path)| (ino, path.into_bytes()))
+                .collect()
+        }
+        None => std::collections::BTreeMap::new(),
+    };
+    if let Some(raw) = value.get(raw) {
+        paths.extend(serde_json::from_value::<
+            std::collections::BTreeMap<u64, Vec<u8>>,
+        >(raw.clone())?);
+    }
+    Ok(paths)
 }
 
 impl<T: FilesystemHandler> RemapFs<T> {
@@ -85,7 +138,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
         // Root inode is always 1 in FUSE
         inner_to_stable.insert(1, 1);
         stable_to_inner.insert(1, 1);
-        paths.insert(1, String::new());
+        paths.insert(1, Vec::new());
 
         Self {
             inner,
@@ -100,12 +153,12 @@ impl<T: FilesystemHandler> RemapFs<T> {
         }
     }
 
-    /// FNV-1a hash of a path string, used to compute stable inodes.
+    /// FNV-1a hash of a path, used to compute stable inodes.
     ///
     /// Returns a value >= 2 (0 is invalid, 1 is reserved for root).
-    pub fn path_hash(path: &str) -> u64 {
+    pub fn path_hash(path: impl AsRef<[u8]>) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-        for byte in path.as_bytes() {
+        for byte in path.as_ref() {
             hash ^= *byte as u64;
             hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
         }
@@ -118,11 +171,11 @@ impl<T: FilesystemHandler> RemapFs<T> {
     }
 
     /// Build a relative path from parent path and child name.
-    fn format_path(parent_path: &str, name: &str) -> String {
+    fn format_path(parent_path: &[u8], name: &[u8]) -> Vec<u8> {
         if parent_path.is_empty() {
-            name.to_string()
+            name.to_vec()
         } else {
-            format!("{}/{}", parent_path, name)
+            [parent_path, b"/", name].concat()
         }
     }
 
@@ -138,7 +191,9 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// The path a restored table recorded for `stable` when that path no longer
     /// resolved at the restore.
     pub fn gone_path(&self, stable: u64) -> Option<String> {
-        self.gone.get(&stable).map(|p| p.value().clone())
+        self.gone
+            .get(&stable)
+            .map(|p| String::from_utf8_lossy(p.value()).into_owned())
     }
 
     /// Look up the stable inode for an inner inode.
@@ -164,13 +219,12 @@ impl<T: FilesystemHandler> RemapFs<T> {
             }
             Entry::Vacant(e) => {
                 // Compute path and hash while holding the shard lock
-                let name_str = String::from_utf8_lossy(name);
                 let parent_path = self
                     .paths
                     .get(&parent_stable)
                     .map(|p| p.value().clone())
                     .unwrap_or_default();
-                let path = Self::format_path(&parent_path, &name_str);
+                let path = Self::format_path(&parent_path, name);
                 let mut stable_ino = Self::path_hash(&path);
 
                 // Handle conflicts (true hash collision or rename-then-recreate). An inode
@@ -182,7 +236,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 if taken(&stable_ino) {
                     debug!(
                         stable_ino,
-                        path = %path,
+                        path = %String::from_utf8_lossy(&path),
                         "stable_ino taken, finding alternative"
                     );
                     let mut found = false;
@@ -195,7 +249,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
                         }
                     }
                     if !found {
-                        error!(path = %path, "failed to find free stable_ino");
+                        error!(path = %String::from_utf8_lossy(&path), "failed to find free stable_ino");
                         return Err(());
                     }
                 }
@@ -423,8 +477,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 }
 
                 let inner_ino = entry.ino;
-                let name_str = String::from_utf8_lossy(&entry.name);
-                let expected_path = Self::format_path(&dir_path, &name_str);
+                let expected_path = Self::format_path(&dir_path, &entry.name);
 
                 if let Some(existing_stable) = self.inner_to_stable.get(&inner_ino) {
                     let stable = *existing_stable;
@@ -434,8 +487,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
                     if let Some(mut stored_path) = self.paths.get_mut(&stable) {
                         if *stored_path != expected_path {
                             debug!(
-                                old_path = %*stored_path,
-                                new_path = %expected_path,
+                                old_path = %String::from_utf8_lossy(&stored_path),
+                                new_path = %String::from_utf8_lossy(&expected_path),
                                 "readdir: fixing stale path"
                             );
                             *stored_path = expected_path;
@@ -487,13 +540,12 @@ impl<T: FilesystemHandler> RemapFs<T> {
                         entry.attr.ino = stable_ino;
 
                         // Path staleness detection
-                        let name_str = String::from_utf8_lossy(&entry.name);
-                        let expected_path = Self::format_path(&dir_path, &name_str);
+                        let expected_path = Self::format_path(&dir_path, &entry.name);
                         if let Some(mut stored_path) = self.paths.get_mut(&stable_ino) {
                             if *stored_path != expected_path {
                                 debug!(
-                                    old_path = %*stored_path,
-                                    new_path = %expected_path,
+                                    old_path = %String::from_utf8_lossy(&stored_path),
+                                    new_path = %String::from_utf8_lossy(&expected_path),
                                     "readdirplus: fixing stale path"
                                 );
                                 *stored_path = expected_path;
@@ -518,8 +570,6 @@ impl<T: FilesystemHandler> RemapFs<T> {
         newname: &[u8],
         flags: u32,
     ) {
-        let name_str = String::from_utf8_lossy(name);
-        let newname_str = String::from_utf8_lossy(newname);
         let parent_path = self
             .paths
             .get(&parent_stable)
@@ -530,8 +580,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
             .get(&newparent_stable)
             .map(|p| p.value().clone())
             .unwrap_or_default();
-        let old_path = Self::format_path(&parent_path, &name_str);
-        let new_path = Self::format_path(&newparent_path, &newname_str);
+        let old_path = Self::format_path(&parent_path, name);
+        let new_path = Self::format_path(&newparent_path, newname);
 
         // Find stable_ino of the source entry by scanning paths
         let source_stable = self
@@ -562,13 +612,18 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 self.paths.insert(src, new_path.clone());
 
                 // Update descendant paths (for directory renames)
-                let old_prefix = format!("{}/", old_path);
-                let new_prefix = format!("{}/", new_path);
-                let updates: Vec<(u64, String)> = self
+                let old_prefix = [old_path.as_slice(), b"/"].concat();
+                let new_prefix = [new_path.as_slice(), b"/"].concat();
+                let updates: Vec<(u64, Vec<u8>)> = self
                     .paths
                     .iter()
                     .filter(|e| e.value().starts_with(&old_prefix))
-                    .map(|e| (*e.key(), e.value().replacen(&old_prefix, &new_prefix, 1)))
+                    .map(|e| {
+                        (
+                            *e.key(),
+                            [&new_prefix[..], &e.value()[old_prefix.len()..]].concat(),
+                        )
+                    })
                     .collect();
                 for (ino, path) in updates {
                     self.paths.insert(ino, path);
@@ -584,7 +639,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// Used for portable snapshot restore.
     pub fn serialize_table(&self) -> String {
         let _no_rename_in_flight = self.rename_lock.read().unwrap_or_else(|e| e.into_inner());
-        let paths: std::collections::BTreeMap<u64, String> = self
+        let paths: std::collections::BTreeMap<u64, Vec<u8>> = self
             .paths
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
@@ -593,7 +648,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
         // the live ones, so a restore of a snapshot of this clone knows those inodes too
         // (the guest still holds them) and never resolves them again: a file the host
         // later creates at the same path is another file.
-        let gone: std::collections::BTreeMap<u64, String> = self
+        let gone: std::collections::BTreeMap<u64, Vec<u8>> = self
             .gone
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
@@ -607,7 +662,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
 
     /// Parse a serialized table into its handle base and paths. A table from before the handle base
     /// was recorded is a bare map of paths, and gets LEGACY_HANDLE_BASE.
-    fn parse_table(json: &str) -> (u64, std::collections::BTreeMap<u64, String>) {
+    fn parse_table(json: &str) -> (u64, std::collections::BTreeMap<u64, Vec<u8>>) {
         let value: serde_json::Value = match serde_json::from_str(json) {
             Ok(value) => value,
             Err(e) => {
@@ -619,14 +674,17 @@ impl<T: FilesystemHandler> RemapFs<T> {
             }
         };
         let (handle_base, paths) = match value.get("paths") {
-            Some(paths) => (
+            Some(_) => (
                 value
                     .get("handle_base")
                     .and_then(|b| b.as_u64())
                     .unwrap_or(LEGACY_HANDLE_BASE),
-                paths.clone(),
+                table_paths(&value, "paths", "raw_paths"),
             ),
-            None => (LEGACY_HANDLE_BASE, value),
+            None => (
+                LEGACY_HANDLE_BASE,
+                table_paths(&serde_json::json!({ "paths": value }), "paths", "raw_paths"),
+            ),
         };
         if handle_base > MAX_HANDLE_BASE {
             error!(
@@ -635,7 +693,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             );
             return (LEGACY_HANDLE_BASE, std::collections::BTreeMap::new());
         }
-        match serde_json::from_value(paths) {
+        match paths {
             Ok(paths) => (handle_base, paths),
             Err(e) => {
                 error!(
@@ -649,11 +707,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
 
     /// The inodes a serialized table records as gone at an earlier restore. None in a
     /// table that has no `gone` field.
-    fn parse_gone(json: &str) -> std::collections::BTreeMap<u64, String> {
+    fn parse_gone(json: &str) -> std::collections::BTreeMap<u64, Vec<u8>> {
         serde_json::from_str::<serde_json::Value>(json)
             .ok()
-            .and_then(|value| value.get("gone").cloned())
-            .and_then(|gone| serde_json::from_value(gone).ok())
+            .and_then(|value| table_paths(&value, "gone", "raw_gone").ok())
             .unwrap_or_default()
     }
 
@@ -678,7 +735,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
         // Root is always mapped
         inner_to_stable.insert(1, 1);
         stable_to_inner.insert(1, 1);
-        paths.insert(1, String::new());
+        paths.insert(1, Vec::new());
 
         // Walk each path to discover inner inodes
         for (stable_ino, path) in &table {
@@ -687,14 +744,14 @@ impl<T: FilesystemHandler> RemapFs<T> {
             }
 
             // Walk each component through lookup
-            let components: Vec<&str> = path.split('/').collect();
+            let components: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
             let mut current_inner = 1u64; // Start from root
             let mut resolved = true;
 
             for component in &components {
                 let req = VolumeRequest::Lookup {
                     parent: current_inner,
-                    name: component.as_bytes().to_vec(),
+                    name: component.to_vec(),
                     uid: 0,
                     gid: 0,
                     pid: 0,
@@ -707,8 +764,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
                     None => {
                         info!(
                             stable_ino,
-                            path = %path,
-                            component = %component,
+                            path = %String::from_utf8_lossy(path),
+                            component = %String::from_utf8_lossy(component),
                             "restore: path no longer exists, skipping"
                         );
                         resolved = false;
@@ -1196,6 +1253,60 @@ mod tests {
         );
     }
 
+    /// A held file whose name is not UTF-8 resolves in a restored server, from a plain volume's
+    /// table and from a portable one's (#1789). Linux names are bytes.
+    ///
+    /// RED BEFORE THE FIX: the plain table recorded the inode as gone (its path had no UTF-8
+    /// form), and the portable one stored the name with U+FFFD in place of the byte, which named
+    /// nothing at the restore; either way the clone refused the guest's inode.
+    #[test]
+    fn a_held_name_that_is_not_utf8_survives_the_table() {
+        use std::os::unix::ffi::OsStrExt;
+        let name: &[u8] = b"caf\xe9";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(name)), b"N").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let lookup = |fs: &dyn FilesystemHandler| {
+            fs.handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent: 1,
+                    name: name.to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            )
+            .attr()
+            .unwrap()
+            .ino
+        };
+
+        let plain = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let plain_ino = lookup(&plain);
+        let portable = RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false));
+        let portable_ino = lookup(&portable);
+        for (kind, table, ino) in [
+            (
+                "plain",
+                plain.inode_table(plain.capture_inodes()),
+                plain_ino,
+            ),
+            ("portable", portable.serialize_table(), portable_ino),
+        ] {
+            let clone = RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), false),
+                &table,
+            );
+            let attr = clone.handle_request_with_groups(&VolumeRequest::Getattr { ino }, &[]);
+            assert!(
+                attr.attr().is_some(),
+                "{kind}: the held inode is refused after the restore: {attr:?}; table {table}"
+            );
+        }
+    }
+
     /// A restored server of a read-only volume reads with file handle 0. Its inner server answers
     /// OPEN with ENOSYS (zero-message open), so the guest kernel opens nothing and reads with handle
     /// 0; that is no handle at all, not one from before the snapshot to reopen. FLUSH with handle 0
@@ -1424,11 +1535,17 @@ mod tests {
     fn a_table_without_a_handle_base_still_restores() {
         let (base, paths) = RemapFs::<MockFs>::parse_table(r#"{"1":"","42":"data.txt"}"#);
         assert_eq!(base, LEGACY_HANDLE_BASE);
-        assert_eq!(paths.get(&42).map(String::as_str), Some("data.txt"));
+        assert_eq!(
+            paths.get(&42).map(Vec::as_slice),
+            Some(b"data.txt".as_slice())
+        );
         let (base, paths) =
             RemapFs::<MockFs>::parse_table(r#"{"handle_base":7,"paths":{"42":"data.txt"}}"#);
         assert_eq!(base, 7);
-        assert_eq!(paths.get(&42).map(String::as_str), Some("data.txt"));
+        assert_eq!(
+            paths.get(&42).map(Vec::as_slice),
+            Some(b"data.txt".as_slice())
+        );
     }
 
     /// A handle base comes from a table on disk, so a corrupt one can hold any number. Adding a base
@@ -1954,7 +2071,7 @@ mod tests {
 
         // Verify path is "old_name"
         let stable_50 = remap.to_stable(50).unwrap();
-        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), "old_name");
+        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), b"old_name");
 
         // Host renames file. Readdir now shows inner_ino=50 as "new_name"
         remap.inner.set_response(VolumeResponse::DirEntries {
@@ -1972,7 +2089,7 @@ mod tests {
         // Path should be updated to "new_name"
         assert_eq!(
             remap.paths.get(&stable_50).unwrap().value(),
-            "new_name",
+            b"new_name",
             "stale path should be corrected by readdir"
         );
     }
@@ -1998,7 +2115,7 @@ mod tests {
         remap.handle_request_with_groups(&lookup, &[]);
 
         let stable_100 = remap.to_stable(100).unwrap();
-        assert_eq!(remap.paths.get(&stable_100).unwrap().value(), "src");
+        assert_eq!(remap.paths.get(&stable_100).unwrap().value(), b"src");
 
         // Guest renames "src" → "dst"
         remap.inner.set_response(VolumeResponse::Ok);
@@ -2017,7 +2134,7 @@ mod tests {
         // Path should now be "dst"
         assert_eq!(
             remap.paths.get(&stable_100).unwrap().value(),
-            "dst",
+            b"dst",
             "rename should update stored path"
         );
     }
@@ -2048,7 +2165,7 @@ mod tests {
         // Should contain root ("") and "data.txt"
         assert_eq!(parsed.len(), 2);
         assert!(parsed.values().any(|v| v.is_empty()));
-        assert!(parsed.values().any(|v| v == "data.txt"));
+        assert!(parsed.values().any(|v| v == b"data.txt"));
     }
 
     #[test]
@@ -2265,10 +2382,10 @@ mod tests {
         assert_eq!(restored.to_stable(600), Some(file_stable));
 
         // Paths should be preserved
-        assert_eq!(restored.paths.get(&dir_stable).unwrap().value(), "dir");
+        assert_eq!(restored.paths.get(&dir_stable).unwrap().value(), b"dir");
         assert_eq!(
             restored.paths.get(&file_stable).unwrap().value(),
-            "dir/file.txt"
+            b"dir/file.txt"
         );
     }
 
@@ -2352,7 +2469,7 @@ mod tests {
 
         assert_eq!(
             remap.paths.get(&child_stable).unwrap().value(),
-            "dir/child.txt"
+            b"dir/child.txt"
         );
 
         // Rename "dir" → "newdir"
@@ -2372,10 +2489,10 @@ mod tests {
         );
 
         // Both parent and child paths should be updated
-        assert_eq!(remap.paths.get(&dir_stable).unwrap().value(), "newdir");
+        assert_eq!(remap.paths.get(&dir_stable).unwrap().value(), b"newdir");
         assert_eq!(
             remap.paths.get(&child_stable).unwrap().value(),
-            "newdir/child.txt",
+            b"newdir/child.txt",
             "descendant path should be updated after directory rename"
         );
     }
@@ -2509,7 +2626,7 @@ mod tests {
             &[],
         );
         let stable_50 = remap.to_stable(50).unwrap();
-        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), "original");
+        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), b"original");
 
         // Host renames file. Readdir now shows inner_ino=50 as "renamed"
         remap.inner.set_response(VolumeResponse::DirEntries {
@@ -2527,17 +2644,17 @@ mod tests {
         );
 
         // Path should be updated
-        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), "renamed");
+        assert_eq!(remap.paths.get(&stable_50).unwrap().value(), b"renamed");
 
         // Serialize should reflect the corrected path
         let json = remap.serialize_table();
         let parsed = RemapFs::<MockFs>::parse_table(&json).1;
         assert!(
-            parsed.values().any(|v| v == "renamed"),
+            parsed.values().any(|v| v == b"renamed"),
             "serialized table should have corrected path"
         );
         assert!(
-            !parsed.values().any(|v| v == "original"),
+            !parsed.values().any(|v| v == b"original"),
             "serialized table should NOT have stale path"
         );
     }
