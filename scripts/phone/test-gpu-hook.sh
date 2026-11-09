@@ -45,6 +45,14 @@ if run && grep -q 'gpu retake' "$dir/asked" && grep -q '^first_frame_at_ms=\|fir
 else
   bad "a released GPU: $(cat "$dir/out")"
 fi
+# first_frame_at_ms is the wall clock (ms since the epoch), which the restore record compares
+# with the host's; first_frame_ms is an interval on the monotonic clock.
+at=$(sed -n 's/.*first_frame_at_ms=\([0-9]*\).*/\1/p' "$dir/out" | tail -1)
+if [ -n "$at" ] && [ $(( $(date +%s%3N) - at )) -ge 0 ] && [ $(( $(date +%s%3N) - at )) -lt 60000 ]; then
+  ok "first_frame_at_ms is the wall clock"
+else
+  bad "first_frame_at_ms is not the wall clock: '$at', now $(date +%s%3N)"
+fi
 
 printf 'what\r\n' > "$dir/status"
 if run; then bad "a retake succeeded on an unexpected status: $(cat "$dir/out")"; else ok "an unexpected status fails"; fi

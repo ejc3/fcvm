@@ -391,6 +391,23 @@ echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo front > "$B/cut"
 bact open_browser && [ "$(cat "$B/front")" = browser ] && grep -q "shown_ms=[0-9]" "$B/out" && adb_has "shell input keycombination 113 46" \
   && ok "open_browser whose am output ends after Starting goes by the browser in front" \
   || bad "open_browser with am's output cut: $(cat "$dir/act.err" "$B/out")"
+# The time to the front is an interval, so a wall clock stepped back meanwhile (an NTP
+# correction) must not make it negative: on 2026-11-09 a CI run failed the test above with
+# shown_ms=-858. This stand-in date steps `date +%s%3N` back 2 s after its first call.
+mkdir -p "$B/clockbin"
+real_date=$(command -v date)
+cat > "$B/clockbin/date" <<S
+#!/bin/bash
+if [ "\$1" = "+%s%3N" ]; then
+  n=\$(cat "$B/clockcalls" 2>/dev/null || echo 0); echo \$((n + 1)) > "$B/clockcalls"
+  t=\$("$real_date" +%s%3N); [ "\$n" -ge 1 ] && t=\$((t - 2000)); echo "\$t"
+else exec "$real_date" "\$@"; fi
+S
+chmod +x "$B/clockbin/date"; rm -f "$B/clockcalls"
+echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo front > "$B/cut"
+PATH="$B/clockbin:$PATH" bact open_browser && grep -q "shown_ms=[0-9]" "$B/out" \
+  && ok "the time to the front stays an interval when the wall clock steps back" \
+  || bad "open_browser with the wall clock stepped back: $(cat "$dir/act.err" "$B/out")"
 echo dev.fcvm.robotpark/.MainActivity > "$B/top"; echo never > "$B/cut"
 if FRONT_WAIT_MS=1000 bact open_browser; then bad "open_browser succeeded with Robot Park in front"
 elif [ "$(grep -c "shell am start -W -n org.cromite.cromite" "$B/adb.log")" = 2 ] && grep -q "did not come to the front (dev.fcvm.robotpark/.MainActivity is)" "$dir/act.err"; then
