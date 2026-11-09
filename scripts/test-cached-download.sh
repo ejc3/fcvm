@@ -55,5 +55,32 @@ PY
 [ -z "$direct" ] || fail "workflow steps download GitHub release files without cached-download.sh:
 $direct"
 
+# A cache that holds cached-download.sh's files is keyed on the script too: the file names in
+# it are the script's layout, and a key that outlives a layout change restores files the script
+# no longer recognises, downloads again, and, being an exact hit, never saves the new copy.
+stale=$(python3 - "$workflows" <<'PY'
+import pathlib, re, sys
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    lines = path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if not re.search(r"uses: actions/cache(/restore|/save)?@", line):
+            continue
+        step_indent = len(line) - len(line.lstrip(" -"))
+        fields = {}
+        for nxt in lines[i + 1:]:
+            if nxt.strip().startswith("- ") and len(nxt) - len(nxt.lstrip(" ")) < step_indent:
+                break
+            m = re.match(r"\s+(path|key):\s*(.*)", nxt)
+            if m:
+                fields.setdefault(m.group(1), m.group(2))
+        held = fields.get("path", "")
+        if re.search(r"/(downloads|gradle-dist)$", held) and \
+                "scripts/cached-download.sh" not in fields.get("key", ""):
+            print(f"{path.name}:{i + 1}: path {held} key {fields.get('key')}")
+PY
+)
+[ -z "$stale" ] || fail "caches of cached-download.sh files are not keyed on the script:
+$stale"
+
 [ $rc = 0 ] && echo "ok: cached-download serves warm copies without the source and publishes only verified files"
 exit $rc
