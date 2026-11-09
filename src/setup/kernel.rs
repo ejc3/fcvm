@@ -1031,24 +1031,96 @@ enum BuildTree {
     /// A tree of this invocation's own, removed after the build. Two setups building the
     /// same profile and SHA into different stores hold different store locks, so a tree
     /// named only by profile and SHA would let one remove the other's mid-compile.
-    Owned(PathBuf),
+    /// `<tree>.owner` is held locked by this process and, inherited, by the build child,
+    /// so a later build reclaims the tree of a setup killed mid-compile once both are gone.
+    Owned { path: PathBuf, owner: std::fs::File },
 }
 
 impl BuildTree {
-    fn for_build(profile_name: &str, sha: &str) -> Self {
-        match std::env::var_os("BUILD_DIR") {
-            Some(dir) if !dir.is_empty() => Self::Caller(PathBuf::from(dir)),
-            _ => Self::Owned(std::env::temp_dir().join(format!(
-                "kernel-build-{profile_name}-{sha}-{}",
-                uuid::Uuid::new_v4().simple()
-            ))),
+    fn for_build(profile_name: &str, sha: &str) -> Result<Self> {
+        if let Some(dir) = std::env::var_os("BUILD_DIR").filter(|d| !d.is_empty()) {
+            return Ok(Self::Caller(PathBuf::from(dir)));
         }
+        let temp = std::env::temp_dir();
+        reclaim_abandoned_build_trees(&temp);
+        let path = temp.join(format!(
+            "kernel-build-{profile_name}-{sha}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let owner = lock_build_tree_owner(&path)?;
+        Ok(Self::Owned { path, owner })
     }
 
     fn path(&self) -> &Path {
         match self {
-            Self::Caller(p) | Self::Owned(p) => p,
+            Self::Caller(p) | Self::Owned { path: p, .. } => p,
         }
+    }
+}
+
+fn build_tree_owner(tree: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.owner", tree.display()))
+}
+
+/// Create `<tree>.owner` already locked: the lock is taken under a temporary name and the
+/// file renamed into place, so a reclaim pass never sees an owner file it could lock before
+/// its creator does. The descriptor is left inheritable, so the build child keeps the lock
+/// if this process is killed first.
+fn lock_build_tree_owner(tree: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let staged = PathBuf::from(format!("{}.owner.tmp", tree.display()));
+    let file =
+        std::fs::File::create(&staged).with_context(|| format!("creating {}", staged.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "locking {}: {}",
+            staged.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    std::fs::rename(&staged, build_tree_owner(tree))
+        .with_context(|| format!("publishing the owner of {}", tree.display()))?;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+        bail!(
+            "making the owner of {} inheritable: {}",
+            tree.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(file)
+}
+
+/// Remove every kernel build tree under `dir` whose owner lock nobody holds: its setup and
+/// build child are gone (a setup killed mid-compile skips its own cleanup).
+fn reclaim_abandoned_build_trees(dir: &Path) {
+    use std::os::fd::AsRawFd;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(tree) = name
+            .strip_prefix("kernel-build-")
+            .and_then(|_| name.strip_suffix(".owner"))
+        else {
+            continue;
+        };
+        let Ok(owner) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        if unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        let tree = dir.join(tree);
+        match std::fs::remove_dir_all(&tree) {
+            Ok(()) => info!(dir = %tree.display(), "reclaimed an abandoned kernel build tree"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(dir = %tree.display(), error = %e, "could not reclaim a kernel build tree");
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -1075,8 +1147,9 @@ async fn run_kernel_build(
 ) -> Result<std::process::ExitStatus> {
     cmd.env("BUILD_DIR", tree.path());
     let status = run_streaming(cmd, label).await;
-    if let BuildTree::Owned(dir) = tree {
-        remove_kernel_build_dir(dir).await;
+    if let BuildTree::Owned { path, .. } = tree {
+        remove_kernel_build_dir(path).await;
+        let _ = tokio::fs::remove_file(build_tree_owner(path)).await;
     }
     status
 }
@@ -1150,7 +1223,7 @@ async fn build_kernel_locally(
     super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_kernel_build(
         cmd,
-        &BuildTree::for_build(profile_name, &sha),
+        &BuildTree::for_build(profile_name, &sha)?,
         "kernel_build",
     )
     .await
@@ -3128,15 +3201,18 @@ mod tests {
     /// $BUILD_DIR stays the caller's.
     #[tokio::test]
     async fn two_builds_of_one_kernel_never_share_a_tree_and_a_callers_tree_stays() {
-        let a = BuildTree::for_build("nested", "0123456789ab");
-        let b = BuildTree::for_build("nested", "0123456789ab");
-        assert!(matches!(a, BuildTree::Owned(_)) && matches!(b, BuildTree::Owned(_)));
+        let a = BuildTree::for_build("nested", "0123456789ab").unwrap();
+        let b = BuildTree::for_build("nested", "0123456789ab").unwrap();
+        assert!(matches!(a, BuildTree::Owned { .. }) && matches!(b, BuildTree::Owned { .. }));
         assert_ne!(
             a.path(),
             b.path(),
             "two builds of one kernel share {}",
             a.path().display()
         );
+        for tree in [&a, &b] {
+            let _ = std::fs::remove_file(build_tree_owner(tree.path()));
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let caller = dir.path().join("pre-seeded");
@@ -3155,6 +3231,32 @@ mod tests {
         assert!(
             caller.join("linux-x.tar.xz").exists(),
             "the caller's tree was removed"
+        );
+    }
+
+    /// A setup killed mid-compile skips its own cleanup. The next build reclaims that tree
+    /// once nobody holds its owner lock, and leaves a tree whose build is still running.
+    #[test]
+    fn an_abandoned_build_tree_is_reclaimed_and_a_live_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("kernel-build-nested-0123456789ab-aaaa");
+        let live = dir.path().join("kernel-build-nested-0123456789ab-bbbb");
+        for tree in [&stale, &live] {
+            std::fs::create_dir_all(tree.join("linux-x")).unwrap();
+            std::fs::write(tree.join("linux-x/vmlinux.o"), b"o").unwrap();
+        }
+        drop(lock_build_tree_owner(&stale).unwrap());
+        let _held = lock_build_tree_owner(&live).unwrap();
+
+        reclaim_abandoned_build_trees(dir.path());
+
+        assert!(
+            !stale.exists() && !build_tree_owner(&stale).exists(),
+            "the abandoned tree was not reclaimed"
+        );
+        assert!(
+            live.join("linux-x/vmlinux.o").exists() && build_tree_owner(&live).exists(),
+            "a tree whose owner lock is held was reclaimed"
         );
     }
 
@@ -3213,15 +3315,18 @@ mod tests {
 
             let status = run_kernel_build(
                 Command::new(&script),
-                &BuildTree::Owned(build_dir.clone()),
+                &BuildTree::Owned {
+                    path: build_dir.clone(),
+                    owner: lock_build_tree_owner(&build_dir).unwrap(),
+                },
                 "test_build",
             )
             .await
             .unwrap();
             assert_eq!(status.code(), Some(exit), "the stub build ran");
             assert!(
-                !build_dir.exists(),
-                "the {name} build left its tree at {}",
+                !build_dir.exists() && !build_tree_owner(&build_dir).exists(),
+                "the {name} build left its tree or owner file at {}",
                 build_dir.display()
             );
         }
