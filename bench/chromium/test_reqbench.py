@@ -1174,6 +1174,30 @@ class ReapExcludesReclaim(unittest.TestCase):
             self.assertEqual(reaped, [state])
             self.assertEqual(reqbench.left_on_disk(state, vm_dir), [])
 
+    def test_a_directory_removed_during_the_safety_check_is_still_safe(self):
+        """RED BEFORE THE FIX: safe_vm_data_dir asked lexists, then isdir.
+        A reclaim that removed the directory between the two made it read as
+        an entry that is not a directory, so the reap refused and left the
+        clone's state behind (campaign d3389c81 s4: "refusing to remove ... not
+        an exact child of .../vm-disks"). The check now takes one lstat, and a
+        directory already gone has nothing unsafe about it."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            state, vm_dir = self._clone(root)
+            shutil.rmtree(vm_dir)
+            real_lexists = os.path.lexists
+            # The interleaving: the directory existed for the first look and
+            # was gone for the second.
+            with mock.patch.object(os.path, "lexists",
+                                   side_effect=lambda p: True if p == vm_dir else real_lexists(p)):
+                safe = reqbench.safe_vm_data_dir(root, state, vm_dir)
+            self.assertEqual(safe, os.path.realpath(vm_dir))
+            out: dict = {}
+            reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [state])
+            self.assertEqual(reqbench.left_on_disk(state, vm_dir), [])
+
     def test_a_lock_held_past_the_wait_keeps_the_state(self):
         """A holder that does not let go is not a reclaim: the reap records the
         error and keeps the state, the only pointer to the clone's disk."""

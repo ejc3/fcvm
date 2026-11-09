@@ -2169,6 +2169,16 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     if not data_root or not state_path or not data_dir:
         return ""
     trusted = os.path.realpath(os.path.join(data_root, "vm-disks"))
+    # One lstat, not lexists then isdir: under concurrent clones another
+    # launch's reclaim can remove this directory between two calls, and a
+    # path that existed for the first and not the second read as "exists but
+    # is not a directory", refusing a reap with nothing left to remove (campaign
+    # d3389c81 s4, 1 of 7,560 requests). A missing directory is safe: rmtree
+    # has nothing to do and the state is still this clone's to remove.
+    try:
+        entry_mode = os.lstat(os.path.abspath(os.path.normpath(data_dir))).st_mode
+    except FileNotFoundError:
+        entry_mode = None
     raw = os.path.abspath(os.path.normpath(data_dir))
     head, vm_id = os.path.split(raw)
     expected = os.path.join(trusted, vm_id)
@@ -2184,7 +2194,7 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
         or os.path.islink(raw)
         or real != expected
         or not contained
-        or (os.path.lexists(raw) and not os.path.isdir(raw))
+        or (entry_mode is not None and not stat.S_ISDIR(entry_mode))
     ):
         return ""
     return real

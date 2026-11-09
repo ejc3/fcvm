@@ -827,7 +827,14 @@ def _control_gate(
     if measurement_end_ns > stop_ns:
         raise AnalysisInvalid("host-control arm stopped before the request workload drained")
     first_deadline = expected_origin + control_schedule["phase_offset_ns"]
-    expected_count = max(0, (stop_ns - 1 - first_deadline) // interval + 1)
+    # Each deadline carries its seeded offset within one frame
+    # (reqscale.control_frame_jitter_ns), so count the deadlines that fell
+    # before the stop one by one.
+    expected_count = 0
+    while (first_deadline + expected_count * interval
+           + reqscale.control_frame_jitter_ns(control_schedule["phase_seed"], expected_count)
+           < stop_ns):
+        expected_count += 1
     if len(records) != expected_count:
         raise AnalysisInvalid(
             f"host-control arm recorded {len(records)} requests but {expected_count} "
@@ -836,7 +843,8 @@ def _control_gate(
     for index, row in enumerate(records):
         if row.get("control_index") != index:
             raise AnalysisInvalid("host-control indices are not contiguous")
-        expected = expected_origin + control_schedule["phase_offset_ns"] + index * interval
+        expected = (expected_origin + control_schedule["phase_offset_ns"] + index * interval
+                    + reqscale.control_frame_jitter_ns(control_schedule["phase_seed"], index))
         if row.get("scheduled_ns") != expected:
             raise AnalysisInvalid(f"host-control row {index} diverges from its seeded schedule")
         if row.get("schema") != reqscale.RECORD_SCHEMA or row.get("kind") != "host-control":

@@ -18,6 +18,7 @@ import select
 import shlex
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -1184,18 +1185,22 @@ class CapacityGates(unittest.TestCase):
 
     def test_seeded_control_deadlines_and_drift_gate_are_exact(self):
         schedule = {
-            "control": {"interval_ns": 10_000_000_000, "phase_offset_ns": 123},
+            "control": {"interval_ns": 10_000_000_000, "phase_offset_ns": 123, "phase_seed": 7},
             "capacity_criteria": self.CRITERIA,
         }
         origin = 1000
+
+        def deadline(index):
+            return 1123 + index * 10_000_000_000 + reqscale.control_frame_jitter_ns(7, index)
+
         records = [
             {
                 "schema": reqscale.RECORD_SCHEMA,
                 "kind": "host-control",
                 "control_index": index,
-                "scheduled_ns": 1123 + index * 10_000_000_000,
-                "actual_launch_ns": 1_000_000 + 1123 + index * 10_000_000_000,
-                "artifact_ns": 1_000_000 + 1123 + index * 10_000_000_000
+                "scheduled_ns": deadline(index),
+                "actual_launch_ns": 1_000_000 + deadline(index),
+                "artifact_ns": 1_000_000 + deadline(index)
                                + round(latency * 1_000_000),
                 "latency_ms": latency,
                 "launch_lag_ms": 1.0,
@@ -1221,6 +1226,34 @@ class CapacityGates(unittest.TestCase):
             reqscale_analyze._control_gate(
                 records, schedule, status, origin, records[-1]["artifact_ns"]
             )
+
+    def test_control_deadlines_take_a_seeded_phase_within_one_frame(self):
+        """RED BEFORE THE FIX: host-control deadlines fell on exact 10 s
+        multiples. The control's latency waits for compositor frames, and on
+        that grid the frame phase drifts about 0.4 ms per control, so campaign
+        d3389c81's 4 vCPU run walked down 0.4 ms a control and jumped by a
+        frame (16.5 ms) every 35 to 40 controls between 42 and 88 ms; its
+        halves' medians were 49.7 and 67.8 ms, 36.3% drift on a quiet host.
+        Each deadline now carries a seeded offset within one 60 Hz frame,
+        which the scheduler applies and the analyzer requires."""
+        frame = reqscale.CONTROL_FRAME_JITTER_NS
+        self.assertEqual(frame, 16_666_667)
+        offsets = [reqscale.control_frame_jitter_ns(20261104, i) for i in range(140)]
+        self.assertTrue(all(0 <= o < frame for o in offsets))
+        self.assertEqual(offsets, [reqscale.control_frame_jitter_ns(20261104, i) for i in range(140)])
+        # Spread over the frame: every eighth of it holds some deadlines, and
+        # consecutive deadlines do not walk the frame in small steps.
+        self.assertEqual(len({o * 8 // frame for o in offsets}), 8)
+        steps = [abs(b - a) for a, b in zip(offsets, offsets[1:])]
+        self.assertGreater(statistics.median(steps), frame // 8)
+        source = open(os.path.join(HERE, "reqscale.py")).read()
+        run = source[source.index("class ControlScheduler"):]
+        run = run[run.index("    def _run(self)"):run.index("    def start(self)")]
+        self.assertIn("control_frame_jitter_ns(self.seed, index)", run)
+        schedule = reqscale.build_schedule(
+            reqscale.ScheduleConfig(rates=(0.8,), scored_bursts=5, seed=20261104,
+                                    criteria=reqscale.CapacityCriteria(**{k: v for k, v in self.CRITERIA.items() if k != "require_zero_failures"}), urls=("http://127.0.0.1/x",)), "a" * 32)
+        self.assertEqual(schedule["control"]["frame_jitter_ns"], frame)
 
     def test_impossible_cell_metrics_are_invalid_not_publishable_failures(self):
         cell = self.cell()
@@ -1734,7 +1767,12 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         control_stop = measurement_end + 1
         first_deadline = control_origin + schedule["control"]["phase_offset_ns"]
         controls = []
-        deadline = first_deadline
+
+        def control_deadline(index):
+            return (first_deadline + index * schedule["control"]["interval_ns"]
+                    + reqscale.control_frame_jitter_ns(schedule["control"]["phase_seed"], index))
+
+        deadline = control_deadline(0)
         while deadline < control_stop:
             actual = deadline + 1_000_000
             artifact = actual + 100_000_000
@@ -1745,7 +1783,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "launch_lag_ms": 1.0, "latency_ms": 100.0,
                 "ok": True, "result": {"ok": True},
             })
-            deadline += schedule["control"]["interval_ns"]
+            deadline = control_deadline(len(controls))
 
         sample_origin = measurement_start - 1_000_000_000
         sample_stop = measurement_end + 1
