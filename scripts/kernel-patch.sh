@@ -6,6 +6,10 @@
 #   ./scripts/kernel-patch.sh create <profile> <patch-name> <file1> [file2...]
 #   ./scripts/kernel-patch.sh edit <profile> <patch-number>
 #   ./scripts/kernel-patch.sh validate <profile>
+#   ./scripts/kernel-patch.sh resolve <profile>
+#
+# <profile> is a kernel profile name (nested), or <name>.host_kernel (nested.host_kernel)
+# for the host kernel that profile installs, which skips *.vm.patch as the host build does.
 #
 # Examples:
 #   # Create a new patch for fs/fuse/dir.c
@@ -44,6 +48,24 @@ get_config_arch() {
     esac
 }
 
+# The rootfs-config.toml table of a profile. The host kernel of profile P lives in
+# [kernel_profiles.P.<arch>.host_kernel], not [kernel_profiles.P.host_kernel.<arch>].
+profile_section() {
+    local profile="$1" config_arch="$2"
+    if [[ "$profile" == *.host_kernel ]]; then
+        printf '[kernel_profiles.%s.%s.host_kernel]\n' "${profile%.host_kernel}" "$config_arch"
+    else
+        printf '[kernel_profiles.%s.%s]\n' "$profile" "$config_arch"
+    fi
+}
+
+# The host build applies *.patch but never *.vm.patch (src/setup/kernel.rs), so a host
+# profile's commands skip them too.
+skips_patch() {
+    local profile="$1" patch="$2"
+    [[ "$profile" == *.host_kernel && "$patch" == *.vm.patch ]]
+}
+
 # Get kernel version from config
 get_kernel_version() {
     local profile="$1"
@@ -59,7 +81,7 @@ get_kernel_version() {
     # Match the exact architecture-specific TOML section. Treating the section
     # name as a grep regex makes its brackets a character class and silently
     # returns an empty version.
-    version=$(awk -v section="[kernel_profiles.${profile}.${config_arch}]" '
+    version=$(awk -v section="$(profile_section "$profile" "$config_arch")" '
         $0 == section { in_section = 1; next }
         in_section && /^\[/ { exit }
         in_section && /^[[:space:]]*kernel_version[[:space:]]*=/ {
@@ -72,7 +94,7 @@ get_kernel_version() {
     ' "$config_file")
 
     [[ -n "$version" ]] || error \
-        "Could not find kernel_version in [kernel_profiles.${profile}.${config_arch}]"
+        "Could not find kernel_version in $(profile_section "$profile" "$config_arch")"
     printf '%s\n' "$version"
 }
 
@@ -91,7 +113,7 @@ get_patches_dir() {
     # A profile may name its own patches_dir, and the Rust build reads it
     # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
     # a different set of patches than the one that actually gets built.
-    if declared=$(awk -v section="[kernel_profiles.${profile}.${config_arch}]" '
+    if declared=$(awk -v section="$(profile_section "$profile" "$config_arch")" '
         $0 == section { in_section = 1; next }
         in_section && /^\[/ { exit 1 }
         in_section && /^[[:space:]]*patches_dir[[:space:]]*=/ {
@@ -164,6 +186,7 @@ apply_patches_until() {
     local kernel_dir="$1"
     local patches_dir="$2"
     local stop_at="$3"  # e.g., "0002" or empty to apply all
+    local profile="${4:-}"
 
     cd "$kernel_dir"
 
@@ -173,6 +196,7 @@ apply_patches_until() {
 
     for patch in "$patches_dir"/*.patch; do
         [[ -f "$patch" ]] || continue
+        skips_patch "$profile" "$patch" && continue
 
         local patch_name=$(basename "$patch")
         local patch_num="${patch_name:0:4}"
@@ -259,7 +283,7 @@ cmd_create() {
     local kernel_dir=$(setup_kernel_source "$version" "$workdir")
 
     # Apply existing patches
-    apply_patches_until "$kernel_dir" "$patches_dir" ""
+    apply_patches_until "$kernel_dir" "$patches_dir" "" "$profile"
 
     # Mark current state
     cd "$kernel_dir"
@@ -338,6 +362,8 @@ cmd_edit() {
     # Find the patch file
     local patch_file=$(ls "$patches_dir"/${patch_num}*.patch 2>/dev/null | head -1)
     [[ -f "$patch_file" ]] || error "No patch found matching: ${patch_num}*.patch"
+    skips_patch "$profile" "$patch_file" && error \
+        "$(basename "$patch_file") is guest-only (*.vm.patch); the host build never applies it"
 
     local patch_name=$(basename "$patch_file")
 
@@ -347,7 +373,7 @@ cmd_edit() {
     local kernel_dir=$(setup_kernel_source "$version" "$workdir")
 
     # Apply patches up to (but not including) this one
-    apply_patches_until "$kernel_dir" "$patches_dir" "$patch_num"
+    apply_patches_until "$kernel_dir" "$patches_dir" "$patch_num" "$profile"
 
     # Apply the target patch
     cd "$kernel_dir"
@@ -396,6 +422,7 @@ cmd_validate() {
     local failed=0
     for patch in "$patches_dir"/*.patch; do
         [[ -f "$patch" ]] || continue
+        skips_patch "$profile" "$patch" && continue
 
         local patch_name=$(basename "$patch")
 
@@ -435,6 +462,13 @@ case "${1:-}" in
         shift
         cmd_validate "$@"
         ;;
+    resolve)
+        shift
+        [[ -n "${1:-}" ]] || error "Usage: $0 resolve <profile>"
+        resolved_version=$(get_kernel_version "$1") || exit 1
+        resolved_patches=$(get_patches_dir "$1") || exit 1
+        printf 'version=%s\npatches_dir=%s\n' "$resolved_version" "$resolved_patches"
+        ;;
     *)
         echo "Usage: $0 <command> [args...]"
         echo ""
@@ -450,6 +484,11 @@ case "${1:-}" in
         echo ""
         echo "  validate <profile>"
         echo "      Validate all patches apply cleanly"
+        echo ""
+        echo "  resolve <profile>"
+        echo "      Print the kernel version and patches_dir the profile uses"
+        echo ""
+        echo "  <profile> is a profile name (nested) or <name>.host_kernel (nested.host_kernel)"
         echo ""
         echo "Examples:"
         echo "  $0 create nested 0004-my-fix fs/fuse/dir.c"
