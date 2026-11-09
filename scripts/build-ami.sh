@@ -105,9 +105,9 @@ compute_hash() {
   # symlink produced a valid-looking hash computed over FEWER inputs. That is the
   # stale-AMI bug this function exists to prevent, wearing a different hat:
   # check_existing_ami would match an image built from a different kernel.
-  # The host kernel's patch set is the patches_dir its own table names (#659: the 7.3
-  # host builds from kernel/patches-arm64-host while 6.18 guests build from
-  # kernel/patches-arm64), so read it from that table rather than assume a directory.
+  # The host kernel's patch set is the patches_dir its own table names, which can
+  # differ from the guest's (#659 ran a 7.3 host from its own set under 6.18 guests),
+  # so read it from that table rather than assume a directory.
   local host_patches_dir
   if ! host_patches_dir=$(awk '
       /^\[/ { in_section = ($0 == "[kernel_profiles.nested.arm64.host_kernel]") }
