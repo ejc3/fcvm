@@ -122,16 +122,35 @@ const MAX_MEM_LEN: u64 = 1 << 40;
 pub struct ImageKey([u8; 32]);
 
 impl ImageKey {
+    /// The key of a memory image of `len` bytes, last modified at `mtime_sec` seconds and
+    /// `mtime_nsec` nanoseconds, in the snapshot generation whose `config.json` has the
+    /// SHA-256 `config_digest`. [`ImageKey::of`] takes the three facts from a `stat`;
+    /// `snapshot import` takes them from an archive's manifest, which records them as they
+    /// were on the exporting host.
+    pub(crate) fn from_parts(
+        config_digest: &[u8; 32],
+        len: u64,
+        mtime_sec: i64,
+        mtime_nsec: i64,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(config_digest);
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime_sec.to_le_bytes());
+        hasher.update(mtime_nsec.to_le_bytes());
+        Self(hasher.finalize().into())
+    }
+
     /// Derive the key of the memory image at `path`.
     pub fn of(path: &Path, config_digest: &[u8; 32]) -> Result<Self> {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("stat-ing memory image {}", path.display()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(config_digest);
-        hasher.update(meta.len().to_le_bytes());
-        hasher.update(meta.mtime().to_le_bytes());
-        hasher.update(meta.mtime_nsec().to_le_bytes());
-        Ok(Self(hasher.finalize().into()))
+        Ok(Self::from_parts(
+            config_digest,
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))
     }
 
     /// Derive the key of the snapshot generation whose memory image and config are at these
@@ -154,6 +173,42 @@ impl std::fmt::Debug for ImageKey {
             write!(f, "{b:02x}")?;
         }
         Ok(())
+    }
+}
+
+/// Why the bytes of a sidecar are not the recorded working set of the image they were
+/// decoded for. It prints as the rest of a sentence whose subject is the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unusable {
+    /// Not a whole sidecar: what is wrong with it.
+    Malformed(&'static str),
+    /// Written in another format version: the one it has.
+    Version(u64),
+    /// Recorded against a memory image of another length: the one it describes.
+    ImageLength(u64),
+    /// Recorded against another memory image or another generation's config.
+    Key,
+}
+
+impl std::fmt::Display for Unusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(why) => write!(f, "does not decode ({why})"),
+            Self::Version(found) => write!(
+                f,
+                "has format version {found} and this build reads version {VERSION}"
+            ),
+            Self::ImageLength(found) => write!(
+                f,
+                "describes a memory image of {found} bytes, which is not the length it was \
+                 checked against"
+            ),
+            Self::Key => write!(
+                f,
+                "was recorded against another memory image or another config than the ones \
+                 it was checked against"
+            ),
+        }
     }
 }
 
@@ -399,13 +454,28 @@ impl PageSet {
 
     /// Parse the on-disk representation, checking it describes `key`'s image.
     ///
-    /// Every rejection is a `Ok(None)` with a reason, not an error: a working set that does
-    /// not apply is simply absent.
+    /// Every rejection is a `None` with a logged reason, not an error: a working set that
+    /// does not apply is absent.
     fn decode(buf: &[u8], key: &ImageKey, mem_len: u64) -> Option<Self> {
-        let reject = |why: &str| -> Option<Self> {
-            debug!(target: "uffd", reason = why, "ignoring recorded working set");
-            None
-        };
+        match Self::decode_recorded(buf, key, mem_len) {
+            Ok(set) => Some(set),
+            Err(why) => {
+                debug!(target: "uffd", reason = %why, "ignoring recorded working set");
+                None
+            }
+        }
+    }
+
+    /// [`decode`](Self::decode) for a caller that reports why a sidecar does not apply:
+    /// `snapshot import`, which decodes an archived sidecar under the key of the exporting
+    /// host's image before it writes the set under the installed image's key.
+    pub(crate) fn decode_recorded(
+        buf: &[u8],
+        key: &ImageKey,
+        mem_len: u64,
+    ) -> Result<Self, Unusable> {
+        let reject =
+            |why: &'static str| -> Result<Self, Unusable> { Err(Unusable::Malformed(why)) };
         if buf.len() < HEADER_LEN {
             return reject("file shorter than header");
         }
@@ -414,20 +484,20 @@ impl PageSet {
             return reject("bad magic");
         }
         if u64_at(8) != VERSION {
-            return reject("unsupported version");
+            return Err(Unusable::Version(u64_at(8)));
         }
         if u64_at(16) != GRANULE {
             return reject("different granule");
         }
         if u64_at(24) != mem_len {
-            return reject("memory image size changed");
+            return Err(Unusable::ImageLength(u64_at(24)));
         }
         let granules = u64_at(32);
         if granules != mem_len.div_ceil(GRANULE) {
             return reject("granule count does not match image size");
         }
         if buf[40..72] != key.0 {
-            return reject("memory image changed (key mismatch)");
+            return Err(Unusable::Key);
         }
         let words = (granules as usize).div_ceil(64);
         if buf.len() < HEADER_LEN + words * 8 {
@@ -466,7 +536,7 @@ impl PageSet {
                 next += 2;
             }
         }
-        Some(set)
+        Ok(set)
     }
 }
 
@@ -887,13 +957,7 @@ impl WorkingSetStore {
         generation_config_path: &Path,
         set: &PageSet,
     ) -> Result<()> {
-        anyhow::ensure!(
-            mem_len <= MAX_MEM_LEN,
-            "memory image {} is {mem_len} bytes, past the {MAX_MEM_LEN}-byte working-set limit",
-            mem_file_path.display()
-        );
-        let key = ImageKey::of_generation(mem_file_path, generation_config_path)?;
-        let path = Self::path_for(mem_file_path);
+        let (path, key) = Self::seed_target(mem_file_path, mem_len, generation_config_path)?;
         let lock_file = File::options()
             .create(true)
             .read(true)
@@ -907,6 +971,45 @@ impl WorkingSetStore {
         let result = write_set(&path, set, &key, mem_len);
         lock.unlock().map_err(|(_, err)| err).ok();
         result
+    }
+
+    /// Write `set` as the recorded working set of a snapshot generation that is staged and
+    /// has no name yet: `snapshot import` calls it on its staging directory, after it has
+    /// written the generation's config and before it syncs the directory and renames it to
+    /// the tag.
+    ///
+    /// The caller must hold the tag's lock exclusively, and the directory must not have the
+    /// tag's name yet: this takes no lock and makes no lock file, so it is safe only while
+    /// the sidecar has no other writer and no reader. A staging directory under that lock
+    /// has neither until the rename, which publishes the sidecar whole with the rest of the
+    /// generation.
+    ///
+    /// The key is the one [`WorkingSetStore::open`] derives once the directory has its
+    /// name: the config's bytes and the memory image's length and modification time, none
+    /// of which the rename changes.
+    pub(crate) fn seed_staged_generation(
+        mem_file_path: &Path,
+        mem_len: u64,
+        generation_config_path: &Path,
+        set: &PageSet,
+    ) -> Result<()> {
+        let (path, key) = Self::seed_target(mem_file_path, mem_len, generation_config_path)?;
+        write_set(&path, set, &key, mem_len)
+    }
+
+    /// Where a seeded set is written and the key it is written under.
+    fn seed_target(
+        mem_file_path: &Path,
+        mem_len: u64,
+        generation_config_path: &Path,
+    ) -> Result<(PathBuf, ImageKey)> {
+        anyhow::ensure!(
+            mem_len <= MAX_MEM_LEN,
+            "memory image {} is {mem_len} bytes, past the {MAX_MEM_LEN}-byte working-set limit",
+            mem_file_path.display()
+        );
+        let key = ImageKey::of_generation(mem_file_path, generation_config_path)?;
+        Ok((Self::path_for(mem_file_path), key))
     }
 
     /// The set to prefetch for a clone starting now.
@@ -1159,15 +1262,28 @@ pub fn hint_covers_most_of_the_image(hint_bytes: u64, mem_len: u64) -> bool {
     hint_bytes > mem_len / 2
 }
 
-/// Read and validate a recorded set. `None` means "nothing usable here" — always a normal
-/// outcome, never an error.
-fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
+/// The most bytes the recorded working set of a `mem_len`-byte image takes on disk: the
+/// header, the bitmap, and a first-touch time for every granule.
+fn encoded_len_bound(mem_len: u64) -> u64 {
     let granules = mem_len.div_ceil(GRANULE);
     let bitmap_bytes = granules.div_ceil(64).saturating_mul(8);
     let times_bytes = granules.saturating_mul(std::mem::size_of::<FirstTouch>() as u64);
-    let max_len = (HEADER_LEN as u64)
+    (HEADER_LEN as u64)
         .saturating_add(bitmap_bytes)
-        .saturating_add(times_bytes);
+        .saturating_add(times_bytes)
+}
+
+/// [`encoded_len_bound`] for a caller that holds a sidecar's bytes in memory before it
+/// decodes them. `None` for an image past the length a working set is recorded for
+/// ([`MAX_MEM_LEN`]), whose bound is no bound on an allocation.
+pub(crate) fn max_recorded_len(mem_len: u64) -> Option<u64> {
+    (mem_len <= MAX_MEM_LEN).then(|| encoded_len_bound(mem_len))
+}
+
+/// Read and validate a recorded set. `None` means "nothing usable here", which is always a
+/// normal outcome and never an error.
+fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
+    let max_len = encoded_len_bound(mem_len);
     let mut buf = Vec::new();
     match File::open(path).and_then(|f| f.take(max_len.saturating_add(1)).read_to_end(&mut buf)) {
         Ok(_) => {}
@@ -2226,5 +2342,201 @@ mod tests {
             open_store(&image, mem_len).to_prefetch().is_empty(),
             "trailing bytes past the exact bitmap shape must invalidate the hint"
         );
+    }
+
+    /// Pages in four first-touch tiers: the first half second, two later ones, and no known
+    /// time.
+    fn tiered_set(mem_len: u64) -> PageSet {
+        let mut set = PageSet::empty(mem_len);
+        set.insert_range_at(0, 3 * GRANULE, 1);
+        set.insert_range_at(10 * GRANULE, 2 * GRANULE, 30);
+        set.insert_range_at(40 * GRANULE, GRANULE, 100);
+        set.insert_range(63 * GRANULE, GRANULE);
+        assert_eq!(
+            set.by_first_touch()
+                .iter()
+                .filter(|tier| !tier.is_empty())
+                .count(),
+            4,
+            "control: the set spans four first-touch tiers"
+        );
+        set
+    }
+
+    /// The key built from a config digest and a memory image's length and modification time
+    /// is the key `ImageKey::of` derives from a `stat` of that image, and each of the four
+    /// facts is part of it.
+    #[test]
+    fn a_key_from_parts_is_the_key_of_the_image_with_those_facts() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("parts", mem_len);
+        let meta = std::fs::metadata(&image).unwrap();
+        let (sec, nsec) = (meta.mtime(), meta.mtime_nsec());
+        let digest = [0x42; 32];
+        let key = ImageKey::of(&image, &digest).unwrap();
+
+        assert_eq!(ImageKey::from_parts(&digest, mem_len, sec, nsec), key);
+        for (what, other) in [
+            (
+                "config digest",
+                ImageKey::from_parts(&[0x43; 32], mem_len, sec, nsec),
+            ),
+            (
+                "length",
+                ImageKey::from_parts(&digest, mem_len + 1, sec, nsec),
+            ),
+            (
+                "seconds",
+                ImageKey::from_parts(&digest, mem_len, sec + 1, nsec),
+            ),
+            (
+                "nanoseconds",
+                ImageKey::from_parts(&digest, mem_len, sec, nsec + 1),
+            ),
+        ] {
+            assert!(
+                other != key,
+                "a key built with another {what} is the same key"
+            );
+        }
+    }
+
+    /// `decode_recorded` gives back the pages and first-touch times of a sidecar under the
+    /// key and the image length it was written for, and otherwise says which of them is
+    /// wrong: the key, the length, the format version, or the bytes.
+    #[test]
+    fn decode_recorded_says_why_a_sidecar_does_not_apply() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("why", mem_len);
+        let key = image_key(&image);
+        let set = tiered_set(mem_len);
+        let good = set.encode(&key, mem_len);
+
+        assert_eq!(
+            PageSet::decode_recorded(&good, &key, mem_len),
+            Ok(set.clone())
+        );
+        let other_key = ImageKey::from_parts(&[0x43; 32], mem_len, 0, 0);
+        assert_eq!(
+            PageSet::decode_recorded(&good, &other_key, mem_len),
+            Err(Unusable::Key)
+        );
+        assert_eq!(
+            PageSet::decode_recorded(&good, &key, 2 * mem_len),
+            Err(Unusable::ImageLength(mem_len))
+        );
+        let mut other_version = good.clone();
+        other_version[8..16].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        assert_eq!(
+            PageSet::decode_recorded(&other_version, &key, mem_len),
+            Err(Unusable::Version(VERSION + 1))
+        );
+        for (bytes, why) in [
+            (&good[..good.len() - 1], "truncated first-touch times"),
+            (&good[..HEADER_LEN + 4], "truncated bitmap"),
+            (&b"not a working set"[..], "file shorter than header"),
+        ] {
+            assert_eq!(
+                PageSet::decode_recorded(bytes, &key, mem_len),
+                Err(Unusable::Malformed(why))
+            );
+        }
+    }
+
+    /// What `snapshot import` does with an archived sidecar. The set recorded for one
+    /// generation decodes under that generation's key, built from the digest of its config
+    /// and its image's length and modification time. Seeded into a staged generation with
+    /// another config and another modification time, it is what a store of that generation
+    /// loads once the directory has its name: the same pages in the same first-touch tiers.
+    /// The seed makes no lock file and leaves no temporary.
+    #[test]
+    fn a_set_seeded_into_a_staged_generation_is_what_its_store_loads() {
+        let mem_len = 64 * GRANULE;
+        let set = tiered_set(mem_len);
+
+        // The exporting side: a generation with a recorded set.
+        let source = fake_image("seed-source", mem_len);
+        let source_config = generation_config_for(&source);
+        std::fs::write(&source_config, b"exported generation").unwrap();
+        WorkingSetStore::seed_held_generation(&source, mem_len, &source_config, &set).unwrap();
+        let archived = std::fs::read(WorkingSetStore::path_for(&source)).unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let archived_key = ImageKey::from_parts(
+            &Sha256::digest(b"exported generation").into(),
+            mem_len,
+            meta.mtime(),
+            meta.mtime_nsec(),
+        );
+        let decoded = PageSet::decode_recorded(&archived, &archived_key, mem_len)
+            .expect("the sidecar decodes under the key of the facts it was recorded with");
+
+        // The importing side: a staging directory with its own config and memory image.
+        let root = tempfile::Builder::new()
+            .prefix("fcvm-ws-test-staged-")
+            .tempdir()
+            .unwrap();
+        let staging = root.path().join("example-tag.creating");
+        std::fs::create_dir(&staging).unwrap();
+        let (memory, config) = (staging.join("memory.bin"), staging.join("config.json"));
+        let image = File::create(&memory).unwrap();
+        image.set_len(mem_len).unwrap();
+        image
+            .set_modified(meta.modified().unwrap() + Duration::from_secs(3600))
+            .unwrap();
+        std::fs::write(&config, b"imported generation").unwrap();
+        assert_eq!(
+            PageSet::decode_recorded(
+                &archived,
+                &ImageKey::of_generation(&memory, &config).unwrap(),
+                mem_len
+            ),
+            Err(Unusable::Key),
+            "control: the staged generation has a key of its own"
+        );
+
+        WorkingSetStore::seed_staged_generation(&memory, mem_len, &config, &decoded).unwrap();
+
+        let mut names: Vec<String> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["config.json", "memory.bin", "memory.bin.working-set"],
+            "the staged generation's files after the seed"
+        );
+
+        // Publication is a rename of the directory.
+        let dir = root.path().join("example-tag");
+        std::fs::rename(&staging, &dir).unwrap();
+        let store = WorkingSetStore::open(
+            &dir.join("memory.bin"),
+            mem_len,
+            &dir.join("config.json"),
+            &root.path().join("example-tag.lock"),
+        )
+        .unwrap();
+        assert_eq!(store.to_prefetch(), set, "pages and first-touch times");
+        assert!(
+            *store.to_prefetch_ordered() == set.by_first_touch(),
+            "first-touch tiers"
+        );
+    }
+
+    /// The bound on a sidecar's length is the length of a set that holds every granule,
+    /// and an image past the working-set limit has none.
+    #[test]
+    fn the_longest_sidecar_of_an_image_holds_every_granule() {
+        let mem_len = 100 * GRANULE;
+        let image = fake_image("longest", mem_len);
+        let mut every = PageSet::empty(mem_len);
+        every.insert_range(0, mem_len);
+        assert_eq!(
+            max_recorded_len(mem_len),
+            Some(every.encode(&image_key(&image), mem_len).len() as u64)
+        );
+        assert!(max_recorded_len(MAX_MEM_LEN).is_some());
+        assert_eq!(max_recorded_len(MAX_MEM_LEN + 1), None);
     }
 }
