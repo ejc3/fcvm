@@ -62,16 +62,8 @@ jobs:
         working-directory: fcvm
         run: ./scripts/build-passt.sh
       - name: Install Firecracker
-        run: |
-          ARCH=$(uname -m)
-          FC_VERSION="1.14.0"
-          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
-            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
-          sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-            "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
-            "release-v${FC_VERSION}-${ARCH}/jailer-v${FC_VERSION}-${ARCH}"
-          sudo mv "/usr/local/bin/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
-          sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+        working-directory: fcvm
+        run: ./scripts/ci-install-firecracker.sh
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm

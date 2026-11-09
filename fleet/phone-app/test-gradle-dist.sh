@@ -11,8 +11,9 @@ trap 'rm -rf "$dir"' EXIT
 mkdir -p "$dir/src" "$dir/dist" "$dir/bin" "$dir/sync"
 cp "$here/Makefile" "$here/Containerfile" "$dir/src/"
 version=$(sed -n 's/^ARG GRADLE_VERSION=//p' "$here/Containerfile")
-head -c 1048576 /dev/urandom > "$dir/dist/gradle-$version-bin.zip"
-sha=$(sha256sum "$dir/dist/gradle-$version-bin.zip" | cut -d' ' -f1)
+head -c 1048576 /dev/urandom > "$dir/dist/zip"
+sha=$(sha256sum "$dir/dist/zip" | cut -d' ' -f1)
+mv "$dir/dist/zip" "$dir/dist/$sha-gradle-$version-bin.zip"
 cat > "$dir/bin/podman" <<'S'
 #!/bin/bash
 # image exists: never; build: A holds the staged archive open until B has built, then reports
@@ -35,7 +36,7 @@ case "$1" in
 esac
 S
 chmod +x "$dir/bin/podman"
-mk() { make -s -C "$dir/src" image PODMAN="$dir/bin/podman" GRADLE_DIST="$dir/dist" GRADLE_SHA256="$sha"; }
+mk() { make -s -C "$dir/src" image PODMAN="$dir/bin/podman" GRADLE_DIST="$dir/dist" GRADLE_SHA256="$sha" CACHED_DOWNLOAD="$here/../../scripts/cached-download.sh"; }
 ROLE=A SYNC="$dir/sync" mk > "$dir/out.A" 2>&1 &
 pA=$!
 for _ in $(seq 1 200); do [ -e "$dir/sync/a-open" ] && break; sleep 0.05; done
@@ -45,6 +46,7 @@ ROLE=B SYNC="$dir/sync" mk > "$dir/out.B" 2>&1 || { echo "FAIL: run B failed"; c
 wait "$pA" || { echo "FAIL: run A failed"; cat "$dir/out.A"; rc=1; }
 result=$(cat "$dir/sync/a-result" 2>/dev/null)
 [ "$result" = unchanged ] || { echo "FAIL: run B modified the archive run A's build was reading ($result)"; rc=1; }
-[ "$(ls -A "$dir/src/.gradle-dist" | grep -vc '\.zip$')" = 0 ] || { echo "FAIL: staging left temporary files: $(ls -A "$dir/src/.gradle-dist")"; rc=1; }
+left=$(find "$dir/src/.gradle-dist" -mindepth 1 ! -name '*.zip')
+[ -z "$left" ] || { echo "FAIL: staging left temporary files: $left"; rc=1; }
 [ $rc = 0 ] && echo "ok: concurrent make image runs leave each build's staged archive intact"
 exit $rc
