@@ -8,7 +8,8 @@ mod warmup;
 mod working_set;
 
 pub use handler::UffdHandler;
-pub use holes::for_each_data_run;
+pub(crate) use holes::flush_for_hole_walk;
+pub use holes::{for_each_data_run, try_for_each_data_run};
 pub use release::{mark_in_use, release_idle_snapshots, Released};
 pub use server::{
     preflight_clone_hugepages, record_window_from_env, FaultAround, Prefetch, ReplayLimit,

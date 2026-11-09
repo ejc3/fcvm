@@ -1485,6 +1485,15 @@ fn merge_with(
         size
     );
 
+    // Both passes find the diff's data with SEEK_DATA and SEEK_HOLE in a loop of their own, a window at a time. A
+    // diff on FUSE is flushed here, once, before the first of those seeks: until then a page still dirty in the
+    // page cache reads as a hole there, and the merge would leave it out of the base.
+    let diff = std::fs::File::open(diff_path)
+        .with_context(|| format!("opening diff snapshot: {}", diff_path.display()))?;
+    crate::uffd::flush_for_hole_walk(&diff)
+        .with_context(|| format!("diff snapshot: {}", diff_path.display()))?;
+    drop(diff);
+
     let shared = MergeShared::new(tuning.min_punch);
     // The walk that counts only seeks, and what it has to cover is known before it starts from the blocks the
     // diff has allocated. A small diff is walked on the calling thread.
@@ -10984,6 +10993,37 @@ mod tests {
             error.contains("flushing the merged memory file")
                 && error.contains("the disk went away"),
             "{error}"
+        );
+    }
+
+    /// A merge seeks for the diff's data in loops of its own (`window_writes`, `diff_has_data_at`), not through
+    /// `uffd::for_each_data_run`, so it gives the diff the flush a file on FUSE needs itself, before either pass
+    /// starts. No fake filesystem misreports dirty pages to SEEK_HOLE, so the order is pinned by the source.
+    #[test]
+    fn a_merge_flushes_a_diff_on_fuse_before_it_seeks_for_its_data() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("\nfn merge_with(")
+            .expect("merge_with is gone from common.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("merge_with has no end")];
+        let flush = body
+            .find("crate::uffd::flush_for_hole_walk(&diff)")
+            .expect("merge_with no longer flushes the diff before its hole walks");
+        let first_pass = body.find("merge_pass(").expect("merge_with has no pass");
+        assert!(
+            flush < first_pass,
+            "the diff must be flushed before the first pass seeks for its data"
+        );
+        // Control: the seeks are where this test says they are, and nowhere else in the file's own code.
+        let code = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests")];
+        assert_eq!(
+            code.matches("Whence::Seek").count(),
+            3,
+            "common.rs seeks for data and holes in window_writes and diff_has_data_at, which merge_with \
+             covers; a seek anywhere else needs a flush before it"
         );
     }
 

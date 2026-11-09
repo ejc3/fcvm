@@ -11,7 +11,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use memmap2::MmapOptions;
-use nix::sys::statfs::{fstatfs, FsType, FUSE_SUPER_MAGIC};
 use userfaultfd::{Event, FaultKind, ReadWrite, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -632,29 +631,6 @@ impl FileHoles {
     }
 }
 
-/// Whether the memory file has to be flushed before `SEEK_HOLE` describes it, on a
-/// filesystem of type `fs_type`. Only on FUSE: fuse-pipe forwards `SEEK_HOLE` to the host, so
-/// in a nested L1 whose data dir is on fuse-pipe with the writeback cache, a page still dirty
-/// in the L1's page cache would read as a hole and be served as zeros. A local filesystem
-/// answers `SEEK_HOLE` from its page cache, dirty pages included, and flushing a file just
-/// written costs seconds (`fdatasync` took 3.27 s for one on btrfs).
-fn flush_before_mapping_holes(fs_type: FsType) -> bool {
-    fs_type == FUSE_SUPER_MAGIC
-}
-
-/// The holes of the first `mem_size` bytes of `file`, after a flush where
-/// [`flush_before_mapping_holes`] calls for one. The walk moves the file offset, so `file` is
-/// a description of its own ([`open_for_hole_walk`]).
-fn build_file_holes(file: &File, mem_size: usize) -> Result<HoleMap> {
-    let fs_type = fstatfs(file)
-        .context("reading the memory file's filesystem type")?
-        .filesystem_type();
-    if flush_before_mapping_holes(fs_type) {
-        file.sync_data().context("flushing the memory file")?;
-    }
-    HoleMap::from_file(file, mem_size)
-}
-
 /// A read-only open file description of `file`, through `/proc/self/fd`, whose file offset
 /// nothing else uses. `SEEK_DATA` and `SEEK_HOLE` move the offset, and the hole walk runs
 /// while the server serves, so it does not use a duplicate of the served descriptor, which
@@ -664,7 +640,9 @@ fn open_for_hole_walk(file: &File) -> std::io::Result<File> {
 }
 
 /// Build the hole map of `file` on a thread of its own and publish it into `source`, a COPY
-/// page source, when it is whole. The source is weak, so the build keeps nothing alive: a
+/// page source, when it is whole. The walk flushes a memory file on FUSE first
+/// ([`HoleMap::from_file`]), and it moves the file offset, so `file` is a description of its
+/// own ([`open_for_hole_walk`]). The source is weak, so the build keeps nothing alive: a
 /// server dropped before the build ends gets nothing published.
 fn spawn_hole_map_build(
     snapshot_id: &str,
@@ -678,7 +656,7 @@ fn spawn_hole_map_build(
         .name("fcvm-holes".to_string())
         .spawn(move || {
             let started = std::time::Instant::now();
-            let map = build_file_holes(&file, mem_size);
+            let map = HoleMap::from_file(&file, mem_size);
             drop(file);
             publish_file_holes(&snapshot, &source, map, started.elapsed());
         });
@@ -13335,65 +13313,6 @@ mod tests {
         );
     }
 
-    /// A memory file on FUSE is flushed before its holes are mapped, and one on a local
-    /// filesystem is not. fuse-pipe forwards SEEK_HOLE to the host, so in a nested L1 with the
-    /// writeback cache a page still dirty in the L1 would read as a hole. A local filesystem
-    /// answers SEEK_HOLE from its page cache, and a flush of a file just written costs seconds.
-    #[test]
-    fn the_memory_file_is_flushed_before_its_holes_are_mapped_only_on_fuse() {
-        use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, TMPFS_MAGIC, XFS_SUPER_MAGIC};
-        assert!(
-            flush_before_mapping_holes(FUSE_SUPER_MAGIC),
-            "a memory file on FUSE must be flushed: SEEK_HOLE there sees only what was written \
-             back"
-        );
-        for (name, local) in [
-            ("btrfs", BTRFS_SUPER_MAGIC),
-            ("ext4", EXT4_SUPER_MAGIC),
-            ("xfs", XFS_SUPER_MAGIC),
-            ("tmpfs", TMPFS_MAGIC),
-        ] {
-            assert!(
-                !flush_before_mapping_holes(local),
-                "a memory file on {name} must not be flushed: SEEK_HOLE there reads the page \
-                 cache, and a flush of a file just written costs seconds"
-            );
-        }
-        // Control: the decision is made on the type of the file served, and a memfd is tmpfs.
-        let memfd = memfd_with_pages(c"fcvm-holes-fs-type", 1, &[]);
-        assert_eq!(
-            fstatfs(&memfd)
-                .expect("fstatfs on a memfd")
-                .filesystem_type(),
-            TMPFS_MAGIC
-        );
-    }
-
-    /// The flush that a memory file on FUSE gets comes before the walk that maps its holes. No
-    /// fake filesystem misreports dirty pages to SEEK_HOLE, so the order is pinned by the
-    /// source.
-    #[test]
-    fn the_hole_map_is_built_after_a_flush_only_fuse_gets() {
-        let source = include_str!("server.rs");
-        let start = source
-            .find("fn build_file_holes(")
-            .expect("build_file_holes was renamed without updating this test");
-        let body = &source[start..];
-        let body = &body[..body.find("\n}\n").expect("build_file_holes ends")];
-        let at = |needle: &str| {
-            body.find(needle)
-                .unwrap_or_else(|| panic!("build_file_holes has no `{needle}`"))
-        };
-        assert!(
-            at("if flush_before_mapping_holes(") < at(".sync_data()"),
-            "the memory file is flushed only where flush_before_mapping_holes says so"
-        );
-        assert!(
-            at(".sync_data()") < at("HoleMap::from_file("),
-            "the memory file must be flushed before its holes are mapped"
-        );
-    }
-
     /// The hole walk runs on an open file description of its own, so the served descriptor's
     /// file offset stays where it was, however long the walk takes.
     #[test]
@@ -13404,7 +13323,7 @@ mod tests {
         let set = unsafe { libc::lseek(memfd.as_raw_fd(), 5, libc::SEEK_SET) };
         assert_eq!(set, 5, "control: the served descriptor's offset is set");
         let walk = open_for_hole_walk(&memfd).expect("opening the memory file again");
-        let holes = build_file_holes(&walk, 8 * page).expect("mapping the holes");
+        let holes = HoleMap::from_file(&walk, 8 * page).expect("mapping the holes");
         assert_eq!(
             holes.bytes(),
             6 * page,
@@ -13537,7 +13456,7 @@ mod tests {
             unreachable!("the source set above is COPY");
         };
         holes.publish(Some(
-            build_file_holes(&memfd, clone.file_pages * PAGE).expect("mapping the memfd's holes"),
+            HoleMap::from_file(&memfd, clone.file_pages * PAGE).expect("mapping the memfd's holes"),
         ));
         assert_eq!(clone.touch(&uffd, &mut state, 3), 0);
         assert_eq!(
