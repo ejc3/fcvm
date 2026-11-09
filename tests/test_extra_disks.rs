@@ -539,6 +539,125 @@ async fn test_nfs_two_clones_of_one_snapshot_both_mount() -> Result<()> {
     result
 }
 
+/// Twin clones of one NFS snapshot each keep the file the guest held open across it (#1737).
+///
+/// Both clones inherit the snapshot's NFSv4 client identity, and the server keeps one copy of
+/// that client's open state. When one clone closes its held descriptor the server frees that
+/// open, and the other clone's held descriptor is left naming nothing: its next write failed
+/// with EBADF. Each clone is a separate machine, so each must keep its own open.
+#[tokio::test]
+async fn test_nfs_twin_clones_each_keep_a_held_file() -> Result<()> {
+    let (vm_name, clone_name, snap, _serve) = common::unique_names("nfs-held-twins");
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("held.txt"), "0123456789\n").await?;
+    let mount_spec = format!("{}:/mydata", source_dir.path().display());
+
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        "--nfs",
+        &mount_spec,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning NFS baseline")?;
+    common::poll_health_by_pid(pid, 180).await?;
+    // A process that holds /mydata/held.txt open for writing as fd 3 and, on request, writes
+    // through it with an fsync (so a refused write is seen at once) or closes it.
+    common::exec_in_container(
+        pid,
+        &[
+            "sh -c 'exec 3<>/mydata/held.txt && touch /tmp/held && while :; do \
+           if [ -e /tmp/write ]; then rm /tmp/write; \
+             if printf twin | dd conv=notrunc,fsync bs=4 count=1 1>&3 2>/tmp/err; \
+             then echo ok > /tmp/done; else echo \"failed: $(cat /tmp/err)\" > /tmp/done; fi; fi; \
+           if [ -e /tmp/close ]; then rm /tmp/close; exec 3>&-; echo closed > /tmp/done; fi; \
+           sleep 0.1; done' >/dev/null 2>&1 &",
+        ],
+    )
+    .await?;
+    wait_for_file(
+        pid,
+        "/tmp/held",
+        "the baseline's holder never opened /mydata/held.txt",
+    )
+    .await?;
+    common::create_snapshot_by_pid(pid, &snap)
+        .await
+        .context("creating snapshot of NFS baseline")?;
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let mut clones = Vec::new();
+    for i in 0..2 {
+        let name = format!("{clone_name}-{i}");
+        let (clone_child, clone_pid) =
+            common::spawn_fcvm(&["snapshot", "run", "--snapshot", &snap, "--name", &name])
+                .await
+                .with_context(|| format!("restoring NFS clone {i}"))?;
+        clones.push((clone_child, clone_pid));
+    }
+    let result = async {
+        for (i, (_, clone_pid)) in clones.iter().enumerate() {
+            common::poll_health_by_pid(*clone_pid, 120)
+                .await
+                .with_context(|| format!("clone {i} never became healthy"))?;
+        }
+        let ask = |clone_pid: u32, what: &'static str| async move {
+            common::exec_in_container(clone_pid, &[&format!("rm -f /tmp/done; touch /tmp/{what}")])
+                .await?;
+            wait_for_file(clone_pid, "/tmp/done", "the holder never answered").await?;
+            common::exec_in_container(clone_pid, &["cat /tmp/done"]).await
+        };
+        let closed = ask(clones[0].1, "close").await?;
+        anyhow::ensure!(closed.trim() == "closed", "clone 0 closing: {closed:?}");
+        let wrote = ask(clones[1].1, "write").await?;
+        anyhow::ensure!(
+            wrote.trim() == "ok",
+            "clone 1 wrote through the file it held across the snapshot after clone 0 \
+             closed its own: {}",
+            wrote.trim()
+        );
+        Ok(())
+    }
+    .await;
+    for (mut clone_child, clone_pid) in clones {
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+    }
+    let _ = std::fs::remove_dir_all(
+        std::env::var("FCVM_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs/root"))
+            .join("snapshots")
+            .join(&snap),
+    );
+    result
+}
+
+/// Wait up to 30 s for `path` to exist in `pid`'s container.
+async fn wait_for_file(pid: u32, path: &str, never: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let seen = common::exec_in_container(
+            pid,
+            &[&format!("test -e {path} && echo seen || echo waiting")],
+        )
+        .await?;
+        if seen.trim() == "seen" {
+            return Ok(());
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "{never}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Runs `podman run --disk-dir DIR:/data:ro` with the snapshot cache on, reads
 /// /data/marker.txt in the container, and stops the VM. Returns the content, the
 /// cache decision the run logged, its snapshot key, and whether it copied the directory.

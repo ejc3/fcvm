@@ -1536,7 +1536,7 @@ async fn scenario_body(
         }
     }
     // The holds kept working through everything after the restore. With a twin on NFS
-    // either clone can be the one the server's state does not follow.
+    // either clone can be the one whose lock is lost.
     let final_holds = if s.after == After::TwoClones {
         twin_holds(s, active)
     } else {
@@ -1566,17 +1566,17 @@ async fn scenario_body(
     Ok(())
 }
 
-/// The holds of a scenario with two clones of one snapshot. Two clones of one NFS
-/// snapshot hold the snapshot's open files under the one NFSv4 client identity they
-/// both inherited, and the server keeps one copy of that client's open and lock state:
-/// whichever clone it does not follow gets an error on those files (EBADF on a write),
-/// never another file's data (#1737).
+/// The holds of a scenario with two clones of one snapshot. Each clone gives the NFS clients
+/// it restored identities of their own and re-opens its held files under them (#1737), so
+/// every hold works in both, except an NFS lock: both clones held the snapshot's exclusive
+/// lock, and only one machine can hold it, so the other's lock is lost and refused, never
+/// shared.
 fn twin_holds(s: &Scenario, active: &[Hold]) -> Vec<Hold> {
     active
         .iter()
         .cloned()
         .map(|mut h| {
-            if s.storage == Storage::Nfs && !matches!(h.kind, "listen" | "swperf" | "hwperf") {
+            if s.storage == Storage::Nfs && h.kind == "flock" {
                 h.expect = Expect::CorrectOrError;
             }
             h
