@@ -68,9 +68,13 @@ taken inside an NMI ("Host injected async #PF in interrupt disabled region")
 until upstream took it as 81d99abe2bd8, which 6.18.59 carries; it holds no
 x86-only patch today.
 
-The nested profiles' `kernel/patches-arm64` and `kernel/patches-x86` also feed
-the host kernels (`make install-host-kernel`), minus the `.vm.patch` files. The
-host kernels pin 6.18.60 or later, the first 6.18 release with Linux commit
+The host kernels (`make install-host-kernel`) apply the `patches_dir` of their
+own `host_kernel` table, minus the `.vm.patch` files: `kernel/patches-x86` on
+x86_64, shared with the nested guest, and `kernel/patches-arm64-host` on arm64,
+where the host runs 7.3.3 ahead of the 6.18.60 guests (an L1 guest kernel newer
+than its host wedges L2, #659). Edit a host patch with
+`scripts/kernel-patch.sh edit nested.host_kernel <patch>`. The host kernels pin
+6.18.60 or a later 6.18 release, or 7.2 or later: the first releases with Linux commit
 25ae123db10b (6.18 stable 39679927fa7a), which removes an `rcu_barrier()` from
 `br_multicast_dev_del()`. Each fcvm VM has a bridge in its own network
 namespace, and the kernel tears dying namespaces down in batches under one RTNL
