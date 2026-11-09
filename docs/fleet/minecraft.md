@@ -64,7 +64,9 @@ fcvm's lockfile.
 
 - **Bots.** [azalea](https://github.com/azalea-rs/azalea), an MIT-licensed Rust bot client, from
   its 26.3 branch with one fix (`ejc3/azalea`, branch `fcvm-26.3`: the swing animation packet's
-  entity id is a VarInt; without it every swing breaks the packet stream). Three bots join over
+  entity id is a VarInt; without it every swing breaks the packet stream). The bug is reported
+  upstream as [azalea-rs/azalea#404](https://github.com/azalea-rs/azalea/issues/404), which is
+  the reason for the fork; once upstream fixes it, the pin moves back to azalea-rs/azalea. Three bots join over
   the guest's loopback. A bot that nobody drives walks to a random column of the map's region
   with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. After a restore
   every bot's connection is gone (fcvm's restore retires the snapshot's sockets), the bots join
@@ -148,7 +150,8 @@ fcvm's lockfile.
 - **Pumpkin** is GPL-3.0. The image carries its licence and a notice naming the repository and
   commit it was built from, and the build fetches that exact commit, so the source of every
   binary is public. Nothing of it is changed.
-- **azalea** is MIT. The fix is public in `ejc3/azalea`.
+- **azalea** is MIT. The fix is public in `ejc3/azalea` and reported upstream as
+  azalea-rs/azalea#404.
 - **No Mojang asset.** The page draws flat colours of our own; the image holds no client or
   server jar, texture, sound or language file.
 - **Offline mode** means the servers check no Minecraft account, so anyone with a Java Edition
