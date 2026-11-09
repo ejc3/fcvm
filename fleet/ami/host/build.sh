@@ -33,7 +33,7 @@ exec > >(tee -a "$L/$PHASE.log") 2>&1
 # to SIGKILL after TimeoutStopSec, and a name is never another process's. Every way out of
 # a phase stops them, so a failed phase leaves nothing writing to the checkout or the store
 # while it is retried.
-BG_UNITS="fleet-ami-windows-image"
+BG_UNITS="fleet-ami-windows-image fleet-ami-minecraft-image"
 bg_stop() { systemctl stop $BG_UNITS 2>/dev/null || true; systemctl reset-failed $BG_UNITS 2>/dev/null || true; }
 # bg_start UNIT LOG [systemd-run options] -- COMMAND...: run COMMAND as UNIT, its output in LOG.
 # The unit stays loaded once its command ends (RemainAfterExit), so bg_wait reads its result.
@@ -199,6 +199,16 @@ build)
   as_user "cd $SRC && make setup-btrfs"
   # build-image.sh prints the image directory last on stdout, after its log lines on stderr.
   bg_start fleet-ami-windows-image "$L/windows-image.log" -- bash "$SRC/fleet/windows/build-image.sh" /mnt/fcvm-btrfs/windows
+  # Minecraft mode's tile image (docs/fleet/minecraft.md: Pumpkin built from its pinned commit,
+  # and mctile) depends on nothing else this phase builds, and in line it was the phase's longest
+  # step: 19 min of a 44 min phase on 2026-11-09 (Pumpkin's cargo build 17 min). It runs beside
+  # the rest and the phase waits for it where it used to build it. It is built as root, straight
+  # into root's store, the agent's: a rootful build runs inside its unit's cgroup, so stopping
+  # the unit stops it (rootless podman's would not, see the bridge below). make refuses to run as
+  # root, so the build user's make prints the recipe's command and root runs it.
+  mc_build=$(as_user "cd $SRC && make -s -n minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet" | sed -n '/^podman build /,$p')
+  [ -n "$mc_build" ] || { echo "make minecraft-image printed no podman build"; exit 1; }
+  bg_start fleet-ami-minecraft-image "$L/minecraft-image.log" -- bash -c "cd $SRC && $mc_build"
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
@@ -228,13 +238,10 @@ build)
   as_user "podman save --format oci-archive localhost/fcvm-potato:fleet -o /mnt/fcvm-btrfs/potato.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/potato.oci.tar
   rm -f /mnt/fcvm-btrfs/potato.oci.tar
-  # Minecraft mode (docs/fleet/minecraft.md): the tile image (Pumpkin built from its pinned
-  # commit, and mctile), in root's store for the agent (--minecraft). The agent makes its gold
-  # snapshot when it starts.
-  as_user "cd $SRC && make minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet"
-  as_user "podman save --format oci-archive localhost/fcvm-minecraft:fleet -o /mnt/fcvm-btrfs/minecraft.oci.tar"
-  podman load -q -i /mnt/fcvm-btrfs/minecraft.oci.tar
-  rm -f /mnt/fcvm-btrfs/minecraft.oci.tar
+  # Minecraft mode: the tile image, in root's store for the agent (--minecraft), started after
+  # the checkout. The agent makes its gold snapshot when it starts.
+  bg_wait fleet-ami-minecraft-image "$L/minecraft-image.log"
+  podman image exists localhost/fcvm-minecraft:fleet || { echo "root's store has no localhost/fcvm-minecraft:fleet"; exit 1; }
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
   # system image built from source, and Robot Park, built with the AOSP build's tools.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"

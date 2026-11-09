@@ -534,6 +534,23 @@ class PipelineTests(unittest.TestCase):
                 if name == "build":
                     self.assertLess(setup, phase.index("bg_start fleet-ami-windows-image"))
 
+    def test_the_minecraft_image_builds_beside_the_rest_into_roots_store(self):
+        # In line it was the build phase's longest step (19 of 44 min on 2026-11-09). It starts
+        # after the checkout, as root (a rootful build stays in its unit's cgroup), and the phase
+        # waits for it where it used to build it, before the phones.
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        start = build.index("bg_start fleet-ami-minecraft-image")
+        self.assertLess(build.index("git checkout -q -f --detach $FCVM_COMMIT"), start)
+        self.assertLess(start, build.index('as_user "cd $SRC && make build"'))
+        self.assertIn("make -s -n minecraft-image MINECRAFT_IMAGE=localhost/fcvm-minecraft:fleet", build[:start])
+        wait = build.index('bg_wait fleet-ami-minecraft-image "$L/minecraft-image.log"')
+        self.assertLess(wait, build.index("make setup-phone"))
+        self.assertLess(wait, build.index("podman image exists localhost/fcvm-minecraft:fleet"))
+        # no second build, and no copy through the build user's store
+        self.assertNotIn('as_user "cd $SRC && make minecraft-image', build)
+        self.assertNotIn("minecraft.oci.tar", build)
+
     def test_background_jobs_are_named_units_stopped_on_every_way_out(self):
         # A failed phase must not leave a job writing to the checkout or the store while it is
         # retried (Codex on #1778): the jobs are transient systemd units of fixed names, the
@@ -541,7 +558,7 @@ class PipelineTests(unittest.TestCase):
         # by stopping any a phase that could not run its trap left behind.
         source = (HERE / "host/build.sh").read_text()
         preamble = source.split('\ncase "$PHASE" in\n', 1)[0]
-        self.assertIn('BG_UNITS="fleet-ami-windows-image"', preamble)
+        self.assertIn('BG_UNITS="fleet-ami-windows-image fleet-ami-minecraft-image"', preamble)
         trap = [line for line in preamble.splitlines() if line.startswith("trap ") and line.endswith(" EXIT")]
         self.assertEqual(len(trap), 1)
         self.assertIn("bg_stop;", trap[0])
