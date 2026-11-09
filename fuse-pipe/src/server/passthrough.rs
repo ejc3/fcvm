@@ -64,6 +64,9 @@ pub struct PassthroughFs {
     mount_points: Option<MountPoints>,
 }
 
+/// Inodes per thread below which [`PassthroughFs::inode_table`] adds no thread.
+const INODE_TABLE_CHUNK: usize = 16_384;
+
 /// What [`PassthroughFs::capture_inodes`] took while the guest was paused: the held inodes,
 /// each kept open so its path can be read after the guest forgets it, and the highest handle.
 pub struct CapturedInodes {
@@ -486,47 +489,88 @@ impl PassthroughFs {
     /// volume, or whose reported path leads to another inode, is recorded as gone: a request on
     /// it is refused, never served from another file.
     pub fn inode_table(&self, captured: CapturedInodes) -> String {
+        self.inode_table_in_chunks(captured, INODE_TABLE_CHUNK)
+    }
+
+    /// [`Self::inode_table`], with at least `chunk` inodes per thread.
+    pub(crate) fn inode_table_in_chunks(&self, captured: CapturedInodes, chunk: usize) -> String {
         use std::os::unix::ffi::OsStrExt;
-        let mut paths = std::collections::BTreeMap::new();
-        let mut gone = std::collections::BTreeMap::new();
+        type Paths = std::collections::BTreeMap<u64, Vec<u8>>;
         let root = self
             .inner
             .readlinkat_proc_file(fuse_backend_rs::api::filesystem::ROOT_ID);
-        for pinned in &captured.pins {
-            let ino = pinned.inode();
-            if ino == fuse_backend_rs::api::filesystem::ROOT_ID {
-                continue;
-            }
-            let path = self.inner.pinned_path(pinned);
-            let stat = self.inner.pinned_stat(pinned);
-            let relative = match (&root, &path) {
-                (Ok(root), Ok(path)) => path.strip_prefix(root).ok(),
-                _ => None,
-            };
-            // The path the kernel reports for a descriptor is only a name: an inode whose name
-            // was removed while another link keeps it reads "<name> (deleted)", which another
-            // file can have. The table names the inode only while that path still leads to it.
-            let names_the_inode = |relative: &std::path::Path| {
-                let (Ok(root), Ok(stat)) = (&root, &stat) else {
-                    return false;
+        // One readlink and two stats per inode: about 3.5 us each, so a guest holding a million
+        // files takes seconds on one thread. The creator waits for this after the resume, so the
+        // inodes are split across threads.
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(16)
+            .min(captured.pins.len() / chunk.max(1) + 1);
+        let chunk = captured.pins.len().div_ceil(threads).max(1);
+        let read = |pins: &[fuse_backend_rs::passthrough::PinnedInode]| -> (Paths, Paths) {
+            let mut paths = Paths::new();
+            let mut gone = Paths::new();
+            for pinned in pins {
+                let ino = pinned.inode();
+                if ino == fuse_backend_rs::api::filesystem::ROOT_ID {
+                    continue;
+                }
+                let path = self.inner.pinned_path(pinned);
+                let stat = self.inner.pinned_stat(pinned);
+                let relative = match (&root, &path) {
+                    (Ok(root), Ok(path)) => path.strip_prefix(root).ok(),
+                    _ => None,
                 };
-                std::fs::symlink_metadata(root.join(relative)).is_ok_and(|found| {
-                    use std::os::unix::fs::MetadataExt;
-                    found.dev() == stat.st_dev && found.ino() == stat.st_ino && stat.st_nlink > 0
-                })
-            };
-            match relative {
-                Some(relative) if names_the_inode(relative) => {
-                    paths.insert(ino, relative.as_os_str().as_bytes().to_vec());
-                }
-                _ => {
-                    let shown = path.as_ref().map_or_else(
-                        |error| format!("<path unreadable: {error}>").into_bytes(),
-                        |path| path.as_os_str().as_bytes().to_vec(),
-                    );
-                    gone.insert(ino, shown);
+                // The path the kernel reports for a descriptor is only a name: an inode whose
+                // name was removed while another link keeps it reads "<name> (deleted)", which
+                // another file can have. The table names the inode only while that path still
+                // leads to it.
+                let names_the_inode = |relative: &std::path::Path| {
+                    let (Ok(root), Ok(stat)) = (&root, &stat) else {
+                        return false;
+                    };
+                    std::fs::symlink_metadata(root.join(relative)).is_ok_and(|found| {
+                        use std::os::unix::fs::MetadataExt;
+                        found.dev() == stat.st_dev
+                            && found.ino() == stat.st_ino
+                            && stat.st_nlink > 0
+                    })
+                };
+                match relative {
+                    Some(relative) if names_the_inode(relative) => {
+                        paths.insert(ino, relative.as_os_str().as_bytes().to_vec());
+                    }
+                    _ => {
+                        let shown = path.as_ref().map_or_else(
+                            |error| format!("<path unreadable: {error}>").into_bytes(),
+                            |path| path.as_os_str().as_bytes().to_vec(),
+                        );
+                        gone.insert(ino, shown);
+                    }
                 }
             }
+            (paths, gone)
+        };
+        let parts: Vec<(Paths, Paths)> = if threads <= 1 {
+            vec![read(&captured.pins)]
+        } else {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = captured
+                    .pins
+                    .chunks(chunk)
+                    .map(|pins| scope.spawn(move || read(pins)))
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("an inode table worker panicked"))
+                    .collect()
+            })
+        };
+        let mut paths = Paths::new();
+        let mut gone = Paths::new();
+        for (part_paths, part_gone) in parts {
+            paths.extend(part_paths);
+            gone.extend(part_gone);
         }
         super::remap::table_json(captured.max_handle, &paths, &gone)
     }

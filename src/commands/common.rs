@@ -6401,10 +6401,12 @@ pub async fn create_snapshot_core(
     };
     // The volumes' inode tables describe the inodes the saved guest holds only while it stays
     // paused: once resumed it closes and forgets files (#1684).
+    let capture_started = std::time::Instant::now();
     let extra_files_result = extra_files_while_paused(
         extra_files,
         snapshot_result.is_ok() && disk_copy_result.is_ok(),
     );
+    let capture_ms = (capture_started.elapsed().as_secs_f64() * 10000.0).round() / 10.0;
 
     // The pause/save silently orphans in-flight host↔guest vsock connections
     // (exec sessions block forever with no error on either side). Record it by
@@ -6468,15 +6470,6 @@ pub async fn create_snapshot_core(
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(error);
     }
-    // The VM runs again; read the paths of the inodes the tables captured.
-    let extra_files = match read_extra_files(extra_files_reader) {
-        Ok(files) => files,
-        Err(error) => {
-            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
-            return Err(error);
-        }
-    };
-
     boundary.resume_ms = boundary.lap(boundary_started);
     info!(
         snapshot = %snapshot_config.name,
@@ -6485,6 +6478,7 @@ pub async fn create_snapshot_core(
         save_ms = boundary.save_ms,
         disk_ms = boundary.disk_ms,
         resume_ms = boundary.resume_ms,
+        capture_ms,
         "snapshot boundary timings"
     );
     match source_disposition {
@@ -6495,6 +6489,23 @@ pub async fn create_snapshot_core(
             info!(snapshot = %snapshot_config.name, "disposable source remains paused, processing snapshot");
         }
     }
+
+    // The VM runs again; read the paths of the inodes the tables captured. Timed apart from
+    // the boundary: the guest is no longer paused.
+    let tables_started = std::time::Instant::now();
+    let extra_files = match read_extra_files(extra_files_reader) {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(error);
+        }
+    };
+    info!(
+        snapshot = %snapshot_config.name,
+        tables_ms = (tables_started.elapsed().as_secs_f64() * 10000.0).round() / 10.0,
+        files = extra_files.len(),
+        "snapshot extra files read after the resume"
+    );
 
     // NOTE: Do NOT bump restore-epoch here. Snapshot create DOES sever the guest's
     // established vsock connections — Firecracker's `Vsock::prepare_save` queues a

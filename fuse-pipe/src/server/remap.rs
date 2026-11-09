@@ -1307,6 +1307,45 @@ mod tests {
         }
     }
 
+    /// A plain volume's table read on several threads names every held inode, as on one.
+    #[test]
+    fn a_plain_volume_table_read_on_threads_names_every_held_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let mut held = Vec::new();
+        for i in 0..40 {
+            let name = format!("f{i}");
+            std::fs::write(dir.path().join(&name), b"x").unwrap();
+            let entry = source.handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent: 1,
+                    name: name.into_bytes(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            );
+            held.push(entry.attr().unwrap().ino);
+        }
+        let on_threads = source.inode_table_in_chunks(source.capture_inodes(), 2);
+        let on_one = source.inode_table_in_chunks(source.capture_inodes(), usize::MAX);
+        assert_eq!(on_threads, on_one);
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &on_threads,
+        );
+        for ino in held {
+            let attr = clone.handle_request_with_groups(&VolumeRequest::Getattr { ino }, &[]);
+            assert!(
+                attr.attr().is_some(),
+                "inode {ino} is missing: {on_threads}"
+            );
+        }
+    }
+
     /// A restored server of a read-only volume reads with file handle 0. Its inner server answers
     /// OPEN with ENOSYS (zero-message open), so the guest kernel opens nothing and reads with handle
     /// 0; that is no handle at all, not one from before the snapshot to reopen. FLUSH with handle 0
