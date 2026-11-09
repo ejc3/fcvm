@@ -1,52 +1,49 @@
-From 8a4a46837004abd735ebd8647cf2fab729910b41 Mon Sep 17 00:00:00 2001
+From 6b5b14b79e8df8ce31045ae768797ab122d2e864 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 00:08:11 +0000
-Subject: [PATCH] nfs: give a restored machine's NFSv4 clients identities of
+Subject: [PATCH] nfs: give a restored machine's NFSv4.0 clients identities of
  their own
 
 A machine restored from a snapshot holds the snapshot's NFSv4 clients:
 their owner identifiers, and the client ID, opens and locks the server gave
 them. A second copy restored from the same snapshot holds the same, and the
 server keeps one copy of that state, so when one copy closes a file the
-other's open of it is gone and its next write fails with EBADF.
+other's open of it is gone and its next write fails.
 
-Writing /sys/fs/nfs/net/nfs_client/renew_identities gives every NFSv4 client
-of the namespace a random salt, appended to its owner identifier, and sets
-its state up again as after the server lost it: the state manager drops the
-cached identifier, takes a new client ID under the salted one, and
-re-establishes every open and lock outside a grace period. Each copy of the
-machine then holds opens of its own. The salt keeps the identity apart from
-the clients the machine creates after the restore, which take the namespace
-identifier unchanged.
+Writing a nonzero salt in hex to /sys/fs/nfs/net/nfs_client/renew_identities
+appends it to the owner identifier of every NFSv4.0 client of the namespace
+(the next values to the clients after the first) and sets each client's
+state up again as after the server lost it: a new client ID under the salted
+identifier, then every open and lock re-established outside a grace period.
+Each copy of the machine then holds opens of its own. The writer supplies
+the salt because copies restored from one snapshot share the kernel's random
+state. The salt keeps the identity apart from the clients the machine
+creates after the restore, which take the namespace identifier unchanged.
 
-The identifier is replaced under nfs_client_lock, under which the client list
-walk compares identifiers, by the state manager, which alone sends
-SETCLIENTID and EXCHANGE_ID.
+Only the state manager sends SETCLIENTID for an existing v4.0 client, so the
+identifier is replaced while the writer holds the state manager's running
+bit: no manager iteration is part way through establishing a lease under the
+old identifier, or with the purge verifier, when the purge is flagged. The
+client-list walk compares identifiers under nfs_client_lock, so the pointer
+is swapped under it. v4.1 and later are left alone, since session trunking
+sends EXCHANGE_ID for an existing client outside the state manager.
 ---
- fs/nfs/nfs4_fs.h          |  2 ++
- fs/nfs/nfs4proc.c         | 27 +++++++++++----
- fs/nfs/nfs4state.c        | 71 +++++++++++++++++++++++++++++++++++++++
- fs/nfs/sysfs.c            | 24 +++++++++++++
+ fs/nfs/nfs4_fs.h          |  1 +
+ fs/nfs/nfs4proc.c         | 27 ++++++++++----
+ fs/nfs/nfs4state.c        | 76 +++++++++++++++++++++++++++++++++++++++
+ fs/nfs/sysfs.c            | 32 +++++++++++++++++
  include/linux/nfs_fs_sb.h |  3 ++
- 5 files changed, 121 insertions(+), 6 deletions(-)
+ 5 files changed, 133 insertions(+), 6 deletions(-)
 
 diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
-index c34c89a..eab63a2 100644
+index c34c89a..6fe7388 100644
 --- a/fs/nfs/nfs4_fs.h
 +++ b/fs/nfs/nfs4_fs.h
-@@ -48,6 +48,7 @@ enum nfs4_client_state {
- 	NFS4CLNT_RECALL_ANY_LAYOUT_READ,
- 	NFS4CLNT_RECALL_ANY_LAYOUT_RW,
- 	NFS4CLNT_DELEGRETURN_DELAYED,
-+	NFS4CLNT_NEW_OWNER_ID,
- };
- 
- #define NFS4_RENEW_TIMEOUT		0x01
-@@ -503,6 +504,7 @@ extern void nfs_inode_find_state_and_recover(struct inode *inode,
+@@ -503,6 +503,7 @@ extern void nfs_inode_find_state_and_recover(struct inode *inode,
  		const nfs4_stateid *stateid);
  extern int nfs4_state_mark_reclaim_nograce(struct nfs_client *, struct nfs4_state *);
  extern void nfs4_schedule_lease_recovery(struct nfs_client *);
-+extern void nfs4_renew_client_identities(struct net *net);
++extern void nfs4_renew_client_identities(struct net *net, u32 salt);
  extern int nfs4_wait_clnt_recover(struct nfs_client *clp);
  extern int nfs4_client_recover_expired_lease(struct nfs_client *clp);
  extern void nfs4_schedule_state_manager(struct nfs_client *);
@@ -144,81 +141,74 @@ index 84ba899..0c847c0 100644
  	return 0;
  }
 diff --git a/fs/nfs/nfs4state.c b/fs/nfs/nfs4state.c
-index 01179f7..198bc0e 100644
+index 01179f7..d5d8808 100644
 --- a/fs/nfs/nfs4state.c
 +++ b/fs/nfs/nfs4state.c
-@@ -2087,10 +2087,30 @@ static int nfs4_reclaim_lease(struct nfs_client *clp)
- 	return 0;
- }
- 
-+/*
-+ * Forget the client's owner identifier, so that the next SETCLIENTID or
-+ * EXCHANGE_ID builds a new one with the client's owner salt. Called by the
-+ * state manager, which alone sends those. A walk of the client list reads the
-+ * identifier under nfs_client_lock, so it is replaced under that lock.
-+ */
-+static void nfs4_drop_owner_id(struct nfs_client *clp)
-+{
-+	struct nfs_net *nn = net_generic(clp->cl_net, nfs_net_id);
-+	const char *old;
-+
-+	spin_lock(&nn->nfs_client_lock);
-+	old = clp->cl_owner_id;
-+	clp->cl_owner_id = NULL;
-+	spin_unlock(&nn->nfs_client_lock);
-+	kfree(old);
-+}
-+
- static int nfs4_purge_lease(struct nfs_client *clp)
- {
- 	int status;
- 
-+	if (test_and_clear_bit(NFS4CLNT_NEW_OWNER_ID, &clp->cl_state))
-+		nfs4_drop_owner_id(clp);
- 	status = nfs4_establish_lease(clp);
- 	if (status < 0)
- 		return nfs4_handle_reclaim_lease_error(clp, status);
-@@ -2397,6 +2417,57 @@ void nfs41_notify_server(struct nfs_client *clp)
+@@ -2397,6 +2397,82 @@ void nfs41_notify_server(struct nfs_client *clp)
  	nfs4_schedule_state_manager(clp);
  }
  
 +/*
-+ * Give the client a new owner identity and set up its state again under it,
-+ * as when the server has lost the state: a new client ID, then every open and
-+ * lock re-established outside a grace period.
++ * Give an NFSv4.0 client a new owner identity and set up its state again
++ * under it, as when the server has lost the state: a new client ID, then
++ * every open and lock re-established outside a grace period.
++ *
++ * Only the state manager sends SETCLIENTID for an existing v4.0 client, so
++ * the identifier is replaced while this thread holds the state manager's
++ * running bit: no manager iteration can be part way through establishing a
++ * lease under the old identifier, or with the purge verifier, when the bits
++ * below are set. The client-list walk reads identifiers under
++ * nfs_client_lock, so the pointer is swapped under it. v4.1 and later are
++ * left alone: session trunking sends EXCHANGE_ID for an existing client
++ * outside the state manager.
 + */
-+static void nfs4_renew_client_identity(struct nfs_client *clp)
++static void nfs4_renew_client_identity(struct nfs_client *clp, u32 salt)
 +{
-+	WRITE_ONCE(clp->cl_owner_salt, get_random_u32() | 1);
-+	set_bit(NFS4CLNT_NEW_OWNER_ID, &clp->cl_state);
++	struct nfs_net *nn = net_generic(clp->cl_net, nfs_net_id);
++	const char *old;
++
++	if (wait_on_bit_lock_action(&clp->cl_state, NFS4CLNT_MANAGER_RUNNING,
++				    nfs_wait_bit_killable, TASK_KILLABLE))
++		return;
++	spin_lock(&nn->nfs_client_lock);
++	old = clp->cl_owner_id;
++	clp->cl_owner_id = NULL;
++	clp->cl_owner_salt = salt;
++	spin_unlock(&nn->nfs_client_lock);
++	kfree(old);
 +	set_bit(NFS4CLNT_LEASE_EXPIRED, &clp->cl_state);
 +	set_bit(NFS4CLNT_PURGE_STATE, &clp->cl_state);
 +	clear_bit(NFS4CLNT_LEASE_CONFIRM, &clp->cl_state);
 +	nfs4_state_start_reclaim_nograce(clp);
++	nfs4_clear_state_manager_bit(clp);
 +	nfs4_schedule_state_manager(clp);
 +}
 +
 +/**
-+ * nfs4_renew_client_identities - give every NFSv4 client of a net namespace
-+ * a new owner identity
++ * nfs4_renew_client_identities - give every NFSv4.0 client of a net
++ * namespace a new owner identity
 + * @net: the network namespace
++ * @salt: appended to the first client's owner identifier, the next values
++ *	(skipping 0) to the others'. The caller supplies it because copies of
++ *	a machine restored from one snapshot share the kernel's random state.
 + *
 + * A machine restored from a snapshot holds the snapshot's NFSv4 clients, with
 + * their owner identities and the client ID, opens and locks the server gave
 + * them. Another copy of the machine restored from the same snapshot holds the
 + * same, and the server keeps one copy of that state: when one copy closes a
-+ * file, the other's open of it is gone. Afterwards each client has an identity
-+ * of its own, a random salt appended to its owner identifier, and holds its
-+ * opens and locks under it, so each copy of the machine holds its own.
++ * file, the other's open of it is gone. Afterwards each v4.0 client has an
++ * identity of its own, a salt appended to its owner identifier, and holds its
++ * opens and locks under it, so each copy of the machine holds its own. Waits, killably, for each client's state manager to finish what it is
++ * doing.
 + */
-+void nfs4_renew_client_identities(struct net *net)
++void nfs4_renew_client_identities(struct net *net, u32 salt)
 +{
 +	struct nfs_net *nn = net_generic(net, nfs_net_id);
 +	struct nfs_client *clp, *prev = NULL;
 +
 +	spin_lock(&nn->nfs_client_lock);
 +	list_for_each_entry(clp, &nn->nfs_client_list, cl_share_link) {
-+		if (clp->rpc_ops->version != 4 ||
++		if (clp->rpc_ops->version != 4 || clp->cl_minorversion != 0 ||
 +		    clp->cl_cons_state != NFS_CS_READY)
 +			continue;
 +		if (!refcount_inc_not_zero(&clp->cl_count))
@@ -226,7 +216,8 @@ index 01179f7..198bc0e 100644
 +		spin_unlock(&nn->nfs_client_lock);
 +		nfs_put_client(prev);
 +		prev = clp;
-+		nfs4_renew_client_identity(clp);
++		nfs4_renew_client_identity(clp, salt);
++		salt = salt + 1 ?: 1;
 +		spin_lock(&nn->nfs_client_lock);
 +	}
 +	spin_unlock(&nn->nfs_client_lock);
@@ -237,17 +228,18 @@ index 01179f7..198bc0e 100644
  {
  	if (test_and_set_bit(NFS4CLNT_LEASE_EXPIRED, &clp->cl_state) == 0) {
 diff --git a/fs/nfs/sysfs.c b/fs/nfs/sysfs.c
-index ea6e616..8cf115a 100644
+index ea6e616..e8b3d2e 100644
 --- a/fs/nfs/sysfs.c
 +++ b/fs/nfs/sysfs.c
-@@ -135,8 +135,32 @@ static const void *nfs_netns_client_namespace(const struct kobject *kobj)
+@@ -135,8 +135,40 @@ static const void *nfs_netns_client_namespace(const struct kobject *kobj)
  static struct kobj_attribute nfs_netns_client_id = __ATTR(identifier,
  		0644, nfs_netns_identifier_show, nfs_netns_identifier_store);
  
 +#if IS_BUILTIN(CONFIG_NFS_V4)
 +/*
-+ * Writing anything gives every NFSv4 client of the namespace a new owner
-+ * identity and sets its state up again under it (nfs4_renew_client_identities).
++ * Writing a nonzero salt in hex gives every NFSv4.0 client of the namespace a
++ * new owner identity and sets its state up again under it
++ * (nfs4_renew_client_identities).
 + */
 +static ssize_t nfs_netns_renew_identities_store(struct kobject *kobj,
 +		struct kobj_attribute *attr,
@@ -256,8 +248,15 @@ index ea6e616..8cf115a 100644
 +	struct nfs_netns_client *c = container_of(kobj,
 +			struct nfs_netns_client,
 +			kobject);
++	u32 salt;
++	int ret;
 +
-+	nfs4_renew_client_identities(c->net);
++	ret = kstrtou32(buf, 16, &salt);
++	if (ret)
++		return ret;
++	if (!salt)
++		return -EINVAL;
++	nfs4_renew_client_identities(c->net, salt);
 +	return count;
 +}
 +
@@ -274,7 +273,7 @@ index ea6e616..8cf115a 100644
  };
  ATTRIBUTE_GROUPS(nfs_netns_client);
 diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
-index 30ac384..12665a2 100644
+index 30ac384..0658f1e 100644
 --- a/include/linux/nfs_fs_sb.h
 +++ b/include/linux/nfs_fs_sb.h
 @@ -88,6 +88,9 @@ struct nfs_client {
@@ -282,7 +281,7 @@ index 30ac384..12665a2 100644
  	/* Client owner identifier */
  	const char *		cl_owner_id;
 +	/* Appended to the owner identifier once nfs4_renew_client_identities() gave the
-+	 * client a new one: 0 until then. */
++	 * client a new one: 0 until then. Set under nfs_client_lock. */
 +	u32			cl_owner_salt;
  
  	u32			cl_cb_ident;	/* v4.0 callback identifier */

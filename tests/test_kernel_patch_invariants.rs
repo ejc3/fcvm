@@ -404,3 +404,63 @@ fn the_kernel_source_repository_runs_no_background_gc() {
         "setup_kernel_source must turn off automatic gc before its first commit"
     );
 }
+
+/// The NFS identity renewal (#1737) replaces an NFSv4.0 client's owner identifier only while it
+/// holds the state manager's running bit, so no manager iteration is part way through a
+/// SETCLIENTID under the old identifier or with the purge verifier when the purge is flagged;
+/// that SETCLIENTID would have told the server the snapshot's client rebooted and dropped the
+/// state of every other copy. It leaves v4.1 and later alone, whose session trunking sends
+/// EXCHANGE_ID, which reads the identifier, outside the state manager. Pinned in the patch
+/// text: the kernel build is the only other place it runs.
+#[test]
+fn the_nfs_identity_renewal_holds_the_state_manager_and_skips_sessions() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let name = "0006-nfs-give-restored-clients-identities-of-their-own.vm.patch";
+    let arm64 = root.join("kernel/patches-arm64").join(name);
+    let x86 = root
+        .join("kernel/patches-x86")
+        .join("0007-nfs-give-restored-clients-identities-of-their-own.vm.patch");
+    assert_eq!(
+        fs::canonicalize(&x86).expect("the x86 nested patch set links the NFS patch"),
+        fs::canonicalize(&arm64).unwrap(),
+        "the x86 nested kernel applies the same NFS patch as the arm64 one"
+    );
+    let patch = fs::read_to_string(&arm64).expect("read the NFS patch");
+    let renew_one = extract_block(
+        &patch,
+        "+static void nfs4_renew_client_identity(struct nfs_client *clp, u32 salt)",
+        "+}",
+    )
+    .expect("the patch defines nfs4_renew_client_identity");
+    let mut at = 0;
+    for step in [
+        "wait_on_bit_lock_action(&clp->cl_state, NFS4CLNT_MANAGER_RUNNING",
+        "spin_lock(&nn->nfs_client_lock);",
+        "clp->cl_owner_id = NULL;",
+        "spin_unlock(&nn->nfs_client_lock);",
+        "set_bit(NFS4CLNT_PURGE_STATE, &clp->cl_state);",
+        "nfs4_clear_state_manager_bit(clp);",
+        "nfs4_schedule_state_manager(clp);",
+    ] {
+        let found = renew_one[at..]
+            .find(step)
+            .unwrap_or_else(|| panic!("nfs4_renew_client_identity lacks, or misorders, `{step}`"));
+        at += found + step.len();
+    }
+    let renew_all = extract_block(
+        &patch,
+        "+void nfs4_renew_client_identities(struct net *net, u32 salt)",
+        "+}",
+    )
+    .expect("the patch defines nfs4_renew_client_identities");
+    assert!(
+        renew_one.contains("clp->cl_owner_salt = salt;") && !renew_one.contains("get_random"),
+        "nfs4_renew_client_identity salts the identifier with the kernel's own randomness, which \
+         twin clones restored from one snapshot share"
+    );
+    assert!(
+        renew_all.contains("clp->cl_minorversion != 0"),
+        "nfs4_renew_client_identities renews v4.1+ clients, whose trunking reads the identifier \
+         outside the state manager"
+    );
+}

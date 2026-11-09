@@ -53,9 +53,12 @@ The nested profiles, the only ones with an NFS client, also apply
 (linked from `kernel/patches-x86`). Two clones restored from one snapshot hold the
 snapshot's NFSv4 clients, identity and server state included, and the server keeps one copy
 of that state: when one clone closed a file it held across the snapshot, the other's next
-write to it failed with EIO (#1737). Writing `/sys/fs/nfs/net/nfs_client/renew_identities`,
-which fc-agent does in every restore, gives each client a random salt on its owner identifier,
-a new client ID and its opens and locks again under it. Linux has no such interface.
+write to it failed with EIO (#1737). Writing a salt in hex to
+`/sys/fs/nfs/net/nfs_client/renew_identities` gives each NFSv4.0 client the salt (the next
+values for further clients) on its owner identifier, a new client ID and its opens and locks
+again under it. fc-agent writes it in every restore of a guest with NFS shares, with a salt
+from the restore epoch the host makes for that restore, since twin clones resume with the
+same random state. Linux has no such interface.
 
 x86 patches live in `kernel/patches-default-x86`, which the x86 default profile
 applies in place of `kernel/patches-default` and which links the shared patches.
