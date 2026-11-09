@@ -170,7 +170,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '22'
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 12.15.0
       # ffmpeg from the ffmpeg-static package (a static build with libx264), not apt
@@ -218,7 +218,7 @@ jobs:
       # "retain-on-failure"); without this it dies with the runner (#1348).
       - name: Upload Playwright traces
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fleet-web-test-results
           path: fleet/web/test-results
@@ -516,7 +516,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -565,7 +565,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -600,7 +600,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fcvm -> target
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
@@ -700,7 +700,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Persistent self-hosted targets live in leased btrfs generations.
           # Restoring a cache here would replace the checkout symlink with an
@@ -897,7 +897,7 @@ jobs:
           sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-host-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
@@ -999,7 +999,7 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Persistent self-hosted targets live in leased btrfs generations.
           # Restoring a cache here would replace the checkout symlink with an
@@ -1220,7 +1220,7 @@ jobs:
           sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-host-root-${{ matrix.arch }}-${{ matrix.mode }}
           path: /tmp/fcvm-test-logs/
@@ -1392,7 +1392,7 @@ jobs:
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-container-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
