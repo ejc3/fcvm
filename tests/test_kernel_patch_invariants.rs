@@ -464,3 +464,52 @@ fn the_nfs_identity_renewal_holds_the_state_manager_and_skips_sessions() {
          outside the state manager"
     );
 }
+
+/// The host kernel of a profile can carry a different release and patch set from its guest
+/// kernel (#659: a 7.3 host under 6.18 guests). `kernel-patch.sh` must then work on the
+/// host's own `[kernel_profiles.<p>.<arch>.host_kernel]` table, not the guest's.
+#[test]
+fn kernel_patch_resolves_a_host_kernel_profile_from_its_own_table() {
+    let root = tempfile::tempdir().expect("create the fixture checkout");
+    fs::create_dir_all(root.path().join("scripts")).unwrap();
+    let script = root.path().join("scripts/kernel-patch.sh");
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+        &script,
+    )
+    .expect("copy kernel-patch.sh");
+    fs::write(
+        root.path().join("rootfs-config.toml"),
+        "[kernel_profiles.nested.arm64]\n\
+         kernel_version = \"6.18.60\"\n\
+         patches_dir = \"kernel/patches-arm64\"\n\n\
+         [kernel_profiles.nested.arm64.host_kernel]\n\
+         kernel_version = \"7.3.3\"\n\
+         patches_dir = \"kernel/patches-arm64-host\"\n",
+    )
+    .unwrap();
+    let resolve = |profile: &str| {
+        let out = Command::new("bash")
+            .arg(&script)
+            .args(["resolve", profile])
+            .env("KERNEL_PATCH_ARCH", "aarch64")
+            .output()
+            .expect("run kernel-patch.sh resolve");
+        assert!(
+            out.status.success(),
+            "resolve {profile} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let root = root.path().display();
+    assert_eq!(
+        resolve("nested.host_kernel"),
+        format!("version=7.3.3\npatches_dir={root}/kernel/patches-arm64-host\n")
+    );
+    assert_eq!(
+        resolve("nested"),
+        format!("version=6.18.60\npatches_dir={root}/kernel/patches-arm64\n")
+    );
+}
