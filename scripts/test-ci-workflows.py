@@ -135,13 +135,21 @@ class WorkflowSecurityTest(unittest.TestCase):
         for ref in ['refs/heads/feature', 'refs/tags/v1', 'refs/pull/1/merge', '']:
             self.assertFalse(self.builder(github('workflow_dispatch', ref=ref)))
 
-    def test_builder_automatic_runs_require_successful_same_repo_main(self):
+    def test_builder_automatic_runs_require_uncancelled_same_repo_main(self):
         for origin in ['ejc3/fcvm', 'outsider/fcvm', '']:
             for branch in ['main', 'feature', '']:
                 for conclusion in ['success', 'failure', 'cancelled']:
                     run = {'head_repository': {'full_name': origin}, 'head_branch': branch, 'conclusion': conclusion}
                     self.assertEqual(self.builder(github('workflow_run', {'workflow_run': run})),
-                                     origin == 'ejc3/fcvm' and branch == 'main' and conclusion == 'success')
+                                     origin == 'ejc3/fcvm' and branch == 'main' and conclusion != 'cancelled')
+
+    def test_ci_runs_these_tests_on_every_pull_request(self):
+        # The AMI job runs this suite only after an owner approves a publish, so
+        # a stale expectation here broke no PR and stayed red on main (#1765).
+        content = (ROOT / '.github/workflows/ci.yml').read_text()
+        job = re.search(r'^  actionlint:\n(.*?)(?=^  [\w-]+:|\Z)', content, re.M | re.S)
+        self.assertIsNotNone(job, 'ci.yml has no actionlint job')
+        self.assertRegex(job[1], r'(?m)^        run: make test-ci-security$')
 
     def test_builder_publish_environment_and_immutable_checkout(self):
         self.assertEqual(job_field('build-runner-ami.yml', 'build-ami', 'environment'), 'runner-ami-publish')

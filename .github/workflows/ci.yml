@@ -272,6 +272,8 @@ jobs:
         run: make test-ci-scope
       - name: Test cached release downloads
         run: bash scripts/test-cached-download.sh
+      - name: Test workflow trust conditions and AMI build arguments
+        run: make test-ci-security
 
   # The fleet renderer's host tests (fleet/renderer/tests/test_host.cpp: scene
   # parsing, tile geometry, wire formats, TLS), and the phone app's scene tests.
