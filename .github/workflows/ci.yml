@@ -240,13 +240,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Download actionlint (checksum-pinned)
+      # actionlint is a GitHub release file, so it comes through cached-download.sh from a
+      # cache keyed on its checksum; a warm cache makes no request.
+      - name: Restore actionlint
+        id: actionlint-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/downloads
+          key: actionlint-1.7.10-f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f-${{ hashFiles('scripts/cached-download.sh') }}
+      - name: Fetch actionlint (checksum-pinned)
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --location --retry 10 --retry-connrefused -o /tmp/actionlint.tgz \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.10/actionlint_1.7.10_linux_amd64.tar.gz
-          echo "f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f  /tmp/actionlint.tgz" | sha256sum -c -
+          ./scripts/cached-download.sh \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.10/actionlint_1.7.10_linux_amd64.tar.gz \
+            f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f /tmp/actionlint.tgz "$RUNNER_TEMP/downloads"
           tar -C /tmp -xzf /tmp/actionlint.tgz actionlint
+      - name: Save actionlint
+        if: steps.actionlint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/downloads
+          key: actionlint-1.7.10-f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f-${{ hashFiles('scripts/cached-download.sh') }}
       - name: Lint workflows
         # shellcheck stays off until the pre-existing SC2086/SC2129 findings in
         # claude.yml's run blocks are fixed; actionlint's own checks
@@ -256,6 +270,8 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test cached release downloads
+        run: bash scripts/test-cached-download.sh
 
   # The fleet renderer's host tests (fleet/renderer/tests/test_host.cpp: scene
   # parsing, tile geometry, wire formats, TLS), and the phone app's scene tests.
@@ -307,7 +323,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/gradle-dist
-          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile') }}
+          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile', 'scripts/cached-download.sh') }}
       - name: Fetch the Gradle distribution
         run: make -C fleet/phone-app gradle-dist GRADLE_DIST="$RUNNER_TEMP/gradle-dist"
       - name: Save the Gradle distribution
@@ -315,7 +331,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/gradle-dist
-          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile') }}
+          key: phone-app-gradle-dist-${{ hashFiles('fleet/phone-app/Containerfile', 'scripts/cached-download.sh') }}
       - name: Restore Gradle's dependency cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -720,16 +736,8 @@ jobs:
         working-directory: fcvm
         run: ./scripts/build-passt.sh
       - name: Install Firecracker
-        run: |
-          ARCH=$(uname -m)
-          FC_VERSION="1.14.0"
-          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
-            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
-          sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-            "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
-            "release-v${FC_VERSION}-${ARCH}/jailer-v${FC_VERSION}-${ARCH}"
-          sudo mv "/usr/local/bin/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
-          sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+        working-directory: fcvm
+        run: ./scripts/ci-install-firecracker.sh
       - name: Restore cargo tools cache
         id: cache-cargo-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -1019,16 +1027,8 @@ jobs:
         working-directory: fcvm
         run: ./scripts/build-passt.sh
       - name: Install Firecracker
-        run: |
-          ARCH=$(uname -m)
-          FC_VERSION="1.14.0"
-          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
-            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
-          sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-            "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
-            "release-v${FC_VERSION}-${ARCH}/jailer-v${FC_VERSION}-${ARCH}"
-          sudo mv "/usr/local/bin/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
-          sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+        working-directory: fcvm
+        run: ./scripts/ci-install-firecracker.sh
       - name: Restore cargo tools cache
         id: cache-cargo-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
