@@ -18,6 +18,7 @@ import sys
 import tempfile
 import tarfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -791,8 +792,29 @@ print("warm-log-permissions-pass")
         with self.assertRaisesRegex(RuntimeError, "isolated builder command failed") as error:
             self.run_driver()
         self.assertNotIn("secret", str(error.exception))
-        self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
+        # both builders may launch before the failure stops the other; none is replaced
+        launched = [call["slot"] for call in self.broker.calls if call["action"] == "launch"]
+        self.assertEqual(len(launched), len(set(launched)))
+        self.assertLessEqual(set(launched), {"host-build", "tile-build"})
+        self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
         self.no_manifest()
+
+    def test_a_build_side_stalled_past_the_deadline_cannot_hold_the_cleanup(self):
+        # Codex on #1802: a host build stalled before its renderer export held the pair, and so
+        # run()'s cleanup, past the deadline. The pair waits only until the deadline.
+        stall = threading.Event()
+        original = self.driver.build_host
+        def stalled(renderer_ready=None):
+            stall.wait(30)
+            return original(renderer_ready)
+        self.broker.deadline = self.now + 3600
+        with patch.object(self.driver, "build_host", side_effect=stalled), \
+                patch.object(self.driver, "remaining", side_effect=lambda cleanup=False: 1):
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                self.driver.build_pair()
+            self.assertLess(time.monotonic() - started, 10)
+        stall.set()
 
     def test_failed_phase_archives_metadata_before_cleanup_without_repeating_the_phase(self):
         self.worker.fail_phase = "host/build.sh build"

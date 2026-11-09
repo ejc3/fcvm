@@ -367,14 +367,32 @@ class Pipeline:
         def tile():
             try:
                 self.build_tile_prep()
-                renderer = renderer_ready.result()
+                # bounded by the deadline: a host build that stalls past it cannot hold the tile
+                renderer = renderer_ready.result(timeout=self.remaining())
                 return self.build_tile_finish(renderer)
             except BaseException as error:
                 failed(error)
                 raise
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            built = {"host": executor.submit(host), "tile": executor.submit(tile)}
-            concurrent.futures.wait(built.values())
+        # Daemon threads, not an executor: a side stalled in a call past the deadline must not
+        # hold run() from its cleanup, at its end or at the interpreter's exit.
+        built = {}
+        for name, work in (("host", host), ("tile", tile)):
+            future = concurrent.futures.Future()
+            def runner(work=work, future=future):
+                try:
+                    future.set_result(work())
+                except BaseException as error:
+                    future.set_exception(error)
+            threading.Thread(target=runner, name="fleet-ami-" + name, daemon=True).start()
+            built[name] = future
+        try:
+            _, pending = concurrent.futures.wait(built.values(), timeout=self.remaining(cleanup=True))
+        finally:
+            if first:
+                self.cancelled.set()
+        if pending:
+            self.cancelled.set()
+            raise RuntimeError("the image build reached its fixed deadline")
         if first:
             raise first[0]
         renderer, host_image = built["host"].result()
