@@ -31,6 +31,15 @@ def require(value, message):
         raise RuntimeError(message)
 
 
+# The CodeBuild lease and the broker's deadline (ejc3/aws DEADLINE_SECONDS and
+# fcvm_ami_build_minutes carry the same number). Measured 2026-11-08 and 09: the host builder
+# launch to its CreateImage took 2 h 58 min to 3 h 14 min on three builds (the Windows image
+# and the bridge are in it), and the host image then has to become available before the
+# validators start; at 240 minutes no build ever launched a tile builder. 360 leaves the tile
+# build (beside the host build), both images' three-boot validation and cleanup about 90
+# minutes over the host side's longest measured run plus its image creation.
+LEASE_MINUTES = 360
+
 class BuilderCommandFailed(RuntimeError):
     """An assigned builder returned a terminal command failure."""
 
@@ -108,7 +117,7 @@ class Pipeline:
         self.cancelled = threading.Event()
 
     def remaining(self, *, cleanup=False):
-        require(cleanup or not self.cancelled.is_set(), "a parallel validator failed")
+        require(cleanup or not self.cancelled.is_set(), "a parallel build or validation failed")
         seconds = int(self.deadline - self.clock())
         require(seconds > 0, "the image build reached its fixed deadline")
         return seconds
@@ -130,7 +139,7 @@ class Pipeline:
         with self.call_lock:
             while True:
                 require(action in {"cleanup", "status"} or not self.cancelled.is_set(),
-                        "a parallel validator failed")
+                        "a parallel build or validation failed")
                 try:
                     reply = self.broker.invoke(FunctionName=self.config["broker_arn"],
                         InvocationType="RequestResponse", Payload=canonical(request))
@@ -305,7 +314,7 @@ class Pipeline:
             return current if current != old else None
         return self.wait(changed)
 
-    def build_host(self):
+    def build_host(self, renderer_ready=None):
         slot = "host-build"
         self.launch(slot)
         self.security_update(slot)
@@ -317,6 +326,9 @@ class Pipeline:
         require(re.fullmatch(r"[0-9a-f]{64}", renderer.get("sha256", "")), "renderer export has no digest")
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", renderer.get("image_id", "")), "renderer image has no identity")
         renderer["staged"] = self.stage(slot, "renderer.oci.tar.zst", renderer)
+        if renderer_ready is not None:
+            # The tile build's image phase needs only this export: it goes on beside the bake.
+            renderer_ready.set_result(renderer)
         self.phase(slot, "host", "bake")
         exported = self.guest(slot, "export-store", self.config["bucket"], self.builder_prefixes[slot], self.config["asset_region"])
         expected = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst", "parts", "sha256.json"}
@@ -329,6 +341,44 @@ class Pipeline:
         self.guest(slot, "seal", "host")
         image = self.seal(slot)
         return renderer, image
+
+    def build_pair(self):
+        """The host and tile builds side by side. The tile's launch, prep and reboot need nothing
+        from the host, and its image phase only the host's renderer export, so a tile build
+        waited out the whole host build for nothing: with the host side at about 3 h of the
+        factory's deadline, three builds in a row (2026-11-08) never launched a tile builder.
+        Either side failing stops the other at its next broker call or wait."""
+        renderer_ready = concurrent.futures.Future()
+        first = []   # the first failure; the other side then fails on the cancellation it caused
+        lock = threading.Lock()
+        def failed(error):
+            with lock:
+                if not first:
+                    first.append(error)
+            self.cancelled.set()
+        def host():
+            try:
+                return self.build_host(renderer_ready)
+            except BaseException as error:
+                failed(error)
+                if not renderer_ready.done():
+                    renderer_ready.set_exception(error)
+                raise
+        def tile():
+            try:
+                self.build_tile_prep()
+                renderer = renderer_ready.result()
+                return self.build_tile_finish(renderer)
+            except BaseException as error:
+                failed(error)
+                raise
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            built = {"host": executor.submit(host), "tile": executor.submit(tile)}
+            concurrent.futures.wait(built.values())
+        if first:
+            raise first[0]
+        renderer, host_image = built["host"].result()
+        return renderer, host_image, built["tile"].result()
 
     def initialize_tls(self):
         """Two isolated per-build canaries, generated without a private-key file."""
@@ -377,6 +427,11 @@ class Pipeline:
         return image
 
     def build_tile(self, renderer):
+        self.build_tile_prep()
+        return self.build_tile_finish(renderer)
+
+    def build_tile_prep(self):
+        """The tile build's steps that need nothing from the host build, run beside it."""
         slot = "tile-build"
         self.launch(slot)
         self.security_update(slot)
@@ -390,6 +445,9 @@ class Pipeline:
         # The tracing boot must read on its own; trace replaces the old profile.
         self.shell(slot, "rm -f /etc/fcvm-fleet/prefetch.list")
         self.reboot(slot)
+
+    def build_tile_finish(self, renderer):
+        slot = "tile-build"
         url = self.worker.client("s3", self.config["asset_region"]).generate_presigned_url("get_object",
             Params={"Bucket": self.config["bucket"], "Key": self.prefix + "renderer.oci.tar.zst",
                     "VersionId": renderer["staged"]["version_id"]},
@@ -448,7 +506,7 @@ class Pipeline:
     def await_ready(self):
         initial = self.call("status")
         self.deadline = initial["deadline_unix"]
-        require(self.clock() < self.deadline <= self.clock() + 240 * 60,
+        require(self.clock() < self.deadline <= self.clock() + LEASE_MINUTES * 60,
                 "broker deadline is not bounded by the CodeBuild lease")
         require(initial.get("build_id") == self.build_id, "broker build identity differs")
         require(initial.get("source_commit") == self.config["source_commit"], "broker source revision differs")
@@ -480,8 +538,7 @@ class Pipeline:
             self.worker.client("s3", self.config["asset_region"]).put_object(Bucket=self.config["bucket"], Key=self.prefix + "source.tar",
                 Body=self.archive, ContentType="application/x-tar", IfNoneMatch="*")
             self.initialize_tls()
-            renderer, host = self.build_host()
-            tile = self.build_tile(renderer)
+            renderer, host, tile = self.build_pair()
             require(host.get("image_id") != tile.get("image_id"), "host and tile images are not distinct")
             self.cleanup()
             def validate(kind):

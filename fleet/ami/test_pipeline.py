@@ -961,7 +961,7 @@ print("warm-log-permissions-pass")
         self.assertFalse(self.broker.slots)
 
     def test_source_and_deadline_are_broker_bound_before_any_launch(self):
-        for name, value in (("source", "f" * 40), ("deadline", 14501), ("deadline", 100), ("input_sha", "bad")):
+        for name, value in (("source", "f" * 40), ("deadline", 100 + 360 * 60 + 1), ("deadline", 100), ("input_sha", "bad")):
             with self.subTest(name=name, value=value):
                 self.setUp()
                 setattr(self.broker, name, value)
@@ -972,8 +972,15 @@ print("warm-log-permissions-pass")
                 self.assertFalse(self.worker.objects)
                 self.no_manifest()
 
-    def test_total_lease_accepts_240_minutes_without_extending_individual_commands(self):
-        for seconds in (150 * 60 + 1, 240 * 60):
+    def test_a_lease_past_the_fixed_bound_is_refused_before_any_launch(self):
+        self.broker.deadline = self.now + 360 * 60 + 1
+        with self.assertRaisesRegex(RuntimeError, "not bounded by the CodeBuild lease"):
+            self.run_driver()
+        self.assertFalse(any(call["action"] == "launch" for call in self.broker.calls))
+
+    def test_total_lease_accepts_360_minutes_without_extending_individual_commands(self):
+        # 240 minutes never reached a tile builder (2026-11-08): the host side alone took 3 h.
+        for seconds in (150 * 60 + 1, 240 * 60 + 1, 360 * 60):
             with self.subTest(seconds=seconds):
                 self.setUp()
                 deadline = self.now + seconds
@@ -996,8 +1003,32 @@ print("warm-log-permissions-pass")
         self.worker.stale_boots = True
         with self.assertRaisesRegex(RuntimeError, "deadline"):
             self.run_driver()
-        self.assertLessEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
+        # the two builders run side by side; no validator launches without a resumed boot
+        launched = [call["slot"] for call in self.broker.calls if call["action"] == "launch"]
+        self.assertLessEqual(set(launched), {"host-build", "tile-build"})
         self.no_manifest()
+
+    def test_the_tile_build_runs_beside_the_host_build(self):
+        # Three factory builds in a row (2026-11-08: fe5ccbfc, fb6baada, 853eb034) sealed the host
+        # image about 3 h into the 4 h deadline and never launched a tile builder. The tile's
+        # launch, prep and reboot need nothing from the host: the host's build phase is held
+        # here until the tile's prep has been sent, which a tile build that waits for the host
+        # never does. The tile's image phase still follows the host's renderer export.
+        tile_prep = threading.Event()
+        original = self.worker.send_command
+        def send(**arguments):
+            command = arguments["Parameters"]["commands"][0]
+            if "tile/build.sh prep" in command:
+                tile_prep.set()
+            if "host/build.sh build" in command:
+                self.assertTrue(tile_prep.wait(10), "the host's build phase began with no tile prep beside it")
+            return original(**arguments)
+        with patch.object(self.worker, "send_command", side_effect=send):
+            self.run_driver()
+        commands = [entry["Parameters"]["commands"][0] for entry in self.worker.commands]
+        at = lambda text: next(index for index, command in enumerate(commands) if text in command)
+        self.assertLess(at("tile/build.sh prep"), at("host/build.sh build"))
+        self.assertLess(at("export-renderer"), at("tile/build.sh image"))
 
     def test_broker_never_accepts_caller_commands_profiles_or_launch_parameters(self):
         self.driver.call("status")
