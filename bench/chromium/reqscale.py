@@ -63,7 +63,7 @@ sys.path.insert(0, HERE)
 import reqbench  # noqa: E402
 
 
-SCHEDULE_SCHEMA = "fcvm.chromium.reqscale.schedule.v2"
+SCHEDULE_SCHEMA = "fcvm.chromium.reqscale.schedule.v3"
 RECORD_SCHEMA = "fcvm.chromium.reqscale.record.v2"
 # v3: failed_rates, the rates whose requests failed while the run went on.
 STATUS_SCHEMA = "fcvm.chromium.reqscale.status.v3"
@@ -75,6 +75,20 @@ SCORE_SECONDS = 60.0
 WARMUP_BURSTS = 1
 MIN_SCORED_REQUESTS = 200  # per backend and rate, across the scored bursts
 CONTROL_INTERVAL_SECONDS = 10.0
+# Each host-control deadline is moved by a seeded offset below one 60 Hz frame.
+# The control's latency includes the wait for the next compositor frame, and on
+# exact 10 s deadlines the phase between the two clocks drifts slowly, so the
+# latency walked a 42 to 72 ms sawtooth with a period of about 40 controls and
+# the drift gate compared two halves of it: campaign d3389c81's 4 vCPU run read
+# 36.3% drift on a quiet host while its 2 and 8 vCPU runs read 3.2% and 10.8%.
+# A uniform offset within the frame makes the phase random from one control to
+# the next.
+CONTROL_FRAME_JITTER_NS = 16_666_667
+
+
+def control_frame_jitter_ns(seed: int, index: int) -> int:
+    """The seeded offset of host-control deadline `index` within one frame."""
+    return _derive_u64(seed, "control-frame-jitter", index) % CONTROL_FRAME_JITTER_NS
 SAMPLE_INTERVAL_SECONDS = 5.0
 GUARDEXEC = os.path.join(HERE, "guardexec.py")
 GUARDSUPERVISE = os.path.join(HERE, "guardsupervise.py")
@@ -648,6 +662,8 @@ def build_schedule(config: ScheduleConfig, run_id: str) -> dict:
             "phase_seed": config.seed,
             "phase_derivation": "sha256 fcvm-reqscale-seed-v1/control-phase",
             "phase_offset_ns": control_phase_ns,
+            "frame_jitter_ns": CONTROL_FRAME_JITTER_NS,
+            "frame_jitter_derivation": "sha256 fcvm-reqscale-seed-v1/control-frame-jitter/<index>",
             "warmup_requests": 1,
         },
         "host_sample_interval_ns": round(SAMPLE_INTERVAL_SECONDS * 1e9),
@@ -3398,6 +3414,12 @@ class ControlScheduler:
         phase_ns = schedule.get("phase_offset_ns")
         if not isinstance(phase_ns, int) or isinstance(phase_ns, bool) or not 0 <= phase_ns < interval_ns:
             raise MeasurementInvalid("host control phase offset is invalid")
+        if schedule.get("frame_jitter_ns") != CONTROL_FRAME_JITTER_NS:
+            raise MeasurementInvalid("host control frame jitter is not declared")
+        seed = schedule.get("phase_seed")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise MeasurementInvalid("host control has no seed for its frame jitter")
+        self.seed = seed
         self.control = control
         self.sink = sink
         self.interval_ns = interval_ns
@@ -3414,7 +3436,8 @@ class ControlScheduler:
         index = 0
         try:
             while True:
-                scheduled_ns = self.origin_ns + self.phase_ns + index * self.interval_ns
+                scheduled_ns = (self.origin_ns + self.phase_ns + index * self.interval_ns
+                                + control_frame_jitter_ns(self.seed, index))
                 remaining_s = (scheduled_ns - time.monotonic_ns()) / 1_000_000_000
                 if remaining_s > 0 and self.stop_event.wait(remaining_s):
                     return
