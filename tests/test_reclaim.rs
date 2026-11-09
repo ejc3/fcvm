@@ -456,40 +456,74 @@ async fn a_sigkilled_export_leaves_its_temporary_to_the_next_export() -> Result<
     Ok(())
 }
 
-/// Every `fcvm snapshot export` the tests start by hand carries the parent-death signal
-/// (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"), here and in the lifecycle test that parks one
-/// on a pipe: an export that outlived a test nextest killed would keep its snapshot's lock.
+/// Every `fcvm snapshot export` and `fcvm snapshot import` the tests start by hand carries
+/// the parent-death signal (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"): one that outlived a
+/// test nextest killed would keep its snapshot's lock. A command is armed between its
+/// arguments and the call that runs it, or it is built by this file's `fcvm` closure, each
+/// of which arms what it returns.
 #[test]
-fn every_hand_built_export_command_dies_with_its_test() {
-    const EXPORT_ARGS: &str = r#"["snapshot", "export","#;
+fn every_hand_built_export_and_import_command_dies_with_its_test() {
     const ARMED: &str = "common::set_test_pdeathsig(&mut ";
-    for (file, source) in [
-        ("test_reclaim.rs", include_str!("test_reclaim.rs")),
+    const RUNS: [&str; 3] = ["spawn()", ".status()", ".output()"];
+    // Per file: how many places build an export command, and an import command.
+    for (file, source, exports, imports) in [
+        ("test_reclaim.rs", include_str!("test_reclaim.rs"), 4, 3),
         (
             "test_lifecycle_interleave.rs",
             include_str!("test_lifecycle_interleave.rs"),
+            1,
+            0,
+        ),
+        ("test_pmem.rs", include_str!("test_pmem.rs"), 1, 1),
+        (
+            "test_snapshot_clone.rs",
+            include_str!("test_snapshot_clone.rs"),
+            1,
+            1,
+        ),
+        (
+            "test_localhost_image.rs",
+            include_str!("test_localhost_image.rs"),
+            1,
+            1,
         ),
     ] {
-        let source = source
-            .split("fn every_hand_built_export_command_dies_with_its_test")
-            .next()
-            .unwrap();
-        let built: Vec<usize> = source
-            .match_indices(EXPORT_ARGS)
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(
-            built.len(),
-            1,
-            "{file}: the place that builds the export command moved"
-        );
-        // The command is armed between its arguments and the first spawn after them.
-        let rest = &source[built[0]..];
-        let before_spawn = &rest[..rest.find("spawn()").expect("the export is spawned")];
-        assert!(
-            before_spawn.contains(ARMED),
-            "{file}: the export command is built without set_test_pdeathsig:\n{before_spawn}"
-        );
+        for (subcommand, expected) in [("export", exports), ("import", imports)] {
+            let args = format!(r#"["snapshot", "{subcommand}","#);
+            let built: Vec<usize> = source.match_indices(&args).map(|(at, _)| at).collect();
+            assert_eq!(
+                built.len(),
+                expected,
+                "{file}: the places that build a snapshot {subcommand} command changed"
+            );
+            for at in built {
+                let rest = &source[at..];
+                let run = RUNS
+                    .iter()
+                    .filter_map(|run| rest.find(run))
+                    .min()
+                    .unwrap_or_else(|| panic!("{file}: a snapshot {subcommand} is never run"));
+                let by_closure = source[..at].ends_with("fcvm(&");
+                assert!(
+                    rest[..run].contains(ARMED) || by_closure,
+                    "{file}: a snapshot {subcommand} command is built without \
+                     set_test_pdeathsig:\n{}",
+                    &rest[..run]
+                );
+            }
+        }
+        // The closure that builds the other commands arms each one.
+        // In two pieces, so this line is not one of the closures it finds.
+        for closure in source
+            .split(concat!("let fcvm = ", "|args: &[&str]| {"))
+            .skip(1)
+        {
+            let body = closure.split("\n    };").next().unwrap();
+            assert!(
+                body.contains(ARMED),
+                "{file}: an fcvm closure builds commands without set_test_pdeathsig:\n{body}"
+            );
+        }
     }
 }
 
@@ -582,6 +616,320 @@ async fn a_sigkilled_import_leaves_its_staging_directory_to_the_next_import() ->
         "the next import did not install its snapshot"
     );
     Ok(())
+}
+
+/// `snapshot import` stages a pmem store entry its host lacks in the store's `tmp/`, and
+/// publishes it only once the archive has verified. An import killed with the entry staged
+/// leaves that temp and its staging directory, and no entry. The next import, of a snapshot
+/// without pmem images, removes both before it stages its own.
+#[tokio::test]
+async fn a_sigkilled_import_leaves_its_staged_pmem_entry_to_the_next_import() -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let data = tempfile::tempdir()?;
+    let archives = tempfile::tempdir()?;
+    let snapshots = data.path().join("snapshots");
+    let (killed_tag, next_tag) = ("reclaim-import-pmem-killed", "reclaim-import-pmem-next");
+    let archive_of = |tag: &str| archives.path().join(format!("{tag}.archive"));
+    let fcvm = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
+        command.args(args).env("FCVM_DATA_DIR", data.path());
+        // An import parked at its failpoint must not outlive a test that nextest killed.
+        common::set_test_pdeathsig(&mut command);
+        command
+    };
+
+    // The snapshot to kill the import of maps one pmem image: an entry of the store under
+    // this test's data directory, published as a `--pmem` run publishes it. The store
+    // refuses an image on tmpfs, which the system temp directory can be, so the image is
+    // under fcvm's data directory.
+    let images = tempfile::tempdir_in(fcvm::paths::data_dir())?;
+    let image = images.path().join("model.img");
+    {
+        let file = std::fs::File::create(&image)?;
+        file.set_len(fcvm::storage::pmem::PMEM_ALIGNMENT)?;
+        file.write_all_at(&[7u8; 8192], 4096)?;
+    }
+    for tag in [killed_tag, next_tag] {
+        snapshot_without_a_vm(data.path(), tag)?;
+    }
+    let store = fcvm::storage::pmem_store::PmemStore::open(data.path())?;
+    let device = fcvm::storage::pmem::resolve_pmem_devices(
+        &store,
+        &[format!("{}:/models:ro", image.display())],
+        &[],
+    )?
+    .remove(0);
+    let entry = PathBuf::from(&device.path);
+    let store_tmp = store.dir().join("tmp");
+    drop(store);
+    {
+        let config_path = snapshots.join(killed_tag).join("config.json");
+        let mut config: fcvm::storage::SnapshotConfig =
+            serde_json::from_slice(&std::fs::read(&config_path)?)?;
+        config.metadata.pmem_devices = vec![device];
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    }
+    for tag in [killed_tag, next_tag] {
+        let status = fcvm(&["snapshot", "export", tag, "--output"])
+            .arg(archive_of(tag))
+            .status()
+            .await
+            .context("exporting a snapshot to import")?;
+        anyhow::ensure!(status.success(), "the export of {tag} failed: {status}");
+        std::fs::remove_dir_all(snapshots.join(tag))?;
+    }
+    // The importing host never had the entry.
+    std::fs::remove_file(&entry)?;
+    anyhow::ensure!(
+        names_in(&store_tmp)?.is_empty(),
+        "control: the store has a temp before the import: {:?}",
+        names_in(&store_tmp)?
+    );
+
+    let import = |tag: &str| {
+        let mut command = fcvm(&["snapshot", "import", "--input"]);
+        command.arg(archive_of(tag));
+        command
+    };
+    let staging = snapshots.join(format!("{killed_tag}.creating"));
+
+    // Killed with the archive verified and the entry whole in the store's temp directory,
+    // before anything of the import has a name outside its staging directory.
+    let park = tempfile::tempdir()?;
+    let spec = format!(
+        "snapshot.import.externals_staged:park:{}",
+        park.path().display()
+    );
+    let mut killed = import(killed_tag)
+        .env("FCVM_FAILPOINT", &spec)
+        .spawn()
+        .context("spawning the import to kill")?;
+    let killed_pid = killed.id().context("the import has no pid")?;
+    let observed = async {
+        // An import that ends instead of parking is reported at once, with its status.
+        wait_for(
+            "the import did not park at snapshot.import.externals_staged",
+            Duration::from_secs(60),
+            || {
+                parked(park.path())
+                    .map(|_| Ok(()))
+                    .or_else(|| killed.try_wait().ok().flatten().map(Err))
+            },
+        )
+        .await?
+        .map_err(|status| anyhow::anyhow!("the import ended before it parked: {status}"))?;
+        let temps = names_in(&store_tmp)?;
+        anyhow::ensure!(
+            temps.len() == 1,
+            "the parked import has not staged exactly one pmem entry in {}: {temps:?}",
+            store_tmp.display()
+        );
+        anyhow::ensure!(
+            !entry.exists(),
+            "the parked import has published its pmem entry before the failpoint"
+        );
+        anyhow::ensure!(
+            staging.join("memory.bin").is_file() && !snapshots.join(killed_tag).exists(),
+            "the parked import has not staged its snapshot in {}, or has published it",
+            staging.display()
+        );
+        Ok(())
+    }
+    .await;
+    let reaped = sigkill(&mut killed, killed_pid).await;
+    observed?;
+    reaped?;
+    anyhow::ensure!(
+        names_in(&store_tmp)?.len() == 1 && staging.exists(),
+        "the killed import's temp or staging directory is already gone, so the kill ran \
+         its cleanup"
+    );
+
+    let status = import(next_tag)
+        .status()
+        .await
+        .context("running the next import")?;
+    anyhow::ensure!(status.success(), "the next import failed: {status}");
+    assert_eq!(
+        names_in(&store_tmp)?,
+        Vec::<String>::new(),
+        "the killed import's staged pmem entry survived the next import"
+    );
+    anyhow::ensure!(
+        !staging.exists(),
+        "the killed import's staging directory survived the next import: {}",
+        staging.display()
+    );
+    anyhow::ensure!(
+        !entry.exists() && !snapshots.join(killed_tag).exists(),
+        "the killed import published its pmem entry or its tag"
+    );
+    anyhow::ensure!(
+        snapshots.join(next_tag).join("config.json").is_file(),
+        "the next import did not install its snapshot"
+    );
+    Ok(())
+}
+
+/// `snapshot import` stages an image disk its host lacks in a temporary beside the disk's
+/// path in the image cache, recorded for reclaim before the file exists, and publishes it
+/// only once the archive has verified. An import killed with the disk staged leaves that
+/// temporary and its record. The next import, of a snapshot without an image disk, removes
+/// both before it stages its own.
+///
+/// The image cache is the configured one. Its place comes from the config's assets
+/// directory, with the kernels and the rootfs, and not from `FCVM_DATA_DIR`, so this test
+/// cannot give the fcvm it runs a cache of its own without a config of its own. It uses a
+/// disk name no image has, and removes what it made there. The reclaim record is under the
+/// test's data directory, where no other test's launch finds it.
+#[tokio::test]
+async fn a_sigkilled_import_leaves_its_staged_image_disk_to_the_next_import() -> Result<()> {
+    let data = tempfile::tempdir()?;
+    let archives = tempfile::tempdir()?;
+    let snapshots = data.path().join("snapshots");
+    let (killed_tag, next_tag) = ("reclaim-import-disk-killed", "reclaim-import-disk-next");
+    let archive_of = |tag: &str| archives.path().join(format!("{tag}.archive"));
+    let fcvm = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
+        command.args(args).env("FCVM_DATA_DIR", data.path());
+        // An import parked at its failpoint must not outlive a test that nextest killed.
+        common::set_test_pdeathsig(&mut command);
+        command
+    };
+
+    // A Docker archive disk, the kind a snapshot records no identity for, under the digest
+    // of no image.
+    let image_cache = fcvm::paths::image_cache_dir();
+    std::fs::create_dir_all(&image_cache)?;
+    let digest = uuid::Uuid::new_v4().simple().to_string();
+    let disk = image_cache.join(format!("{digest}.docker.tar"));
+    let of_this_test = || -> Result<Vec<String>> {
+        Ok(names_in(&image_cache)?
+            .into_iter()
+            .filter(|name| name.starts_with(&digest))
+            .collect())
+    };
+    let result = async {
+        std::fs::write(&disk, vec![9u8; 64 * 1024])?;
+        for tag in [killed_tag, next_tag] {
+            snapshot_without_a_vm(data.path(), tag)?;
+        }
+        {
+            let config_path = snapshots.join(killed_tag).join("config.json");
+            let mut config: fcvm::storage::SnapshotConfig =
+                serde_json::from_slice(&std::fs::read(&config_path)?)?;
+            config.metadata.image_disk_path = Some(disk.clone());
+            std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+        }
+        for tag in [killed_tag, next_tag] {
+            let status = fcvm(&["snapshot", "export", tag, "--output"])
+                .arg(archive_of(tag))
+                .status()
+                .await
+                .context("exporting a snapshot to import")?;
+            anyhow::ensure!(status.success(), "the export of {tag} failed: {status}");
+            std::fs::remove_dir_all(snapshots.join(tag))?;
+        }
+        // The importing host never had the disk.
+        std::fs::remove_file(&disk)?;
+        anyhow::ensure!(
+            of_this_test()?.is_empty(),
+            "control: the image cache holds something of this test before the import: {:?}",
+            of_this_test()?
+        );
+
+        let import = |tag: &str| {
+            let mut command = fcvm(&["snapshot", "import", "--input"]);
+            command.arg(archive_of(tag));
+            command
+        };
+        let owners = fcvm::reclaim::owner_dir_in(data.path())?;
+        let temp_records = || -> Result<Vec<String>> {
+            Ok(names_in(&owners)?
+                .into_iter()
+                .filter(|name| name.starts_with("store-temp-") && name.ends_with(".json"))
+                .collect())
+        };
+
+        // Killed with the archive verified and the disk whole in its temporary, before
+        // anything of the import has a name outside its staging directory.
+        let park = tempfile::tempdir()?;
+        let spec = format!(
+            "snapshot.import.externals_staged:park:{}",
+            park.path().display()
+        );
+        let mut killed = import(killed_tag)
+            .env("FCVM_FAILPOINT", &spec)
+            .spawn()
+            .context("spawning the import to kill")?;
+        let killed_pid = killed.id().context("the import has no pid")?;
+        let observed = async {
+            // An import that ends instead of parking is reported at once, with its status.
+            wait_for(
+                "the import did not park at snapshot.import.externals_staged",
+                Duration::from_secs(60),
+                || {
+                    parked(park.path())
+                        .map(|_| Ok(()))
+                        .or_else(|| killed.try_wait().ok().flatten().map(Err))
+                },
+            )
+            .await?
+            .map_err(|status| anyhow::anyhow!("the import ended before it parked: {status}"))?;
+            let staged = of_this_test()?;
+            anyhow::ensure!(
+                staged.len() == 1 && staged[0].ends_with(".tmp") && !disk.exists(),
+                "the parked import has not staged exactly one temporary of its image disk \
+                 in {}, or has published the disk: {staged:?}",
+                image_cache.display()
+            );
+            anyhow::ensure!(
+                temp_records()?.len() == 1,
+                "the staged image disk has no reclaim record: {:?}",
+                names_in(&owners)?
+            );
+            Ok(())
+        }
+        .await;
+        let reaped = sigkill(&mut killed, killed_pid).await;
+        observed?;
+        reaped?;
+        anyhow::ensure!(
+            of_this_test()?.len() == 1,
+            "the killed import's temporary is already gone, so the kill ran its cleanup"
+        );
+
+        let status = import(next_tag)
+            .status()
+            .await
+            .context("running the next import")?;
+        anyhow::ensure!(status.success(), "the next import failed: {status}");
+        // Errors, not panics: what is left in the image cache is removed below.
+        anyhow::ensure!(
+            of_this_test()?.is_empty(),
+            "the killed import's staged image disk survived the next import: {:?}",
+            of_this_test()?
+        );
+        anyhow::ensure!(
+            temp_records()?.is_empty(),
+            "the record of the killed import's staged image disk survived the next import: {:?}",
+            temp_records()?
+        );
+        anyhow::ensure!(
+            !snapshots.join(killed_tag).exists(),
+            "the killed import published its tag"
+        );
+        anyhow::ensure!(
+            snapshots.join(next_tag).join("config.json").is_file(),
+            "the next import did not install its snapshot"
+        );
+        Ok(())
+    }
+    .await;
+    for name in of_this_test().unwrap_or_default() {
+        let _ = std::fs::remove_file(image_cache.join(name));
+    }
+    result
 }
 
 /// Build a localhost image whose content, and so whose digest, is this test's own, and

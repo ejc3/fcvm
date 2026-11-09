@@ -166,7 +166,7 @@ pub(super) async fn get_image_cache_ref(image: &str) -> Result<ImageCacheRef> {
 /// Parse the `{{.Digest}}\t{{.Id}}` output of `podman image inspect` into an
 /// [`ImageCacheRef`]. Split out from the command call so the empty-digest fallback can
 /// be unit-tested without a live podman.
-fn parse_image_cache_ref(image: &str, stdout: &str) -> Result<ImageCacheRef> {
+pub(super) fn parse_image_cache_ref(image: &str, stdout: &str) -> Result<ImageCacheRef> {
     // Strip ONLY the trailing newline. A locally-built image reports an EMPTY digest,
     // so podman emits "\t<id>" — a leading tab. `str::trim()` would eat that leading tab
     // (a tab is whitespace), collapsing the two fields into one and making `split_once`

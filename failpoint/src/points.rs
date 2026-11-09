@@ -22,6 +22,7 @@ pub const HOST_POINTS: &[&str] = &[
     "restore.unlocked",
     "snapshot.create.locked",
     "snapshot.export.pre_rename",
+    "snapshot.import.externals_staged",
     "snapshot.import.pre_publish",
     "snapshot.install.pre_rename",
     "snapshot.install.post_rename",

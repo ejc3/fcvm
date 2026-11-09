@@ -417,6 +417,169 @@ async fn build_marker_image(image_name: &str, suffix: &str) -> Result<()> {
     .await
 }
 
+/// A VM that runs a localhost image in overlay mode attaches the image's storage image, a
+/// file of the host's image cache, and its snapshot records that path and the SHA-256 of
+/// the file. Exported, the snapshot comes back on a host that has neither it nor the
+/// storage image: `snapshot import` installs the disk at the recorded path as the build the
+/// snapshot recorded, and the container of a clone restored from the imported snapshot
+/// reads a file of the image, which is in the store on that disk.
+#[tokio::test]
+async fn test_localhost_overlay_snapshot_export_delete_import_restores() -> Result<()> {
+    let suffix = "overlay-import";
+    let image_name = image_name_for_suffix(suffix);
+    build_marker_image(&image_name, suffix).await?;
+    let (baseline, clone, snapshot, _) = common::unique_names(suffix);
+    let fcvm_path = common::find_fcvm_binary()?;
+    let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+    // On the store, not in /tmp: the archive holds the guest's memory image.
+    let archive_dir = tempfile::Builder::new()
+        .prefix("overlay-import-test-")
+        .tempdir_in(fcvm::paths::data_dir())
+        .context("creating a directory for the archive")?;
+    let archive = archive_dir.path().join("snapshot.archive");
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline,
+            "--no-snapshot",
+            "--image-mode",
+            "overlay",
+            &image_name,
+        ],
+        &baseline,
+    )
+    .await
+    .context("spawning the VM to snapshot")?;
+    let mut baseline_running = true;
+    let mut clone_pid = None;
+    // The storage image of this test's own image, removed afterwards whatever the outcome.
+    let mut image_disk = None;
+    let result = async {
+        common::poll_health_by_pid(baseline_pid, 180).await?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot).await?;
+        common::kill_process(baseline_pid).await;
+        baseline_running = false;
+
+        let exported = snapshots.load_snapshot(&snapshot).await?;
+        let disk = exported
+            .metadata
+            .image_disk_path
+            .clone()
+            .context("the snapshot records no image disk")?;
+        let identity = exported
+            .metadata
+            .image_disk_identity
+            .clone()
+            .context("the snapshot records no image disk identity")?;
+        anyhow::ensure!(
+            disk.parent() == Some(fcvm::paths::image_cache_dir().as_path()) && disk.is_file(),
+            "the snapshot's image disk {} is not a file of the image cache",
+            disk.display()
+        );
+        image_disk = Some(disk.clone());
+        let disk_len = std::fs::metadata(&disk)?.len();
+
+        let mut export = tokio::process::Command::new(&fcvm_path);
+        export
+            .args(["snapshot", "export", &snapshot, "--output"])
+            .arg(&archive);
+        // Must not outlive a test that nextest killed: it holds the snapshot's lock.
+        common::set_test_pdeathsig(&mut export);
+        let out = export.output().await.context("running snapshot export")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "snapshot export failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The importing host: no snapshot and no storage image.
+        common::delete_snapshot(&snapshot).await?;
+        std::fs::remove_file(&disk)
+            .with_context(|| format!("removing the image disk {}", disk.display()))?;
+
+        let mut import = tokio::process::Command::new(&fcvm_path);
+        import.args(["snapshot", "import", "--input"]).arg(&archive);
+        // Must not outlive a test that nextest killed: it holds the tag's lock.
+        common::set_test_pdeathsig(&mut import);
+        let out = import.output().await.context("running snapshot import")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "snapshot import failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let installed = std::fs::metadata(&disk)
+            .with_context(|| format!("the import did not install {}", disk.display()))?;
+        anyhow::ensure!(
+            installed.len() == disk_len,
+            "the installed image disk is {} bytes and the exported one was {disk_len}",
+            installed.len()
+        );
+        // Hashed here, from the file's bytes. `fcvm::utils::verify_image_disk_identity`
+        // answers from the digest the import recorded for the file and reads none of it.
+        let installed_identity = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            use std::io::Read;
+            let mut file = std::fs::File::open(&disk)
+                .with_context(|| format!("opening the installed {}", disk.display()))?;
+            // sha2 0.11 hashers are not `io::Write`, so the file is fed in by hand.
+            let mut buffer = vec![0u8; 1 << 20];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("reading the installed {}", disk.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            format!("sha256:{}", hex::encode(hasher.finalize()))
+        };
+        anyhow::ensure!(
+            installed_identity == identity,
+            "the installed image disk {} has the identity {installed_identity} and the \
+             snapshot recorded {identity}",
+            disk.display()
+        );
+
+        let (_clone_child, pid) = common::spawn_fcvm_with_logs(
+            &["snapshot", "run", "--snapshot", &snapshot, "--name", &clone],
+            &clone,
+        )
+        .await
+        .context("spawning a clone of the imported snapshot")?;
+        clone_pid = Some(pid);
+        common::poll_health_by_pid(pid, 180)
+            .await
+            .context("the restore of the imported snapshot did not start a healthy clone")?;
+        let marker = common::exec_in_container(pid, &[&format!("cat /{STORE_MARKER}")])
+            .await
+            .context("reading the image's marker file in the clone's container")?;
+        anyhow::ensure!(
+            marker.trim() == suffix,
+            "the clone's container read {:?} from the image's marker file, which holds \
+             {suffix:?}",
+            marker.trim()
+        );
+        Ok(())
+    }
+    .await;
+    if let Some(pid) = clone_pid {
+        common::kill_process(pid).await;
+    }
+    if baseline_running {
+        common::kill_process(baseline_pid).await;
+    }
+    common::delete_snapshot(&snapshot).await.ok();
+    if let Some(disk) = image_disk {
+        std::fs::remove_file(disk).ok();
+    }
+    result
+}
+
 /// Get the immutable image ID (`sha256:…`) of a localhost image via podman.
 async fn podman_image_id(image_name: &str) -> Result<String> {
     let out = tokio::process::Command::new("podman")
