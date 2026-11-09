@@ -2548,12 +2548,19 @@ fn every_x86_guest_kernel_pins_a_release_with_the_async_pf_nmi_fix() {
         let version = config["kernel_profiles"][&profile_name][&arch]["kernel_version"]
             .as_str()
             .unwrap();
-        let release = version
-            .strip_prefix("6.18.")
-            .and_then(|release| release.parse::<u32>().ok());
-        if release.is_none_or(|release| release < 59) {
+        // 81d99abe2bd8 is in v7.3 itself, and 6.18.59 carries it as a backport.
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect();
+        let has_fix = match parts[..] {
+            [6, 18, release, ..] => release >= 59,
+            [major, minor, ..] => (major, minor) >= (7, 3),
+            _ => false,
+        };
+        if !has_fix {
             wrong.push(format!(
-                "{profile_name}.{arch} pins {version}, before 6.18.59"
+                "{profile_name}.{arch} pins {version}, before 6.18.59 or 7.3"
             ));
         }
         if let Some(dir) = vm_kernel_patches_dir(&profile) {
