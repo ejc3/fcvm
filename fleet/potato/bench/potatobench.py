@@ -632,6 +632,9 @@ async def cmd_ladder(a):
         rec.flush()
         print("SIZE", size, json.dumps(res), flush=True)
         await game.quiesce(ring)
+        if res.get("reason") == "wake_failed":
+            # a ring that could not wake measures nothing, and neither would the larger ones
+            sys.exit(f"size {size}: player {res.get('player')} failed to wake: {res.get('error')}")
 
 
 class Game:

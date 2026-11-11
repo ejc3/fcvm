@@ -154,5 +154,47 @@ class LadderWakeFailure(unittest.TestCase):
         self.assertLess(asyncio.run(run()), 2)
 
 
+class LadderExit(unittest.TestCase):
+    def test_a_ladder_whose_round_failed_to_wake_exits_with_the_error(self):
+        # the round's players are put back to sleep (quiesce) and the command then fails with the
+        # wake's error, instead of going on to the next size and exiting 0
+        import asyncio
+        from types import SimpleNamespace
+        from unittest import mock
+
+        calls = []
+
+        class FakeHost:
+            def __init__(self, out, n, prefix):
+                async def nothing():
+                    return None
+                self.players = [SimpleNamespace(k=k, boot=nothing, sleep=nothing) for k in range(n)]
+
+            async def start(self):
+                calls.append("start")
+
+        class FakeGame:
+            def __init__(self, host, a, rec):
+                pass
+
+            async def watch(self, p):
+                return None
+
+            async def play(self, ring, rnd):
+                calls.append(f"play {len(ring)}")
+                return {"reason": "wake_failed", "player": 0, "error": "potato-0: fcvm exited with status 1"}
+
+            async def quiesce(self, ring):
+                calls.append("quiesce")
+
+        with tempfile.TemporaryDirectory() as out:
+            a = SimpleNamespace(out=out, sizes=[2, 4], parallel=8, budget=0, hold=100, min_hold=10, start_floor=0)
+            with mock.patch.object(pb, "Host", FakeHost), mock.patch.object(pb, "Game", FakeGame), \
+                    mock.patch.object(pb, "host_prefix", lambda: "2001:db8::/80"):
+                with self.assertRaises(SystemExit) as e:
+                    asyncio.run(pb.cmd_ladder(a))
+        self.assertIn("status 1", str(e.exception.code))
+        self.assertEqual(calls, ["start", "play 2", "quiesce"])
+
 if __name__ == "__main__":
     unittest.main()
