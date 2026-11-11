@@ -65,5 +65,136 @@ class Bookkeeping(unittest.TestCase):
         self.assertEqual([pb.burst_arm(i, 2) for i in range(5)],
                          [(0, False), (0, True), (1, False), (1, True), (0, False)])
 
+class Hello(unittest.TestCase):
+    def test_a_player_whose_fcvm_exits_fails_at_once_with_its_status(self):
+        # a player whose fcvm exits before it says hello (a refused preflight) must not be
+        # waited for until the hello's timeout, which is 600 s for a boot
+        import asyncio
+        import time
+
+        async def run(out):
+            os.makedirs(os.path.join(out, "logs"))
+            p = pb.Player(0, "2001:db8::/80", out)
+            with open(p.logpath("run"), "w") as f:
+                f.write("2026-01-01T00:00:00.000000Z ERROR fcvm: Error: routed mode preflight check failed\n")
+            p.proc = await asyncio.create_subprocess_exec("sh", "-c", "exit 3")
+            t = time.monotonic()
+            with self.assertRaises(RuntimeError) as e:
+                await p.hello(5)
+            self.assertLess(time.monotonic() - t, 4)
+            self.assertIn("status 3", str(e.exception))
+            self.assertIn("preflight check failed", str(e.exception))
+
+        with tempfile.TemporaryDirectory() as out:
+            asyncio.run(run(out))
+
+    def test_a_wake_whose_fcvm_exits_leaves_no_probe_running(self):
+        import asyncio
+
+        async def run(out):
+            os.makedirs(os.path.join(out, "logs"))
+            p = pb.Player(0, "2001:db8::/80", out)
+            with self.assertRaises(RuntimeError):
+                await p.wake(env=dict(os.environ, FCVM_BIN="false"))
+            return [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(asyncio.run(run(out)), [])
+
+    def test_a_hello_that_arrives_is_returned(self):
+        import asyncio
+
+        async def run(out):
+            p = pb.Player(0, "2001:db8::/80", out)
+            p.proc = await asyncio.create_subprocess_exec("sleep", "30")
+            p.hellos.put_nowait((1.0, {"colour": 2}))
+            try:
+                self.assertEqual(await p.hello(5), (1.0, {"colour": 2}))
+            finally:
+                p.proc.kill()
+                await p.proc.wait()
+
+        with tempfile.TemporaryDirectory() as out:
+            asyncio.run(run(out))
+
+
+class LadderWakeFailure(unittest.TestCase):
+    """A round whose first wakes fail ends at once, says why, and sends no ball to wait for."""
+
+    def game(self):
+        from types import SimpleNamespace
+        a = SimpleNamespace(hold=100, shrink=100, min_hold=10, flight=100, round_secs=5, margin=150,
+                            first_wake_ms=1500)
+        return pb.Game(SimpleNamespace(players=[]), a, open(os.devnull, "w"))
+
+    def test_a_failed_first_wake_puts_its_error_in_the_round_result(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        async def refuse(**_):
+            raise RuntimeError("potato-0: fcvm exited with status 1 before it said hello")
+
+        p = SimpleNamespace(k=0, phase="asleep", colour=0, counter=0, chain=ZERO, wake=refuse,
+                            addr="2001:db8::1000", ball_addr=lambda: "[2001:db8::1000]:7070")
+        res = asyncio.run(self.game().play([p], 1))
+        self.assertEqual(res["reason"], "wake_failed")
+        self.assertIn("status 1", res["error"])
+
+    def test_a_round_that_sent_no_ball_does_not_wait_for_it_to_land(self):
+        import asyncio
+        import time
+
+        async def run():
+            g = self.game()
+            g.round = {"id": 1, "n": 4, "hold": 100, "tasks": set(), "landed": asyncio.Event(), "ball_sent": False}
+            t = time.monotonic()
+            await asyncio.wait_for(g.quiesce([]), 5)
+            return time.monotonic() - t
+
+        self.assertLess(asyncio.run(run()), 2)
+
+
+class LadderExit(unittest.TestCase):
+    def test_a_ladder_whose_round_failed_to_wake_exits_with_the_error(self):
+        # the round's players are put back to sleep (quiesce) and the command then fails with the
+        # wake's error, instead of going on to the next size and exiting 0
+        import asyncio
+        from types import SimpleNamespace
+        from unittest import mock
+
+        calls = []
+
+        class FakeHost:
+            def __init__(self, out, n, prefix):
+                async def nothing():
+                    return None
+                self.players = [SimpleNamespace(k=k, boot=nothing, sleep=nothing) for k in range(n)]
+
+            async def start(self):
+                calls.append("start")
+
+        class FakeGame:
+            def __init__(self, host, a, rec):
+                pass
+
+            async def watch(self, p):
+                return None
+
+            async def play(self, ring, rnd):
+                calls.append(f"play {len(ring)}")
+                return {"reason": "wake_failed", "player": 0, "error": "potato-0: fcvm exited with status 1"}
+
+            async def quiesce(self, ring):
+                calls.append("quiesce")
+
+        with tempfile.TemporaryDirectory() as out:
+            a = SimpleNamespace(out=out, sizes=[2, 4], parallel=8, budget=0, hold=100, min_hold=10, start_floor=0)
+            with mock.patch.object(pb, "Host", FakeHost), mock.patch.object(pb, "Game", FakeGame), \
+                    mock.patch.object(pb, "host_prefix", lambda: "2001:db8::/80"):
+                with self.assertRaises(SystemExit) as e:
+                    asyncio.run(pb.cmd_ladder(a))
+        self.assertIn("status 1", str(e.exception.code))
+        self.assertEqual(calls, ["start", "play 2", "quiesce"])
+
 if __name__ == "__main__":
     unittest.main()

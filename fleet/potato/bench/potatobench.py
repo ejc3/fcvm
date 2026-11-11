@@ -230,7 +230,26 @@ class Player:
         self.colour, self.counter, self.chain = hello["colour"], hello["counter"], hello["chain"]
 
     async def hello(self, timeout):
-        return await asyncio.wait_for(self.hellos.get(), timeout)
+        """The next hello. If this player's fcvm exits first (a refused preflight, a failed
+        restore), raise at once with its exit status and the log's last error line, instead
+        of waiting out the timeout."""
+        get = asyncio.ensure_future(self.hellos.get())
+        died = asyncio.ensure_future(self.proc.wait()) if self.proc is not None else None
+        try:
+            done, _ = await asyncio.wait({get, died} - {None}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            pending = [t for t in (get, died) if t is not None and not t.done()]
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        if get in done:
+            return get.result()
+        if died is not None and died in done:
+            errors = [line.strip() for line in lines(self.logpath("run")) if " ERROR " in line]
+            raise RuntimeError(f"{self.name}: fcvm exited with status {died.result()} before it said hello"
+                               + (f"; {errors[-1]}" if errors else ""))
+        raise TimeoutError(f"{self.name}: no hello within {timeout} s (phase {self.phase})")
 
     async def expect(self, kind, timeout):
         deadline = now() + timeout
@@ -291,7 +310,12 @@ class Player:
         while not self.hellos.empty():
             self.hellos.get_nowait()
         probe_task = asyncio.create_task(probe_until_open(self.addr, BALL_PORT, 60))
-        hello_t, hello = await self.hello(60)
+        try:
+            hello_t, hello = await self.hello(60)
+        except BaseException:
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
+            raise
         probe_t, probe, refusals = await probe_task
         # a restored player catches again only once it is told it woke
         await tell(self.addr, {"type": "wake"})
@@ -608,6 +632,9 @@ async def cmd_ladder(a):
         rec.flush()
         print("SIZE", size, json.dumps(res), flush=True)
         await game.quiesce(ring)
+        if res.get("reason") == "wake_failed":
+            # a ring that could not wake measures nothing, and neither would the larger ones
+            sys.exit(f"size {size}: player {res.get('player')} failed to wake: {res.get('error')}")
 
 
 class Game:
@@ -720,7 +747,7 @@ class Game:
             t_w, hello_t, hello, probe_t, probe, refusals = await p.wake()
         except Exception as e:  # noqa: BLE001
             self.write({"type": "wake_failed", "player": p.k, "error": str(e)})
-            self.end(reason="wake_failed", player=p.k)
+            self.end(reason="wake_failed", player=p.k, error=str(e))
             return
         ok = proof_follows(want, hello)
         if r:
@@ -746,6 +773,7 @@ class Game:
         ball = {"round": rnd, "seq": 0, "ring": [p.ball_addr() for p in ring], "hold_ms": a.hold,
                 "shrink_permille": a.shrink, "min_hold_ms": a.min_hold, "flight_ms": a.flight, "trail": []}
         t0 = now()
+        r["ball_sent"] = True
         await send_ball(ring[0].addr, ball)
         try:
             await asyncio.wait_for(r["stop"].wait(), a.round_secs)
@@ -763,10 +791,11 @@ class Game:
         ball still in the air drops and the next round starts from a quiet host."""
         r = self.round
         lap = r["n"] * (r["hold"] + self.a.flight) / 1000.0
-        try:
-            await asyncio.wait_for(r["landed"].wait(), lap + 30)
-        except asyncio.TimeoutError:
-            self.write({"type": "ball_still_up", "round": r["id"]})
+        if r.get("ball_sent"):  # a round whose first wakes failed sent no ball
+            try:
+                await asyncio.wait_for(r["landed"].wait(), lap + 30)
+            except asyncio.TimeoutError:
+                self.write({"type": "ball_still_up", "round": r["id"]})
         await asyncio.gather(*r["tasks"], return_exceptions=True)
         # the round is over for every awake player before it sleeps: no snapshot holds a throw
         await asyncio.gather(*(tell(p.addr, {"type": "stop", "round": r["id"]}) for p in ring if p.phase == "awake"),
