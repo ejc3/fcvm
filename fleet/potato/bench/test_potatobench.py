@@ -65,5 +65,45 @@ class Bookkeeping(unittest.TestCase):
         self.assertEqual([pb.burst_arm(i, 2) for i in range(5)],
                          [(0, False), (0, True), (1, False), (1, True), (0, False)])
 
+class Hello(unittest.TestCase):
+    def test_a_player_whose_fcvm_exits_fails_at_once_with_its_status(self):
+        # a player whose fcvm exits before it says hello (a refused preflight) must not be
+        # waited for until the hello's timeout, which is 600 s for a boot
+        import asyncio
+        import time
+
+        async def run(out):
+            os.makedirs(os.path.join(out, "logs"))
+            p = pb.Player(0, "2001:db8::/80", out)
+            with open(p.logpath("run"), "w") as f:
+                f.write("2026-01-01T00:00:00.000000Z ERROR fcvm: Error: routed mode preflight check failed\n")
+            p.proc = await asyncio.create_subprocess_exec("sh", "-c", "exit 3")
+            t = time.monotonic()
+            with self.assertRaises(RuntimeError) as e:
+                await p.hello(5)
+            self.assertLess(time.monotonic() - t, 4)
+            self.assertIn("status 3", str(e.exception))
+            self.assertIn("preflight check failed", str(e.exception))
+
+        with tempfile.TemporaryDirectory() as out:
+            asyncio.run(run(out))
+
+    def test_a_hello_that_arrives_is_returned(self):
+        import asyncio
+
+        async def run(out):
+            p = pb.Player(0, "2001:db8::/80", out)
+            p.proc = await asyncio.create_subprocess_exec("sleep", "30")
+            p.hellos.put_nowait((1.0, {"colour": 2}))
+            try:
+                self.assertEqual(await p.hello(5), (1.0, {"colour": 2}))
+            finally:
+                p.proc.kill()
+                await p.proc.wait()
+
+        with tempfile.TemporaryDirectory() as out:
+            asyncio.run(run(out))
+
+
 if __name__ == "__main__":
     unittest.main()

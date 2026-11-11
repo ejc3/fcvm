@@ -230,7 +230,25 @@ class Player:
         self.colour, self.counter, self.chain = hello["colour"], hello["counter"], hello["chain"]
 
     async def hello(self, timeout):
-        return await asyncio.wait_for(self.hellos.get(), timeout)
+        """The next hello. If this player's fcvm exits first (a refused preflight, a failed
+        restore), raise at once with its exit status and the log's last error line, instead
+        of waiting out the timeout."""
+        get = asyncio.ensure_future(self.hellos.get())
+        died = asyncio.ensure_future(self.proc.wait()) if self.proc is not None else None
+        try:
+            done, _ = await asyncio.wait({get, died} - {None}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (get, died):
+                if t is not None and not t.done():
+                    t.cancel()
+        if get in done:
+            return get.result()
+        if died is not None and died in done:
+            errors = [line.strip() for line in lines(self.logpath("run")) if " ERROR " in line]
+            raise RuntimeError(f"{self.name}: fcvm exited with status {died.result()} before it said hello"
+                               + (f"; {errors[-1]}" if errors else ""))
+        raise TimeoutError(f"{self.name}: no hello within {timeout} s (phase {self.phase})")
 
     async def expect(self, kind, timeout):
         deadline = now() + timeout
