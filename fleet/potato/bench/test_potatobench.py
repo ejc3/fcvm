@@ -88,6 +88,19 @@ class Hello(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             asyncio.run(run(out))
 
+    def test_a_wake_whose_fcvm_exits_leaves_no_probe_running(self):
+        import asyncio
+
+        async def run(out):
+            os.makedirs(os.path.join(out, "logs"))
+            p = pb.Player(0, "2001:db8::/80", out)
+            with self.assertRaises(RuntimeError):
+                await p.wake(env=dict(os.environ, FCVM_BIN="false"))
+            return [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(asyncio.run(run(out)), [])
+
     def test_a_hello_that_arrives_is_returned(self):
         import asyncio
 
@@ -103,6 +116,42 @@ class Hello(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as out:
             asyncio.run(run(out))
+
+
+class LadderWakeFailure(unittest.TestCase):
+    """A round whose first wakes fail ends at once, says why, and sends no ball to wait for."""
+
+    def game(self):
+        from types import SimpleNamespace
+        a = SimpleNamespace(hold=100, shrink=100, min_hold=10, flight=100, round_secs=5, margin=150,
+                            first_wake_ms=1500)
+        return pb.Game(SimpleNamespace(players=[]), a, open(os.devnull, "w"))
+
+    def test_a_failed_first_wake_puts_its_error_in_the_round_result(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        async def refuse(**_):
+            raise RuntimeError("potato-0: fcvm exited with status 1 before it said hello")
+
+        p = SimpleNamespace(k=0, phase="asleep", colour=0, counter=0, chain=ZERO, wake=refuse,
+                            addr="2001:db8::1000", ball_addr=lambda: "[2001:db8::1000]:7070")
+        res = asyncio.run(self.game().play([p], 1))
+        self.assertEqual(res["reason"], "wake_failed")
+        self.assertIn("status 1", res["error"])
+
+    def test_a_round_that_sent_no_ball_does_not_wait_for_it_to_land(self):
+        import asyncio
+        import time
+
+        async def run():
+            g = self.game()
+            g.round = {"id": 1, "n": 4, "hold": 100, "tasks": set(), "landed": asyncio.Event(), "ball_sent": False}
+            t = time.monotonic()
+            await asyncio.wait_for(g.quiesce([]), 5)
+            return time.monotonic() - t
+
+        self.assertLess(asyncio.run(run()), 2)
 
 
 if __name__ == "__main__":
