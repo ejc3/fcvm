@@ -195,7 +195,11 @@ pub async fn sweep_fork_snapshots(dir: &Path) {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("mc-fork-"))
-        .map(|n| n.trim_end_matches(".lock").to_string())
+        .map(|n| {
+            n.trim_end_matches(".stage-lock")
+                .trim_end_matches(".lock")
+                .to_string()
+        })
         .collect();
     tags.sort();
     tags.dedup();
@@ -208,6 +212,7 @@ pub async fn sweep_fork_snapshots(dir: &Path) {
             crate::commands::common::acquire_snapshot_dir_lock(&dir.join(&tag), true).await
         {
             if !dir.join(&tag).exists() {
+                let _ = std::fs::remove_file(dir.join(format!("{tag}.stage-lock")));
                 let _ = std::fs::remove_file(&lock);
             }
         }
@@ -1223,6 +1228,24 @@ mod tests {
         assert!(!h(true, Some(19.0)).steady());
         assert!(!h(true, None).steady());
         assert!(!h(false, Some(20.0)).steady());
+    }
+
+    /// The sweep removes a dead agent's fork snapshot with its generation lock and the stage
+    /// lock a create took on it as a parent, and reads neither lock file as a tag.
+    #[tokio::test]
+    async fn the_sweep_removes_a_forks_lock_files() {
+        let d = tempfile::tempdir().unwrap();
+        let snap = d.path().join("mc-fork-mc-2-3");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("config.json"), "{}").unwrap();
+        std::fs::write(d.path().join("mc-fork-mc-2-3.lock"), "").unwrap();
+        std::fs::write(d.path().join("mc-fork-mc-2-3.stage-lock"), "").unwrap();
+        sweep_fork_snapshots(d.path()).await;
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "the sweep left {left:?}");
     }
 
     /// A fork's snapshot is removed under its generation lock: while a create holds it (reading

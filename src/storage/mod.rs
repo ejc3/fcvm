@@ -1,3 +1,4 @@
+pub mod compact;
 pub mod disk;
 pub mod disk_dir;
 pub mod extents;

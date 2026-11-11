@@ -487,6 +487,11 @@ impl SnapshotManager {
         Self { snapshots_dir }
     }
 
+    /// The directory holding the snapshots.
+    pub fn snapshots_dir(&self) -> &Path {
+        &self.snapshots_dir
+    }
+
     /// Save a snapshot
     pub async fn save_snapshot(&self, config: SnapshotConfig) -> Result<()> {
         validate_snapshot_name(&config.name)?;
@@ -575,6 +580,16 @@ impl SnapshotManager {
 
     /// Delete a snapshot
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        self.delete_snapshot_compacting(name, None).await
+    }
+
+    /// Delete a snapshot, and record in `compaction` what its survivors may keep of its
+    /// memory file's extents (`storage::compact`), for a rewrite once the delete is done.
+    pub async fn delete_snapshot_compacting(
+        &self,
+        name: &str,
+        compaction: Option<&mut crate::storage::compact::Compaction>,
+    ) -> Result<()> {
         validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
         // Serialize deletion with creators and restores.  Removing the directory
@@ -588,6 +603,9 @@ impl SnapshotManager {
                 .with_context(|| format!("locking snapshot '{}' for deletion", name))?;
 
         if snapshot_dir.exists() {
+            if let Some(compaction) = compaction {
+                compaction.before_removal(&self.snapshots_dir, name).await;
+            }
             crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
                 .await
                 .context("removing snapshot directory")?;
@@ -609,6 +627,18 @@ impl SnapshotManager {
         &self,
         name: &str,
         expected: &SnapshotGeneration,
+    ) -> Result<bool> {
+        self.delete_snapshot_if_generation_compacting(name, expected, None)
+            .await
+    }
+
+    /// [`Self::delete_snapshot_if_generation`], recording in `compaction` what its survivors
+    /// may keep of its memory file's extents, as [`Self::delete_snapshot_compacting`] does.
+    pub async fn delete_snapshot_if_generation_compacting(
+        &self,
+        name: &str,
+        expected: &SnapshotGeneration,
+        compaction: Option<&mut crate::storage::compact::Compaction>,
     ) -> Result<bool> {
         validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
@@ -633,6 +663,9 @@ impl SnapshotManager {
             return Ok(false);
         }
 
+        if let Some(compaction) = compaction {
+            compaction.before_removal(&self.snapshots_dir, name).await;
+        }
         crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
             .await
             .context("removing invalid snapshot generation")?;

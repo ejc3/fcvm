@@ -343,8 +343,14 @@ async fn cmd_snapshots_delete(args: SnapshotsDeleteArgs) -> Result<()> {
         }
     }
 
-    snapshot_manager.delete_snapshot(&args.name).await?;
+    let mut compaction = crate::storage::compact::Compaction::default();
+    snapshot_manager
+        .delete_snapshot_compacting(&args.name, Some(&mut compaction))
+        .await?;
     println!("Deleted snapshot '{}'", args.name);
+    // A diff snapshot of it keeps the parts of its extents the diff replaced until its own
+    // memory file is rewritten (#1810).
+    compaction.rewrite_survivors(&paths::snapshot_dir()).await;
 
     Ok(())
 }
@@ -424,10 +430,17 @@ async fn prune_delete(manager: &SnapshotManager, candidates: Vec<PruneCandidate>
         retained: 0,
         failed: 0,
     };
+    // Survivors are rewritten once every candidate is gone, so a snapshot pruned with its
+    // parent is not rewritten first.
+    let mut compaction = crate::storage::compact::Compaction::default();
     for candidate in candidates {
         let name = candidate.name;
         match manager
-            .delete_snapshot_if_generation(&name, &candidate.generation)
+            .delete_snapshot_if_generation_compacting(
+                &name,
+                &candidate.generation,
+                Some(&mut compaction),
+            )
             .await
         {
             Ok(true) => {
@@ -444,6 +457,7 @@ async fn prune_delete(manager: &SnapshotManager, candidates: Vec<PruneCandidate>
             }
         }
     }
+    compaction.rewrite_survivors(manager.snapshots_dir()).await;
     outcome
 }
 
