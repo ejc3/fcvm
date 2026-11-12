@@ -72,10 +72,11 @@ fcvm's lockfile.
   which is the reason for the fork, and the particles bug is to be added there; once upstream
   fixes both, the pin moves back to azalea-rs/azalea. Three bots join over
   the guest's loopback. A bot that nobody drives walks to a random column of the map's region
-  with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. After a restore
-  every bot's connection is gone (fcvm's restore retires the snapshot's sockets), the bots join
-  again within 100 ms, and the program reseeds its choices from the guest's random pool, the
-  tile's name and its generation, so a fork and its source do not walk the same paths.
+  with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. A restore keeps
+  the bots connected: their connections to Pumpkin are loopback inside the guest, which fcvm's
+  restore keeps (it retires only sockets whose peer is outside the guest). When the agent posts
+  the copy's scene, the program reseeds its choices from the guest's random pool, the tile's
+  name and its generation, so a fork and its source do not walk the same paths.
 - **The map.** The bots share one view of the world. Every 200 ms the program reads the top
   block of every column of a 128 x 128 region around the spawn (the chunk heightmaps the server
   sends, then the block below the first empty one) and turns its registry name into one of 48
