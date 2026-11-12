@@ -613,3 +613,194 @@ fn kernel_patch_resolves_a_host_kernel_profile_from_its_own_table() {
         String::from_utf8_lossy(&edit.stderr)
     );
 }
+
+/// The three kernel files the arm64 host's vgic-v3 patch changes, excerpted in
+/// `tests/fixtures/vgic-v3-hcr-<major>.<minor>` from the release the host pins.
+const VGIC_HCR_FILES: [&str; 3] = [
+    "arch/arm64/kvm/hyp/vgic-v3-sr.c",
+    "arch/arm64/kvm/vgic/vgic.c",
+    "include/kvm/arm_vgic.h",
+];
+
+const VGIC_HCR_PATCH: &str = "vgic-v3-keep-hcr-on-quiet-exits.patch";
+
+/// The arm64 host kernel's release, its patch set and the vgic-v3 fixture cut from it.
+fn vgic_hcr_port() -> (String, PathBuf, PathBuf) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+    let host = &config["kernel_profiles"]["nested"]["arm64"]["host_kernel"];
+    let release = host["kernel_version"]
+        .as_str()
+        .expect("[kernel_profiles.nested.arm64.host_kernel] pins a kernel_version")
+        .to_string();
+    let patches_dir = host["patches_dir"]
+        .as_str()
+        .expect("[kernel_profiles.nested.arm64.host_kernel] names a patches_dir");
+    let series = release.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
+    (
+        release,
+        root.join(patches_dir).join(VGIC_HCR_PATCH),
+        root.join(format!("tests/fixtures/vgic-v3-hcr-{series}")),
+    )
+}
+
+/// A fixture cut from another release would let the patch apply here and fail to
+/// apply in the host build, or the reverse.
+#[test]
+fn the_vgic_hcr_fixture_is_cut_from_the_pinned_arm64_host_kernel() {
+    let (release, _, fixture) = vgic_hcr_port();
+    for file in VGIC_HCR_FILES {
+        let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
+            panic!(
+                "the arm64 host pins Linux {release}, and {} has no {file} excerpt: {e}",
+                fixture.display()
+            )
+        });
+        assert!(
+            text.contains(&format!("Linux v{release} {file}")),
+            "{}/{file} is not cut from Linux {release}, which the arm64 host kernel pins. \
+             Cut the same line range again from that release and record its SHA-256 in the \
+             header.",
+            fixture.display()
+        );
+    }
+}
+
+/// Run the arm64 host kernel's GICv3 world switch with its own
+/// `vgic-v3-keep-hcr-on-quiet-exits.patch` applied, in a C harness that models one CPU's
+/// virtual CPU interface and computes ICH_MISR_EL2 from it (fcvm #659): vcpu load and put
+/// and guest entry and exit from `arch/arm64/kvm/hyp/vgic-v3-sr.c`, and the run loop's
+/// `kvm_vgic_flush_hwstate()` and `kvm_vgic_sync_hwstate()` from
+/// `arch/arm64/kvm/vgic/vgic.c`.
+///
+/// Since 6.19 every exit walks the ap_list under its lock to fill and prune it, clears
+/// ICH_HCR_EL2 and reads ICH_MISR_EL2, and every entry writes ICH_HCR_EL2 again,
+/// whether or not an interrupt is in flight. On a c9g.metal-48xl host that took an HVC
+/// exit from 396 ns on 6.18.60 to 453 ns on 7.3.3. Without the patch the `loop` scenario
+/// fails on that work. `matrix` and `putload` pass with or without it: they fail a change
+/// that leaves the host holding a register state that raises a maintenance interrupt, or
+/// that enters the guest with ICH_HCR_EL2 other than what the vgic computed.
+#[test]
+fn quiet_vgic_exits_leave_ich_hcr_el2_programmed_without_a_host_maintenance_interrupt() {
+    let (release, patch, fixture) = vgic_hcr_port();
+    let temp = tempfile::tempdir().expect("create the vgic-v3 fixture directory");
+    for file in VGIC_HCR_FILES {
+        let dest = temp.path().join(file);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(file), &dest)
+            .unwrap_or_else(|e| panic!("copy the {file} excerpt: {e}"));
+    }
+
+    // Without the patch, run the release's own functions and fail on what they do.
+    let patched = patch.exists();
+    if patched {
+        let applied = Command::new("patch")
+            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
+            .arg(&patch)
+            .current_dir(temp.path())
+            .output()
+            .expect("run patch");
+        assert!(
+            applied.status.success(),
+            "{} does not apply to the {release} excerpts:\n{}{}",
+            patch.display(),
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
+
+    let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
+    let types = extract_block(
+        &read("include/kvm/arm_vgic.h"),
+        "struct vgic_v3_cpu_if {",
+        "};",
+    )
+    .expect("struct vgic_v3_cpu_if is missing from the arm_vgic.h excerpt");
+    fs::write(temp.path().join("extracted-types.c"), types).unwrap();
+    let mut extracted = String::new();
+    for (file, start, with_patch) in [
+        (VGIC_HCR_FILES[0], "static u64 compute_ich_hcr(", false),
+        (
+            VGIC_HCR_FILES[0],
+            "static bool __vgic_v3_hcr_can_signal_mi(",
+            true,
+        ),
+        (VGIC_HCR_FILES[0], "void __vgic_v3_save_state(", false),
+        (VGIC_HCR_FILES[0], "void __vgic_v3_restore_state(", false),
+        (VGIC_HCR_FILES[0], "void __vgic_v3_activate_traps(", false),
+        (VGIC_HCR_FILES[0], "void __vgic_v3_deactivate_traps(", false),
+        (
+            VGIC_HCR_FILES[1],
+            "static inline void vgic_save_state(",
+            false,
+        ),
+        (VGIC_HCR_FILES[1], "void kvm_vgic_sync_hwstate(", false),
+        (
+            VGIC_HCR_FILES[1],
+            "static inline void vgic_restore_state(",
+            false,
+        ),
+        (VGIC_HCR_FILES[1], "static void vgic_flush_no_lrs(", true),
+        (VGIC_HCR_FILES[1], "static void vgic_flush_state(", false),
+        (VGIC_HCR_FILES[1], "void kvm_vgic_flush_hwstate(", false),
+    ] {
+        match extract_block(&read(file), start, "}") {
+            Some(block) => extracted.push_str(&block),
+            None => assert!(
+                with_patch && !patched,
+                "`{start}` is missing from the {} {release} excerpts",
+                if patched { "patched" } else { "unpatched" }
+            ),
+        }
+    }
+    fs::write(temp.path().join("extracted.c"), extracted).unwrap();
+    fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
+
+    let binary = temp.path().join("vgic-hcr");
+    let compiled = Command::new("cc")
+        .args([
+            "-std=gnu11",
+            "-g",
+            "-O1",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-Werror=implicit-function-declaration",
+            "-Werror=incompatible-pointer-types",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(temp.path().join("harness.c"))
+        .output()
+        .expect("run cc");
+    assert!(
+        compiled.status.success(),
+        "the {release} vgic-v3 harness failed to compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let mut failures = Vec::new();
+    for scenario in ["loop", "matrix", "putload"] {
+        // As for the shadow stage-2 harness: no address randomization, no LeakSanitizer.
+        let result = Command::new("setarch")
+            .args([std::env::consts::ARCH, "-R"])
+            .arg(&binary)
+            .arg(scenario)
+            .env("ASAN_OPTIONS", "detect_leaks=0")
+            .output()
+            .expect("run the vgic-v3 harness");
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let first: Vec<&str> = stderr.lines().take(5).collect();
+            failures.push(format!("{scenario}: {}", first.join("\n  ")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Linux {release} with{} {VGIC_HCR_PATCH}:\n{}",
+        if patched { "" } else { "out" },
+        failures.join("\n")
+    );
+}

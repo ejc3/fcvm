@@ -87,6 +87,18 @@ creation took 180 ms (#1563). fcvm carried the commit as a patch until the pin
 reached 6.18.60. `every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier`
 fails if a host kernel pins an earlier release.
 
+`kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
+6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow
+series) every entry and exit runs the vgic flush and sync in full when no interrupt is in
+flight: the empty ap_list is walked under its lock to fill and prune it, ICH_HCR_EL2 is
+cleared and ICH_MISR_EL2 read on exit, and ICH_HCR_EL2 is written again on entry. The patch
+skips the walk and the lock for an empty ap_list, as 6.18 did, and on VHE leaves
+ICH_HCR_EL2 programmed across an exit when no LR is in use and the value cannot raise a
+maintenance interrupt before the next entry. `quiet_vgic_exits_leave_ich_hcr_el2_programmed_without_a_host_maintenance_interrupt`
+runs the release's flush, sync, load and put against a model of the CPU interface: it
+fails without the patch on the work a quiet exit does, and fails any change that leaves
+the host holding a register state that raises a maintenance interrupt.
+
 The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
 x86_64): the default patches, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
