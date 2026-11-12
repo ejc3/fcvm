@@ -1,0 +1,202 @@
+From 54575a2f46373ea8e84ed3b8f0ca77b94b2bbcb1 Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:06:43 +0000
+Subject: [PATCH] KVM: arm64: vgic: Do no vgic work on an exit with nothing in
+ flight
+
+Since 6.19 (the vgic-lr-overflow series, in particular dd598fc1139f
+"KVM: arm64: Compute vgic state irrespective of the number of
+interrupts" and 00c6d0d4a805 "KVM: arm64: GICv3: Decouple ICH_HCR_EL2
+programming from LRs"), every entry and exit runs the vgic flush and
+sync in full when no interrupt is in flight: the empty ap_list is walked
+under its lock to fill the LRs and again to prune it, ICH_HCR_EL2 is
+cleared and ICH_MISR_EL2 read on exit, and ICH_HCR_EL2 is written again
+on entry.
+
+With an empty ap_list, compute the maintenance interrupt configuration
+from an empty summary without taking the lock, and do not prune. The
+list is checked without the lock, as before 6.19: an interrupt queued
+after the check makes a request and kicks the vcpu.
+
+On VHE, leave ICH_HCR_EL2 programmed across an exit when no LR is in
+use and the value cannot raise a maintenance interrupt before the next
+entry (no underflow, no-pending or EOIcount interrupt enabled, and each
+group enable or disable interrupt armed for the state the guest's VMCR
+does not have), and skip the entry's write when the register already
+holds the value. vgic_hcr_live says the CPU's register holds
+vgic_hcr_hw; vcpu load forgets it and vcpu put clears the register.
+
+fcvm #659: an in-kernel HVC exit on a c9g.metal-48xl host, one vCPU
+with a vGICv3, took 275.5 ns on 6.18.60, 313.7 ns on 7.3.3 and 295.8 ns
+with this patch; without a vGIC, 409.8, 460.3 and 416.3 ns.
+---
+ arch/arm64/kvm/hyp/vgic-v3-sr.c | 42 +++++++++++++++++++++++++++++++--
+ arch/arm64/kvm/vgic/vgic.c      | 33 +++++++++++++++++++++++++-
+ include/kvm/arm_vgic.h          |  9 +++++++
+ 3 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/kvm/hyp/vgic-v3-sr.c b/arch/arm64/kvm/hyp/vgic-v3-sr.c
+index 74d4a50..5f4ffc6 100644
+--- a/arch/arm64/kvm/hyp/vgic-v3-sr.c
++++ b/arch/arm64/kvm/hyp/vgic-v3-sr.c
+@@ -203,6 +203,26 @@ static u64 compute_ich_hcr(struct vgic_v3_cpu_if *cpu_if)
+ 	return cpu_if->vgic_hcr | vgic_ich_hcr_trap_bits();
+ }
+ 
++/*
++ * With no LR in use, the maintenance interrupts @hcr can raise are underflow,
++ * no pending, EOIcount and the four group enable/disable ones. The last four
++ * depend only on the VMCR the guest left, which nothing changes before the
++ * next entry.
++ */
++static bool __vgic_v3_hcr_can_signal_mi(u64 hcr, u64 vmcr)
++{
++	bool grp0 = vmcr & ICH_VMCR_EL2_VENG0_MASK;
++	bool grp1 = vmcr & ICH_VMCR_EL2_VENG1_MASK;
++
++	if (hcr & (ICH_HCR_EL2_UIE | ICH_HCR_EL2_NPIE | ICH_HCR_EL2_LRENPIE))
++		return true;
++
++	return ((hcr & ICH_HCR_EL2_VGrp0EIE) && grp0) ||
++	       ((hcr & ICH_HCR_EL2_VGrp0DIE) && !grp0) ||
++	       ((hcr & ICH_HCR_EL2_VGrp1EIE) && grp1) ||
++	       ((hcr & ICH_HCR_EL2_VGrp1DIE) && !grp1);
++}
++
+ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
+ {
+ 	u64 used_lrs = cpu_if->used_lrs;
+@@ -243,6 +263,17 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
+ 		cpu_if->vgic_hcr |= val & ICH_HCR_EL2_EOIcount;
+ 	}
+ 
++	/*
++	 * Clearing ICH_HCR_EL2 here and writing it again on entry costs two GIC
++	 * system register writes and a read on every exit. Leave it programmed
++	 * when it cannot raise a maintenance interrupt before the next entry;
++	 * __vgic_v3_deactivate_traps() clears it on put.
++	 */
++	if (cpu_if->vgic_hcr_live && !used_lrs &&
++	    !__vgic_v3_hcr_can_signal_mi(cpu_if->vgic_hcr_hw, cpu_if->vgic_vmcr))
++		return;
++
++	cpu_if->vgic_hcr_live = false;
+ 	write_gicreg(0, ICH_HCR_EL2);
+ 
+ 	/*
+@@ -256,9 +287,13 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
+ void __vgic_v3_restore_state(struct vgic_v3_cpu_if *cpu_if)
+ {
+ 	u64 used_lrs = cpu_if->used_lrs;
++	u64 hcr = compute_ich_hcr(cpu_if);
+ 	int i;
+ 
+-	write_gicreg(compute_ich_hcr(cpu_if), ICH_HCR_EL2);
++	if (!cpu_if->vgic_hcr_live || cpu_if->vgic_hcr_hw != hcr)
++		write_gicreg(hcr, ICH_HCR_EL2);
++	cpu_if->vgic_hcr_hw = hcr;
++	cpu_if->vgic_hcr_live = has_vhe();
+ 
+ 	for (i = 0; i < used_lrs; i++)
+ 		__gic_v3_set_lr(cpu_if->vgic_lr[i], i);
+@@ -335,6 +370,8 @@ void __vgic_v3_activate_traps(struct vgic_v3_cpu_if *cpu_if)
+ 	if (static_branch_unlikely(&vgic_v3_cpuif_trap) ||
+ 	    cpu_if->its_vpe.its_vm || !cpu_if->vgic_sre)
+ 		write_gicreg(vgic_ich_hcr_trap_bits() | ICH_HCR_EL2_En, ICH_HCR_EL2);
++
++	cpu_if->vgic_hcr_live = false;
+ }
+ 
+ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
+@@ -358,8 +395,9 @@ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
+ 	 * no interrupts were being injected, and we disable it again here.
+ 	 */
+ 	if (static_branch_unlikely(&vgic_v3_cpuif_trap) ||
+-	    cpu_if->its_vpe.its_vm || !cpu_if->vgic_sre)
++	    cpu_if->its_vpe.its_vm || !cpu_if->vgic_sre || cpu_if->vgic_hcr_live)
+ 		write_gicreg(0, ICH_HCR_EL2);
++	cpu_if->vgic_hcr_live = false;
+ }
+ 
+ void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
+diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
+index 5cf5a1e..49c78b5 100644
+--- a/arch/arm64/kvm/vgic/vgic.c
++++ b/arch/arm64/kvm/vgic/vgic.c
+@@ -1093,7 +1093,9 @@ void kvm_vgic_sync_hwstate(struct kvm_vcpu *vcpu)
+ 
+ 	vgic_fold_state(vcpu);
+ 
+-	if (!vgic_is_v5(vcpu->kvm))
++	/* Nothing to prune on an empty ap_list. */
++	if (!vgic_is_v5(vcpu->kvm) &&
++	    !list_empty(&vcpu->arch.vgic_cpu.ap_list_head))
+ 		vgic_prune_ap_list(vcpu);
+ }
+ 
+@@ -1127,6 +1129,25 @@ static inline void vgic_restore_state(struct kvm_vcpu *vcpu)
+ 		__vgic_v3_restore_state(&vcpu->arch.vgic_cpu.vgic_v3);
+ }
+ 
++/*
++ * With nothing on the ap_list there is no LR to fill, and only the maintenance
++ * interrupt configuration has to be computed, from the summary of an empty list.
++ */
++static void vgic_flush_no_lrs(struct kvm_vcpu *vcpu)
++{
++	struct ap_list_summary als = {};
++
++	*host_data_ptr(last_lr_irq) = NULL;
++
++	if (!static_branch_unlikely(&kvm_vgic_global_state.gicv3_cpuif)) {
++		vcpu->arch.vgic_cpu.vgic_v2.used_lrs = 0;
++		vgic_v2_configure_hcr(vcpu, &als);
++	} else {
++		vcpu->arch.vgic_cpu.vgic_v3.used_lrs = 0;
++		vgic_v3_configure_hcr(vcpu, &als);
++	}
++}
++
+ static void vgic_flush_state(struct kvm_vcpu *vcpu)
+ {
+ 	if (vgic_is_v5(vcpu->kvm)) {
+@@ -1134,6 +1155,16 @@ static void vgic_flush_state(struct kvm_vcpu *vcpu)
+ 		return;
+ 	}
+ 
++	/*
++	 * Checked without the ap_list_lock, as before 6.19: an interrupt queued
++	 * after the check makes a request and kicks the vcpu, so this entry is
++	 * abandoned or interrupted and the next one sees it.
++	 */
++	if (list_empty(&vcpu->arch.vgic_cpu.ap_list_head)) {
++		vgic_flush_no_lrs(vcpu);
++		return;
++	}
++
+ 	scoped_guard(raw_spinlock, &vcpu->arch.vgic_cpu.ap_list_lock)
+ 		vgic_flush_lr_state(vcpu);
+ }
+diff --git a/include/kvm/arm_vgic.h b/include/kvm/arm_vgic.h
+index 086b757..b795269 100644
+--- a/include/kvm/arm_vgic.h
++++ b/include/kvm/arm_vgic.h
+@@ -470,6 +470,15 @@ struct vgic_v3_cpu_if {
+ 	struct its_vpe	its_vpe;
+ 
+ 	unsigned int used_lrs;
++
++	/*
++	 * VHE only: true while this CPU's ICH_HCR_EL2 holds vgic_hcr_hw, as
++	 * __vgic_v3_restore_state() wrote it. __vgic_v3_save_state() leaves
++	 * it programmed when it cannot raise a maintenance interrupt before
++	 * the next entry, and that entry then does not write it again.
++	 */
++	bool		vgic_hcr_live;
++	u32		vgic_hcr_hw;
+ };
+ 
+ struct vgic_v5_cpu_if {
+-- 
+2.43.0
+
