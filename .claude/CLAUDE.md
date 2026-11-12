@@ -2586,7 +2586,7 @@ fuse-pipe/benches/
 
 7. **Resource Limits** (2025-12-08)
    - RLIMIT_NOFILE raised on startup: fc-agent to 65536, fcvm to the host's hard limit (at least
-     65536), since a `--map` server holds a descriptor per inode the guest holds
+     65536, at most `fs.nr_open`), since a `--map` server holds a descriptor per inode the guest holds
    - Prevents EMFILE errors during parallel test execution
    - Required for large-scale POSIX compliance test suites
 
