@@ -607,15 +607,8 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] set hostname to {}", hostname);
         }
     }
-    // net.ipv4.ip_unprivileged_port_start=0: With --user, the container runs as
-    // a non-root user but needs to bind port 80. The VM is single-tenant so this is safe.
-    for sysctl in &[
-        "fs.file-max=2097152",
-        "fs.nr_open=2097152",
-        "net.ipv4.ip_unprivileged_port_start=0",
-        "kernel.threads-max=4194304",
-        "net.core.somaxconn=65535",
-    ] {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    for sysctl in guest_sysctls(&cmdline) {
         let _ = std::process::Command::new("sysctl")
             .args(["-w", sysctl])
             .output();
@@ -1507,6 +1500,57 @@ mod tests {
         assert!(
             body.contains("server {addr} iburst") && !body.contains("refclock"),
             "start_chronyd must give chronyd NTP sources only"
+        );
+    }
+}
+
+/// The sysctls fc-agent sets in every guest, plus, in a guest booted with the nested
+/// profile (`kvm-arm.mode=nested`), `net.ipv4.tcp_min_tso_segs=44`.
+///
+/// net.ipv4.ip_unprivileged_port_start=0: with --user the container runs as a
+/// non-root user but needs to bind port 80; the VM is single-tenant, so this is safe.
+///
+/// tcp_min_tso_segs: TCP sizes each TSO segment from its pacing rate, with a floor of
+/// this many MSS (2 by default). A sender whose every virtio-net kick costs a nested
+/// exit is slow, so its segments are a packet or two and it pays an exit per packet:
+/// an L3 guest moved about 1 KB per exit and 15 Mbit/s out on a 7.3.3 host, at about
+/// 1,350 exits a second whatever it sent (#659). With 44 (one 64 KiB segment) the
+/// same exit rate carried about 5 KB each and 55 Mbit/s.
+fn guest_sysctls(cmdline: &str) -> Vec<&'static str> {
+    let mut sysctls = vec![
+        "fs.file-max=2097152",
+        "fs.nr_open=2097152",
+        "net.ipv4.ip_unprivileged_port_start=0",
+        "kernel.threads-max=4194304",
+        "net.core.somaxconn=65535",
+    ];
+    if cmdline
+        .split_whitespace()
+        .any(|arg| arg == "kvm-arm.mode=nested")
+    {
+        sysctls.push("net.ipv4.tcp_min_tso_segs=44");
+    }
+    sysctls
+}
+
+#[cfg(test)]
+mod guest_sysctl_tests {
+    use super::guest_sysctls;
+
+    #[test]
+    fn a_nested_guest_sends_full_size_tso_segments() {
+        let nested = guest_sysctls("console=ttyS0 kvm-arm.mode=nested numa=off arm64.nv2");
+        assert!(
+            nested.contains(&"net.ipv4.tcp_min_tso_segs=44"),
+            "a nested-profile guest must raise tcp_min_tso_segs, or a slow sender pays a \
+             nested exit per packet: {nested:?}"
+        );
+        let default = guest_sysctls("console=ttyS0 reboot=k panic=1");
+        assert!(
+            !default
+                .iter()
+                .any(|s| s.starts_with("net.ipv4.tcp_min_tso_segs")),
+            "only nested-profile guests change TSO sizing: {default:?}"
         );
     }
 }
