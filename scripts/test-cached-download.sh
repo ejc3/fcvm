@@ -27,6 +27,12 @@ cmp -s "$dir/src/gone.tgz" "$dir/out2" || fail "warm run wrote the wrong bytes"
 
 bad=$(printf '0%.0s' $(seq 64))
 mv "$dir/src/gone.tgz" "$dir/src/a.tgz"
+# Nothing on stdout, cold or warm: callers capture their stdout (make apk's APK path).
+stdout=$("$dl" "$url" "$sha" "$dir/out4" "$dir/cache-quiet" 2>/dev/null) || fail "quiet cold run failed"
+[ -z "$stdout" ] || fail "a cold run wrote to stdout: $stdout"
+stdout=$("$dl" "$url" "$sha" "$dir/out5" "$dir/cache-quiet" 2>/dev/null) || fail "quiet warm run failed"
+[ -z "$stdout" ] || fail "a warm run wrote to stdout: $stdout"
+
 if "$dl" "$url" "$bad" "$dir/out3" "$dir/cache2" > "$dir/bad.log" 2>&1; then fail "a checksum mismatch succeeded"; fi
 [ -z "$(ls -A "$dir/cache2" 2>/dev/null)" ] || fail "a checksum mismatch left files: $(ls -A "$dir/cache2")"
 [ ! -e "$dir/out3" ] || fail "a checksum mismatch wrote OUT"

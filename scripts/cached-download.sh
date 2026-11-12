@@ -11,6 +11,11 @@
 # actions/cache. The copy is published by a unique temporary name and a rename, so concurrent
 # runs sharing CACHE_DIR never see a partial file, and a file whose checksum does not match is
 # never published.
+#
+# It writes nothing to stdout: its callers run inside commands whose stdout is captured (make
+# apk prints the built APK's path, which scripts/phone/app.sh reads), and a status line there
+# became part of that path when the cache was cold (generation ten's host image build, 2026-11-12). Status goes to
+# stderr.
 set -euo pipefail
 [ $# -ge 3 ] || { echo "usage: cached-download.sh URL SHA256 OUT [CACHE_DIR]" >&2; exit 2; }
 url=$1 sha=$2 out=$3
@@ -19,9 +24,9 @@ dir=${4:-${CACHED_DOWNLOAD_DIR:-/mnt/fcvm-btrfs/cache/downloads}}
 name=$(basename "${url%%\?*}")
 cached="$dir/$sha-$name"
 if [ -f "$cached" ] && echo "$sha  $cached" | sha256sum -c --status -; then
-  echo "cached-download: $name from $cached, no download"
+  echo "cached-download: $name from $cached, no download" >&2
 else
-  echo "cached-download: downloading $url"
+  echo "cached-download: downloading $url" >&2
   mkdir -p "$dir"
   tmp=$(mktemp "$dir/.$name.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
