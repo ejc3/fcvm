@@ -520,18 +520,12 @@ impl PassthroughFs {
                     (Ok(root), Ok(path)) => path.strip_prefix(root).ok(),
                     _ => None,
                 };
-                // The path the kernel reports for a descriptor is where its dentry is now, unless
-                // the dentry was removed: then it reads "<name> (deleted)", which another file
-                // can have, also when another link keeps the inode. Such a path names the inode
-                // only while it still leads to it. Checking every path would cost two more
-                // system calls per inode.
-                let removed = path
-                    .as_ref()
-                    .is_ok_and(|path| path.as_os_str().as_bytes().ends_with(b" (deleted)"));
+                // The path the kernel reports for a descriptor is only a name: a removed dentry
+                // reads "<name> (deleted)", which another file can have, and a dentry under a
+                // directory the host has since covered with a mount still reports its old path,
+                // which now leads to the covering file. The table names the inode only while that
+                // path still leads to it, so every path is checked, not only the removed ones.
                 let names_the_inode = |relative: &std::path::Path| {
-                    if !removed {
-                        return true;
-                    }
                     let (Ok(root), Ok(stat)) = (&root, &self.inner.pinned_stat(pinned)) else {
                         return false;
                     };
