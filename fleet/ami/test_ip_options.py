@@ -365,6 +365,17 @@ class StoreSettledTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(log[-1], "store.sh")
 
+    def test_the_build_phase_drops_the_base_images_store_parts_after_the_restore(self):
+        # The base image's packed store filled the builder's root volume (the Minecraft image's
+        # build ran out of space): the build phase removes its parts once the boot restore is
+        # done, before the image builds start, and keeps the part list for a restore from S3.
+        build = self.BUILD[self.BUILD.index("\nbuild)\n"):self.BUILD.index("\n  ;;\nbake)")]
+        drop = build.index("find /var/lib/fcvm-fleet/store -maxdepth 1 -name '*.tar.zst' -delete")
+        self.assertLess(build.index("store_settled"), drop)
+        self.assertLess(drop, build.index("bg_start fleet-ami-windows-image"))
+        self.assertLess(drop, build.index("bg_start fleet-ami-minecraft-image"))
+        self.assertNotIn("rm -rf /var/lib/fcvm-fleet/store", build)
+
     def test_prep_and_build_reach_the_store_only_through_it(self):
         for phase, end in (("prep)", "\n  ;;\nbuild)"), ("build)", "\n  ;;\nbake)")):
             with self.subTest(phase=phase):
