@@ -375,6 +375,10 @@ class StoreSettledTests(unittest.TestCase):
         self.assertLess(drop, build.index("bg_start fleet-ami-windows-image"))
         self.assertLess(drop, build.index("bg_start fleet-ami-minecraft-image"))
         self.assertNotIn("rm -rf /var/lib/fcvm-fleet/store", build)
+        # Only a missing directory is skipped: a deletion that fails stops the phase.
+        line = build[build.rindex("\n", 0, drop) + 1:build.index("\n", drop)]
+        self.assertEqual(line.strip(), "if [ -d /var/lib/fcvm-fleet/store ]; then find /var/lib/fcvm-fleet/store "
+                                       "-maxdepth 1 -name '*.tar.zst' -delete; fi")
 
     def test_prep_and_build_reach_the_store_only_through_it(self):
         for phase, end in (("prep)", "\n  ;;\nbuild)"), ("build)", "\n  ;;\nbake)")):

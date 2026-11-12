@@ -187,7 +187,8 @@ build)
   # between it filled the 61 GB root: the Minecraft image's build ran out of space there on
   # 2026-11-12. Drop the parts once the restore is done; the list and /etc/fcvm-fleet/store.env
   # stay, so a reboot before bake still restores the store from S3.
-  find /var/lib/fcvm-fleet/store -maxdepth 1 -name '*.tar.zst' -delete 2>/dev/null || true
+  # A builder from Ubuntu has no store directory; a deletion that fails stops the phase.
+  if [ -d /var/lib/fcvm-fleet/store ]; then find /var/lib/fcvm-fleet/store -maxdepth 1 -name '*.tar.zst' -delete; fi
   # VFIO maps all guest memory for DMA, which counts against the caller's memlock limit;
   # children inherit it through sudo.
   prlimit --pid $$ --memlock=unlimited:unlimited
