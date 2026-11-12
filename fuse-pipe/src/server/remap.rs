@@ -1210,6 +1210,100 @@ mod tests {
         );
     }
 
+    /// A held file whose directory the host covers with a mount keeps reporting its old path,
+    /// without " (deleted)", and that path now leads to the covering file. The table must record
+    /// the inode as gone, so a restore refuses it instead of serving the other file. Mounting
+    /// needs a mount namespace, so the test runs itself again under `unshare`, as root of a new
+    /// user namespace.
+    ///
+    /// RED BEFORE THE FIX: a table that checked only paths ending in " (deleted)" named the held
+    /// inode by "sub/file", and the clone answered it with the covering file's attributes.
+    #[test]
+    fn a_held_file_under_a_covering_mount_is_not_restored_as_the_covering_file() {
+        const INNER: &str = "FUSE_PIPE_TEST_IN_MOUNT_NAMESPACE";
+        const NAME: &str =
+            "server::remap::tests::a_held_file_under_a_covering_mount_is_not_restored_as_the_covering_file";
+        if std::env::var_os(INNER).is_none() {
+            let status = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads", "1"])
+                .env(INNER, "1")
+                .status()
+                .expect("BLOCKED: could not run unshare");
+            assert!(
+                status.success(),
+                "the test failed in its mount namespace: {status}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cover = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/file"), b"held").unwrap();
+        std::fs::write(cover.path().join("file"), b"the covering file").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        let lookup = |parent: u64, name: &str| {
+            source
+                .handle_request_with_groups(
+                    &VolumeRequest::Lookup {
+                        parent,
+                        name: name.as_bytes().to_vec(),
+                        uid,
+                        gid,
+                        pid: 0,
+                    },
+                    &[],
+                )
+                .attr()
+                .unwrap()
+                .ino
+        };
+        let sub = lookup(1, "sub");
+        let held = lookup(sub, "file");
+
+        let target =
+            std::ffi::CString::new(dir.path().join("sub").as_os_str().as_encoded_bytes()).unwrap();
+        let from = std::ffi::CString::new(cover.path().as_os_str().as_encoded_bytes()).unwrap();
+        // Safe: both are NUL-terminated paths; the other arguments are null or flags.
+        let mounted = unsafe {
+            libc::mount(
+                from.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            mounted,
+            0,
+            "bind mount: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let table = source.inode_table(source.capture_inodes());
+        let clone = RemapFs::restore_from_table(
+            crate::server::PassthroughFs::for_volume(dir.path(), false),
+            &table,
+        );
+        let attr = clone.handle_request_with_groups(&VolumeRequest::Getattr { ino: held }, &[]);
+        assert!(
+            attr.attr().is_none(),
+            "the held inode is served from the file that covers its path: {attr:?}; table {table}"
+        );
+    }
+
     /// The path the kernel reports for a held file whose name was removed, while another link
     /// keeps it, is "<name> (deleted)", which another file may have. The table must not send
     /// the guest's inode to that file (#1684).
