@@ -6,16 +6,27 @@ use tracing::error;
 use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
-/// The file descriptor limits fcvm runs with, from the limits it was started with: both at the
-/// hard limit, and at least 65536 (which only a privileged process can raise a lower hard limit
-/// to).
+/// The file descriptor limit fcvm runs with (soft and hard alike), from the hard limit it was
+/// started with and the kernel's ceiling (`fs.nr_open`): the hard limit, at least 65536 (which
+/// only a privileged process can raise a lower hard limit to), and never above the ceiling,
+/// since the kernel refuses any limit above it, even a hard limit it already has.
 ///
 /// A volume server holds one descriptor for every inode the guest holds on a `--map`, so the
 /// soft limit is how many files a guest can hold there: at 65536 a guest that looked up 100k
 /// files got EMFILE from the server. The hard limit is the most the host allows, and fcvm used to
 /// lower it to 65536 as well.
-fn nofile_limits(hard: libc::rlim_t) -> libc::rlim_t {
-    hard.max(65536)
+fn nofile_limits(hard: libc::rlim_t, nr_open: Option<libc::rlim_t>) -> libc::rlim_t {
+    let wanted = hard.max(65536);
+    nr_open.map_or(wanted, |ceiling| wanted.min(ceiling))
+}
+
+/// The kernel's per-process descriptor ceiling.
+fn nr_open() -> Option<libc::rlim_t> {
+    std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Raise the file descriptor limit (see [`nofile_limits`]).
@@ -30,26 +41,26 @@ fn raise_resource_limits() {
     if unsafe { getrlimit(RLIMIT_NOFILE, &mut current) } != 0 {
         current.rlim_max = 65536;
     }
-    let target = nofile_limits(current.rlim_max);
-    let raised = rlimit {
-        rlim_cur: target,
-        rlim_max: target,
-    };
-    // Safe: setrlimit only reads the struct it is given.
-    if unsafe { setrlimit(RLIMIT_NOFILE, &raised) } == 0 {
-        return;
+    let ceiling = nr_open();
+    // The target, then (unprivileged with a hard limit below 65536) the hard limit itself, both
+    // within the kernel's ceiling.
+    for target in [
+        nofile_limits(current.rlim_max, ceiling),
+        ceiling.map_or(current.rlim_max, |ceiling| current.rlim_max.min(ceiling)),
+    ] {
+        let limit = rlimit {
+            rlim_cur: target,
+            rlim_max: target,
+        };
+        // Safe: setrlimit only reads the struct it is given.
+        if unsafe { setrlimit(RLIMIT_NOFILE, &limit) } == 0 {
+            return;
+        }
     }
-    // Unprivileged with a hard limit below 65536: take the hard limit itself.
-    let soft_at_hard = rlimit {
-        rlim_cur: current.rlim_max,
-        rlim_max: current.rlim_max,
-    };
-    if unsafe { setrlimit(RLIMIT_NOFILE, &soft_at_hard) } != 0 {
-        eprintln!(
-            "[fcvm] warning: failed to raise RLIMIT_NOFILE: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    eprintln!(
+        "[fcvm] warning: failed to raise RLIMIT_NOFILE: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn main() -> Result<()> {
@@ -206,7 +217,17 @@ mod tests {
     /// than 65536 files on a `--map` needs that many descriptors in the volume server.
     #[test]
     fn the_descriptor_limit_is_the_hard_limit() {
-        assert_eq!(super::nofile_limits(1_048_576), 1_048_576);
-        assert_eq!(super::nofile_limits(4096), 65536);
+        assert_eq!(super::nofile_limits(1_048_576, Some(1_048_576)), 1_048_576);
+        assert_eq!(super::nofile_limits(4096, Some(1_048_576)), 65536);
+        assert_eq!(super::nofile_limits(1_048_576, None), 1_048_576);
+    }
+
+    /// A hard limit above the kernel's ceiling (`fs.nr_open` lowered after the launcher set it)
+    /// is never asked for: the kernel refuses it even unchanged, which left fcvm at its soft
+    /// limit (1024) where the old fixed 65536 was granted (review of #1792).
+    #[test]
+    fn the_descriptor_limit_stays_within_the_kernel_ceiling() {
+        assert_eq!(super::nofile_limits(1_048_576, Some(65536)), 65536);
+        assert_eq!(super::nofile_limits(4096, Some(32768)), 32768);
     }
 }
