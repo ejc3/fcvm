@@ -1386,15 +1386,18 @@ measure)
     # egress-mss1200 caps the TCP segment size, so no GSO segment is larger than
     # the path MTU: if it moves data where plain egress does not, large segments
     # are lost on the way, rather than the hop being slow.
-    # egress-tso44 raises tcp_min_tso_segs for one run: a sender this slow sizes
-    # its TSO segments by its pacing rate, so each one is a packet or two, and
-    # each costs this level a virtio-net kick.
-    for dirn in egress ingress egress-mss1200 egress-tso44; do
+    # egress-tso2 puts tcp_min_tso_segs back to the kernel's default of 2 for one
+    # run, against the 44 fc-agent sets in nested guests: a sender this slow sizes
+    # its TSO segments by its pacing rate, so with 2 each one is a packet or two,
+    # and each costs this level a virtio-net kick. It and egress-mss1200 are probes
+    # and do not fail the run; egress and ingress do.
+    FAILED=0
+    for dirn in egress ingress egress-mss1200 egress-tso2; do
         flag=""
         [ "$dirn" = ingress ] && flag="-R"
         [ "$dirn" = egress-mss1200 ] && flag="-M 1200"
         tso=$(sysctl -n net.ipv4.tcp_min_tso_segs)
-        [ "$dirn" = egress-tso44 ] && sysctl -qw net.ipv4.tcp_min_tso_segs=44
+        [ "$dirn" = egress-tso2 ] && sysctl -qw net.ipv4.tcp_min_tso_segs=2
         touch "$DIR/go-L$PARENT-$LEVEL-$dirn"
         sleep 0.5
         read -r b0 t0 < <(busy)
@@ -1413,12 +1416,15 @@ except Exception:
     print('FAIL')
 ")
         echo "NET_HOP_L${{PARENT}}_L${{LEVEL}}_$dirn=${{rate}}Mbps child_cpu_busy=$(( (b1 - b0) * 100 / (t1 - t0 + 1) ))%"
+        case "$dirn" in egress|ingress) [ "$rate" = FAIL ] && FAILED=1 ;; esac
         sleep 6
         echo "--- L$PARENT threads during the L$PARENT-L$LEVEL $dirn transfer"
         cat "$DIR/top-L$PARENT-$LEVEL-$dirn.txt" 2>/dev/null || echo "(no sample)"
         echo "--- L$PARENT KVM exits during it (before, after)"
         paste "$DIR/kvm-L$PARENT-$LEVEL-$dirn.before" "$DIR/kvm-L$PARENT-$LEVEL-$dirn.after" 2>/dev/null || echo "(no counters)"
     done
+    # A failed transfer is a broken hop, not a slow one.
+    [ "$FAILED" = 0 ]
     ;;
 esac
 "#
@@ -1532,7 +1538,9 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool, include
             || line.contains("FUSE_SMALLREAD_L")
             || line.contains("MEM_L");
         let is_large_file = line.contains("FUSE_COPY_TO_L") || line.contains("FUSE_COPY_FROM_L");
-        let is_network = line.contains("NET_EGRESS_L") || line.contains("NET_INGRESS_L");
+        let is_network = line.contains("NET_EGRESS_L")
+            || line.contains("NET_INGRESS_L")
+            || line.contains("NET_HOP_L");
 
         if is_standard || (include_large_files && is_large_file) || (include_network && is_network)
         {
@@ -1751,7 +1759,7 @@ async fn run_nested_n_levels(
             marker = marker
         ),
         BenchmarkMode::WithNetwork => format!(
-            "#!/bin/bash\nset -ex\n{level_script} {n}\n{net_script_call} {n}\n{hop} measure {n}\necho {marker}\n",
+            "#!/bin/bash\nset -ex\n{level_script} {n}\n{hop} measure {n}\n{net_script_call} {n}\necho {marker}\n",
             level_script = level_script,
             net_script_call = net_script_call,
             hop = hop_path,
@@ -1873,8 +1881,8 @@ set -ex
 
 # Run script for this level
 {level_script} {level}
-{net_script_call} {level}
 [ {level} -ge 2 ] && {hop} measure {level}
+{net_script_call} {level}
 {hop} serve {level}
 
 echo "L{level}: Importing image from shared cache..."
