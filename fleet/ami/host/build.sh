@@ -65,6 +65,24 @@ rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive
 APT="apt-get -o DPkg::Lock::Timeout=600"
+# store_settled: the store as this boot's fcvm-fleet-store.service leaves it. On a builder from a
+# BASE_AMI that unit restores the base image's store at boot, after mounting it, and SSM answers
+# (the reboot step's test) long before it finishes: a store.sh called meanwhile finds the store
+# mounted and returns, and the phase then works in a store the restore is still writing. On
+# 2026-11-12 the build phase removed an old Windows installation the restore was copying, the
+# restore from S3 failed on it and emptied the store before falling back to the AMI's copy, and
+# took the cargo target make build had just made with it (ejc3/fcvm#1825). So wait while the
+# unit is activating, and fail if it failed; then store.sh mounts the empty store when the unit
+# did not run (a builder from Ubuntu, whose image has no store parts yet).
+store_settled() {
+  local unit=fcvm-fleet-store.service state
+  while state=$(systemctl is-active "$unit" 2>/dev/null); [ "$state" = activating ]; do sleep 5; done
+  if [ "$state" = failed ]; then
+    systemctl status --no-pager "$unit" | tail -n 20 || true
+    echo "this boot's store restore ($unit) failed"; return 1
+  fi
+  /usr/local/lib/fcvm-fleet/store.sh
+}
 # Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
 as_user() {
   local uid; uid=$(id -u "$U")
@@ -144,7 +162,7 @@ X
   # store (store.sh mounts it empty), installed to /boot as GRUB's default, and booted by the
   # reboot after prep, so the build phase builds and warms everything on it.
   $APT install -y libdw-dev debhelper rsync kmod cpio patch
-  /usr/local/lib/fcvm-fleet/store.sh
+  store_settled
   [ -x "$UH/.cargo/bin/cargo" ] || as_user 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
   [ -d "$SRC/.git" ] || as_user "git clone -q https://github.com/ejc3/fcvm.git $SRC"
   as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
@@ -162,7 +180,7 @@ build)
   loginctl enable-linger "$U"
   for _ in $(seq 1 30); do [ -S "/run/user/$(id -u "$U")/bus" ] && break; sleep 1; done
   /usr/local/lib/fcvm-fleet/bind-vfio.sh
-  /usr/local/lib/fcvm-fleet/store.sh   # no archive yet: mounts the empty NVMe store
+  store_settled   # a base image's store, restored at boot; else the empty NVMe store
   # VFIO maps all guest memory for DMA, which counts against the caller's memlock limit;
   # children inherit it through sudo.
   prlimit --pid $$ --memlock=unlimited:unlimited

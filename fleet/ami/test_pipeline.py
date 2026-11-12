@@ -528,7 +528,7 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(phase=name):
                 phase = phases[name]
                 setup = phase.index('as_user "cd $SRC && make setup-btrfs"')
-                self.assertLess(phase.index("/usr/local/lib/fcvm-fleet/store.sh"), setup)
+                self.assertLess(phase.index("store_settled"), setup)
                 self.assertLess(phase.index("git checkout -q -f --detach $FCVM_COMMIT"), setup)
                 self.assertLess(setup, phase.index(first))
                 if name == "build":
