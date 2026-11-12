@@ -1,0 +1,198 @@
+From 1ed0716cd47721d1c782e42d2e4b50868a1ccdd3 Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 22:53:15 +0000
+Subject: [PATCH] KVM: arm64: nv: Cut the calls 7.3 added to a guest
+ hypervisor's exits
+
+7.3 added work to every exit of a vCPU in hyp context, the vCPU of a
+guest hypervisor:
+
+- 3fc7867a95c0 ("KVM: arm64: Make HCR_EL2 a non-VNCR register") copies
+  HCR_EL2 into the VNCR page's NVHCR_EL2 slot on every entry and back on
+  every exit, each copy a masked read and a masked write: four more
+  calls to kvm_vcpu_apply_reg_masks() per exit, two of them for
+  NVHCR_EL2, which has no masks without FEAT_NV3.
+
+- 62ed180231f4 ("KVM: arm64: Add NVHCR_EL2 context switching") grew
+  __activate_traps() and __kvm_vcpu_run_vhe() enough that GCC stopped
+  inlining ___ctxt_sys_reg() there, and the world switch now calls
+  out-of-line copies of ___ctxt_sys_reg(), vcpu_has_nv(), is_hyp_ctxt()
+  and vcpu_el2_e2h_is_set().
+
+Without FEAT_NV3 on the host, copy HCR_EL2 to NVHCR_EL2 as it is stored
+(every writer of HCR_EL2 masks it, and NVHCR_EL2 has no masks), and copy
+it back, masked, only when the guest changed it. Make those accessors
+and __vcpu_has_feature() __always_inline, and apply the register masks
+inline in the VHE world switch, which does it several times per exit.
+Nothing changes for a host with FEAT_NV3.
+
+fcvm #659: host kernel instructions per SMC exit of a vCPU at virtual
+EL2 (one vCPU, vGICv3, c9g.metal-48xl): 3345 on 6.18.60, 3856 before
+the feat-nv3 topic, 4174 after it, 4014 on 7.3.3 with
+vgic-v3-keep-hcr-on-quiet-exits.patch, 3375 with this patch; 362, 395,
+417, 400 and 354 ns per exit.
+---
+ arch/arm64/include/asm/kvm_emulate.h |  8 +++----
+ arch/arm64/include/asm/kvm_host.h    | 22 +++++++++++++++--
+ arch/arm64/include/asm/kvm_nested.h  |  2 +-
+ arch/arm64/kvm/hyp/vhe/switch.c      | 35 +++++++++++++++++++++-------
+ 4 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index a3c1928..242145e 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -193,13 +193,13 @@ static inline bool vcpu_is_el2(const struct kvm_vcpu *vcpu)
+ 	return vcpu_is_el2_ctxt(&vcpu->arch.ctxt);
+ }
+ 
+-static inline bool vcpu_el2_e2h_is_set(const struct kvm_vcpu *vcpu)
++static __always_inline bool vcpu_el2_e2h_is_set(const struct kvm_vcpu *vcpu)
+ {
+ 	return (!cpus_have_final_cap(ARM64_HAS_HCR_NV1) ||
+ 		(__vcpu_sys_reg(vcpu, HCR_EL2) & HCR_E2H));
+ }
+ 
+-static inline bool vcpu_el2_tge_is_set(const struct kvm_vcpu *vcpu)
++static __always_inline bool vcpu_el2_tge_is_set(const struct kvm_vcpu *vcpu)
+ {
+ 	return ctxt_sys_reg(&vcpu->arch.ctxt, HCR_EL2) & HCR_TGE;
+ }
+@@ -223,7 +223,7 @@ static inline bool vcpu_el2_amo_is_set(const struct kvm_vcpu *vcpu)
+ 	return ctxt_sys_reg(&vcpu->arch.ctxt, HCR_EL2) & HCR_AMO;
+ }
+ 
+-static inline bool is_hyp_ctxt(const struct kvm_vcpu *vcpu)
++static __always_inline bool is_hyp_ctxt(const struct kvm_vcpu *vcpu)
+ {
+ 	bool e2h, tge;
+ 	u64 hcr;
+@@ -252,7 +252,7 @@ static inline bool vcpu_is_host_el0(const struct kvm_vcpu *vcpu)
+ 	return is_hyp_ctxt(vcpu) && !vcpu_is_el2(vcpu);
+ }
+ 
+-static inline bool is_nested_ctxt(struct kvm_vcpu *vcpu)
++static __always_inline bool is_nested_ctxt(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu_has_nv(vcpu) && !is_hyp_ctxt(vcpu);
+ }
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 8dfaa33..3cea0e4 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -1193,7 +1193,7 @@ struct kvm_vcpu_arch {
+  * Don't bother with VNCR-based accesses in the nVHE code, it has no
+  * business dealing with NV.
+  */
+-static inline u64 *___ctxt_sys_reg(const struct kvm_cpu_context *ctxt, int r)
++static __always_inline u64 *___ctxt_sys_reg(const struct kvm_cpu_context *ctxt, int r)
+ {
+ #if !defined (__KVM_NVHE_HYPERVISOR__)
+ 	if (unlikely(cpus_have_final_cap(ARM64_HAS_NESTED_VIRT) &&
+@@ -1212,7 +1212,25 @@ static inline u64 *___ctxt_sys_reg(const struct kvm_cpu_context *ctxt, int r)
+ 
+ #define ctxt_sys_reg(c,r)	(*__ctxt_sys_reg(c,r))
+ 
++#ifdef __KVM_VHE_HYPERVISOR__
++/*
++ * The VHE world switch masks HCR_EL2 and other sanitised EL2 registers
++ * several times on every exit of a guest hypervisor's vCPU: do it inline
++ * there rather than through a call.
++ */
++static __always_inline u64 __kvm_apply_reg_masks(struct kvm_arch *arch,
++						 enum vcpu_sysreg sr, u64 v)
++{
++	struct resx resx = __kvm_get_sysreg_resx(arch, sr);
++
++	return (v & ~resx.res0) | resx.res1;
++}
++
++#define kvm_vcpu_apply_reg_masks(vcpu, sr, v)				\
++	__kvm_apply_reg_masks(&(vcpu)->kvm->arch, (sr), (v))
++#else
+ u64 kvm_vcpu_apply_reg_masks(const struct kvm_vcpu *, enum vcpu_sysreg, u64);
++#endif
+ 
+ #define __vcpu_assign_sys_reg(v, r, val)				\
+ 	do {								\
+@@ -1547,7 +1565,7 @@ bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu);
+ #define kvm_vm_has_ran_once(kvm)					\
+ 	(test_bit(KVM_ARCH_FLAG_HAS_RAN_ONCE, &(kvm)->arch.flags))
+ 
+-static inline bool __vcpu_has_feature(const struct kvm_arch *ka, int feature)
++static __always_inline bool __vcpu_has_feature(const struct kvm_arch *ka, int feature)
+ {
+ 	return test_bit(feature, ka->vcpu_features);
+ }
+diff --git a/arch/arm64/include/asm/kvm_nested.h b/arch/arm64/include/asm/kvm_nested.h
+index 0f899ad..bf92806 100644
+--- a/arch/arm64/include/asm/kvm_nested.h
++++ b/arch/arm64/include/asm/kvm_nested.h
+@@ -7,7 +7,7 @@
+ #include <asm/kvm_emulate.h>
+ #include <asm/kvm_pgtable.h>
+ 
+-static inline bool vcpu_has_nv(const struct kvm_vcpu *vcpu)
++static __always_inline bool vcpu_has_nv(const struct kvm_vcpu *vcpu)
+ {
+ 	return (!__is_defined(__KVM_NVHE_HYPERVISOR__) &&
+ 		cpus_have_final_cap(ARM64_HAS_NESTED_VIRT) &&
+diff --git a/arch/arm64/kvm/hyp/vhe/switch.c b/arch/arm64/kvm/hyp/vhe/switch.c
+index 7875911..f06bb6f 100644
+--- a/arch/arm64/kvm/hyp/vhe/switch.c
++++ b/arch/arm64/kvm/hyp/vhe/switch.c
+@@ -70,11 +70,19 @@ static u64 __compute_hcr(struct kvm_vcpu *vcpu)
+ 		if (!vcpu_el2_e2h_is_set(vcpu))
+ 			hcr |= HCR_NV1;
+ 
+-		/* Publish the guest's view of HCR_EL2 to the HW */
++		/*
++		 * Publish the guest's view of HCR_EL2 to the HW. Without
++		 * FEAT_NV3 on the host, NVHCR_EL2 has no masks of its own and
++		 * HCR_EL2 is stored sanitised (every writer masks it), so a
++		 * plain copy publishes what a masked read and write would.
++		 */
+ 		if (cpus_have_final_cap(ARM64_HAS_NV3) && vcpu_el2_e2h_is_set(vcpu))
+ 			write_sysreg_s(__vcpu_sys_reg(vcpu, HCR_EL2), SYS_NVHCR_EL2);
+-		else
++		else if (cpus_have_final_cap(ARM64_HAS_NV3))
+ 			__vcpu_assign_sys_reg(vcpu, NVHCR_EL2, __vcpu_sys_reg(vcpu, HCR_EL2));
++		else
++			ctxt_sys_reg(&vcpu->arch.ctxt, NVHCR_EL2) =
++				ctxt_sys_reg(&vcpu->arch.ctxt, HCR_EL2);
+ 
+ 		/*
+ 		 * Nothing in HCR_EL2 should impact running in hypervisor
+@@ -577,13 +585,22 @@ static void fixup_nv_guest_exit(struct kvm_vcpu *vcpu)
+ 		*vcpu_cpsr(vcpu) &= ~(PSR_MODE_MASK | PSR_MODE32_BIT);
+ 		*vcpu_cpsr(vcpu) |= mode;
+ 
+-		/* Publish the latest HCR_EL2 to the emulation */
+-		hcr = (cpus_have_final_cap(ARM64_HAS_NV3) &&
+-		       vcpu_el2_e2h_is_set(vcpu)) ?
+-			read_sysreg_s(SYS_NVHCR_EL2) :
+-			__vcpu_sys_reg(vcpu, NVHCR_EL2);
+-
+-		__vcpu_assign_sys_reg(vcpu, HCR_EL2, hcr);
++		/*
++		 * Publish the latest HCR_EL2 to the emulation. Without
++		 * FEAT_NV3, a value the guest left as the entry published it
++		 * is already the sanitised HCR_EL2: only a changed one needs
++		 * masking on its way back.
++		 */
++		if (cpus_have_final_cap(ARM64_HAS_NV3)) {
++			hcr = vcpu_el2_e2h_is_set(vcpu) ?
++				read_sysreg_s(SYS_NVHCR_EL2) :
++				__vcpu_sys_reg(vcpu, NVHCR_EL2);
++			__vcpu_assign_sys_reg(vcpu, HCR_EL2, hcr);
++		} else {
++			hcr = ctxt_sys_reg(&vcpu->arch.ctxt, NVHCR_EL2);
++			if (hcr != ctxt_sys_reg(&vcpu->arch.ctxt, HCR_EL2))
++				__vcpu_assign_sys_reg(vcpu, HCR_EL2, hcr);
++		}
+ 	}
+ 
+ 	/* Apply extreme paranoia! */
+-- 
+2.43.0
+
