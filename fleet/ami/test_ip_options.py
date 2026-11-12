@@ -318,5 +318,62 @@ else: sys.exit(91)
                     self.assertTrue(self.remote_proof(family=family, consumer_change=(name, "guard-only")))
 
 
+class StoreSettledTests(unittest.TestCase):
+    """The host recipe's phases use the store only once this boot's store unit has finished
+    restoring it (ejc3/fcvm#1825): a builder from a base image restores that image's store at
+    boot, and a phase that ran beside the restore lost its files to the restore's cleanup."""
+
+    BUILD = (AMI / "host" / "build.sh").read_text()
+
+    def run_settled(self, states):
+        start = self.BUILD.index("store_settled() {")
+        body = self.BUILD[start:self.BUILD.index("\n}\n", start) + 3]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "states").write_text("\n".join(states) + "\n")
+            (tmp / "systemctl").write_text(
+                "#!/bin/bash\n"
+                f'log={tmp}/log; states={tmp}/states\n'
+                'case "$1" in\n'
+                '  is-active) s=$(head -n 1 "$states"); [ "$(wc -l < "$states")" -gt 1 ] && sed -i 1d "$states";'
+                ' echo "is-active $s" >> "$log"; echo "$s"; [ "$s" = active ];;\n'
+                '  status) echo status >> "$log";;\n'
+                '  *) exit 9;;\n'
+                'esac\n')
+            (tmp / "store.sh").write_text(f'#!/bin/bash\necho store.sh >> {tmp}/log\n')
+            for f in ("systemctl", "store.sh"):
+                (tmp / f).chmod(0o755)
+            script = (body.replace("/usr/local/lib/fcvm-fleet/store.sh", str(tmp / "store.sh"))
+                      .replace("sleep 5", "sleep 0"))
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + script + "\nstore_settled"],
+                                    env=dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}"),
+                                    capture_output=True, text=True, timeout=10)
+            return result.returncode, (tmp / "log").read_text().split("\n")[:-1]
+
+    def test_the_store_is_used_only_after_the_boot_restore_finished(self):
+        rc, log = self.run_settled(["activating", "activating", "active"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(log, ["is-active activating", "is-active activating", "is-active active", "store.sh"])
+
+    def test_a_failed_boot_restore_fails_the_phase(self):
+        rc, log = self.run_settled(["activating", "failed"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("store.sh", log)
+
+    def test_a_builder_without_store_parts_mounts_the_empty_store(self):
+        rc, log = self.run_settled(["inactive"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(log[-1], "store.sh")
+
+    def test_prep_and_build_reach_the_store_only_through_it(self):
+        for phase, end in (("prep)", "\n  ;;\nbuild)"), ("build)", "\n  ;;\nbake)")):
+            with self.subTest(phase=phase):
+                text = self.BUILD[self.BUILD.index("\n" + phase + "\n"):self.BUILD.index(end)]
+                self.assertNotIn("fcvm-fleet/store.sh", text)
+                first_use = min(i for i in (text.find("/mnt/fcvm-btrfs"), text.find("make setup-btrfs"), text.find("as_user"))
+                                if i >= 0)
+                self.assertLess(text.index("store_settled"), first_use)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
