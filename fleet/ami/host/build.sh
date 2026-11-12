@@ -181,6 +181,14 @@ build)
   for _ in $(seq 1 30); do [ -S "/run/user/$(id -u "$U")/bus" ] && break; sleep 1; done
   /usr/local/lib/fcvm-fleet/bind-vfio.sh
   store_settled   # a base image's store, restored at boot; else the empty NVMe store
+  # A builder from a base image carries that image's packed store on its root volume
+  # (/var/lib/fcvm-fleet/store: 24 GB for the 853eb034 image, whose store holds a Windows
+  # installation). The boot restore has unpacked it, bake removes and rewrites it, and in
+  # between it filled the 61 GB root: the Minecraft image's build ran out of space there on
+  # 2026-11-12. Drop the parts once the restore is done; the list and /etc/fcvm-fleet/store.env
+  # stay, so a reboot before bake still restores the store from S3.
+  # A builder from Ubuntu has no store directory; a deletion that fails stops the phase.
+  if [ -d /var/lib/fcvm-fleet/store ]; then find /var/lib/fcvm-fleet/store -maxdepth 1 -name '*.tar.zst' -delete; fi
   # VFIO maps all guest memory for DMA, which counts against the caller's memlock limit;
   # children inherit it through sudo.
   prlimit --pid $$ --memlock=unlimited:unlimited
