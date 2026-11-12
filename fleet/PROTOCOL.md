@@ -1068,7 +1068,8 @@ name Java Edition players connect to (port 25565): the frame URL's host when the
 `wss://` on a DNS name, else null (an IP literal, or a plain `ws://` URL). A tile's `phase` is
 the agent's (`restoring`, `forking`, `running`, `failed`; `relaunching` until the agent reports
 the new launch, `pending` before its first report). `last_relaunch` times the server's last
-restore from the click to the first chunk its bots received after it: `first_frame_at` is the
+restore from the click to its first chunk (the restored tile answering with its map, a chunk and
+every bot connected; a restore keeps the bots' connections): `first_frame_at` is the
 report's `first_chunk_at` (below), kept between the click and the coordinator's read of the
 report, as a sandbox's desktop time is; a launch nobody clicked starts `total_ms` before it.
 `phases` are the report's `timings`. `server` is the first host's (by name) `minecraft_server`
@@ -2995,7 +2996,7 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
   view opens (`503`) until the agent posts the tile's own scene. It only takes access away.
 - `GET /health`: `ready` (the server listens, every bot spawned, every column known), `tile`,
   `generation`, `scene`, `tps`, `bots` (`wanted`, `online`), `players`, `sessions` (how many
-  times the first bot joined; a restore makes it rejoin), `chunks` (in the current session),
+  times the first bot joined; a restore keeps the bots connected, so it does not change), `chunks` (in the current session),
   `map` (`known`, `cells`), `viewers`, `driver`, `times_unix_ms` (`start`,
   `server_listening`, `first_chunk` of the current session, `bots_spawned`, `map_ready`),
   `top_blocks` (the commonest top blocks of the map), `tls` (`loaded`, `loads`), `tps_age_ms`

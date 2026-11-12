@@ -36,8 +36,10 @@ pub const GOLD_VM: &str = "mc-gold";
 pub const VIEW_PORT: u16 = 8080;
 /// The tick rate a server must hold.
 pub const HOLD_TPS: f64 = 19.5;
-/// Bumped when the gold flow changes what the snapshot holds.
-pub const GOLD_FLOW: &str = "mc-gold-1";
+/// Bumped when the gold flow changes what the snapshot holds. 2: a gold made by an fc-agent
+/// that keeps the guest's IPv4-mapped loopback connections across a restore, which is what
+/// lets a restored tile count as up while its bots stay connected ([`Health::up`]).
+pub const GOLD_FLOW: &str = "mc-gold-2";
 
 #[derive(Debug, Clone)]
 pub struct MinecraftCfg {
@@ -243,13 +245,28 @@ pub struct Health {
     pub generation: u64,
     #[serde(default)]
     pub tile: String,
+    #[serde(default)]
+    pub bots: Option<BotCount>,
+}
+
+/// A tile's bots: connected, and how many it runs.
+#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
+pub struct BotCount {
+    #[serde(default)]
+    pub online: u64,
+    #[serde(default)]
+    pub wanted: u64,
 }
 
 impl Health {
-    /// A restored tile is up once its bots joined again after the snapshot (`sessions` past the
-    /// snapshot's) and received a chunk.
-    pub fn up_after(&self, snapshot_sessions: u64) -> bool {
-        self.ready && self.sessions > snapshot_sessions && self.chunks > 0
+    /// A restored tile is up once it answers with its map, a chunk and every bot connected. The
+    /// restore keeps the guest's loopback connections, the bots' to Pumpkin among them (fc-agent's
+    /// snapshot network boundary), so a tile restored from a [`GOLD_FLOW`] 2 snapshot is up as
+    /// soon as it answers; a bot the restore did disconnect is waited for. (Before, the restore
+    /// reset Pumpkin's end of each bot connection, and the tile waited about a second for the
+    /// rejoin.)
+    pub fn up(&self) -> bool {
+        self.ready && self.chunks > 0 && self.bots.as_ref().is_some_and(|b| b.online >= b.wanted)
     }
 
     pub fn steady(&self) -> bool {
@@ -501,13 +518,19 @@ fn child(program: &Path) -> tokio::process::Command {
 }
 
 async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
+    health_within(http, place, Duration::from_secs(2)).await
+}
+
+/// How long one `/health` attempt of a restore's wait may take. The wait's first attempts go
+/// out while the clone is still being restored, and a SYN sent then is lost (nothing reads the
+/// tap yet): with the 2 s of [`health`], every restore waited out that attempt and was timed at
+/// 2.0 s whatever it took. A short attempt, retried every poll, sees the tile as soon as it
+/// answers.
+pub const UP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn health_within(http: &reqwest::Client, place: &Place, timeout: Duration) -> Option<Health> {
     let url = format!("http://{}/health", place.http);
-    let r = http
-        .get(url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?;
+    let r = http.get(url).timeout(timeout).send().await.ok()?;
     if !r.status().is_success() {
         return None;
     }
@@ -741,11 +764,7 @@ impl Server {
     }
 
     /// Wait until the restored tile is up: its bots joined after the snapshot and got a chunk.
-    async fn wait_up(
-        &self,
-        vm: &mut Vm,
-        snapshot_sessions: u64,
-    ) -> std::result::Result<(), String> {
+    async fn wait_up(&self, vm: &mut Vm) -> std::result::Result<(), String> {
         let until = tokio::time::sleep(self.cfg.ready_deadline);
         tokio::pin!(until);
         let mut tick = tokio::time::interval(self.cfg.poll);
@@ -753,8 +772,8 @@ impl Server {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let h = health(&self.http, &self.place).await;
-                    if h.as_ref().is_some_and(|h| h.up_after(snapshot_sessions)) {
+                    let h = health_within(&self.http, &self.place, UP_PROBE_TIMEOUT).await;
+                    if h.as_ref().is_some_and(Health::up) {
                         return Ok(());
                     }
                     last = h;
@@ -774,7 +793,6 @@ impl Server {
         &self,
         live: &mut Option<Live>,
         gold: &str,
-        gold_sessions: u64,
         want: &Desired,
         fork_ok: bool,
     ) -> std::result::Result<Live, String> {
@@ -795,7 +813,7 @@ impl Server {
             });
         // Dropped on every way out of this function: the copy's snapshot is removed.
         let mut fork_snapshot = None;
-        let (tag, sessions) = match source {
+        let tag = match source {
             Some((f, pid, place)) => {
                 self.report("forking", generation, BTreeMap::new(), None, None, None);
                 let before = health(&self.http, &place).await.map(|h| h.sessions);
@@ -817,16 +835,15 @@ impl Server {
                 });
                 timings.insert("snapshot_ms".to_string(), ts.elapsed().as_millis() as u64);
                 tracing::info!(target: "fcvm::fleet::minecraft", server = %self.id, from = %f.slot, snapshot_ms = timings["snapshot_ms"], "forking");
-                let s =
-                    before.ok_or_else(|| format!("{} did not answer before its fork", f.slot))?;
-                (tag, s)
+                before.ok_or_else(|| format!("{} did not answer before its fork", f.slot))?;
+                tag
             }
             None => {
                 if want.fork.is_some() {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %self.id, fork_ok, "no copy of the fork's source this time; restoring from the gold snapshot");
                 }
                 self.report("restoring", generation, BTreeMap::new(), None, None, None);
-                (gold.to_string(), gold_sessions)
+                gold.to_string()
             }
         };
         if let Some(mut old) = live.take() {
@@ -849,7 +866,7 @@ impl Server {
         };
         let mut held = None;
         let up = {
-            let wait = self.wait_up(&mut vm, sessions);
+            let wait = self.wait_up(&mut vm);
             tokio::pin!(wait);
             tokio::pin!(poster);
             loop {
@@ -964,7 +981,7 @@ async fn supervise(
                     _ = removed(&mut desired) => break None,
                 }
             };
-            let Some(GoldState::Ready(tag, sessions)) = g else {
+            let Some(GoldState::Ready(tag, _)) = g else {
                 break;
             };
             if let Some(delay) = retry_after.take() {
@@ -975,7 +992,7 @@ async fn supervise(
             }
             let want = desired.borrow_and_update().clone();
             let r = tokio::select! {
-                r = ctx.relaunch(&mut live, &tag, sessions, &want, fork_failed != Some(want.generation)) => Some(r),
+                r = ctx.relaunch(&mut live, &tag, &want, fork_failed != Some(want.generation)) => Some(r),
                 _ = removed(&mut desired) => None,
             };
             match r {
@@ -1170,18 +1187,29 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_tile_is_up_only_once_its_bots_joined_again_and_got_a_chunk() {
-        let h = |ready, sessions, chunks| Health {
+    fn a_restored_tile_is_up_once_it_answers_with_a_chunk_and_every_bot() {
+        let h = |ready, chunks, online| Health {
             ready,
-            sessions,
             chunks,
+            bots: Some(BotCount { online, wanted: 3 }),
             ..Default::default()
         };
-        // The snapshot's own session, still listed before the bots notice the restore.
-        assert!(!h(true, 1, 300).up_after(1));
-        assert!(!h(true, 2, 0).up_after(1));
-        assert!(!h(false, 2, 10).up_after(1));
-        assert!(h(true, 2, 10).up_after(1));
+        assert!(h(true, 10, 3).up());
+        assert!(
+            !h(true, 10, 2).up(),
+            "a bot the restore disconnected is waited for"
+        );
+        assert!(!h(true, 0, 3).up());
+        assert!(!h(false, 10, 3).up());
+        assert!(
+            !Health {
+                ready: true,
+                chunks: 10,
+                ..Default::default()
+            }
+            .up(),
+            "a tile that names no bots"
+        );
     }
 
     #[test]

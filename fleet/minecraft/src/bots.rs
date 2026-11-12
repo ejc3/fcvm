@@ -149,6 +149,17 @@ enum Pilot {
     },
 }
 
+/// What the bots' choices are reseeded on: a new session (the bots joined again) or a new scene
+/// (the agent posted this tile's own name and generation, as it does to a fork's copy).
+fn reseed_key(tile: &Tile) -> (u64, u64, String) {
+    let scene = tile.scene.read();
+    (
+        tile.sessions.load(Ordering::Relaxed),
+        scene.generation,
+        scene.tile.clone(),
+    )
+}
+
 fn seed(tile: &Tile) -> u64 {
     // A restored tile runs the same program from the same memory as its source; the scene's
     // name and generation and the guest's random pool make each copy choose its own way.
@@ -168,7 +179,10 @@ fn seed(tile: &Tile) -> u64 {
 pub async fn control(tile: Arc<Tile>) {
     let mut pilots: Vec<Pilot> = vec![Pilot::Idle { until: 0 }; tile.cfg.bots];
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed(&tile));
-    let mut session = 0;
+    // Choices are reseeded on each new session and each new scene: a restore keeps the bots
+    // connected (their loopback connections survive it), so the scene the agent posts to the
+    // copy, with its own name and generation, is what tells a fork from its source.
+    let mut session = (0, 0, String::new());
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut n_tick: u64 = 0;
@@ -176,7 +190,7 @@ pub async fn control(tile: Arc<Tile>) {
         tick.tick().await;
         n_tick += 1;
         let now = unix_ms();
-        let s = tile.sessions.load(Ordering::Relaxed);
+        let s = reseed_key(&tile);
         if s != session {
             session = s;
             rng = rand::rngs::StdRng::seed_from_u64(seed(&tile));
@@ -452,4 +466,32 @@ fn status_tick(tile: &Tile, bots: &[Option<Client>], now: u64) {
         "type": "status", "t": now, "tps": tps, "players": players,
         "drive": seen.map(|(seq, at)| serde_json::json!({"seq": seq, "moved_at": at})),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A restore keeps the bots connected, so the session count stays; the copy's own scene is
+    /// what changes the bots' choices, so a fork and its source do not walk the same paths.
+    #[test]
+    fn a_new_scene_reseeds_the_bots_as_a_new_session_does() {
+        let tile = Tile::new(crate::tile::Cfg {
+            bots: 0,
+            server: "127.0.0.1:1".into(),
+            region_side: 16,
+            bot_prefix: "b".into(),
+        });
+        let k0 = reseed_key(&tile);
+        assert_eq!(reseed_key(&tile), k0);
+        {
+            let mut s = tile.scene.write();
+            s.tile = "mc-2".into();
+            s.generation = 7;
+        }
+        let k1 = reseed_key(&tile);
+        assert_ne!(k1, k0, "the copy's scene");
+        tile.sessions.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(reseed_key(&tile), k1, "a new session");
+    }
 }

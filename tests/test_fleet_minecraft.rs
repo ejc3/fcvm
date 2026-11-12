@@ -45,7 +45,7 @@ impl Tile {
 async fn health(State(t): State<Tile>) -> Result<Json<serde_json::Value>, StatusCode> {
     let s = t.sessions().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(
-        serde_json::json!({"ready": true, "tps": 20.0, "sessions": s, "chunks": 12}),
+        serde_json::json!({"ready": true, "tps": 20.0, "sessions": s, "chunks": 12, "bots": {"online": 3, "wanted": 3}}),
     ))
 }
 
@@ -429,7 +429,7 @@ async fn a_fork_copies_its_running_source_into_the_target_without_stopping_the_s
         !ev.iter().any(|e| e[0] == "exit" && e[1] == "mc-1"),
         "the source never stops: {ev:?}"
     );
-    // Up only once the copy's bots joined past the source's count.
+    // The copy carries the source's world and its bots' sessions.
     assert_eq!(
         std::fs::read_to_string(f.path.join("sessions-mc-2"))
             .unwrap()

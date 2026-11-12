@@ -109,10 +109,17 @@ impl TcpSocketIdentity {
         }
     }
 
+    /// A loopback connection has both ends in the guest, so it survives the restore. That
+    /// includes an IPv6 socket whose peer is an IPv4-mapped loopback address
+    /// (`::ffff:127.0.0.1`): a dual-stack server listening on `[::]` (Pumpkin in Minecraft
+    /// mode) holds its IPv4 loopback clients that way, and retiring those reset the server's
+    /// end of every in-guest connection on each restore.
     fn is_preserved(&self) -> Result<bool> {
         Ok(match self.peer_ip()? {
             IpAddr::V4(address) => address.is_loopback(),
-            IpAddr::V6(address) => address.is_loopback(),
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map_or(address.is_loopback(), |v4| v4.is_loopback()),
         })
     }
 
@@ -2941,6 +2948,44 @@ mod tests {
                 cookie: [cookie, 0],
             },
         }
+    }
+
+    fn socket6(peer: Ipv6Addr) -> TcpSocketIdentity {
+        let words = peer.octets();
+        let word = |i: usize| u32::from_ne_bytes(words[i * 4..i * 4 + 4].try_into().unwrap());
+        TcpSocketIdentity {
+            family: libc::AF_INET6 as u8,
+            state: 1,
+            id: InetDiagSockId {
+                source_port_be: 25565u16.to_be(),
+                destination_port_be: 54848u16.to_be(),
+                source: [0, 0, 0, 0],
+                destination: [word(0), word(1), word(2), word(3)],
+                interface_id: 0,
+                cookie: [7, 0],
+            },
+        }
+    }
+
+    /// Both ends of a loopback connection are in the guest, so the restore keeps it, in every
+    /// form the kernel reports one: IPv4, IPv6, and an IPv6 socket of a dual-stack server
+    /// whose peer is IPv4-mapped loopback. Anything that leaves the guest is retired.
+    #[test]
+    fn loopback_peers_survive_the_restore_and_others_do_not() {
+        assert!(socket(1, [127, 0, 0, 1]).is_preserved().unwrap());
+        assert!(socket(1, [127, 0, 0, 53]).is_preserved().unwrap());
+        assert!(socket6(Ipv6Addr::LOCALHOST).is_preserved().unwrap());
+        assert!(socket6("::ffff:127.0.0.1".parse().unwrap())
+            .is_preserved()
+            .unwrap());
+        assert!(!socket(1, [10, 0, 2, 2]).is_preserved().unwrap());
+        assert!(!socket6("::ffff:10.0.2.2".parse().unwrap())
+            .is_preserved()
+            .unwrap());
+        assert!(!socket6("2001:db8::1".parse().unwrap())
+            .is_preserved()
+            .unwrap());
+        assert!(!socket6("fe80::1".parse().unwrap()).is_preserved().unwrap());
     }
 
     #[derive(Default)]
