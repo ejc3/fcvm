@@ -954,7 +954,8 @@ fn a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies() {
 /// `vcpu_has_nv()`, `is_hyp_ctxt()` and `vcpu_el2_e2h_is_set()`: 173 more host
 /// instructions per exit at that commit. `__always_inline` is what keeps a later change
 /// from moving them out again, so the patched headers must declare each of them that
-/// way, and apply the register masks inline in the VHE world switch.
+/// way, and apply the register masks inline in the VHE world switch, computing what
+/// `kvm_vcpu_apply_reg_masks()` computes.
 #[test]
 fn the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit() {
     let (release, patched, temp) = nv_exit_excerpts();
@@ -1008,5 +1009,50 @@ fn the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit() {
         "Linux {release} with{} {NV_EXIT_PATCH} leaves the world switch calling out of line:\n{}",
         if patched { "" } else { "out" },
         missing.join("\n")
+    );
+
+    // The inline masking must compute what kvm_vcpu_apply_reg_masks() does.
+    let (_, _, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
+    let mut extracted = String::new();
+    for (start, end) in [
+        ("struct resx {", "};"),
+        ("struct kvm_sysreg_masks {", "};"),
+        ("static inline struct resx __kvm_get_sysreg_resx(", "}"),
+        ("static __always_inline u64 __kvm_apply_reg_masks(", "}"),
+    ] {
+        let block = extract_block(&host, start, end)
+            .unwrap_or_else(|| panic!("`{start}` is missing from the patched kvm_host.h excerpt"));
+        extracted.push_str(&block);
+    }
+    fs::write(temp.path().join("extracted-masks.c"), extracted).unwrap();
+    fs::copy(fixture.join("masks.c"), temp.path().join("masks.c")).unwrap();
+    let binary = temp.path().join("masks");
+    let compiled = Command::new("cc")
+        .args([
+            "-std=gnu11",
+            "-O1",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-Werror=implicit-function-declaration",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(temp.path().join("masks.c"))
+        .output()
+        .expect("run cc");
+    assert!(
+        compiled.status.success(),
+        "the {release} register masking harness failed to compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = Command::new(&binary)
+        .env("ASAN_OPTIONS", "detect_leaks=0")
+        .output()
+        .expect("run the register masking harness");
+    assert!(
+        result.status.success(),
+        "the VHE world switch's inline register masking in {NV_EXIT_PATCH} differs from \
+         kvm_vcpu_apply_reg_masks():\n{}",
+        String::from_utf8_lossy(&result.stderr)
     );
 }

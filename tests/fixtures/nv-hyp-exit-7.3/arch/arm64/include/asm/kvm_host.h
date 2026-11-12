@@ -2,11 +2,35 @@
  * Verbatim line ranges from Linux v7.3.3 arch/arm64/include/asm/kvm_host.h:
  * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/include/asm/kvm_host.h
  * Complete source SHA256: ac044465ffccb1446e843e0edfb22626ce8c0c73f34339be978e1163217f65bc
- * Lines 1165-1200, 1520-1534, each range separated by one blank line.
+ * Lines 650-672, 1165-1200, 1520-1534, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv-guest-hypervisor-exits-without-calls.patch to this file,
  * then checks or compiles the functions it names from it.
  */
+struct resx {
+	u64	res0;
+	u64	res1;
+};
+
+struct kvm_sysreg_masks {
+	struct resx mask[NR_SYS_REGS - __SANITISED_REG_START__];
+};
+
+static inline struct resx __kvm_get_sysreg_resx(struct kvm_arch *arch,
+						enum vcpu_sysreg sr)
+{
+	struct kvm_sysreg_masks *masks;
+
+	masks = arch->sysreg_masks;
+	if (likely(masks &&
+		   sr >= __SANITISED_REG_START__ && sr < NR_SYS_REGS))
+		return masks->mask[sr - __SANITISED_REG_START__];
+
+	return (struct resx){};
+}
+
+#define kvm_get_sysreg_resx(k, sr) __kvm_get_sysreg_resx(&(k)->arch, (sr))
+
  * memory backed version of a register, and not the one most recently
  * accessed by a running VCPU.  For example, for userspace access or
  * for system registers that are never context switched, but only
