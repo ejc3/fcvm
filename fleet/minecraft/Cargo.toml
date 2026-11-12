@@ -10,10 +10,12 @@ publish = false
 [workspace]
 
 [dependencies]
-# The ejc3/azalea fork (branch fcvm-26.3) is upstream's 26.3 branch plus one fix: the swing
-# animation packet's entity id is a VarInt. Reported upstream as azalea-rs/azalea#404; once
-# upstream fixes it, move back to azalea-rs/azalea.
-azalea = { git = "https://github.com/ejc3/azalea", rev = "070ad4a4a7e321a5b98ceac1dc1d920defb5d9b2", default-features = false, features = ["packet-event"] }
+# The ejc3/azalea fork (branch fcvm-26.3) is upstream's 26.3 branch plus two fixes: the swing
+# animation packet's entity id is a VarInt, and the level particles packet is read in 26.3's
+# field order (particle first, a max speed per axis, a VarInt count, a randomization type).
+# The swing bug is reported upstream as azalea-rs/azalea#404 and the particles bug is to be
+# added there; once upstream fixes both, move back to azalea-rs/azalea.
+azalea = { git = "https://github.com/ejc3/azalea", rev = "afbc06d7b026ad5964b56aae82d57df162967473", default-features = false, features = ["packet-event"] }
 anyhow = "1"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["full"] }
