@@ -1168,7 +1168,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| truncate_id(&vm_state.vm_id, 8).to_string())
     });
-    validate_snapshot_name(&snapshot_name)?;
+    crate::storage::validate_new_snapshot_name(&snapshot_name)?;
 
     // Connect to running VM
     let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");

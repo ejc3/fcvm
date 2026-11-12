@@ -352,11 +352,11 @@ struct Copy {
 /// Rewrite the memory file of the snapshot in `snapshot_dir` as a copy of itself when it keeps
 /// enough of its extents it does not reference and shares no extent with another file ([`Holding::refusal`]).
 ///
-/// The copy is written without a lock: the snapshot can be restored, served and staged from
-/// meanwhile. The rename runs under the snapshot's generation lock shared (so the snapshot is
-/// not replaced or deleted under it) and its stage lock exclusively (so no snapshot create
-/// shares its extents in between), and only after the file is found to be the one copied and
-/// to share nothing still. A process killed during the copy leaves the copy recorded with the
+/// The copy and the rename run under the snapshot's generation lock shared (so the snapshot is
+/// not replaced or deleted under them) and its stage lock exclusively (so no snapshot create
+/// stages from it meanwhile, which would also carry the copy into the new snapshot's
+/// directory); the snapshot can still be restored and served. The rename runs only after the
+/// file is found to be the one copied and to share nothing still. A process killed during the copy leaves the copy recorded with the
 /// reclaim, which removes it; the rename is atomic and the copy is synced before it, so the
 /// path names the whole old file or the whole new one.
 pub async fn rewrite_memory_file(snapshot_dir: &Path) -> Result<Rewrite> {
@@ -373,6 +373,20 @@ pub async fn rewrite_memory_file(snapshot_dir: &Path) -> Result<Rewrite> {
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", memory.display())),
     }
+    // Both locks are held across the copy as well as the rename: a create that staged from the
+    // snapshot, or replaced it, while the copy was written would carry the copy into its own
+    // directory or into `<tag>.old`, where the reclaim record no longer names it. A create
+    // that stages from this snapshot waits for the copy.
+    let _generation = crate::commands::common::acquire_snapshot_dir_lock(snapshot_dir, false)
+        .await
+        .context("locking the snapshot's generation for the rewrite")?;
+    let _stage = crate::commands::common::acquire_snapshot_stage_lock(snapshot_dir, true)
+        .await
+        .context("locking the snapshot against staging for the rewrite")?;
+    // Absolute, so the reclaim finds it from any working directory.
+    let snapshot_dir = std::path::absolute(snapshot_dir)
+        .with_context(|| format!("resolving {}", snapshot_dir.display()))?;
+    let memory = snapshot_dir.join(SNAPSHOT_MEMORY_FILE);
     let temp = snapshot_dir.join(format!(
         "{SNAPSHOT_MEMORY_FILE}.rewrite-{}",
         uuid::Uuid::new_v4().simple()
@@ -403,12 +417,6 @@ pub async fn rewrite_memory_file(snapshot_dir: &Path) -> Result<Rewrite> {
         }
     };
 
-    let _generation = crate::commands::common::acquire_snapshot_dir_lock(snapshot_dir, false)
-        .await
-        .context("locking the snapshot's generation for the rewrite")?;
-    let _stage = crate::commands::common::acquire_snapshot_stage_lock(snapshot_dir, true)
-        .await
-        .context("locking the snapshot against staging for the rewrite")?;
     let swapped = {
         let memory = memory.clone();
         let copy_path = copy.path.clone();
@@ -484,19 +492,10 @@ fn copy_if_worth_it(memory: &Path, temp: &Path) -> Result<std::result::Result<Co
         )));
     }
 
-    let copy = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp)
-        .with_context(|| format!("creating {}", temp.display()))?;
-    // The flag can only change while the file is empty: match it before writing.
-    crate::storage::inode_flags::match_nodatacow(&source, &copy);
-    copy.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))
-        .context("setting the copy's mode")?;
-    if euid == 0 && (meta.uid() != 0 || meta.gid() != 0) {
-        std::os::unix::fs::fchown(&copy, Some(meta.uid()), Some(meta.gid()))
-            .context("giving the copy the memory file's owner")?;
-    }
+    let copy = match create_copy_like(&source, &meta, temp, euid)? {
+        Ok(copy) => copy,
+        Err(reason) => return Ok(Err(reason)),
+    };
     copy.set_len(len).context("sizing the copy")?;
     let copied = copy_data_runs(&source, &copy, len)?;
     copy.sync_all().context("syncing the copy")?;
@@ -513,6 +512,45 @@ fn copy_if_worth_it(memory: &Path, temp: &Path) -> Result<std::result::Result<Co
         before,
         copied,
     }))
+}
+
+/// Create the empty file `temp` with `source`'s nodatacow flag, mode, owner and group. A rootless
+/// owner can give it any group it belongs to, root any owner; a copy that cannot keep both is
+/// removed and refused (`Ok(Err(reason))`), so a rewrite never changes who may read the file.
+fn create_copy_like(
+    source: &File,
+    meta: &std::fs::Metadata,
+    temp: &Path,
+    euid: u32,
+) -> Result<std::result::Result<File, String>> {
+    let copy = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)
+        .with_context(|| format!("creating {}", temp.display()))?;
+    // The flag can only change while the file is empty: match it before writing.
+    crate::storage::inode_flags::match_nodatacow(source, &copy);
+    let made = copy.metadata().context("reading the copy's metadata")?;
+    if made.uid() != meta.uid() || made.gid() != meta.gid() {
+        let uid = (euid == 0 && made.uid() != meta.uid()).then_some(meta.uid());
+        let _ = std::os::unix::fs::fchown(&copy, uid, Some(meta.gid()));
+        let given = copy.metadata().context("reading the copy's metadata")?;
+        if given.uid() != meta.uid() || given.gid() != meta.gid() {
+            drop(copy);
+            let _ = std::fs::remove_file(temp);
+            return Ok(Err(format!(
+                "a copy cannot keep its owner and group ({}:{}); this process made it {}:{}",
+                meta.uid(),
+                meta.gid(),
+                given.uid(),
+                given.gid()
+            )));
+        }
+    }
+    // After any fchown, which clears the set-id bits.
+    copy.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .context("setting the copy's mode")?;
+    Ok(Ok(copy))
 }
 
 /// Copy every data run of the first `len` bytes of `source` to the same offset of `dest`,
@@ -705,6 +743,70 @@ mod tests {
 
     /// The copy keeps the bytes, the holes, the length and the nanosecond modification time,
     /// so the working-set key of the snapshot is the same before and after.
+    /// The reclaim record names the copy by an absolute path: a launch from another working
+    /// directory would otherwise resolve a relative one elsewhere, find nothing, and drop the
+    /// record while the copy stays (#1810 review). And the copy is written under both locks.
+    #[test]
+    fn the_rewrite_records_an_absolute_copy_path_and_copies_under_its_locks() {
+        let source = include_str!("compact.rs");
+        let body = &source[source.find("pub async fn rewrite_memory_file(").unwrap()..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("rewrite_memory_file does not call {needle}"))
+        };
+        assert!(at("acquire_snapshot_stage_lock(") < at("std::path::absolute(snapshot_dir)"));
+        assert!(at("std::path::absolute(snapshot_dir)") < at("Resource::Temp"));
+        assert!(at("Resource::Temp") < at("copy_if_worth_it("));
+    }
+
+    /// A copy keeps its source's owner and group, or is refused and removed: a rewrite never
+    /// changes who may read a memory file (#1810 review). Unprivileged, a root-owned source
+    /// cannot be matched, so its copy is refused; a source in one of this process's
+    /// supplementary groups keeps that group.
+    ///
+    /// RED BEFORE THE FIX: an unprivileged copy took the process's own group and was kept.
+    #[test]
+    fn a_copy_keeps_owner_and_group_or_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let root_owned = std::path::Path::new("/etc/hostname");
+        let source = File::open(root_owned).unwrap();
+        let meta = source.metadata().unwrap();
+        let temp = dir.path().join("copy");
+        match create_copy_like(&source, &meta, &temp, euid).unwrap() {
+            Ok(copy) => {
+                let made = copy.metadata().unwrap();
+                assert_eq!((made.uid(), made.gid()), (meta.uid(), meta.gid()));
+                assert_eq!(euid, 0, "an unprivileged process matched a root-owned file");
+            }
+            Err(_) => {
+                assert_ne!(euid, 0, "root could not match a root-owned file");
+                assert!(!temp.exists(), "the refused copy was left behind");
+            }
+        }
+
+        let egid = unsafe { libc::getegid() };
+        let other = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|gid| gid.as_raw())
+            .find(|gid| *gid != egid);
+        if let Some(gid) = other {
+            let own = dir.path().join("own");
+            std::fs::write(&own, b"x").unwrap();
+            std::os::unix::fs::chown(&own, None, Some(gid)).unwrap();
+            let source = File::open(&own).unwrap();
+            let meta = source.metadata().unwrap();
+            let temp = dir.path().join("own-copy");
+            let copy = create_copy_like(&source, &meta, &temp, euid)
+                .unwrap()
+                .expect("a group this process belongs to is kept");
+            assert_eq!(copy.metadata().unwrap().gid(), gid);
+        }
+    }
+
     #[test]
     fn a_copy_keeps_bytes_holes_length_and_mtime() {
         let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();

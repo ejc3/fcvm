@@ -231,3 +231,56 @@ async fn siblings_are_rewritten_only_once_one_is_left() -> Result<()> {
     assert_holds_only_its_own_bytes(&fs, base, "after deleting a and b2")?;
     Ok(())
 }
+
+/// The rewrite waits for a create that stages from the snapshot before it writes its copy: a
+/// subvolume snapshot taken during the copy would carry the copy into the new snapshot's
+/// directory, where its reclaim record does not follow it (#1810 review).
+///
+/// RED BEFORE THE FIX: the copy was written without the stage lock, so it appeared beside the
+/// memory file while a create held the lock.
+#[tokio::test]
+async fn the_rewrite_waits_for_a_create_staging_from_the_snapshot() -> Result<()> {
+    let fs = Loopback::new()?;
+    let store = fs.mount.join("snapshots");
+    std::fs::create_dir(&store)?;
+    full_snapshot(&store, "a")?;
+    let b = diff_snapshot(&store, "a", "b", 0xee)?;
+    let manager = SnapshotManager::new(store.clone());
+    let mut compaction = Compaction::default();
+    manager
+        .delete_snapshot_compacting("a", Some(&mut compaction))
+        .await?;
+    fs.used()?;
+
+    // A create staging from b holds b's stage lock shared.
+    let staging = fcvm::commands::common::acquire_snapshot_stage_lock(&b, false).await?;
+    let rewrite = tokio::spawn({
+        let b = b.clone();
+        async move { fcvm::storage::compact::rewrite_memory_file(&b).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let copies = |dir: &Path| -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".rewrite-"))
+            .collect()
+    };
+    assert!(
+        copies(&b).is_empty(),
+        "the rewrite wrote {:?} while a create held the snapshot's stage lock",
+        copies(&b)
+    );
+    assert!(
+        !rewrite.is_finished(),
+        "the rewrite did not wait for the stage lock"
+    );
+    drop(staging);
+    let outcome = rewrite.await??;
+    assert!(
+        matches!(outcome, fcvm::storage::compact::Rewrite::Rewrote { .. }),
+        "after the create, the rewrite ran: {outcome:?}"
+    );
+    assert!(copies(&b).is_empty());
+    Ok(())
+}
