@@ -1440,6 +1440,61 @@ mod tests {
         }
     }
 
+    /// A table read whose worker threads cannot start reads their chunks on the calling thread.
+    /// The address-space limit is set just above what the process maps, so a thread's stack
+    /// cannot be mapped, as root too.
+    ///
+    /// RED BEFORE THE FIX: `scope.spawn` panicked, so the table server dropped its connection and
+    /// the snapshot failed although one thread could read the table (review of #1792).
+    #[test]
+    fn a_table_read_whose_threads_cannot_start_names_every_held_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = crate::server::PassthroughFs::for_volume(dir.path(), false);
+        for i in 0..40 {
+            let name = format!("f{i}");
+            std::fs::write(dir.path().join(&name), b"x").unwrap();
+            let entry = source.handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent: 1,
+                    name: name.into_bytes(),
+                    uid,
+                    gid,
+                    pid: 0,
+                },
+                &[],
+            );
+            assert!(entry.attr().is_some());
+        }
+        let on_one = source.inode_table_in_chunks(source.capture_inodes(), usize::MAX);
+        let captured = source.capture_inodes();
+        let mapped: u64 = std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSize:"))
+            .and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap();
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit only touch the struct given.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut before) }, 0);
+        let tight = libc::rlimit {
+            rlim_cur: (mapped + 512) * 1024,
+            rlim_max: before.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &tight) }, 0);
+        let spawned = std::thread::Builder::new().spawn(|| ()).map(|t| t.join());
+        let on_threads = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.inode_table_in_chunks(captured, 2)
+        }));
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &before) }, 0);
+        assert!(spawned.is_err(), "the limit did not stop a thread starting");
+        assert_eq!(on_threads.expect("the table read panicked"), on_one);
+    }
+
     /// A restored server of a read-only volume reads with file handle 0. Its inner server answers
     /// OPEN with ENOSYS (zero-message open), so the guest kernel opens nothing and reads with handle
     /// 0; that is no handle at all, not one from before the snapshot to reopen. FLUSH with handle 0

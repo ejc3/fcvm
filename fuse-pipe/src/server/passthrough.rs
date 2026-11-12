@@ -554,15 +554,25 @@ impl PassthroughFs {
         let parts: Vec<(Paths, Paths)> = if threads <= 1 {
             vec![read(&captured.pins)]
         } else {
+            // A thread that cannot start (the process at its thread or memory limit) leaves its
+            // chunk to this thread, so the table is still whole.
             std::thread::scope(|scope| {
                 let workers: Vec<_> = captured
                     .pins
                     .chunks(chunk)
-                    .map(|pins| scope.spawn(move || read(pins)))
+                    .map(|pins| {
+                        std::thread::Builder::new()
+                            .name("fcvm-inode-table".into())
+                            .spawn_scoped(scope, move || read(pins))
+                            .map_err(|_| pins)
+                    })
                     .collect();
                 workers
                     .into_iter()
-                    .map(|worker| worker.join().expect("an inode table worker panicked"))
+                    .map(|worker| match worker {
+                        Ok(worker) => worker.join().expect("an inode table worker panicked"),
+                        Err(pins) => read(pins),
+                    })
                     .collect()
             })
         };
