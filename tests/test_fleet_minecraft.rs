@@ -228,6 +228,7 @@ async fn fake_from(
         places.push(Place {
             ipv6: None,
             http: addr,
+            tls_port: None,
         });
         scenes.push(s);
     }
@@ -249,6 +250,7 @@ async fn fake_from(
         Place {
             ipv6: None,
             http: gold_addr,
+            tls_port: None,
         },
         out,
         reqwest::Client::builder().no_proxy().build().unwrap(),

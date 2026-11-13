@@ -1659,7 +1659,10 @@ export class MockCoordinator {
           }
           if (typeof b["renderers_silent"] === "boolean") this.opts.renderers.setSilent(b["renderers_silent"]);
           if (typeof b["no_poster"] === "boolean") this.noPoster = b["no_poster"];
-          if (typeof b["ipv6_down"] === "boolean") this.opts.renderers.setV6Down(b["ipv6_down"]);
+          if (typeof b["ipv6_down"] === "boolean") {
+            this.opts.renderers.setV6Down(b["ipv6_down"]);
+            this.minecraft?.setV6Down(b["ipv6_down"]);
+          }
           return { ok: true };
         });
         return;

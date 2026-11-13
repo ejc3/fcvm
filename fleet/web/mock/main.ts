@@ -170,6 +170,7 @@ export async function startMock() {
             count: int("FLEET_MOCK_MINECRAFT", 0),
             port: int("FLEET_MOCK_MINECRAFT_PORT"),
             publicHost: env("FLEET_MOCK_HOST", "localhost"),
+            publicHostV4: env("FLEET_MOCK_HOST_V4", "127.0.0.1"),
             cap: int("FLEET_MOCK_MINECRAFT_CAP", 2),
             claimSecs: int("FLEET_MOCK_MINECRAFT_CLAIM_S", 120),
             cooldownSecs: int("FLEET_MOCK_MINECRAFT_COOLDOWN_S", 60),

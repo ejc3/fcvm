@@ -100,13 +100,28 @@ pub struct Place {
     pub ipv6: Option<Ipv6Addr>,
     /// Where the agent reaches its tile's plain HTTP.
     pub http: SocketAddr,
+    /// The host port its view socket's TLS (443 in the VM) is published on at the publish
+    /// address (`--tls-publish-base` plus its index): the IPv4 path, for viewers with no IPv6,
+    /// that every GPU slot and Windows sandbox has too.
+    pub tls_port: Option<u16>,
 }
 
 impl Place {
-    pub fn routed(addr: Ipv6Addr) -> Place {
+    pub fn routed(addr: Ipv6Addr, tls_port: Option<u16>) -> Place {
         Place {
             ipv6: Some(addr),
             http: SocketAddr::new(addr.into(), VIEW_PORT),
+            tls_port,
+        }
+    }
+
+    /// What a server reports of its IPv4 path: the host's one public address and this server's
+    /// published TLS port, which the coordinator names `<label>-v4` and the page falls back to
+    /// when the viewer has no IPv6 (fleet/web/core/net.ts). Neither without both.
+    pub fn v4_path(&self, public_ipv4: Option<&str>) -> (Option<String>, Option<u16>) {
+        match (public_ipv4, self.tls_port) {
+            (Some(ip), Some(port)) => (Some(ip.to_string()), Some(port)),
+            _ => (None, None),
         }
     }
 }
@@ -147,9 +162,22 @@ pub fn gold_argv(cfg: &MinecraftCfg, prefix: &str, place: &Place) -> Vec<String>
 /// copied with (a fork's source borrower among it) until the agent gives it its own.
 pub const RESTORE_HOOK: &str = "mctile restored";
 
-pub fn restore_argv(tag: &str, name: &str, prefix: &str, place: &Place) -> Vec<String> {
+pub fn restore_argv(
+    tag: &str,
+    name: &str,
+    prefix: &str,
+    place: &Place,
+    publish_ip: &str,
+) -> Vec<String> {
     let mut a = s(&["snapshot", "run", "--snapshot", tag, "--name", name]);
     a.extend(network_args(prefix, place));
+    // A port a restore can bind: given here, not in the gold snapshot, so every server shares it.
+    if let Some(p) = place.tls_port {
+        a.extend(s(&[
+            "--publish",
+            &format!("{publish_ip}:{p}:{}", super::tls::PORT),
+        ]));
+    }
     a.extend(s(&["--on-restore", RESTORE_HOOK]));
     a
 }
@@ -701,6 +729,7 @@ impl Server {
         retry_in: Option<Duration>,
         first_chunk_at: Option<u64>,
     ) {
+        let (ipv4, v4_port) = self.place.v4_path(self.agent.public_ipv4.as_deref());
         let _ = self.out.send(AgentMsg::Slot(SlotReport {
             id: self.id.clone(),
             phase: phase.into(),
@@ -711,6 +740,8 @@ impl Server {
             error,
             retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
             ipv6: self.place.ipv6.map(|a| a.to_string()),
+            ipv4,
+            v4_port,
             place: self.agent.place.clone(),
             first_chunk_at,
             ..Default::default()
@@ -850,7 +881,13 @@ impl Server {
             self.stop(&mut old).await;
         }
         let tr = Instant::now();
-        let argv = restore_argv(&tag, &self.id, &self.prefix, &self.place);
+        let argv = restore_argv(
+            &tag,
+            &self.id,
+            &self.prefix,
+            &self.place,
+            &self.agent.publish_ip,
+        );
         let mut vm =
             Vm::spawn_args(&self.agent.fcvm, &argv, &self.id).map_err(|e| format!("{e:#}"))?;
         // The tile's scene as soon as it answers, posted beside the wait for its first chunk so
@@ -1143,7 +1180,7 @@ mod tests {
 
     #[test]
     fn the_gold_boots_routed_with_its_bots_and_the_certificate() {
-        let p = Place::routed("2001:db8::1:2".parse().unwrap());
+        let p = Place::routed("2001:db8::1:2".parse().unwrap(), None);
         let a = gold_argv(&cfg(), "2001:db8::/64", &p).join(" ");
         assert!(a.starts_with("podman run --name mc-gold --network routed --ipv6-prefix 2001:db8::/64 --ipv6-address 2001:db8::1:2"), "{a}");
         assert!(a.contains("--mem 1024 --cpu 1 --env MCTILE_BOTS=3"), "{a}");
@@ -1156,9 +1193,9 @@ mod tests {
 
     #[test]
     fn a_server_restores_at_its_address_and_only_the_gold_snapshot_stops_its_source() {
-        let p = Place::routed("2001:db8::7".parse().unwrap());
+        let p = Place::routed("2001:db8::7".parse().unwrap(), None);
         assert_eq!(
-            restore_argv("mc-gold-x", "mc-3", "2001:db8::/64", &p),
+            restore_argv("mc-gold-x", "mc-3", "2001:db8::/64", &p, "0.0.0.0"),
             s(&[
                 "snapshot",
                 "run",
@@ -1184,6 +1221,32 @@ mod tests {
         assert!(!snapshot_argv(42, "mc-fork-mc-2-5", false)
             .iter()
             .any(|a| a == "--stop"));
+    }
+
+    #[test]
+    fn a_server_publishes_its_view_socket_for_ipv4_viewers() {
+        // A viewer with no IPv6 (an IPv4-only home network) cannot resolve or reach the tile's
+        // own address; the host's public IPv4 at the server's TLS port is its way in.
+        let p = Place::routed("2001:db8::7".parse().unwrap(), Some(20212));
+        let a = restore_argv("mc-gold-x", "mc-3", "2001:db8::/64", &p, "0.0.0.0");
+        let at = a
+            .iter()
+            .position(|x| x == "--publish")
+            .expect("no --publish");
+        assert_eq!(a[at + 1], "0.0.0.0:20212:443");
+        assert_eq!(
+            p.v4_path(Some("192.0.2.4")),
+            (Some("192.0.2.4".to_string()), Some(20212))
+        );
+        // No public address, or no published port: no IPv4 path is reported.
+        assert_eq!(p.v4_path(None), (None, None));
+        let q = Place::routed("2001:db8::7".parse().unwrap(), None);
+        assert_eq!(q.v4_path(Some("192.0.2.4")), (None, None));
+        assert!(
+            !restore_argv("mc-gold-x", "mc-3", "2001:db8::/64", &q, "0.0.0.0")
+                .iter()
+                .any(|x| x == "--publish")
+        );
     }
 
     #[test]

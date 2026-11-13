@@ -1062,7 +1062,10 @@ The snapshot's `state.minecraft` is absent with no servers, else:
 to four, then rows of equal length, each tile square (the map is 128 x 128 columns);
 `image_aspect` is that image's. `frame_url` is the tile's view socket ("Minecraft tile",
 below): the agent's URL, or with published names the launch's name under the subzone with the
-path `/view` (`mc-<n>-<token>`, as `slot-<n>-<token>` names a slot's frames). A lent server
+path `/view` (`mc-<n>-<token>`, as `slot-<n>-<token>` names a slot's frames). `frame_url_v4` is
+the same view socket over the host's IPv4 address at the server's published port
+(`mc-<n>-<token>-v4`), null when the agent reports no IPv4 path; the page picks the family as it
+does for every stream (IPv6 first, IPv4 when IPv6 does not connect). A lent server
 keeps its `frame_url`: everyone watches it, and only its driver drives it. `join` is the host
 name Java Edition players connect to (port 25565): the frame URL's host when the URL is
 `wss://` on a DNS name, else null (an IP literal, or a plain `ws://` URL). A tile's `phase` is
