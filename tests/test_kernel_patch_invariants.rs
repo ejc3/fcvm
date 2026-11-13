@@ -586,6 +586,188 @@ fn kernel_patch_resolves_a_host_kernel_profile_from_its_own_table() {
     );
 }
 
+/// A checkout with `scripts/kernel-patch.sh`, a host kernel profile pinning release 9.9.9
+/// with five patches to one 30-line file, and a work directory holding that release's
+/// source, already extracted, so the script downloads nothing. In glob order `0001-first`,
+/// `0002-second`, `vgic-other`, `vgic-quiet` and `world` change lines 4, 10, 16, 22 and 28.
+struct KernelPatchFixture {
+    root: tempfile::TempDir,
+    work: tempfile::TempDir,
+}
+
+impl KernelPatchFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create the fixture checkout");
+        fs::create_dir_all(root.path().join("scripts")).unwrap();
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+            root.path().join("scripts/kernel-patch.sh"),
+        )
+        .expect("copy kernel-patch.sh");
+        fs::write(
+            root.path().join("rootfs-config.toml"),
+            "[kernel_profiles.nested.arm64.host_kernel]\n\
+             kernel_version = \"9.9.9\"\n\
+             patches_dir = \"kernel/patches-arm64-host\"\n",
+        )
+        .unwrap();
+        let patches = root.path().join("kernel/patches-arm64-host");
+        fs::create_dir_all(&patches).unwrap();
+        let lines: Vec<String> = (1..=30).map(|n| format!("l{n}")).collect();
+        // A unified diff of a.c changing line `n` to `to`, with three lines of context.
+        let patch = |n: usize, to: &str| {
+            let (from, until) = (n - 3, n + 3);
+            let mut body = format!(
+                "--- a/a.c\n+++ b/a.c\n@@ -{from},{len} +{from},{len} @@\n",
+                len = until - from + 1
+            );
+            for i in from..=until {
+                if i == n {
+                    body.push_str(&format!("-l{i}\n+{to}\n"));
+                } else {
+                    body.push_str(&format!(" l{i}\n"));
+                }
+            }
+            body
+        };
+        for (name, n, to) in [
+            ("0001-first.patch", 4, "one-1"),
+            ("0002-second.patch", 10, "two-2"),
+            ("vgic-other.patch", 16, "other-o"),
+            ("vgic-quiet.patch", 22, "quiet-q"),
+            ("world.patch", 28, "world-w"),
+        ] {
+            fs::write(patches.join(name), patch(n, to)).unwrap();
+        }
+        let work = tempfile::tempdir().expect("create the work directory");
+        fs::write(work.path().join("linux-9.9.9.tar.xz"), "").unwrap();
+        fs::create_dir_all(work.path().join("linux-9.9.9")).unwrap();
+        fs::write(work.path().join("linux-9.9.9/a.c"), lines.join("\n") + "\n").unwrap();
+        Self { root, work }
+    }
+
+    fn run(&self, args: &[&str], stdin: &str) -> std::process::Output {
+        use std::io::Write;
+        let mut child = Command::new("bash")
+            .arg(self.root.path().join("scripts/kernel-patch.sh"))
+            .args(args)
+            .env("KERNEL_PATCH_ARCH", "aarch64")
+            .env("KERNEL_PATCH_WORKDIR", self.work.path())
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run kernel-patch.sh");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// a.c in the work tree.
+    fn source(&self) -> String {
+        fs::read_to_string(self.work.path().join("linux-9.9.9/a.c")).unwrap()
+    }
+
+    fn patch(&self, name: &str) -> String {
+        fs::read_to_string(
+            self.root
+                .path()
+                .join("kernel/patches-arm64-host")
+                .join(name),
+        )
+        .unwrap()
+    }
+}
+
+fn output_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// `edit` takes a patch by its number, its full name or a prefix only it has, and sets the
+/// tree up as the patches before it plus that patch. Unnumbered patches (the host kernel's
+/// `vgic-v3-keep-hcr-on-quiet-exits.patch`) have no number: matching the first four
+/// characters of each name against the argument applied every patch, the target and the
+/// ones after it included, then applied the target a second time.
+#[test]
+fn kernel_patch_edit_finds_a_patch_by_its_name_or_a_unique_prefix() {
+    for name in ["vgic-quiet", "vgic-quiet.patch", "vgic-q"] {
+        let fixture = KernelPatchFixture::new();
+        let out = fixture.run(&["edit", "nested.host_kernel", name], "");
+        assert!(
+            out.status.success(),
+            "edit {name} failed:\n{}",
+            output_text(&out)
+        );
+        let source = fixture.source();
+        assert!(
+            source.contains("one-1\n")
+                && source.contains("two-2\n")
+                && source.contains("other-o\n")
+                && source.contains("quiet-q\n")
+                && source.contains("\nl28\n"),
+            "edit {name} must leave the patches before vgic-quiet.patch and vgic-quiet.patch \
+             itself applied, and world.patch not:\n{source}"
+        );
+    }
+
+    let fixture = KernelPatchFixture::new();
+    let out = fixture.run(&["edit", "nested.host_kernel", "vgic"], "");
+    assert!(
+        !out.status.success() && output_text(&out).contains("more than one patch"),
+        "edit with a prefix two patches share must refuse, not pick one:\n{}",
+        output_text(&out)
+    );
+}
+
+/// `finish` after `edit` writes the whole patch: what it held before the edit and the
+/// edit. It used to write only the newest commit, the edit alone, and so replaced the
+/// patch with the change made to it.
+#[test]
+fn kernel_patch_finish_writes_the_whole_edited_patch() {
+    let fixture = KernelPatchFixture::new();
+    let out = fixture.run(&["edit", "nested.host_kernel", "0002"], "");
+    assert!(
+        out.status.success(),
+        "edit 0002 failed:\n{}",
+        output_text(&out)
+    );
+    let tree = fixture.work.path().join("linux-9.9.9/a.c");
+    fs::write(&tree, fixture.source().replace("\nl13\n", "\nthirteen-e\n")).unwrap();
+    let workdir = fixture.work.path().display().to_string();
+    let out = fixture.run(
+        &[
+            "finish",
+            "nested.host_kernel",
+            "0002-second.patch",
+            &workdir,
+        ],
+        "second, edited\nThe edited patch.\n",
+    );
+    assert!(
+        out.status.success(),
+        "finish failed:\n{}",
+        output_text(&out)
+    );
+    let patch = fixture.patch("0002-second.patch");
+    assert!(
+        patch.contains("+two-2\n") && patch.contains("+thirteen-e\n") && !patch.contains("one-1"),
+        "the finished patch must hold the patch's own change and the edit, and nothing from \
+         the patches before it:\n{patch}"
+    );
+}
+
 /// The three kernel files the arm64 host's vgic-v3 patch changes, excerpted in
 /// `tests/fixtures/vgic-v3-hcr-<major>.<minor>` from the release the host pins.
 const VGIC_HCR_FILES: [&str; 3] = [
