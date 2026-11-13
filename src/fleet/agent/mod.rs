@@ -359,6 +359,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             bots: args.minecraft_bots,
             snapshot_dir: args.minecraft_snapshot_dir.clone(),
             tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
+            publish_tls: args.tls_secret.is_some() && args.tls_publish_base.is_some(),
             gold_deadline: Duration::from_secs(300),
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
@@ -537,16 +538,19 @@ where
             .ipv6_prefix
             .as_ref()
             .context("Minecraft mode needs the host's IPv6 prefix")?;
+        // The view sockets' IPv4 path, by index after the sandboxes' as their ports are, when the
+        // servers have a certificate to serve it with.
+        let tls_base = agent.cfg.tls_publish_base.filter(|_| m.publish_tls);
         for k in 0..m.count as usize {
             let i = base + k;
-            // The view socket's IPv4 path, by index after the sandboxes' as their ports are.
-            let tls = tls_port(agent.cfg.tls_publish_base, i, &format!("server {k}"))?;
+            let tls = tls_port(tls_base, i, &format!("server {k}"))?;
             mc_places.push(minecraft::Place::routed(prefix.slot_address(i)?, tls));
         }
-        // The gold server takes no viewers: nothing is published for it.
+        // The gold takes no viewers. It publishes guest port 443 on loopback at the first
+        // server's port (it runs before any server) so that every restore can move it.
         mc_gold = Some(minecraft::Place::routed(
             prefix.slot_address(base + m.count as usize)?,
-            None,
+            mc_places.first().and_then(|p| p.tls_port),
         ));
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");

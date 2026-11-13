@@ -56,6 +56,11 @@ pub struct MinecraftCfg {
     pub snapshot_dir: PathBuf,
     /// The certificate directory, when the agent has a certificate (`--tls-secret`).
     pub tls_dir: Option<PathBuf>,
+    /// Whether every server publishes its view socket's TLS port (443 in the VM) on the host's
+    /// IPv4 address: the agent has a certificate and `--tls-publish-base`. The gold VM then
+    /// publishes guest port 443 too, because a restore from memory can move a published port
+    /// but cannot add one (`fcvm snapshot run --publish`).
+    pub publish_tls: bool,
     pub gold_deadline: Duration,
     /// A restore (or fork) to its bots' first chunk.
     pub ready_deadline: Duration,
@@ -80,6 +85,11 @@ impl MinecraftCfg {
                 "tls"
             } else {
                 "plain"
+            },
+            if self.publish_tls {
+                "publish-443"
+            } else {
+                "unpublished"
             },
         ] {
             h.update(part.as_bytes());
@@ -151,6 +161,14 @@ pub fn gold_argv(cfg: &MinecraftCfg, prefix: &str, place: &Place) -> Vec<String>
     ]));
     if let Some(dir) = &cfg.tls_dir {
         a.extend(super::tls::vm_args(dir));
+    }
+    // Guest port 443 published, so that each server's restore can move it to its own port. The
+    // gold runs alone, before any server, so it borrows the first server's port, on loopback.
+    if let (true, Some(p)) = (cfg.publish_tls, place.tls_port) {
+        a.extend(s(&[
+            "--publish",
+            &format!("127.0.0.1:{p}:{}", super::tls::PORT),
+        ]));
     }
     a.push(cfg.image.clone());
     a
@@ -1155,6 +1173,7 @@ mod tests {
             bots: 3,
             snapshot_dir: "/s".into(),
             tls_dir: Some("/run/fcvm-fleet/tls".into()),
+            publish_tls: false,
             gold_deadline: Duration::from_secs(300),
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
@@ -1173,6 +1192,10 @@ mod tests {
         let mut c = cfg();
         c.mem_mib = 2048;
         assert_ne!(a.gold_key(), c.gold_key());
+        // A gold that publishes guest port 443 is a different snapshot from one that does not.
+        let mut d = cfg();
+        d.publish_tls = true;
+        assert_ne!(a.gold_key(), d.gold_key());
         assert!(
             a.gold_tag().starts_with("mc-gold-") && a.gold_tag().len() == "mc-gold-".len() + 12
         );
@@ -1221,6 +1244,43 @@ mod tests {
         assert!(!snapshot_argv(42, "mc-fork-mc-2-5", false)
             .iter()
             .any(|a| a == "--stop"));
+    }
+
+    /// The guest ports a `--publish` list names.
+    fn published_guest_ports(argv: &[String]) -> Vec<String> {
+        argv.windows(2)
+            .filter(|w| w[0] == "--publish")
+            .map(|w| w[1].rsplit(':').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_port_a_restore_publishes_is_one_the_gold_published() {
+        // `fcvm snapshot run --publish` moves a port the snapshot published and refuses any
+        // other: a server publishing 443 from a gold that did not would never restore.
+        let mut c = cfg();
+        c.publish_tls = true;
+        let gold = Place::routed("2001:db8::9".parse().unwrap(), Some(20212));
+        let g = gold_argv(&c, "2001:db8::/64", &gold);
+        assert_eq!(published_guest_ports(&g), vec!["443"]);
+        // on loopback: the gold takes no viewers
+        assert!(
+            g.join(" ").contains("--publish 127.0.0.1:20212:443"),
+            "{g:?}"
+        );
+        for (k, port) in [(0u16, 20212u16), (3, 20215)] {
+            let p = Place::routed(format!("2001:db8::{}", 7 + k).parse().unwrap(), Some(port));
+            let r = restore_argv("mc-gold-x", "mc-1", "2001:db8::/64", &p, "0.0.0.0");
+            for port in published_guest_ports(&r) {
+                assert!(
+                    published_guest_ports(&g).contains(&port),
+                    "{r:?} publishes {port}, the gold did not"
+                );
+            }
+        }
+        // Without the IPv4 path neither publishes.
+        let plain = Place::routed("2001:db8::9".parse().unwrap(), None);
+        assert!(published_guest_ports(&gold_argv(&cfg(), "2001:db8::/64", &plain)).is_empty());
     }
 
     #[test]
