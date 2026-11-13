@@ -51,21 +51,42 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Fetch the secret and write the file when it differs from what is there. Returns
-/// whether it changed. The secret's scene token goes into the file and into `token`.
-pub async fn refresh(
-    secrets: &Secrets,
-    secret: &str,
-    dir: &Path,
-    token: &SceneToken,
-) -> Result<bool> {
-    let v: serde_json::Value = serde_json::from_str(&secrets.get(secret).await?)
-        .with_context(|| format!("secret {secret} is not JSON"))?;
+/// Where the certificate comes from: the fleet's secret, or a local file in the secret's
+/// format (`--tls-file`, a host checked with a throwaway CA of its own).
+pub enum Source {
+    Secret(Secrets, String),
+    File(std::path::PathBuf),
+}
+
+impl Source {
+    fn name(&self) -> String {
+        match self {
+            Source::Secret(_, s) => format!("secret {s}"),
+            Source::File(p) => format!("file {}", p.display()),
+        }
+    }
+
+    async fn read(&self) -> Result<String> {
+        match self {
+            Source::Secret(secrets, s) => secrets.get(s).await,
+            Source::File(p) => {
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))
+            }
+        }
+    }
+}
+
+/// Read the certificate and write the file when it differs from what is there. Returns
+/// whether it changed. Its scene token goes into the file and into `token`.
+pub async fn refresh(source: &Source, dir: &Path, token: &SceneToken) -> Result<bool> {
+    let secret = source.name();
+    let v: serde_json::Value = serde_json::from_str(&source.read().await?)
+        .with_context(|| format!("{secret} is not JSON"))?;
     let field = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
             .map(str::to_string)
-            .with_context(|| format!("secret {secret} has no {k}"))
+            .with_context(|| format!("{secret} has no {k}"))
     };
     let mut doc = serde_json::json!({"cert": field("cert")?, "key": field("key")?});
     let scene = v
@@ -91,9 +112,9 @@ pub async fn refresh(
 }
 
 /// Keep the files current, hourly.
-pub async fn run(secrets: Secrets, secret: String, dir: std::path::PathBuf, token: SceneToken) {
+pub async fn run(source: Source, dir: std::path::PathBuf, token: SceneToken) {
     loop {
-        match refresh(&secrets, &secret, &dir, &token).await {
+        match refresh(&source, &dir, &token).await {
             Ok(true) => tracing::info!(dir = %dir.display(), "renderer certificate updated"),
             Ok(false) => {}
             Err(e) => {

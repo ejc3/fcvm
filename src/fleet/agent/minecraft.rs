@@ -779,7 +779,7 @@ impl Server {
                 .scene
                 .borrow()
                 .as_ref()
-                .map(|s| s.admit_keys.clone())
+                .map(tile_admit_keys)
                 .unwrap_or_default(),
             driver: want.driver.clone(),
             driver_until: want.driver_until,
@@ -1163,8 +1163,34 @@ pub async fn inspect_image(podman: &Path, image: &str) -> Result<(String, Option
     ))
 }
 
+/// The keys a server checks its view sockets' direct tokens with. A fleet tile admits only a
+/// direct token (it names the viewer a take-over drives for), so it needs keys even when the
+/// coordinator checks no direct stream: without a broadcast `admit_keys` is empty, and the
+/// coordinator's own key, which every seated viewer's direct token is made with, comes as
+/// `mirror_keys`. With an empty list the tile would admit nobody.
+pub fn tile_admit_keys(scene: &SharedScene) -> Vec<String> {
+    if scene.admit_keys.is_empty() {
+        scene.mirror_keys.clone()
+    } else {
+        scene.admit_keys.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A coordinator without a broadcast checks no direct stream (`admit_keys` empty), and a
+    /// fleet Minecraft tile with no keys refuses every view socket. Found by the host-image
+    /// viewer-path acceptance (fleet/tools/viewer-acceptance.sh): every view socket closed with
+    /// 1008 on a coordinator with no broadcast.
+    #[test]
+    fn a_server_gets_the_coordinators_key_without_a_broadcast() {
+        let mut scene = SharedScene::new(&fleet_core::scene::Scene::new(1_000), 1.0);
+        scene.mirror_keys = vec!["aa".repeat(32)];
+        assert_eq!(tile_admit_keys(&scene), vec!["aa".repeat(32)]);
+        scene.admit_keys = vec!["bb".repeat(32)];
+        assert_eq!(tile_admit_keys(&scene), vec!["bb".repeat(32)]);
+    }
+
     use super::*;
 
     fn cfg() -> MinecraftCfg {

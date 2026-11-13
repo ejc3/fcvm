@@ -30,7 +30,9 @@ preserved. An unreachable builder or uncertain command delivery may leave no arc
 
 The factory uses isolated build/test certificates and its own instance profile.
 Production images and warm caches that may contain production TLS material are not
-CI build inputs. A pair publishes only after real GPU frames, a restored phone,
+CI build inputs. A pair publishes only after real GPU frames, a restored phone, every mode's
+tiles answering a viewer over IPv4 and IPv6 (`fleet/tools/viewer-acceptance.sh`, on the host's
+cold boot),
 certificate rotation, the exact firewall/boot-unit proofs, and cold boot, reboot and
 stop/start checks. Both images must use the same renderer. Working artifacts are
 private and temporary; the publisher copies the version-pinned validated store into
