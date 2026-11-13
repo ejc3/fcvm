@@ -248,6 +248,13 @@ endif
 # Test log directory (mounted into container)
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
+# The test options (FILTER, STREAM, LIST, IGNORED) reach the make inside the container
+# through its environment: make exports a variable set on its command line to the
+# recipe, and `-e NAME` copies it into the container only when it is set. Passing them
+# as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
+# Without this, `make container-test-unit FILTER=x` ran every test.
+CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
+
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
 # See: https://github.com/containers/podman/issues/16701
@@ -265,7 +272,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
-	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
+	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) $(CONTAINER_TEST_OPTIONS)
 
 # Container run with high process limits (for parallel test suites)
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536

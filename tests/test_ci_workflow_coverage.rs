@@ -3076,3 +3076,30 @@ fn host_jobs_upload_the_vmm_logs_teardown_keeps() {
         );
     }
 }
+
+/// The RustSec database changes without a commit here, so Lint alone notices a new
+/// advisory only when some later change runs it, and then fails that change. The
+/// scheduled workflow runs the same two checks Lint runs, every day.
+#[test]
+fn advisories_are_checked_on_a_schedule() {
+    let daily = parse_workflow("weekly.yml");
+    assert!(
+        triggers(&daily).get("schedule").is_some(),
+        "weekly.yml has no schedule; the advisory check would never run on its own"
+    );
+    let job = workflow_job(&daily, "advisories");
+    let runs: Vec<&str> = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("the advisories job has steps")
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .collect();
+    for check in ["cargo audit", "cargo deny check advisories"] {
+        assert!(
+            runs.iter()
+                .any(|run| run.lines().any(|line| line.trim() == check)),
+            "the scheduled advisories job does not run `{check}`"
+        );
+    }
+}

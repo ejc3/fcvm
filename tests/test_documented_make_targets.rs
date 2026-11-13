@@ -1411,3 +1411,50 @@ fn setup_btrfs_hands_an_existing_assets_directory_to_the_invoking_user() {
         "the existing-directory branch must not chown recursively: {branch}"
     );
 }
+
+/// `make container-test-unit FILTER=x` must run the tests x selects inside the container.
+///
+/// The container targets ran `make build _test-unit` (and `_test-fast`, `_test-all`) in
+/// the container with nothing from the outer command line, so FILTER, STREAM, LIST and
+/// IGNORED were dropped and every test ran. The options reach the inner make through its
+/// environment: make exports a command-line variable to its recipes, and the recipe
+/// hands podman `-e NAME` for each. `make -n` prints the podman command without running
+/// it or any prerequisite's commands.
+#[test]
+fn container_test_targets_hand_the_test_options_to_the_container() {
+    for target in [
+        "container-test-unit",
+        "container-test-fast",
+        "container-test-all",
+    ] {
+        let out = Command::new("make")
+            .args(["-n", target, "FILTER=-E 'test(=a_probe)'"])
+            .current_dir(repo_root())
+            .output()
+            .expect("run make -n");
+        assert!(
+            out.status.success(),
+            "make -n {target} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let inner: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.contains("podman run") && line.contains(" make "))
+            .collect();
+        assert!(
+            !inner.is_empty(),
+            "make -n {target} printed no podman command that runs make; the test cannot \
+             see the recipe it checks:\n{stdout}"
+        );
+        for line in inner {
+            for option in ["FILTER", "STREAM", "LIST", "IGNORED"] {
+                assert!(
+                    line.contains(&format!("-e {option} ")),
+                    "{target} runs make in the container without `-e {option}`, so \
+                     `make {target} {option}=...` is ignored there:\n{line}"
+                );
+            }
+        }
+    }
+}
