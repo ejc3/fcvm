@@ -1366,13 +1366,26 @@ impl TerminalInterrupt {
     /// at its default action (exec resets a handler and keeps an ignored signal ignored). A
     /// test started from a shell that ignores SIGINT would otherwise pass without the fix.
     pub(crate) fn arm() -> Self {
+        // nextest starts every test in a process group of its own, but the privileged lanes
+        // run the test binary under scripts/root-test-runner.sh, whose wrapper leads the
+        // group. Lead a group of our own there, so the SIGINT reaches no other process.
+        // SAFETY: getpgrp, getpid and setpgid(0, 0) act on this process only.
+        unsafe {
+            if libc::getpgrp() != libc::getpid() {
+                assert_eq!(
+                    libc::setpgid(0, 0),
+                    0,
+                    "leading a process group of this test's own: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         // SAFETY: getpgrp and getpid take no arguments and cannot fail.
         let (group, me) = unsafe { (libc::getpgrp(), libc::getpid()) };
         assert_eq!(
             group, me,
-            "BLOCKED: this test signals its own process group and must lead one (nextest \
-             starts every test in a group of its own); here the signal would reach other \
-             processes"
+            "BLOCKED: this test signals its own process group and must lead one; here the \
+             signal would reach other processes"
         );
         let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .expect("installing a SIGINT handler");
