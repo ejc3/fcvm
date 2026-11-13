@@ -59,20 +59,23 @@ def associated_priority(sha, token, fetch=github_json):
 
 
 def not_requestable(sha, token, fetch=github_json):
-    """Why this revision cannot enter the factory now, or None. The factory takes only the
-    current main revision with successful CI. A CI run that completes after the next merge
-    asks for a revision main has moved past, and the weekly schedule can fire while main's
-    newest CI is still running; in both cases the newer revision's own CI completion asks
-    for its image, so this request is not needed."""
+    """Why this revision cannot enter the factory now, or None. A revision with successful
+    CI is requested, the head or a revision main has moved past (the factory admits a recent
+    ancestor of main). Without it, a revision main has moved past and a head whose CI still
+    runs (the weekly schedule can fire then) are skipped: a newer completion asks instead."""
     head = fetch("git/ref/heads/main", token).get("object", {}).get("sha")
     need(isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head), "Invalid main revision")
-    if head != sha:
-        return "main has moved on to " + head + ", whose CI completion requests its image"
     runs = fetch("actions/workflows/ci.yml/runs?branch=main&head_sha=" + sha + "&per_page=20", token)
     runs = runs.get("workflow_runs")
     need(isinstance(runs, list), "Invalid CI runs")
     if any(r.get("conclusion") == "success" for r in runs):
+        # A green revision is requested even when main has moved on: the newer head's run is
+        # often cancelled by the next merge or fails on a download, and waiting for it built
+        # nothing for six hours on 2026-11-08. The factory admits a recent ancestor of main
+        # and refuses one older than a revision it already admitted.
         return None
+    if head != sha:
+        return "main has moved on to " + head + ", whose CI completion requests its image"
     if any(r.get("status") in ("queued", "in_progress", "waiting", "pending", "requested") for r in runs):
         return "main CI for " + sha + " is still running; its completion requests this image"
     return None

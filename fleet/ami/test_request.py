@@ -144,6 +144,13 @@ class RequestTests(unittest.TestCase):
         reason = request.not_requestable("a" * 40, "t", self.github("b" * 40, []))
         self.assertIn("main has moved on", reason)
 
+    def test_a_green_revision_main_moved_past_is_requested(self):
+        # 69050e1c and 5ee037da passed CI after main had moved on, and the newer heads' runs
+        # failed or were cancelled: nothing was built for six hours (2026-11-08). The factory
+        # admits a green recent ancestor of main and refuses one older than it already built.
+        green = [{"status": "completed", "conclusion": "success"}]
+        self.assertIsNone(request.not_requestable("a" * 40, "t", self.github("b" * 40, green)))
+
     def test_the_schedule_skips_a_head_whose_ci_still_runs(self):
         # the weekly schedule at 02:24 fired on 38d63412 while its CI ran (run 41377552783)
         reason = request.not_requestable("a" * 40, "t", self.github("a" * 40, [{"status": "in_progress", "conclusion": None}]))
