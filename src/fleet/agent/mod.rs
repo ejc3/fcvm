@@ -109,6 +109,17 @@ impl AggregateCfg {
     }
 }
 
+/// The host port a place's TLS is published on: `--tls-publish-base` plus its index, the same
+/// numbering for GPU slots, then Windows sandboxes, then Minecraft servers. `None` without a base.
+fn tls_port(base: Option<u16>, index: usize, what: &str) -> Result<Option<u16>> {
+    let Some(b) = base else { return Ok(None) };
+    u16::try_from(index)
+        .ok()
+        .and_then(|i| b.checked_add(i))
+        .map(Some)
+        .with_context(|| format!("--tls-publish-base {b} leaves no port for {what}"))
+}
+
 /// An IPv6 literal in brackets, for `<address>:<port>`.
 fn bracket(ip: &str) -> String {
     if ip.contains(':') && !ip.starts_with('[') {
@@ -348,6 +359,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             bots: args.minecraft_bots,
             snapshot_dir: args.minecraft_snapshot_dir.clone(),
             tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
+            publish_tls: args.tls_secret.is_some() && args.tls_publish_base.is_some(),
             gold_deadline: Duration::from_secs(300),
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
@@ -491,17 +503,7 @@ where
             Some(p) => Some(p.slot_address(i)?),
             None => None,
         };
-        let tls_port = match agent.cfg.tls_publish_base {
-            Some(b) => Some(
-                u16::try_from(i)
-                    .ok()
-                    .and_then(|i| b.checked_add(i))
-                    .with_context(|| {
-                        format!("--tls-publish-base {b} leaves no port for GPU {i}")
-                    })?,
-            ),
-            None => None,
-        };
+        let tls_port = tls_port(agent.cfg.tls_publish_base, i, &format!("GPU {i}"))?;
         ports.insert(g.sbdf.clone(), (port, addr, tls_port));
     }
     // Windows sandboxes take the ports and addresses after every GPU's, by their index.
@@ -522,17 +524,7 @@ where
                 Some(p) => Some(p.slot_address(i)?),
                 None => None,
             },
-            tls_port: match agent.cfg.tls_publish_base {
-                Some(b) => Some(
-                    u16::try_from(i)
-                        .ok()
-                        .and_then(|i| b.checked_add(i))
-                        .with_context(|| {
-                            format!("--tls-publish-base {b} leaves no port for sandbox {k}")
-                        })?,
-                ),
-                None => None,
-            },
+            tls_port: tls_port(agent.cfg.tls_publish_base, i, &format!("sandbox {k}"))?,
         });
     }
     // Minecraft servers take the addresses after the sandboxes', and the gold VM the one after
@@ -546,11 +538,19 @@ where
             .ipv6_prefix
             .as_ref()
             .context("Minecraft mode needs the host's IPv6 prefix")?;
+        // The view sockets' IPv4 path, by index after the sandboxes' as their ports are, when the
+        // servers have a certificate to serve it with.
+        let tls_base = agent.cfg.tls_publish_base.filter(|_| m.publish_tls);
         for k in 0..m.count as usize {
-            mc_places.push(minecraft::Place::routed(prefix.slot_address(base + k)?));
+            let i = base + k;
+            let tls = tls_port(tls_base, i, &format!("server {k}"))?;
+            mc_places.push(minecraft::Place::routed(prefix.slot_address(i)?, tls));
         }
+        // The gold takes no viewers. It publishes guest port 443 on loopback at the first
+        // server's port (it runs before any server) so that every restore can move it.
         mc_gold = Some(minecraft::Place::routed(
             prefix.slot_address(base + m.count as usize)?,
+            mc_places.first().and_then(|p| p.tls_port),
         ));
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");

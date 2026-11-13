@@ -312,9 +312,9 @@ export class McTiles {
   getLive = (): Record<string, McTileLive> => this.snap;
 
   /** For the test hook: what each socket holds. */
-  debug(): Record<string, { open: boolean; viewer: string | null; tps: number | null; worldSeq: number | null; players: McPlayer[]; errors: number }> {
+  debug(): Record<string, { url: string; open: boolean; viewer: string | null; tps: number | null; worldSeq: number | null; players: McPlayer[]; errors: number }> {
     const out: ReturnType<McTiles["debug"]> = {};
-    for (const [id, s] of this.sockets) out[id] = { open: s.open, viewer: s.viewer, tps: s.tps, worldSeq: s.world?.seq ?? null, players: s.players, errors: s.errors };
+    for (const [id, s] of this.sockets) out[id] = { url: s.url, open: s.open, viewer: s.viewer, tps: s.tps, worldSeq: s.world?.seq ?? null, players: s.players, errors: s.errors };
     return out;
   }
 

@@ -219,6 +219,44 @@ test("taking a server over drives its first bot: a key moves it, the panel times
   await expect(page.getByTestId("mc-tile-mc-2")).toHaveAttribute("data-phase", "live", { timeout: 15_000 });
 });
 
+test("a viewer with no IPv6 reaches every server over its IPv4 name: the worlds draw and a take-over drives; with IPv6, the tile's own name", async ({ page }) => {
+  const family = () => page.evaluate(() => window.__minecraft!.client.getState().net.family);
+  const hosts = async () => new Set(Object.values(await tilesNow(page)).map((t) => new URL(t.url).hostname));
+  await admin("/mock/fault", { ipv6_down: true });
+  try {
+    await openMinecraft(page);
+    expect(await family()).toBe("v4");
+    expect(await hosts()).toEqual(new Set(["127.0.0.1"]));
+    for (const slot of SLOTS) {
+      await expect.poll(async () => (await drawnShare(page, slot)).share, { message: slot }).toBeGreaterThan(0.9);
+      await expect(page.getByTestId(`mc-tps-${slot}`)).toHaveText(/^\d+\.\d TPS$/);
+    }
+    await page.getByTestId("mc-take-mc-3").click();
+    await expect(page.getByTestId("mc-panel")).toBeVisible();
+    await expect.poll(async () => drivenBot(page, "mc:3")).not.toBeNull();
+    const start = (await drivenBot(page, "mc:3"))!;
+    if (await page.getByTestId("mc-pad").count()) {
+      const fwd = page.getByTestId("mc-pad-forward");
+      await fwd.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "touch", isPrimary: true });
+      await expect.poll(async () => { const b = await drivenBot(page, "mc:3"); return Math.hypot(b!.x - start.x, b!.z - start.z); }, { timeout: 5000 }).toBeGreaterThan(1);
+      await fwd.dispatchEvent("pointerup", { pointerId: 1, pointerType: "touch", isPrimary: true });
+    } else {
+      await page.keyboard.down("KeyW");
+      await expect.poll(async () => { const b = await drivenBot(page, "mc:3"); return Math.hypot(b!.x - start.x, b!.z - start.z); }, { timeout: 5000 }).toBeGreaterThan(1);
+      await page.keyboard.up("KeyW");
+    }
+    await expect(page.getByTestId("mc-first-change")).toHaveText(/^Key to first change: last \d+ ms, median \d+ ms \(1 key\)$/);
+    await page.getByTestId("mc-give-back").click();
+    await expect(page.getByTestId("mc-panel")).toHaveCount(0);
+  } finally {
+    await admin("/mock/fault", { ipv6_down: false });
+  }
+  // A new page load probes again: IPv6 works now, so every server is reached by its own name.
+  await openMinecraft(page);
+  expect(await family()).toBe("v6");
+  expect(await hosts()).toEqual(new Set(["localhost"]));
+});
+
 test("a place and a dig change the world on the tile, timed to the delta that shows them", async ({ page }, info) => {
   await openMinecraft(page);
   await page.getByTestId("mc-take-mc-1").click();

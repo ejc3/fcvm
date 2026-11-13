@@ -141,6 +141,7 @@ fn mc_cfg(snaps: &Path) -> MinecraftCfg {
         bots: 3,
         snapshot_dir: snaps.to_path_buf(),
         tls_dir: None,
+        publish_tls: false,
         gold_deadline: Duration::from_secs(20),
         ready_deadline: Duration::from_secs(20),
         snapshot_deadline: Duration::from_secs(20),
@@ -228,6 +229,7 @@ async fn fake_from(
         places.push(Place {
             ipv6: None,
             http: addr,
+            tls_port: None,
         });
         scenes.push(s);
     }
@@ -249,6 +251,7 @@ async fn fake_from(
         Place {
             ipv6: None,
             http: gold_addr,
+            tls_port: None,
         },
         out,
         reqwest::Client::builder().no_proxy().build().unwrap(),

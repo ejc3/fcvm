@@ -47,6 +47,11 @@ export interface MockMinecraftOptions {
   /** The view sockets' port (0 asks the kernel) and the host name frame_url carries. */
   port: number;
   publicHost: string;
+  /**
+   * The host name frame_url_v4 carries: the mock stands in for the two families with two names
+   * for one listener, as its renderers do (renderer.ts).
+   */
+  publicHostV4?: string;
   /** With a zone, every server's `join` is `mc-<n>.<zone>`; without, null (a `ws://` frame URL). */
   joinZone?: string | null;
 }
@@ -265,6 +270,11 @@ export class MockMinecraft {
         socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
         return;
       }
+      // A viewer with no IPv6: its connects to the tile's own (IPv6) name fail.
+      if (this.v6Down && (req.headers.host ?? "").replace(/:\d+$/, "") !== this.v4Host) {
+        socket.destroy();
+        return;
+      }
       // a server between launches has no view to give, as the tile answers 503 before its scene
       if (s.phase !== "running") {
         socket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
@@ -298,6 +308,21 @@ export class MockMinecraft {
     return `ws://${this.opts.publicHost}:${this.port}/${slot}/view`;
   }
 
+  private get v4Host(): string {
+    return this.opts.publicHostV4 ?? "127.0.0.1";
+  }
+
+  /** The same view socket over the server's IPv4 name (the host's address and its published port). */
+  frameUrlV4(slot: string): string {
+    return `ws://${this.v4Host}:${this.port}/${slot}/view`;
+  }
+
+  private v6Down = false;
+  /** Tests: refuse every view socket opened by the IPv6 name, as for a viewer with no IPv6. */
+  setV6Down(down: boolean): void {
+    this.v6Down = down;
+  }
+
   state() {
     const lent = this.servers.filter((s) => s.borrow !== null);
     return {
@@ -319,7 +344,7 @@ export class MockMinecraft {
         error: null,
         failure: null,
         frame_url: this.frameUrl(s.slot),
-        frame_url_v4: null,
+        frame_url_v4: this.frameUrlV4(s.slot),
         gpu: null,
         host: s.host,
         place: null,
