@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { clockReceived, initialClock, pingSent, serverNow, shouldPing, PING_TIMEOUT_MS } from "../clock.ts";
 import { admitChunk, heightSent, heightToSend, MAX_DECODE_QUEUE, newStream, streamOpened, wantHeight } from "../stream.ts";
 import { buildFrame, codecFromSps, innerRect, NO_CROP, parseFrame, parseStreamHeader, splitNals, nalType } from "../frame.ts";
-import { frameSocketUrl, reconnectDelayMs, sameStreamAtAnyHeight, urlHost } from "../net.ts";
+import { frameOpenDeadlineMs, frameSocketUrl, reconnectDelayMs, sameStreamAtAnyHeight, urlHost } from "../net.ts";
 
 describe("clock sync", () => {
   it("estimates the offset from a symmetric round trip", () => {
@@ -78,6 +78,10 @@ describe("frame messages", () => {
 describe("connections", () => {
   it("backs off from half a second, doubling, to ten", () => {
     expect([0, 1, 2, 3, 4, 5, 20].map(reconnectDelayMs)).toEqual([500, 1000, 2000, 4000, 8000, 10_000, 10_000]);
+  });
+
+  it("gives a frame socket 5 s to open, then 10 and 20 on later tries", () => {
+    expect([0, 1, 2, 3, 20].map(frameOpenDeadlineMs)).toEqual([5000, 10_000, 20_000, 20_000, 20_000]);
   });
 
   it("sets h on a frame URL, replacing an old one", () => {

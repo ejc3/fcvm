@@ -8,7 +8,8 @@ import { snap, type Box } from "./layout.ts";
 import * as fmt from "./format.ts";
 import { serverNow } from "./clock.ts";
 import { sameViewer, type Tile, type Windows, type WindowTile } from "./protocol.ts";
-import type { ClientState, Notice } from "./store.ts";
+import type { ClientState, Notice, TileFrameStats } from "./store.ts";
+import { streamUrl, type Family } from "./net.ts";
 import { BLANK_PLAN, directPlan, gridOf, openedArea, tenths } from "./phones.ts";
 import { phaseText, sleepView, verifyView, type DrawPlan, type SleepView } from "./view.ts";
 
@@ -18,12 +19,16 @@ export const NO_WINDOWS = "This fleet runs no Windows sandboxes.";
 
 /** Between two tiles, CSS pixels. */
 export const WINDOWS_TILE_GAP = 12;
-/** Room under a tile for its slot, edition, time to desktop and label, and the same with the panel open on a narrow screen. */
-export const WINDOWS_CAPTION_H = 96;
-export const WINDOWS_CAPTION_H_NARROW = 120;
-export const WINDOWS_CAPTION_H_COMPACT = 104;
-/** A caption narrower than this is compact: its words smaller, its edition left out. */
-export const WINDOWS_CAPTION_FULL_MIN_W = 170;
+/**
+ * Room under a tile, CSS pixels: on a wide screen one row (slot, time to desktop, Take over)
+ * and a line for a borrow; on a phone the row wraps under the slot; compact is a column of
+ * smaller words. The edition and the evaluation notice are said once, in the header.
+ */
+export const WINDOWS_CAPTION_H = 52;
+export const WINDOWS_CAPTION_H_NARROW = 72;
+export const WINDOWS_CAPTION_H_COMPACT = 70;
+/** A caption narrower than this is compact: its words smaller, in a column. */
+export const WINDOWS_CAPTION_FULL_MIN_W = 280;
 /** One action a second from a holder (PROTOCOL.md, "Windows mode": Actions). */
 export const WINDOWS_ACTION_INTERVAL_MS = 1000;
 
@@ -63,6 +68,12 @@ export interface WindowBox {
 
 export interface WindowsLayoutInput {
   area: Box;
+  /**
+   * Fill the area: every screen takes the columns that make the desktops largest, and the block
+   * is centred down the area as well as across it. Windows mode fills; the Minecraft servers keep
+   * the snapshot's rows from the top.
+   */
+  fill?: boolean;
   tiles: readonly Tile[];
   imageAspect: number;
   /** A phone-sized screen: two columns, or one row with the panel open. */
@@ -88,7 +99,7 @@ export function windowTileAspect(tiles: readonly Tile[], imageAspect: number): n
  * that make the desktops largest.
  */
 export function layoutWindows(inp: WindowsLayoutInput): WindowBox[] {
-  return layoutCaptioned(inp, WINDOWS_CAPTIONS);
+  return layoutCaptioned({ fill: true, ...inp }, WINDOWS_CAPTIONS);
 }
 
 /** The room under a tile, CSS pixels: wide, narrow, compact, and the width below which a caption is compact. */
@@ -124,8 +135,9 @@ export function layoutCaptioned(inp: WindowsLayoutInput, caps: CaptionSizes): Wi
   };
   const rectCols = Math.max(1, gridOf(sorted).cols);
   let cols = inp.narrow ? (inp.panel ? Math.min(4, n) : Math.min(2, n)) : rectCols;
-  // Beside the open panel the room is narrow: take the columns that make the desktops largest.
-  if (inp.panel && !inp.narrow) cols = largest(cols);
+  // Beside the open panel the room is narrow, and a filled stage is any shape: take the columns
+  // that make the desktops largest.
+  if ((inp.panel || inp.fill === true) && !inp.narrow) cols = largest(cols);
   // A wide screen keeps the snapshot's rows; a phone whose cells are under a full caption's
   // width takes the columns that make the desktops largest. Above the open panel (compact from
   // the start) it keeps rows of at least four, so a short room gets one long row rather than
@@ -134,14 +146,16 @@ export function layoutCaptioned(inp: WindowsLayoutInput, caps: CaptionSizes): Wi
   if (!compact && cellFor(cols) < caps.fullMinW) {
     compact = true;
     capH = caps.compact;
-    pick = inp.narrow;
+    pick = inp.narrow || inp.fill === true;
   } else if (compact && inp.narrow && cellFor(cols) < caps.fullMinW) {
     pick = true;
   }
   if (pick) cols = largest(cols, inp.panel ? cols : 1);
   const cellW = cellFor(cols);
   const cellH = snap(cellW / aspect, dpr);
-  const top = area.y;
+  const rows = Math.ceil(n / cols);
+  const blockH = rows * (cellH + capH) + (rows - 1) * WINDOWS_TILE_GAP;
+  const top = inp.fill === true ? area.y + Math.max(0, (area.h - blockH) / 2) : area.y;
   return sorted.map((t, i) => {
     const row = Math.floor(i / cols);
     const len = Math.min(cols, n - row * cols);
@@ -215,24 +229,56 @@ function actionLabel(name: string): string {
   return WINDOWS_ACTION_LABELS[name] ?? name.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 }
 
+/** A running sandbox's stream that is not showing its desktop: why, as the tile says it. */
+export interface TileLink {
+  state: "connecting" | "unreachable" | "retrying";
+  text: string;
+  /** When it tries again; null when the text says it all. */
+  detail: string | null;
+  /** The tile offers Retry, which opens a socket now. */
+  retry: boolean;
+}
+
+const FAMILY_NAME: Record<Family, string> = { v6: "IPv6", v4: "IPv4" };
+
+/**
+ * What a running sandbox's tile says while its desktop is not drawn (null once it is), in the
+ * words the Minecraft tiles use: connecting (the address family is not settled yet, or a socket
+ * is opening), cannot reach (sockets failed and the next waits out its delay) or retrying (the
+ * next attempt is open). `stats` is the frame worker's report for the tile's stream (`d:<id>`),
+ * `now` local Unix ms.
+ */
+export function tileLink(t: { id: string; slot: string | null; phase: string; frame_url: string | null; frame_url_v4: string | null }, family: Family | null, stats: TileFrameStats | undefined, now: number): TileLink | null {
+  if (t.phase !== "running") return null;
+  const name = sandboxName(t);
+  if (family === null) return { state: "connecting", text: "Finding the way to the sandboxes.", detail: null, retry: false };
+  if (streamUrl(t, family) === null) return { state: "unreachable", text: `${name} has no address this network can reach.`, detail: null, retry: false };
+  const failures = stats?.failures ?? 0;
+  if (stats !== undefined && stats.connected && stats.newestT !== null) return null;
+  if (stats === undefined || failures === 0) return { state: "connecting", text: `Connecting to ${name}.`, detail: null, retry: false };
+  const text = `Cannot reach ${name}'s desktop over ${FAMILY_NAME[family]}.`;
+  const retryAt = stats.retryAt ?? null;
+  if (retryAt !== null) return { state: "unreachable", text, detail: `Trying again in ${Math.max(1, Math.ceil((retryAt - now) / 1000))} s.`, retry: true };
+  return { state: "retrying", text, detail: "Trying again now.", retry: true };
+}
+
 // ---- the view ------------------------------------------------------------------------
 
 export interface WindowCard {
   id: string;
   slot: string;
-  edition: string | null;
   /** "Desktop in 2.31 s" once the sandbox has drawn its desktop. */
   desktopIn: string | null;
   /** The dark tile's running timer, while the sandbox restores. */
   timer: string | null;
   /** A failed sandbox's reason. */
   error: string | null;
-  /** "Windows Server 2025 evaluation, for demonstration only". */
-  label: string;
+  /** A running sandbox whose desktop is not drawn: connecting, can't reach or retrying. */
+  link: TileLink | null;
   box: Box | null;
   caption: Box | null;
   dark: boolean;
-  /** Smaller words and no edition, for a narrow caption (`WINDOWS_CAPTION_FULL_MIN_W`). */
+  /** Smaller words in a column, for a narrow caption (`WINDOWS_CAPTION_FULL_MIN_W`). */
   compact: boolean;
   /** Whether the caption draws Take over (a compact caption leaves it out while the panel is open). */
   showTake: boolean;
@@ -247,6 +293,8 @@ export interface WindowCard {
 }
 
 export interface WindowsHeader {
+  /** "Windows Server 2025 evaluation, for demonstration only": once on the page, here. */
+  label: string;
   up: string;
   median: string;
   slowest: string;
@@ -265,7 +313,6 @@ export interface WindowsPanel {
   title: string;
   session: string;
   countdown: string;
-  label: string;
   note: string;
   actions: { name: string; label: string; disabled: boolean }[];
   giveBack: string;
@@ -320,6 +367,7 @@ function headerOf(w: Windows, you: string | null): WindowsHeader {
   const img = w.image;
   const days = img === null ? 0 : img.age_days;
   return {
+    label: w.label,
     up: `${up} of ${w.tiles.length} ${w.tiles.length === 1 ? "sandbox" : "sandboxes"} up`,
     median: `Median time to desktop ${median === null ? "--" : hundredthsText(median)}`,
     slowest: `Slowest ${times.length === 0 ? "--" : hundredthsText(Math.max(...times))}`,
@@ -376,25 +424,29 @@ export function windowsView(inp: WindowsInput): WindowsView {
   const panelOpen = held !== null;
   const area = inp.stage === null ? null : panelOpen ? openedArea(inp.stage, inp.narrow) : inp.stage;
   const placed = new Map(area === null ? [] : layoutWindows({ area, tiles: w.tiles, imageAspect: w.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }).map((b) => [b.id, b]));
+  // Streams open only for a seated viewer whose browser decodes them; the banner says why not.
+  const streams = inp.canDecode && s.admission?.locked !== true;
   const cards: WindowCard[] = w.tiles.map((t) => {
     const p = placed.get(t.id);
+    const link = streams ? tileLink(t, s.net.family, s.frames?.tiles[`d:${t.id}`], inp.now) : null;
     const slot = sandboxName(t);
     const running = t.phase === "running";
     const restoring = isRestoring(t);
     const lentToOther = t.borrowed !== null && !mine(t);
-    const state = running ? "streaming" : phaseText(t.phase);
+    const state = running ? (link === null ? "streaming" : (link.text.charAt(0).toLowerCase() + link.text.slice(1)).replace(/\.$/, "")) : phaseText(t.phase);
     let takeTitle: string | null = null;
     if (held !== null && !mine(t)) takeTitle = `You are using ${sandboxName(held)}. Give it back to take another.`;
     else if (lentToOther) takeTitle = "Lent to another viewer.";
     else if (!running) takeTitle = "It can be borrowed once it has restored.";
+    // A turn with no desktop to watch: the actions would run where this viewer cannot see them.
+    else if (link !== null) takeTitle = "It can be borrowed once its desktop reaches this page.";
     return {
       id: t.id,
       slot,
-      edition: w.image?.edition ?? null,
       desktopIn: desktopInText(t),
       timer: restoring ? restoringText(t, srvNow) : null,
       error: t.phase === "failed" ? failedText(t) : null,
-      label: w.label,
+      link,
       box: p?.box ?? null,
       caption: p?.caption ?? null,
       dark: !running,
@@ -402,7 +454,7 @@ export function windowsView(inp: WindowsInput): WindowsView {
       // With its panel open, this viewer takes nothing more.
       showTake: !(p?.compact === true && panelOpen),
       reset: { label: `Reset ${slot}`, disabled: !online || t.borrowed !== null },
-      take: { label: "Take over", disabled: !online || !running || t.borrowed !== null || held !== null, title: takeTitle },
+      take: { label: "Take over", disabled: !online || !running || link !== null || t.borrowed !== null || held !== null, title: takeTitle },
       lentText: mine(t) ? "Yours" : lentToOther ? `Lent to another viewer until ${fmt.utcClock(t.borrowed!.until)} UTC` : null,
       mine: mine(t),
       lent: lentToOther,
@@ -420,7 +472,6 @@ export function windowsView(inp: WindowsInput): WindowsView {
       title: sandboxName(held),
       session: b.session!,
       countdown: `Returns in ${left} s`,
-      label: w.label,
       note: "Fixed actions only: nothing you type or point at reaches Windows. The sandbox is reset when you give it back.",
       actions: held.actions.map((name) => ({ name, label: actionLabel(name), disabled: !online || !running })),
       giveBack: "Give back",

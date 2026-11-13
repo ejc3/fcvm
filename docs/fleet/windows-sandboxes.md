@@ -12,11 +12,14 @@ yet run in production, with no container and no fc-agent.
 
 - `?mode=windows` opens it; without the parameter the wall is unchanged.
 - **The desktops.** Every sandbox is a tile showing its Windows desktop live, at 1280 x 720,
-  laid out like the phones (one row of up to four, then rows of equal length). Each tile is
-  labelled with its slot (`win-3`), the edition, and "Desktop in X.XX s": the time from the
-  click that asked for a fresh sandbox to the first frame of its desktop decoded on the host.
+  as large as the page allows (the number of columns that makes them largest, the block centred
+  in the room under the header). Each tile is labelled with its slot (`win-3`) and "Desktop in
+  X.XX s": the time from the click that asked for a fresh sandbox to the first frame of its
+  desktop decoded on the host. A tile whose stream has not drawn its desktop says so:
+  connecting, or that it cannot reach the desktop over the viewer's address family and when it
+  tries again.
 - **The header.** Sandboxes up, the median and the slowest time to desktop of the last reset
-  of each, and the last "Reset all".
+  of each, the last "Reset all", and the image's edition, build and age.
 - **Reset.** Clicking a tile throws its sandbox away and restores a new one from the
   snapshot; the tile goes dark and its timer runs until the new desktop's first frame.
   "Reset all" does every sandbox at once, which is the number the demo is tuned for, as the
@@ -26,8 +29,8 @@ yet run in production, with no container and no fc-agent.
   fixed sequence of key presses and clicks the host sends for it. There are no free clicks,
   because a click on Windows' on-screen keyboard is typing (Licensing, below). When the borrow
   ends the sandbox is reset, so the next viewer finds the same idle desktop.
-- **The label.** Every tile and the take-over panel say "Windows Server 2025 evaluation, for
-  demonstration only" (Licensing, below).
+- **The label.** The page says "Windows Server 2025 evaluation, for demonstration only" once,
+  in its header, wherever the panel is (Licensing, below).
 - **Proof that it is live.** The taskbar clock is Windows' own, set from the host at every
   restore before the sandbox is reported ready, so every tile reads the same minute as the
   viewer's own clock. "About" opens `winver` with the build and the evaluation's expiry date.
@@ -106,8 +109,8 @@ below is enforced by code with a test, not by convention:
   Desktop Services client access licences, whatever the evaluation clause allows. Staging
   behind Access is the licensee's own evaluation; whether a public launch needs RDS CALs is
   for the owner to decide before it, and is not settled here.
-- **A visible "demonstration" label.** Every tile and the take-over panel carry "Windows Server
-  2025 evaluation, for demonstration only", and Windows' own desktop shows the evaluation's
+- **A visible "demonstration" label.** The page's header carries "Windows Server 2025
+  evaluation, for demonstration only" once, and every desktop shows Windows' own evaluation
   watermark with its expiry.
 
 Staging behind Cloudflare Access comes first. **A public, ungated launch still needs the
