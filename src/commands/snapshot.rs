@@ -726,7 +726,7 @@ async fn prepare_prefilled_memory(gpus: &[String], memory_path: &Path) -> Option
                     false,
                 ),
             };
-            let stats = spares::fill_from(&file, &memory_path, spares::COPY_THREADS)?;
+            let stats = spares::fill_from(&file, &memory_path, spares::FILL_THREADS, node)?;
             Ok((file, claimed, stats, mib))
         },
     )

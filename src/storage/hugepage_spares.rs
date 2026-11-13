@@ -56,10 +56,13 @@ const TMP_PREFIX: &str = ".tmp-";
 pub const DIR_ENV: &str = "FCVM_HUGEPAGE_SPARES_DIR";
 pub const FLOOR_ENV: &str = "FCVM_HUGEPAGE_SPARES_FLOOR_MIB";
 pub const COUNT_ENV: &str = "FCVM_HUGEPAGE_SPARES";
-/// The threads that copy a memory file into a spare, and that allocate a file on the restore
-/// path. Each copies at a few GB/s from the page cache; eight cover a 6 GiB guest in about
-/// 0.3 s.
+/// The threads that allocate a file on the restore path.
 pub const COPY_THREADS: usize = 8;
+/// The threads that copy a memory file into a spare. Measured on a g4dn.metal copying a 6 GiB
+/// phone memory file from the page cache into an allocated hugetlbfs file, threads on the
+/// file's NUMA node: 4 threads 342 to 376 ms, 8 187, 12 158, 16 145 to 146, 24 and 32 145 to
+/// 149. Sixteen reach the node's copy bandwidth.
+pub const FILL_THREADS: usize = 16;
 
 /// The pool's directory: `FCVM_HUGEPAGE_SPARES_DIR`, else `/dev/hugepages/fcvm-<uid>`.
 pub fn default_dir() -> PathBuf {
@@ -525,6 +528,36 @@ fn split(start: u64, end: u64, parts: usize) -> Vec<(u64, u64)> {
     out
 }
 
+/// The CPUs of NUMA node `node`, from `<sysfs>/devices/system/node/node<N>/cpulist`.
+fn node_cpus(sysfs: &Path, node: u32) -> Option<nix::sched::CpuSet> {
+    let list =
+        std::fs::read_to_string(sysfs.join(format!("devices/system/node/node{node}/cpulist")))
+            .ok()?;
+    let mut set = nix::sched::CpuSet::new();
+    for cpu in parse_cpulist(&list)? {
+        set.set(cpu).ok()?;
+    }
+    Some(set)
+}
+
+/// A kernel CPU list (`0-23,48-71`) as CPU numbers; `None` for anything else.
+fn parse_cpulist(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                if a > b {
+                    return None;
+                }
+                cpus.extend(a..=b);
+            }
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+    (!cpus.is_empty()).then_some(cpus)
+}
+
 /// What [`fill_from`] copied.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FillStats {
@@ -533,9 +566,16 @@ pub struct FillStats {
     pub ms: u64,
 }
 
-/// Copy `source`'s data into `dest`, a zeroed file at least as large, on `threads` threads.
-/// A hole in `source` is skipped and reads as the destination's zeros.
-pub fn fill_from(dest: &File, source: &Path, threads: usize) -> Result<FillStats> {
+/// Copy `source`'s data into `dest`, a zeroed file at least as large, on `threads` threads,
+/// each run on the CPUs of `node` (the node `dest`'s pages are on) when one is given. A hole in
+/// `source` is skipped and reads as the destination's zeros.
+pub fn fill_from(
+    dest: &File,
+    source: &Path,
+    threads: usize,
+    node: Option<u32>,
+) -> Result<FillStats> {
+    let cpus = node.and_then(|node| node_cpus(Path::new("/sys"), node));
     let started = Instant::now();
     let src = File::open(source).with_context(|| format!("opening {}", source.display()))?;
     let size = src.metadata()?.len();
@@ -578,8 +618,13 @@ pub fn fill_from(dest: &File, source: &Path, threads: usize) -> Result<FillStats
     let result = std::thread::scope(|scope| -> Result<()> {
         let workers: Vec<_> = (0..threads.max(1))
             .map(|_| {
-                let (src, pieces, next) = (&src, &pieces, &next);
+                let (src, pieces, next, cpus) = (&src, &pieces, &next, &cpus);
                 scope.spawn(move || -> Result<()> {
+                    // Writes to memory on another node run at about half the rate. Best effort:
+                    // a thread that cannot be placed copies from where it is.
+                    if let Some(cpus) = cpus {
+                        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), cpus);
+                    }
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(offset, len)) = pieces.get(i) else {
@@ -621,6 +666,29 @@ pub fn fill_from(dest: &File, source: &Path, threads: usize) -> Result<FillStats
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpulists_parse() {
+        assert_eq!(parse_cpulist("0-2,48-49\n"), Some(vec![0, 1, 2, 48, 49]));
+        assert_eq!(parse_cpulist("7"), Some(vec![7]));
+        assert_eq!(parse_cpulist("\n"), None);
+        assert_eq!(parse_cpulist("3-1"), None);
+        assert_eq!(parse_cpulist("a-b"), None);
+    }
+
+    /// The copy threads run on the destination's node: the CPU set comes from that node's
+    /// cpulist.
+    #[test]
+    fn a_nodes_cpus_come_from_its_cpulist() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("devices/system/node/node1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cpulist"), "2-3\n").unwrap();
+        let set = node_cpus(root.path(), 1).expect("no CPU set");
+        assert!(set.is_set(2).unwrap() && set.is_set(3).unwrap());
+        assert!(!set.is_set(0).unwrap());
+        assert!(node_cpus(root.path(), 0).is_none());
+    }
 
     #[test]
     fn meminfo_fields_parse() {
@@ -701,7 +769,7 @@ mod tests {
         dest.set_len(size).unwrap();
         // A non-zero destination proves the hole was not written.
         dest.write_all_at(&vec![0x11; size as usize], 0).unwrap();
-        let stats = fill_from(&dest, &source, 4).unwrap();
+        let stats = fill_from(&dest, &source, 4, None).unwrap();
         let mut got = vec![0u8; size as usize];
         dest.read_exact_at(&mut got, 0).unwrap();
         assert!(got[..4096].iter().all(|&b| b == 0x5a));
