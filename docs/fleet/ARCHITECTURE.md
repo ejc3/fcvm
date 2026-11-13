@@ -104,8 +104,13 @@ runs `fleet/tools/viewer-acceptance.sh` on its cold boot (`viewer_path` in the v
 record). It makes a throwaway CA and a certificate for a test zone, gives them to the host's
 agent (`--tls-file`) so every renderer, phone, sandbox and server publishes its TLS ports as on
 staging, runs a coordinator on loopback that names every launch in that zone and serves the
-zone's DNS, and runs the smoke over IPv4 and IPv6 against it, trusting only that CA. On a
-gpubox: `sudo FCVM=<fcvm> fleet/tools/viewer-acceptance.sh`.
+zone's DNS, and runs the smoke over IPv4 and IPv6 against it, trusting only that CA. The viewer
+is the host itself: it reaches the host's public IPv4 address on its private one, and the places'
+IPv6 addresses stay on the host, so nothing crosses a security group (the factory's builder group
+admits no inbound port at all). The image is checked for its bridges and servers behind the
+published ports; the security group's range is checked by ejc3/aws's test against
+`fleet/published-ports.json` and, end to end, by the staging smoke. On a gpubox:
+`sudo FCVM=<fcvm> fleet/tools/viewer-acceptance.sh`.
 
 ## Components
 

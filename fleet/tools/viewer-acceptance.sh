@@ -11,7 +11,11 @@
 # servers and potato players, the TLS ports published on the host's public IPv4 address from
 # fleet/published-ports.json (--tls-publish-base) and each place's own IPv6 address on 443. Then
 # fleet/coord/stage-smoke.py checks every tile through the coordinator's names, once per family,
-# trusting only the throwaway CA. Runs as root (the agent's routed VMs need it), from the fcvm
+# trusting only the throwaway CA. The viewer is this host, and it reaches the host's public IPv4
+# address on its private one (SMOKE_HOST_LOCAL): what leaves the instance crosses its security
+# group, which is not the image's to check (the image factory's builder group admits no inbound
+# port at all; the staging smoke and ejc3/aws's test of the fleet's range cover that path), and
+# IPv6 to the places' own addresses stays on the host. Runs as root (the agent's routed VMs need it), from the fcvm
 # checkout the image was built from. OUT (default a new directory under /mnt/fcvm-btrfs) keeps
 # the logs and the smoke's lines; the CA's key never leaves it and the directory is removed on a
 # pass unless KEEP=1.
@@ -69,6 +73,14 @@ case ",$MODES," in *,windows,*) agent+=" --windows 4 $WINDOWS_AGENT_ARGS" ;; esa
 case ",$MODES," in *,minecraft,*) agent+=" --minecraft 4" ;; esac
 case ",$MODES," in *,potato,*) agent+=" --potato-players 4" ;; esac
 
+# The host's public IPv4 address, which every -v4 launch name resolves to, and its private one.
+imds() {
+  local token
+  token=$(curl -sf -m 3 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token) &&
+    curl -sf -m 3 -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+}
+PUBLIC4=$(imds public-ipv4) && PRIVATE4=$(imds local-ipv4) || { log "BLOCKED: no IPv4 addresses from IMDS"; exit 2; }
+
 LIVE=$(free_port); DNS=$(free_port)
 log "coordinator on 127.0.0.1:$LIVE, the zone's DNS on 127.0.0.1:$DNS"
 RUST_LOG=fcvm::fleet=info setsid "$F" fleet coord --listen "127.0.0.1:$LIVE" --state-file "$OUT/state.json" \
@@ -96,6 +108,7 @@ for family in v4 v6; do
   [ "$family" = v4 ] || sleep "$((COOLDOWN + 5))"
   log "viewer path over $family"
   SMOKE_LIVE_URL="ws://127.0.0.1:$LIVE/live" SMOKE_RESOLVERS="127.0.0.1:$DNS" SMOKE_ZONE="$ZONE" \
+    SMOKE_HOST_LOCAL="$PUBLIC4=$PRIVATE4" \
     SMOKE_CA_FILE="$OUT/ca.pem" python3 -B "$SRC/fleet/coord/stage-smoke.py" --family "$family" \
     --modes "$MODES" --takeover > "$OUT/smoke-$family.jsonl" 2>>"$OUT/smoke-$family.err"
   status=$?
