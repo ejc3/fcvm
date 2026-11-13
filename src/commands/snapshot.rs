@@ -6278,7 +6278,9 @@ mod tests {
             "the handoff must cover the token through the load that opens the GPU"
         );
         assert!(
-            code[..take].contains("gpu_handoff = Some(setup_try!(begun));")
+            code[..take].contains(
+                "tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))"
+            ) && code[..take].contains("gpu_handoff = Some(setup_try!(begun));")
                 && code[take..load].contains("let taken = setup_try!(taken);"),
             "a failed handoff must unwind the clone's setup (setup_try!)"
         );
