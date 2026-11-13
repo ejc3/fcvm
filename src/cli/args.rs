@@ -1776,6 +1776,50 @@ pub enum GpuCommands {
     Scrub(GpuScrubArgs),
     /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
     Status(GpuStatusArgs),
+    /// The pool of zeroed hugepage files GPU restores take their guest memory from
+    /// (FCVM_HUGEPAGE_SPARES_DIR, default /dev/hugepages/fcvm-<uid>)
+    Spares(GpuSparesArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesArgs {
+    #[command(subcommand)]
+    pub cmd: GpuSparesCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuSparesCommands {
+    /// Create spares of MIB MiB on NODE until there are COUNT, while each leaves the host at
+    /// least the floor of available memory
+    Fill(GpuSparesFillArgs),
+    /// Release spares, largest first, while available memory is below the floor
+    Trim(GpuSparesTrimArgs),
+    /// Print each node and size's spare count as one JSON line
+    Status,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesFillArgs {
+    /// Guest memory size of each spare, in MiB (a multiple of 2)
+    #[arg(long)]
+    pub mib: u64,
+    /// NUMA node the spares' memory is allocated on; any node when omitted
+    #[arg(long)]
+    pub node: Option<u32>,
+    /// Spares to keep (default FCVM_HUGEPAGE_SPARES, else 1)
+    #[arg(long)]
+    pub count: Option<usize>,
+    /// MiB of MemAvailable to leave the host (default FCVM_HUGEPAGE_SPARES_FLOOR_MIB, else
+    /// the larger of 8 GiB and a tenth of memory)
+    #[arg(long)]
+    pub floor_mib: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesTrimArgs {
+    /// MiB of MemAvailable to restore (default as for fill)
+    #[arg(long)]
+    pub floor_mib: Option<u64>,
 }
 
 #[derive(Args, Debug)]

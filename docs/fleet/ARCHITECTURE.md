@@ -705,9 +705,11 @@ from source).
 | `fcvm snapshot create --gpu-warm` with the emulator holding the GPU | refused: "every process with a GPU open must be a CUDA process"; the park is undone and the phone keeps drawing |
 | KVM in a restored VM (`fleet/phone/kvmprobe.c`), Firecracker without nested state | the guest's kernel oopses in `kvm_spurious_fault`, the probe dies with SIGSEGV; with the fork, `kvm ok` |
 
-The memory load is the VFIO pin: a VM with a passed-through device has all its memory
-faulted in and pinned for DMA at restore, about 0.65 s per GiB here, so the phone VM is
-sized small (6 GiB for a 2 GiB phone) and hugepages are the next thing to measure.
+The memory load was the VFIO pin: a VM with a passed-through device has all its memory
+faulted in and pinned for DMA at restore, about 0.65 s per GiB here on 4 KiB pages, so the
+phone VM is sized small (6 GiB for a 2 GiB phone). A GPU restore now loads into prefilled
+2 MiB hugepages (DESIGN.md, "GPU guest memory: prefilled hugepages"), which pin in 5 ms: the
+6 GiB phone's load went from 3,316 to 406 ms plus a 256 ms copy.
 
 **Headless host rendering.** The emulator's `-gpu host` on Linux opens GLX and fails with
 no X display. gfxstream's EGL-on-EGL engine (`ANDROID_EGL_ON_EGL=1`) renders through EGL
@@ -790,8 +792,9 @@ the app's next frame.
 | A: clone restore, then the emulator loads its own snapshot | 12.8 to 13.1 s, measured |
 | B: clone restore of a running phone, renderer retaken | 5.75 to 6.19 s, measured (projected about 5.5 s) |
 
-B is the design and is what fcvm does now (below). Its largest part is the memory pin; the
-phone VM's size and hugepages are the next thing to measure.
+B is the design and is what fcvm does now (below). Its largest part was the memory pin,
+which prefilled hugepages removed (2026-11-13: first frame 6,448 to 3,750 ms on the same box,
+DESIGN.md "GPU guest memory: prefilled hugepages").
 
 #### Flow B, measured (2026-10-28)
 
@@ -822,7 +825,8 @@ start:
 
 The GPU phase is the driver bring-up of any GPU restore (about 950 ms, mostly
 nvidia-persistenced and the memory scrub) plus the retake and the first frame; the rest of
-the ACK is mostly the VFIO memory pin, about 3.8 s for 6 GiB. The projection counted the
+the ACK is mostly the VFIO memory pin, about 3.8 s for 6 GiB (3.3 s on 2026-11-13; prefilled
+hugepages have since cut it to 0.4 s plus a 0.26 s copy). The projection counted the
 renderer's start and the state load of an emulator quickboot load (0.55 s); the retake
 measures 0.8 to 0.9 s, since it also loads the host driver and initializes EGL, and
 recreates the 22 render threads. The warm snapshot of the running phone took 12.6 to 13.0 s
@@ -1692,8 +1696,8 @@ Two things the browser showed wrong in the mirror, both fixed in `app/_wall/mirr
    tools from AOSP source (#1412), so nothing the phone runs is under the SDK license.
 3. Done: snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
-   on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). The VM's size
-   and hugepages are next.
+   on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). Guest memory
+   in prefilled hugepages (DESIGN.md, "GPU guest memory: prefilled hugepages").
 4. The app's scene (Robot Park, `fleet/phone-app`): the Android-themed scene, deterministic
    by rectangle, its info tab, the action intents and socket, surface-loss handling; the seam
    test in `make phone-test`.
