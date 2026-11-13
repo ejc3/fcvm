@@ -248,6 +248,13 @@ endif
 # Test log directory (mounted into container)
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
+# The test options (FILTER, STREAM, LIST, IGNORED) reach the make inside the container
+# through its environment: make exports a variable set on its command line to the
+# recipe, and `-e NAME` copies it into the container only when it is set. Passing them
+# as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
+# Without this, `make container-test-unit FILTER=x` ran every test.
+CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
+
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
 # See: https://github.com/containers/podman/issues/16701
@@ -265,7 +272,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
-	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
+	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) $(CONTAINER_TEST_OPTIONS)
 
 # Container run with high process limits (for parallel test suites)
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
@@ -280,7 +287,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
-	bench-chromium-request-diag bench-webkit-request-diag \
+	bench-chromium-request-diag bench-webkit-request-diag test-boot-race build-boot-race-workload \
 	bench-chromium-scale check-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
@@ -374,6 +381,8 @@ help:
 	@echo "  test-gpu-restore       Run bench/gpu-restore/summarize.py's unit tests"
 	@echo "  test-computesdk        Run bench/computesdk/run.sh's output-directory checks"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
+	@echo "  build-boot-race-workload  Build bench/boot-race's static workload binary (aarch64 musl)"
+	@echo "  test-boot-race        Run bench/boot-race's workload and page renderer tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
 	@echo "  check-chromium-scale  Validate the SCALE_* variables and their schedule, no VM"
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
@@ -1404,6 +1413,22 @@ test-gpu-restore:
 
 test-computesdk:
 	@python3 -m unittest discover -s bench/computesdk -p 'test_*.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
+# bench/boot-race: the workload is its own crate (not a workspace member) with its own target
+# dir, which its Cargo commands lease like every other (scripts/cargo-target-run.sh).
+BOOT_RACE_TARGET ?= bench/boot-race/workload/target
+build-boot-race-workload:
+	mkdir -p "$(abspath $(BOOT_RACE_TARGET))"
+	cd bench/boot-race/workload && CARGO_TARGET_DIR="$(abspath $(BOOT_RACE_TARGET))" \
+		"$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) build --release --target aarch64-unknown-linux-musl
+	@echo "$(abspath $(BOOT_RACE_TARGET))/aarch64-unknown-linux-musl/release/boot-race-workload"
+
+test-boot-race:
+	mkdir -p "$(abspath $(BOOT_RACE_TARGET))"
+	cd bench/boot-race/workload && CARGO_TARGET_DIR="$(abspath $(BOOT_RACE_TARGET))" \
+		"$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) test --release
+	@python3 -m unittest discover -s bench/boot-race -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
 test-chromium-request:

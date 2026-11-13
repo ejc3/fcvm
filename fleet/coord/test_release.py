@@ -511,14 +511,25 @@ def make_certs(directory):
     import subprocess
     d = Path(directory)
     run = lambda *a: subprocess.run(a, check=True, capture_output=True)
+    # A CA without keyUsage is refused under VERIFY_X509_STRICT ("CA cert does not include key
+    # usage extension"), which Python 3.13 and later set in create_default_context(), so on
+    # GitHub's ubuntu-latest (Python 3.14) every TLS probe here failed at "connect".
     run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-        "-keyout", str(d / "ca.key"), "-out", str(d / "ca.pem"), "-days", "1", "-subj", "/CN=viewer-path test CA")
+        "-keyout", str(d / "ca.key"), "-out", str(d / "ca.pem"), "-days", "1", "-subj", "/CN=viewer-path test CA",
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
     run("openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
         "-keyout", str(d / "leaf.key"), "-out", str(d / "leaf.csr"), "-subj", "/CN=tiles.fcvm.dev")
     (d / "ext").write_text("subjectAltName=DNS:*.tiles.fcvm.dev\nbasicConstraints=CA:FALSE\n")
     run("openssl", "x509", "-req", "-in", str(d / "leaf.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
         "-CAcreateserial", "-out", str(d / "leaf.pem"), "-days", "1", "-extfile", str(d / "ext"))
-    CERTS.update(ca=str(d / "ca.pem"), cert=str(d / "leaf.pem"), key=str(d / "leaf.key"))
+    # A second CA that signed nothing here: a viewer trusting only it must refuse the tile. The
+    # leaf itself is no such case: create_default_context() sets VERIFY_X509_PARTIAL_CHAIN on
+    # Python 3.13 and later, which trusts a leaf named in the CA file directly.
+    run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", str(d / "other-ca.key"), "-out", str(d / "other-ca.pem"), "-days", "1", "-subj", "/CN=another CA",
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    CERTS.update(ca=str(d / "ca.pem"), cert=str(d / "leaf.pem"), key=str(d / "leaf.key"),
+                 other_ca=str(d / "other-ca.pem"))
 
 
 def h264(source):
@@ -557,6 +568,27 @@ class ViewerPathTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.dir.cleanup()
+
+    def test_the_test_ca_passes_strict_verification(self):
+        # What create_default_context() does on Python 3.13 and later, whichever Python runs this.
+        import ssl
+        import threading
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(CERTS["cert"], CERTS["key"])
+        client_ctx = ssl.create_default_context(cafile=CERTS["ca"])
+        client_ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+        a, b = socket.socketpair()
+        def serve():
+            with contextlib.suppress(ssl.SSLError, OSError):
+                server_ctx.wrap_socket(b, server_side=True).close()
+        t = threading.Thread(target=serve)
+        t.start()
+        try:
+            client_ctx.wrap_socket(a, server_hostname="win-1-abcdefgh-v4.tiles.fcvm.dev").close()
+        finally:
+            a.close()
+            t.join(10)
+            b.close()
 
     def tile(self, mode, server=None, family="v4", **extra):
         port = server.port if server else 20208
@@ -641,7 +673,7 @@ class ViewerPathTests(unittest.TestCase):
     def test_a_certificate_the_viewer_does_not_trust_fails(self):
         server = FakeViewerServer(self, "v4", stream_of("testsrc"))
         tile = self.tile("windows", server)
-        with patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["cert"]}):
+        with patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["other_ca"]}):
             addr = ipaddress.ip_address(server.host)
             with patch.object(smoke, "lookup", lambda h, f, r: [addr]), \
                     patch.object(smoke, "declared_ports", lambda m, f, h="fcvm": {server.port}):
@@ -798,6 +830,64 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertEqual(sent, ["claim_minecraft"], "nothing was lent, so nothing is given back")
         errors = {l.get("error") for l in lines if l.get("ok") is False}
         self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
+
+
+class HostLocalTests(unittest.TestCase):
+    """The image factory's validator has a builder security group that admits no inbound port and
+    lets out only 80, 443 and 53 over IPv4, so a host-image acceptance that went out through the
+    host's public address, or that required a route to a public control address, refused every
+    image. Under SMOKE_HOST_LOCAL it reaches the host's public IPv4 address on its private one
+    and does not ask the host to prove it is a viewer."""
+
+    LOCAL = {"SMOKE_LIVE_URL": "ws://127.0.0.1:1/live", "SMOKE_HOST_LOCAL": "1.0.0.1=10.0.4.9"}
+
+    def test_the_public_address_is_reached_on_the_private_one(self):
+        with patch.dict(os.environ, self.LOCAL), \
+                patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+            self.assertEqual(smoke.lookup("x-v4.tiles.fleet.test", "v4", ["127.0.0.1:2"]),
+                             [ipaddress.ip_address("10.0.4.9")])
+        with patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+            self.assertEqual(smoke.lookup("x-v4.tiles.fcvm.dev", "v4", ["1.1.1.1"]),
+                             [ipaddress.ip_address("1.0.0.1")], "staging is untouched")
+
+    def test_it_is_refused_outside_an_acceptance_and_for_a_bad_mapping(self):
+        for env in ({"SMOKE_HOST_LOCAL": "1.0.0.1=10.0.4.9"},
+                    {**self.LOCAL, "SMOKE_HOST_LOCAL": "10.0.4.9=1.0.0.1"},
+                    {**self.LOCAL, "SMOKE_HOST_LOCAL": "2001:db8::1=10.0.4.9"}):
+            with self.subTest(env=env), patch.dict(os.environ, env), self.assertRaises(ValueError):
+                smoke.host_local()
+
+    def test_the_host_is_not_asked_to_prove_it_is_a_viewer(self):
+        # Without the change this is the control connection to a public address, which the
+        # builder group's egress refuses over IPv6 and the smoke then blocks on.
+        class Stop(Exception):
+            pass
+        def live_target():
+            raise Stop()
+        with patch.dict(os.environ, self.LOCAL), \
+                patch.object(smoke, "prove_viewer", side_effect=AssertionError("asked the host")), \
+                patch.object(smoke, "live_target", live_target), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(Stop):
+            smoke.main(family="v6", modes=("wall",), relaunch=False)
+
+
+class SmokeWorkflowTests(unittest.TestCase):
+    """The deploys call fleet-viewer-smoke.yml. Its jobs read the Access token from the
+    fleet-stage-deploy environment's secrets, which a called workflow gets only when its caller
+    passes them: without `secrets: inherit` the first run on main sent an empty token and failed
+    its Access check (2026-11-13)."""
+
+    def test_every_caller_of_the_smoke_passes_its_secrets(self):
+        import re
+        callers = 0
+        for path in sorted((HERE.parent.parent / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text()
+            for job in re.split(r"(?m)^  (?=[\w-]+:\n)", text.split("\njobs:\n", 1)[-1]):
+                if "uses: ./.github/workflows/fleet-viewer-smoke.yml" not in job:
+                    continue
+                callers += 1
+                self.assertRegex(job, r"(?m)^    secrets: inherit$", f"{path.name}: the smoke gets no secrets")
+        self.assertEqual(callers, 2, "the coordinator and web deploys both call the smoke")
 
 
 class ResolveTests(unittest.TestCase):

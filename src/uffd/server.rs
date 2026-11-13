@@ -646,13 +646,23 @@ fn flush_before_mapping_holes(fs_type: FsType) -> bool {
 /// [`flush_before_mapping_holes`] calls for one. The walk moves the file offset, so `file` is
 /// a description of its own ([`open_for_hole_walk`]).
 fn build_file_holes(file: &File, mem_size: usize) -> Result<HoleMap> {
+    flush_for_hole_walk(file)?;
+    HoleMap::from_file(file, mem_size)
+}
+
+/// Flush `file` where [`flush_before_mapping_holes`] calls for it, so that `SEEK_DATA` and
+/// `SEEK_HOLE` describe what a reader of it sees. Every walk of a memory file's holes or data
+/// runs comes after this: the hole map here, and the hugepage prefill
+/// (`crate::storage::hugepage_spares::fill_from`), which would otherwise leave a run still
+/// dirty in a nested L1's page cache as zeros in guest memory.
+pub fn flush_for_hole_walk(file: &File) -> Result<()> {
     let fs_type = fstatfs(file)
         .context("reading the memory file's filesystem type")?
         .filesystem_type();
     if flush_before_mapping_holes(fs_type) {
         file.sync_data().context("flushing the memory file")?;
     }
-    HoleMap::from_file(file, mem_size)
+    Ok(())
 }
 
 /// A read-only open file description of `file`, through `/proc/self/fd`, whose file offset
@@ -13375,22 +13385,33 @@ mod tests {
     #[test]
     fn the_hole_map_is_built_after_a_flush_only_fuse_gets() {
         let source = include_str!("server.rs");
-        let start = source
-            .find("fn build_file_holes(")
-            .expect("build_file_holes was renamed without updating this test");
-        let body = &source[start..];
-        let body = &body[..body.find("\n}\n").expect("build_file_holes ends")];
-        let at = |needle: &str| {
+        let body_of = |name: &str| {
+            let start = source
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} was renamed without updating this test"));
+            let body = &source[start..];
+            &body[..body.find("\n}\n").expect("the function ends")]
+        };
+        let flush = body_of("flush_for_hole_walk");
+        let at = |body: &str, needle: &str| {
             body.find(needle)
-                .unwrap_or_else(|| panic!("build_file_holes has no `{needle}`"))
+                .unwrap_or_else(|| panic!("no `{needle}` in {body}"))
         };
         assert!(
-            at("if flush_before_mapping_holes(") < at(".sync_data()"),
+            at(flush, "if flush_before_mapping_holes(") < at(flush, ".sync_data()"),
             "the memory file is flushed only where flush_before_mapping_holes says so"
         );
+        let build = body_of("build_file_holes");
         assert!(
-            at(".sync_data()") < at("HoleMap::from_file("),
+            at(build, "flush_for_hole_walk(") < at(build, "HoleMap::from_file("),
             "the memory file must be flushed before its holes are mapped"
+        );
+        let prefill = include_str!("../storage/hugepage_spares.rs");
+        let start = prefill.find("pub fn fill_from(").expect("no fill_from");
+        let fill = &prefill[start..start + prefill[start..].find("\n}\n").unwrap()];
+        assert!(
+            at(fill, "flush_for_hole_walk(") < at(fill, "for_each_data_run("),
+            "the hugepage prefill walks the memory file's data runs before flushing it"
         );
     }
 

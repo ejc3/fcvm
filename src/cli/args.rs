@@ -594,8 +594,14 @@ pub struct FleetAgentArgs {
 
     /// The fleet's wildcard certificate secret, handed to every renderer (written into
     /// --tls-dir and mapped into each VM)
-    #[arg(long)]
+    #[arg(long, group = "tls")]
     pub tls_secret: Option<String>,
+
+    /// The certificate as a local file in the secret's format (`{"cert", "key",
+    /// "scene_token"}`), instead of --tls-secret: a host checked with a throwaway CA of its
+    /// own (fleet/tools/viewer-acceptance.sh). Read again every hour, as the secret is.
+    #[arg(long, group = "tls")]
+    pub tls_file: Option<std::path::PathBuf>,
 
     /// Where the renderers' certificate files are kept on the host
     #[arg(long, default_value = crate::fleet::agent::tls::HOST_DIR)]
@@ -691,7 +697,7 @@ pub struct FleetAgentArgs {
     /// (--public-ipv4-from-imds), and with an IPv6 prefix on port 443 of `<prefix>::1`,
     /// which the agent adds to the host's default IPv6 interface. The coordinator names
     /// both (`agg-<host>-<token>`).
-    #[arg(long, requires_all = ["aggregate_port", "tls_secret"])]
+    #[arg(long, requires_all = ["aggregate_port", "tls"])]
     pub aggregate_tls_port: Option<u16>,
 
     /// A file the host's boot writes once its store is mounted; its modification time is
@@ -1770,6 +1776,50 @@ pub enum GpuCommands {
     Scrub(GpuScrubArgs),
     /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
     Status(GpuStatusArgs),
+    /// The pool of zeroed hugepage files GPU restores take their guest memory from
+    /// (FCVM_HUGEPAGE_SPARES_DIR, default /dev/hugepages/fcvm-<uid>)
+    Spares(GpuSparesArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesArgs {
+    #[command(subcommand)]
+    pub cmd: GpuSparesCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuSparesCommands {
+    /// Create spares of MIB MiB on NODE until there are COUNT, while each leaves the host at
+    /// least the floor of available memory
+    Fill(GpuSparesFillArgs),
+    /// Release spares, largest first, while available memory is below the floor
+    Trim(GpuSparesTrimArgs),
+    /// Print each node and size's spare count as one JSON line
+    Status,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesFillArgs {
+    /// Guest memory size of each spare, in MiB (a multiple of 2)
+    #[arg(long)]
+    pub mib: u64,
+    /// NUMA node the spares' memory is allocated on; any node when omitted
+    #[arg(long)]
+    pub node: Option<u32>,
+    /// Spares to keep (default FCVM_HUGEPAGE_SPARES, else 1)
+    #[arg(long)]
+    pub count: Option<usize>,
+    /// MiB of MemAvailable to leave the host (default FCVM_HUGEPAGE_SPARES_FLOOR_MIB, else
+    /// the larger of 8 GiB and a tenth of memory)
+    #[arg(long)]
+    pub floor_mib: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuSparesTrimArgs {
+    /// MiB of MemAvailable to restore (default as for fill)
+    #[arg(long)]
+    pub floor_mib: Option<u64>,
 }
 
 #[derive(Args, Debug)]

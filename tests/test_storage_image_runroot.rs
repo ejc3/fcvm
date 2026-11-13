@@ -391,8 +391,9 @@ fn clean_up_within(
 /// writes it before it runs the exit command, so both can still be alive then.
 fn wait_until_store_is_unused(root: &Path, limit: Duration) -> Result<()> {
     let deadline = Instant::now() + limit;
+    let mut seen = Vec::new();
     loop {
-        let users = store_users(root);
+        let users = store_users(root, &mut seen);
         if users.is_empty() {
             return Ok(());
         }
@@ -419,16 +420,19 @@ fn wait_until_store_is_unused(root: &Path, limit: Duration) -> Result<()> {
 /// `do_exit_command`), so it is there for as long as that command is. And any conmon or
 /// podman whose working directory or open files are under `root` is using the store,
 /// whatever its arguments say.
-fn store_users(root: &Path) -> Vec<String> {
+///
+/// A process found holding something under `root` is added to `seen`, by pid and start
+/// time, and stays a user until it has exited. Holding nothing there now does not end
+/// its use: a podman can close the store's files and open them again, and a process
+/// that is exiting has closed its descriptors and dropped its working directory some
+/// time before it becomes a zombie that its parent can reap.
+fn store_users(root: &Path, seen: &mut Vec<(u32, u64)>) -> Vec<String> {
     let own = std::process::id();
     let mut users = Vec::new();
     let mut counted = None;
     if let Some((pid, started)) = recorded_conmon(root) {
-        // A process that has exited keeps its entry under /proc, with its start time,
-        // until its parent has reaped it.
-        let running = state_and_start(pid).filter(|(state, _)| !matches!(state, 'Z' | 'X'));
-        let user = match (running, started) {
-            (Some((_, start)), Some(started)) => (start == started)
+        let user = match (running_since(pid), started) {
+            (Some(start), Some(started)) => (start == started)
                 .then(|| format!("{pid} conmon: the process recorded in {CONMON_IDENTITY}")),
             // No start time was recorded, so the name decides. That errs towards waiting.
             (Some(_), None) => (program_of(pid).as_deref() == Some("conmon"))
@@ -440,6 +444,16 @@ fn store_users(root: &Path) -> Vec<String> {
             counted = Some(pid);
         }
     }
+    seen.retain(|&(pid, started)| running_since(pid) == Some(started));
+    for &(pid, _) in seen.iter() {
+        if Some(pid) == counted {
+            continue;
+        }
+        let program = program_of(pid).unwrap_or_default();
+        let held = held_below(pid, root)
+            .unwrap_or_else(|| "held something under the store and has not exited".into());
+        users.push(format!("{pid} {program}: {held}"));
+    }
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Some(pid) = entry
             .file_name()
@@ -448,7 +462,7 @@ fn store_users(root: &Path) -> Vec<String> {
         else {
             continue;
         };
-        if pid == own || Some(pid) == counted {
+        if pid == own || Some(pid) == counted || seen.iter().any(|&(known, _)| known == pid) {
             continue;
         }
         let Some(program) = program_of(pid) else {
@@ -457,11 +471,25 @@ fn store_users(root: &Path) -> Vec<String> {
         if !STORE_PROGRAMS.contains(&program.as_str()) {
             continue;
         }
+        // Read before what it holds, so that a pid given to another process in between
+        // records the earlier start time, which the next look finds gone.
+        let started = running_since(pid);
         if let Some(held) = held_below(pid, root) {
             users.push(format!("{pid} {program}: {held}"));
+            if let Some(started) = started {
+                seen.push((pid, started));
+            }
         }
     }
     users
+}
+
+/// The start time of process `pid` while it has not exited. A process that has exited
+/// keeps its entry under /proc, with its start time, until its parent has reaped it.
+fn running_since(pid: u32) -> Option<u64> {
+    state_and_start(pid)
+        .filter(|(state, _)| !matches!(state, 'Z' | 'X'))
+        .map(|(_, started)| started)
 }
 
 /// Write conmon's identity next to the pid file podman wrote. The caller has just
@@ -563,17 +591,23 @@ impl Drop for StandIn {
 /// `sleep <secs>` under another program's name: a symlink `<dir>/<program>`, run by that
 /// path, so the kernel's name for the process is `program`.
 fn stand_in(dir: &Path, program: &str, secs: &str, stdin: Stdio) -> Result<StandIn> {
-    std::fs::create_dir_all(dir)?;
-    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-        .into_iter()
-        .map(Path::new)
-        .find(|path| path.exists())
-        .context("no sleep on this host")?;
-    std::os::unix::fs::symlink(sleep, dir.join(program))?;
-    let mut command = Command::new(dir.join(program));
+    let mut command = named_as(dir, program, "sleep")?;
     command.arg(secs).stdin(stdin);
     common::set_test_pdeathsig_std(&mut command);
     Ok(StandIn(command.spawn().context("starting the stand-in")?))
+}
+
+/// A command that runs `executable` from /usr/bin or /bin through a symlink
+/// `<dir>/<program>`.
+fn named_as(dir: &Path, program: &str, executable: &str) -> Result<Command> {
+    std::fs::create_dir_all(dir)?;
+    let target = ["/usr/bin", "/bin"]
+        .into_iter()
+        .map(|bin| Path::new(bin).join(executable))
+        .find(|path| path.exists())
+        .with_context(|| format!("no {executable} on this host"))?;
+    std::os::unix::fs::symlink(target, dir.join(program))?;
+    Ok(Command::new(dir.join(program)))
 }
 
 /// Run the cleanup with a removal that returns at once, and say whether the stand-in was
@@ -652,6 +686,85 @@ fn a_failed_removal_does_not_skip_the_wait() -> Result<()> {
     );
     anyhow::ensure!(error.contains("podman rm said no"), "{error}");
     Ok(())
+}
+
+/// A process that has used the store and holds nothing under it now is still a user
+/// until it has exited. An exiting process closes its descriptors before it becomes a
+/// zombie its parent can reap, so a look that went only by what a process holds let the
+/// cleanup return while the stand-ins above were still being torn down, and their tests
+/// failed (`a_failed_removal_does_not_skip_the_wait`, 2026-11-13). The stand-in here is
+/// a shell under podman's name that holds a file under the store until it is told to
+/// let go, and then waits.
+#[test]
+fn a_process_that_let_go_of_the_store_is_a_user_until_it_exits() -> Result<()> {
+    use std::io::{BufRead, Write};
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let outside = tempfile::TempDir::new()?;
+    std::fs::write(root.join("held"), "")?;
+    let mut command = named_as(outside.path(), "podman", "sh")?;
+    command
+        .args([
+            "-c",
+            "exec 3<\"$0\"; echo held; read a; exec 3<&-; echo closed; read b",
+        ])
+        .arg(root.join("held"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    common::set_test_pdeathsig_std(&mut command);
+    let mut podman = StandIn(command.spawn().context("starting the stand-in")?);
+    let pid = podman.0.id();
+    let mut told = podman.0.stdin.take().context("the stand-in's stdin")?;
+    let mut said = std::io::BufReader::new(podman.0.stdout.take().context("its stdout")?);
+    let mut line = String::new();
+    let mut next_line = |line: &mut String| -> Result<String> {
+        line.clear();
+        said.read_line(line)?;
+        Ok(line.trim().to_owned())
+    };
+
+    let mut seen = Vec::new();
+    anyhow::ensure!(
+        next_line(&mut line)? == "held",
+        "the stand-in did not open the file"
+    );
+    let users = store_users(&root, &mut seen);
+    anyhow::ensure!(
+        names(&users, pid),
+        "a process holding a file under the store is not a user: {users:?}"
+    );
+
+    writeln!(told)?;
+    anyhow::ensure!(
+        next_line(&mut line)? == "closed",
+        "the stand-in did not close the file"
+    );
+    anyhow::ensure!(
+        held_below(pid, &root).is_none(),
+        "the stand-in still holds something under the store"
+    );
+    let users = store_users(&root, &mut seen);
+    anyhow::ensure!(
+        names(&users, pid),
+        "a process that used the store and has not exited is not a user: {users:?}"
+    );
+
+    drop(told);
+    podman.0.wait()?;
+    let users = store_users(&root, &mut seen);
+    anyhow::ensure!(
+        users.is_empty(),
+        "users after the stand-in exited: {users:?}"
+    );
+    Ok(())
+}
+
+/// Whether one of the lines [`store_users`] returned is about process `pid`.
+fn names(users: &[String], pid: u32) -> bool {
+    let pid = pid.to_string();
+    users
+        .iter()
+        .any(|user| user.split(' ').next() == Some(pid.as_str()))
 }
 
 /// Removes a directory a test had the cleanup leave in place.

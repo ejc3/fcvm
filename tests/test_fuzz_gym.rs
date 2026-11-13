@@ -867,29 +867,32 @@ async fn copy_into(pid: u32, source: &Path, dest: &str, vm: bool) -> Result<()> 
 // Logs and checks
 // ---------------------------------------------------------------------------
 
-/// Every hold's log lines in VM `pid`, as label -> [(n, line)].
-async fn hold_logs(
-    pid: u32,
+/// Where a hold logs, in the container or the guest: /tmp/gym-<label>.log.
+const HOLD_LOG_DIR: &str = "/tmp";
+
+/// The shell script that prints every log of `holds` that run in the guest OS
+/// (`in_vm`) or in the container, each after a `== <label>` line. gymhold creates its
+/// log when it starts, and the holds are started in the background, so a log a hold
+/// has not created yet is read as no lines. Any other failure to read a log fails
+/// the script. A script ending in a bare `cat` of a missing log exited with that
+/// cat's status: `exec failed` with an empty stderr, read right after start_holds.
+fn hold_log_script(holds: &[Hold], in_vm: bool, dir: &str) -> String {
+    let reads = holds
+        .iter()
+        .filter(|h| h.in_vm == in_vm)
+        .map(|h| {
+            let log = format!("{dir}/gym-{}.log", h.label);
+            format!("echo '== {}'; [ ! -e {log} ] || cat {log}", h.label)
+        })
+        .collect::<Vec<_>>();
+    format!("set -e; {}", reads.join("; "))
+}
+
+/// Parse [`hold_log_script`]'s output into label -> [(n, line)].
+fn parse_hold_logs(
+    out: &str,
     holds: &[Hold],
-) -> Result<std::collections::BTreeMap<&'static str, Vec<(usize, String)>>> {
-    let script = |in_vm: bool| {
-        holds
-            .iter()
-            .filter(|h| h.in_vm == in_vm)
-            .map(|h| {
-                format!(
-                    "echo '== {}'; cat /tmp/gym-{}.log 2>/dev/null",
-                    h.label, h.label
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    let mut out = common::exec_in_container(pid, &[&script(false)]).await?;
-    if holds.iter().any(|h| h.in_vm) {
-        out.push('\n');
-        out.push_str(&common::exec_in_vm(pid, &[&script(true)]).await?);
-    }
+) -> std::collections::BTreeMap<&'static str, Vec<(usize, String)>> {
     let mut logs = std::collections::BTreeMap::new();
     let mut current: Option<&'static str> = None;
     for line in out.lines() {
@@ -910,7 +913,75 @@ async fn hold_logs(
             .or_insert_with(Vec::new)
             .push((n, line.to_string()));
     }
-    Ok(logs)
+    logs
+}
+
+/// Every hold's log lines in VM `pid`, as label -> [(n, line)].
+async fn hold_logs(
+    pid: u32,
+    holds: &[Hold],
+) -> Result<std::collections::BTreeMap<&'static str, Vec<(usize, String)>>> {
+    let mut out =
+        common::exec_in_container(pid, &[&hold_log_script(holds, false, HOLD_LOG_DIR)]).await?;
+    if holds.iter().any(|h| h.in_vm) {
+        out.push('\n');
+        out.push_str(
+            &common::exec_in_vm(pid, &[&hold_log_script(holds, true, HOLD_LOG_DIR)]).await?,
+        );
+    }
+    Ok(parse_hold_logs(&out, holds))
+}
+
+/// Read right after start_holds, a hold whose log does not exist yet has logged
+/// nothing; it is not a failure of the read. A log that exists and cannot be read
+/// still fails it.
+#[test]
+fn a_hold_that_has_not_created_its_log_yet_reads_as_no_lines() {
+    let holds = holds(Storage::Nfs, true);
+    for in_vm in [false, true] {
+        let ours: Vec<&Hold> = holds.iter().filter(|h| h.in_vm == in_vm).collect();
+        let last = ours.last().expect("holds on both sides").label;
+        let dir = tempfile::tempdir().unwrap();
+        // Every hold but the last one, which the script reads last, has logged.
+        for h in &ours[..ours.len() - 1] {
+            std::fs::write(
+                dir.path().join(format!("gym-{}.log", h.label)),
+                format!("1 {} ok\n", h.label),
+            )
+            .unwrap();
+        }
+        let script = hold_log_script(&holds, in_vm, &dir.path().to_string_lossy());
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "reading the logs failed while {last} had not created its log: {} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let logs = parse_hold_logs(&String::from_utf8_lossy(&out.stdout), &holds);
+        for h in &ours {
+            let want = usize::from(h.label != last);
+            assert_eq!(
+                logs.get(h.label).map(Vec::len),
+                Some(want),
+                "hold {} in {logs:?}",
+                h.label
+            );
+        }
+        // A log that exists and cannot be read fails the read.
+        std::fs::create_dir(dir.path().join(format!("gym-{last}.log"))).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "a log that cannot be read was read as no lines"
+        );
+    }
 }
 
 /// The number of lines each hold has logged.
@@ -1257,7 +1328,7 @@ async fn start_holds(pid: u32, storage: Storage, holds: &[Hold]) -> Result<()> {
             .filter(|h| h.in_vm == in_vm)
             .map(|h| {
                 format!(
-                    "(cd {} && nohup {bin} /tmp/gym-{}.log {} {} {} >/dev/null 2>&1 &)",
+                    "(cd {} && nohup {bin} {HOLD_LOG_DIR}/gym-{}.log {} {} {} >/dev/null 2>&1 &)",
                     h.cwd,
                     h.label,
                     h.kind,

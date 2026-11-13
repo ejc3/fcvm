@@ -512,10 +512,32 @@ def fixed(error):
     return type(error).__name__, text
 
 
+def host_local():
+    """A host-image acceptance checks the host from the host itself (fleet/tools/
+    viewer-acceptance.sh): SMOKE_HOST_LOCAL=<public IPv4>=<private IPv4> names the host's public
+    IPv4 address, which a launch name resolves to, and the private address it is reached on
+    without leaving the host. Traffic to the public address leaves the instance and crosses its
+    security group, which is the staging smoke's and ejc3/aws's test of the range to check; the
+    image's own check is of the bridges and servers behind the published ports. Only with a
+    loopback coordinator (SMOKE_LIVE_URL). None otherwise."""
+    value = os.environ.get("SMOKE_HOST_LOCAL")
+    if not value:
+        return None
+    if not os.environ.get("SMOKE_LIVE_URL"):
+        raise ValueError("SMOKE_HOST_LOCAL is for a host-image acceptance's loopback coordinator only")
+    public, _, private = value.partition("=")
+    public, private = ipaddress.ip_address(public), ipaddress.ip_address(private)
+    if public.version != 4 or private.version != 4 or not public.is_global or private.is_global:
+        raise ValueError("SMOKE_HOST_LOCAL must map a public IPv4 address to a private one")
+    return public, private
+
+
 def lookup(host, family, resolvers):
     """The global addresses of a launch name in `family`, from the first resolver that answers
-    with any: a viewer's browser gets them through public DNS too."""
+    with any: a viewer's browser gets them through public DNS too. Under SMOKE_HOST_LOCAL the
+    host's public IPv4 address is reached on its private one."""
     qtype = FAMILIES[family][1]
+    local = host_local()
     for resolver in resolvers:
         try:
             found = resolve(resolver, host, qtype, 5)
@@ -523,7 +545,7 @@ def lookup(host, family, resolvers):
             continue
         found = [a for a in found if a.is_global]
         if found:
-            return found
+            return [local[1] if local and a == local[0] else a for a in found]
     raise AssertionError("the launch name has no global address in this family")
 
 
@@ -807,9 +829,13 @@ def plain(host, port):
 def main(family="v4", single=False, modes=(), relaunch=True, takeover=False):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
-    if modes:
+    if modes and host_local() is None:
         step(f"viewer: this runner as a {family} viewer")
         prove_viewer(family, single)
+    elif modes:
+        # The viewer is the host itself: whether it has a route out in either family says
+        # nothing about the tiles it serves.
+        print(json.dumps({"viewer": "host-local", "family": family}), flush=True)
     stage, live_url, headers = live_target()
     resolvers = [r for r in os.environ.get("SMOKE_RESOLVERS", "").split(",") if r] or list(PUBLIC_RESOLVERS)
     if stage is not None:

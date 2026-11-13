@@ -908,16 +908,17 @@ pub(crate) struct RetiredChronyd(tokio::sync::OwnedMutexGuard<bool>);
 /// daemon takes the drift file's frequency, or the kernel's when there is none.
 pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
     let lifecycle = CHRONYD_LIFECYCLE.clone().lock_owned().await;
-    for pid in running_chronyd_pids() {
-        let Some(pidfd) = PidFd::open(pid) else {
-            continue;
-        };
-        if pidfd.send_signal(libc::SIGKILL) && !pidfd.wait_for_exit(CHRONYD_TERM_TIMEOUT).await {
-            eprintln!(
-                "[fc-agent] WARNING: chronyd pid {pid} survived SIGKILL for \
-                 {CHRONYD_TERM_TIMEOUT:?}; it may still act on the snapshot's measurements"
-            );
-        }
+    let survivors = end_chronyds(
+        running_chronyd_pids(),
+        &[libc::SIGKILL],
+        std::path::Path::new(CHRONYD_PIDFILE),
+    )
+    .await;
+    for pid in survivors {
+        eprintln!(
+            "[fc-agent] WARNING: chronyd pid {pid} survived SIGKILL for \
+             {CHRONYD_TERM_TIMEOUT:?}; it may still act on the snapshot's measurements"
+        );
     }
     reset_kernel_frequency();
     RetiredChronyd(lifecycle)
@@ -1012,25 +1013,88 @@ async fn stop_running_chronyd() {
         .output()
         .await;
 
-    for pid in running_chronyd_pids() {
-        let pidfd = match PidFd::open(pid) {
-            Some(fd) => fd,
-            // Already gone between the scan and the open — nothing to wait for.
-            None => continue,
+    // SIGKILL cannot be caught; a process that has not exited after it is wedged
+    // in the kernel (uninterruptible), and the new daemon reports the conflict.
+    end_chronyds(
+        running_chronyd_pids(),
+        &[libc::SIGTERM, libc::SIGKILL],
+        std::path::Path::new(CHRONYD_PIDFILE),
+    )
+    .await;
+}
+
+/// chronyd's pid file. [`CHRONY_CONF`] sets no `pidfile`, so this is the
+/// compiled-in default.
+const CHRONYD_PIDFILE: &str = "/run/chrony/chronyd.pid";
+
+/// End each of `pids`: send `signals` in turn, waiting up to
+/// [`CHRONYD_TERM_TIMEOUT`] after each for the process to exit. Returns the PIDs
+/// that had not exited after the last signal.
+async fn end_chronyds(
+    pids: Vec<libc::pid_t>,
+    signals: &[libc::c_int],
+    pidfile: &std::path::Path,
+) -> Vec<libc::pid_t> {
+    let mut exited = Vec::new();
+    let mut survivors = Vec::new();
+    for pid in pids {
+        // Already gone between the scan and the open: nothing to wait for.
+        let Some(pidfd) = PidFd::open(pid) else {
+            continue;
         };
-        if !pidfd.send_signal(libc::SIGTERM) {
-            continue;
+        let mut gone = false;
+        for (i, &signal) in signals.iter().enumerate() {
+            if i > 0 {
+                eprintln!(
+                    "[fc-agent] chronyd pid {pid} did not exit within \
+                     {CHRONYD_TERM_TIMEOUT:?} of signal {}; sending signal {signal}",
+                    signals[i - 1]
+                );
+            }
+            // A failed send means the pinned process is already gone.
+            if !pidfd.send_signal(signal) || pidfd.wait_for_exit(CHRONYD_TERM_TIMEOUT).await {
+                gone = true;
+                break;
+            }
         }
-        if pidfd.wait_for_exit(CHRONYD_TERM_TIMEOUT).await {
-            continue;
+        if gone {
+            exited.push(pid);
+        } else {
+            survivors.push(pid);
         }
-        eprintln!("[fc-agent] chronyd pid {pid} ignored SIGTERM; sending SIGKILL");
-        if pidfd.send_signal(libc::SIGKILL) {
-            // SIGKILL cannot be caught; a process that still has not exited is
-            // wedged in the kernel (uninterruptible), and the new daemon will
-            // report the socket conflict itself.
-            pidfd.wait_for_exit(CHRONYD_TERM_TIMEOUT).await;
-        }
+    }
+    remove_pidfile_naming(pidfile, &exited);
+    survivors
+}
+
+/// Remove chronyd's pid file when it names one of `exited`.
+///
+/// chronyd refuses to start while its pid file names a PID for which `getsid()`
+/// succeeds (`check_pidfile` in chrony's main.c), and `getsid()` succeeds on a
+/// zombie. A chronyd ended with SIGKILL leaves its pid file behind, and its pidfd
+/// reads as exited once it is a zombie, not once it is reaped. chronyd
+/// daemonizes, so its parent is PID 1, and the zombie lasts until systemd reaps
+/// it. A successor started in that window refused with "Another chronyd may
+/// already be running", and a restored VM then ran no chronyd at all. A pid file
+/// naming a process seen to exit is stale whether or not it has been reaped.
+fn remove_pidfile_naming(pidfile: &std::path::Path, exited: &[libc::pid_t]) {
+    let Ok(content) = std::fs::read_to_string(pidfile) else {
+        return;
+    };
+    let Ok(pid) = content.trim().parse::<libc::pid_t>() else {
+        return;
+    };
+    if !exited.contains(&pid) {
+        return;
+    }
+    match std::fs::remove_file(pidfile) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "[fc-agent] WARNING: cannot remove {} naming the ended chronyd {pid}: {e}; \
+             a chronyd started before PID 1 reaps it refuses to run",
+            pidfile.display()
+        ),
     }
 }
 
@@ -1500,6 +1564,81 @@ mod tests {
         assert!(
             body.contains("server {addr} iburst") && !body.contains("refclock"),
             "start_chronyd must give chronyd NTP sources only"
+        );
+    }
+
+    /// chronyd refuses to start while its pid file names a PID for which
+    /// `getsid()` succeeds (`check_pidfile` in chrony 4.5's main.c; the guest's
+    /// chronyd imports `getsid` and no `kill`). This mirrors that check.
+    fn chronyd_refuses_to_start(pidfile: &std::path::Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(pidfile) else {
+            return false;
+        };
+        let Ok(pid) = content.trim().parse::<libc::pid_t>() else {
+            return false;
+        };
+        // SAFETY: getsid takes a pid and has no other preconditions.
+        unsafe { libc::getsid(pid) >= 0 }
+    }
+
+    /// A chronyd ended with SIGKILL leaves its pid file, and its pidfd reads as
+    /// exited while the process is still a zombie: chronyd daemonizes, so its
+    /// parent is PID 1, which reaps it whenever systemd gets to it. `getsid()`
+    /// succeeds on a zombie, so a successor started in that window refused with
+    /// "Another chronyd may already be running", and a restored VM ran no chronyd
+    /// at all. The test holds its own child unreaped to keep the window open.
+    #[tokio::test]
+    async fn a_killed_chronyd_does_not_stop_its_successor_while_it_is_a_zombie() {
+        let source = include_str!("agent.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("agent.rs has no test module")];
+        for caller in [
+            "pub(crate) async fn retire_chronyd_for_restore(",
+            "async fn stop_running_chronyd(",
+        ] {
+            let start = body.find(caller).expect(caller);
+            let end = body[start..].find("\n}\n").unwrap() + start;
+            assert!(
+                body[start..end].contains("end_chronyds(\n        running_chronyd_pids(),")
+                    && body[start..end].contains("std::path::Path::new(CHRONYD_PIDFILE)"),
+                "{caller} must end chronyd through end_chronyds with chronyd's pid file"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("chronyd.pid");
+        let mut daemon = std::process::Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawning a stand-in daemon");
+        let pid = daemon.id() as libc::pid_t;
+        std::fs::write(&pidfile, format!("{pid}\n")).unwrap();
+
+        let survivors = super::end_chronyds(vec![pid], &[libc::SIGKILL], &pidfile).await;
+        assert!(
+            survivors.is_empty(),
+            "SIGKILL did not end {pid}: {survivors:?}"
+        );
+        // SAFETY: getsid takes a pid and has no other preconditions.
+        assert!(
+            unsafe { libc::getsid(pid) } >= 0,
+            "the killed stand-in must still be an unreaped zombie here, or this test \
+             does not reach the window"
+        );
+        assert!(
+            !chronyd_refuses_to_start(&pidfile),
+            "a chronyd started now would refuse: {} still names the zombie {pid}",
+            pidfile.display()
+        );
+        daemon.wait().unwrap();
+
+        // A pid file naming a process that was not ended is left alone.
+        std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
+        super::end_chronyds(Vec::new(), &[libc::SIGKILL], &pidfile).await;
+        assert!(
+            pidfile.exists(),
+            "removed the pid file of a process it did not end"
         );
     }
 }

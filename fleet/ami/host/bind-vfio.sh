@@ -40,6 +40,12 @@ for d in /sys/bus/pci/devices/*; do
   [ "$(cat "$d/vendor")" = 0x10de ] || continue
   make_lock_file "/var/lib/fcvm/gpu/${d##*/}.lock" || bad=1
 done
+# GPU guest memory is 2 MiB hugepages (fcvm's hugepage spares, src/storage/hugepage_spares.rs).
+# Surplus pages come from the host's allocator when a spare or a GPU VM needs one and go back
+# when it is freed, so nothing is held for them at boot; this is only the ceiling, three
+# quarters of memory. fcvm keeps its spares above its own floor of available memory.
+mt=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+echo $(( mt * 3 / 4 / 2048 )) > /proc/sys/vm/nr_overcommit_hugepages || bad=1
 grep -qw intel_iommu=on /proc/cmdline || { [ "$(uname -m)" != x86_64 ] || { echo "kernel booted without intel_iommu=on"; bad=1; }; }
 [ "$n" -gt 0 ] || { echo "no NVIDIA function found"; bad=1; }
 echo "fcvm-fleet-vfio: $n NVIDIA functions, passable=$([ $bad = 0 ] && echo yes || echo no)"

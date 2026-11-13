@@ -641,6 +641,160 @@ enum DirectRestoreMemory {
     ImplicitUffd(ImplicitUffdReason),
 }
 
+/// `FCVM_GPU_GUEST_MEMORY`: `hugepages` (the default) restores a GPU clone into prefilled
+/// hugepage memory; `file` keeps the File backend.
+const GPU_GUEST_MEMORY_ENV: &str = "FCVM_GPU_GUEST_MEMORY";
+
+/// Whether a restore attaches its GPUs over prefilled hugepage memory
+/// (`crate::storage::hugepage_spares`) instead of `direct`. Only a restore with GPUs does: the
+/// DMA map pins every page of guest memory, which costs about 0.65 s per GiB on the File
+/// backend's 4 KiB copy-on-write pages, while prefilled 2 MiB pages pin in milliseconds and
+/// cost nothing in sharing, since a pinned private mapping shares no page anyway. A snapshot
+/// whose guest reports free pages keeps its backend: hugepages cannot return them.
+fn prefill_gpu_memory(
+    gpus: &[String],
+    direct: DirectRestoreMemory,
+    free_page_reporting: bool,
+) -> bool {
+    if gpus.is_empty() || free_page_reporting {
+        return false;
+    }
+    if std::env::var(GPU_GUEST_MEMORY_ENV).is_ok_and(|v| v == "file") {
+        return false;
+    }
+    matches!(
+        direct,
+        DirectRestoreMemory::File
+            | DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages)
+    )
+}
+
+/// Whether the Firecracker this restore runs on takes a prefilled backing: the fork's
+/// binary carries the greeting the backend expects (`FCVM_PREFILLED_MEMORY`). A snapshot
+/// records the binary that made it, and one made before the backend existed restores on that
+/// binary, which would refuse the load.
+fn restore_vmm_accepts_prefilled(runtime_config: &RuntimeConfig) -> bool {
+    let accepts = super::common::find_firecracker(runtime_config)
+        .ok()
+        .and_then(|bin| std::fs::read(bin).ok())
+        .is_some_and(|bytes| binary_names_prefilled(&bytes));
+    if !accepts {
+        info!("this restore's Firecracker has no prefilled memory backend; restoring without hugepages");
+    }
+    accepts
+}
+
+fn binary_names_prefilled(bytes: &[u8]) -> bool {
+    const GREETING: &[u8] = b"FCVM_PREFILLED_MEMORY";
+    bytes.windows(GREETING.len()).any(|w| w == GREETING)
+}
+
+/// A prefilled backing and the pool slot it came from.
+struct PrefilledBacking {
+    file: std::sync::Arc<std::fs::File>,
+    refill: PrefillRefill,
+}
+
+/// The pool a restore took its memory from, refilled after the clone is acknowledged.
+#[derive(Debug, Clone)]
+struct PrefillRefill {
+    node: Option<u32>,
+    mib: u64,
+}
+
+/// Claim a hugepage spare on the first GPU's NUMA node (or allocate one) and copy the memory
+/// file into it. `None`, with a warning, when the host cannot give hugepages: the restore then
+/// uses the transport it would have used without them.
+async fn prepare_prefilled_memory(gpus: &[String], memory_path: &Path) -> Option<PrefilledBacking> {
+    use crate::storage::hugepage_spares as spares;
+    let node = gpus.first().and_then(|g| spares::pci_numa_node(g));
+    let memory_path = memory_path.to_path_buf();
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<(std::fs::File, bool, spares::FillStats, u64)> {
+            let size = std::fs::metadata(&memory_path)
+                .with_context(|| format!("stat {}", memory_path.display()))?
+                .len();
+            let size = size.div_ceil(spares::HUGE_PAGE) * spares::HUGE_PAGE;
+            let mib = size >> 20;
+            let dir = spares::default_dir();
+            let pool = spares::Spares::open(&dir)?;
+            let (file, claimed) = match pool.claim(node, mib)? {
+                Some(file) => (file, true),
+                None => (
+                    spares::allocate_unnamed(&dir, size, node, spares::COPY_THREADS)?,
+                    false,
+                ),
+            };
+            let stats = spares::fill_from(&file, &memory_path, spares::COPY_THREADS)?;
+            Ok((file, claimed, stats, mib))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok((file, claimed, stats, mib))) => {
+            info!(
+                node = ?node,
+                mib,
+                spare = claimed,
+                copied_mib = stats.data_mib,
+                hole_mib = stats.hole_mib,
+                copy_ms = stats.ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                "guest memory prefilled into hugepages"
+            );
+            Some(PrefilledBacking {
+                file: std::sync::Arc::new(file),
+                refill: PrefillRefill { node, mib },
+            })
+        }
+        Ok(Err(error)) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "no hugepage memory for this GPU restore; restoring without it"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(error = %error, "the hugepage prefill panicked; restoring without it");
+            None
+        }
+    }
+}
+
+/// Start `fcvm gpu spares fill` for the pool a restore used, detached: it holds the
+/// pool's lock, so concurrent restores' refills add up to the pool's count, and it is never
+/// on a restore's path. A refill that dies leaves at most an unfinished `.tmp-` file, which
+/// the next fill removes.
+fn spawn_refill(refill: &PrefillRefill) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command.args(["gpu", "spares", "fill", "--mib", &refill.mib.to_string()]);
+    if let Some(node) = refill.node {
+        command.args(["--node", &node.to_string()]);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid in the child between fork and exec, async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match command.spawn() {
+        Ok(child) => {
+            info!(pid = child.id(), node = ?refill.node, mib = refill.mib, "refilling the hugepage spare pool")
+        }
+        Err(error) => warn!(error = %error, "could not start the hugepage spare refill"),
+    }
+}
+
 /// Choose the memory transport for a restore with no serve process.
 ///
 /// `nv2` says whether this restore launches Firecracker with `--enable-nv2`
@@ -3375,6 +3529,12 @@ async fn cmd_snapshot_run_inner(
         None
     };
 
+    // Set when the restore's guest memory comes from the hugepage spare pool: the pool is
+    // refilled for this node and size once the clone is acknowledged.
+    let mut prefilled_restore: Option<PrefillRefill> = None;
+    // When the memory backend was chosen for a direct restore: a prefill copies guest memory
+    // there, so the restore clock starts there.
+    let mut prefill_started: Option<std::time::Instant> = None;
     // Choose memory backend based on mode. Without a serve process the restore maps
     // memory.bin directly unless `direct_restore_memory` says the snapshot needs an
     // implicit in-process UFFD server, which runs as a background tokio task.
@@ -3443,7 +3603,24 @@ async fn cmd_snapshot_run_inner(
             std::env::var("FCVM_FORCE_UFFD").is_ok(),
             map_count,
         );
-        if let DirectRestoreMemory::ImplicitUffd(reason) = direct_memory {
+        prefill_started = Some(std::time::Instant::now());
+        let prefilled = if prefill_gpu_memory(
+            &gpus,
+            direct_memory,
+            snapshot_config.metadata.balloon_free_page_reporting,
+        ) && restore_vmm_accepts_prefilled(&runtime_config)
+        {
+            prepare_prefilled_memory(&gpus, &snapshot_config.memory_path).await
+        } else {
+            None
+        };
+        if let Some(backing) = prefilled {
+            prefilled_restore = Some(backing.refill);
+            MemoryBackend::Prefilled {
+                socket_path: data_dir.join("mem.sock"),
+                backing: backing.file,
+            }
+        } else if let DirectRestoreMemory::ImplicitUffd(reason) = direct_memory {
             if let ImplicitUffdReason::MapCount(shortfall) = reason {
                 warn!(
                     needed = shortfall.needed,
@@ -3604,6 +3781,12 @@ async fn cmd_snapshot_run_inner(
     // Internal: startup_snapshot_base_key forces it on (needs diff snapshot).
     // Hugepages: always disable — KVM splits 2MB Stage 2 block mappings to 4K
     // for dirty tracking, negating the TLB benefit of hugepages.
+    // A clone in prefilled hugepage memory is a hugepage VM from here on: its state, and any
+    // snapshot taken of it, say so, which is what the VMM records too.
+    let hugepages = hugepages || prefilled_restore.is_some();
+    if prefilled_restore.is_some() {
+        vm_state.config.hugepages = true;
+    }
     let needs_dirty_tracking = if hugepages {
         false // hugepage VMs must not split 2MB TLB entries
     } else if args.startup_snapshot_base_key.is_some() || args.prepare.is_some() {
@@ -3764,8 +3947,13 @@ async fn cmd_snapshot_run_inner(
         anyhow::bail!("interrupted by signal during clone setup");
     }
     // Host-observed end-to-end restore clock: from the start of the restore
-    // call through the guest's ACK. Published as ack_ms in the restored record.
-    let restore_started = std::time::Instant::now();
+    // call through the guest's ACK, and from the prefill when guest memory was
+    // prefilled, since that copy is part of loading it. Published as ack_ms in
+    // the restored record.
+    let restore_started = match (&prefilled_restore, prefill_started) {
+        (Some(_), Some(started)) => started,
+        _ => std::time::Instant::now(),
+    };
     let setup_result: Result<super::common::RestoredVmm<Box<dyn crate::hypervisor::Hypervisor>>> =
         if is_ch {
             super::common::restore_from_snapshot_ch(
@@ -3891,6 +4079,8 @@ async fn cmd_snapshot_run_inner(
             "uffd"
         } else if is_uffd {
             "uffd-file"
+        } else if prefilled_restore.is_some() {
+            "hugepage-prefilled"
         } else {
             "file"
         };
@@ -3910,6 +4100,10 @@ async fn cmd_snapshot_run_inner(
                 guest_phases.as_deref(),
             )
         );
+    }
+    // The clone is acknowledged; replace the spare it used.
+    if let Some(refill) = &prefilled_restore {
+        spawn_refill(refill);
     }
 
     // Handle --exec: run command in container then cleanup and exit
@@ -6022,6 +6216,39 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_binary_names_the_prefilled_backend_by_its_greeting() {
+        assert!(binary_names_prefilled(
+            b"\x7fELF...FCVM_PREFILLED_MEMORY..."
+        ));
+        assert!(!binary_names_prefilled(
+            b"\x7fELF...FCVM_UFFD_MINOR_BACKING..."
+        ));
+    }
+
+    /// Only a GPU restore takes prefilled hugepage memory, from a transport it can replace:
+    /// the File backend, or the UFFD server a hugepage snapshot would otherwise need.
+    #[test]
+    fn a_gpu_restore_takes_prefilled_memory() {
+        let gpu = vec!["0000:18:00.0".to_string()];
+        assert!(prefill_gpu_memory(&gpu, DirectRestoreMemory::File, false));
+        assert!(prefill_gpu_memory(
+            &gpu,
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages),
+            false
+        ));
+        assert!(!prefill_gpu_memory(&[], DirectRestoreMemory::File, false));
+        assert!(
+            !prefill_gpu_memory(&gpu, DirectRestoreMemory::File, true),
+            "free page reporting"
+        );
+        assert!(!prefill_gpu_memory(
+            &gpu,
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2),
+            false
+        ));
+    }
 
     /// A snapshot whose fc-agent predates `--guest-thp` ignores the mode a restore sends
     /// and reports the restore done, so a restore asking it for a mode is refused, and one

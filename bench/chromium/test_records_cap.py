@@ -158,6 +158,55 @@ class RecordsCap(unittest.TestCase):
             self.assertIsNotNone(records.entry(os.path.join(alias, "analysis.json")))
             self.assertTrue(campaign_summary.Sources(alias).exists(os.path.join(alias, "analysis.json")))
 
+    def test_a_boot_race_campaign_moves_its_raw_files_and_keeps_its_summary(self):
+        """bench/boot-race runs use their own raw patterns, and their manifest goes beside them. RED BEFORE
+        THE CHANGE: run_raw_files matched the chromium patterns and listed none of a boot-race run's files."""
+        run = os.path.join(records.BOOT_RACE_RESULTS, "boot-race-test")
+        prefix = os.path.relpath(run, records.REPO) + "/"
+        names = ["samples.jsonl", "lambda-reports.json", "setup.json"]
+        with mock.patch.object(records, "committed_files", side_effect=lambda pre: [pre + n for n in names]):
+            raw = records.run_raw_files(run)
+        self.assertEqual(sorted(raw), sorted(prefix + n for n in names if n != "setup.json"))
+        self.assertEqual(records.results_dir([run]), records.BOOT_RACE_RESULTS)
+        self.assertEqual(records.results_dir([os.path.join(records.RESULTS, "x")]), records.RESULTS)
+        with self.assertRaises(SystemExit):
+            records.results_dir([run, os.path.join(records.RESULTS, "x")])
+
+    def test_manifest_removes_staged_raw_files_that_were_never_committed(self):
+        """A boot-race run's raw files are staged, never committed, then moved. RED BEFORE THE FIX (local codex
+        review of the boot-race PR): manifest wrote the manifest and then failed in `git rm`, which refuses a file
+        whose index differs from HEAD, so the files stayed and a retry refused the existing manifest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, recs = os.path.join(tmp, "fcvm"), os.path.join(tmp, "records")
+            path = "bench/boot-race/results/c1/samples.jsonl"
+
+            def git(cwd, *args):
+                subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd,
+                               check=True, capture_output=True)
+
+            for d in (repo, recs):
+                os.makedirs(os.path.join(d, os.path.dirname(path)))
+                with open(os.path.join(d, path), "w") as f:
+                    f.write('{"lane": "fcvm-file"}\n')
+                git(d, "init", "-q")
+            os.makedirs(os.path.join(repo, "bench/chromium"))
+            with open(os.path.join(HERE, "records.py")) as src, \
+                    open(os.path.join(repo, "bench/chromium/records.py"), "w") as dst:
+                dst.write(src.read())
+            git(repo, "add", "bench/chromium/records.py")
+            git(repo, "commit", "-q", "-m", "base")
+            git(repo, "add", path)
+            git(recs, "add", path)
+            git(recs, "commit", "-q", "-m", "records")
+            r = subprocess.run([sys.executable, "bench/chromium/records.py", "manifest", "--campaign", "c1",
+                                "--records", recs, "bench/boot-race/results/c1"], cwd=repo,
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.exists(os.path.join(repo, "bench/boot-race/results/records-c1.json")))
+            self.assertFalse(os.path.exists(os.path.join(repo, path)))
+            listed = subprocess.run(["git", "ls-files", "--", path], cwd=repo, capture_output=True, text=True)
+            self.assertEqual(listed.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main()

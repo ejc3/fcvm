@@ -369,7 +369,7 @@ patches_dir = "kernel/patches-gpu-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "1433710c4f343d392380e1e4f6876e2ecf215926"
+firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -411,10 +411,11 @@ build_inputs = [
 kernel_config = "kernel/phone-x86.conf"
 patches_dir = "kernel/patches-gpu-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
-# The fork's VFIO branch with the nested state in snapshots merged (ejc3/firecracker#23).
+# The fork's VFIO branch with the nested state in snapshots (ejc3/firecracker#23) and the
+# Prefilled memory backend (ejc3/firecracker#24) merged.
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "69894de0188292bf3afc0a5d7f8900a80ca74d56"
+firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
 firecracker_args = "--enable-pci"
 boot_args = "net.ifnames=0"
 

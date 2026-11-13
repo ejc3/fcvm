@@ -2,6 +2,7 @@ pub mod compact;
 pub mod disk;
 pub mod disk_dir;
 pub mod extents;
+pub mod hugepage_spares;
 pub mod inode_flags;
 pub mod pmem;
 pub mod pmem_store;

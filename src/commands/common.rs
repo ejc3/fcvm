@@ -434,6 +434,8 @@ pub async fn spawn_namespace_holder(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
+        crate::utils::own_process_group(&mut cmd);
 
         // Kill holder if parent (fcvm) dies. Without this, holders orphan to init
         // and accumulate when fcvm is SIGKILL'd or crashes.
@@ -2536,6 +2538,62 @@ pub enum MemoryBackend {
     /// UFFDIO_CONTINUE. Lazy *and* shared — clean pages have exactly one physical copy
     /// across all clones, writes CoW into private memory.
     UffdMinor { socket_path: PathBuf },
+    /// A hugetlbfs file that already holds the snapshot's memory
+    /// (`crate::storage::hugepage_spares`), handed to Firecracker over `socket_path` and
+    /// mapped shared, with no memory server. The load restores 2 MiB pages, so the DMA map of
+    /// a passthrough device pins guest memory without faulting it.
+    Prefilled {
+        socket_path: PathBuf,
+        backing: std::sync::Arc<std::fs::File>,
+    },
+}
+
+/// The greeting Firecracker expects with a prefilled backing's descriptor
+/// (ejc3/firecracker `PREFILLED_BACKING_HELLO_V1`).
+const PREFILLED_BACKING_HELLO: &[u8] = b"FCVM_PREFILLED_MEMORY";
+/// How long the load has to connect for its prefilled backing.
+const PREFILLED_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bind `socket_path` and, on a blocking thread, send `backing` with its greeting to the first
+/// connection: the snapshot load's. The socket file is removed once the descriptor is sent,
+/// and the thread gives up after [`PREFILLED_ACCEPT_TIMEOUT`].
+fn serve_prefilled_backing(
+    socket_path: &Path,
+    backing: std::sync::Arc<std::fs::File>,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    use std::os::fd::AsRawFd;
+    use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+    let _ = std::fs::remove_file(socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("binding {}", socket_path.display()))?;
+    listener.set_nonblocking(true)?;
+    let path = socket_path.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + PREFILLED_ACCEPT_TIMEOUT;
+        let result = loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    break stream
+                        .send_with_fd(PREFILLED_BACKING_HELLO, backing.as_raw_fd())
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("sending the prefilled backing: {e}"));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(anyhow::anyhow!(
+                            "the snapshot load did not connect for its prefilled memory within {:?}",
+                            PREFILLED_ACCEPT_TIMEOUT
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => break Err(e).context("accepting the snapshot load's connection"),
+            }
+        };
+        let _ = std::fs::remove_file(&path);
+        result
+    }))
 }
 
 /// Configuration for restoring a VM from a snapshot
@@ -4039,12 +4097,35 @@ pub async fn restore_from_snapshot(
                     backend_path: socket_path.display().to_string(),
                 }
             }
+            MemoryBackend::Prefilled { socket_path, .. } => {
+                info!(
+                    socket = %socket_path.display(),
+                    "loading snapshot with prefilled hugepage memory"
+                );
+                MemBackend {
+                    backend_type: "Prefilled".to_string(),
+                    backend_path: socket_path.display().to_string(),
+                }
+            }
         };
 
         // Failpoint: the VMM runs in its mount namespace, its own directory bound over
         // the source VM's, and has not opened the disks the snapshot names. A harness
         // tears the source VM down in this window.
         failpoint::hit_async("restore.pre_load").await;
+
+        // A prefilled backing is handed over when the load connects for it.
+        let prefilled_sender = match &restore_config.memory_backend {
+            MemoryBackend::Prefilled {
+                socket_path,
+                backing,
+            } => Some(serve_prefilled_backing(socket_path, backing.clone())?),
+            _ => None,
+        };
+        let huge_pages = match &restore_config.memory_backend {
+            MemoryBackend::Prefilled { .. } => Some("2M".to_string()),
+            _ => None,
+        };
 
         // Timing instrumentation: measure snapshot load operation
         let load_start = std::time::Instant::now();
@@ -4061,6 +4142,7 @@ pub async fn restore_from_snapshot(
                 vsock_override: vsock_override.clone(),
                 drive_overrides: drive_overrides.clone(),
                 device_passthrough: crate::firecracker::api::DevicePassthrough::for_gpus(gpus),
+                huge_pages,
             })
             .await
             .context("loading snapshot")
@@ -4071,6 +4153,14 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        if let Some(sender) = prefilled_sender {
+            // The load returned, so Firecracker connected and mapped the backing: the sender
+            // has finished, and a failure there already failed the load.
+            sender
+                .await
+                .context("the prefilled memory sender panicked")?
+                .context("handing the prefilled guest memory to Firecracker")?;
+        }
         info!(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
@@ -7026,6 +7116,24 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// The namespace holder is not in fcvm's process group. In it, the Ctrl+C that fcvm
+    /// handles also killed the holder, and the run loop could report that death and exit 1
+    /// instead of shutting down cleanly (`test_ctrlc_via_terminal`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_terminal_interrupt_does_not_reach_the_namespace_holder() {
+        let interrupt = crate::utils::TerminalInterrupt::arm();
+        let holder_cmd =
+            crate::network::PastaNetwork::new("vm-test".to_string(), "tap-fc".to_string(), vec![])
+                .build_holder_command();
+        let (mut holder, holder_pid) = super::spawn_namespace_holder(&holder_cmd)
+            .await
+            .expect("spawning the namespace holder");
+        interrupt
+            .assert_misses(&mut holder, "the namespace holder")
+            .await;
+        crate::companion::forget(holder_pid);
+    }
+
     /// The restore document carries the restoring host's identity in the shape
     /// fc-agent's `RestoreIdentity` reads. "host-ipv6" is written even when there is
     /// none, because the guest sets its address to exactly what it reads.
@@ -9772,6 +9880,43 @@ mod tests {
         .is_some());
     }
 
+    /// The load's connection gets the prefilled backing with the greeting Firecracker expects,
+    /// as a descriptor of the same file, and the socket is gone afterwards.
+    #[tokio::test]
+    async fn the_prefilled_backing_is_sent_to_the_loads_connection() {
+        use std::os::unix::fs::MetadataExt;
+        use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+        let dir = tempfile::tempdir().unwrap();
+        let backing = tempfile::tempfile_in(dir.path()).unwrap();
+        let ino = backing.metadata().unwrap().ino();
+        let socket = dir.path().join("mem.sock");
+        let sender = serve_prefilled_backing(&socket, std::sync::Arc::new(backing)).unwrap();
+        let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let mut hello = [0u8; 64];
+        let (len, fd) = stream.recv_with_fd(&mut hello).unwrap();
+        sender.await.unwrap().unwrap();
+        assert_eq!(&hello[..len], PREFILLED_BACKING_HELLO);
+        assert_eq!(fd.expect("no descriptor").metadata().unwrap().ino(), ino);
+        assert!(!socket.exists(), "the backing socket outlived the handover");
+    }
+
+    /// A prefilled load asks Firecracker for 2 MiB pages; others send no page size, so a
+    /// Firecracker without the field never sees it.
+    #[test]
+    fn only_a_prefilled_load_names_a_page_size() {
+        let code = include_str!("common.rs");
+        let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let start = code
+            .find("let huge_pages = match &restore_config.memory_backend {")
+            .unwrap();
+        let body = &code[start..start + code[start..].find("};").unwrap()];
+        assert!(
+            body.contains(r#"MemoryBackend::Prefilled { .. } => Some("2M".to_string())"#),
+            "{body}"
+        );
+        assert!(body.contains("_ => None"), "{body}");
+    }
+
     #[test]
     fn snapshot_load_sends_the_vsock_override_only_when_set() {
         use crate::firecracker::api::{MemBackend, SnapshotLoad, VsockOverride};
@@ -9787,6 +9932,7 @@ mod tests {
             vsock_override: None,
             drive_overrides: None,
             device_passthrough: None,
+            huge_pages: None,
         };
         assert!(!serde_json::to_string(&load)
             .unwrap()

@@ -1,7 +1,7 @@
 //! Compile-time guards for architecture-specific kernel patches.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The excerpts in `fixtures/vncr/nested.c` stand in for the pinned kernel's
@@ -412,27 +412,10 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     )
     .unwrap();
 
-    let binary = temp.path().join("s2-tracking");
-    let compiled = Command::new("cc")
-        .args([
-            "-std=gnu11",
-            "-g",
-            "-O1",
-            "-pthread",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-Werror=implicit-function-declaration",
-            "-Werror=incompatible-pointer-types",
-            "-o",
-        ])
-        .arg(&binary)
-        .arg(temp.path().join("harness.c"))
-        .output()
-        .expect("run cc");
-    assert!(
-        compiled.status.success(),
-        "the {release} shadow stage-2 harness failed to compile:\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
+    let harness = SanitizedHarness::build(
+        &temp.path().join("harness.c"),
+        &["-g", "-pthread", "-Werror=incompatible-pointer-types"],
+        &format!("the {release} shadow stage-2 harness"),
     );
 
     let mut scenarios = vec!["targeted", "memslot"];
@@ -441,18 +424,7 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     }
     let mut failures = Vec::new();
     for scenario in scenarios {
-        // Without address randomization: GCC 13's AddressSanitizer crashes in a loop of
-        // "AddressSanitizer:DEADLYSIGNAL" for some layouts when vm.mmap_rnd_bits is 32
-        // (Ubuntu 24.04's kernels), which failed this test at random on CI's x64 lanes.
-        let result = Command::new("setarch")
-            .args([std::env::consts::ARCH, "-R"])
-            .arg(&binary)
-            .arg(scenario)
-            // The harness counts its own allocations; LeakSanitizer needs
-            // ptrace, which some CI containers refuse.
-            .env("ASAN_OPTIONS", "detect_leaks=0")
-            .output()
-            .expect("run the shadow stage-2 harness");
+        let result = harness.run(&[scenario]);
         if !result.status.success() {
             failures.push(format!(
                 "{scenario}: {}",
@@ -765,38 +737,15 @@ fn quiet_vgic_exits_leave_ich_hcr_el2_programmed_without_a_host_maintenance_inte
     fs::write(temp.path().join("extracted.c"), extracted).unwrap();
     fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
 
-    let binary = temp.path().join("vgic-hcr");
-    let compiled = Command::new("cc")
-        .args([
-            "-std=gnu11",
-            "-g",
-            "-O1",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-Werror=implicit-function-declaration",
-            "-Werror=incompatible-pointer-types",
-            "-o",
-        ])
-        .arg(&binary)
-        .arg(temp.path().join("harness.c"))
-        .output()
-        .expect("run cc");
-    assert!(
-        compiled.status.success(),
-        "the {release} vgic-v3 harness failed to compile:\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
+    let harness = SanitizedHarness::build(
+        &temp.path().join("harness.c"),
+        &["-g", "-Werror=incompatible-pointer-types"],
+        &format!("the {release} vgic-v3 harness"),
     );
 
     let mut failures = Vec::new();
     for scenario in ["loop", "matrix", "putload"] {
-        // As for the shadow stage-2 harness: no address randomization, no LeakSanitizer.
-        let result = Command::new("setarch")
-            .args([std::env::consts::ARCH, "-R"])
-            .arg(&binary)
-            .arg(scenario)
-            .env("ASAN_OPTIONS", "detect_leaks=0")
-            .output()
-            .expect("run the vgic-v3 harness");
+        let result = harness.run(&[scenario]);
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
             let first: Vec<&str> = stderr.lines().take(5).collect();
@@ -914,35 +863,15 @@ fn a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies() {
     fs::write(temp.path().join("extracted.c"), extracted).unwrap();
     fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
 
-    let binary = temp.path().join("nv-hcr");
-    let compiled = Command::new("cc")
-        .args([
-            "-std=gnu11",
-            "-g",
-            "-O1",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-Werror=implicit-function-declaration",
-            "-Werror=incompatible-pointer-types",
-            "-o",
-        ])
-        .arg(&binary)
-        .arg(temp.path().join("harness.c"))
-        .output()
-        .expect("run cc");
-    assert!(
-        compiled.status.success(),
-        "the {release} HCR_EL2 harness failed to compile:\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
+    let harness = SanitizedHarness::build(
+        &temp.path().join("harness.c"),
+        &["-g", "-Werror=incompatible-pointer-types"],
+        &format!("the {release} HCR_EL2 harness"),
     );
 
     let mut failures = Vec::new();
     for scenario in ["quiet", "write", "nv3"] {
-        let result = Command::new(&binary)
-            .arg(scenario)
-            .env("ASAN_OPTIONS", "detect_leaks=0")
-            .output()
-            .expect("run the HCR_EL2 harness");
+        let result = harness.run(&[scenario]);
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
             let first: Vec<&str> = stderr.lines().take(5).collect();
@@ -1036,29 +965,12 @@ fn the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit() {
     }
     fs::write(temp.path().join("extracted-masks.c"), extracted).unwrap();
     fs::copy(fixture.join("masks.c"), temp.path().join("masks.c")).unwrap();
-    let binary = temp.path().join("masks");
-    let compiled = Command::new("cc")
-        .args([
-            "-std=gnu11",
-            "-O1",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-Werror=implicit-function-declaration",
-            "-o",
-        ])
-        .arg(&binary)
-        .arg(temp.path().join("masks.c"))
-        .output()
-        .expect("run cc");
-    assert!(
-        compiled.status.success(),
-        "the {release} register masking harness failed to compile:\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
+    let harness = SanitizedHarness::build(
+        &temp.path().join("masks.c"),
+        &[],
+        &format!("the {release} register masking harness"),
     );
-    let result = Command::new(&binary)
-        .env("ASAN_OPTIONS", "detect_leaks=0")
-        .output()
-        .expect("run the register masking harness");
+    let result = harness.run(&[]);
     assert!(
         result.status.success(),
         "the VHE world switch's inline register masking in {NV_EXIT_PATCH} differs from \
@@ -1154,5 +1066,97 @@ fn the_world_switch_inlines_the_helpers_it_runs_on_every_exit() {
         "Linux {release} with{} {WS_INLINE_PATCH} leaves the world switch calling out of line:\n{}",
         if patched { "" } else { "out" },
         missing.join("\n")
+    );
+}
+
+/// A C harness built with AddressSanitizer and UndefinedBehaviorSanitizer, every report
+/// fatal. Every sanitizer harness in this file is built through it, and
+/// `every_sanitizer_harness_is_built_by_sanitized_harness` fails on one that is not.
+///
+/// It links the harness as a fixed-address executable (`-no-pie`). The container CI
+/// builds these harnesses in (rust:1.83-bookworm) has GCC 12's libasan, whose x86_64
+/// allocator reserves the fixed range [0x600000000000, 0x640000000000). CI's x64
+/// runners boot a kernel with vm.mmap_rnd_bits = 32, which loads a PIE executable
+/// anywhere in the 16 TiB above 0x555555554000, a quarter of which is inside that
+/// range. The runtime then dies in a loop of "AddressSanitizer:DEADLYSIGNAL" before
+/// main. Measured in that image on x86_64 at mmap_rnd_bits = 32: 524 of 2000 PIE runs
+/// died, each with the executable inside the range and none outside it; 0 of 2000
+/// `-no-pie` runs died. Libraries, stack and heap are still randomized, and nothing the
+/// sanitizers check depends on where the program is loaded. `setarch -R` also avoids
+/// it, but it needs personality(2), and under Docker's default seccomp profile it failed
+/// 2000 of 2000 runs in the same measurement.
+struct SanitizedHarness {
+    binary: PathBuf,
+    what: String,
+}
+
+impl SanitizedHarness {
+    /// Compiles `source` next to itself with `cc`, the sanitizers, `-std=gnu11 -O1`,
+    /// implicit declarations as errors, and `flags`.
+    fn build(source: &Path, flags: &[&str], what: &str) -> Self {
+        let binary = source.with_extension("");
+        let compiled = Command::new("cc")
+            .args(["-std=gnu11", "-O1", "-Werror=implicit-function-declaration"])
+            .args(["-fsanitize=address,undefined", "-fno-sanitize-recover=all"])
+            .arg("-no-pie")
+            .args(flags)
+            .arg("-o")
+            .arg(&binary)
+            .arg(source)
+            .output()
+            .expect("run cc");
+        assert!(
+            compiled.status.success(),
+            "{what} failed to compile:\n{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        Self {
+            binary,
+            what: what.to_owned(),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        Command::new(&self.binary)
+            .args(args)
+            // The harnesses count their own allocations; LeakSanitizer needs ptrace,
+            // which some CI containers refuse.
+            .env("ASAN_OPTIONS", "detect_leaks=0")
+            .output()
+            .unwrap_or_else(|e| panic!("run {}: {e}", self.what))
+    }
+}
+
+/// Two harnesses here were built as PIE executables and run with randomization on, and
+/// failed Container-x64 on main (runs 43337645689 and 43437338165) with
+/// "AddressSanitizer:DEADLYSIGNAL", while the two run under `setarch -R` passed in the
+/// same jobs. Any `-fsanitize` outside `SanitizedHarness::build`, in this file or another
+/// test, is a harness built without `-no-pie`.
+#[test]
+fn every_sanitizer_harness_is_built_by_sanitized_harness() {
+    let tests = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut stack = vec![tests];
+    let mut sites = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    if line.contains(concat!("\"-f", "sanitize=")) {
+                        sites.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    let this = file!().rsplit('/').next().unwrap();
+    assert!(
+        sites.len() == 1 && sites[0].contains(this),
+        "sanitizer flags must appear only in SanitizedHarness::build, so every harness is \
+         linked with -no-pie; found them at:\n{}",
+        sites.join("\n")
     );
 }
