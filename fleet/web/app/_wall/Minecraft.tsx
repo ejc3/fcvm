@@ -118,18 +118,44 @@ function Caption({ c, onReset, onFork, onTake }: { c: MinecraftCard; onReset: ()
   );
 }
 
+/** One line for Java Edition players: the client, one server's address to copy, and where the others' are. */
+function JoinLine({ join }: { join: { label: string; address: string } }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(join.address).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      },
+      () => setCopied(false),
+    );
+  };
+  return (
+    <p className="mc-join" data-testid="mc-join">
+      <span className="label">{join.label}</span>
+      <code data-testid="mc-join-address">{join.address}</code>
+      <button type="button" className="btn mini" onClick={copy} data-testid="mc-join-copy">
+        {copied ? "Copied" : "Copy"}
+      </button>
+      <span className="hint">Each server's own address is under its tile.</span>
+    </p>
+  );
+}
+
 function Sheet({
   panel,
   narrow,
   top,
   onGiveBack,
   onPad,
+  onRetry,
 }: {
   panel: MinecraftPanel;
   narrow: boolean;
   top: number;
   onGiveBack: () => void;
   onPad: (input: DriveInput, down: boolean) => void;
+  onRetry: () => void;
 }) {
   return (
     <aside className={`win-sheet mc-sheet${narrow ? " narrow" : ""}`} role="dialog" aria-labelledby="mc-sheet-title" data-testid="mc-panel" style={top > 0 ? { top } : undefined}>
@@ -150,9 +176,14 @@ function Sheet({
             {panel.firstChange}
           </p>
           {panel.waiting ? (
-            <p className="note" role="status" data-testid="mc-waiting">
+            <p className={panel.failed ? "refused" : "note"} role="status" data-testid="mc-waiting">
               {panel.waiting}
             </p>
+          ) : null}
+          {panel.failed ? (
+            <button type="button" className="btn" style={{ justifyContent: "center" }} onClick={onRetry} data-testid="mc-retry">
+              Retry
+            </button>
           ) : null}
           {panel.refused ? (
             <p className="refused" role="status" data-testid="mc-drive-refused">
@@ -210,6 +241,8 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const drawn = useRef(new Map<string, string>());
   const driverRef = useRef<{ session: string; id: string; driver: Driver } | null>(null);
   const pumpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The session this page gave back: its panel closes at once, not when the coordinator says so.
+  const [released, setReleased] = useState<string | null>(null);
 
   useEffect(() => {
     document.title = "Minecraft";
@@ -255,8 +288,8 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   }, [narrow]);
 
   const view = useMemo(
-    () => minecraftView({ state, now: now || 0, dpr, stage, narrow, touch, live, drive: { samples, refused } }),
-    [state, now, dpr, stage, narrow, touch, live, samples, refused],
+    () => minecraftView({ state, now: now || 0, dpr, stage, narrow, touch, live, drive: { samples, refused }, released }),
+    [state, now, dpr, stage, narrow, touch, live, samples, refused, released],
   );
   viewRef.current = view;
   const panel = view.panel;
@@ -327,7 +360,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
     const p = viewRef.current?.panel;
     driverRef.current?.driver.releaseAll(localNow());
     pump();
-    if (p) void client.act("release_minecraft", { claim: p.session });
+    if (p) {
+      setReleased(p.session);
+      void client.act("release_minecraft", { claim: p.session });
+    }
   }, [client, pump]);
 
   const input = useCallback(
@@ -459,15 +495,11 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
               {h.server ? <span data-testid="mc-server">{h.server}</span> : null}
               <span data-testid="mc-median">{h.median}</span>
               <span data-testid="mc-slowest">{h.slowest}</span>
-              <span data-testid="mc-last-fork">{h.lastFork}</span>
-              <span data-testid="mc-last-reset-all">{h.lastResetAll}</span>
+              {h.lastFork ? <span data-testid="mc-last-fork">{h.lastFork}</span> : null}
+              {h.lastResetAll ? <span data-testid="mc-last-reset-all">{h.lastResetAll}</span> : null}
             </div>
           ) : null}
-          {h?.join ? (
-            <p className="mc-join" data-testid="mc-join">
-              {h.join}
-            </p>
-          ) : null}
+          {h?.join ? <JoinLine join={h.join} /> : null}
         </header>
         <div ref={stageRef} className="win-stage" data-testid="mc-stage" />
       </main>
@@ -504,6 +536,16 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 onPointerUp={c.mine ? onPointerUp : undefined}
                 onPointerCancel={c.mine ? onPointerUp : undefined}
               />
+              {!c.dark && c.stream ? (
+                <span className={`stream${c.streamFailed ? " failed" : ""}`} role="status" data-testid={`mc-stream-${c.slot}`}>
+                  <span className="text">{c.stream}</span>
+                  {c.streamFailed && c.socket ? (
+                    <button type="button" className="btn mini" onClick={() => tiles.retryNow(c.id)} data-testid={`mc-stream-retry-${c.slot}`}>
+                      Retry
+                    </button>
+                  ) : null}
+                </span>
+              ) : null}
               {c.dark ? (
                 <span className="dark" data-testid={`mc-dark-${c.slot}`}>
                   {c.timer ? (
@@ -531,7 +573,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
           />
         ))}
       </div>
-      {panel ? <Sheet panel={panel} narrow={narrow} top={sheetTop} onGiveBack={giveBack} onPad={input} /> : null}
+      {panel ? <Sheet panel={panel} narrow={narrow} top={sheetTop} onGiveBack={giveBack} onPad={input} onRetry={() => tiles.retryNow(panel.id)} /> : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>
           <Verify client={client} view={view} />

@@ -270,6 +270,11 @@ export class MockMinecraft {
         socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
         return;
       }
+      // Tests: no view socket can be reached at all.
+      if (this.down) {
+        socket.destroy();
+        return;
+      }
       // A viewer with no IPv6: its connects to the tile's own (IPv6) name fail.
       if (this.v6Down && (req.headers.host ?? "").replace(/:\d+$/, "") !== this.v4Host) {
         socket.destroy();
@@ -315,6 +320,13 @@ export class MockMinecraft {
   /** The same view socket over the server's IPv4 name (the host's address and its published port). */
   frameUrlV4(slot: string): string {
     return `ws://${this.v4Host}:${this.port}/${slot}/view`;
+  }
+
+  private down = false;
+  /** Tests: refuse every view socket, by either name, and drop the open ones. */
+  setDown(down: boolean): void {
+    this.down = down;
+    if (down) for (const c of this.wss.clients) c.terminate();
   }
 
   private v6Down = false;

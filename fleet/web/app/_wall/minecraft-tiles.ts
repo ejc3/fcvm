@@ -45,6 +45,10 @@ class TileSocket {
   tps: number | null = null;
   /** Messages the page could not read, for the test hook. */
   errors = 0;
+  /** Connection attempts that ended without opening since the socket last opened. */
+  failures = 0;
+  /** When the socket began trying to connect without being open (local ms); null while open. */
+  connectingSince: number | null = now();
   /** Something changed since the last draw. */
   dirty = true;
   /** The world shaded into a canvas of one pixel per column, and the world seq it shows. */
@@ -74,6 +78,8 @@ class TileSocket {
     try {
       ws = new WebSocket(this.url);
     } catch {
+      this.failures++;
+      this.owner.changed();
       this.retry();
       return;
     }
@@ -81,6 +87,8 @@ class TileSocket {
     ws.onopen = () => {
       this.open = true;
       this.attempt = 0;
+      this.failures = 0;
+      this.connectingSince = null;
       ws.send(this.first);
       this.owner.changed();
     };
@@ -99,14 +107,25 @@ class TileSocket {
       const was = this.open;
       this.open = false;
       this.ws = null;
+      if (was) this.connectingSince = now();
+      else this.failures++;
       // a restore of the server closes every socket to it: the next launch is a new world
       this.world = null;
       this.players = [];
       this.tps = null;
       this.dirty = true;
-      if (was) this.owner.changed();
+      this.owner.changed();
       this.retry();
     };
+  }
+
+  /** Try again now instead of after the backoff (the page's Retry). */
+  retryNow(): void {
+    if (this.closed || this.open || this.ws !== null) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.attempt = 0;
+    this.connect();
   }
 
   private retry(): void {
@@ -268,6 +287,11 @@ export class McTiles {
     this.changed();
   }
 
+  /** Reconnect tile `id`'s socket at once, if it is waiting to try again. */
+  retryNow(id: string): void {
+    this.sockets.get(id)?.retryNow();
+  }
+
   send(id: string, msg: DriveMsg): boolean {
     return this.sockets.get(id)?.send(JSON.stringify(msg)) ?? false;
   }
@@ -298,7 +322,7 @@ export class McTiles {
 
   changed(): void {
     const next: Record<string, McTileLive> = {};
-    for (const [id, s] of this.sockets) next[id] = { open: s.open, viewer: s.viewer, tps: s.tps, hasMap: s.world !== null };
+    for (const [id, s] of this.sockets) next[id] = { open: s.open, viewer: s.viewer, tps: s.tps, hasMap: s.world !== null, failures: s.failures, connectingSince: s.connectingSince };
     if (JSON.stringify(next) === JSON.stringify(this.snap)) return;
     this.snap = next;
     for (const f of this.listeners) f();
