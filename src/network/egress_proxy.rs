@@ -170,7 +170,10 @@ impl StreamActivity {
         }
         let sent = self.last_to_dest_ms.load(Ordering::Relaxed);
         // The latest bytes went to the destination, and nothing has come back since.
-        (self.last_direction.load(Ordering::Relaxed) == SENT
+        // `sent` is read before the direction, so a first send recorded in between shows
+        // the direction with the stamp still 0; that read is not yet a wait.
+        (sent != 0
+            && self.last_direction.load(Ordering::Relaxed) == SENT
             && now_ms.saturating_sub(sent - 1) >= threshold_ms)
             .then_some("awaiting a reply from its destination")
     }
