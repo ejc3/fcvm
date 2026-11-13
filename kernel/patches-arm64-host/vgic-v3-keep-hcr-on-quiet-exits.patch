@@ -1,6 +1,6 @@
-From 4418427211884de18617100e0f96bdbeb2c1eb44 Mon Sep 17 00:00:00 2001
+From 5e3cb0748ac590fc8c9c559fd18555946409862b Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 03:05:29 +0000
+Date: Fri, 13 Nov 2026 14:37:38 +0000
 Subject: [PATCH] KVM: arm64: vgic: Do no vgic work on an exit with nothing in
  flight
 
@@ -32,8 +32,9 @@ vgic_hcr_hw; vcpu load forgets it and vcpu put clears the register.
 fcvm #659: an in-kernel HVC exit on a c9g.metal-48xl host, one vCPU
 with a vGICv3, took 275.5 ns on 6.18.60, 313.7 ns on 7.3.3 and 295.8 ns
 with this patch without the fold skip; without a vGIC, 409.8, 460.3 and
-416.3 ns. On a c8g.metal-48xl host the fold skip takes an SMC exit with
-a vGICv3 from 2058 to 2022 host instructions and 778 to 763 cycles.
+416.3 ns. The fold skip takes 38 host instructions off an SMC exit with
+a vGICv3 (2210 to 2172, c9g.metal-48xl, three boots each); its cycles
+(924.6 to 922.6) moved less than they vary between boots (4 to 9).
 ---
  arch/arm64/kvm/hyp/vgic-v3-sr.c | 42 +++++++++++++++++++++++++++++++--
  arch/arm64/kvm/vgic/vgic.c      | 41 ++++++++++++++++++++++++++++++--

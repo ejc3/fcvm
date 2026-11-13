@@ -1,0 +1,114 @@
+From 57cb8aedd3044681dfddb2f2344763b1f207e9e0 Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:03:09 +0000
+Subject: [PATCH] KVM: arm64: Inline the VHE world switch helpers GCC calls out
+ of line
+
+On 7.3 GCC no longer inlines several small helpers of the VHE world
+switch that 6.18 inlined, although their source did not change: the
+sysreg save and restore paths call __sysreg_save_common_state() and
+__sysreg_restore_common_state() out of line, and each of those calls
+ctxt_mdscr_el1() (four calls per exit), which out of line can no longer
+fold ctxt_to_vcpu() and ctxt_is_guest() into its callers;
+__kvm_vcpu_run_vhe() calls fpsimd_lazy_switch_to_guest(), and
+__activate_traps() and sysreg_save_guest_state_vhe() call a partial
+copy of vserror_state_is_nested().
+
+Make them __always_inline, with ctxt_to_vcpu(), ctxt_is_guest() and
+fpsimd_lazy_switch_to_host(), so the world switch keeps them inline
+whatever the size of its callers.
+
+fcvm #659: on a c9g.metal-48xl host an SMC exit with a vGICv3 runs 149
+fewer host instructions (2172 to 2023), and its median over boots drops
+from 922.1 cycles (9 boots) to 910.8 (6 boots); HVC exits with and
+without a vGIC and SMC exits at virtual EL2 drop by 6 to 11 cycles.
+---
+ arch/arm64/include/asm/kvm_emulate.h       |  2 +-
+ arch/arm64/kvm/hyp/include/hyp/switch.h    |  4 ++--
+ arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h | 10 +++++-----
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index 242145e..d3f4502 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -257,7 +257,7 @@ static __always_inline bool is_nested_ctxt(struct kvm_vcpu *vcpu)
+ 	return vcpu_has_nv(vcpu) && !is_hyp_ctxt(vcpu);
+ }
+ 
+-static inline bool vserror_state_is_nested(struct kvm_vcpu *vcpu)
++static __always_inline bool vserror_state_is_nested(struct kvm_vcpu *vcpu)
+ {
+ 	if (!is_nested_ctxt(vcpu))
+ 		return false;
+diff --git a/arch/arm64/kvm/hyp/include/hyp/switch.h b/arch/arm64/kvm/hyp/include/hyp/switch.h
+index 1ce7130..6db595e 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@ -520,7 +520,7 @@ static inline void __hyp_sve_save_host(void)
+ 	fpsimd_save_common(&hctxt->fp_regs);
+ }
+ 
+-static inline void fpsimd_lazy_switch_to_guest(struct kvm_vcpu *vcpu)
++static __always_inline void fpsimd_lazy_switch_to_guest(struct kvm_vcpu *vcpu)
+ {
+ 	u64 zcr_el1, zcr_el2;
+ 
+@@ -541,7 +541,7 @@ static inline void fpsimd_lazy_switch_to_guest(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
+-static inline void fpsimd_lazy_switch_to_host(struct kvm_vcpu *vcpu)
++static __always_inline void fpsimd_lazy_switch_to_host(struct kvm_vcpu *vcpu)
+ {
+ 	u64 zcr_el1, zcr_el2;
+ 
+diff --git a/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h b/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+index c382848..0c3a5b1 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
++++ b/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+@@ -18,7 +18,7 @@
+ 
+ static inline bool ctxt_has_s1poe(struct kvm_cpu_context *ctxt);
+ 
+-static inline struct kvm_vcpu *ctxt_to_vcpu(struct kvm_cpu_context *ctxt)
++static __always_inline struct kvm_vcpu *ctxt_to_vcpu(struct kvm_cpu_context *ctxt)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt->__hyp_running_vcpu;
+ 
+@@ -28,12 +28,12 @@ static inline struct kvm_vcpu *ctxt_to_vcpu(struct kvm_cpu_context *ctxt)
+ 	return vcpu;
+ }
+ 
+-static inline bool ctxt_is_guest(struct kvm_cpu_context *ctxt)
++static __always_inline bool ctxt_is_guest(struct kvm_cpu_context *ctxt)
+ {
+ 	return host_data_ptr(host_ctxt) != ctxt;
+ }
+ 
+-static inline u64 *ctxt_mdscr_el1(struct kvm_cpu_context *ctxt)
++static __always_inline u64 *ctxt_mdscr_el1(struct kvm_cpu_context *ctxt)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt_to_vcpu(ctxt);
+ 
+@@ -54,7 +54,7 @@ static inline u64 ctxt_midr_el1(struct kvm_cpu_context *ctxt)
+ 	return kvm_read_vm_id_reg(kvm, SYS_MIDR_EL1);
+ }
+ 
+-static inline void __sysreg_save_common_state(struct kvm_cpu_context *ctxt)
++static __always_inline void __sysreg_save_common_state(struct kvm_cpu_context *ctxt)
+ {
+ 	*ctxt_mdscr_el1(ctxt)	= read_sysreg(mdscr_el1);
+ 
+@@ -197,7 +197,7 @@ static inline void __sysreg_save_el2_return_state(struct kvm_cpu_context *ctxt)
+ 		ctxt_sys_reg(ctxt, VDISR_EL2) = read_sysreg_s(SYS_VDISR_EL2);
+ }
+ 
+-static inline void __sysreg_restore_common_state(struct kvm_cpu_context *ctxt)
++static __always_inline void __sysreg_restore_common_state(struct kvm_cpu_context *ctxt)
+ {
+ 	write_sysreg(*ctxt_mdscr_el1(ctxt),  mdscr_el1);
+ 
+-- 
+2.43.0
+
