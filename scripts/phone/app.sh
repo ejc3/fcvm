@@ -12,8 +12,18 @@ set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)/fleet/phone-app
 ROOT=$("$(dirname "$0")/aosp.sh" --root-path)
 WORK=$ROOT/phone-work
-id=$(cd "$SRC" && find . -type f -not -path '*/build/*' -not -path './.gradle/*' -not -path './.kotlin/*' -print0 \
-  | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+# The id names the app's sources: every file in $SRC but those its .gitignore ignores, the
+# outputs a build leaves there. A build must not change the id: build.sh builds the app and
+# asks for its path afterwards, and a cold `make apk` stages the Gradle archive in
+# .gradle-dist/, which once moved the path to an app nobody built (ejc3/aws#823). Each line of
+# .gitignore is a directory (`name/`) or a file name pattern, ignored at any depth, as git does.
+skip=()
+while IFS= read -r pattern; do
+  case "$pattern" in '' | '#'*) continue ;; esac
+  [[ "$pattern" =~ ^[A-Za-z0-9._*-]+/?$ ]]     || { echo "app.sh: $SRC/.gitignore: '$pattern' is not a directory or file name pattern" >&2; exit 2; }
+  if [[ "$pattern" == */ ]]; then skip+=(-not -path "*/${pattern%/}/*"); else skip+=(-not -name "$pattern"); fi
+done < "$SRC/.gitignore"
+id=$(cd "$SRC" && find . -type f "${skip[@]}" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
 APK=$WORK/robotpark-$id.apk
 if [ "${1:-}" = --apk-path ]; then echo "$APK"; exit 0; fi
 # One build and publication at a time in this checkout: a second run waits, then finds the
