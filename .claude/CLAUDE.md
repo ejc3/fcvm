@@ -244,6 +244,24 @@ on the present, and the `default` profile keeps the clock running through a paus
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;
 `every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
 
+## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
+
+A fleet mode (wall, phones, Windows, Minecraft, potato) counts as working only when the
+viewer-path smoke passes for it from an IPv4-only viewer and an IPv6 viewer
+(`fleet/coord/stage-smoke.py`, `.github/workflows/fleet-viewer-smoke.yml`; the rule and what
+each check requires are in docs/fleet/ARCHITECTURE.md, "When a mode counts as working"). Tiles
+the coordinator reports `running`, a host-side health check or a socket that opens are not
+evidence. Never report a mode "up", "deployed" or "working" on anything less.
+
+- Every port a viewer connects to is declared once, in `fleet/published-ports.json`. The agent
+  allocates from it and refuses a place outside it; the smoke refuses a published URL outside
+  it; ejc3/aws derives the GPU hosts' security group range from it. A new mode or a new place
+  count changes that file first.
+- 2026-11-13: Windows and Minecraft reported every sandbox and server up on staging while
+  every tile was black. The security group dropped their IPv4 ports, Windows over IPv6 never
+  answered the TLS handshake, and Minecraft published no IPv4 path. The deploy smoke checked
+  only the wall's renderers, over IPv4, on ports it hardcoded.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,

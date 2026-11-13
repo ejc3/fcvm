@@ -69,6 +69,36 @@ The detail view:
   action). When it is on, the coordinator relaunches every tile on that schedule, fcvm and
   EC2 alike, so the two clocks keep ticking without anyone clicking.
 
+## When a mode counts as working
+
+A mode (the wall, phones, Windows, Minecraft, potato) is up only when the viewer-path smoke
+(`fleet/coord/stage-smoke.py`, run by `.github/workflows/fleet-viewer-smoke.yml`) passes for
+it from an IPv4-only viewer and from an IPv6 viewer. The coordinator reporting a tile
+`running`, a host-side health check, or a TLS socket that only opens do not count. On
+2026-11-13 Windows and Minecraft reported every sandbox and server up on staging while every
+tile was black: IPv4 viewers were dropped by the security group (ports past 20207), Windows
+over IPv6 never answered the TLS handshake, and Minecraft had no IPv4 path at all.
+
+For each tile the coordinator's state lists, in each family, the smoke requires:
+
+- a URL in that family, on a launch name of the zone, on a port that
+  `fleet/published-ports.json` declares for the tile's mode and family;
+- the name's address from public DNS, then TCP, a TLS handshake against the viewer's trust
+  and the WebSocket upgrade;
+- the mode's first real payload: frames that decode (ffmpeg) to a picture that is not flat
+  (wall, phones, Windows), a map that fills its grid (Minecraft), a verified catch seen on
+  /live (potato, which has no viewer socket);
+- for Minecraft, one take-over round trip: borrow a server, a drive message it acknowledges
+  as its driver's, give it back.
+
+A tile that is not running when the wait ends, a mode the coordinator reports nothing of,
+and a family without a URL each fail. A smoke that cannot check blocks: no ffmpeg, a runner
+without the family, or (for the IPv4 run) a runner that also reaches IPv6, since then its
+pass says nothing about IPv4-only viewers. Its output names tiles by id with fixed error text,
+never a URL, host name or token. It runs after every coordinator and web deploy to staging
+and daily; a failure fails the job on main and opens or updates the `fleet-viewer-smoke`
+issue.
+
 ## Components
 
 ```

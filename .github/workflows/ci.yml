@@ -302,7 +302,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Coordinator release and IPv4 staging probe tests
+      # The viewer-path smoke's tests encode and decode H.264 with ffmpeg (libx264).
+      - name: Install ffmpeg
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg
+      - name: Coordinator release and viewer-path smoke tests
         run: python3 -B fleet/coord/test_release.py
       - name: Fleet image IP-options guard tests
         run: python3 -B fleet/ami/test_ip_options.py

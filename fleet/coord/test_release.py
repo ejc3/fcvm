@@ -6,12 +6,14 @@ import fnmatch
 import io
 import copy
 import errno
+import ipaddress
 import json
 import os
 import socket
 import struct
 import base64
 import hashlib
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -258,7 +260,7 @@ class FailureTests(unittest.TestCase):
         out = io.StringIO()
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
                 contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
-            smoke.run()
+            smoke.run(["--relaunch"])
         return json.loads(out.getvalue().strip().splitlines()[-1])
 
     def test_a_closed_live_socket_names_its_step_and_message(self):
@@ -428,6 +430,374 @@ class ReconnectTests(unittest.TestCase):
         self.assertIsInstance(result["error"], RuntimeError)
         self.assertEqual(len(result["connections"]), 1)
         self.assertEqual(result["intents"], [])
+
+
+class FakeViewerServer:
+    """A tile on loopback as a viewer meets it: TCP, then TLS with a throwaway CA, the
+    WebSocket upgrade, the client's first message, then what `behave` sends."""
+
+    def __init__(self, test, family, behave, tls=True):
+        import ssl as _ssl
+        import threading
+        self.behave, self.first = behave, []
+        af, host = (socket.AF_INET, "127.0.0.1") if family == "v4" else (socket.AF_INET6, "::1")
+        self.listener = socket.socket(af, socket.SOCK_STREAM)
+        self.listener.bind((host, 0))
+        self.listener.listen(8)
+        self.port, self.host = self.listener.getsockname()[1], host
+        test.addCleanup(self.listener.close)
+        self.context = None
+        if tls:
+            self.context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            self.context.load_cert_chain(CERTS["cert"], CERTS["key"])
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                raw, _ = self.listener.accept()
+            except OSError:
+                return
+            import threading
+            threading.Thread(target=self.one, args=(raw,), daemon=True).start()
+
+    def one(self, raw):
+        try:
+            if self.context is None:  # accepts TCP and never answers the TLS handshake
+                raw.recv(4096)
+                time.sleep(60)
+                return
+            s = self.context.wrap_socket(raw, server_side=True)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(1)
+            key = [l.split(b":", 1)[1].strip() for l in head.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            s.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            self.first.append(read_client_message(s))
+            self.behave(s, self)
+            time.sleep(5)
+        except OSError:
+            pass
+
+
+def read_client_message(s):
+    s.recv(1)
+    b = s.recv(1)[0]
+    n = b & 127
+    if n == 126:
+        n = struct.unpack(">H", s.recv(2))[0]
+    mask = s.recv(4)
+    data = b""
+    while len(data) < n:
+        data += s.recv(n - len(data))
+    return json.loads(bytes(c ^ mask[i % 4] for i, c in enumerate(data)))
+
+
+def send_server(s, payload, opcode=1):
+    if isinstance(payload, dict):
+        payload = json.dumps(payload).encode()
+    n = len(payload)
+    size = bytes([n]) if n < 126 else (b"\x7e" + struct.pack(">H", n) if n < 65536 else b"\x7f" + struct.pack(">Q", n))
+    s.sendall(bytes([0x80 | opcode]) + size + payload)
+
+
+CERTS = {}
+
+
+def make_certs(directory):
+    """A throwaway CA and a leaf for *.tiles.fcvm.dev, as the host-image acceptance makes."""
+    import subprocess
+    d = Path(directory)
+    run = lambda *a: subprocess.run(a, check=True, capture_output=True)
+    run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", str(d / "ca.key"), "-out", str(d / "ca.pem"), "-days", "1", "-subj", "/CN=viewer-path test CA")
+    run("openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", str(d / "leaf.key"), "-out", str(d / "leaf.csr"), "-subj", "/CN=tiles.fcvm.dev")
+    (d / "ext").write_text("subjectAltName=DNS:*.tiles.fcvm.dev\nbasicConstraints=CA:FALSE\n")
+    run("openssl", "x509", "-req", "-in", str(d / "leaf.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+        "-CAcreateserial", "-out", str(d / "leaf.pem"), "-days", "1", "-extfile", str(d / "ext"))
+    CERTS.update(ca=str(d / "ca.pem"), cert=str(d / "leaf.pem"), key=str(d / "leaf.key"))
+
+
+def h264(source):
+    """Access units of a 64x48 H.264 stream of an ffmpeg lavfi source, split at their delimiters."""
+    import subprocess
+    out = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", source + (":" if "=" in source else "=") + "size=64x48:rate=30", "-frames:v", "6",
+                          "-c:v", "libx264", "-bf", "0", "-g", "30", "-bsf:v", "h264_metadata=aud=insert",
+                          "-f", "h264", "pipe:1"], check=True, capture_output=True).stdout
+    aud = b"\x00\x00\x00\x01\x09"
+    return [aud + u for u in out.split(aud) if u]
+
+
+def fcvf(unit, keyframe, n):
+    return b"FCVF\x01" + bytes([1 if keyframe else 0]) + struct.pack("<HHdI", 64, 48, n / 30, n) + unit
+
+
+def stream_of(source):
+    units = h264(source)
+    def behave(s, server):
+        send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
+        for i, u in enumerate(units):
+            send_server(s, fcvf(u, i == 0, i), opcode=2)
+    return behave
+
+
+class ViewerPathTests(unittest.TestCase):
+    """The viewer path against tiles on loopback: what each broken state of 2026-11 looked like
+    to a viewer must fail, and a tile that streams a picture must pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.dir = tempfile.TemporaryDirectory()
+        make_certs(cls.dir.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def tile(self, mode, server=None, family="v4", **extra):
+        port = server.port if server else 20208
+        host = "win-1-abcdefgh" + ("-v4" if family == "v4" else "") + ".tiles.fcvm.dev"
+        path = "/view" if mode == "minecraft" else "/frames"
+        url = f"wss://{host}:{port}{path}" if port != 443 else f"wss://{host}{path}"
+        key = "frame_url_v4" if family == "v4" else "frame_url"
+        return {"id": "t:1", "slot": "mc-1" if mode == "minecraft" else "win-1", "phase": "running",
+                key: url, **extra}
+
+    def probe(self, mode, tile, family="v4", server=None, admit="v1.9.v-1.mac", ports=None, **kw):
+        addr = ipaddress.ip_address(server.host) if server else ipaddress.ip_address("192.0.2.9")
+        declared = ports if ports is not None else {server.port} if server else None
+        patches = [patch.object(smoke, "lookup", lambda host, fam, r: [addr]),
+                   patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["ca"]})]
+        if declared is not None:
+            patches.append(patch.object(smoke, "declared_ports", lambda m, f, h="fcvm": declared))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            stack.enter_context(patch.object(smoke, "PROBE_SECONDS", 3))
+            return smoke.probe_tile(mode, "fcvm", tile, family, admit, "v-1", ["192.0.2.53"], **kw)
+
+    def test_a_streaming_tile_decodes_to_a_picture_over_each_family(self):
+        for family in ("v4", "v6"):
+            with self.subTest(family=family):
+                server = FakeViewerServer(self, family, stream_of("testsrc"))
+                p = self.probe("windows", self.tile("windows", server, family), family, server)
+                self.assertTrue(p.ok, p.line())
+                self.assertGreaterEqual(p.detail["lumaSpread"], smoke.FLAT_SPREAD)
+                self.assertEqual(server.first, [{"admit": "v1.9.v-1.mac"}], "the token is the first message")
+
+    def test_a_tile_with_no_url_in_the_family_fails(self):
+        # Minecraft before #1833: view sockets on IPv6 names only.
+        tile = {"id": "mc:1", "slot": "mc-1", "phase": "running",
+                "frame_url": "wss://mc-1-abcdefgh.tiles.fcvm.dev/view", "frame_url_v4": None}
+        p = self.probe("minecraft", tile, "v4")
+        self.assertFalse(p.ok)
+        self.assertEqual((p.step, p.error[1]), ("published URL",
+                         "the coordinator publishes no URL for this tile in this family"))
+
+    def test_a_port_outside_the_declaration_fails_before_any_connection(self):
+        with patch.object(smoke, "Socket", side_effect=AssertionError("connected")):
+            for mode, port in (("windows", 20205), ("wall", 20208), ("minecraft", 20216), ("phones", 20300)):
+                with self.subTest(mode=mode, port=port):
+                    tile = {"id": "x:1", "slot": "x-1", "phase": "running",
+                            "frame_url_v4": f"wss://x-1-abcdefgh-v4.tiles.fcvm.dev:{port}" + ("/view" if mode == "minecraft" else "/frames")}
+                    p = smoke.probe_tile(mode, "fcvm", tile, "v4", None, "v-1", [])
+                    self.assertEqual((p.ok, p.error[1]), (False, "a port outside fleet/published-ports.json for its mode and family"))
+            tile = {"id": "x:1", "frame_url": "wss://x-1-abcdefgh.tiles.fcvm.dev:20208/frames"}
+            self.assertFalse(smoke.probe_tile("windows", "fcvm", tile, "v6", None, "v-1", []).ok, "IPv6 is on 443 only")
+
+    def test_the_declared_ports_are_the_agents(self):
+        ports = json.loads((HERE.parent / "published-ports.json").read_text())
+        base = ports["gpu_host_ipv4"]["base"]
+        self.assertEqual(smoke.declared_ports("windows", "v4"), set(range(base + 8, base + 12)))
+        self.assertEqual(smoke.declared_ports("phones", "v4"), smoke.declared_ports("wall", "v4"))
+        self.assertEqual(smoke.declared_ports("wall", "v4", "ec2"), {443})
+        self.assertEqual(smoke.declared_ports("minecraft", "v6"), {443})
+
+    def test_a_socket_whose_tls_handshake_never_answers_fails(self):
+        # Windows over IPv6: the TCP connection opened and the TLS handshake never answered.
+        server = FakeViewerServer(self, "v6", None, tls=False)
+        with patch.object(smoke, "CONNECT_SECONDS", 1):
+            p = self.probe("windows", self.tile("windows", server, "v6"), "v6", server)
+        self.assertFalse(p.ok)
+        self.assertEqual(p.step, "connect")
+        self.assertEqual(p.error[1], "timed out")
+
+    def test_an_open_socket_that_sends_no_frame_fails(self):
+        server = FakeViewerServer(self, "v4", lambda s, srv: None)
+        p = self.probe("windows", self.tile("windows", server), "v4", server)
+        self.assertFalse(p.ok)
+        self.assertEqual(p.step, "stream header")
+
+    def test_a_flat_picture_is_a_blank_tile(self):
+        server = FakeViewerServer(self, "v4", stream_of("color=c=black"))
+        p = self.probe("wall", self.tile("wall", server), "v4", server)
+        self.assertFalse(p.ok)
+        self.assertEqual(p.error[1], "the tile's first picture is flat: a blank tile")
+
+    def test_a_certificate_the_viewer_does_not_trust_fails(self):
+        server = FakeViewerServer(self, "v4", stream_of("testsrc"))
+        tile = self.tile("windows", server)
+        with patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["cert"]}):
+            addr = ipaddress.ip_address(server.host)
+            with patch.object(smoke, "lookup", lambda h, f, r: [addr]), \
+                    patch.object(smoke, "declared_ports", lambda m, f, h="fcvm": {server.port}):
+                p = smoke.probe_tile("windows", "fcvm", tile, "v4", None, "v-1", [])
+        self.assertFalse(p.ok)
+        self.assertEqual(p.step, "connect")
+
+    def minecraft(self, messages):
+        def behave(s, server):
+            for m in messages:
+                send_server(s, m)
+            while True:
+                m = read_client_message(s)
+                if m.get("type") == "drive":
+                    server.first.append(m)
+                    send_server(s, {"type": "drive_ack", "seq": m["seq"], "ok": m["seq"] >= 2})
+        return behave
+
+    def test_a_minecraft_tile_must_send_its_hello_then_a_map(self):
+        good = [{"type": "hello", "tile": "mc-1", "generation": 1, "bots": 2},
+                {"type": "map", "seq": 1, "region": {"x0": 0, "z0": 0, "w": 2, "h": 2},
+                 "cells": base64.b64encode(bytes([3, 64] * 4)).decode()}]
+        server = FakeViewerServer(self, "v4", self.minecraft(good))
+        p = self.probe("minecraft", self.tile("minecraft", server), "v4", server, takeover=True)
+        self.assertTrue(p.ok, p.line())
+        self.assertEqual(p.detail["mapColumns"], 4)
+        self.assertIn("driveAckMs", p.detail, "the take-over waited for an acknowledged drive")
+        unread = {**good[1], "cells": base64.b64encode(bytes(8)).decode()}
+        for messages, step in (([{**good[0], "tile": "mc-2"}], "view hello"), (good[:1], "view map"),
+                               ([good[0], unread], "view map")):
+            with self.subTest(step=step):
+                server = FakeViewerServer(self, "v4", self.minecraft(messages))
+                p = self.probe("minecraft", self.tile("minecraft", server), "v4", server)
+                self.assertEqual((p.ok, p.step), (False, step))
+
+    def test_without_admission_a_view_socket_names_the_viewer(self):
+        good = [{"type": "hello", "tile": "mc-1"}, {"type": "map", "region": {"w": 1, "h": 1},
+                "cells": base64.b64encode(bytes([3, 64])).decode()}]
+        server = FakeViewerServer(self, "v4", self.minecraft(good))
+        self.assertTrue(self.probe("minecraft", self.tile("minecraft", server), "v4", server, admit=None).ok)
+        self.assertEqual(server.first[0], {"viewer": "v-1"})
+
+    def test_a_probe_line_carries_no_url_host_or_token(self):
+        server = FakeViewerServer(self, "v4", lambda s, srv: None)
+        tile = self.tile("windows", server)
+        p = self.probe("windows", tile, "v4", server)
+        text = json.dumps(p.line())
+        for secret in ("tiles.fcvm.dev", "127.0.0.1", "v1.9.v-1.mac", str(server.port)):
+            self.assertNotIn(secret, text)
+
+    def test_every_tile_the_state_names_is_expected_and_a_missing_mode_fails(self):
+        state = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "running"},
+                           {"id": "fcvm:2", "half": "fcvm", "phase": "waiting_capacity"},
+                           {"id": "fcvm:3", "half": "fcvm", "phase": "borrowed", "borrowed": {"viewer": "v-9"}}],
+                 "windows": {"tiles": [{"id": "win:1", "phase": "running"}]},
+                 # A lent server keeps its URLs: everyone watches it, so it is checked.
+                 "minecraft": {"tiles": [{"id": "mc:1", "phase": "borrowed", "borrowed": {"viewer": "v-9"},
+                                          "frame_url": "wss://mc-1-abcdefgh.tiles.fcvm.dev/view"}]},
+                 "aggregates": [{"id": "agg:h", "half": "fcvm", "frame_url": None, "frame_url_v4": None}]}
+        jobs, failed = smoke.sweep_jobs(state, ("wall", "windows", "minecraft", "phones"), "v4", None, "v-1", [])
+        self.assertEqual([j[2]["id"] for j in jobs], ["fcvm:1", "win:1", "mc:1"])
+        self.assertEqual([(f.mode, f.tile, f.error[1]) for f in failed],
+                         [("wall", "fcvm:2", "the tile is not running"),
+                          ("phones", None, "the coordinator reports no tiles of this mode")])
+        self.assertFalse(smoke.settled(state, ("wall",)))
+        self.assertTrue(smoke.settled({**state, "tiles": state["tiles"][:1]}, ("wall", "windows", "minecraft")))
+        self.assertFalse(smoke.settled(state, ("potato",)))
+
+    def test_the_viewer_must_have_its_family_and_with_single_family_only_it(self):
+        with patch.object(smoke, "reaches", lambda f: f == "v4"):
+            smoke.prove_viewer("v4", single=True)
+            with self.assertRaises(RuntimeError):
+                smoke.prove_viewer("v6", single=False)
+        with patch.object(smoke, "reaches", lambda f: True), self.assertRaises(AssertionError):
+            smoke.prove_viewer("v4", single=True)
+        with patch.object(smoke, "reaches", lambda f: True):
+            smoke.prove_viewer("v6", single=False)
+
+    def test_no_decoder_blocks(self):
+        with patch.object(smoke.shutil, "which", return_value=None), self.assertRaises(RuntimeError):
+            smoke.decode([b"\x00"], 1, 1)
+
+    def test_a_failed_tile_fails_the_run_with_its_step(self):
+        out = io.StringIO()
+        with patch.object(smoke, "main", return_value=2), contextlib.redirect_stdout(out), \
+                self.assertRaises(SystemExit):
+            smoke.run(["--modes", "windows"])
+        self.assertEqual(json.loads(out.getvalue().splitlines()[-1]),
+                         {"status": "failed", "step": "viewer path", "errorType": "AssertionError",
+                          "error": "a tile failed the viewer path"})
+
+
+class ViewerPathFlowTests(unittest.TestCase):
+    """main() with modes: it waits for every mode to settle, probes every tile, borrows a
+    Minecraft server and gives it back, and needs a potato catch it saw."""
+
+    def run_flow(self, claim="committed", catch=True):
+        clock, sent, probed = [100.0], [], []
+        tile = lambda i, **k: {"id": f"t:{i}", "slot": f"s-{i}", "half": "fcvm", "phase": "running",
+                               "frame_url": "wss://x.tiles.fcvm.dev/frames", "frame_url_v4": None, **k}
+        state = {"tiles": [tile(1)], "phones": {"tiles": [tile(2)]}, "windows": {"tiles": [tile(3, phase="restoring")]},
+                 "minecraft": {"tiles": [tile(4)]}, "potato": {"capacity": 4, "round": {"seq": 7}}}
+        class Live:
+            def __init__(self, *a, **k):
+                self.queue = [{"type": "hello", "viewer": "v-1"},
+                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                              {"type": "snapshot", "state": copy.deepcopy(state)}]
+            def send(self, m):
+                if m.get("type") != "intent":
+                    return
+                sent.append(m["name"])
+                self.queue.append({"type": "receipt", "id": m["id"],
+                                   "outcome": claim if m["name"] == "claim_minecraft" else "committed"})
+                if m["name"] == "claim_minecraft" and claim == "committed":
+                    state["minecraft"]["tiles"][0]["borrowed"] = {"viewer": "v-1"}
+                    self.queue.append({"type": "snapshot", "state": copy.deepcopy(state)})
+            def message(self, deadline):
+                clock[0] += 1
+                if not self.queue:
+                    if catch:
+                        state["potato"]["round"]["seq"] += 1
+                    state["windows"]["tiles"][0]["phase"] = "running"
+                    return 1, json.dumps({"type": "snapshot", "state": copy.deepcopy(state)}).encode()
+                return 1, json.dumps(self.queue.pop(0)).encode()
+            def close(self): pass
+        def probe(mode, half, t, family, admit, viewer, resolvers, takeover=None):
+            probed.append((mode, t["id"], admit, bool(takeover)))
+            p = smoke.Probe(mode, t["id"], family)
+            p.ok = True
+            return p
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), patch.object(smoke, "probe_tile", probe), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v6", modes=smoke.MODES, relaunch=False, takeover=True)
+        return failed, sent, probed, [json.loads(l) for l in out.getvalue().splitlines()]
+
+    def test_every_mode_is_probed_after_it_settles_and_the_borrow_is_returned(self):
+        failed, sent, probed, lines = self.run_flow()
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(sorted(i for _, i, _, t in probed if not t), ["t:1", "t:2", "t:3", "t:4"])
+        self.assertEqual([(m, i, a) for m, i, a, t in probed if t], [("minecraft", "t:4", "tok")])
+        self.assertEqual(sent, ["claim_minecraft", "release_minecraft"])
+        self.assertTrue(any(l.get("mode") == "potato" and l.get("ok") for l in lines))
+
+    def test_a_refused_take_over_and_no_catch_fail(self):
+        failed, sent, _, lines = self.run_flow(claim="refused", catch=False)
+        self.assertEqual(failed, 2)
+        self.assertEqual(sent, ["claim_minecraft"], "nothing was lent, so nothing is given back")
+        errors = {l.get("error") for l in lines if l.get("ok") is False}
+        self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
 
 
 class ResolveTests(unittest.TestCase):

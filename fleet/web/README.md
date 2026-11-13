@@ -55,6 +55,13 @@ scripts/   dev-mock.ts (run the page on the mock), measure.ts (decode and draw c
            (the coordinator's snapshot states for the contract tests)
 ```
 
+## When a mode counts as working
+
+A mode the page shows is up only when the viewer-path smoke passes for it from an IPv4-only
+viewer and an IPv6 viewer (docs/fleet/ARCHITECTURE.md, "When a mode counts as working"):
+every tile through public DNS and its published port to a decoded picture, a Minecraft map or
+a potato catch. Tiles the coordinator reports running are not enough.
+
 ## Running it
 
 Ports come from the environment or a gitignored `.env.ports`; nothing uses a framework
