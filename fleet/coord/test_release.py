@@ -663,13 +663,15 @@ class ViewerPathTests(unittest.TestCase):
     def test_a_minecraft_tile_must_send_its_hello_then_a_map(self):
         good = [{"type": "hello", "tile": "mc-1", "generation": 1, "bots": 2},
                 {"type": "map", "seq": 1, "region": {"x0": 0, "z0": 0, "w": 2, "h": 2},
-                 "cells": base64.b64encode(bytes(8)).decode()}]
+                 "cells": base64.b64encode(bytes([3, 64] * 4)).decode()}]
         server = FakeViewerServer(self, "v4", self.minecraft(good))
         p = self.probe("minecraft", self.tile("minecraft", server), "v4", server, takeover=True)
         self.assertTrue(p.ok, p.line())
         self.assertEqual(p.detail["mapColumns"], 4)
         self.assertIn("driveAckMs", p.detail, "the take-over waited for an acknowledged drive")
-        for messages, step in (([{**good[0], "tile": "mc-2"}], "view hello"), (good[:1], "view map")):
+        unread = {**good[1], "cells": base64.b64encode(bytes(8)).decode()}
+        for messages, step in (([{**good[0], "tile": "mc-2"}], "view hello"), (good[:1], "view map"),
+                               ([good[0], unread], "view map")):
             with self.subTest(step=step):
                 server = FakeViewerServer(self, "v4", self.minecraft(messages))
                 p = self.probe("minecraft", self.tile("minecraft", server), "v4", server)
@@ -677,7 +679,7 @@ class ViewerPathTests(unittest.TestCase):
 
     def test_without_admission_a_view_socket_names_the_viewer(self):
         good = [{"type": "hello", "tile": "mc-1"}, {"type": "map", "region": {"w": 1, "h": 1},
-                "cells": base64.b64encode(bytes(2)).decode()}]
+                "cells": base64.b64encode(bytes([3, 64])).decode()}]
         server = FakeViewerServer(self, "v4", self.minecraft(good))
         self.assertTrue(self.probe("minecraft", self.tile("minecraft", server), "v4", server, admit=None).ok)
         self.assertEqual(server.first[0], {"viewer": "v-1"})
@@ -695,14 +697,17 @@ class ViewerPathTests(unittest.TestCase):
                            {"id": "fcvm:2", "half": "fcvm", "phase": "waiting_capacity"},
                            {"id": "fcvm:3", "half": "fcvm", "phase": "borrowed", "borrowed": {"viewer": "v-9"}}],
                  "windows": {"tiles": [{"id": "win:1", "phase": "running"}]},
+                 # A lent server keeps its URLs: everyone watches it, so it is checked.
+                 "minecraft": {"tiles": [{"id": "mc:1", "phase": "borrowed", "borrowed": {"viewer": "v-9"},
+                                          "frame_url": "wss://mc-1-abcdefgh.tiles.fcvm.dev/view"}]},
                  "aggregates": [{"id": "agg:h", "half": "fcvm", "frame_url": None, "frame_url_v4": None}]}
-        jobs, failed = smoke.sweep_jobs(state, ("wall", "windows", "minecraft"), "v4", None, "v-1", [])
-        self.assertEqual([j[2]["id"] for j in jobs], ["fcvm:1", "win:1"])
+        jobs, failed = smoke.sweep_jobs(state, ("wall", "windows", "minecraft", "phones"), "v4", None, "v-1", [])
+        self.assertEqual([j[2]["id"] for j in jobs], ["fcvm:1", "win:1", "mc:1"])
         self.assertEqual([(f.mode, f.tile, f.error[1]) for f in failed],
                          [("wall", "fcvm:2", "the tile is not running"),
-                          ("minecraft", None, "the coordinator reports no tiles of this mode")])
+                          ("phones", None, "the coordinator reports no tiles of this mode")])
         self.assertFalse(smoke.settled(state, ("wall",)))
-        self.assertTrue(smoke.settled({**state, "tiles": state["tiles"][:1]}, ("wall", "windows")))
+        self.assertTrue(smoke.settled({**state, "tiles": state["tiles"][:1]}, ("wall", "windows", "minecraft")))
         self.assertFalse(smoke.settled(state, ("potato",)))
 
     def test_the_viewer_must_have_its_family_and_with_single_family_only_it(self):

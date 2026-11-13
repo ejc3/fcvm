@@ -459,6 +459,14 @@ def mine(tile, viewer):
     return bool(tile.get("borrowed")) and (tile["borrowed"] or {}).get("viewer") == viewer
 
 
+def private(tile, viewer):
+    """Lent to another viewer with its stream withdrawn from everyone else (a wall tile, a phone,
+    a sandbox): not this viewer's to check. A lent Minecraft server keeps its URLs, since everyone
+    watches it, so it is checked like any other."""
+    return (bool(tile.get("borrowed")) and not mine(tile, viewer)
+            and not tile.get("frame_url") and not tile.get("frame_url_v4"))
+
+
 def settled(state, modes, viewer=None):
     """Every tile of every mode is running (a tile lent to another viewer is left out: its stream
     is its viewer's), and the potato game has players."""
@@ -472,7 +480,7 @@ def settled(state, modes, viewer=None):
         if not tiles:
             return False
         for _, t in tiles:
-            if t.get("phase") != "running" and not (t.get("borrowed") and not mine(t, viewer)):
+            if t.get("phase") not in ("running", "borrowed") and not private(t, viewer):
                 return False
     return True
 
@@ -631,6 +639,10 @@ def prove_view(connection, slot, deadline, probe):
             raise AssertionError("the view's map cells are not base64")
         if len(cells) != w * h * 2:
             raise AssertionError("the view's map cells do not fill its region")
+        # A column the tile has not read is material 0 at height 0: a map of only those is a
+        # blank tile.
+        if not any(cells):
+            raise AssertionError("the view's map holds no column the server has read: a blank tile")
         return {"mapColumns": w * h, "bots": hello.get("bots")}
     raise TimeoutError("the server sent no map in time")
 
@@ -722,9 +734,9 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
         for half, t in tiles:
             if mode == "aggregate" and not (t.get("frame_url") or t.get("frame_url_v4")):
                 continue  # an aggregator that serves no browser: aggregation is off
-            if t.get("borrowed") and not mine(t, viewer):
+            if private(t, viewer):
                 continue
-            if t.get("phase", "running") != "running":
+            if t.get("phase", "running") not in ("running", "borrowed"):
                 p = Probe(mode, t.get("id"), family)
                 p.step, p.error = "coordinator state", ("AssertionError", "the tile is not running")
                 failed.append(p)
