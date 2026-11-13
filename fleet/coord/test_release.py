@@ -800,6 +800,25 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
 
 
+class SmokeWorkflowTests(unittest.TestCase):
+    """The deploys call fleet-viewer-smoke.yml. Its jobs read the Access token from the
+    fleet-stage-deploy environment's secrets, which a called workflow gets only when its caller
+    passes them: without `secrets: inherit` the first run on main sent an empty token and failed
+    its Access check (2026-11-13)."""
+
+    def test_every_caller_of_the_smoke_passes_its_secrets(self):
+        import re
+        callers = 0
+        for path in sorted((HERE.parent.parent / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text()
+            for job in re.split(r"(?m)^  (?=[\w-]+:\n)", text.split("\njobs:\n", 1)[-1]):
+                if "uses: ./.github/workflows/fleet-viewer-smoke.yml" not in job:
+                    continue
+                callers += 1
+                self.assertRegex(job, r"(?m)^    secrets: inherit$", f"{path.name}: the smoke gets no secrets")
+        self.assertEqual(callers, 2, "the coordinator and web deploys both call the smoke")
+
+
 class ResolveTests(unittest.TestCase):
     """The public-resolver check against a resolver on loopback that answers as it is told."""
 
