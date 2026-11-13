@@ -542,7 +542,11 @@ pub fn fill_from(dest: &File, source: &Path, threads: usize) -> Result<FillStats
     if dest.metadata()?.len() < size {
         bail!("the hugepage file is smaller than {}", source.display());
     }
-    let extents = data_extents(&src, size)?;
+    // A run still dirty in this kernel's page cache over FUSE (a nested L1) would read as a
+    // hole and stay zeros in guest memory.
+    crate::uffd::flush_for_hole_walk(&src)?;
+    let mut extents = Vec::new();
+    crate::uffd::for_each_data_run(&src, size, |start, end| extents.push((start, end - start)))?;
     let data: u64 = extents.iter().map(|(_, len)| len).sum();
     // 32 MiB pieces, taken in turn by the threads.
     const PIECE: u64 = 32 << 20;
@@ -612,36 +616,6 @@ pub fn fill_from(dest: &File, source: &Path, threads: usize) -> Result<FillStats
     };
     debug!(?stats, "filled hugepage guest memory from the memory file");
     Ok(stats)
-}
-
-/// `(offset, len)` of every data extent of `file` (`SEEK_DATA`/`SEEK_HOLE`), the whole file
-/// when the filesystem does not report holes.
-fn data_extents(file: &File, size: u64) -> Result<Vec<(u64, u64)>> {
-    let fd = file.as_raw_fd();
-    let mut out = Vec::new();
-    let mut at: i64 = 0;
-    while (at as u64) < size {
-        // SAFETY: lseek on a descriptor this function borrows.
-        let data = unsafe { libc::lseek(fd, at, libc::SEEK_DATA) };
-        if data < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ENXIO) {
-                break;
-            }
-            return Err(error).context("SEEK_DATA on the memory file");
-        }
-        // SAFETY: as above.
-        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(std::io::Error::last_os_error()).context("SEEK_HOLE on the memory file");
-        }
-        let end = (hole as u64).min(size);
-        if end > data as u64 {
-            out.push((data as u64, end - data as u64));
-        }
-        at = hole;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
