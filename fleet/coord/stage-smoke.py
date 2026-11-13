@@ -14,7 +14,8 @@ blocks.
     stage-smoke.py [--family v4|v6] [--single-family] [--modes wall,phones,...] [--relaunch]
                    [--takeover]
 
-Failure output carries no URL, host name or token: tile ids, the mode, the family and fixed text.
+Failure output carries no URL, host name or token: tile ids, the mode, the family and fixed text
+(and, for potato, the numbers and fixed words PotatoWatch keeps).
 """
 import ast
 import base64
@@ -492,6 +493,8 @@ class Probe:
     def __init__(self, mode, tile, family):
         self.mode, self.tile, self.family = mode, tile, family
         self.step, self.ok, self.error, self.detail = "start", False, None, {}
+        # What a failed check saw that attributes it (numbers and fixed words only).
+        self.seen = None
 
     def line(self):
         out = {"mode": self.mode, "tile": self.tile, "family": self.family, "ok": self.ok}
@@ -499,6 +502,8 @@ class Probe:
             out.update(self.detail)
         else:
             out.update(step=self.step, errorType=self.error[0], error=self.error[1])
+            if self.seen is not None:
+                out["seen"] = self.seen
         return out
 
 
@@ -767,15 +772,71 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
     return jobs, failed
 
 
-def potato_probe(family, caught):
+def potato_probe(family, caught, seen=None):
     """The potato game has no viewer socket: the page draws /live. A verified catch while the
-    smoke watched (the round's latest catch moved) is its first real payload."""
+    smoke watched (the round's latest catch moved) is its first real payload. Without one, the
+    line carries what the watch saw (PotatoWatch)."""
     p = Probe("potato", None, family)
     if caught:
         p.ok, p.detail = True, {"verifiedCatch": True}
     else:
         p.step, p.error = "verified catch", ("AssertionError", "no verified catch while the smoke watched")
+        p.seen = seen
     return p
+
+
+class PotatoWatch:
+    """What /live said of the potato game while the smoke waited for a catch: each round seen
+    (id, size, latest seq), each drop (round, reason, stage), the players' phases at the end and
+    how many snapshots arrived. It tells a round that never caught from one that kept dropping,
+    from no round at all, from a /live that sent nothing. A drop's `detail` and a failure's error
+    are free text that can name an address, so only numbers and fixed words are kept."""
+
+    KEEP = 10
+
+    def __init__(self, started):
+        self.started, self.last, self.snapshots = started, None, 0
+        self.rounds, self.drops, self.potato = [], [], {}
+
+    @staticmethod
+    def word(value):
+        return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,31}", value) else None
+
+    @staticmethod
+    def number(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    def see(self, state):
+        if state is self.last:
+            return
+        self.last, self.snapshots = state, self.snapshots + 1
+        potato = state.get("potato")
+        self.potato = potato if isinstance(potato, dict) else {}
+        r = self.potato.get("round")
+        if isinstance(r, dict):
+            entry = {k: self.number(r.get(k)) for k in ("id", "size", "seq")}
+            if self.rounds and self.rounds[-1]["id"] == entry["id"]:
+                self.rounds[-1] = entry
+            else:
+                self.rounds.append(entry)
+        d = self.potato.get("last_drop")
+        if isinstance(d, dict):
+            entry = {"round": self.number(d.get("round")), "size": self.number(d.get("size")),
+                     "reason": self.word(d.get("reason")), "player": self.number(d.get("player")),
+                     "seq": self.number(d.get("seq")), "stage": self.word(d.get("stage")),
+                     "stageMs": self.number(d.get("stage_ms"))}
+            if entry not in self.drops:
+                self.drops.append(entry)
+
+    def evidence(self, now):
+        phases = {}
+        for player in self.potato.get("players") or []:
+            phase = self.word(player.get("phase")) if isinstance(player, dict) else None
+            phases[phase or "other"] = phases.get(phase or "other", 0) + 1
+        return {"watchedSeconds": round(now - self.started, 1), "snapshots": self.snapshots,
+                "capacity": self.number(self.potato.get("capacity")),
+                "rounds": self.rounds[-self.KEEP:], "drops": self.drops[-self.KEEP:],
+                "phases": dict(sorted(phases.items()))}
 
 
 def relaunch_interval_seconds():
@@ -979,13 +1040,16 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
         probes.append(minecraft_takeover(family, token, viewer, resolvers, until, commit, now))
     if "potato" in modes:
         step("/live: a verified potato catch")
-        watch_by = time.monotonic() + 90
+        watch = PotatoWatch(time.monotonic())
+        watch_by = watch.started + 90
         def caught(s):
+            watch.see(s)
             seq = ((s.get("potato") or {}).get("round") or {}).get("seq")
             return (seq is not None and seq != catches) or time.monotonic() > watch_by
         until(caught)
         seq = ((now()[0].get("potato") or {}).get("round") or {}).get("seq")
-        probes.append(potato_probe(family, seq is not None and seq != catches))
+        probes.append(potato_probe(family, seq is not None and seq != catches,
+                                   watch.evidence(time.monotonic())))
     for p in probes:
         print(json.dumps(p.line()), flush=True)
     failed = sum(not p.ok for p in probes)

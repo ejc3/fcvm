@@ -832,6 +832,55 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
 
 
+class PotatoEvidenceTests(unittest.TestCase):
+    """A potato check that sees no catch names what the game did while the smoke watched: the
+    rounds, the drops with their reason and stage, the player phases and how many snapshots
+    arrived. The staging run of 2026-11-13 (43456580894) printed only "no verified catch" in
+    both families, and the coordinator's log is not readable where the smoke runs, so nothing
+    said whether a round was running, dropping or absent."""
+
+    def test_a_failed_watch_carries_the_rounds_drops_and_player_phases_it_saw(self):
+        drop = {"round": 41, "size": 64, "reason": "not_listening", "player": 3, "seq": 0,
+                "stage": "waking", "stage_ms": 812.5, "at": 1_000_060_000,
+                "detail": "player 3 was waking when player 2 threw (to [2001:db8::1003]:7070)"}
+        players = [{"player": 0, "phase": "awake"}, {"player": 1, "phase": "asleep"},
+                   {"player": 2, "phase": "asleep"}]
+        snapshots = [
+            {"capacity": 96, "round": {"id": 41, "size": 64, "seq": 0, "started_at": 1_000_000_000,
+                                       "last_catch_at": 1_000_050_000}, "players": players},
+            {"capacity": 96, "round": None, "next_round_at": 1_000_065_000, "last_drop": drop,
+             "players": players},
+            {"capacity": 96, "round": {"id": 42, "size": 96, "seq": None, "started_at": 1_000_065_000},
+             "last_drop": drop, "players": players + [{"player": 3, "phase": "booting"}]},
+        ]
+        clock, current = [0.0], [{"potato": snapshots[0]}]
+
+        def until(predicate):
+            for potato in snapshots + [snapshots[-1]] * 3:
+                clock[0] += 40
+                current[0] = {"potato": potato}
+                if predicate(current[0]):
+                    return current[0]
+            raise AssertionError("the watch did not end")
+
+        out = io.StringIO()
+        with patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.viewer_path("v4", ("potato",), False, [], until, None,
+                                       lambda: (current[0], {}, "v-1"))
+        self.assertEqual(failed, 1)
+        line = next(json.loads(l) for l in out.getvalue().splitlines() if '"potato"' in l)
+        self.assertEqual(line["error"], "no verified catch while the smoke watched")
+        seen = line["seen"]
+        self.assertEqual(seen["rounds"], [{"id": 41, "size": 64, "seq": 0}, {"id": 42, "size": 96, "seq": None}])
+        self.assertEqual(seen["drops"], [{"round": 41, "size": 64, "reason": "not_listening", "player": 3,
+                                          "seq": 0, "stage": "waking", "stageMs": 812.5}])
+        self.assertEqual(seen["capacity"], 96)
+        self.assertEqual(seen["phases"], {"asleep": 2, "awake": 1, "booting": 1})
+        self.assertGreaterEqual(seen["snapshots"], 3)
+        self.assertGreaterEqual(seen["watchedSeconds"], 90)
+        self.assertNotIn("2001:db8", json.dumps(line), "a drop's free text can name an address")
+
+
 class HostLocalTests(unittest.TestCase):
     """The image factory's validator has a builder security group that admits no inbound port and
     lets out only 80, 443 and 53 over IPv4, so a host-image acceptance that went out through the

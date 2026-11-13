@@ -87,7 +87,9 @@ For each tile the coordinator's state lists, in each family, the smoke requires:
   and the WebSocket upgrade;
 - the mode's first real payload: frames that decode (ffmpeg) to a picture that is not flat
   (wall, phones, Windows), a map that fills its grid (Minecraft), a verified catch seen on
-  /live (potato, which has no viewer socket);
+  /live within 90 s (potato, which has no viewer socket). Without one, the line's `seen`
+  holds what /live showed meanwhile: each round (id, size, latest seq), each drop (reason,
+  stage), the players' phases and the count of snapshots;
 - for Minecraft, one take-over round trip: borrow a server, a drive message it acknowledges
   as its driver's, give it back.
 
