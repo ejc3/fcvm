@@ -96,6 +96,11 @@ struct StreamActivity {
     from_dest: AtomicU64,
     last_to_dest_ms: AtomicU64,
     last_from_dest_ms: AtomicU64,
+    /// Which way the latest bytes went ([`SENT`] or [`RECEIVED`], 0 before any). The
+    /// timestamps above are milliseconds, and a request written in the millisecond its
+    /// predecessor's reply arrived has the same stamp as that reply, so they cannot order
+    /// the two.
+    last_direction: std::sync::atomic::AtomicU8,
     /// Set when this wait was reported, cleared when the wait ends.
     reported: AtomicBool,
 }
@@ -111,13 +116,20 @@ impl StreamActivity {
             from_dest: AtomicU64::new(0),
             last_to_dest_ms: AtomicU64::new(0),
             last_from_dest_ms: AtomicU64::new(0),
+            last_direction: std::sync::atomic::AtomicU8::new(0),
             reported: AtomicBool::new(false),
         }
     }
 
-    fn record(counter: &AtomicU64, last: &AtomicU64, n: usize) {
+    fn record(&self, direction: u8, n: usize) {
+        let (counter, last) = if direction == SENT {
+            (&self.to_dest, &self.last_to_dest_ms)
+        } else {
+            (&self.from_dest, &self.last_from_dest_ms)
+        };
         counter.fetch_add(n as u64, Ordering::Relaxed);
         last.store(now_ms() + 1, Ordering::Relaxed);
+        self.last_direction.store(direction, Ordering::Relaxed);
     }
 
     /// What this stream has waited on for `threshold_ms` at `now_ms`, if anything.
@@ -127,11 +139,8 @@ impl StreamActivity {
                 .then_some("connecting to its destination");
         }
         let sent = self.last_to_dest_ms.load(Ordering::Relaxed);
-        let received = self.last_from_dest_ms.load(Ordering::Relaxed);
-        // Bytes sent after the last byte back, or with none back yet. A reply read in the
-        // same millisecond as the request counts as answered.
-        (sent != 0
-            && (received == 0 || sent > received)
+        // The latest bytes went to the destination, and nothing has come back since.
+        (self.last_direction.load(Ordering::Relaxed) == SENT
             && now_ms.saturating_sub(sent - 1) >= threshold_ms)
             .then_some("awaiting a reply from its destination")
     }
@@ -159,6 +168,11 @@ impl StreamActivity {
         )
     }
 }
+
+/// [`StreamActivity::last_direction`]: bytes went to the destination.
+const SENT: u8 = 1;
+/// [`StreamActivity::last_direction`]: bytes came back from the destination.
+const RECEIVED: u8 = 2;
 
 /// A session's open streams, shared with its stall scan.
 type ActivityRegistry = Arc<Mutex<HashMap<u32, Arc<StreamActivity>>>>;
@@ -434,7 +448,7 @@ async fn handle_stream(
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            StreamActivity::record(&down.from_dest, &down.last_from_dest_ms, n);
+            down.record(RECEIVED, n);
             if !send_frame(&wtx, stream_id, FRAME_DATA, &buf[..n]).await {
                 break; // Writer channel closed (vsock died)
             }
@@ -451,7 +465,7 @@ async fn handle_stream(
                 FRAME_DATA => {
                     // Recorded before the write, so bytes the destination has read are
                     // always counted.
-                    StreamActivity::record(&up.to_dest, &up.last_to_dest_ms, payload.len());
+                    up.record(SENT, payload.len());
                     if tcp_wr.write_all(&payload).await.is_err() {
                         break;
                     }
@@ -509,6 +523,27 @@ mod tests {
     /// to it and none read back, and a reply ends the wait. Each count is recorded before
     /// the step the test waits on, and the scan is handed a clock past the threshold, so
     /// nothing here depends on timing.
+    /// A request written in the millisecond the previous reply arrived carries the same
+    /// stamp as that reply. It is still the latest event, and still unanswered.
+    #[test]
+    fn a_request_in_the_reply_s_millisecond_is_still_awaiting_its_answer() {
+        let stream = StreamActivity::new(9, "127.0.0.1:443".parse().unwrap());
+        stream.connected.store(true, Ordering::Relaxed);
+        stream.record(SENT, 10);
+        stream.record(RECEIVED, 20);
+        stream.record(SENT, 30);
+        let stamp = stream.last_to_dest_ms.load(Ordering::Relaxed);
+        stream.last_from_dest_ms.store(stamp, Ordering::Relaxed);
+        let threshold = STALL_REPORT_AFTER.as_millis() as u64;
+        assert_eq!(
+            stream.waiting_on(stamp - 1 + threshold, threshold),
+            Some("awaiting a reply from its destination"),
+            "a request sent after the last reply, in the same millisecond, was read as answered"
+        );
+        stream.record(RECEIVED, 5);
+        assert_eq!(stream.waiting_on(stamp - 1 + threshold, threshold), None);
+    }
+
     #[tokio::test]
     async fn a_request_its_destination_never_answers_is_reported_once_with_its_bytes() {
         let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -159,7 +159,16 @@ pub(crate) struct StreamActivity {
     from_host: std::sync::atomic::AtomicU64,
     last_to_host_ms: std::sync::atomic::AtomicU64,
     last_from_host_ms: std::sync::atomic::AtomicU64,
+    /// Which way the latest bytes went ([`SENT`] or [`RECEIVED`], 0 before any). The
+    /// millisecond stamps cannot order a request written in the millisecond its
+    /// predecessor's reply arrived.
+    last_direction: std::sync::atomic::AtomicU8,
 }
+
+/// [`StreamActivity::last_direction`]: bytes went to the host.
+const SENT: u8 = 1;
+/// [`StreamActivity::last_direction`]: bytes came back from the host.
+const RECEIVED: u8 = 2;
 
 /// Every redirected connection that is still open, across sessions.
 static OPEN_STREAMS: std::sync::LazyLock<DashMap<u64, Arc<StreamActivity>>> =
@@ -183,6 +192,7 @@ impl OpenStream {
             from_host: Default::default(),
             last_to_host_ms: Default::default(),
             last_from_host_ms: Default::default(),
+            last_direction: Default::default(),
         });
         let key = NEXT_ACTIVITY_KEY.fetch_add(1, Ordering::Relaxed);
         OPEN_STREAMS.insert(key, activity.clone());
@@ -197,13 +207,15 @@ impl Drop for OpenStream {
 }
 
 impl StreamActivity {
-    fn record(
-        counter: &std::sync::atomic::AtomicU64,
-        last: &std::sync::atomic::AtomicU64,
-        n: usize,
-    ) {
+    fn record(&self, direction: u8, n: usize) {
+        let (counter, last) = if direction == SENT {
+            (&self.to_host, &self.last_to_host_ms)
+        } else {
+            (&self.from_host, &self.last_from_host_ms)
+        };
         counter.fetch_add(n as u64, Ordering::Relaxed);
         last.store(activity_now_ms() + 1, Ordering::Relaxed);
+        self.last_direction.store(direction, Ordering::Relaxed);
     }
 
     fn describe(&self, now_ms: u64) -> String {
@@ -221,7 +233,7 @@ impl StreamActivity {
         let from_host_ms = self.last_from_host_ms.load(Ordering::Relaxed);
         let state = if !self.open_ok.load(Ordering::Relaxed) {
             "awaiting OPEN_OK"
-        } else if to_host_ms != 0 && (from_host_ms == 0 || to_host_ms > from_host_ms) {
+        } else if self.last_direction.load(Ordering::Relaxed) == SENT {
             "awaiting a reply"
         } else {
             "relaying"
@@ -585,7 +597,7 @@ async fn relay_connection(
                 Ok(n) => n,
             };
             // Recorded before the send, so a frame the host has received is always counted.
-            StreamActivity::record(&up.to_host, &up.last_to_host_ms, n);
+            up.record(SENT, n);
             if !writer_state
                 .send_frame(stream_id, FRAME_DATA, &buf[..n])
                 .await
@@ -603,11 +615,7 @@ async fn relay_connection(
             match frame_type {
                 FRAME_DATA => {
                     // Recorded on arrival from the host, before the client takes it.
-                    StreamActivity::record(
-                        &activity.from_host,
-                        &activity.last_from_host_ms,
-                        payload.len(),
-                    );
+                    activity.record(RECEIVED, payload.len());
                     if client_wr.write_all(&payload).await.is_err() {
                         break;
                     }
@@ -925,6 +933,24 @@ mod tests {
     /// The report a silent pull prints shows a stream's request leaving the guest with no
     /// reply, then the reply arriving, then the stream gone once it closes. Each count is
     /// recorded before the step the test waits on, so no step races its record.
+    /// A request sent in the millisecond the previous reply arrived has the same stamp as
+    /// that reply, and is still the one awaiting an answer.
+    #[test]
+    fn a_request_in_the_reply_s_millisecond_reads_as_awaiting_a_reply() {
+        let open = OpenStream::register(11, "127.0.0.1:443".parse().unwrap());
+        let stream = &open.activity;
+        stream.open_ok.store(true, Ordering::Relaxed);
+        stream.record(SENT, 10);
+        stream.record(RECEIVED, 20);
+        stream.record(SENT, 30);
+        let stamp = stream.last_to_host_ms.load(Ordering::Relaxed);
+        stream.last_from_host_ms.store(stamp, Ordering::Relaxed);
+        let line = stream.describe(stamp - 1);
+        assert!(line.contains("awaiting a reply"), "{line}");
+        stream.record(RECEIVED, 5);
+        assert!(stream.describe(stamp - 1).contains("relaying"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn open_streams_report_shows_what_each_stream_carried() {
         let (writer_tx, mut writer_rx) = mpsc::channel(16);
