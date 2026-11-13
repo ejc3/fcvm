@@ -63,6 +63,10 @@ export interface TileFrameStats {
   lag: LagStats | null;
   /** Frame message bytes received since the stream was first opened (the take-over panel's video readout). */
   bytes?: number;
+  /** Sockets that closed (or missed their open deadline) since the stream last decoded a frame. */
+  failures?: number;
+  /** Local Unix ms the next socket opens, while the stream waits out its reconnect delay; null otherwise. */
+  retryAt?: number | null;
 }
 
 export interface FrameStats {

@@ -30,6 +30,7 @@ import {
   parseFrame,
   parseStreamHeader,
   reconnectDelayMs,
+  frameOpenDeadlineMs,
   admitMessage,
   sameStreamAtAnyHeight,
   releaseBefore,
@@ -80,6 +81,10 @@ class TileStream {
   frames: Held[] = [];
   attempt = 0;
   retry: ReturnType<typeof setTimeout> | null = null;
+  /** Local Unix ms the retry timer fires, while it is set (the tile's "retrying in" readout). */
+  retryAt: number | null = null;
+  /** Closes a socket that has not opened by its deadline (frameOpenDeadlineMs). */
+  openDeadline: ReturnType<typeof setTimeout> | null = null;
   closed = false;
   decodedTimes: number[] = [];
   decodeStart = new Map<number, number>();
@@ -128,8 +133,15 @@ class TileStream {
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.ctl = { ...newStream(this.height), wanted: this.height };
+    this.clearOpenDeadline();
+    // A connect whose packets are dropped never fails on its own: close it, which retries.
+    this.openDeadline = setTimeout(() => {
+      this.openDeadline = null;
+      if (this.ws === ws && ws.readyState === WebSocket.CONNECTING) ws.close();
+    }, frameOpenDeadlineMs(this.attempt));
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      this.clearOpenDeadline();
       // The token first: a renderer that needs one reads it before anything else.
       if (this.admit !== null) ws.send(admitMessage(this.admit));
       this.ctl = streamOpened(this.ctl, true);
@@ -142,11 +154,14 @@ class TileStream {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.clearOpenDeadline();
       this.resetDecoder();
       if (this.closed) return;
       const delay = reconnectDelayMs(this.attempt++);
+      this.retryAt = now() + delay;
       this.retry = setTimeout(() => {
         this.retry = null;
+        this.retryAt = null;
         this.open();
       }, delay);
     };
@@ -175,6 +190,7 @@ class TileStream {
   private reopen(): void {
     if (this.retry) clearTimeout(this.retry);
     this.retry = null;
+    this.retryAt = null;
     this.attempt = 0;
     const old = this.ws;
     // Detached first: the old socket's onclose ignores a socket that is no longer this.ws.
@@ -305,9 +321,29 @@ class TileStream {
     return this.decodedTimes.length / 2;
   }
 
+  /** The viewer's Retry: open a socket now instead of after the backoff or the open deadline. */
+  retryNow(): void {
+    if (this.closed || (this.ws !== null && this.ws.readyState === WebSocket.OPEN)) return;
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = null;
+    this.retryAt = null;
+    const old = this.ws;
+    // Detached first: the old socket's onclose ignores a socket that is no longer this.ws.
+    this.ws = null;
+    old?.close();
+    this.open();
+  }
+
+  private clearOpenDeadline(): void {
+    if (this.openDeadline) clearTimeout(this.openDeadline);
+    this.openDeadline = null;
+  }
+
   close(): void {
     this.closed = true;
     if (this.retry) clearTimeout(this.retry);
+    this.retryAt = null;
+    this.clearOpenDeadline();
     const ws = this.ws;
     this.ws = null;
     ws?.close();
@@ -1063,6 +1099,8 @@ function report(): void {
       decodeMs: s.decodeMs.length > 0 ? pct(s.decodeMs, 0.5) : null,
       lag: s.log.summary(),
       bytes: s.bytes,
+      failures: s.attempt,
+      retryAt: s.retryAt,
     };
   }
   const stats: FrameStats = {
@@ -1115,6 +1153,9 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       break;
     case "resize":
       resize(m.width, m.height, m.dpr);
+      break;
+    case "retry":
+      for (const st of streams.values()) if (st.id === m.id) st.retryNow();
       break;
     case "plan":
       settings = m.settings;

@@ -5,13 +5,14 @@ import {
   layoutWindows,
   medianMs,
   restoringText,
+  tileLink,
   windowsNotice,
   windowsView,
   WINDOWS_ACTION_LABELS,
   type WindowsInput,
 } from "../windows.ts";
 import { INTENT_NAMES, parseServerMsg, ProtocolError, type FleetState, type Windows, type WindowTile } from "../protocol.ts";
-import { initialState, reduce, type ClientState, type Notice } from "../store.ts";
+import { initialState, reduce, type ClientState, type FrameStats, type Notice, type TileFrameStats } from "../store.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
 const LABEL = "Windows Server 2025 evaluation, for demonstration only";
@@ -67,7 +68,11 @@ function stateWith(windows: Windows | null, you = "v-1", over: Partial<FleetStat
   let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
   s = reduce(s, { type: "family", family: "v6", probeMs: 100, via: "race" });
   s = reduce(s, { type: "message", text: JSON.stringify({ type: "hello", viewer: you, turnstile: null }), at: EPOCH });
-  return reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), windows, ...over }), at: EPOCH });
+  s = reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), windows, ...over }), at: EPOCH });
+  // Every sandbox's desktop is drawn: the frame worker reports each stream connected with a frame.
+  const live: TileFrameStats = { connected: true, fps: 15, newestT: 1, width: 1280, height: 720, behind: false, decodeMs: 2, lag: null, failures: 0, retryAt: null };
+  const tiles = Object.fromEntries((windows?.tiles ?? []).map((t) => [`d:${t.id}`, live]));
+  return reduce(s, { type: "frame-stats", stats: { at: EPOCH, T: 1, tiles, drawMsP50: 0, drawMsP95: 0, rafMsP50: 0, rafMsP95: 0, allLive: true, live: [], mode: "direct" } });
 }
 
 const STAGE = { x: 0, y: 150, w: 1000, h: 480 };
@@ -150,13 +155,13 @@ describe("windows in the snapshot", () => {
 });
 
 describe("a sandbox's words", () => {
-  it("says its slot, edition, the label and the time to desktop in two decimals", () => {
+  it("says its slot and the time to desktop in two decimals, and leaves the edition and the label to the header", () => {
     const v = viewOf(windowsOf(4));
     expect(v.cards.map((c) => c.slot)).toEqual(["win-1", "win-2", "win-3", "win-4"]);
     for (const c of v.cards) {
-      expect(c.edition).toBe("Windows Server 2025 Datacenter Evaluation (Desktop Experience)");
+      expect(Object.keys(c)).not.toContain("edition");
+      expect(Object.keys(c)).not.toContain("label");
       expect(c.desktopIn).toBe("Desktop in 2.31 s");
-      expect(c.label).toBe(LABEL);
       expect(c.timer).toBeNull();
       expect(c.error).toBeNull();
       expect(c.dark).toBe(false);
@@ -179,7 +184,7 @@ describe("a sandbox's words", () => {
     expect(c.dark).toBe(true);
     expect(c.timer).toBe("Restoring 1.4 s");
     expect(c.desktopIn).toBeNull();
-    expect(c.label).toBe(LABEL);
+    expect(c.link).toBeNull();
     expect(viewOf(w, { now: NOW + 600 }).cards[1]!.timer).toBe("Restoring 2.0 s");
   });
 
@@ -287,13 +292,12 @@ describe("taking a sandbox over", () => {
     for (const c of v.cards) expect(c.take).toEqual({ label: "Take over", disabled: false, title: null });
   });
 
-  it("gives the holder a panel with exactly the tile's actions, the countdown, the label and Give back", () => {
+  it("gives the holder a panel with exactly the tile's actions, the countdown and Give back", () => {
     const v = viewOf(held("v-1"));
     const p = v.panel!;
     expect(p.slot).toBe("win-3");
     expect(p.session).toBe("windows-claim-3");
     expect(p.countdown).toBe("Returns in 97 s");
-    expect(p.label).toBe(LABEL);
     expect(p.giveBack).toBe("Give back");
     expect(p.actions.map((a) => [a.name, a.label])).toEqual([
       ["start_menu", "Start menu"],
@@ -356,15 +360,54 @@ describe("taking a sandbox over", () => {
   });
 });
 
-describe("the label", () => {
-  it("is on every tile and on the panel, whatever the phase", () => {
+describe("the label and the edition", () => {
+  it("are said once, in the header, whatever the phases and with the panel open", () => {
     let w = windowsOf(4);
     w = with1(w, 1, { phase: "restoring", last_relaunch: { clicked_at: NOW - 500, first_frame_at: null, phases: {} } });
     w = with1(w, 2, { phase: "failed", error: "x" });
     w.tiles[3]!.borrowed = { session: "windows-claim-1", viewer: "v-1", since: NOW, until: NOW + 5000 };
     const v = viewOf(w);
-    expect(v.cards.map((c) => c.label)).toEqual([LABEL, LABEL, LABEL, LABEL]);
-    expect(v.panel!.label).toBe(LABEL);
+    expect(v.header!.label).toBe(LABEL);
+    expect(v.header!.image).toBe("Windows Server 2025 Datacenter Evaluation (Desktop Experience), build 26100.1742, 12 days old");
+    const text = JSON.stringify({ cards: v.cards, panel: v.panel });
+    expect(text).not.toContain(LABEL);
+    expect(text).not.toContain("Datacenter Evaluation");
+  });
+});
+
+describe("a tile whose stream is not drawn", () => {
+  const tile = windowsOf(1).tiles[0]!;
+  const st = (over: Partial<TileFrameStats>): TileFrameStats => ({ connected: false, fps: 0, newestT: null, width: 0, height: 0, behind: false, decodeMs: null, lag: null, failures: 0, retryAt: null, ...over });
+
+  it("says it is connecting until the family is settled, and while a socket opens", () => {
+    expect(tileLink(tile, null, undefined, NOW)).toEqual({ state: "connecting", text: "Finding the way to the sandboxes.", detail: null, retry: false });
+    expect(tileLink(tile, "v4", undefined, NOW)).toEqual({ state: "connecting", text: "Connecting to win-1.", detail: null, retry: false });
+    expect(tileLink(tile, "v4", st({}), NOW)?.state).toBe("connecting");
+    expect(tileLink(tile, "v4", st({ connected: true }), NOW)?.state).toBe("connecting");
+  });
+
+  it("says it cannot reach the desktop over the family, when it tries again, and offers Retry", () => {
+    expect(tileLink(tile, "v4", st({ failures: 2, retryAt: NOW + 1500 }), NOW)).toEqual({ state: "unreachable", text: "Cannot reach win-1's desktop over IPv4.", detail: "Trying again in 2 s.", retry: true });
+    expect(tileLink(tile, "v6", st({ failures: 3, retryAt: null }), NOW)).toEqual({ state: "retrying", text: "Cannot reach win-1's desktop over IPv6.", detail: "Trying again now.", retry: true });
+    expect(tileLink({ ...tile, frame_url_v4: null }, "v4", undefined, NOW)).toEqual({ state: "unreachable", text: "win-1 has no address this network can reach.", detail: null, retry: false });
+  });
+
+  it("says nothing once the desktop is drawn, or while the sandbox is not running (its timer speaks)", () => {
+    expect(tileLink(tile, "v6", st({ connected: true, newestT: 12.5 }), NOW)).toBeNull();
+    expect(tileLink({ ...tile, phase: "restoring" }, null, undefined, NOW)).toBeNull();
+  });
+
+  it("reaches the tile from the frame worker's report, and the tile's name for a screen reader", () => {
+    const frames: FrameStats = { at: NOW, T: null, tiles: { "d:win:2": st({ failures: 1, retryAt: NOW + 900 }) }, drawMsP50: 0, drawMsP95: 0, rafMsP50: 0, rafMsP95: 0, allLive: false, live: [], mode: "direct" };
+    const s = reduce(stateWith(windowsOf(2)), { type: "frame-stats", stats: frames });
+    const v = windowsView(input(s));
+    expect(v.cards[0]!.link?.text).toBe("Connecting to win-1.");
+    expect(v.cards[1]!.link).toEqual({ state: "unreachable", text: "Cannot reach win-2's desktop over IPv6.", detail: "Trying again in 1 s.", retry: true });
+    expect(v.cards[1]!.ariaLabel).toBe("win-2, cannot reach win-2's desktop over IPv6. Click to reset it.");
+    // no turn while its desktop does not reach this page
+    expect(v.cards[1]!.take).toEqual({ label: "Take over", disabled: true, title: "It can be borrowed once its desktop reaches this page." });
+    // no stream to wait for: a viewer without a seat, or a browser that cannot decode
+    expect(windowsView(input(s, { canDecode: false })).cards.every((c) => c.link === null)).toBe(true);
   });
 });
 
@@ -413,7 +456,7 @@ describe("layout", () => {
   const overlap = (a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) =>
     a.x < b.x + b.w - 1e-6 && b.x < a.x + a.w - 1e-6 && a.y < b.y + b.h - 1e-6 && b.y < a.y + a.h - 1e-6;
 
-  it.each([1, 2, 3, 4, 5, 8, 9, 12])("%s sandboxes: 16:9 desktops of one size, inside the stage, apart, in the snapshot's rows", (n) => {
+  it.each([1, 2, 3, 4, 5, 8, 9, 12])("%s sandboxes: 16:9 desktops of one size, inside the stage, apart, as large as any number of columns allows", (n) => {
     const L = boxesOf(n);
     expect(L).toHaveLength(n);
     for (const b of L) {
@@ -430,7 +473,29 @@ describe("layout", () => {
       expect(overlap(L[i]!.box, L[j]!.box)).toBe(false);
       expect(overlap(L[i]!.box, L[j]!.caption)).toBe(false);
     }
-    expect(new Set(L.map((b) => b.box.y)).size).toBe(Math.ceil(n / 4));
+    // No other number of columns gives larger desktops (the cell width any c allows, as layoutCaptioned computes it).
+    const capH = L[0]!.caption.h + 4;
+    const aspect = 16 / 9;
+    for (let c = 1; c <= n; c++) {
+      const rows = Math.ceil(n / c);
+      const w = Math.min((STAGE.w - (c - 1) * 12) / c, ((STAGE.h - rows * capH - (rows - 1) * 12) / rows) * aspect);
+      expect(L[0]!.box.w, `${c} columns`).toBeGreaterThanOrEqual(Math.floor(w) - 1);
+    }
+  });
+
+  it("fills a 1728 x 996 screen: four desktops two by two, the block centred down the stage", () => {
+    // The stage under the header at 1728 x 996 (24 px margins, header 120 px tall).
+    const stage = { x: 24, y: 120, w: 1680, h: 852 };
+    const L = boxesOf(4, { area: stage });
+    expect(new Set(L.map((b) => b.box.y)).size).toBe(2);
+    expect(new Set(L.map((b) => b.box.x)).size).toBe(2);
+    // One row of four would be 411 px wide (the page before); two by two is far larger.
+    expect(L[0]!.box.w).toBeGreaterThan(650);
+    const top = Math.min(...L.map((b) => b.box.y));
+    const bottom = Math.max(...L.map((b) => b.caption.y + b.caption.h));
+    // The block takes the stage's whole height, or is centred in it.
+    expect(Math.abs(top - stage.y - (stage.y + stage.h - bottom))).toBeLessThanOrEqual(6);
+    expect(bottom - top).toBeGreaterThan(stage.h * 0.9);
   });
 
   it("a narrow screen takes two columns, or one row beside an open panel", () => {
@@ -497,8 +562,9 @@ describe("captions", () => {
     const w = windowsOf(3);
     const L = layoutWindows({ area: { x: 0, y: 0, w: 684, h: 420 }, tiles: w.tiles, imageAspect: 16 / 3, narrow: true, panel: false, dpr: 2 });
     expect(L.every((b) => b.compact)).toBe(true);
-    expect(new Set(L.map((b) => b.box.y)).size).toBe(1);
-    expect(L[0]!.box.w).toBe(220);
+    // three across would be 220 px; two columns of two rows are 238
+    expect(new Set(L.map((b) => b.box.y)).size).toBe(2);
+    expect(L[0]!.box.w).toBe(238);
   });
 
   it("with the panel open on a short phone, eight desktops still get room: the columns that make them largest", () => {

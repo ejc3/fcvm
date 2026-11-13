@@ -14,7 +14,8 @@
  *
  *   loop     1000 entries and exits through the run loop's two calls with an
  *            empty ap_list, then 10 with one interrupt queued: counts the locks
- *            taken, the list walks and the GIC system register accesses.
+ *            taken, the list walks, the LR folds and the GIC system register
+ *            accesses.
  *   matrix   every combination of the maintenance interrupt enables, the
  *            guest's group enables before and after a run, and one list
  *            register in each state: after an exit the host must never hold a
@@ -174,10 +175,12 @@ struct ap_list_summary {
 	unsigned int nr_pend, nr_act, nr_sgi;
 };
 
+enum vgic_type { VGIC_V2, VGIC_V3 };
 static struct {
+	enum vgic_type type;
 	bool gicv3_cpuif;
 	bool has_gicv4;
-} kvm_vgic_global_state = { .gicv3_cpuif = true };
+} kvm_vgic_global_state = { .type = VGIC_V3, .gicv3_cpuif = true };
 static void *last_lr_irq __attribute__((unused));
 #define host_data_ptr(field) (&field)
 #define DEBUG_SPINLOCK_BUG_ON(x) do { } while (0)
@@ -284,11 +287,11 @@ static void reset(struct vgic_v3_cpu_if *cpu_if)
 
 /*
  * A Linux guest with group 1 enabled and nothing in flight: the state of
- * almost every exit. Up to 6.18 such an exit took no lock and touched no GIC
- * register. 7.3 fills, folds and prunes the empty ap_list under its lock,
- * clears ICH_HCR_EL2 and reads ICH_MISR_EL2 on exit, and writes ICH_HCR_EL2
- * again on entry: on a c9g.metal-48xl host an HVC exit took 396 ns on 6.18.60
- * and 453 ns on 7.3.3 (fcvm #659).
+ * almost every exit. Up to 6.18 such an exit took no lock, folded no LR and
+ * touched no GIC register. 7.3 fills, folds and prunes the empty ap_list
+ * under its lock, clears ICH_HCR_EL2 and reads ICH_MISR_EL2 on exit, and
+ * writes ICH_HCR_EL2 again on entry: on a c9g.metal-48xl host an HVC exit
+ * took 396 ns on 6.18.60 and 453 ns on 7.3.3 (fcvm #659).
  */
 static void loop(void)
 {
@@ -313,17 +316,18 @@ static void loop(void)
 		CHECK(!mi_asserted(), "loop: exit %d leaves a maintenance interrupt asserted", i);
 	}
 	unsigned long gic = writes[ICH_HCR_EL2] + reads[ICH_HCR_EL2] + reads[ICH_MISR_EL2];
-	CHECK(locks_taken == 0 && lr_fills == 0 && prunes == 0 && gic <= 1,
+	CHECK(locks_taken == 0 && lr_fills == 0 && prunes == 0 && folds == 0 && gic <= 1,
 	      "loop: %d exits with an empty ap_list took the ap_list_lock %lu times, walked it "
-	      "%lu times to fill LRs and %lu times to prune it, wrote ICH_HCR_EL2 %lu times and "
-	      "read ICH_MISR_EL2 %lu times; an empty list needs no lock and no walk, and "
-	      "ICH_HCR_EL2 needs one write, on the first entry", exits, locks_taken, lr_fills,
-	      prunes, writes[ICH_HCR_EL2], reads[ICH_MISR_EL2]);
+	      "%lu times to fill LRs and %lu times to prune it, folded the LRs %lu times, wrote "
+	      "ICH_HCR_EL2 %lu times and read ICH_MISR_EL2 %lu times; an empty list needs no "
+	      "lock, no walk and no fold, and ICH_HCR_EL2 needs one write, on the first entry",
+	      exits, locks_taken, lr_fills, prunes, folds, writes[ICH_HCR_EL2],
+	      reads[ICH_MISR_EL2]);
 
-	/* An interrupt queued: every entry fills the LRs and every exit prunes the list. */
+	/* An interrupt queued: every entry fills the LRs, every exit folds and prunes. */
 	queued.next = queued.prev = &vgic_cpu->ap_list_head;
 	vgic_cpu->ap_list_head.next = vgic_cpu->ap_list_head.prev = &queued;
-	locks_taken = lr_fills = prunes = 0;
+	locks_taken = lr_fills = folds = prunes = 0;
 	for (int i = 0; i < busy; i++) {
 		kvm_vgic_flush_hwstate(&vcpu);
 		CHECK(hcr_is_programmed(cpu_if) && hw_lr[0] == (ICH_LR_PENDING_BIT | 27),
@@ -332,9 +336,9 @@ static void loop(void)
 		kvm_vgic_sync_hwstate(&vcpu);
 		CHECK(!mi_asserted(), "loop: busy exit %d leaves a maintenance interrupt asserted", i);
 	}
-	CHECK(lr_fills == busy && prunes == busy,
-	      "loop: %d exits with an interrupt queued filled the LRs %lu times and pruned %lu times",
-	      busy, lr_fills, prunes);
+	CHECK(lr_fills == busy && folds == busy && prunes == busy,
+	      "loop: %d exits with an interrupt queued filled the LRs %lu times, folded them %lu "
+	      "times and pruned %lu times", busy, lr_fills, folds, prunes);
 
 	__vgic_v3_deactivate_traps(cpu_if);
 	CHECK(hw[ICH_HCR_EL2] == 0, "loop: put leaves ICH_HCR_EL2 %#llx", (unsigned long long)hw[ICH_HCR_EL2]);

@@ -1663,6 +1663,9 @@ export class MockCoordinator {
             this.opts.renderers.setV6Down(b["ipv6_down"]);
             this.minecraft?.setV6Down(b["ipv6_down"]);
           }
+          if (typeof b["minecraft_down"] === "boolean") this.minecraft?.setDown(b["minecraft_down"]);
+          if (typeof b["minecraft_hang"] === "boolean") this.minecraft?.setHang(b["minecraft_hang"]);
+          if (typeof b["ipv4_silent"] === "boolean") this.opts.renderers.setV4Silent(b["ipv4_silent"]);
           return { ok: true };
         });
         return;

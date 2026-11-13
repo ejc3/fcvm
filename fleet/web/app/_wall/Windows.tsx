@@ -71,23 +71,10 @@ function Caption({ c, onTake }: { c: WindowCard; onTake: () => void }) {
           </button>
         ) : null}
       </div>
-      {!c.compact && c.edition ? (
-        <p className="edition" title={c.edition} data-testid={`sandbox-edition-${c.slot}`}>
-          {c.edition}
+      {c.lentText ? (
+        <p className="lent" data-testid={`sandbox-lent-${c.slot}`}>
+          {c.lentText}
         </p>
-      ) : null}
-      {/* On every tile in every layout: the evaluation's terms ask for it. */}
-      <p className="label" data-testid={`sandbox-label-${c.slot}`}>
-        {c.label}
-      </p>
-      {!c.compact ? (
-        <>
-          {c.lentText ? (
-            <p className="lent" data-testid={`sandbox-lent-${c.slot}`}>
-              {c.lentText}
-            </p>
-          ) : null}
-        </>
       ) : null}
     </div>
   );
@@ -119,9 +106,6 @@ function Sheet({ panel, narrow, top, onGiveBack, onAction }: { panel: WindowsPan
           <button type="button" className="btn" style={{ justifyContent: "center" }} onClick={onGiveBack} data-testid="win-give-back">
             {panel.giveBack}
           </button>
-          <p className="label" data-testid="win-panel-label">
-            {panel.label}
-          </p>
         </section>
       </div>
     </aside>
@@ -142,10 +126,6 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<WindowsView | null>(null);
-
-  useEffect(() => {
-    document.title = "Windows";
-  }, []);
 
   // Clock, capability, connection. The tiles' timers count tenths of a second.
   useEffect(() => {
@@ -285,6 +265,11 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
               {h.image ? <span data-testid="win-image">{h.image}</span> : null}
             </div>
           ) : null}
+          {h ? (
+            <p className="win-label" data-testid="win-label">
+              {h.label}
+            </p>
+          ) : null}
           {h?.warning ? (
             <p className="win-warning" role="status" data-testid="win-warning">
               {h.warning}
@@ -330,8 +315,15 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
               aria-label={c.ariaLabel}
               data-testid={`sandbox-hit-${c.slot}`}
               data-phase={c.dark ? "dark" : "live"}
+              data-link={c.link?.state}
               onClick={() => void client.act("windows_reset", { slot: c.slot })}
             >
+              {c.link ? (
+                <span className={`win-link ${c.link.state}`} role="status" data-testid={`sandbox-link-${c.slot}`}>
+                  <span className="text">{c.link.text}</span>
+                  {c.link.detail ? <span className="detail">{c.link.detail}</span> : null}
+                </span>
+              ) : null}
               {c.dark ? (
                 <span className="dark" data-testid={`sandbox-dark-${c.slot}`}>
                   {c.timer ? (
@@ -346,6 +338,20 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
                   ) : null}
                 </span>
               ) : null}
+            </button>
+          ) : null,
+        )}
+        {view.cards.map((c) =>
+          c.box && c.link?.retry ? (
+            <button
+              key={`retry-${c.id}`}
+              type="button"
+              className="btn mini win-retry"
+              style={{ left: c.box.x + c.box.w / 2, top: c.box.y + c.box.h - 12 }}
+              onClick={() => client.retryStream(`d:${c.id}`)}
+              data-testid={`sandbox-retry-${c.slot}`}
+            >
+              Retry
             </button>
           ) : null,
         )}

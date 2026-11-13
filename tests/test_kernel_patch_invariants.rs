@@ -682,9 +682,9 @@ fn the_vgic_hcr_fixture_is_cut_from_the_pinned_arm64_host_kernel() {
 /// `kvm_vgic_flush_hwstate()` and `kvm_vgic_sync_hwstate()` from
 /// `arch/arm64/kvm/vgic/vgic.c`.
 ///
-/// Since 6.19 every exit walks the ap_list under its lock to fill and prune it, clears
-/// ICH_HCR_EL2 and reads ICH_MISR_EL2, and every entry writes ICH_HCR_EL2 again,
-/// whether or not an interrupt is in flight. On a c9g.metal-48xl host that took an HVC
+/// Since 6.19 every exit walks the ap_list under its lock to fill and prune it, folds the
+/// LRs back, clears ICH_HCR_EL2 and reads ICH_MISR_EL2, and every entry writes
+/// ICH_HCR_EL2 again, whether or not an interrupt is in flight. On a c9g.metal-48xl host that took an HVC
 /// exit from 396 ns on 6.18.60 to 453 ns on 7.3.3. Without the patch the `loop` scenario
 /// fails on that work. `matrix` and `putload` pass with or without it: they fail a change
 /// that leaves the host holding a register state that raises a maintenance interrupt, or

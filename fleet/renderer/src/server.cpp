@@ -269,6 +269,7 @@ void Server::handle(Conn& c) {
     return;
   }
   if (path == "/still" && (method == "GET" || method == "HEAD")) {
+    if (fleet() && !p_.allows_fleet_still()) return respond(c, 404, "Not Found", "");
     // the next frame drawn, as JPEG: at the height being streamed, or with no
     // stream at tile height h (the renderer keeps drawing that way for
     // STILL_HOLD_S, so in a hold repeated requests return a converging image)

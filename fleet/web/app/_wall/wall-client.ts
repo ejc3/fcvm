@@ -491,6 +491,11 @@ export class WallClient {
     this.worker?.postMessage({ type: "resize", width, height, dpr } satisfies ToWorker);
   }
 
+  /** Open the frame stream of draw source `id` now rather than after its backoff. */
+  retryStream(id: string): void {
+    this.worker?.postMessage({ type: "retry", id } satisfies ToWorker);
+  }
+
   plan(plan: DrawPlan, settings: DrawSettings): void {
     if (!this.worker) return;
     const key = JSON.stringify([plan, settings]);

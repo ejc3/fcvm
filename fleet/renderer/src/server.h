@@ -23,6 +23,8 @@ class FrameSource {
   virtual bool post_budget(const std::string& body, std::string* err) = 0;
   virtual bool raw_frame(double t, std::string* ppm, std::string* tile_json) = 0;
   virtual bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) = 0;
+  // Whether the public fleet listener may serve a poster without a viewer token.
+  virtual bool allows_fleet_still() const { return true; }
   virtual std::string health_json() = 0;
   // Whether a GET /frames with this direct token may stream.
   virtual bool admits(const std::string& token) = 0;
@@ -57,6 +59,7 @@ class Server {
   void serve();
 
  private:
+  friend struct ServerTest;
   int open_listener(int port, std::string* err);
   void accept_loop(int lfd, bool tls);
   void handle(Conn& c);
