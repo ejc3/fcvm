@@ -104,8 +104,8 @@ fcvm's lockfile.
 - **The agent** (`fcvm fleet agent --minecraft N`): runs N servers on a host, named in its hello
   (`minecraft`), each an fcvm VM of the `fleet/minecraft` image in routed mode with its own
   public IPv6 address. With `--tls-publish-base` and the host's public IPv4 address, each server's
-  view socket (443 in the VM) is also published on the host's IPv4 address at the base plus its
-  index (after the GPU slots' and the Windows sandboxes'), and reported as its IPv4 path: a viewer
+  view socket (443 in the VM) is also published on the host's IPv4 address at the base plus the
+  Minecraft range's offset plus its index (`fleet/published-ports.json`), and reported as its IPv4 path: a viewer
   with no IPv6 reaches the tile at `mc-<n>-<token>-v4`, as it reaches a GPU slot or a sandbox. At
   start it boots one gold VM (`mc-gold`), waits until its `/health` says
   ready (the server listens, every bot spawned, every column of the map known) and the tick rate

@@ -5,6 +5,7 @@ pub mod addr;
 pub mod dial;
 pub mod inventory;
 pub mod minecraft;
+pub mod ports;
 pub mod potato;
 pub mod slot;
 pub mod spot;
@@ -109,17 +110,6 @@ impl AggregateCfg {
     }
 }
 
-/// The host port a place's TLS is published on: `--tls-publish-base` plus its index, the same
-/// numbering for GPU slots, then Windows sandboxes, then Minecraft servers. `None` without a base.
-fn tls_port(base: Option<u16>, index: usize, what: &str) -> Result<Option<u16>> {
-    let Some(b) = base else { return Ok(None) };
-    u16::try_from(index)
-        .ok()
-        .and_then(|i| b.checked_add(i))
-        .map(Some)
-        .with_context(|| format!("--tls-publish-base {b} leaves no port for {what}"))
-}
-
 /// An IPv6 literal in brackets, for `<address>:<port>`.
 fn bracket(ip: &str) -> String {
     if ip.contains(':') && !ip.starts_with('[') {
@@ -179,6 +169,7 @@ pub fn boot_times(
 
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
     let started_at = unix_ms();
+    ports::check_aggregate(args.tls_publish_base, args.aggregate_tls_port)?;
     let host = match args.host {
         Some(h) => h,
         None if args.host_from_imds => crate::fleet::coord::aws::imds("instance-id")
@@ -492,6 +483,13 @@ where
     let mut ports = HashMap::new();
     // Ports and addresses by inventory index, the wall's GPUs first, then the phones'.
     let all: Vec<Gpu> = agent.gpus.iter().chain(&agent.phones).cloned().collect();
+    // The TLS host ports, from fleet/published-ports.json: each mode in its own range.
+    let tls = ports::allocate(
+        agent.cfg.tls_publish_base,
+        all.len(),
+        agent.windows.as_ref().map_or(0, |w| w.count) as usize,
+        agent.minecraft.as_ref().map_or(0, |m| m.count) as usize,
+    )?;
     for (i, g) in all.iter().enumerate() {
         let port = u16::try_from(i)
             .ok()
@@ -503,8 +501,7 @@ where
             Some(p) => Some(p.slot_address(i)?),
             None => None,
         };
-        let tls_port = tls_port(agent.cfg.tls_publish_base, i, &format!("GPU {i}"))?;
-        ports.insert(g.sbdf.clone(), (port, addr, tls_port));
+        ports.insert(g.sbdf.clone(), (port, addr, tls.slots[i]));
     }
     // Windows sandboxes take the ports and addresses after every GPU's, by their index.
     let mut places = Vec::new();
@@ -524,7 +521,7 @@ where
                 Some(p) => Some(p.slot_address(i)?),
                 None => None,
             },
-            tls_port: tls_port(agent.cfg.tls_publish_base, i, &format!("sandbox {k}"))?,
+            tls_port: tls.windows[k],
         });
     }
     // Minecraft servers take the addresses after the sandboxes', and the gold VM the one after
@@ -538,13 +535,12 @@ where
             .ipv6_prefix
             .as_ref()
             .context("Minecraft mode needs the host's IPv6 prefix")?;
-        // The view sockets' IPv4 path, by index after the sandboxes' as their ports are, when the
-        // servers have a certificate to serve it with.
-        let tls_base = agent.cfg.tls_publish_base.filter(|_| m.publish_tls);
+        // The view sockets' IPv4 path, in the servers' declared range, when the servers have a
+        // certificate to serve it with.
         for k in 0..m.count as usize {
             let i = base + k;
-            let tls = tls_port(tls_base, i, &format!("server {k}"))?;
-            mc_places.push(minecraft::Place::routed(prefix.slot_address(i)?, tls));
+            let port = tls.minecraft[k].filter(|_| m.publish_tls);
+            mc_places.push(minecraft::Place::routed(prefix.slot_address(i)?, port));
         }
         // The gold takes no viewers. It publishes guest port 443 on loopback at the first
         // server's port (it runs before any server) so that every restore can move it.

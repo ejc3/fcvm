@@ -1,0 +1,14 @@
+{
+  "about": "Every port a viewer's browser connects to, by address family and mode. The only declaration: the host agent allocates from it (src/fleet/agent/ports.rs), the viewer-path smoke checks each published URL against it (fleet/coord/stage-smoke.py), and ejc3/aws derives the GPU hosts' security group range from it. A GPU host publishes on its one public IPv4 address at gpu_host_ipv4.base (the agent's --tls-publish-base) plus the place's offset in its mode's range plus its index there.",
+  "ipv6_port": 443,
+  "ec2_tile_ipv4_port": 443,
+  "gpu_host_ipv4": {
+    "base": 20200,
+    "ranges": [
+      {"mode": "slot", "offset": 0, "count": 8, "what": "a GPU slot: a wall renderer or a phone, by its GPU's index in the host's inventory"},
+      {"mode": "windows", "offset": 8, "count": 4, "what": "a Windows sandbox's bridge, by the sandbox's index on its host"},
+      {"mode": "minecraft", "offset": 12, "count": 4, "what": "a Minecraft server's view socket, by the server's index on its host"},
+      {"mode": "aggregate", "offset": 16, "count": 1, "what": "the host's aggregator (--aggregate-tls-port)"}
+    ]
+  }
+}

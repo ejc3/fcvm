@@ -1604,7 +1604,11 @@ The IPv4 path: a GPU host has one public IPv4 address, shared by its slots.
 `--tls-publish-base <port>` forwards each slot's TLS port on the host (`--publish-ip`, port
 `<port> + GPU index`, fcvm's `--publish`, which relays into a routed VM and goes away with its
 fcvm), and `--public-ipv4-from-imds` reports the host's address (IMDS `public-ipv4`, assigned
-by EC2 at launch) as `ipv4`, with the slot's port as `v4_port`. The host
+by EC2 at launch) as `ipv4`, with the slot's port as `v4_port`. Every place's TLS port is in its
+mode's range of `fleet/published-ports.json`: `<port>` plus the range's offset plus the place's
+index in its mode (GPU slots by GPU index, then Windows sandboxes, Minecraft servers and the
+aggregator in ranges of their own). The agent refuses to start with more places of a mode than
+its range holds, and an `--aggregate-tls-port` other than the declared one. The host
 AMI's unit (`fcvm-fleet-agent.service`, `ExecStart=/usr/local/bin/fcvm fleet agent
 $FLEET_AGENT_ARGS`) takes, in `/etc/fcvm-fleet/agent.env`:
 
@@ -1661,8 +1665,9 @@ podman run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1
   <--windows-bridge-image> serve
 ```
 
-with the ports a slot at its index would have (`--base-port`, `--tls-publish-base`, and with
-an IPv6 prefix its address, which the agent puts on the host's default IPv6 interface as for
+with the HTTP port a slot at its index would have (`--base-port`), the TLS port of the sandbox's
+index in the Windows range (`--tls-publish-base`, above), and with an IPv6 prefix the address a
+slot at its index would have, which the agent puts on the host's default IPv6 interface as for
 the aggregator); the scene token is in `tls.json`, as for a renderer. A bridge that publishes on
 its IPv6 address runs on `fcvm-windows-bridge`, a podman network with IPv6, which the agent
 makes before the gold flow (`podman network create --ipv6 --ignore`, then checks
