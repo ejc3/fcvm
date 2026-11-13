@@ -8,6 +8,8 @@ on:
       - 'src/cli/**'
       - 'fleet/core/**'
       - 'fleet/coord/**'
+      - 'fleet/published-ports.json'
+      - '.github/workflows/fleet-viewer-smoke.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'build.rs'
@@ -101,12 +103,14 @@ jobs:
           COORDINATOR_REPO: ${{ secrets.COORDINATOR_REPO }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
         run: python3 -B fleet/coord/publish.py
-      # This is a real viewer: it may wake the fleet and relaunches one tile
-      # in each half. A capacity drought fails this check; it never counts as a pass.
-      - name: Access, fresh launch names and renderer frames over IPv4
-        env:
-          STAGING_API_URL: ${{ vars.STAGING_API_URL }}
-          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-        run: python3 -B fleet/coord/stage-smoke.py
+
+  # The viewer-path smoke against the new coordinator: every mode's tiles from an IPv4-only
+  # viewer and an IPv6 one, the relaunch and fresh launch names. A failure fails this run and
+  # opens or updates the fleet-viewer-smoke issue.
+  smoke:
+    needs: deploy
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-viewer-smoke.yml

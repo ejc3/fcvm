@@ -1,0 +1,127 @@
+name: Fleet viewer-path smoke
+
+# What a viewer's browser gets from staging (stage.fcvm.dev), for every mode and every tile the
+# coordinator reports running, once from a viewer with IPv4 only and once from one with IPv6
+# (fleet/coord/stage-smoke.py). A mode counts as working only when both pass (docs/fleet/
+# ARCHITECTURE.md, "When a mode counts as working"). It runs after every coordinator and web
+# deploy (both call this workflow), and daily; each run is a real viewer and may wake the fleet.
+#
+# The two viewers:
+# - IPv4: a GitHub-hosted runner, which has no IPv6. The smoke proves that before it checks
+#   anything (--single-family: a TCP connection to a public IPv6 address must fail).
+# - IPv6: a self-hosted runner, which has a global IPv6 address (ejc3/aws runner-autoscale.tf
+#   proves one at launch); the smoke proves the runner reaches a public IPv6 address first.
+#
+# A failure fails the job and opens (or comments on) one issue labelled fleet-viewer-smoke.
+
+on:
+  workflow_call:
+  schedule:
+    - cron: '41 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The modes staging runs. A mode the coordinator reports no tiles of fails the smoke.
+env:
+  MODES: wall,phones,windows,minecraft,potato
+
+jobs:
+  ipv4:
+    name: IPv4-only viewer
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 45
+    concurrency:
+      group: fleet-viewer-smoke
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install ffmpeg (the smoke decodes each tile's first picture)
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg
+      # It relaunches one tile in each wall half (fresh launch names) and borrows and drives one
+      # Minecraft server; a capacity drought fails it, never counts as a pass.
+      - name: Every mode over IPv4, relaunch and fresh names, take-over
+        env:
+          STAGING_API_URL: ${{ vars.STAGING_API_URL }}
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -o pipefail
+          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family --relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: Failing tiles to the job summary
+        if: ${{ failure() }}
+        run: |
+          { echo "### v4 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ipv6:
+    name: IPv6 viewer
+    needs: ipv4
+    # After the IPv4 viewer, whatever it found: its relaunches would race this run's probes.
+    if: ${{ !cancelled() && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, Linux, ARM64]
+    environment: fleet-stage-deploy
+    timeout-minutes: 45
+    concurrency:
+      group: fleet-viewer-smoke
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install ffmpeg (the smoke decodes each tile's first picture)
+        run: command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg)
+      - name: Every mode over IPv6, take-over
+        env:
+          STAGING_API_URL: ${{ vars.STAGING_API_URL }}
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -o pipefail
+          python3 -B fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: Failing tiles to the job summary
+        if: ${{ failure() }}
+        run: |
+          { echo "### v6 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: Report a failure
+    needs: [ipv4, ipv6]
+    if: ${{ failure() && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the fleet-viewer-smoke issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          IPV4: ${{ needs.ipv4.result }}
+          IPV6: ${{ needs.ipv6.result }}
+        run: |
+          set -euo pipefail
+          body=$(printf 'The viewer-path smoke failed on %s (%s, workflow "%s").\n\n- IPv4-only viewer: %s\n- IPv6 viewer: %s\n\nRun: %s\n\nEach failing tile is in the job summary: its mode, id, family, step and fixed error text. A mode counts as working only when both viewers pass (docs/fleet/ARCHITECTURE.md).\n' \
+            "$SHA" "$EVENT" "$WORKFLOW" "$IPV4" "$IPV6" "$RUN_URL")
+          gh label create fleet-viewer-smoke --force --color B60205 --description "The fleet viewer-path smoke is failing"
+          issue=$(gh issue list --label fleet-viewer-smoke --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "Fleet viewer-path smoke is failing" --label fleet-viewer-smoke --body "$body"
+          fi

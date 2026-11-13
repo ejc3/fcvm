@@ -13,6 +13,7 @@ on:
     paths:
       - 'fleet/web/**'
       - '.github/workflows/fleet-web-deploy.yml'
+      - '.github/workflows/fleet-viewer-smoke.yml'
   workflow_dispatch:
 
 permissions:
@@ -97,3 +98,13 @@ jobs:
             "6:"*"Could not resolve host"*) echo "no custom domain yet (ejc3/aws#627): not reachable" ;;
             *) echo "::error::stage.fcvm.dev answered an unauthenticated request without Access: $out"; exit 1 ;;
           esac
+
+  # The viewer-path smoke against the page's coordinator, after every web deploy: every mode's
+  # tiles from an IPv4-only viewer and an IPv6 one (fleet-viewer-smoke.yml).
+  smoke:
+    needs: deploy
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-viewer-smoke.yml

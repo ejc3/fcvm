@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Prove Access, fresh launch names that resolve at once, and renderer frames over IPv4 on staging."""
+"""The viewer-path smoke: what a viewer's browser gets from every tile of every mode.
+
+Proves Access, fresh launch names that resolve at once, and, for each mode (the wall's
+renderers, phones, Windows sandboxes, Minecraft servers, the potato game), that every tile the
+coordinator reports running answers a viewer over the address family checked: through public
+DNS and the published port to a decoded, non-flat frame (or a Minecraft map, or a verified potato
+catch), with one take-over round trip where staging allows it. The tiles, their URLs and their
+ports come from the coordinator's own state; each port must be one fleet/published-ports.json
+declares for its mode and family. A tile that does not answer, or a family it has no URL for,
+fails the check, and a check that cannot run (no ffmpeg, a viewer that does not have the family)
+blocks.
+
+    stage-smoke.py [--family v4|v6] [--single-family] [--modes wall,phones,...] [--relaunch]
+                   [--takeover]
+
+Failure output carries no URL, host name or token: tile ids, the mode, the family and fixed text.
+"""
 import ast
 import base64
 import errno
@@ -8,9 +24,13 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import struct
+import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,18 +68,29 @@ def describe(error):
     return None
 
 
+# The two address families a viewer can have: the socket family, the DNS record type, and the
+# state field holding a tile's URL in that family.
+FAMILIES = {"v4": (socket.AF_INET, 1, "frame_url_v4"), "v6": (socket.AF_INET6, 28, "frame_url")}
+
+
 def ipv4(host, port):
     """Use the same address family as an IPv4-only viewer; reject private endpoints."""
-    addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    return public(host, port, "v4")
+
+
+def public(host, port, family):
+    """A TLS socket to host over one family only, through the system resolver; private
+    endpoints are refused. For the coordinator's own names, which are not launch names."""
+    addresses = socket.getaddrinfo(host, port, FAMILIES[family][0], socket.SOCK_STREAM)
     for _, _, _, _, address in addresses:
         if not ipaddress.ip_address(address[0]).is_global:
             continue
         try:
-            raw = socket.create_connection(address, timeout=20)
+            raw = socket.create_connection(address[:2], timeout=20)
             return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
         except OSError:
             continue
-    raise RuntimeError("no reachable public IPv4 endpoint")
+    raise RuntimeError("no reachable public endpoint in this family")
 
 
 class WebSocketClosed(RuntimeError):
@@ -67,11 +98,13 @@ class WebSocketClosed(RuntimeError):
 
 
 class Socket:
-    def __init__(self, url, headers=None):
+    def __init__(self, url, headers=None, opener=None):
+        """A WebSocket over TLS. `opener(host, port)` gives the TLS socket: by default an
+        IPv4 one through the system resolver."""
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "wss" or parsed.username or parsed.password or parsed.fragment:
             raise ValueError("a secure WebSocket URL is required")
-        self.s = ipv4(parsed.hostname, parsed.port or 443)
+        self.s = (opener or ipv4)(parsed.hostname, parsed.port or 443)
         key = base64.b64encode(os.urandom(16)).decode()
         authority = parsed.netloc
         extra = ""
@@ -152,13 +185,58 @@ class Socket:
         self.s.close()
 
 
-def frame_host(url):
+# The zone every launch name is under, and the resolvers that are asked for it: staging's,
+# or a host-image acceptance's own coordinator (fleet/tools/viewer-acceptance.sh).
+ZONE = os.environ.get("SMOKE_ZONE", "fcvm.dev")
+
+
+def published_ports():
+    """fleet/published-ports.json: the one declaration of every port a viewer connects to."""
+    return json.loads((Path(__file__).resolve().parent.parent / "published-ports.json").read_text())
+
+
+# The range of fleet/published-ports.json each mode's GPU-host IPv4 port is in, and the path of
+# its viewer socket.
+RANGE_OF = {"wall": "slot", "phones": "slot", "windows": "windows", "minecraft": "minecraft",
+            "aggregate": "aggregate"}
+PATH_OF = {"minecraft": "/view"}
+
+
+def declared_ports(mode, family, half="fcvm"):
+    """The ports a viewer may be sent to for a tile of `mode` over `family`."""
+    ports = published_ports()
+    if family == "v6":
+        return {ports["ipv6_port"]}
+    if half == "ec2":
+        return {ports["ec2_tile_ipv4_port"]}
+    host = ports["gpu_host_ipv4"]
+    r = {x["mode"]: x for x in host["ranges"]}[RANGE_OF[mode]]
+    first = host["base"] + r["offset"]
+    return set(range(first, first + r["count"]))
+
+
+def checked(url, path, ports):
+    """The host and port of a viewer URL, refused unless it is a secure WebSocket on a launch
+    name of the zone, at `path`, on one of `ports`."""
     parsed = urllib.parse.urlsplit(url)
-    if (parsed.scheme != "wss" or not parsed.hostname or not parsed.hostname.endswith(".fcvm.dev")
-            or parsed.username or parsed.password or parsed.path != "/frames" or parsed.query or parsed.fragment
-            or (parsed.port or 443) not in (443, *range(20200, 20208))):
+    if (parsed.scheme != "wss" or not parsed.hostname or not parsed.hostname.endswith("." + ZONE)
+            or parsed.username or parsed.password or parsed.path != path or parsed.query or parsed.fragment):
         raise ValueError("unexpected frame endpoint")
-    return parsed.hostname
+    if (parsed.port or 443) not in ports:
+        raise ValueError("a port outside fleet/published-ports.json for its mode and family")
+    return parsed.hostname, parsed.port or 443
+
+
+def endpoint(url, mode, family, half="fcvm"):
+    """A published viewer URL of a tile of `mode` over `family`: on its mode's path and on a port
+    the declaration gives its mode and family."""
+    return checked(url, PATH_OF.get(mode, "/frames"), declared_ports(mode, family, half))
+
+
+def frame_host(url):
+    """A wall tile's frame endpoint, in either family and either half: its host name."""
+    ports = declared_ports("wall", "v4") | declared_ports("wall", "v4", "ec2") | declared_ports("wall", "v6")
+    return checked(url, "/frames", ports)[0]
 
 
 def prove_frame(tile, admit=None):
@@ -280,12 +358,25 @@ def addresses(reply, ident, query, qtype):
     return found
 
 
+def resolver_address(resolver):
+    """A resolver as `ip`, `ip:port` or `[ip6]:port`: (family, ip, port)."""
+    port, ip = DNS_PORT, resolver
+    if resolver.startswith("["):
+        ip, _, rest = resolver[1:].partition("]")
+        port = int(rest.lstrip(":")) if rest else DNS_PORT
+    elif resolver.count(":") == 1:
+        ip, port = resolver.split(":")[0], int(resolver.split(":")[1])
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    return family, ip, port
+
+
 def resolve(resolver, name, qtype, timeout):
-    """One query to a public resolver; the addresses it answers within timeout seconds."""
+    """One query to a resolver; the addresses it answers within timeout seconds."""
     ident, query = dns_query(name, qtype)
     deadline = time.monotonic() + timeout
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect((resolver, DNS_PORT))
+    family, ip, port = resolver_address(resolver)
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.connect((ip, port))
         s.send(query)
         while True:
             left = deadline - time.monotonic()
@@ -315,6 +406,344 @@ def prove_resolves(tile):
     return slowest
 
 
+# ---- The viewer path: every mode, every tile, one address family ---------------------------
+
+# The modes a viewer can open, and where the coordinator's state lists their tiles.
+MODES = ("wall", "phones", "windows", "minecraft", "potato")
+# A frame decoded to a flat image is a blank tile: its luma spread (brightest less darkest, of
+# 255) must reach this. A rendered scene, a phone's screen and a desktop all exceed it.
+FLAT_SPREAD = 16
+# How long one tile may take to give its first payload, and to accept TCP and finish TLS.
+PROBE_SECONDS = 40
+CONNECT_SECONDS = 10
+# Control endpoints that say whether this viewer has a family at all: Cloudflare's resolver,
+# on 443, in each family.
+CONTROL = {"v4": ("1.1.1.1", 443), "v6": ("2606:4700:4700::1111", 443)}
+
+
+def reaches(family, timeout=10):
+    """Whether this viewer opens a TCP connection over `family` to a public control endpoint."""
+    try:
+        with socket.socket(FAMILIES[family][0], socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(CONTROL[family])
+        return True
+    except OSError:
+        return False
+
+
+def prove_viewer(family, single):
+    """A check of one family needs a viewer that has it; with `single`, one that has no other,
+    so a pass is a pass for viewers that have only this family."""
+    if not reaches(family):
+        raise RuntimeError("this viewer has no route in the family it checks")
+    other = "v6" if family == "v4" else "v4"
+    if single and reaches(other):
+        raise AssertionError("this viewer is not single-family: it reaches the other family too")
+
+
+def tiles_of(state, mode):
+    """The tiles the coordinator reports for `mode`, as (half, tile); None when it reports no
+    such mode at all."""
+    if mode == "wall":
+        return [(t.get("half"), t) for t in state.get("tiles") or []] or None
+    if mode == "aggregate":
+        return [(a.get("half"), a) for a in state.get("aggregates") or []]
+    view = state.get(mode)
+    if not isinstance(view, dict) or not view.get("tiles"):
+        return None
+    return [("fcvm", t) for t in view["tiles"]]
+
+
+def mine(tile, viewer):
+    return bool(tile.get("borrowed")) and (tile["borrowed"] or {}).get("viewer") == viewer
+
+
+def settled(state, modes, viewer=None):
+    """Every tile of every mode is running (a tile lent to another viewer is left out: its stream
+    is its viewer's), and the potato game has players."""
+    for mode in modes:
+        if mode == "potato":
+            potato = state.get("potato")
+            if not isinstance(potato, dict) or not potato.get("capacity"):
+                return False
+            continue
+        tiles = tiles_of(state, mode)
+        if not tiles:
+            return False
+        for _, t in tiles:
+            if t.get("phase") != "running" and not (t.get("borrowed") and not mine(t, viewer)):
+                return False
+    return True
+
+
+class Probe:
+    """One viewer-path check's outcome: the mode, the tile id, the family, what was proved or the
+    step that failed and its fixed text. Printed as one JSON line; no URL, host or token."""
+
+    def __init__(self, mode, tile, family):
+        self.mode, self.tile, self.family = mode, tile, family
+        self.step, self.ok, self.error, self.detail = "start", False, None, {}
+
+    def line(self):
+        out = {"mode": self.mode, "tile": self.tile, "family": self.family, "ok": self.ok}
+        if self.ok:
+            out.update(self.detail)
+        else:
+            out.update(step=self.step, errorType=self.error[0], error=self.error[1])
+        return out
+
+
+def fixed(error):
+    """Fixed text for a probe's exception (describe(), plus timeouts and TLS's own reason code)."""
+    text = describe(error)
+    if text is None and isinstance(error, (TimeoutError, socket.timeout)):
+        text = "timed out"
+    if text is None and isinstance(error, ssl.SSLError) and re.fullmatch(r"[A-Z0-9_]{1,64}", str(error.reason or "")):
+        text = "TLS " + error.reason
+    return type(error).__name__, text
+
+
+def lookup(host, family, resolvers):
+    """The global addresses of a launch name in `family`, from the first resolver that answers
+    with any: a viewer's browser gets them through public DNS too."""
+    qtype = FAMILIES[family][1]
+    for resolver in resolvers:
+        try:
+            found = resolve(resolver, host, qtype, 5)
+        except (OSError, ValueError, AssertionError):
+            continue
+        found = [a for a in found if a.is_global]
+        if found:
+            return found
+    raise AssertionError("the launch name has no global address in this family")
+
+
+def tls_context():
+    """The trust a viewer has: the system's, or a host-image acceptance's throwaway CA."""
+    ca = os.environ.get("SMOKE_CA_FILE")
+    return ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+
+
+def opener(family, resolvers):
+    """A Socket opener that goes through public DNS to an address of `family` only."""
+    def open_tls(host, port):
+        last = None
+        for address in lookup(host, family, resolvers):
+            try:
+                raw = socket.create_connection((str(address), port), timeout=CONNECT_SECONDS)
+            except OSError as error:
+                last = error
+                continue
+            try:
+                raw.settimeout(CONNECT_SECONDS)
+                return tls_context().wrap_socket(raw, server_hostname=host)
+            except OSError as error:
+                raw.close()
+                last = error
+        raise last or RuntimeError("no reachable public endpoint in this family")
+    return open_tls
+
+
+def decode(units, width, height):
+    """The first picture of `units` (Annex-B access units from a keyframe) as 8-bit luma,
+    through ffmpeg; the decoded bytes."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is not installed: frames cannot be decoded")
+    out = subprocess.run([ffmpeg, "-v", "error", "-f", "h264", "-i", "pipe:0", "-frames:v", "1",
+                          "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"],
+                         input=b"".join(units), capture_output=True, timeout=30)
+    if out.returncode != 0 or len(out.stdout) < width * height:
+        raise AssertionError("the tile's frames did not decode to a picture")
+    return out.stdout[:width * height]
+
+
+def prove_stream(connection, deadline, probe):
+    """A frame stream: its header, then FCVF frames from a keyframe that decode to a picture
+    that is not flat. Returns the picture's size and luma spread."""
+    header, units, size = None, [], None
+    probe.step = "stream header"
+    while time.monotonic() < deadline:
+        opcode, payload = connection.message(deadline)
+        if opcode == 1 and header is None:
+            try:
+                header = json.loads(payload)
+            except ValueError:
+                raise AssertionError("the stream's header is not JSON")
+            if not isinstance(header, dict) or not re.fullmatch(r"avc1\.[0-9A-Fa-f]{6}", str(header.get("codec"))):
+                raise AssertionError("the stream's header names no H.264 codec")
+            probe.step = "first keyframe"
+            continue
+        if opcode != 2:
+            continue
+        if header is None:
+            raise AssertionError("a frame arrived before the stream's header")
+        if len(payload) < 26 or payload[:5] != b"FCVF\x01":
+            raise AssertionError("a frame message without FCVF framing")
+        keyframe, (width, height) = payload[5] & 1, struct.unpack("<HH", payload[6:10])
+        if not units and not keyframe:
+            continue
+        if not width or not height:
+            raise AssertionError("a frame of zero size")
+        size = size or (width, height)
+        units.append(payload[22:])
+        probe.step = "decode"
+        if len(units) >= 4:
+            break
+    if not units:
+        raise TimeoutError("the tile sent no keyframe in time")
+    picture = decode(units, *size)
+    spread = max(picture) - min(picture)
+    if spread < FLAT_SPREAD:
+        raise AssertionError("the tile's first picture is flat: a blank tile")
+    return {"width": size[0], "height": size[1], "lumaSpread": spread}
+
+
+def prove_view(connection, slot, deadline, probe):
+    """A Minecraft view socket: its hello for this server, then the map it draws."""
+    probe.step = "view hello"
+    hello = None
+    while time.monotonic() < deadline:
+        opcode, payload = connection.message(deadline)
+        if opcode != 1:
+            continue
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            raise AssertionError("a view message is not JSON")
+        kind = message.get("type") if isinstance(message, dict) else None
+        if hello is None:
+            if kind != "hello" or message.get("tile") != slot:
+                raise AssertionError("the view socket's first message is not this server's hello")
+            hello = message
+            probe.step = "view map"
+            continue
+        if kind != "map":
+            continue
+        region = message.get("region") or {}
+        w, h = region.get("w"), region.get("h")
+        if not (isinstance(w, int) and isinstance(h, int) and 0 < w * h <= 1 << 20):
+            raise AssertionError("the view's map region is not a grid")
+        try:
+            cells = base64.b64decode(message.get("cells") or "", validate=True)
+        except ValueError:
+            raise AssertionError("the view's map cells are not base64")
+        if len(cells) != w * h * 2:
+            raise AssertionError("the view's map cells do not fill its region")
+        return {"mapColumns": w * h, "bots": hello.get("bots")}
+    raise TimeoutError("the server sent no map in time")
+
+
+def drive_round_trip(connection, deadline, probe):
+    """A take-over's round trip: a drive message (no keys held) that the server acknowledges
+    as its driver's. Until the borrow reaches the server it answers not ok; retried."""
+    probe.step = "drive acknowledged"
+    seq = 0
+    while time.monotonic() < deadline:
+        seq += 1
+        connection.send({"type": "drive", "seq": seq, "keys": [], "yaw": 0})
+        start = time.monotonic()
+        while time.monotonic() < min(deadline, start + 2):
+            try:
+                opcode, payload = connection.message(min(deadline, start + 2))
+            except TimeoutError:
+                break
+            if opcode != 1:
+                continue
+            message = json.loads(payload)
+            if message.get("type") == "drive_ack" and message.get("seq") == seq:
+                if message.get("ok") is True:
+                    return {"driveAckMs": round((time.monotonic() - start) * 1000)}
+                break
+        time.sleep(0.5)
+    raise TimeoutError("the server never acknowledged the driver")
+
+
+def probe_tile(mode, half, tile, family, admit, viewer, resolvers, takeover=None):
+    """Prove one tile over one family; the Probe. `takeover` drives a Minecraft server this
+    viewer has borrowed."""
+    probe = Probe(mode, tile.get("id"), family)
+    try:
+        probe.step = "published URL"
+        url = tile.get(FAMILIES[family][2])
+        if not url:
+            raise AssertionError("the coordinator publishes no URL for this tile in this family")
+        endpoint(url, mode, family, half)
+        probe.step = "connect"
+        socket_url = url if mode == "minecraft" else url + "?h=180"
+        connection = Socket(socket_url, opener=opener(family, resolvers))
+        try:
+            deadline = time.monotonic() + PROBE_SECONDS
+            if admit is not None:
+                connection.send({"admit": admit})
+            elif mode == "minecraft":
+                connection.send({"viewer": viewer})
+            if mode == "minecraft":
+                probe.detail = prove_view(connection, tile.get("slot"), deadline, probe)
+                if takeover:
+                    probe.detail.update(drive_round_trip(connection, deadline + 20, probe))
+            else:
+                probe.detail = prove_stream(connection, deadline, probe)
+        finally:
+            connection.close()
+        probe.ok = True
+    except Exception as error:
+        probe.error = fixed(error)
+    return probe
+
+
+def probe_all(jobs):
+    """Run every (args) of probe_tile at once; the Probes, in order."""
+    out = [None] * len(jobs)
+    def run(i):
+        out[i] = probe_tile(*jobs[i])
+    threads = [threading.Thread(target=run, args=(i,), name=f"probe-{i}") for i in range(len(jobs))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def sweep_jobs(state, modes, family, admit, viewer, resolvers):
+    """A probe per tile of every mode (and per serving aggregate), and a Probe failed already
+    for each tile the coordinator has no running stream of and each mode it reports nothing of."""
+    jobs, failed = [], []
+    for mode in modes + ("aggregate",):
+        if mode == "potato":
+            continue
+        tiles = tiles_of(state, mode)
+        if tiles is None:
+            p = Probe(mode, None, family)
+            p.step, p.error = "coordinator state", ("AssertionError", "the coordinator reports no tiles of this mode")
+            failed.append(p)
+            continue
+        for half, t in tiles:
+            if mode == "aggregate" and not (t.get("frame_url") or t.get("frame_url_v4")):
+                continue  # an aggregator that serves no browser: aggregation is off
+            if t.get("borrowed") and not mine(t, viewer):
+                continue
+            if t.get("phase", "running") != "running":
+                p = Probe(mode, t.get("id"), family)
+                p.step, p.error = "coordinator state", ("AssertionError", "the tile is not running")
+                failed.append(p)
+                continue
+            jobs.append((mode, half, t, family, admit, viewer, resolvers))
+    return jobs, failed
+
+
+def potato_probe(family, caught):
+    """The potato game has no viewer socket: the page draws /live. A verified catch while the
+    smoke watched (the round's latest catch moved) is its first real payload."""
+    p = Probe("potato", None, family)
+    if caught:
+        p.ok, p.detail = True, {"verifiedCatch": True}
+    else:
+        p.step, p.error = "verified catch", ("AssertionError", "no verified catch while the smoke watched")
+    return p
+
+
 def relaunch_interval_seconds():
     # The image and this probe come from the same commit. Read its server default
     # instead of copying a rate limit that could drift when the core changes.
@@ -341,39 +770,77 @@ def get(url, headers=None):
         return error.code, error.headers, b""
 
 
-def main():
+def live_target():
+    """Where /live is and how to reach it: staging through Access, or a host-image acceptance's
+    own coordinator on loopback (SMOKE_LIVE_URL, plain ws://, no Access)."""
+    local = os.environ.get("SMOKE_LIVE_URL")
+    if local:
+        parsed = urllib.parse.urlsplit(local)
+        if parsed.scheme != "ws" or not ipaddress.ip_address(parsed.hostname).is_loopback:
+            raise ValueError("SMOKE_LIVE_URL must be a ws:// URL on loopback")
+        return None, local, {}
     api, origin = os.environ["STAGING_API_URL"].rstrip("/"), os.environ["STAGING_ORIGIN"].rstrip("/")
     headers = {"CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"],
                "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"], "Origin": origin}
-    step("Access check")
-    for url in (api + "/healthz", origin + "/"):
-        code, response_headers, _ = get(url)
-        location = urllib.parse.urlsplit(response_headers.get("Location", ""))
-        if code != 302 or location.scheme != "https" or not (location.hostname or "").endswith(".cloudflareaccess.com"):
-            raise AssertionError("staging did not require Access")
-        code, _, _ = get(url, headers)
-        if code != 200:
-            raise AssertionError("authenticated staging request failed")
-    step("agents-only endpoint check")
-    code, _, _ = get(api + "/agent", headers)
-    if code not in (401, 403, 302):
-        raise AssertionError("the CI token reached the agents-only endpoint")
+    return (api, origin), api.replace("https://", "wss://", 1) + "/live", headers
+
+
+def plain(host, port):
+    """A plain TCP socket to a loopback coordinator (host-image acceptance only)."""
+    if not ipaddress.ip_address(host).is_loopback:
+        raise ValueError("a plain socket is for a loopback coordinator only")
+    return socket.create_connection((host, port), timeout=20)
+
+
+def main(family="v4", single=False, modes=(), relaunch=True, takeover=False):
+    """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
+    names); `modes` adds the viewer path over `family` for every tile of each mode."""
+    if modes:
+        step(f"viewer: this runner as a {family} viewer")
+        prove_viewer(family, single)
+    stage, live_url, headers = live_target()
+    resolvers = [r for r in os.environ.get("SMOKE_RESOLVERS", "").split(",") if r] or list(PUBLIC_RESOLVERS)
+    if stage is not None:
+        api, origin = stage
+        step("Access check")
+        for url in (api + "/healthz", origin + "/"):
+            code, response_headers, _ = get(url)
+            location = urllib.parse.urlsplit(response_headers.get("Location", ""))
+            if code != 302 or location.scheme != "https" or not (location.hostname or "").endswith(".cloudflareaccess.com"):
+                raise AssertionError("staging did not require Access")
+            code, _, _ = get(url, headers)
+            if code != 200:
+                raise AssertionError("authenticated staging request failed")
+        step("agents-only endpoint check")
+        code, _, _ = get(api + "/agent", headers)
+        if code not in (401, 403, 302):
+            raise AssertionError("the CI token reached the agents-only endpoint")
+    def live():
+        if stage is None:
+            parsed = urllib.parse.urlsplit(live_url)
+            return Socket("wss" + live_url[2:], headers, opener=lambda h, p: plain(parsed.hostname, parsed.port or 80))
+        if modes:
+            return Socket(live_url, headers, opener=lambda h, p: public(h, p, family))
+        return Socket(live_url, headers)
     step("/live connect")
-    connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
+    connection = live()
+    failures = 0
     try:
         # The first message on /live: a page's seat ticket (none here).
         connection.send({"type": "seat", "ticket": None})
-        deadline = time.monotonic() + 720
+        deadline = time.monotonic() + 720 + (900 if modes else 0)
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
         state, admission = {}, {}
-        seat, reconnects = None, 0
+        seat, reconnects, viewer = None, 0, None
         def take(message):
-            nonlocal state, admission, seat
+            nonlocal state, admission, seat, viewer
             if message.get("type") == "snapshot":
                 state = message["state"]
             elif message.get("type") == "admission":
                 admission = message
                 seat = message.get("seat")
+            elif message.get("type") == "hello":
+                viewer = message.get("viewer")
         def until(predicate):
             nonlocal connection, state, admission, reconnects
             while time.monotonic() < deadline:
@@ -388,7 +855,7 @@ def main():
                     connection.close()
                     state, admission = {}, {}
                     reconnects += 1
-                    connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
+                    connection = live()
                     connection.send({"type": "seat", "ticket": seat})
                     print(json.dumps({"reconnect": reconnects}), flush=True)
                     continue
@@ -404,6 +871,24 @@ def main():
             if not token:
                 raise AssertionError("the smoke connection was given no direct token")
             return token
+        def commit(name, args):
+            """Send an intent and wait for its receipt; whether it committed."""
+            intent = str(uuid.uuid4())
+            connection.send({"type": "intent", "id": intent, "name": name, "args": args})
+            # A refused intent must fail explicitly, rather than wait for an unrelated change.
+            while True:
+                opcode, payload = connection.message(deadline)
+                if opcode != 1:
+                    continue
+                message = json.loads(payload)
+                take(message)
+                if message.get("type") == "receipt" and message.get("id") == intent:
+                    return message.get("outcome") == "committed"
+        if modes:
+            failures = viewer_path(family, modes, takeover, resolvers, until, commit,
+                                   lambda: (state, admission, viewer))
+        if not relaunch:
+            return failures
         for half in ("fcvm", "ec2"):
             step(f"/live: wait for an {half} tile to run")
             until(lambda s: ready(s, half))
@@ -417,22 +902,11 @@ def main():
             if delay > 0:
                 time.sleep(delay)
             step(f"/live: {half} relaunch receipt")
-            intent = str(uuid.uuid4())
-            connection.send({"type": "intent", "id": intent, "name": "relaunch", "args": {"tile": old["id"]}})
-            # A refused intent must fail explicitly, rather than wait for an unrelated scheduled race.
-            while True:
-                opcode, payload = connection.message(deadline)
-                if opcode != 1:
-                    continue
-                message = json.loads(payload)
-                take(message)
-                if message.get("type") == "receipt" and message.get("id") == intent:
-                    if message.get("outcome") != "committed":
-                        raise AssertionError("staging refused the relaunch")
-                    # Start the interval at the receipt, after the server accepted
-                    # the intent, so varying network latency cannot shorten it.
-                    next_relaunch = time.monotonic() + interval
-                    break
+            if not commit("relaunch", {"tile": old["id"]}):
+                raise AssertionError("staging refused the relaunch")
+            # Start the interval at the receipt, after the server accepted
+            # the intent, so varying network latency cannot shorten it.
+            next_relaunch = time.monotonic() + interval
             step(f"/live: wait for the relaunched {half} tile to run")
             until(lambda s: ready(s, half, slot=old["slot"], after=old["generation"]))
             new = ready(state, half, slot=old["slot"], after=old["generation"])
@@ -448,11 +922,88 @@ def main():
                               "directAdmission": direct() is not None}), flush=True)
     finally:
         connection.close()
+    return failures
 
 
-def run():
+def viewer_path(family, modes, takeover, resolvers, until, commit, now):
+    """Every tile of every mode over `family`, as a viewer's browser reaches it; prints a line per
+    tile and returns how many failed. `until`, `commit` and `now` are main's /live helpers."""
+    step("/live: wait for every mode's tiles to run")
+    settle_by = time.monotonic() + 600
+    until(lambda s: settled(s, modes, now()[2]) or time.monotonic() > settle_by)
+    state, admission, viewer = now()
+    token = (admission.get("direct") or {}).get("value")
+    catches = ((state.get("potato") or {}).get("round") or {}).get("seq")
+    step("viewer path")
+    jobs, probes = sweep_jobs(state, modes, family, token, viewer, resolvers)
+    probes = probe_all(jobs) + probes
+    if takeover and "minecraft" in modes:
+        probes.append(minecraft_takeover(family, token, viewer, resolvers, until, commit, now))
+    if "potato" in modes:
+        step("/live: a verified potato catch")
+        watch_by = time.monotonic() + 90
+        def caught(s):
+            seq = ((s.get("potato") or {}).get("round") or {}).get("seq")
+            return (seq is not None and seq != catches) or time.monotonic() > watch_by
+        until(caught)
+        seq = ((now()[0].get("potato") or {}).get("round") or {}).get("seq")
+        probes.append(potato_probe(family, seq is not None and seq != catches))
+    for p in probes:
+        print(json.dumps(p.line()), flush=True)
+    failed = sum(not p.ok for p in probes)
+    print(json.dumps({"family": family, "modes": list(modes), "probes": len(probes), "failed": failed}), flush=True)
+    return failed
+
+
+def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
+    """Borrow a server, drive it once through its view socket, give it back."""
+    p = Probe("minecraft", None, family)
+    p.step = "take over"
+    if not commit("claim_minecraft", {}):
+        p.error = ("AssertionError", "the coordinator refused the take-over")
+        return p
     try:
-        main()
+        held_by = time.monotonic() + 30
+        def held(s):
+            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or []) or time.monotonic() > held_by
+        until(held)
+        tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, viewer)), None)
+        if tile is None:
+            p.error = ("AssertionError", "the borrowed server never showed as this viewer's")
+            return p
+        p = probe_tile("minecraft", "fcvm", tile, family, token, viewer, resolvers, takeover=True)
+        p.tile = (p.tile or "") + " take-over"
+        return p
+    finally:
+        commit("release_minecraft", {})
+
+
+
+def arguments(argv):
+    import argparse
+    parser = argparse.ArgumentParser(description="The viewer-path smoke (module docstring).")
+    parser.add_argument("--family", choices=sorted(FAMILIES), default="v4")
+    parser.add_argument("--single-family", action="store_true",
+                        help="require a viewer that has no other family (an IPv4-only runner)")
+    parser.add_argument("--modes", default="", help="comma separated, of " + ",".join(MODES))
+    parser.add_argument("--relaunch", action="store_true", help="relaunch a tile per wall half")
+    parser.add_argument("--takeover", action="store_true", help="borrow and drive a Minecraft server")
+    args = parser.parse_args(argv)
+    modes = tuple(m for m in args.modes.split(",") if m)
+    if any(m not in MODES for m in modes):
+        parser.error("unknown mode")
+    if not modes and not args.relaunch:
+        parser.error("nothing to check: give --modes or --relaunch")
+    return dict(family=args.family, single=args.single_family, modes=modes,
+                relaunch=args.relaunch, takeover=args.takeover)
+
+
+def run(argv=None):
+    try:
+        failed = main(**arguments(sys.argv[1:] if argv is None else argv))
+        if failed:
+            step("viewer path")
+            raise AssertionError("a tile failed the viewer path")
     except Exception as error:
         print(json.dumps({"status": "failed", "step": STEP, "errorType": type(error).__name__,
                           "error": describe(error)}))
