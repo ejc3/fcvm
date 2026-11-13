@@ -110,18 +110,102 @@ async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether something holds a snapshot's memory file in use, as a release pass sees it: its
-/// exclusive lock is refused (`uffd::release`).
+/// Whether a reader holds a snapshot's memory file in use (`uffd::release`).
 fn memory_file_in_use(snapshot: &str) -> Result<bool> {
-    let path = fcvm::paths::snapshot_dir()
-        .join(snapshot)
-        .join("memory.bin");
-    let pass = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&pass) {
-        Ok(()) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(error).with_context(|| format!("locking {}", path.display())),
-    }
+    marked_in_use(
+        &fcvm::paths::snapshot_dir()
+            .join(snapshot)
+            .join("memory.bin"),
+    )
+}
+
+/// Whether some process holds a shared `flock` on `path`: the mark a memory server or a
+/// File-backed restore's VM manager takes (`uffd::mark_in_use`).
+///
+/// Read from /proc/locks, not by asking for the lock. A refused exclusive lock cannot tell a
+/// reader's shared mark from a release pass, which holds an idle file exclusively, and any
+/// test that starts a memory server runs a pass over the shared snapshot directory
+/// (`a_release_pass_holding_a_memory_file_is_not_a_mark`).
+fn marked_in_use(path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let ino = file.metadata()?.ino();
+    // /proc/locks names the superblock's device, which on btrfs is not the st_dev of a file
+    // (that is its subvolume's). The file's mount carries the superblock's.
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .map(str::trim)
+        .with_context(|| format!("no mnt_id in the fdinfo of {}", path.display()))?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let device = mountinfo
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|fields| fields.first() == Some(&mount_id))
+        .and_then(|fields| {
+            let (major, minor) = fields.get(2)?.split_once(':')?;
+            Some((major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?))
+        })
+        .with_context(|| format!("mount {mount_id} of {} is not in mountinfo", path.display()))?;
+    let locks = std::fs::read_to_string("/proc/locks")?;
+    Ok(shared_flock_on(&locks, device, ino))
+}
+
+/// Whether a /proc/locks listing holds a granted shared `flock` on inode `ino` of the
+/// superblock `device`. Lines read `<n>: FLOCK  ADVISORY  READ <pid> <maj>:<min>:<ino> 0 EOF`,
+/// major and minor in hex; a waiter's line has `->` after the number and holds nothing.
+fn shared_flock_on(locks: &str, device: (u64, u64), ino: u64) -> bool {
+    locks.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, "FLOCK", _, "READ", _, id, ..] = fields.as_slice() else {
+            return false;
+        };
+        let mut parts = id.split(':');
+        let (Some(major), Some(minor), Some(inode), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        u64::from_str_radix(major, 16).ok() == Some(device.0)
+            && u64::from_str_radix(minor, 16).ok() == Some(device.1)
+            && inode.parse::<u64>().ok() == Some(ino)
+    })
+}
+
+/// A release pass (`uffd::release`) holds every idle memory file exclusively around one
+/// `posix_fadvise` call, and any test that starts a memory server runs one over the shared
+/// snapshot directory. That lock is not a reader's mark. In CI run 43447084079 a pass of
+/// another test's server held this suite's files from 15:36:35.897 to 15:36:36.392, and
+/// `test_restored_clone_reboot_comes_back_healthy` checked just after 15:36:36.05 that its clone's
+/// mark had gone, read the pass's lock as the mark, and failed.
+#[test]
+fn a_release_pass_holding_a_memory_file_is_not_a_mark() -> Result<()> {
+    // On the store the snapshots live on: on btrfs a file's st_dev is its subvolume's, not
+    // the superblock device /proc/locks names.
+    let root = fcvm::paths::data_dir();
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    let dir = tempfile::tempdir_in(&root)?;
+    let path = dir.path().join("memory.bin");
+    std::fs::write(&path, b"memory")?;
+    assert!(!marked_in_use(&path)?, "an unlocked file is not marked");
+
+    let pass = std::fs::File::open(&path)?;
+    fs2::FileExt::lock_exclusive(&pass)?;
+    assert!(
+        !marked_in_use(&path)?,
+        "a release pass holding the file exclusively was read as a reader's mark"
+    );
+    drop(pass);
+
+    let reader = std::fs::File::open(&path)?;
+    fs2::FileExt::lock_shared(&reader)?;
+    assert!(marked_in_use(&path)?, "a reader's shared mark was not seen");
+    drop(reader);
+    assert!(!marked_in_use(&path)?, "a dropped mark was still seen");
+    Ok(())
 }
 
 /// Write a marker into the container's writable layer and verify it.
