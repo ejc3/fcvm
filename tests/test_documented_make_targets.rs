@@ -1427,11 +1427,15 @@ fn container_test_targets_hand_the_test_options_to_the_container() {
         "container-test-fast",
         "container-test-all",
     ] {
-        let out = Command::new("make")
-            .args(["-n", target, "FILTER=-E 'test(=a_probe)'"])
-            .current_dir(repo_root())
-            .output()
-            .expect("run make -n");
+        let mut make = Command::new("make");
+        make.args(["-n", target, "FILTER=-E 'test(=a_probe)'"])
+            .current_dir(repo_root());
+        // The Host-Root lanes run this binary as root, and the Makefile refuses root.
+        if let Some((uid, gid)) = harness_user() {
+            use std::os::unix::process::CommandExt;
+            make.uid(uid).gid(gid);
+        }
+        let out = make.output().expect("run make -n");
         assert!(
             out.status.success(),
             "make -n {target} failed:\n{}",
