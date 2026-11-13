@@ -3572,6 +3572,16 @@ def probe_tcp_connect(endpoint: str, timeout_s: float = 2.0) -> dict:
     return out
 
 
+# printf format for asking guest Chromium's DevTools for /json/version over nc.
+# HTTP/1.1 with a Host header: the DevTools server drops an HTTP/1.0 request
+# ("Cannot handle request with protocol: HTTP/1.0") without a byte of reply, so
+# the probe used to come back empty from a guest whose Chromium was answering.
+DEVTOOLS_VERSION_REQUEST = (
+    "GET /json/version HTTP/1.1\\r\\nHost: 127.0.0.1:{port}\\r\\n"
+    "Connection: close\\r\\n\\r\\n"
+)
+
+
 class FailureProbe:
     """Capture guest-side and host-side state for a clone that just failed.
 
@@ -3877,7 +3887,7 @@ class FailureProbe:
             # Chromium answering on guest loopback while the host cannot reach
             # it puts the fault in the network path, not in the browser.
             ("cdp_from_guest_loopback",
-             f"printf 'GET /json/version HTTP/1.0\\r\\n\\r\\n' "
+             f"printf '{DEVTOOLS_VERSION_REQUEST.format(port=port)}' "
              f"| nc -w 2 127.0.0.1 {port}"),
             # What restore-epoch does the guest see RIGHT NOW, and can it see
             # MMDS at all? `fetch_latest_metadata` is MMDS V2, so the token PUT

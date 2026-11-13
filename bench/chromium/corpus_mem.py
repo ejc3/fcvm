@@ -46,7 +46,13 @@ import time
 import uuid
 
 import host_resource_finalizer
-from reqbench import host_facts, host_identity, snapshot_generation, valid_snapshot_name
+from reqbench import (
+    DEVTOOLS_VERSION_REQUEST,
+    host_facts,
+    host_identity,
+    snapshot_generation,
+    valid_snapshot_name,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
@@ -724,7 +730,7 @@ def clone_forensics(args, clone, reason):
         # netcat-openbsd and iproute2 are in the guest rootfs; curl is not
         # (rootfs-config.toml [packages]; reqbench's FailureProbe uses the same).
         probe = ("export PATH=/usr/sbin:/usr/bin:/sbin:/bin; "
-                 f"r=$(printf 'GET /json/version HTTP/1.0\\r\\n\\r\\n' | nc -w 2 127.0.0.1 {port}); "
+                 f"r=$(printf '{DEVTOOLS_VERSION_REQUEST.format(port=port)}' | nc -w 2 127.0.0.1 {port}); "
                  "rc=$?; printf '%s\\n' \"$r\" | head -c 400; echo; echo nc_rc=$rc; ss -Htlnp; "
                  # The restore's ingress gate answers a new inbound TCP flow
                  # with a reset until the restore publishes (fc-agent
