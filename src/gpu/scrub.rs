@@ -735,11 +735,17 @@ fn clean_token_path(state_dir: &Path, sbdf: &str) -> PathBuf {
 
 /// Remove the clean token, durably. Called under the scrub's lock before the GPU is touched.
 fn remove_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
-    let path = clean_token_path(state_dir, sbdf);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+    for path in [
+        clean_token_path(state_dir, sbdf),
+        clean_key_path(state_dir, sbdf),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
     }
     std::fs::File::open(state_dir)
         .and_then(|dir| dir.sync_all())
@@ -756,22 +762,32 @@ fn boot_id() -> Result<String> {
         .to_string())
 }
 
+/// The key that makes a token valid, `<state_dir>/<sbdf>.clean-key`, readable by root only.
+fn clean_key_path(state_dir: &Path, sbdf: &str) -> PathBuf {
+    state_dir.join(format!("{sbdf}.clean-key"))
+}
+
 /// Write the clean token, durably. Called under the scrub's lock after a success is recorded.
 /// The handoff lock file is created first, so wherever a token exists every restore can take
-/// the GPU's handoff ([`begin_handoff`]). The token is mode 0666: a restore that cannot unlink
-/// it (a rootless one) empties it instead, which voids it.
+/// the GPU's handoff ([`begin_handoff`]). A token names this boot and a random nonce, and is
+/// valid only while it matches the key, which holds the same and which only root can read.
+/// The token is mode 0622: any user can empty it (a rootless restore does, which voids it),
+/// and no one but root can read it, so no one but root can write a valid one.
 fn write_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     create_handoff_file(state_dir, sbdf)?;
-    let path = clean_token_path(state_dir, sbdf);
-    let boot = boot_id()?;
-    std::fs::File::create(&path)
-        .and_then(|mut file| {
-            file.set_permissions(std::fs::Permissions::from_mode(0o666))?;
-            file.write_all(boot.as_bytes())?;
-            file.sync_all()
-        })
-        .with_context(|| format!("writing {}", path.display()))?;
+    let secret = format!("{}:{}", boot_id()?, uuid::Uuid::new_v4().simple());
+    let write = |path: &Path, mode: u32| {
+        std::fs::File::create(path)
+            .and_then(|mut file| {
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                file.write_all(secret.as_bytes())?;
+                file.sync_all()
+            })
+            .with_context(|| format!("writing {}", path.display()))
+    };
+    write(&clean_key_path(state_dir, sbdf), 0o600)?;
+    write(&clean_token_path(state_dir, sbdf), 0o622)?;
     std::fs::File::open(state_dir)
         .and_then(|dir| dir.sync_all())
         .with_context(|| format!("syncing {}", state_dir.display()))
@@ -870,20 +886,27 @@ fn take_clean_token_as(state_dir: &Path, sbdf: &str, root: bool) -> bool {
             .open(&path);
         return false;
     }
-    // Only a scrub writes the token, and none can run while the caller holds a lease; a
-    // rootless restore can empty it only under the handoff the caller holds. So the contents
-    // read here are the contents unlinked below.
-    let Ok(written) = std::fs::read_to_string(&path) else {
+    // Only a scrub writes the token and the key, and none can run while the caller holds a
+    // lease; a rootless restore can empty the token only under the handoff the caller holds.
+    // So the contents read here are the contents unlinked below.
+    let key_path = clean_key_path(state_dir, sbdf);
+    let (Ok(written), Ok(key)) = (
+        std::fs::read_to_string(&path),
+        std::fs::read_to_string(&key_path),
+    ) else {
+        let _ = std::fs::remove_file(&path);
         return false;
     };
     if std::fs::remove_file(&path).is_err() {
         return false;
     }
+    let _ = std::fs::remove_file(&key_path);
     // Durable before the VM opens the GPU: a crash cannot bring the token back.
     let synced = std::fs::File::open(state_dir)
         .and_then(|dir| dir.sync_all())
         .is_ok();
-    synced && boot_id().is_ok_and(|boot| written.trim() == boot)
+    let this_boot = boot_id().is_ok_and(|boot| key.split(':').next() == Some(boot.as_str()));
+    synced && this_boot && !key.is_empty() && written == key
 }
 
 /// Refuse a quarantined GPU. Called for every `--gpu` before the VM starts.
@@ -1243,6 +1266,24 @@ mod tests {
             !take_clean_token_as(&state, sbdf, true),
             "a token survived a rootless VM"
         );
+        // A token anyone could write (this boot's id, readable by all) is not a valid one:
+        // only the key, which only root can read, makes it valid.
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(!take_clean_token_as(&state, sbdf, false));
+        std::fs::write(&token, boot_id().unwrap()).unwrap();
+        assert!(
+            !take_clean_token_as(&state, sbdf, true),
+            "a token rewritten with the boot id was honoured"
+        );
+        // The key is root's alone and the token cannot be read back by others.
+        use std::os::unix::fs::PermissionsExt;
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&clean_key_path(&state, sbdf)), 0o600);
+        assert_eq!(mode(&token), 0o622);
+        assert!(take_clean_token_as(&state, sbdf, true));
         // A scrub that fails after the reset leaves no token.
         let failed = scrub_and_record_with(
             &fake.root.path().join("sys"),
