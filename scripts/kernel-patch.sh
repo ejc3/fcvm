@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/kernel-patch.sh create <profile> <patch-name> <file1> [file2...]
-#   ./scripts/kernel-patch.sh edit <profile> <patch-number>
+#   ./scripts/kernel-patch.sh edit <profile> <patch>   (number, full name or unique prefix)
 #   ./scripts/kernel-patch.sh validate <profile>
 #   ./scripts/kernel-patch.sh resolve <profile>
 #
@@ -185,7 +185,7 @@ setup_kernel_source() {
 apply_patches_until() {
     local kernel_dir="$1"
     local patches_dir="$2"
-    local stop_at="$3"  # e.g., "0002" or empty to apply all
+    local stop_at="$3"  # a patch's file name, or empty to apply all
     local profile="${4:-}"
 
     cd "$kernel_dir"
@@ -199,10 +199,9 @@ apply_patches_until() {
         skips_patch "$profile" "$patch" && continue
 
         local patch_name=$(basename "$patch")
-        local patch_num="${patch_name:0:4}"
 
         # Stop if we've reached the target patch
-        if [[ -n "$stop_at" && "$patch_num" == "$stop_at" ]]; then
+        if [[ -n "$stop_at" && "$patch_name" == "$stop_at" ]]; then
             break
         fi
 
@@ -220,6 +219,28 @@ apply_patches_until() {
     git commit -q -m "Applied patches" --allow-empty
 }
 
+# The patch in $patches_dir that <name> names: its file name (with or without .patch), or
+# the one patch whose name starts with <name>. An unnumbered patch has no number to match.
+find_patch() {
+    local patches_dir="$1" name="${2%.patch}"
+    local matches=()
+
+    if [[ -f "$patches_dir/$name.patch" ]]; then
+        printf '%s\n' "$patches_dir/$name.patch"
+        return
+    fi
+    for patch in "$patches_dir"/"$name"*.patch; do
+        [[ -f "$patch" ]] && matches+=("$patch")
+    done
+    [[ ${#matches[@]} -gt 0 ]] || error "No patch found matching: ${name}*.patch"
+    [[ ${#matches[@]} -eq 1 ]] || error "'$name' matches more than one patch: $(for m in "${matches[@]}"; do printf '%s ' "$(basename "$m")"; done)"
+    printf '%s\n' "${matches[0]}"
+}
+
+# finish writes the patch as the difference from this tag: the tree before the patch
+# being created or edited, so the patch file holds all of it, not only the last change.
+PATCH_BASE_TAG=kernel-patch-base
+
 # Generate a patch from current changes
 generate_patch() {
     local kernel_dir="$1"
@@ -231,6 +252,11 @@ generate_patch() {
 
     # Stage all changes
     git add -A
+
+    # Everything since the base is the patch: an edit's earlier commits fold into it.
+    git rev-parse -q --verify "refs/tags/$PATCH_BASE_TAG" >/dev/null ||
+        error "No $PATCH_BASE_TAG tag in $kernel_dir: start it with create or edit"
+    git reset -q --soft "$PATCH_BASE_TAG"
 
     # Check if there are changes
     if git diff --cached --quiet; then
@@ -272,7 +298,7 @@ cmd_create() {
     local version patches_dir
     version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
     patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
-    local workdir="/tmp/kernel-patch-$$"
+    local workdir="${KERNEL_PATCH_WORKDIR:-/tmp/kernel-patch-$$}"
 
     # An empty patches_dir means the profile deliberately applies no patches.
     [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot create a patch"
@@ -289,6 +315,7 @@ cmd_create() {
     cd "$kernel_dir"
     git add -A
     git commit -q -m "Pre-edit state" --allow-empty
+    git tag -f "$PATCH_BASE_TAG" >/dev/null
 
     echo ""
     echo "=========================================="
@@ -348,20 +375,20 @@ cmd_edit() {
     local profile="${1:-}"
     local patch_num="${2:-}"
 
-    [[ -z "$profile" ]] && error "Usage: $0 edit <profile> <patch-number>"
-    [[ -z "$patch_num" ]] && error "Usage: $0 edit <profile> <patch-number>"
+    [[ -z "$profile" ]] && error "Usage: $0 edit <profile> <patch>"
+    [[ -z "$patch_num" ]] && error "Usage: $0 edit <profile> <patch>"
 
     local version patches_dir
     version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
     patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
-    local workdir="/tmp/kernel-patch-$$"
+    local workdir="${KERNEL_PATCH_WORKDIR:-/tmp/kernel-patch-$$}"
 
     # An empty patches_dir means the profile deliberately applies no patches.
     [[ -z "$patches_dir" ]] && error "Profile '$profile' has patches disabled (patches_dir is empty); cannot edit a patch"
 
-    # Find the patch file
-    local patch_file=$(ls "$patches_dir"/${patch_num}*.patch 2>/dev/null | head -1)
-    [[ -f "$patch_file" ]] || error "No patch found matching: ${patch_num}*.patch"
+    # Find the patch file: by number, by its full name, or by a prefix only it has
+    local patch_file
+    patch_file=$(find_patch "$patches_dir" "$patch_num") || exit 1
     skips_patch "$profile" "$patch_file" && error \
         "$(basename "$patch_file") is guest-only (*.vm.patch); the host build never applies it"
 
@@ -373,12 +400,13 @@ cmd_edit() {
     local kernel_dir=$(setup_kernel_source "$version" "$workdir")
 
     # Apply patches up to (but not including) this one
-    apply_patches_until "$kernel_dir" "$patches_dir" "$patch_num" "$profile"
+    apply_patches_until "$kernel_dir" "$patches_dir" "$patch_name" "$profile"
+    cd "$kernel_dir"
+    git tag -f "$PATCH_BASE_TAG" >/dev/null
 
     # Apply the target patch
-    cd "$kernel_dir"
     info "Applying $patch_name..."
-    patch -p1 < "$patch_file" || warn "Patch applied with issues"
+    patch -p1 --forward --batch < "$patch_file" || error "$patch_name does not apply on the patches before it"
 
     git add -A
     git commit -q -m "Applied $patch_name" --allow-empty
@@ -476,8 +504,9 @@ case "${1:-}" in
         echo "  create <profile> <patch-name> <file1> [file2...]"
         echo "      Start creating a new patch"
         echo ""
-        echo "  edit <profile> <patch-number>"
-        echo "      Edit an existing patch (e.g., edit nested 0002)"
+        echo "  edit <profile> <patch>"
+        echo "      Edit an existing patch, named by number, full name or a unique prefix"
+        echo "      (e.g., edit nested 0002, edit nested.host_kernel vgic-v3-keep-hcr-on-quiet-exits)"
         echo ""
         echo "  finish <profile> <patch-name> <workdir>"
         echo "      Finish editing and generate the patch file"
