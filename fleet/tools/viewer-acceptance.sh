@@ -87,8 +87,13 @@ trap stop EXIT
 . "$SRC/fleet/tools/lib.sh"
 wait_listening 127.0.0.1 "$LIVE" 120 "$CP" || { log "BLOCKED: the coordinator did not listen"; exit 2; }
 
+# Both families borrow a Minecraft server from the same client address, and a client waits
+# minecraft_claim_cooldown_secs (fleet/core/src/state.rs) after a return to borrow again.
+COOLDOWN=$(grep -oE 'minecraft_claim_cooldown_secs: [0-9]+' "$SRC/fleet/core/src/state.rs" | grep -oE '[0-9]+$')
+[ -n "$COOLDOWN" ] || { log "BLOCKED: no Minecraft claim cooldown in fleet/core/src/state.rs"; exit 2; }
 rc=0
 for family in v4 v6; do
+  [ "$family" = v4 ] || sleep "$((COOLDOWN + 5))"
   log "viewer path over $family"
   SMOKE_LIVE_URL="ws://127.0.0.1:$LIVE/live" SMOKE_RESOLVERS="127.0.0.1:$DNS" SMOKE_ZONE="$ZONE" \
     SMOKE_CA_FILE="$OUT/ca.pem" python3 -B "$SRC/fleet/coord/stage-smoke.py" --family "$family" \
