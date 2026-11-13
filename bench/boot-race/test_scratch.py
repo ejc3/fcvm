@@ -217,5 +217,16 @@ class ScratchTests(unittest.TestCase):
                 self.assertFalse(any(c[:3] == ('mount', '-t', 'ext4') for c in self.commands))
 
 
+
+class BoxSetup(unittest.TestCase):
+    def test_the_build_runs_in_a_new_login_not_under_sg(self):
+        """sg kvm makes kvm the primary group, and newuidmap then refuses setup-fcvm's rootless podman. RED BEFORE
+        THE FIX: box-setup.sh ran make build and make setup-fcvm under sg kvm, and setup-fcvm failed on the box."""
+        text = (Path(__file__).resolve().parent / "box-setup.sh").read_text()
+        commands = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        self.assertFalse([l for l in commands if l.lstrip().startswith("sg ")])
+        self.assertTrue([l for l in commands if l.startswith("sudo -u ubuntu -H bash -c") and "setup-fcvm" in l])
+
+
 if __name__ == '__main__':
     unittest.main()
