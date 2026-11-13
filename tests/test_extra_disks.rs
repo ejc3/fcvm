@@ -44,38 +44,150 @@ impl MountMethod {
     }
 }
 
-/// Create a small ext4 disk image with a test file
-async fn create_test_disk(path: &Path) -> Result<()> {
-    // Create 64MB sparse file and format as ext4
-    tokio::process::Command::new("truncate")
-        .args(["-s", "64M", path.to_str().unwrap()])
-        .status()
-        .await?;
-    tokio::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", path.to_str().unwrap()])
-        .status()
-        .await?;
+/// Set in the re-executed child of the test below: the image it is to build.
+const DISK_IMAGE_CHILD: &str = "FCVM_EXT4_DISK_IMAGE_TEST_IMAGE";
 
-    // Mount temporarily, write test file, unmount
-    // Use path-derived name to avoid collisions when tests run in parallel
-    let mount_dir = format!("/tmp/fcvm-disk-{:x}", {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut h);
-        h.finish()
-    });
-    tokio::fs::create_dir_all(&mount_dir).await?;
-    tokio::process::Command::new("mount")
-        .args([path.to_str().unwrap(), &mount_dir])
-        .status()
-        .await?;
-    tokio::fs::write(format!("{}/test.txt", mount_dir), "hello\n").await?;
-    tokio::process::Command::new("umount")
-        .arg(&mount_dir)
-        .status()
-        .await?;
-    tokio::fs::remove_dir(&mount_dir).await.ok();
+/// Printed by that child once it has built the image. `--exact` with a name that matches no
+/// test exits 0 having run nothing, so after a rename the exit status alone would stay green.
+const DISK_IMAGE_BODY_RAN: &str = "ext4-disk-image: the child built the image";
+
+/// Stands in for `umount` in the child's PATH. Before unmounting, it starts a process in a
+/// private mount namespace whose working directory is the mounted image. The namespace holds
+/// a copy of every mount on the host at that moment, as any process creating one then does,
+/// and the working directory keeps that copy of the image's mount in use: removing the
+/// mountpoint detaches the copy, but a copy in use stays alive until it is let go, and the
+/// filesystem with it. It appends that process's pid to `$HOLD_DIR/holders` for the parent
+/// to stop. The holder's own output goes nowhere: holding the child's stdout open would keep
+/// the parent waiting until the holder exits, and the filesystem would be released before
+/// the parent looked at the image.
+const UMOUNT_STAND_IN: &str = r#"#!/bin/sh
+set -eu
+mkfifo "$HOLD_DIR/ready"
+unshare --mount --propagation private -- sh -c 'cd "$2"; echo $$ > "$1"; exec sleep 30' \
+    sh "$HOLD_DIR/ready" "$1" </dev/null >/dev/null 2>&1 &
+read holder < "$HOLD_DIR/ready"
+echo "$holder" >> "$HOLD_DIR/holders"
+exec "$REAL_UMOUNT" "$@"
+"#;
+
+/// An image from `common::ext4_disk_image` mounts read-only in a guest whatever else on the
+/// host holds a copy of a mount while the image is built. A read-only `--disk` is a
+/// read-only block device in the guest, and ext4 refuses one whose journal needs recovery:
+/// `EXT4-fs (vdb): write access unavailable, cannot proceed (try mounting with noload)`,
+/// and fc-agent fails with `cannot mount /dev/vdb read-only`.
+///
+/// RED BEFORE THE FIX: the helper loop-mounted the image on the host to write its file,
+/// unmounted it and removed the mountpoint. With the stand-in's namespace holding a copy of
+/// that mount in use, `umount` returned 0 and the mountpoint was removed while the
+/// filesystem stayed mounted, its superblock flagged needs_recovery, and that is the image
+/// a VM would get. CI run 43499719102 failed `test_fuse_snapshot_matrix_plus_disk` with
+/// that error.
+#[tokio::test]
+async fn an_ext4_disk_image_is_clean_while_a_mount_namespace_holds_the_hosts_mounts() -> Result<()>
+{
+    const TEST_NAME: &str =
+        "an_ext4_disk_image_is_clean_while_a_mount_namespace_holds_the_hosts_mounts";
+    if let Some(image) = std::env::var_os(DISK_IMAGE_CHILD) {
+        common::ext4_disk_image(Path::new(&image), &[("test.txt", "hello\n")]).await?;
+        println!("{DISK_IMAGE_BODY_RAN}");
+        return Ok(());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin)?;
+    let stand_in = bin.join("umount");
+    std::fs::write(&stand_in, UMOUNT_STAND_IN)?;
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))?;
+    let real_umount = std::process::Command::new("sh")
+        .args(["-c", "command -v umount"])
+        .output()
+        .context("finding umount")?;
+    anyhow::ensure!(real_umount.status.success(), "umount is not on PATH");
+    let real_umount = String::from_utf8(real_umount.stdout)?.trim().to_string();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let image = dir.path().join("disk.raw");
+    let child = tokio::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", TEST_NAME, "--nocapture", "--test-threads", "1"])
+        .env(DISK_IMAGE_CHILD, &image)
+        .env("PATH", path)
+        .env("HOLD_DIR", dir.path())
+        .env("REAL_UMOUNT", &real_umount)
+        .output()
+        .await
+        .context("running the child")?;
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    // Stopped when this test returns, after the image has been read.
+    let holders: Vec<HeldNamespace> = std::fs::read_to_string(dir.path().join("holders"))
+        .unwrap_or_default()
+        .lines()
+        .map(|pid| pid.parse().map(HeldNamespace))
+        .collect::<Result<_, _>>()
+        .context("reading the holders' pids")?;
+    anyhow::ensure!(
+        child.status.success() && stdout.contains(DISK_IMAGE_BODY_RAN),
+        "the child did not build the image: {}\n{stdout}\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    // A holder that is gone has released its copy of the mount, and the image says nothing
+    // about a build it watched.
+    for holder in &holders {
+        anyhow::ensure!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(holder.0), None).is_ok(),
+            "the mount namespace holder {} exited before the image was read",
+            holder.0
+        );
+    }
+
+    let header = tokio::process::Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(&image)
+        .output()
+        .await
+        .context("running dumpe2fs")?;
+    anyhow::ensure!(header.status.success(), "dumpe2fs -h failed");
+    let header = String::from_utf8_lossy(&header.stdout);
+    let features = header
+        .lines()
+        .find(|line| line.starts_with("Filesystem features:"))
+        .context("dumpe2fs printed no feature line")?;
+    anyhow::ensure!(
+        !features.contains("needs_recovery"),
+        "the image's journal needs recovery, so a read-only guest cannot mount it: {features}"
+    );
+
+    let file = tokio::process::Command::new("debugfs")
+        .args(["-R", "cat /test.txt"])
+        .arg(&image)
+        .output()
+        .await
+        .context("running debugfs")?;
+    anyhow::ensure!(
+        file.status.success() && file.stdout == b"hello\n",
+        "test.txt in the image: {:?}",
+        String::from_utf8_lossy(&file.stdout)
+    );
     Ok(())
+}
+
+/// A process holding a mount namespace, killed when dropped.
+struct HeldNamespace(i32);
+
+impl Drop for HeldNamespace {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.0),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
 }
 
 /// Test RW disk: mounted, readable, writable, blocks snapshots
@@ -83,7 +195,7 @@ async fn create_test_disk(path: &Path) -> Result<()> {
 async fn test_extra_disk_rw() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("disk-rw");
     let disk_path = PathBuf::from(format!("/tmp/fcvm-{}.raw", vm_name));
-    create_test_disk(&disk_path).await?;
+    common::ext4_disk_image(&disk_path, &[("test.txt", "hello\n")]).await?;
 
     // Start VM with disk at /data
     let disk_spec = format!("{}:/data", disk_path.display());
@@ -129,7 +241,7 @@ async fn test_extra_disk_rw() -> Result<()> {
 async fn test_extra_disk_ro_clone() -> Result<()> {
     let (vm_name, clone_name, snap_name, serve_name) = common::unique_names("disk-ro");
     let disk_path = PathBuf::from(format!("/tmp/fcvm-{}.raw", vm_name));
-    create_test_disk(&disk_path).await?;
+    common::ext4_disk_image(&disk_path, &[("test.txt", "hello\n")]).await?;
 
     // Start VM with RO disk at /data
     let disk_spec = format!("{}:/data:ro", disk_path.display());
