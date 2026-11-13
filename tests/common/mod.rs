@@ -360,6 +360,54 @@ fn is_in_container() -> bool {
     false
 }
 
+/// A 64 MiB ext4 image at `image` holding `files` (name, contents) in its root directory.
+///
+/// `mkfs.ext4 -d` writes the files into the new filesystem, so the image is never mounted on
+/// the host. A host mount can be copied into another process's private mount namespace (a
+/// restored clone's Firecracker, `unshare --mount`, a container) while it is up. While that
+/// copy is in use, the host `umount` and the removal of the mountpoint both succeed and the
+/// filesystem stays mounted with its journal flagged for recovery, and a guest given the
+/// image read-only cannot mount it.
+pub async fn ext4_disk_image(
+    image: &std::path::Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let source = tempfile::TempDir::new().context("creating the image's source directory")?;
+    std::fs::set_permissions(source.path(), std::fs::Permissions::from_mode(0o755))?;
+    for (name, contents) in files {
+        std::fs::write(source.path().join(name), contents)
+            .with_context(|| format!("writing {name} into the image's source directory"))?;
+    }
+    let truncate = tokio::process::Command::new("truncate")
+        .args(["-s", "64M"])
+        .arg(image)
+        .output()
+        .await
+        .context("running truncate")?;
+    anyhow::ensure!(
+        truncate.status.success(),
+        "truncate -s 64M {}: {}",
+        image.display(),
+        String::from_utf8_lossy(&truncate.stderr).trim()
+    );
+    let mkfs = tokio::process::Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .arg(source.path())
+        .arg(image)
+        .output()
+        .await
+        .context("running mkfs.ext4")?;
+    anyhow::ensure!(
+        mkfs.status.success(),
+        "mkfs.ext4 -d {} {}: {}",
+        source.path().display(),
+        image.display(),
+        String::from_utf8_lossy(&mkfs.stderr).trim()
+    );
+    Ok(())
+}
+
 /// Generate unique names for snapshot/clone tests.
 ///
 /// Returns (baseline_name, clone_name, snapshot_name, serve_name) with unique suffixes.

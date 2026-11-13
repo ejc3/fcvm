@@ -20,7 +20,7 @@ mod common;
 
 use anyhow::{Context, Result};
 #[cfg(feature = "privileged-tests")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Verify a file is readable from the container's FUSE mount, with retries.
@@ -117,40 +117,6 @@ async fn verify_fuse_write(
         filename,
         last_err.unwrap_or_default()
     )
-}
-
-/// Create a small ext4 disk image with a test file.
-/// Reuses the pattern from test_extra_disks.rs.
-#[cfg(feature = "privileged-tests")]
-async fn create_test_disk(path: &Path) -> Result<()> {
-    tokio::process::Command::new("truncate")
-        .args(["-s", "64M", path.to_str().unwrap()])
-        .status()
-        .await?;
-    tokio::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", path.to_str().unwrap()])
-        .status()
-        .await?;
-
-    // Mount temporarily, write test file, unmount
-    let mount_dir = format!("/tmp/fcvm-disk-{:x}", {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut h);
-        h.finish()
-    });
-    tokio::fs::create_dir_all(&mount_dir).await?;
-    tokio::process::Command::new("mount")
-        .args([path.to_str().unwrap(), &mount_dir])
-        .status()
-        .await?;
-    tokio::fs::write(format!("{}/disk-test.txt", mount_dir), "disk-hello\n").await?;
-    tokio::process::Command::new("umount")
-        .arg(&mount_dir)
-        .status()
-        .await?;
-    tokio::fs::remove_dir(&mount_dir).await.ok();
-    Ok(())
 }
 
 // =============================================================================
@@ -701,7 +667,7 @@ async fn test_fuse_snapshot_matrix_plus_disk() -> Result<()> {
 
     // Setup
     tokio::fs::write(format!("{}/fuse-file.txt", host_dir), "fuse-data").await?;
-    create_test_disk(&disk_path).await?;
+    common::ext4_disk_image(&disk_path, &[("disk-test.txt", "disk-hello\n")]).await?;
 
     let map_arg = format!("{}:/mnt/fuse:ro", host_dir);
     let disk_arg = format!("{}:/mnt/disk:ro", disk_path.display());
