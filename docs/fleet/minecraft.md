@@ -67,10 +67,11 @@ fcvm's lockfile.
   packet's entity id is a VarInt; without the fix every swing breaks the packet stream. The level
   particles packet is read in 26.3's field order (the particle first, a max speed per axis, a
   VarInt count and a randomization type); without the fix the bots read the particle id as a
-  boolean and log "Boolean value was not 0 or 1" for every bubble particle. The swing bug is
-  reported upstream as [azalea-rs/azalea#404](https://github.com/azalea-rs/azalea/issues/404),
-  which is the reason for the fork, and the particles bug is to be added there; once upstream
-  fixes both, the pin moves back to azalea-rs/azalea. Three bots join over
+  boolean and log "Boolean value was not 0 or 1" for every bubble particle. Both bugs are
+  reported upstream in [azalea-rs/azalea#404](https://github.com/azalea-rs/azalea/issues/404),
+  the swing bug in the issue and the particles bug in
+  [a comment](https://github.com/azalea-rs/azalea/issues/404#issuecomment-6841991366); once
+  upstream fixes both, the pin moves back to azalea-rs/azalea. Three bots join over
   the guest's loopback. A bot that nobody drives walks to a random column of the map's region
   with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. A restore keeps
   the bots connected: their connections to Pumpkin are loopback inside the guest, which fcvm's
@@ -155,7 +156,7 @@ fcvm's lockfile.
 - **Pumpkin** is GPL-3.0. The image carries its licence and a notice naming the repository and
   commit it was built from, and the build fetches that exact commit, so the source of every
   binary is public. Nothing of it is changed.
-- **azalea** is MIT. Both fixes are public in `ejc3/azalea`; the swing fix is reported upstream as
+- **azalea** is MIT. Both fixes are public in `ejc3/azalea`; both bugs are reported upstream in
   azalea-rs/azalea#404.
 - **No Mojang asset.** The page draws flat colours of our own; the image holds no client or
   server jar, texture, sound or language file.
