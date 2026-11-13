@@ -615,13 +615,17 @@ potato-image: cargo-target-link
 	CARGO_TARGET_DIR=target $(CARGO) build --locked --release -p fleet-potato --target $(MUSL_TARGET)
 	ctx=$$(mktemp -d) && trap 'rm -rf "$$ctx"' EXIT && \
 	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile "$$ctx/" && \
-	podman build --squash-all -t $(POTATO_IMAGE) -f "$$ctx/Containerfile" "$$ctx"
+	podman build $(PODMAN_BUILD_PROXY) --squash-all -t $(POTATO_IMAGE) -f "$$ctx/Containerfile" "$$ctx"
 
-# The Minecraft mode's tile (fleet/minecraft, docs/fleet/minecraft.md): Pumpkin built unmodified
-# from PUMPKIN_COMMIT, and mctile. Its own Cargo workspace on its own pinned toolchains (azalea,
-# the bot client, needs nightly); the build runs in the image and runs mctile's tests first.
+# The Minecraft mode's tile (fleet/minecraft, docs/fleet/minecraft.md): Pumpkin built from
+# PUMPKIN_COMMIT of the ejc3/Pumpkin fork (upstream plus a login timeout), and mctile. Its own
+# Cargo workspace on its own pinned toolchains (azalea, the bot client, needs nightly); the build
+# runs in the image and runs mctile's tests first.
+# A proxy on the host's loopback is reached from a build container only on the host's network: such
+# a build runs with --network=host and keeps its proxy variables (scripts/podman-build-proxy-args.sh).
+PODMAN_BUILD_PROXY = $(shell $(MAKEFILE_DIR)scripts/podman-build-proxy-args.sh)
 MINECRAFT_IMAGE ?= localhost/fcvm-minecraft:dev
-PUMPKIN_COMMIT ?= 3ea7d281654a03fdc4f4fee43734c098acd1fb52
+PUMPKIN_COMMIT ?= 1aa35ecca1e35a44d6fe7f10acb11d7750f8fc36
 # The one Java Edition version that commit speaks (its pumpkin-data CURRENT_MC_VERSION).
 MINECRAFT_JAVA_VERSION ?= 26.3
 # The podman that builds it. The fleet host recipe builds into root's store with
@@ -629,7 +633,7 @@ MINECRAFT_JAVA_VERSION ?= 26.3
 MINECRAFT_PODMAN ?= podman
 .PHONY: minecraft-image test-minecraft
 minecraft-image:
-	$(MINECRAFT_PODMAN) build --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
+	$(MINECRAFT_PODMAN) build $(PODMAN_BUILD_PROXY) --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
 	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
 
 # mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's), and the
@@ -640,6 +644,7 @@ MINECRAFT_TARGET ?= target
 test-minecraft:
 	cd fleet/minecraft && mkdir -p "$(MINECRAFT_TARGET)" && CARGO_TARGET_DIR="$(MINECRAFT_TARGET)" "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) test --locked --release
 	python3 -B fleet/minecraft/bench/test_bench.py
+	python3 -B fleet/minecraft/test_image_build.py
 
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
@@ -815,9 +820,9 @@ CACHE_TO_FLAG := $(shell podman login --get-login ghcr.io >/dev/null 2>&1 && ech
 container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	@mkdir -p /tmp/fcvm-container-target
-	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
+	podman build $(PODMAN_BUILD_PROXY) -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
 		--layers --cache-from $(CONTAINER_CACHE_REPO) $(CACHE_TO_FLAG) . \
-	|| podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
+	|| podman build $(PODMAN_BUILD_PROXY) -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
 		--layers --cache-from $(CONTAINER_CACHE_REPO) .
 
 container-shell: cargo-target-link container-build

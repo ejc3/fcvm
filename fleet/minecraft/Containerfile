@@ -11,7 +11,7 @@ ARG RUST_NIGHTLY=nightly-2026-08-20
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none \
     && rustup toolchain install --profile minimal "$RUST_STABLE" "$RUST_NIGHTLY"
-ARG PUMPKIN_REPO=https://github.com/Pumpkin-MC/Pumpkin.git
+ARG PUMPKIN_REPO=https://github.com/ejc3/Pumpkin.git
 ARG PUMPKIN_COMMIT
 RUN test -n "$PUMPKIN_COMMIT" && git init -q /pumpkin && cd /pumpkin \
     && git fetch -q --depth 1 "$PUMPKIN_REPO" "$PUMPKIN_COMMIT" && git checkout -q FETCH_HEAD \
@@ -24,7 +24,7 @@ COPY src ./src
 RUN RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" cargo test --locked --release && RUSTUP_TOOLCHAIN="$RUST_NIGHTLY" cargo build --locked --release
 
 FROM docker.io/library/debian:trixie-slim
-ARG PUMPKIN_REPO=https://github.com/Pumpkin-MC/Pumpkin.git
+ARG PUMPKIN_REPO=https://github.com/ejc3/Pumpkin.git
 ARG PUMPKIN_COMMIT
 ARG MINECRAFT_JAVA_VERSION
 ARG PUMPKIN_SHORT

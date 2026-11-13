@@ -6,6 +6,14 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Players one server takes at once, the tile's own bots among them: Pumpkin refuses a login past
+/// it. The servers take public joins (docs/fleet/minecraft.md, "Public joins").
+pub const MAX_PLAYERS: u32 = 20;
+/// Seconds a connection has to finish logging in before Pumpkin closes it (`login_timeout`, the
+/// ejc3/Pumpkin fork's; upstream has none, so a silent connection was held for as long as its
+/// client kept it open).
+pub const LOGIN_TIMEOUT_SECS: u64 = 15;
+
 #[derive(Debug, Clone)]
 pub struct ServerCfg {
     pub bin: PathBuf,
@@ -14,7 +22,24 @@ pub struct ServerCfg {
     pub seed: String,
     pub view_distance: u8,
     pub max_players: u32,
+    pub login_timeout_secs: u64,
     pub motd: String,
+}
+
+impl ServerCfg {
+    /// The tile's server: the public limits above, a seed and view distance from its arguments.
+    pub fn tile(bin: PathBuf, dir: PathBuf, port: u16, seed: String, view_distance: u8) -> ServerCfg {
+        ServerCfg {
+            bin,
+            dir,
+            port,
+            seed,
+            view_distance,
+            max_players: MAX_PLAYERS,
+            login_timeout_secs: LOGIN_TIMEOUT_SECS,
+            motd: "fcvm Minecraft tile (Pumpkin)".into(),
+        }
+    }
 }
 
 /// `pumpkin.toml`: offline mode (bots and players need no account), creative so everyone can
@@ -38,6 +63,7 @@ address = "[::]:{port}"
 encryption = false
 online_mode = false
 max_players = {max}
+login_timeout = {login}
 view_distance = {vd}
 simulation_distance = {vd}
 motd = "{motd}"
@@ -79,6 +105,7 @@ use_tty = false
         seed = c.seed.replace(['"', '\\'], ""),
         port = c.port,
         max = c.max_players,
+        login = c.login_timeout_secs,
         vd = c.view_distance,
         motd = c.motd.replace(['"', '\\', '\n'], ""),
     )
@@ -127,6 +154,7 @@ mod tests {
             seed: "fc\"vm".into(),
             view_distance: 6,
             max_players: 20,
+            login_timeout_secs: 15,
             motd: "mc-1\n".into(),
         };
         let t: toml::Value = toml::from_str(&config(&c)).unwrap();
@@ -152,5 +180,15 @@ mod tests {
                 "{svc}"
             );
         }
+    }
+
+    #[test]
+    fn the_tile_caps_its_players_and_closes_a_login_that_does_not_finish() {
+        let c = ServerCfg::tile("/x".into(), "/d".into(), 25565, "fcvm".into(), 6);
+        let t: toml::Value = toml::from_str(&config(&c)).unwrap();
+        let java = &t["networking"]["java"];
+        // 0 would be no cap at all; the public limits need both.
+        assert_eq!(java["max_players"].as_integer(), Some(20));
+        assert_eq!(java["login_timeout"].as_integer(), Some(15));
     }
 }

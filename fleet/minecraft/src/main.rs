@@ -107,15 +107,7 @@ async fn main() -> Result<()> {
             tls_cert_file,
             tls_port,
         } => {
-            let sc = pumpkin::ServerCfg {
-                bin,
-                dir,
-                port: mc_port,
-                seed,
-                view_distance,
-                max_players: 20,
-                motd: "fcvm Minecraft tile (Pumpkin)".into(),
-            };
+            let sc = pumpkin::ServerCfg::tile(bin, dir, mc_port, seed, view_distance);
             let t = tile::Tile::new(tile_cfg(&common, format!("127.0.0.1:{mc_port}")));
             let tls = Arc::new(server::Tls::default());
             let app = server::App {
