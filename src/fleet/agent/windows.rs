@@ -254,8 +254,8 @@ pub enum BridgeMode {
 pub const BRIDGE_NETWORK: &str = "fcvm-windows-bridge";
 
 /// Make `BRIDGE_NETWORK` with IPv6, or check the one there has it. A network of that name
-/// without IPv6 (made by something else) is replaced: no bridge of this agent runs yet, and
-/// `reclaim_bridges` removed any left by an earlier one. Fails when podman cannot make it, so the
+/// without IPv6 (made by something else) is replaced when no container is on it: no bridge of this
+/// agent runs yet, and `reclaim_bridges` removed any left by an earlier one. Fails when podman cannot make it, so the
 /// gold flow fails with the reason rather than starting sandboxes no IPv6 viewer can reach.
 pub async fn ensure_bridge_network(cfg: &WindowsCfg) -> Result<()> {
     async fn podman(cfg: &WindowsCfg, args: &[&str]) -> Result<String> {
@@ -290,7 +290,9 @@ pub async fn ensure_bridge_network(cfg: &WindowsCfg) -> Result<()> {
         network = BRIDGE_NETWORK,
         "the bridge network has no IPv6: making it again"
     );
-    podman(cfg, &["network", "rm", "-f", BRIDGE_NETWORK]).await?;
+    // Without -f: podman refuses to remove a network a container is on, and that refusal fails
+    // the gold flow. With -f it would stop and remove the containers, which this agent may not own.
+    podman(cfg, &["network", "rm", BRIDGE_NETWORK]).await?;
     podman(cfg, &create).await?;
     match podman(cfg, &inspect).await?.as_str() {
         "true" => Ok(()),
@@ -2204,9 +2206,7 @@ mod tests {
         ensure_bridge_network(&cfg).await.unwrap();
         assert_eq!(
             log(dir.path()),
-            format!(
-                "{create}\n{inspect}\nnetwork rm -f fcvm-windows-bridge\n{create}\n{inspect}\n"
-            )
+            format!("{create}\n{inspect}\nnetwork rm fcvm-windows-bridge\n{create}\n{inspect}\n")
         );
 
         // Still without IPv6: an error, so no sandbox starts on it.
