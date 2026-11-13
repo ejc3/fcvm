@@ -1223,8 +1223,10 @@ async fn exec_with_timeout(pid: u32, cmd: &[&str], vm: bool) -> anyhow::Result<S
     };
 
     if !output.status.success() {
+        // The status says whether the command exited non-zero (fcvm exec passes its
+        // code through and logs nothing) or exec itself failed (it logs the error).
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("exec failed: {}", stderr);
+        anyhow::bail!("exec failed ({}): {}", output.status, stderr);
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
