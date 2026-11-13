@@ -624,8 +624,9 @@ const VGIC_HCR_FILES: [&str; 3] = [
 
 const VGIC_HCR_PATCH: &str = "vgic-v3-keep-hcr-on-quiet-exits.patch";
 
-/// The arm64 host kernel's release, its patch set and the vgic-v3 fixture cut from it.
-fn vgic_hcr_port() -> (String, PathBuf, PathBuf) {
+/// The arm64 host kernel's release, one patch of its patch set and the fixture
+/// `tests/fixtures/<fixture>-<major>.<minor>` cut from that release.
+fn host_kernel_port(patch: &str, fixture: &str) -> (String, PathBuf, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config: toml::Value = toml::from_str(
         &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
@@ -642,9 +643,14 @@ fn vgic_hcr_port() -> (String, PathBuf, PathBuf) {
     let series = release.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
     (
         release,
-        root.join(patches_dir).join(VGIC_HCR_PATCH),
-        root.join(format!("tests/fixtures/vgic-v3-hcr-{series}")),
+        root.join(patches_dir).join(patch),
+        root.join(format!("tests/fixtures/{fixture}-{series}")),
     )
+}
+
+/// The arm64 host kernel's release, its patch set and the vgic-v3 fixture cut from it.
+fn vgic_hcr_port() -> (String, PathBuf, PathBuf) {
+    host_kernel_port(VGIC_HCR_PATCH, "vgic-v3-hcr")
 }
 
 /// A fixture cut from another release would let the patch apply here and fail to
@@ -802,5 +808,251 @@ fn quiet_vgic_exits_leave_ich_hcr_el2_programmed_without_a_host_maintenance_inte
         "Linux {release} with{} {VGIC_HCR_PATCH}:\n{}",
         if patched { "" } else { "out" },
         failures.join("\n")
+    );
+}
+
+/// The kernel files the arm64 host's guest hypervisor exit patch changes, excerpted in
+/// `tests/fixtures/nv-hyp-exit-<major>.<minor>` from the release the host pins.
+const NV_EXIT_FILES: [&str; 4] = [
+    "arch/arm64/kvm/hyp/vhe/switch.c",
+    "arch/arm64/include/asm/kvm_host.h",
+    "arch/arm64/include/asm/kvm_nested.h",
+    "arch/arm64/include/asm/kvm_emulate.h",
+];
+
+const NV_EXIT_PATCH: &str = "nv-guest-hypervisor-exits-without-calls.patch";
+
+/// The guest hypervisor exit fixture with the host's patch applied when it exists, in a
+/// temporary directory: (release, whether the patch was applied, directory).
+fn nv_exit_excerpts() -> (String, bool, tempfile::TempDir) {
+    let (release, patch, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
+    let temp = tempfile::tempdir().expect("create the guest hypervisor exit fixture directory");
+    for file in NV_EXIT_FILES {
+        let dest = temp.path().join(file);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(file), &dest)
+            .unwrap_or_else(|e| panic!("copy the {file} excerpt: {e}"));
+    }
+    // Without the patch, check the release's own code and fail on what it does.
+    let patched = patch.exists();
+    if patched {
+        let applied = Command::new("patch")
+            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
+            .arg(&patch)
+            .current_dir(temp.path())
+            .output()
+            .expect("run patch");
+        assert!(
+            applied.status.success(),
+            "{} does not apply to the {release} excerpts:\n{}{}",
+            patch.display(),
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
+    (release, patched, temp)
+}
+
+#[test]
+fn the_nv_exit_fixture_is_cut_from_the_pinned_arm64_host_kernel() {
+    let (release, _, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
+    for file in NV_EXIT_FILES {
+        let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
+            panic!(
+                "the arm64 host pins Linux {release}, and {} has no {file} excerpt: {e}",
+                fixture.display()
+            )
+        });
+        assert!(
+            text.contains(&format!("Linux v{release} {file}")),
+            "{}/{file} is not cut from Linux {release}, which the arm64 host kernel pins. \
+             Cut the same line ranges again from that release and record its SHA-256 in the \
+             header.",
+            fixture.display()
+        );
+    }
+}
+
+/// Run the arm64 host kernel's HCR_EL2 hand-off around a guest hypervisor's run, with
+/// its own `nv-guest-hypervisor-exits-without-calls.patch` applied, in a C harness
+/// (fcvm #659): `__compute_hcr()` and `fixup_nv_guest_exit()` from
+/// `arch/arm64/kvm/hyp/vhe/switch.c`.
+///
+/// 7.3 (3fc7867a95c0) moved HCR_EL2 out of the VNCR page and copies it to the page's
+/// NVHCR_EL2 slot on every entry in hyp context and back on every exit, each copy a
+/// masked read and a masked write: four more out-of-line `kvm_vcpu_apply_reg_masks()`
+/// calls per exit of a guest hypervisor's vCPU, two of them, on a host without
+/// FEAT_NV3, for a register that has no masks. Without the patch the `quiet` scenario
+/// fails on that masking. `write` and `nv3` pass with or without it: they fail a change
+/// that leaves HCR_EL2 other than the guest's write sanitised, or publishes the guest
+/// anything else on entry.
+#[test]
+fn a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies() {
+    let (release, patched, temp) = nv_exit_excerpts();
+    let (_, _, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
+    let text = fs::read_to_string(temp.path().join(NV_EXIT_FILES[0])).unwrap();
+    let mut extracted = String::new();
+    for start in [
+        "#define NV_HCR_GUEST_EXCLUDE",
+        "static u64 __compute_hcr(",
+        "static void fixup_nv_guest_exit(",
+    ] {
+        let block = extract_block(&text, start, "}")
+            .unwrap_or_else(|| panic!("`{start}` is missing from the {release} excerpt"));
+        extracted.push_str(&block);
+    }
+    fs::write(temp.path().join("extracted.c"), extracted).unwrap();
+    fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
+
+    let binary = temp.path().join("nv-hcr");
+    let compiled = Command::new("cc")
+        .args([
+            "-std=gnu11",
+            "-g",
+            "-O1",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-Werror=implicit-function-declaration",
+            "-Werror=incompatible-pointer-types",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(temp.path().join("harness.c"))
+        .output()
+        .expect("run cc");
+    assert!(
+        compiled.status.success(),
+        "the {release} HCR_EL2 harness failed to compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let mut failures = Vec::new();
+    for scenario in ["quiet", "write", "nv3"] {
+        let result = Command::new(&binary)
+            .arg(scenario)
+            .env("ASAN_OPTIONS", "detect_leaks=0")
+            .output()
+            .expect("run the HCR_EL2 harness");
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let first: Vec<&str> = stderr.lines().take(5).collect();
+            failures.push(format!("{scenario}: {}", first.join("\n  ")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Linux {release} with{} {NV_EXIT_PATCH}:\n{}",
+        if patched { "" } else { "out" },
+        failures.join("\n")
+    );
+}
+
+/// The accessors the VHE world switch calls on every exit of a guest hypervisor's vCPU
+/// must be inlined there (fcvm #659). 7.3's 62ed180231f4 grew `__activate_traps()` and
+/// `__kvm_vcpu_run_vhe()` until GCC stopped inlining `___ctxt_sys_reg()`, and with the
+/// release's `static inline` the world switch calls out-of-line copies of it,
+/// `vcpu_has_nv()`, `is_hyp_ctxt()` and `vcpu_el2_e2h_is_set()`: 173 more host
+/// instructions per exit at that commit. `__always_inline` is what keeps a later change
+/// from moving them out again, so the patched headers must declare each of them that
+/// way, and apply the register masks inline in the VHE world switch, computing what
+/// `kvm_vcpu_apply_reg_masks()` computes.
+#[test]
+fn the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit() {
+    let (release, patched, temp) = nv_exit_excerpts();
+    let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
+    let mut missing = Vec::new();
+    for (file, definition) in [
+        (NV_EXIT_FILES[2], "static __always_inline bool vcpu_has_nv("),
+        (
+            NV_EXIT_FILES[1],
+            "static __always_inline u64 *___ctxt_sys_reg(",
+        ),
+        (
+            NV_EXIT_FILES[1],
+            "static __always_inline bool __vcpu_has_feature(",
+        ),
+        (
+            NV_EXIT_FILES[3],
+            "static __always_inline bool vcpu_el2_e2h_is_set(",
+        ),
+        (
+            NV_EXIT_FILES[3],
+            "static __always_inline bool vcpu_el2_tge_is_set(",
+        ),
+        (NV_EXIT_FILES[3], "static __always_inline bool is_hyp_ctxt("),
+        (
+            NV_EXIT_FILES[3],
+            "static __always_inline bool is_nested_ctxt(",
+        ),
+    ] {
+        if !read(file).lines().any(|line| line.starts_with(definition)) {
+            missing.push(format!("{file}: `{definition}`"));
+        }
+    }
+    let host = read(NV_EXIT_FILES[1]);
+    let vhe = host
+        .split("#ifdef __KVM_VHE_HYPERVISOR__")
+        .nth(1)
+        .and_then(|rest| rest.split("#else").next());
+    if !vhe.is_some_and(|block| {
+        block.contains("static __always_inline u64 __kvm_apply_reg_masks(")
+            && block.contains("#define kvm_vcpu_apply_reg_masks(")
+    }) {
+        missing.push(format!(
+            "{}: an `#ifdef __KVM_VHE_HYPERVISOR__` block defining kvm_vcpu_apply_reg_masks() \
+             through an __always_inline helper",
+            NV_EXIT_FILES[1]
+        ));
+    }
+    assert!(
+        missing.is_empty(),
+        "Linux {release} with{} {NV_EXIT_PATCH} leaves the world switch calling out of line:\n{}",
+        if patched { "" } else { "out" },
+        missing.join("\n")
+    );
+
+    // The inline masking must compute what kvm_vcpu_apply_reg_masks() does.
+    let (_, _, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
+    let mut extracted = String::new();
+    for (start, end) in [
+        ("struct resx {", "};"),
+        ("struct kvm_sysreg_masks {", "};"),
+        ("static inline struct resx __kvm_get_sysreg_resx(", "}"),
+        ("static __always_inline u64 __kvm_apply_reg_masks(", "}"),
+    ] {
+        let block = extract_block(&host, start, end)
+            .unwrap_or_else(|| panic!("`{start}` is missing from the patched kvm_host.h excerpt"));
+        extracted.push_str(&block);
+    }
+    fs::write(temp.path().join("extracted-masks.c"), extracted).unwrap();
+    fs::copy(fixture.join("masks.c"), temp.path().join("masks.c")).unwrap();
+    let binary = temp.path().join("masks");
+    let compiled = Command::new("cc")
+        .args([
+            "-std=gnu11",
+            "-O1",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-Werror=implicit-function-declaration",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(temp.path().join("masks.c"))
+        .output()
+        .expect("run cc");
+    assert!(
+        compiled.status.success(),
+        "the {release} register masking harness failed to compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = Command::new(&binary)
+        .env("ASAN_OPTIONS", "detect_leaks=0")
+        .output()
+        .expect("run the register masking harness");
+    assert!(
+        result.status.success(),
+        "the VHE world switch's inline register masking in {NV_EXIT_PATCH} differs from \
+         kvm_vcpu_apply_reg_masks():\n{}",
+        String::from_utf8_lossy(&result.stderr)
     );
 }

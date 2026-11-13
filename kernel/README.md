@@ -99,6 +99,19 @@ runs the release's flush, sync, load and put against a model of the CPU interfac
 fails without the patch on the work a quiet exit does, and fails any change that leaves
 the host holding a register state that raises a maintenance interrupt.
 
+`kernel/patches-arm64-host/nv-guest-hypervisor-exits-without-calls.patch` takes back what 7.3
+added to every exit of a guest hypervisor's vCPU (#659). 3fc7867a95c0 moved HCR_EL2 out of the
+VNCR page and copies it to the page's NVHCR_EL2 slot and back around every run in hyp context,
+each copy a masked read and a masked write. 62ed180231f4 grew the VHE world switch until GCC
+stopped inlining `___ctxt_sys_reg()`, so every exit calls out-of-line copies of it,
+`vcpu_has_nv()`, `is_hyp_ctxt()` and `vcpu_el2_e2h_is_set()`. On a host without FEAT_NV3 the
+patch copies HCR_EL2 as stored and copies it back, masked, only when the guest changed it; it
+makes those accessors `__always_inline`, and applies the register masks inline in the VHE world
+switch. `a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies` runs the release's
+`__compute_hcr()` and `fixup_nv_guest_exit()` in a harness and fails without the patch on the
+masking; `the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit` fails without it on
+the `static inline` declarations.
+
 The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
 x86_64): the default patches, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
