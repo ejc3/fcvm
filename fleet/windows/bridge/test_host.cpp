@@ -820,6 +820,11 @@ int main() {
     b.reset();
     CHECK(b.next_ms() == 100, "a connection that worked starts again at 100 ms");
   }
+  {
+    auto bridge = source_text("bridge.h");
+    CHECK(bridge.find("bool allows_fleet_still() const override { return false; }") != std::string::npos,
+          "the Windows bridge marks its poster private");
+  }
   {  // the server is set up as the renderer's: the scene token before it listens
     std::string m = source_text("main.cpp");
     size_t conf = m.find("scene_token.configure_from_env();"), set = m.find("s.set_scene_token(&scene_token)");

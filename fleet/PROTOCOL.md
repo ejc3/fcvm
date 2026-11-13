@@ -2867,7 +2867,8 @@ doubling to 2 s, for ever: it starts before the sandbox restores.
   caller sends reaches Windows: the name selects a sequence written in the source
   (`kActions`, `fleet/windows/bridge/logic.cpp`), other fields are ignored, and no free keys,
   text or clicks exist. An action never holds up frames.
-- `GET /still`: the surface as last composed, JPEG.
+- `GET /still`: the surface as last composed, JPEG, for local development only. A fleet bridge
+  returns 404 for GET and HEAD; its desktop is available through the admitted `/frames` stream.
 - `GET /health`: the renderer's first six keys (`fps`, `heights`, `streams`, `gpu` null, `t`,
   `frame`), `boot_id`, `ready` (connected), `error` when failed, `startup_ms`
   (`first_frame_sent`, from the process start), `viewers`, and `windows`:

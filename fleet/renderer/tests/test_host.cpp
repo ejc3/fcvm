@@ -1,5 +1,6 @@
 // Host-side tests: no GPU needed. Scene contract parsing, camera interpolation
 // and holds, tile geometry, wire formats.
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cmath>
@@ -21,11 +22,82 @@
 #include "../src/nvenc.h"
 #include "../src/proto.h"
 #include "../src/scene.h"
+#include "../src/server.h"
 #include "../src/subscriber.h"
 #include "../src/threads.h"
 #include "../src/world.h"
 #include "check.h"
 #include "tls_check.h"
+
+struct ServerTest {
+  struct PosterSource : FrameSource {
+    explicit PosterSource(bool public_poster) : public_poster(public_poster) {}
+    bool public_poster;
+    int reads = 0;
+    std::shared_ptr<Subscriber> subscribe(int, int) override { return nullptr; }
+    void unsubscribe(const std::shared_ptr<Subscriber>&) override {}
+    void wake() override {}
+    bool post_scene(const std::string&, std::string*) override { return false; }
+    bool post_budget(const std::string&, std::string*) override { return false; }
+    bool raw_frame(double, std::string*, std::string*) override { return false; }
+    bool next_frame(int, std::vector<uint8_t>* rgba, int* w, int* h, std::string*) override {
+      ++reads;
+      *w = *h = 16;
+      rgba->assign(16 * 16 * 4, 0xff);
+      return true;
+    }
+    bool allows_fleet_still() const override { return public_poster; }
+    std::string health_json() override { return "{}"; }
+    bool admits(const std::string&) override { return false; }
+    bool requires_admit() override { return true; }
+    bool has_scene() override { return true; }
+  };
+
+  static std::string request(Server& server, const std::string& method) {
+    int fd[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return {};
+    Conn client(fd[0], nullptr);
+    {
+      Conn peer(fd[1], nullptr);
+      std::string req = method + " /still?h=16 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+      if (!client.write_all(req.data(), req.size())) return {};
+      server.handle(peer);
+    }
+    client.set_read_deadline_ms(2000);
+    std::string response;
+    char bytes[4096];
+    for (long n; (n = client.read(bytes, sizeof bytes)) > 0;) response.append(bytes, n);
+    return response;
+  }
+
+  static void still_never_reads_a_private_fleet_frame() {
+    // The configured path need not hold a token yet for the listener to be a fleet listener.
+    SceneToken scene;
+    scene.configure("unused.json", true);
+    PosterSource desktop(false);
+    Server fleet_desktop(desktop);
+    fleet_desktop.set_scene_token(&scene);
+    for (const char* method : {"GET", "HEAD"}) {
+      auto response = request(fleet_desktop, method);
+      CHECK(response.find("HTTP/1.1 404 ") == 0 && response.find("image/jpeg") == std::string::npos &&
+                response.size() >= 4 && response.find("\r\n\r\n") == response.size() - 4,
+            "private fleet %s returns 404 without any frame bytes", method);
+    }
+    CHECK(desktop.reads == 0, "private fleet requests never ask for desktop pixels (reads %d)", desktop.reads);
+
+    PosterSource local_source(false);
+    Server local_desktop(local_source);
+    auto local = request(local_desktop, "GET");
+    CHECK(local.find("HTTP/1.1 200 ") == 0 && local.find("image/jpeg") != std::string::npos && local_source.reads == 1,
+          "a local desktop can still return its JPEG");
+    PosterSource renderer(true);
+    Server fleet_renderer(renderer);
+    fleet_renderer.set_scene_token(&scene);
+    auto poster = request(fleet_renderer, "GET");
+    CHECK(poster.find("HTTP/1.1 200 ") == 0 && poster.find("image/jpeg") != std::string::npos && renderer.reads == 1,
+          "a fleet renderer can still return its public poster");
+  }
+};
 
 static const char* kContractExample =
     R"({"epoch_unix_ms": 1761100000000, "rect": {"x":0.5,"y":0.0,"w":0.0625,"h":0.111},
@@ -187,7 +259,8 @@ int main() {
     SceneToken none;
     CHECK(!none.configured(), "no token file: not a fleet renderer");
   }
-  // server.cpp needs the pipeline and so is not built here: where it asks these.
+  ServerTest::still_never_reads_a_private_fleet_frame();
+  // Ordering of access checks in the server's request and stream handlers.
   {
     auto src = source_lines("../src/server.cpp");
     auto find_from = [&](long from, const std::string& needle) -> long {
