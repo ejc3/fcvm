@@ -114,3 +114,6 @@ jobs:
       contents: read
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
+    # The smoke's jobs read the Access token from the fleet-stage-deploy environment; a called
+    # workflow sees secrets only when its caller passes them.
+    secrets: inherit
