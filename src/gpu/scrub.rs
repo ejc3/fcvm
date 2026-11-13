@@ -757,11 +757,17 @@ fn boot_id() -> Result<String> {
 }
 
 /// Write the clean token, durably. Called under the scrub's lock after a success is recorded.
+/// The handoff lock file is created first, so wherever a token exists every restore can take
+/// the GPU's handoff ([`begin_handoff`]). The token is mode 0666: a restore that cannot unlink
+/// it (a rootless one) empties it instead, which voids it.
 fn write_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    create_handoff_file(state_dir, sbdf)?;
     let path = clean_token_path(state_dir, sbdf);
     let boot = boot_id()?;
     std::fs::File::create(&path)
         .and_then(|mut file| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o666))?;
             file.write_all(boot.as_bytes())?;
             file.sync_all()
         })
@@ -771,14 +777,102 @@ fn write_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
         .with_context(|| format!("syncing {}", state_dir.display()))
 }
 
-/// Take the GPU's clean token, for a VM holding its lease: `true` when a host scrub cleared
-/// the GPU's memory and no VM has had the GPU since, and this caller is the one VM that gets
-/// it that way. The guest's own scrub is then redundant. Only the token's unlink decides, so
-/// two VMs racing for one GPU cannot both see it clean. Any error reads as not clean.
-pub fn take_clean_token(state_dir: &Path, sbdf: &str, _lease: &GpuLease) -> bool {
+/// The GPU's handoff lock, `<state_dir>/<sbdf>.handoff`. Every restore that attaches the GPU
+/// holds it exclusively from its clean token step until its snapshot load has opened the GPU
+/// ([`begin_handoff`]). Without it two restores of one GPU could interleave: one takes the
+/// token and has not opened the GPU yet, the other opens it, runs a tenant and exits, and the
+/// first then gets a used GPU it was told is clean. VFIO admits one opener at a time, so once
+/// the holder's load has opened the GPU no other VM can have it until that VM is gone.
+fn handoff_path(state_dir: &Path, sbdf: &str) -> PathBuf {
+    state_dir.join(format!("{sbdf}.handoff"))
+}
+
+fn create_handoff_file(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = handoff_path(state_dir, sbdf);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("making {} readable", path.display()))?;
+    Ok(file)
+}
+
+/// The handoff locks a restore holds until its load has opened its GPUs; dropping it releases
+/// them, and so does the kernel when the process dies.
+#[must_use = "the handoff orders restores only while it is held"]
+#[derive(Debug)]
+pub struct GpuHandoff {
+    _locks: Vec<std::fs::File>,
+}
+
+/// Take the handoff lock of every GPU in `sbdfs`, exclusively and in address order (so two
+/// restores of the same GPUs cannot deadlock), waiting for a restore that holds one. A root
+/// run creates a missing lock file. A rootless run skips a missing one: lock files exist
+/// wherever a host scrub ever wrote a token ([`write_clean_token`]), so a GPU without one has
+/// no token to race for.
+pub fn begin_handoff(state_dir: &Path, sbdfs: &[String]) -> Result<GpuHandoff> {
+    begin_handoff_as(state_dir, sbdfs, nix::unistd::geteuid().is_root())
+}
+
+/// [`begin_handoff`] with whether the caller may create the lock files supplied.
+pub fn begin_handoff_as(
+    state_dir: &Path,
+    sbdfs: &[String],
+    may_create: bool,
+) -> Result<GpuHandoff> {
+    let mut sorted: Vec<&String> = sbdfs.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut locks = Vec::with_capacity(sorted.len());
+    for sbdf in sorted {
+        let path = handoff_path(state_dir, sbdf);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && may_create => {
+                create_handoff_file(state_dir, sbdf)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+        };
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        locks.push(file);
+    }
+    Ok(GpuHandoff { _locks: locks })
+}
+
+/// Take the GPU's clean token, for a VM holding its lease and its handoff: `true` when a host
+/// scrub cleared the GPU's memory and no VM has had the GPU since, and this caller is the one
+/// VM that gets it that way. The guest's own scrub is then redundant. A root caller unlinks
+/// the token, so two VMs cannot both see it clean; any other caller empties it, which voids it
+/// for every later VM, since a rootless VM uses the GPU too. Any error reads as not clean.
+pub fn take_clean_token(
+    state_dir: &Path,
+    sbdf: &str,
+    _lease: &GpuLease,
+    _handoff: &GpuHandoff,
+) -> bool {
+    take_clean_token_as(state_dir, sbdf, nix::unistd::geteuid().is_root())
+}
+
+/// [`take_clean_token`] with whether the caller can unlink the token supplied.
+fn take_clean_token_as(state_dir: &Path, sbdf: &str, root: bool) -> bool {
     let path = clean_token_path(state_dir, sbdf);
-    // Only a scrub writes the token, and none can run while the caller holds a lease, so the
-    // contents read here are the contents unlinked below.
+    if !root {
+        // Voids the token: an empty one names no boot.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path);
+        return false;
+    }
+    // Only a scrub writes the token, and none can run while the caller holds a lease; a
+    // rootless restore can empty it only under the handoff the caller holds. So the contents
+    // read here are the contents unlinked below.
     let Ok(written) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -1118,13 +1212,11 @@ mod tests {
         let (report, _) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
         assert!(token.exists(), "a successful scrub left no clean token");
-        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
-        assert!(take_clean_token(&state, sbdf, &lease));
+        assert!(take_clean_token_as(&state, sbdf, true));
         assert!(
-            !take_clean_token(&state, sbdf, &lease),
+            !take_clean_token_as(&state, sbdf, true),
             "a second VM was told the GPU is clean"
         );
-        drop(lease);
         // A token left from an earlier scrub is gone before the next scrub touches the GPU.
         let (report, _) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
@@ -1138,13 +1230,19 @@ mod tests {
         // A token from another boot is taken (so it cannot be taken again) but vouches for
         // nothing.
         std::fs::write(&token, "another-boot").unwrap();
-        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
         assert!(
-            !take_clean_token(&state, sbdf, &lease),
+            !take_clean_token_as(&state, sbdf, true),
             "a token from another boot was honoured"
         );
         assert!(!token.exists());
-        drop(lease);
+        // A rootless VM that gets the GPU voids the token for every VM after it.
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(!take_clean_token_as(&state, sbdf, false));
+        assert!(
+            !take_clean_token_as(&state, sbdf, true),
+            "a token survived a rootless VM"
+        );
         // A scrub that fails after the reset leaves no token.
         let failed = scrub_and_record_with(
             &fake.root.path().join("sys"),
@@ -1156,6 +1254,44 @@ mod tests {
         );
         assert_eq!(failed.outcome, "failed");
         assert!(!token.exists(), "a failed scrub left a clean token");
+    }
+
+    /// A restore holding a GPU's handoff keeps every other restore of that GPU from starting
+    /// its own until the first lets go, whatever order the GPUs were named in; a scrub creates
+    /// the lock file a rootless restore needs.
+    #[test]
+    fn a_handoff_excludes_another_handoff_of_the_same_gpu() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(
+            handoff_path(&state, "0000:18:00.0").exists(),
+            "the scrub made no handoff lock"
+        );
+        let gpus = vec!["0000:19:00.0".to_string(), "0000:18:00.0".to_string()];
+        let first = begin_handoff_as(&state, &gpus, true).unwrap();
+        let probe = std::fs::File::open(handoff_path(&state, "0000:18:00.0")).unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a second restore could take the handoff of a GPU being handed off"
+        );
+        let state2 = state.clone();
+        let reversed: Vec<String> = gpus.iter().rev().cloned().collect();
+        let waiter =
+            std::thread::spawn(move || begin_handoff_as(&state2, &reversed, false).map(|_| ()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !waiter.is_finished(),
+            "the second handoff did not wait for the first"
+        );
+        drop(first);
+        waiter.join().unwrap().unwrap();
+        // A rootless restore of a GPU no scrub ever touched has no lock file and nothing to
+        // wait for.
+        let empty = fake.root.path().join("no-scrub");
+        std::fs::create_dir_all(&empty).unwrap();
+        let _nothing_to_wait_for = begin_handoff_as(&empty, &gpus, false).unwrap();
     }
 
     /// The lease belongs to the VM, not the process: one process running two

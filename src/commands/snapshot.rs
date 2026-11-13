@@ -3867,18 +3867,26 @@ async fn cmd_snapshot_run_inner(
     // The GPUs the snapshot load attaches. The guest kernel is not told of them, so
     // fc-agent rescans PCI, loads the driver and writes the CDI spec before it
     // acknowledges this restore (fc-agent `gpu::attach`).
+    let mut gpu_handoff: Option<crate::gpu::scrub::GpuHandoff> = None;
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
         // Every GPU a host scrub cleared, with no VM given it since: the guest's scrub would
         // zero memory that is already zero. Taken here, before the load opens the GPUs, and
         // only all or nothing (the guest's scrub covers every GPU it has).
         let state_dir = crate::gpu::scrub::state_dir();
+        // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
+        // below), so no other restore of these GPUs can use one between the token and the
+        // open.
+        gpu_handoff = Some(crate::gpu::scrub::begin_handoff(&state_dir, &gpus)?);
+        let handoff = gpu_handoff.as_ref().expect("just taken");
         // Every token is taken, not only up to the first missing one: a GPU this VM gets must
         // not keep a token that tells the next VM it is clean.
         let taken: Vec<bool> = _gpu_leases
             .iter()
             .zip(&gpus)
-            .map(|(lease, sbdf)| crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease))
+            .map(|(lease, sbdf)| {
+                crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease, handoff)
+            })
             .collect();
         let scrubbed = taken.iter().all(|&clean| clean);
         if scrubbed {
@@ -3996,6 +4004,8 @@ async fn cmd_snapshot_run_inner(
             .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
         };
 
+    // The load has opened the GPUs (or failed), so the handoff is over.
+    drop(gpu_handoff);
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
     // of this clone.
@@ -6239,9 +6249,22 @@ mod tests {
     fn a_restore_takes_every_clean_token() {
         let code = include_str!("snapshot.rs");
         let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let handoff = code
+            .find("begin_handoff(&state_dir, &gpus)")
+            .expect("no handoff");
         let take = code
-            .find("take_clean_token(&state_dir, sbdf, lease)")
+            .find("take_clean_token(&state_dir, sbdf, lease, handoff)")
             .expect("no take");
+        let load = code
+            .find("super::common::restore_from_snapshot(")
+            .expect("no load");
+        let released = code
+            .find("drop(gpu_handoff);")
+            .expect("the handoff is never released");
+        assert!(
+            handoff < take && take < load && load < released,
+            "the handoff must cover the token through the load that opens the GPU"
+        );
         let rest = &code[take..];
         let collect = rest
             .find(".collect();")

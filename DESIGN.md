@@ -2689,15 +2689,20 @@ agent runs it and only on Turing to Ada with a bus reset.
 is already zero, on the restore's path. A successful host scrub therefore leaves a
 token, `/var/lib/fcvm/gpu/<sbdf>.clean`, holding this boot's id: it removes any token
 before it touches the GPU (with the quarantine mark) and writes the new one, synced,
-after it records the success. A restore that holds the GPU's lease takes the token by
-unlinking it before the load opens the GPU (`take_clean_token`), so exactly one VM
-gets the GPU that way, and the restore document then says `gpus-host-scrubbed`
-(only when every GPU's token was taken). fc-agent skips its scrub on that word and
-scrubs on every other restore and on the source's unpark. A scrub that fails or dies,
-a VM killed after taking the token, a reboot, or a host image baked with a token
-(another boot's id) all leave the next VM without the word, so the cost of any of
-them is one in-guest scrub, never a skipped one. Only root can take a token, so a
-rootless restore always scrubs in the guest.
+after it records the success. A restore that holds the GPU's lease takes the GPU's
+handoff lock (`<sbdf>.handoff`, exclusively, in address order), takes the token by
+unlinking it (`take_clean_token`) and keeps the handoff until its snapshot load has
+opened the GPU, which VFIO then holds for that VM alone. So exactly one VM gets the GPU
+as clean, and no other restore can open and use the GPU between that VM's token and its
+open. The restore document then says `gpus-host-scrubbed` (only when every GPU's token
+was taken). fc-agent skips its scrub on that word and scrubs on every other restore and
+on the source's unpark. A rootless restore cannot unlink the token in the root-owned
+directory, so it empties it (the token is mode 0666), which voids it for every VM after
+it, and scrubs in its own guest. A scrub that fails or dies, a VM killed after taking
+the token, a reboot, or a host image baked with a token (another boot's id) all leave
+the next VM without the word, so the cost of any of them is one in-guest scrub, never a
+skipped one. The token speaks for fcvm's restores only: a process that opens the VFIO
+device some other way is not covered, and on the fleet hosts nothing does.
 
 Measured on 2026-11-13 on one g4dn.metal, prefilled hugepage restores (above), five per
 arm onto one T4, with and without `fcvm gpu scrub` of that GPU before each restore. The
