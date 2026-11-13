@@ -1654,6 +1654,7 @@ podman run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1
   --volume <rdp_socket>:/run/windows/rdp.sock --volume <dir>/sandbox-password:/run/windows/sandbox-password:ro
   --env RDP_SOCKET=/run/windows/rdp.sock --env RDP_USER=sandbox --env RDP_PASSWORD_FILE=/run/windows/sandbox-password
   --volume <state dir>/<image id>/desktop-ref.ppm:/run/windows/desktop-ref.ppm:ro --env DESKTOP_REF=/run/windows/desktop-ref.ppm
+  [--network fcvm-windows-bridge]
   --env PORT=8080 --publish <publish ip>:<port>:8080
   [--volume <tls dir>:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443
    [--publish <publish ip>:<tls port>:443] [--publish [<ipv6>]:443:443]]
@@ -1662,7 +1663,13 @@ podman run --rm --replace --pull=never --label fcvm.fleet.windows-bridge=1
 
 with the ports a slot at its index would have (`--base-port`, `--tls-publish-base`, and with
 an IPv6 prefix its address, which the agent puts on the host's default IPv6 interface as for
-the aggregator); the scene token is in `tls.json`, as for a renderer. The logon is the same
+the aggregator); the scene token is in `tls.json`, as for a renderer. A bridge that publishes on
+its IPv6 address runs on `fcvm-windows-bridge`, a podman network with IPv6, which the agent
+makes before the gold flow (`podman network create --ipv6 --ignore`, then checks
+`IPv6Enabled`, and makes it again if a network of that name has none; the gold flow fails if
+podman cannot). podman's default network has no IPv6, and there netavark forwards no IPv6 port:
+conmon holds `[<ipv6>]:443` with nothing behind it, so an IPv6 viewer's socket opens and is
+never answered. The logon is the same
 container without ports or certificate, with `--volume <state dir>/<image id>:/run/windows/state
 --env DESKTOP_REF_OUT=/run/windows/state/desktop-ref.ppm` and `logon`; the image's entrypoint
 is the bridge, so the mode is its only argument. A bridge is stopped through podman, since the
