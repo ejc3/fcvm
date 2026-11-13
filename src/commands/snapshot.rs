@@ -3050,9 +3050,9 @@ async fn cmd_snapshot_run_inner(
     // load instead of the guest's GPU phase (src/gpu/reset.rs).
     let mut gpu_handoff: Option<crate::gpu::scrub::GpuHandoff> = None;
     let mut gpus_host_scrubbed = false;
-    let mut gpu_reset: Option<
-        tokio::task::JoinHandle<Result<crate::gpu::reset::OpenWithoutReset>>,
-    > = None;
+    // Declared after the leases and the handoff, so on any way out it is dropped (and its thread
+    // waited for) before they are released.
+    let mut gpu_reset: Option<crate::gpu::reset::EarlyReset> = None;
     if !gpus.is_empty() {
         let state_dir = crate::gpu::scrub::state_dir();
         // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
@@ -3085,15 +3085,10 @@ async fn cmd_snapshot_run_inner(
         // A root restore resets the GPUs now (unless the host scrub just did) and keeps the
         // open from resetting them again; a rootless one cannot, and leaves it to the open.
         if nix::unistd::geteuid().is_root() {
-            let (gpus, scrubbed) = (gpus.clone(), gpus_host_scrubbed);
-            gpu_reset = Some(tokio::task::spawn_blocking(move || {
-                crate::gpu::reset::prepare_open(
-                    Path::new("/sys"),
-                    &gpus,
-                    scrubbed,
-                    &crate::gpu::reset::sysfs_reset,
-                )
-            }));
+            gpu_reset = Some(crate::gpu::reset::EarlyReset::start(
+                gpus.clone(),
+                gpus_host_scrubbed,
+            )?);
         }
     }
 
@@ -4006,10 +4001,9 @@ async fn cmd_snapshot_run_inner(
     // resetting the GPUs again until the load is over.
     let gpu_open = match gpu_reset.take() {
         Some(task) => {
-            let prepared = task
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
+            // The reset ran beside the prefill and has finished or is about to; this waits for
+            // it on the restore's own task, so no way out leaves it running.
+            let prepared = task.finish();
             Some(setup_try!(prepared))
         }
         None => None,
@@ -6327,10 +6321,16 @@ mod tests {
             "the tokens are taken after the setup owns resources"
         );
         let reset = code
-            .find("crate::gpu::reset::prepare_open(")
+            .find("crate::gpu::reset::EarlyReset::start(")
             .expect("no early reset");
+        let declared = |name: &str| code.find(name).unwrap_or_else(|| panic!("no `{name}`"));
+        assert!(
+            declared("let mut _gpu_leases") < declared("let mut gpu_handoff")
+                && declared("let mut gpu_handoff") < declared("let mut gpu_reset"),
+            "the early reset must be dropped (and waited for) before the handoff and the leases"
+        );
         let joined = code
-            .find("Some(setup_try!(prepared))")
+            .find("let prepared = task.finish();")
             .expect("the reset is not joined");
         let restored = code
             .find("drop(gpu_open);")

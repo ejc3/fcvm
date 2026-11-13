@@ -103,6 +103,49 @@ pub fn prepare_open(
     Ok(guard)
 }
 
+/// [`prepare_open`] running on a thread of its own, beside the restore's prefill. Dropping it,
+/// on any way out of the restore, waits for the thread: the reset and the reset method are
+/// changed only while the restore still holds the GPUs' leases and handoff, which it releases
+/// after this (they are declared before it, so they are dropped after it).
+#[derive(Debug)]
+pub struct EarlyReset(Option<std::thread::JoinHandle<Result<OpenWithoutReset>>>);
+
+impl EarlyReset {
+    /// Start [`prepare_open`] for `sbdfs` with the sysfs reset.
+    pub fn start(sbdfs: Vec<String>, host_scrubbed: bool) -> Result<Self> {
+        Self::start_with(move || {
+            prepare_open(Path::new("/sys"), &sbdfs, host_scrubbed, &sysfs_reset)
+        })
+    }
+
+    fn start_with(
+        work: impl FnOnce() -> Result<OpenWithoutReset> + Send + 'static,
+    ) -> Result<Self> {
+        let thread = std::thread::Builder::new()
+            .name("fcvm-gpu-reset".into())
+            .spawn(work)
+            .context("starting the GPU reset thread")?;
+        Ok(Self(Some(thread)))
+    }
+
+    /// Wait for the reset and take the guard that keeps the open from resetting again.
+    pub fn finish(mut self) -> Result<OpenWithoutReset> {
+        let thread = self.0.take().expect("finished once");
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the GPU reset thread panicked"))?
+    }
+}
+
+impl Drop for EarlyReset {
+    fn drop(&mut self) {
+        // The guard in the result, if any, puts the reset method back as it drops.
+        if let Some(thread) = self.0.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// The sysfs reset (`<device>/reset`), the one the host scrub uses.
 pub fn sysfs_reset(device: &Path) -> Result<()> {
     let path = device.join("reset");
@@ -198,6 +241,28 @@ mod tests {
         );
         drop(guard);
         assert_eq!(method(&left), "bus");
+    }
+
+    /// A restore that leaves before it collects the reset waits for it, and the method is back
+    /// to `bus` when it has left, so nothing changes the GPU after its locks are released.
+    #[test]
+    fn dropping_an_early_reset_waits_for_it_and_restores_the_method() {
+        let root = tempfile::tempdir().unwrap();
+        let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
+        let sysfs = root.path().to_path_buf();
+        let task = EarlyReset::start_with(move || {
+            prepare_open(&sysfs, &["0000:18:00.0".into()], false, &|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            })
+        })
+        .unwrap();
+        drop(task);
+        assert_eq!(
+            method(&device),
+            "bus",
+            "the reset was still running after the drop"
+        );
     }
 
     /// A reset that fails leaves the method as it was and fails the restore.
