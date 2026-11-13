@@ -313,7 +313,9 @@ fn scrub_device_marked(
             driver.as_deref().unwrap_or("no driver")
         );
     }
-    let method = read_trimmed(&device.join("reset_method"))?;
+    // A restore killed while it kept the open from resetting the GPU left the method empty
+    // (src/gpu/reset.rs); the scrub puts `bus` back before it checks.
+    let method = crate::gpu::reset::repair_reset_method(&device)?;
     if method != "bus" {
         bail!(
             "GPU {sbdf} resets by '{method}'; its memory clear runs after a secondary bus \

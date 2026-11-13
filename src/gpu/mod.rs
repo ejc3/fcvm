@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+pub mod reset;
 pub mod scrub;
 
 /// The Firecracker argument a kernel profile must carry for passthrough: devices
