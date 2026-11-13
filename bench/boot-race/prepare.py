@@ -7,6 +7,7 @@
     prepare.py --config cfg.json instances    launch the start and hibernate lanes' instances and stop them
     prepare.py --config cfg.json ecs-host     launch the ECS-on-EC2 container instance and pull the image on it
     prepare.py --config cfg.json cleanup      terminate every Project=boot-race instance, deregister the AMI
+    prepare.py --config cfg.json leftovers    fail unless nothing the campaign made is left billing
 
 Each step records what it made in the config file, which race.py reads.
 """
@@ -216,16 +217,38 @@ def cleanup(cfg, s):
     race.log(f"deleted {len(imgs)} image references from the boot-race repository")
 
 
+def leftovers(cfg, s):
+    """Fail if any Project=boot-race instance, image or snapshot, pushed image, or campaign task is still there."""
+    ec2, ecs, ecr = s.client("ec2"), s.client("ecs"), s.client("ecr")
+    tag = [{"Name": "tag:Project", "Values": ["boot-race"]}]
+    left = []
+    r = ec2.describe_instances(Filters=tag)
+    left += [f"instance {i['State']['Name']}" for res in r["Reservations"] for i in res["Instances"]
+             if i["State"]["Name"] != "terminated"]
+    left += [f"image {im['Name']}" for im in ec2.describe_images(Owners=["self"], Filters=tag)["Images"]]
+    left += ["snapshot" for _ in ec2.describe_snapshots(OwnerIds=["self"], Filters=tag)["Snapshots"]]
+    left += ["pushed image" for _ in ecr.describe_images(repositoryName="boot-race")["imageDetails"]]
+    path = cfg["results"] + "/tasks.txt"
+    arns = sorted(set(open(path).read().split())) if os.path.exists(path) else []
+    for i in range(0, len(arns), 100):
+        for t in ecs.describe_tasks(cluster="boot-race", tasks=arns[i:i + 100])["tasks"]:
+            if t["lastStatus"] != "STOPPED":
+                left.append(f"task {t['lastStatus']}")
+    race.log(f"checked {len(arns)} campaign tasks; left: {left or 'nothing'}")
+    if left:
+        raise SystemExit(f"{len(left)} campaign resources are still there: {left}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("step", choices=["image", "lambda", "ami", "instances", "ecs-host", "cleanup"])
+    ap.add_argument("step", choices=["image", "lambda", "ami", "instances", "ecs-host", "cleanup", "leftovers"])
     a = ap.parse_args()
     with open(a.config) as f:
         cfg = json.load(f)
     s = race.session()
     {"image": image, "lambda": lambda_code, "ami": ami, "instances": instances, "ecs-host": ecs_host,
-     "cleanup": cleanup}[a.step](cfg, s)
+     "cleanup": cleanup, "leftovers": leftovers}[a.step](cfg, s)
     save(a.config, cfg)
 
 

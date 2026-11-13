@@ -15,7 +15,10 @@ for _ in $(seq 1 600); do
   kill -0 $BASE 2>/dev/null || { echo "base VM exited"; tail -30 "$RESULTS/fcvm-base.log"; exit 1; }
   sleep 0.5
 done
-curl -sf --noproxy '*' -m 1 "http://127.0.0.1:$PORT/"; echo
+ANSWER=$(curl -sf --noproxy '*' -m 1 "http://127.0.0.1:$PORT/")
+echo "$ANSWER"
+# race.py refuses an fcvm sample whose answer is not from this process (cfg.json fcvm_proc_id).
+echo "fcvm_proc_id=$(jq -r .proc_id <<<"$ANSWER")"
 "$FCVM" snapshot create --pid "$BASE" --tag "$TAG" 2>&1 | tail -5
 kill -TERM $BASE; wait $BASE || true
 setsid "$FCVM" snapshot serve "$TAG" > "$RESULTS/fcvm-serve.log" 2>&1 < /dev/null &

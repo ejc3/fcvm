@@ -39,6 +39,9 @@ class Identity(unittest.TestCase):
         self.assertIsNone(race.check_identity("fcvm-file", A, A, cfg))
         self.assertIsNotNone(race.check_identity("fcvm-uffd", A, B, cfg))
 
+    def test_fcvm_without_the_snapshot_process_id_is_refused(self):
+        self.assertIn("fcvm_proc_id", race.check_identity("fcvm-file", A, A, {}))
+
     def test_cold_lambda_is_not_refused_here(self):
         # its evidence (Init Duration, new process, new kernel) is reported on the page instead
         self.assertIsNone(race.check_identity("lambda-cold", A, A, {}))

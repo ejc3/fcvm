@@ -9,7 +9,8 @@ Every lane is timed the same way: t0 is taken immediately before the call that a
 `fcvm snapshot run`, RunInstances, StartInstances, RunTask, or the HTTPS request to a function URL), and t1 when an
 HTTP GET from this host, outside the VM/instance/task/function, has read a complete 200 answer from the workload.
 
-Subcommands: prepare-*, run, logs, cleanup. Samples are appended to <results>/samples.jsonl as they are taken.
+Subcommands: run, reports (the Lambda REPORT lines), setup (setup.json for the page). Samples are appended to
+<results>/samples.jsonl as they are taken.
 """
 
 import argparse
@@ -41,6 +42,12 @@ LANES = [
 
 def now_ms():
     return time.time_ns() // 1_000_000
+
+
+def load1():
+    """The campaign host's 1-minute load average, recorded with every sample as quiet-box evidence."""
+    with open("/proc/loadavg") as f:
+        return float(f.read().split()[0])
 
 
 def log(*a):
@@ -300,6 +307,10 @@ class Ecs:
         wall, mono = time.time_ns() / 1e6, time.monotonic_ns()
         out = self.invoke({"action": "run", **payload})
         returned = time.monotonic_ns()
+        if out.get("task_arn"):
+            # Every task this campaign started, for prepare.py leftovers (kept on the box: ARNs are not public).
+            with open(self.cfg["results"] + "/tasks.txt", "a") as f:
+                f.write(out["task_arn"] + "\n")
         if out.get("failures") or not out.get("task_arn"):
             raise RuntimeError(f"RunTask failures: {out.get('failures')}")
         return Launch((wall, mono, out)), returned
@@ -423,7 +434,9 @@ def check_identity(lane, prev, answer, cfg):
             return "answered from a new runtime process: a cold start, not a warm invocation"
     elif lane.startswith("fcvm"):
         want = cfg.get("fcvm_proc_id")
-        if want and answer["proc_id"] != want:
+        if not want:
+            return "no fcvm_proc_id in the config (fcvm-prep.sh prints it)"
+        if answer["proc_id"] != want:
             return "answered from a process that is not the snapshot's workload"
     elif lane != "lambda-cold" and same:
         return "answered from the previous sample's process"
@@ -455,7 +468,7 @@ async def run(cfg, rounds, first_round, lanes):
         order = lanes[k:] + lanes[:k]
         for lane in order:
             log(f"round {rnd} lane {lane}")
-            rec = {"round": rnd, "lane": lane, "t_attempt_unix_ms": now_ms()}
+            rec = {"round": rnd, "lane": lane, "t_attempt_unix_ms": now_ms(), "load1": load1()}
             try:
                 if lane.startswith("fcvm"):
                     s = await fcvm.sample(lane, f"br-{lane}-{rnd}", 21000 + rnd * 10 + LANES.index(lane))
@@ -523,6 +536,71 @@ def fetch_reports(cfg):
     log(f"{len(found)} REPORT lines -> {path}")
 
 
+# ------------------------------------------------------------------ setup.json
+def imds(path):
+    """One instance metadata value of the campaign host (IMDSv2), or None off EC2."""
+    import urllib.request
+
+    try:
+        tok = urllib.request.urlopen(urllib.request.Request(
+            "http://169.254.169.254/latest/api/token", method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
+        return urllib.request.urlopen(urllib.request.Request(
+            f"http://169.254.169.254/latest/meta-data/{path}",
+            headers={"X-aws-ec2-metadata-token": tok}), timeout=2).read().decode()
+    except OSError:
+        return None
+
+
+def run_out(args):
+    return subprocess.run(args, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def setup_rows(cfg, s):
+    """The configuration every lane ran in, read from the host and from AWS (not from memory), as page rows."""
+    ec2, ecs, lam = s.client("ec2"), s.client("ecs"), s.client("lambda")
+    rows = [["Region", REGION]]
+    rows.append(["Campaign host", f"{imds('instance-type')}, {os.cpu_count()} vCPUs, "
+                 f"{imds('instance-life-cycle')}, kernel {os.uname().release}"])
+    # The checkout this driver runs from is the one fcvm was built from (box-setup.sh).
+    commit = run_out(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"])
+    rows.append(["fcvm", f"commit {commit[:12]}, {run_out([cfg['fcvm_bin'], '--version'])}"])
+    rows.append(["fcvm VM", "1 vCPU, 2048 MiB, rootless networking, port published on 127.0.0.1; one snapshot, "
+                 "restored by both fcvm lanes"])
+    lt = ec2.describe_launch_template_versions(LaunchTemplateName="boot-race-ec2", Versions=["$Default"])
+    lt = lt["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+    root = lt["BlockDeviceMappings"][0]["Ebs"]
+    base = ec2.describe_images(ImageIds=[lt["ImageId"]])["Images"][0]["Name"]
+    rows.append(["EC2 lanes", f"{lt['InstanceType']}, {root['VolumeType']} {root['VolumeSize']} GiB root, "
+                 f"AMI made from {base} with the workload as a systemd unit"])
+    host_lt = ec2.describe_launch_template_versions(LaunchTemplateName="boot-race-ecs-host", Versions=["$Default"])
+    host_lt = host_lt["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+    host_ami = ec2.describe_images(ImageIds=[host_lt["ImageId"]])["Images"][0]["Name"]
+    for fam, label in (("boot-race-fargate", "ECS on Fargate"), ("boot-race-ec2", "ECS on EC2")):
+        td = ecs.describe_task_definition(taskDefinition=fam)["taskDefinition"]
+        cpu = int(td["cpu"]) / 1024
+        text = f"task {cpu:g} vCPU, {td['memory']} MiB, {td['runtimePlatform']['cpuArchitecture']}, " \
+               f"network mode {td['networkMode']}"
+        if fam == "boot-race-ec2":
+            text += f"; container instance {host_lt['InstanceType']} from {host_ami}, image cached"
+        else:
+            text += "; no public IP, image pulled through ECR endpoints in the VPC"
+        rows.append([label, text])
+    for k in ("cold", "warm"):
+        fc = lam.get_function_configuration(FunctionName=f"boot-race-{k}")
+        rows.append([f"Lambda, {k}", f"{fc['Runtime']}, {fc['Architectures'][0]}, {fc['MemorySize']} MB, "
+                     f"function URL with IAM auth, BOOT_RACE_EXIT_AFTER_RESPONSE="
+                     f"{fc['Environment']['Variables'].get('BOOT_RACE_EXIT_AFTER_RESPONSE')}"])
+    return rows
+
+
+def write_setup(cfg):
+    path = cfg["results"] + "/setup.json"
+    with open(path, "w") as f:
+        json.dump({"region": REGION, "rows": setup_rows(cfg, session())}, f, indent=1)
+    log(f"setup -> {path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -532,6 +610,7 @@ def main():
     r.add_argument("--first-round", type=int, default=0)
     r.add_argument("--lanes", default=",".join(LANES))
     sub.add_parser("reports")
+    sub.add_parser("setup")
     a = ap.parse_args()
     with open(a.config) as f:
         cfg = json.load(f)
@@ -544,6 +623,8 @@ def main():
         asyncio.run(run(cfg, a.rounds, a.first_round, lanes))
     elif a.cmd == "reports":
         fetch_reports(cfg)
+    elif a.cmd == "setup":
+        write_setup(cfg)
 
 
 if __name__ == "__main__":

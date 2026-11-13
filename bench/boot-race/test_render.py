@@ -64,6 +64,22 @@ class Build(unittest.TestCase):
             self.assertEqual(fc["checks"]["new_proc"], 2)
             self.assertEqual(data["rounds"], 3)
 
+    def test_setup_rows_derived_from_the_records_come_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            recs = [
+                sample("ecs-fargate", 0, 1793851066938, 30000.0, load1=0.12, platform_version="1.4.0"),
+                sample("fcvm-file", 1, 1793851166938, 200.0, load1=0.31),
+            ]
+            write_results(d, recs)
+            setup = render.build(d)["setup"]
+            rows = dict(setup["rows"])
+            self.assertEqual(setup["rows"][0], ["Date (UTC)", "2026-11-05"])
+            self.assertTrue(rows["Rounds"].startswith("2,"))
+            self.assertEqual(rows["Fargate platform"], "1.4.0")
+            self.assertIn("0.12 to 0.31", rows["Campaign host load"])
+            self.assertEqual(rows["Region"], "us-east-2")
+            self.assertEqual({lid for lid, _ in setup["checks"]}, set(render.LANES))
+
     def test_init_duration_is_joined_by_request_id(self):
         with tempfile.TemporaryDirectory() as d:
             recs = [sample("lambda-cold", 0, 1, 120.0, request_id="r1"), sample("lambda-cold", 1, 2, 130.0, request_id="r2")]

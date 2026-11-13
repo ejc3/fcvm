@@ -10,6 +10,7 @@ identity checks the page reports (did the environment change, was there an Init 
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -68,6 +69,26 @@ LANES = {
         "start": "RunInstances from an AMI with the workload installed",
     },
 }
+
+# What the page says each lane's identity evidence shows, filled from the records ({n}, {new_proc}, ...).
+CHECKS = [
+    ["fcvm-uffd", "{n} samples answered from {new_proc} workload process and {new_boot} kernel boot: every restore "
+                  "resumed the snapshot's own process (race.py refuses any other)."],
+    ["fcvm-file", "{n} samples answered from {new_proc} workload process and {new_boot} kernel boot: every restore "
+                  "resumed the snapshot's own process (race.py refuses any other)."],
+    ["lambda-warm", "{n} samples answered from {new_proc} runtime process; {init} of {report} REPORT lines carried "
+                    "an Init Duration. race.py refuses a warm sample from a new process."],
+    ["lambda-cold", "{n} samples answered from {new_proc} runtime processes and {new_boot} kernel boots; {init} of "
+                    "{report} REPORT lines carried an Init Duration."],
+    ["ecs-ec2", "{n} samples answered from {new_proc} container processes on {new_boot} kernel boot (the one "
+                "container instance)."],
+    ["ecs-fargate", "{n} samples answered from {new_proc} processes on {new_boot} kernel boots: one per task."],
+    ["ec2-hibernate", "{n} samples, {same_proc} of them from the same process that answered before the instance "
+                      "hibernated, on {new_boot} kernel boot: every start resumed the hibernated kernel. race.py "
+                      "refuses a resume that booted."],
+    ["ec2-start", "{n} samples answered from {new_proc} processes and {new_boot} kernel boots: every start booted."],
+    ["ec2-launch", "{n} samples answered from {new_proc} processes and {new_boot} kernel boots: one per instance."],
+]
 
 FORBIDDEN = [
     re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt)-[0-9a-f]{8,17}\b"),
@@ -185,6 +206,20 @@ def build(results):
         )
     lanes.sort(key=lambda l: (l["median_ms"] is None, l["median_ms"] or 0))
     starts = [s["t"] for l in lanes for s in l["samples"]] + [f["t"] for l in lanes for f in l["failed"] if f["t"]]
+    setup = dict(setup)
+    setup["checks"] = CHECKS
+    days = sorted({datetime.datetime.fromtimestamp(t / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+                   for t in starts})
+    loads = [r["load1"] for r in recs if "load1" in r]
+    fargate = sorted({r["platform_version"] for r in recs if r.get("platform_version")})
+    derived = [["Date (UTC)", " to ".join(days[:1] + days[1:][-1:])]]
+    derived.append(["Rounds", f"{len({r['round'] for r in recs})}, lane order rotated by one lane per round"])
+    if fargate:
+        derived.append(["Fargate platform", ", ".join(fargate)])
+    if loads:
+        derived.append(["Campaign host load", f"1-minute load average {min(loads):.2f} to {max(loads):.2f} "
+                        f"at the start of each sample"])
+    setup["rows"] = derived + list(setup.get("rows", []))
     data = {
         "setup": setup,
         "first_sample_unix_ms": min(starts) if starts else None,
