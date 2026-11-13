@@ -17,3 +17,4 @@ tests/node_modules/
 
 # Local repo symlink (from Quick Start)
 /fcvm
+__pycache__/

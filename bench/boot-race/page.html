@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time to running</title>
+<meta name="description" content="fcvm snapshot restore against EC2, ECS and Lambda: time from asking for compute to the same workload answering a request, one campaign, every lane interleaved.">
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --panel2:#eef1f5; --ink:#17202a; --muted:#56626f; --line:#d5dbe3;
+    --track:#e3e8ef; --fcvm:#1a7f37; --aws:#b35900; --lambda:#8250df; --ecs:#0969da; --accent:#0969da;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3; --muted:#9aa7b4; --line:#2b3440;
+      --track:#232b36; --fcvm:#3fb950; --aws:#f0883e; --lambda:#bc8cff; --ecs:#58a6ff; --accent:#58a6ff;
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3; --muted:#9aa7b4; --line:#2b3440;
+    --track:#232b36; --fcvm:#3fb950; --aws:#f0883e; --lambda:#bc8cff; --ecs:#58a6ff; --accent:#58a6ff;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.55}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 16px}
+  header{padding:36px 0 8px}
+  h1{font-size:30px;margin:0 0 8px;letter-spacing:-.3px}
+  h2{font-size:21px;margin:40px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  p{margin:10px 0}
+  a{color:var(--accent)}
+  code{font-family:var(--mono);font-size:14px;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:0 4px;overflow-wrap:anywhere}
+  .lead{font-size:17px}
+  .muted{color:var(--muted)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:16px 0}
+  .controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin-bottom:10px}
+  .controls button,.controls select{font:inherit;font-size:15px;color:var(--ink);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 12px;min-height:40px;cursor:pointer}
+  .readout{font-family:var(--mono);font-size:15px;margin-left:auto}
+  .lane{display:grid;grid-template-columns:230px 1fr;gap:4px 14px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+  .lane:first-of-type{border-top:none}
+  .lane .name{font-weight:600;font-size:15px}
+  .lane .stat{font-family:var(--mono);font-size:14px;color:var(--muted)}
+  .lane canvas{width:100%;height:40px;display:block}
+  .lane .trip{grid-column:2;font-family:var(--mono);font-size:14px;color:var(--muted);min-height:1.4em}
+  .lane .trip b{color:var(--ink);font-weight:600}
+  .ends{display:grid;grid-template-columns:230px 1fr;gap:14px;font-size:14px;color:var(--muted)}
+  .ends div:last-child{display:flex;justify-content:space-between}
+  table{width:100%;border-collapse:collapse;font-size:15px;margin:10px 0}
+  th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{color:var(--muted);font-weight:600}
+  td.num,th.num{text-align:right;font-family:var(--mono);white-space:nowrap}
+  .scroll{overflow-x:auto}
+  .dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:7px;vertical-align:-1px}
+  #timeline{width:100%;display:block}
+  #timeline text{font-family:var(--sans);font-size:14px;fill:var(--muted)}
+  footer{color:var(--muted);font-size:14px;padding:30px 0 60px}
+  @media (max-width:700px){
+    h1{font-size:25px}
+    .lane{grid-template-columns:1fr}
+    .lane .trip{grid-column:1}
+    .ends{grid-template-columns:1fr}
+    .ends div:first-child{display:none}
+    .readout{margin-left:0;width:100%}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Time to running</h1>
+  <p class="lead">How long from asking for compute to a workload answering a request, for an fcvm VM restored
+  from a snapshot and for the usual ways of starting the same workload on AWS. Every lane runs the same program
+  and ends at the same event: an HTTP GET from outside the VM, instance, task or function reads its complete
+  answer.</p>
+  <p class="muted" id="when"></p>
+</header>
+
+<section class="panel" aria-label="Animation">
+  <div class="controls">
+    <button id="play" type="button">Pause</button>
+    <label>Speed <select id="speed">
+      <option value="1">real time</option>
+      <option value="0.25">1/4</option>
+      <option value="0.1">1/10</option>
+      <option value="0.01">1/100</option>
+      <option value="0.001">1/1000</option>
+    </select></label>
+    <button id="restart" type="button">Restart</button>
+    <button id="theme" type="button">Theme</button>
+    <span class="readout" id="clock">0.000 s</span>
+  </div>
+  <div class="ends"><div></div><div><span>request sent</span><span>workload</span></div></div>
+  <div id="lanes"></div>
+  <p class="muted" style="font-size:14px;margin-bottom:0">Each ball is one lane. One round trip is one measured
+  sample: out and back takes that sample's time, at the speed chosen above, on the same linear scale for every
+  lane. Trips replay the lane's samples in the order they were taken; a lane that runs out starts again from its
+  first sample and says so. The label under a lane is the trip that last landed.</p>
+</section>
+
+<h2>Results</h2>
+<div class="scroll"><table id="summary">
+  <thead><tr><th>Lane</th><th class="num">Median</th><th class="num">p95</th><th class="num">p99</th>
+  <th class="num">Range</th><th class="num">n</th><th class="num">Failed</th></tr></thead>
+  <tbody></tbody>
+</table></div>
+<p class="muted" style="font-size:14px">Median of the successful samples; p95 is the nearest-rank 95th
+percentile and p99 the 99th, which with fewer than 100 samples is the slowest one. A failed sample is a run that did not answer within its deadline or whose API call was refused; it
+is counted here and left out of the times. So is a sample whose answer came from the wrong process (an identity
+check below).</p>
+<div id="failures" class="muted" style="font-size:15px"></div>
+
+<h2>Where each lane starts the clock</h2>
+<ul id="starts"></ul>
+
+<h2>One campaign, interleaved</h2>
+<p>Every sample by the time it started (a hollow mark is a failed attempt). Each round ran every lane once, one after another, and the order rotated by
+one lane per round, so no lane always ran first or last.</p>
+<div class="panel"><svg id="timeline" role="img" aria-label="Sample start times by lane"></svg></div>
+
+<h2>What each lane checks</h2>
+<div id="checks"></div>
+
+<h2>Setup</h2>
+<div class="scroll"><table id="setup"><tbody></tbody></table></div>
+
+<h2>Method</h2>
+<ul id="method">
+  <li>t0 is read immediately before the call that asks for compute; t1 when the probe has read a complete
+  <code>200</code> answer. Teardown (terminating, stopping, killing the VM) happens after t1 and is not
+  timed.</li>
+  <li>The probe runs on the campaign host. For the EC2 and ECS lanes it opens a new connection to the workload's
+  private address every 20 ms (5 ms for ECS on EC2), each attempt with a 1 s timeout, until one answers; for the
+  fcvm lanes every 1 ms to the VM's published port. Lambda is one HTTPS request to the function URL, signed
+  before t0, so its time includes the TLS handshake.</li>
+  <li>The workload is one static binary: it counts the primes below 200,000 (about half a millisecond) and
+  returns that with a random id drawn at process start and the kernel's boot id. Those two ids are how the page
+  tells a new process and a new kernel from a reused one.</li>
+</ul>
+
+<footer>Source: <code>bench/boot-race/</code> in <a href="https://github.com/ejc3/fcvm">ejc3/fcvm</a>
+(the driver <code>race.py</code>, the workload, and <code>render.py</code>, which built this page from the
+campaign's records).</footer>
+</div>
+
+<script id="data" type="application/json">/*BOOT_RACE_DATA*/null</script>
+<script>
+(function(){
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+if (!D) return;
+
+const COLOR = {"fcvm":"--fcvm","ec2":"--aws","ecs":"--ecs","lambda":"--lambda"};
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const colorOf = (id) => css(COLOR[id.split("-")[0]]);
+const varOf = (id) => `var(${COLOR[id.split("-")[0]]})`;
+
+function fmt(ms){
+  if (ms === null || ms === undefined) return "none";
+  if (ms < 1000) return (ms < 100 ? ms.toFixed(1) : ms.toFixed(0)) + " ms";
+  return (ms/1000).toFixed(ms < 10000 ? 2 : 1) + " s";
+}
+function utc(t){ return new Date(t).toISOString().slice(11,19) + " UTC"; }
+
+// ---------------------------------------------------------------- header line
+const first = new Date(D.first_sample_unix_ms), last = new Date(D.last_sample_unix_ms);
+document.getElementById("when").textContent =
+  `${D.lanes.reduce((a,l)=>a+l.n,0)} samples (${D.lanes.reduce((a,l)=>a+l.failures,0)} failed attempts) in ${D.rounds} rounds over `+
+  `${Math.round((last-first)/60000)} minutes, ${D.setup.region}. Setup and date at the bottom.`;
+
+// ---------------------------------------------------------------- summary
+const tb = document.querySelector("#summary tbody");
+for (const l of D.lanes){
+  const tr = document.createElement("tr");
+  const cells = [
+    `<span class="dot" style="background:${varOf(l.id)}"></span>${l.name}`,
+    fmt(l.median_ms), fmt(l.p95_ms), fmt(l.p99_ms), `${fmt(l.min_ms)} to ${fmt(l.max_ms)}`, l.n, l.failures,
+  ];
+  cells.forEach((c,i)=>{ const td=document.createElement("td"); if(i>=1) td.className="num"; td.innerHTML=c; tr.appendChild(td); });
+  tb.appendChild(tr);
+}
+
+const su = document.getElementById("starts");
+for (const l of D.lanes){
+  const li = document.createElement("li");
+  li.innerHTML = `<b>${l.name}:</b> <code></code>`;
+  li.querySelector("code").textContent = l.start;
+  su.appendChild(li);
+}
+
+const fl = document.getElementById("failures");
+const allFailed = D.lanes.flatMap(l => l.failed.map(f => ({...f, lane: l.name})));
+if (allFailed.length === 0) fl.textContent = "No sample failed.";
+else {
+  const ul = document.createElement("ul");
+  for (const f of allFailed){
+    const li = document.createElement("li");
+    li.textContent = `${f.lane}, round ${f.round}${f.t ? ", " + utc(f.t) : ""}: ${f.error}`;
+    ul.appendChild(li);
+  }
+  fl.appendChild(ul);
+}
+
+// ---------------------------------------------------------------- setup table
+const st = document.querySelector("#setup tbody");
+for (const [k,v] of D.setup.rows){
+  const tr=document.createElement("tr"); const th=document.createElement("th"); th.textContent=k;
+  const td=document.createElement("td"); td.textContent=v; tr.append(th,td); st.appendChild(tr);
+}
+
+// ---------------------------------------------------------------- checks
+const ck = document.getElementById("checks");
+for (const [lid, text] of D.setup.checks || []){
+  const l = D.lanes.find(x=>x.id===lid); if(!l) continue;
+  const c = l.checks;
+  const p = document.createElement("p");
+  p.innerHTML = `<b>${l.name}.</b> ` + text
+    .replace("{n}", l.n).replace("{new_proc}", c.new_proc).replace("{new_boot}", c.new_boot)
+    .replace("{same_proc}", c.same_proc_as_previous).replace("{same_boot}", c.same_boot_as_previous).replace("{n_minus_1}", Math.max(0,l.n-1))
+    .replace("{init}", c.init_duration).replace("{report}", c.report);
+  ck.appendChild(p);
+}
+
+// ---------------------------------------------------------------- timeline
+(function(){
+  const svg = document.getElementById("timeline");
+  const W = 1000, rowH = 26, left = 150, top = 6, H = top + rowH*D.lanes.length + 28;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const t0 = D.first_sample_unix_ms, span = Math.max(1, D.last_sample_unix_ms - t0);
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (n, a) => { const e=document.createElementNS(ns,n); for(const k in a) e.setAttribute(k,a[k]); svg.appendChild(e); return e; };
+  D.lanes.forEach((l, r) => {
+    const y = top + r*rowH + rowH/2;
+    el("text",{x:0,y:y+5}).textContent = l.short;
+    el("line",{x1:left,x2:W-10,y1:y,y2:y,style:"stroke:var(--line)"});
+    for (const f of l.failed){
+      if (!f.t) continue;
+      const x = left + (W-10-left)*(f.t-t0)/span;
+      const c = el("circle",{cx:x.toFixed(1),cy:y,r:4.5,style:`fill:none;stroke:${varOf(l.id)};stroke-width:1.5`});
+      const tt = document.createElementNS(ns,"title");
+      tt.textContent = `${l.short} failed attempt, round ${f.round}, started ${utc(f.t)}`;
+      c.appendChild(tt);
+    }
+    for (const s of l.samples){
+      const x = left + (W-10-left)*(s.t-t0)/span;
+      const c = el("circle",{cx:x.toFixed(1),cy:y,r:4.5,style:`fill:${varOf(l.id)}`});
+      const tt = document.createElementNS(ns,"title");
+      tt.textContent = `${l.short} sample ${s.i}: ${fmt(s.ms)}, started ${utc(s.t)}`;
+      c.appendChild(tt);
+    }
+  });
+  const yb = top + rowH*D.lanes.length + 20;
+  el("text",{x:left,y:yb}).textContent = utc(t0);
+  const e = el("text",{x:W-10,y:yb,"text-anchor":"end"}); e.textContent = utc(D.last_sample_unix_ms);
+})();
+
+// ---------------------------------------------------------------- animation
+const host = document.getElementById("lanes");
+const rows = D.lanes.filter(l => l.samples.length > 0).map((l) => {
+  const div = document.createElement("div"); div.className = "lane";
+  div.innerHTML = `<div><div class="name"><span class="dot" style="background:${varOf(l.id)}"></span>${l.name}</div>`+
+    `<div class="stat">median ${fmt(l.median_ms)} · p95 ${fmt(l.p95_ms)} · n ${l.n}</div></div>`+
+    `<canvas aria-hidden="true"></canvas><div class="trip" aria-live="off"></div>`;
+  host.appendChild(div);
+  return { l, canvas: div.querySelector("canvas"), trip: div.querySelector(".trip"), lastShown: -1 };
+});
+
+// Each lane's samples back to back, in recorded order, repeating: a cumulative table per lane.
+for (const r of rows){
+  r.cum = []; let acc = 0;
+  for (const s of r.l.samples){ r.cum.push(acc); acc += s.ms; }
+  r.total = acc;
+}
+
+let speed = 1, playing = true, simMs = 0, lastFrame = null;
+const sel = document.getElementById("speed");
+sel.addEventListener("change", () => { speed = parseFloat(sel.value); });
+const playBtn = document.getElementById("play");
+playBtn.addEventListener("click", () => { playing = !playing; playBtn.textContent = playing ? "Pause" : "Play"; lastFrame = null; });
+document.getElementById("restart").addEventListener("click", () => { simMs = 0; rows.forEach(r=>{r.lastShown=-1; r.trip.textContent="";}); });
+const clock = document.getElementById("clock");
+document.getElementById("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+});
+const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+if (reduce.matches){ sel.value = "0.1"; speed = 0.1; }
+
+function locate(r, t){
+  // which trip is in flight at simulated time t, and how far along
+  const loops = Math.floor(t / r.total);
+  const within = t - loops*r.total;
+  let lo = 0, hi = r.cum.length - 1;
+  while (lo < hi){ const mid = (lo+hi+1)>>1; if (r.cum[mid] <= within) lo = mid; else hi = mid-1; }
+  const s = r.l.samples[lo];
+  return { k: loops*r.cum.length + lo, idx: lo, loops, frac: (within - r.cum[lo]) / s.ms };
+}
+
+function draw(r, pos){
+  const c = r.canvas, dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w*dpr) || c.height !== Math.round(h*dpr)){ c.width = Math.round(w*dpr); c.height = Math.round(h*dpr); }
+  const g = c.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+  const pad = 10, y = h/2, x0 = pad, x1 = w - pad;
+  g.strokeStyle = css("--track"); g.lineWidth = 6; g.lineCap = "round";
+  g.beginPath(); g.moveTo(x0,y); g.lineTo(x1,y); g.stroke();
+  g.fillStyle = css("--muted");
+  g.fillRect(x0-2, y-12, 3, 24); g.fillRect(x1-1, y-12, 3, 24);
+  const f = pos.frac < 0.5 ? pos.frac*2 : 2 - pos.frac*2;
+  g.fillStyle = colorOf(r.l.id);
+  g.beginPath(); g.arc(x0 + (x1-x0)*f, y, 8, 0, Math.PI*2); g.fill();
+}
+
+function frame(ts){
+  if (playing && lastFrame !== null) simMs += (ts - lastFrame) * speed;
+  lastFrame = playing ? ts : null;
+  clock.textContent = (simMs/1000).toFixed(3) + " s" + (speed !== 1 ? `  (at ${sel.options[sel.selectedIndex].text})` : "");
+  for (const r of rows){
+    const pos = locate(r, simMs);
+    draw(r, pos);
+    // the trip that last landed is the one before the trip in flight
+    const landed = pos.k - 1;
+    if (landed !== r.lastShown && landed >= 0){
+      r.lastShown = landed;
+      const n = r.cum.length, idx = landed % n, loop = Math.floor(landed / n);
+      const s = r.l.samples[idx];
+      r.trip.innerHTML = `trip ${landed+1}: <b>sample ${s.i}, ${fmt(s.ms)}</b>` +
+        (loop > 0 ? ` · replaying from sample 1 (pass ${loop+1}; this lane has ${n} samples)` : "");
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
