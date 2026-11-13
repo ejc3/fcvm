@@ -966,7 +966,7 @@ its first report). `last_relaunch` times the sandbox's last restore from the cli
 first frame of its desktop: `first_frame_at` is the bridge's desktop time
 (`desktop_at`, below), kept between the click and the coordinator's read of the report, so a
 host clock ahead of the coordinator's cannot put it after the report or before the click.
-`label` is the evaluation notice the page shows once, in its header. `image` is the Windows image of
+`label` is the line every tile and the take-over panel show. `image` is the Windows image of
 the first host (by name) that reported one (`windows_image`, below): its manifest, its age in
 whole days, `warning` from 150 days after its installation, `refused` once the agent refuses
 to start sandboxes from it (170 days old, or within 7 days of its evaluation's expiry), and the
