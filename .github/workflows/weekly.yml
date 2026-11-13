@@ -9,6 +9,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A RustSec advisory published against a crate already in Cargo.lock fails nothing until
+  # the next change that runs Lint, and then fails that unrelated PR (RUSTSEC-2026-0538 in
+  # quinn-udp failed main's Lint at 9c22f734). This finds it the day it is published.
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: fcvm
+      - uses: ./fcvm/.github/actions/checkout-deps
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # 1.93.0
+        with:
+          toolchain: 1.93.0
+      - name: Cache cargo tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-audit-0.22.0-deny-0.18.9-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo tools
+        run: |
+          which cargo-audit || cargo install cargo-audit@0.22.0 --locked
+          which cargo-deny || cargo install cargo-deny@0.18.9 --locked
+      - name: Audit
+        working-directory: fcvm
+        run: cargo audit
+      - name: Deny advisories
+        working-directory: fcvm
+        run: cargo deny check advisories
+
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
