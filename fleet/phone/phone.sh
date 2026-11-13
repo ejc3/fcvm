@@ -175,12 +175,20 @@ renderer_on_gpu() {
   r=$("$ADB" shell dumpsys SurfaceFlinger 2>/dev/null | tr -d '\r' | grep -m1 '^GLES:' || true)
   [[ -n "$1" && "$r" == *"$1"* ]] || { echo "SurfaceFlinger does not render on ${1:-the GPU}: ${r:-no GLES line}"; return 1; }
 }
+# `adb install ARGS... APK`; on a failure, prints adb's own last lines, which name the cause
+# (its "Failure [INSTALL_...]" or its error), so a failed start carries it.
+adb_install() {
+  local out
+  out=$("$ADB" install "$@" 2>&1) && return 0
+  echo "adb could not install ${*: -1}: $(tr -d '\r' <<< "$out" | grep -v '^Performing ' | tail -n 3 | tr '\n' ' ')"
+  return 1
+}
 # Robot Park installed and started, its control socket forwarded to 127.0.0.1:$CTL_PORT, and
 # its first frame drawn with a renderer on the GPU named $2; prints why not.
 start_app() {
   local out line
   "$ADB" uninstall dev.fcvm.robotpark > /dev/null 2>&1 || true
-  "$ADB" install "$1" > /dev/null 2>&1 || { echo "adb could not install $1"; return 1; }
+  adb_install "$1" || return 1
   # the app hides the system bars; without this Android covers the scene with a one-time hint
   "$ADB" shell settings put secure immersive_mode_confirmations confirmed > /dev/null 2>&1 || true
   "$ADB" logcat -c > /dev/null 2>&1 || true
@@ -233,7 +241,7 @@ wait_browser_page() {
 }
 # The browser installed with its command line, open on www.nvidia.com; prints its title.
 start_browser() {
-  "$ADB" install -r -g "$1" > /dev/null 2>&1 || { echo "adb could not install $1"; return 1; }
+  adb_install -r -g "$1" || return 1
   # a userdebug image reads Chromium's command line from this file
   "$ADB" shell "echo '_ $BROWSER_FLAGS' > /data/local/tmp/chrome-command-line" || { echo "could not write the browser's command line"; return 1; }
   FRONT_WAIT_MS=${BOOT_FRONT_WAIT_MS:-30000} open_page || return 1

@@ -53,6 +53,8 @@ case "$*" in
   "shell dumpsys activity activities") [ -s "$D/top" ] && echo "  topResumedActivity=ActivityRecord{1 u0 $(cat "$D/top") t9}" ;;
   "logcat -d -s ROBOTPARK:I") echo "I ROBOTPARK: renderer=Android Emulator OpenGL ES Translator (${FAKE_APP_RENDERER:-Tesla T4/PCIe/SSE2})" ;;
   "emu kill") kill "$(cat "$D/run/emulator.pid")" ;;
+  # adb's own words for a refused install: a progress line on stdout, the cause on stderr
+  "install "*) [ -z "${FAKE_INSTALL_FAILS:-}" ] || { echo "Performing Streamed Install"; echo "adb: failed to install ${*: -1}: Failure [$FAKE_INSTALL_FAILS]" >&2; exit 1; } ;;
 esac
 exit 0
 EOF
@@ -163,6 +165,12 @@ has "$D" "streamer fail: the app did not start: am start" && ok "an app that doe
   || bad "an app that does not start: $(cat "$D/log" "$D/out")"
 has "$D" "streamer streaming" && bad "a phone without its app was streamed" || ok "a phone without its app is never streamed"
 stopped "$D" && ok "the emulator of a phone whose app did not start is stopped" || bad "the emulator of a phone whose app did not start still runs"
+# A refused install reports adb's cause, which a failed host image build keeps in its diagnostics.
+D=$(FAKE_INSTALL_FAILS="INSTALL_FAILED_TEST_ONLY: installPackageLI" serve)
+has "$D" "streamer fail: the app did not start: adb could not install /work/robotpark.apk: adb: failed to install /work/robotpark.apk: Failure [INSTALL_FAILED_TEST_ONLY: installPackageLI]" \
+  && grep -qF "Failure [INSTALL_FAILED_TEST_ONLY" "$D/out" && ok "a refused install reports adb's cause" \
+  || bad "a refused install hid adb's cause: $(cat "$D/log" "$D/out")"
+has "$D" "streamer streaming" && bad "a phone whose app was not installed was streamed" || ok "a phone whose app was not installed is never streamed"
 # UWB: the image's UWB service, given no HAL by -feature -Uwb, asks for a bug report a minute or
 # two after boot unless UWB is turned off; serve and boot turn it off once booted, before the
 # app, and a phone that cannot is reported failed.
