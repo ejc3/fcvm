@@ -63,8 +63,27 @@ fn one_source_holds_at_most_the_open_connection_cap() {
 #[test]
 fn one_source_opens_at_most_its_burst_of_new_connections_at_once() {
     let refused_at = in_guarded_namespace(|addr| {
+        // The open-connection rule leaves the chain, so only the rate can refuse. Closing each
+        // connection before the next is not enough: before Linux 7.0, connlimit does not
+        // collect closed connections on a SYN in the same jiffy as its previous one
+        // (`jiffies == list->last_gc` in net/netfilter/nf_conncount.c), so connections closed
+        // a moment ago still count, and the cap refuses the 5th of a fast loop.
+        let mut delete = joinguard::rules()
+            .into_iter()
+            .find(|r| r.iter().any(|a| a == "connlimit"))
+            .expect("the open-connection rule");
+        delete[0] = "-D".into();
+        let out = std::process::Command::new("/usr/sbin/ip6tables")
+            .args(&delete)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let l = TcpListener::bind(addr).unwrap();
-        // one connection at a time, each closed before the next: only the rate can refuse them
+        // one connection at a time, each closed before the next
         for n in 1..=joinguard::NEW_BURST + 2 {
             match connect(addr) {
                 Ok(c) => {
