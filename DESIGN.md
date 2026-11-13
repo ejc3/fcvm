@@ -2867,6 +2867,63 @@ What the arms show:
   populate used to hide. Holding the restored clone paused for 1.2 s before resuming it
   brought nvidia-persistenced back to 466 to 469 ms and the PCI rescan from 120 to 48 ms.
 
+#### GPU resets: before the restore, not at the VFIO open
+
+vfio-pci resets a GPU when a VMM opens it (`vfio_pci_core_enable`), and the Firecracker fork
+resets it again through `VFIO_DEVICE_RESET`: two bus resets of about 180 ms each inside the
+snapshot load, after which the T4 clears its memory and the guest's driver waits for it. A
+root GPU restore now resets each GPU itself, through sysfs, at the start of the restore,
+beside the prefill, and writes an empty `reset_method` so that neither the open nor the
+ioctl resets it again; the guard puts `bus` back once the load has opened the GPU
+(`src/gpu/reset.rs`). When the GPU's clean token says a host scrub reset and cleared it
+since its last VM, it is not reset at all. A rootless restore cannot write sysfs and keeps
+the reset at the open.
+
+Every VM still gets a GPU reset since its last tenant, and the place that holds it is the
+GPU's handoff: the restore takes it (with its lease) before the token and the reset, and
+keeps it until its load has opened the GPU, which VFIO then keeps to that VM; the reset is
+this restore's own or the host scrub's that the token stands for. A restore killed while
+the method is empty leaves it empty: the next root restore and the next host scrub put
+`bus` back before they rely on it, and the guest's scrub, which runs unless the token says
+otherwise, does not depend on any reset. vfio-pci still resets the GPU at release (its
+device-set bus reset), since the open recorded that the function reset was off.
+
+Measured on 2026-11-13 on one g4dn.metal, one boot, five restores per arm onto one T4,
+prefilled hugepage memory, warm snapshots made by this tree's fcvm (medians, ms; ACK from
+the start of the prefill, first frame or token from the start of the fcvm command):
+
+| arm | load | nvidia-persistenced | `gpu_ms` | ACK | first frame / token |
+|---|---|---|---|---|---|
+| phone, reset at the open, no host scrub | 402 | 1,048 | 2,239 | 2,925 | 3,429 |
+| phone, reset at the open, host scrub | 407 | 1,052 | 2,044 | 2,737 | 3,351 |
+| phone, early reset, no host scrub | 40 | 473 | 1,563 | 1,879 | 2,395 |
+| phone, no reset, host scrub | 40 | 472 | 1,375 | 1,689 | 2,255 |
+| llama, reset at the open, no host scrub | 410 | 1,050 | 2,003 | 2,605 | 2,689 |
+| llama, reset at the open, host scrub | 406 | 1,049 | 1,569 | 2,168 | 2,256 |
+| llama, early reset, no host scrub | 40 | 466 | 1,347 | 1,607 | 1,689 |
+| llama, no reset, host scrub | 39 | 465 | 889 | 1,141 | 1,225 |
+
+The early and no-reset arms were driven by hand (`reset` and `reset_method` written by the
+benchmark around an unchanged fcvm, the early reset before fcvm started). The same boot, five
+restores each, with this tree's fcvm doing it:
+
+| arm | load | nvidia-persistenced | `gpu_ms` | ACK | first frame / token |
+|---|---|---|---|---|---|
+| phone, early reset beside the prefill, no host scrub | 40 | 990 | 1,994 | 2,296 | 2,833 |
+| phone, host scrub, no reset | 40 | 469 | 1,302 | 1,605 | 2,126 |
+| llama, early reset beside the prefill, no host scrub | 40 | 1,050 | 1,946 | 2,232 | 2,304 |
+| llama, host scrub, no reset | 40 | 466 | 903 | 1,151 | 1,236 |
+
+The load loses its two bus resets either way (405 to 40 ms). Without a host scrub the GPU's
+memory clear, which starts at the reset, is still running when the guest's driver starts,
+since the reset now begins only the prefill's 160 to 230 ms ahead of the guest; in the hand
+driven arm it began earlier and the driver did not wait. After a host scrub nothing is reset
+and nothing is waited for: nvidia-persistenced takes 466 to 473 ms in every arm with no clear
+pending, which is the guest driver bringing the adapter up and cannot start before the guest
+runs. A warm snapshot of a clone restored this way (`snapshot create --gpu-warm`, whose
+re-attach finds the device's reset off) took 11.4 s, the source answered after it, and a clone
+of that snapshot answered on another GPU.
+
 Measured on 2026-10-23 on a g4dn.metal (eight T4) with Qwen2.5-0.5B-Instruct and two
 servers: vLLM 0.32.0 (`vllm/vllm-openai:v0.32.0-cu129`, fp16, TRITON_ATTN,
 `--gpu-memory-utilization 0.2`, torch.compile and CUDA graphs on, 8 vCPU and 12 GiB

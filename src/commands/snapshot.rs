@@ -3045,6 +3045,53 @@ async fn cmd_snapshot_run_inner(
     check_parked_gpus(snapshot_config.metadata.parked_gpus, &gpus)?;
     vm_state.config.gpus = gpus.clone();
 
+    // The GPUs' handoff, their clean tokens and their reset, taken before anything else this
+    // restore does, so the GPU's own memory clear after the reset overlaps the prefill and the
+    // load instead of the guest's GPU phase (src/gpu/reset.rs).
+    let mut gpu_handoff: Option<crate::gpu::scrub::GpuHandoff> = None;
+    let mut gpus_host_scrubbed = false;
+    // Declared after the leases and the handoff, so on any way out it is dropped (and its thread
+    // waited for) before they are released.
+    let mut gpu_reset: Option<crate::gpu::reset::EarlyReset> = None;
+    if !gpus.is_empty() {
+        let state_dir = crate::gpu::scrub::state_dir();
+        // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
+        // below), so no other restore of these GPUs can take or use one between the token
+        // (or the reset) and the open. The wait runs on a blocking thread: another restore of
+        // the same GPU in this process (`fcvm serve`) must keep its runtime threads to finish
+        // its load and let go.
+        let begun = {
+            let (state_dir, gpus) = (state_dir.clone(), gpus.clone());
+            tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        };
+        gpu_handoff = Some(begun?);
+        let handoff = gpu_handoff.as_ref().expect("just taken");
+        // Every GPU a host scrub cleared, with no VM given it since: the guest's scrub would
+        // zero memory that is already zero. Every token is taken, not only up to the first
+        // missing one: a GPU this VM gets must not keep a token that tells the next VM it is
+        // clean. A token that cannot be voided stops the restore before any GPU is opened.
+        let taken: Result<Vec<bool>> = _gpu_leases
+            .iter()
+            .zip(&gpus)
+            .map(|(lease, sbdf)| {
+                crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease, handoff)
+            })
+            .collect();
+        let taken = taken?;
+        gpus_host_scrubbed = taken.iter().all(|&clean| clean);
+        // A root restore resets the GPUs now (unless the host scrub just did) and keeps the
+        // open from resetting them again; a rootless one cannot, and leaves it to the open.
+        if nix::unistd::geteuid().is_root() {
+            gpu_reset = Some(crate::gpu::reset::EarlyReset::start(
+                gpus.clone(),
+                gpus_host_scrubbed,
+            )?);
+        }
+    }
+
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone());
@@ -3867,41 +3914,9 @@ async fn cmd_snapshot_run_inner(
     // The GPUs the snapshot load attaches. The guest kernel is not told of them, so
     // fc-agent rescans PCI, loads the driver and writes the CDI spec before it
     // acknowledges this restore (fc-agent `gpu::attach`).
-    let mut gpu_handoff: Option<crate::gpu::scrub::GpuHandoff> = None;
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
-        // Every GPU a host scrub cleared, with no VM given it since: the guest's scrub would
-        // zero memory that is already zero. Taken here, before the load opens the GPUs, and
-        // only all or nothing (the guest's scrub covers every GPU it has).
-        let state_dir = crate::gpu::scrub::state_dir();
-        // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
-        // below), so no other restore of these GPUs can use one between the token and the
-        // open.
-        // A failure unwinds the clone's setup like any other step here.
-        // The wait runs on a blocking thread: another restore of the same GPU in this process
-        // (`fcvm serve`) must keep its runtime threads to finish its load and let go.
-        let begun = {
-            let (state_dir, gpus) = (state_dir.clone(), gpus.clone());
-            tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-        };
-        gpu_handoff = Some(setup_try!(begun));
-        let handoff = gpu_handoff.as_ref().expect("just taken");
-        // Every token is taken, not only up to the first missing one: a GPU this VM gets must
-        // not keep a token that tells the next VM it is clean.
-        // A token that cannot be voided stops the restore before any GPU is opened.
-        let taken: Result<Vec<bool>> = _gpu_leases
-            .iter()
-            .zip(&gpus)
-            .map(|(lease, sbdf)| {
-                crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease, handoff)
-            })
-            .collect();
-        let taken = setup_try!(taken);
-        let scrubbed = taken.iter().all(|&clean| clean);
-        if scrubbed {
+        if gpus_host_scrubbed {
             info!(gpus = ?gpus, "every GPU was scrubbed on the host since its last VM");
             restore_latest["gpus-host-scrubbed"] = serde_json::Value::Bool(true);
         }
@@ -3982,6 +3997,17 @@ async fn cmd_snapshot_run_inner(
             .context("cleaning cancelled clone setup")?;
         anyhow::bail!("interrupted by signal during clone setup");
     }
+    // The early reset has finished (it ran beside the prefill); the guard keeps the open from
+    // resetting the GPUs again until the load is over.
+    let gpu_open = match gpu_reset.take() {
+        Some(task) => {
+            // The reset ran beside the prefill and has finished or is about to; this waits for
+            // it on the restore's own task, so no way out leaves it running.
+            let prepared = task.finish();
+            Some(setup_try!(prepared))
+        }
+        None => None,
+    };
     // Host-observed end-to-end restore clock: from the start of the restore
     // call through the guest's ACK, and from the prefill when guest memory was
     // prefilled, since that copy is part of loading it. Published as ack_ms in
@@ -4016,7 +4042,9 @@ async fn cmd_snapshot_run_inner(
             .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
         };
 
-    // The load has opened the GPUs (or failed), so the handoff is over.
+    // The load has opened the GPUs (or failed): the reset method goes back, then the handoff
+    // is over.
+    drop(gpu_open);
     drop(gpu_handoff);
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
@@ -6280,9 +6308,41 @@ mod tests {
         assert!(
             code[..take].contains(
                 "tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))"
-            ) && code[..take].contains("gpu_handoff = Some(setup_try!(begun));")
-                && code[take..load].contains("let taken = setup_try!(taken);"),
-            "a failed handoff must unwind the clone's setup (setup_try!)"
+            ),
+            "the handoff's wait must run on a blocking thread"
+        );
+        // The handoff and the tokens come before the clone's setup owns anything, so a plain
+        // `?` there leaves nothing behind; everything after goes through setup_try!.
+        let setup = code
+            .find("let mut setup = CloneSetupResources::new(")
+            .expect("no setup");
+        assert!(
+            take < setup,
+            "the tokens are taken after the setup owns resources"
+        );
+        let reset = code
+            .find("crate::gpu::reset::EarlyReset::start(")
+            .expect("no early reset");
+        let declared = |name: &str| code.find(name).unwrap_or_else(|| panic!("no `{name}`"));
+        assert!(
+            declared("let mut _gpu_leases") < declared("let mut gpu_handoff")
+                && declared("let mut gpu_handoff") < declared("let mut gpu_reset"),
+            "the early reset must be dropped (and waited for) before the handoff and the leases"
+        );
+        let joined = code
+            .find("let prepared = task.finish();")
+            .expect("the reset is not joined");
+        let restored = code
+            .find("drop(gpu_open);")
+            .expect("the reset method is not restored");
+        assert!(
+            take < reset
+                && reset < setup
+                && joined < load
+                && load < restored
+                && restored < released,
+            "the early reset must start before the setup, be joined before the load, and its \
+             guard dropped after the load and before the handoff"
         );
         let rest = &code[take..];
         let collect = rest
