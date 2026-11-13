@@ -101,8 +101,15 @@ struct StreamActivity {
     /// predecessor's reply arrived has the same stamp as that reply, so they cannot order
     /// the two.
     last_direction: std::sync::atomic::AtomicU8,
-    /// Set when this wait was reported, cleared when the wait ends.
-    reported: AtomicBool,
+    /// When a write to the destination began that has not completed (`now_ms() + 1`; 0
+    /// when none is pending), and how many bytes it carries. A destination that stops
+    /// reading leaves the write pending once the socket buffers fill: those bytes have not
+    /// been written to it.
+    writing_since_ms: AtomicU64,
+    pending: AtomicU64,
+    /// The wait last reported (a `waiting_on` string), so each wait is reported once and
+    /// a change of wait is reported again; `None` once the stream stops waiting.
+    reported: Mutex<Option<&'static str>>,
 }
 
 impl StreamActivity {
@@ -117,8 +124,17 @@ impl StreamActivity {
             last_to_dest_ms: AtomicU64::new(0),
             last_from_dest_ms: AtomicU64::new(0),
             last_direction: std::sync::atomic::AtomicU8::new(0),
-            reported: AtomicBool::new(false),
+            writing_since_ms: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            reported: Mutex::new(None),
         }
+    }
+
+    /// Before a write of `n` bytes to the destination; [`Self::record`] with [`SENT`] once
+    /// it has completed.
+    fn begin_write(&self, n: usize) {
+        self.pending.store(n as u64, Ordering::Relaxed);
+        self.writing_since_ms.store(now_ms() + 1, Ordering::Relaxed);
     }
 
     fn record(&self, direction: u8, n: usize) {
@@ -137,6 +153,11 @@ impl StreamActivity {
         if !self.connected.load(Ordering::Relaxed) {
             return (now_ms.saturating_sub(self.opened_ms - 1) >= threshold_ms)
                 .then_some("connecting to its destination");
+        }
+        let writing = self.writing_since_ms.load(Ordering::Relaxed);
+        if writing != 0 {
+            return (now_ms.saturating_sub(writing - 1) >= threshold_ms)
+                .then_some("blocked writing to its destination");
         }
         let sent = self.last_to_dest_ms.load(Ordering::Relaxed);
         // The latest bytes went to the destination, and nothing has come back since.
@@ -157,12 +178,17 @@ impl StreamActivity {
             }
         };
         format!(
-            "stream {} to {} {waiting_on} for {:.1}s since open: wrote {} B to it (last {}), read {} B from it (last {})",
+            "stream {} to {} {waiting_on} for {:.1}s since open: wrote {} B to it (last {}), {} B pending, read {} B from it (last {})",
             self.stream_id,
             self.dest,
             now_ms.saturating_sub(self.opened_ms - 1) as f64 / 1000.0,
             self.to_dest.load(Ordering::Relaxed),
             ago(self.last_to_dest_ms.load(Ordering::Relaxed)),
+            if self.writing_since_ms.load(Ordering::Relaxed) == 0 {
+                0
+            } else {
+                self.pending.load(Ordering::Relaxed)
+            },
             self.from_dest.load(Ordering::Relaxed),
             ago(self.last_from_dest_ms.load(Ordering::Relaxed)),
         )
@@ -185,11 +211,13 @@ fn newly_stalled(registry: &ActivityRegistry, now_ms: u64, threshold_ms: u64) ->
     for stream in streams {
         match stream.waiting_on(now_ms, threshold_ms) {
             Some(waiting_on) => {
-                if !stream.reported.swap(true, Ordering::Relaxed) {
+                let mut reported = stream.reported.lock().unwrap();
+                if *reported != Some(waiting_on) {
+                    *reported = Some(waiting_on);
                     lines.push(stream.describe(waiting_on, now_ms));
                 }
             }
-            None => stream.reported.store(false, Ordering::Relaxed),
+            None => *stream.reported.lock().unwrap() = None,
         }
     }
     lines
@@ -463,12 +491,15 @@ async fn handle_stream(
         while let Some((frame_type, payload)) = stream_rx.recv().await {
             match frame_type {
                 FRAME_DATA => {
-                    // Recorded before the write, so bytes the destination has read are
-                    // always counted.
-                    up.record(SENT, payload.len());
+                    // Pending before the write and sent after it, so a write the destination
+                    // stops taking reads as pending, and the bytes it has read are counted
+                    // by the time the write returns.
+                    up.begin_write(payload.len());
                     if tcp_wr.write_all(&payload).await.is_err() {
                         break;
                     }
+                    up.writing_since_ms.store(0, Ordering::Relaxed);
+                    up.record(SENT, payload.len());
                 }
                 FRAME_CLOSE | FRAME_RST => break,
                 _ => {}
@@ -523,6 +554,66 @@ mod tests {
     /// to it and none read back, and a reply ends the wait. Each count is recorded before
     /// the step the test waits on, and the scan is handed a clock past the threshold, so
     /// nothing here depends on timing.
+    /// A destination that stops reading leaves the request's write pending once its socket
+    /// buffers fill. Those bytes were not written to it, and the stream is blocked writing,
+    /// not awaiting a reply.
+    #[tokio::test]
+    async fn a_write_the_destination_never_takes_is_reported_as_blocked() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = destination.local_addr().unwrap().port();
+        let (mut guest, host) = UnixStream::pair().unwrap();
+        let registry = ActivityRegistry::default();
+        let session = tokio::spawn(relay_mux_session(host, registry.clone()));
+
+        let mut open = vec![AF_INET, 127, 0, 0, 1];
+        open.extend(port.to_be_bytes());
+        guest.write_all(&frame(7, FRAME_OPEN, &open)).await.unwrap();
+        // Accepted and never read: the request fills the socket buffers and then waits.
+        let (_server, _) = destination.accept().await.unwrap();
+        assert_eq!(read_frame(&mut guest).await.0, FRAME_OPEN_OK);
+
+        // 64 MiB is several times what loopback buffers hold, so a write is left pending.
+        let (guest_rd, mut guest_wr) = guest.into_split();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0u8; MAX_DATA_PAYLOAD];
+            for _ in 0..(64 * 1024 * 1024 / MAX_DATA_PAYLOAD) {
+                if guest_wr
+                    .write_all(&frame(7, FRAME_DATA, &chunk))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let threshold = STALL_REPORT_AFTER.as_millis() as u64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // The report for a time past the threshold. Until a write is left pending the
+        // stream can read as awaiting a reply; the pending write must then be reported.
+        let mut seen = Vec::new();
+        let line = loop {
+            let lines = newly_stalled(&registry, now_ms() + threshold, threshold);
+            if let Some(line) = lines.iter().find(|l| l.contains("blocked writing")) {
+                break line.clone();
+            }
+            seen.extend(lines);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a write the destination never took was never reported as pending; reported: {seen:?}"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            line.contains(&format!("stream 7 to 127.0.0.1:{port} blocked writing")),
+            "{line}"
+        );
+
+        writer.abort();
+        drop(guest_rd);
+        session.abort();
+    }
+
     /// A request written in the millisecond the previous reply arrived carries the same
     /// stamp as that reply. It is still the latest event, and still unanswered.
     #[test]
@@ -565,6 +656,16 @@ mod tests {
             .unwrap();
         let mut received = vec![0u8; request.len()];
         server.read_exact(&mut received).await.unwrap();
+        // The destination has the bytes; the relay counts them once its write returns.
+        let stream = registry.lock().unwrap().get(&7).cloned().expect("stream 7");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while stream.to_dest.load(Ordering::Relaxed) != request.len() as u64 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay's write never completed"
+            );
+            tokio::task::yield_now().await;
+        }
 
         let threshold = STALL_REPORT_AFTER.as_millis() as u64;
         let lines = newly_stalled(&registry, now_ms() + threshold, threshold);
