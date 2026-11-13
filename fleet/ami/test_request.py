@@ -131,18 +131,30 @@ class RequestTests(unittest.TestCase):
             self.invoke("refused", message="only the current main revision can enter the factory")
         self.assertIn("only the current main revision can enter the factory", str(caught.exception))
 
-    def github(self, head, runs):
+    def github(self, head, runs, passed=(), descendants=()):
         def fetch(path, token):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": head}}
+            if path == "actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20":
+                return {"workflow_runs": [{"head_sha": sha, "conclusion": "success"} for sha in passed]}
+            if path.startswith("compare/"):
+                base, newer = path[len("compare/"):].split("...")
+                return ({"status": "ahead", "behind_by": 0} if newer in descendants
+                        else {"status": "behind", "behind_by": 1})
             self.assertTrue(path.startswith("actions/workflows/ci.yml/runs?branch=main&head_sha="))
             return {"workflow_runs": runs}
         return fetch
 
-    def test_a_revision_main_moved_past_is_skipped_not_failed(self):
-        # a CI run that completes after the next merge (2add2b84 behind 38d63412, run 41378535279)
-        reason = request.not_requestable("a" * 40, "t", self.github("b" * 40, []))
-        self.assertIn("main has moved on", reason)
+    def test_a_revision_main_moved_past_is_requested_unless_a_newer_one_passed_ci(self):
+        # ejc3/aws#823: every merge cancels the CI run before it, so a revision main moved past
+        # waited for a newer CI completion that never came (8d46a0ee passed CI behind 9c22f734
+        # on 2026-11-13, run 43431415595, and no request was sent).
+        self.assertIsNone(request.not_requestable("a" * 40, "t", self.github("b" * 40, [])))
+        # an older revision that passed CI is no reason to skip
+        self.assertIsNone(request.not_requestable("a" * 40, "t", self.github("b" * 40, [], passed=["c" * 40])))
+        reason = request.not_requestable("a" * 40, "t", self.github("b" * 40, [], passed=["c" * 40, "d" * 40],
+                                                                   descendants=["d" * 40]))
+        self.assertIn("d" * 40 + " passed CI", reason)
 
     def test_the_schedule_skips_a_head_whose_ci_still_runs(self):
         # the weekly schedule at 02:24 fired on 38d63412 while its CI ran (run 41377552783)
