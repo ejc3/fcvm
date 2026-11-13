@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -978,6 +979,31 @@ pub async fn import_image(
     Ok(image_name.to_string())
 }
 
+/// How long `podman pull` may print nothing before fc-agent reports it. Across 7,610
+/// pulls in six CI runs' VM logs (2026-11-13), podman printed its next line within 5.5 s
+/// of "Trying to pull" every time but once, and that once it printed nothing for 117 s.
+const PULL_SILENCE: Duration = Duration::from_secs(10);
+const PULL_SILENCE_CHECK: Duration = Duration::from_secs(2);
+
+/// The line to print when podman has been silent for `PULL_SILENCE` since `last_ms`, once
+/// per silence: `reported_from` remembers which silence was reported.
+fn pull_silence_report(
+    last_ms: u64,
+    now_ms: u64,
+    reported_from: &mut Option<u64>,
+) -> Option<String> {
+    let silent_ms = now_ms.saturating_sub(last_ms);
+    if silent_ms < PULL_SILENCE.as_millis() as u64 || *reported_from == Some(last_ms) {
+        return None;
+    }
+    *reported_from = Some(last_ms);
+    Some(format!(
+        "podman pull has printed nothing for {:.1}s; {}",
+        silent_ms as f64 / 1000.0,
+        crate::proxy::open_streams_report(now_ms)
+    ))
+}
+
 /// Pull image from registry with retries.
 pub async fn pull_image(plan: &Plan) -> Result<String> {
     const MAX_RETRIES: u32 = 3;
@@ -1019,22 +1045,28 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
             .spawn()
             .context("spawning podman pull")?;
 
+        // When podman last printed a line, for the silence report below.
+        let last_output_ms = Arc::new(AtomicU64::new(crate::proxy::activity_now_ms()));
+        let stdout_last = last_output_ms.clone();
         let stdout_task = child.stdout.take().map(|stdout| {
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    stdout_last.store(crate::proxy::activity_now_ms(), Ordering::Relaxed);
                     eprintln!("[fc-agent] [podman] {}", line);
                 }
             })
         });
 
+        let stderr_last = last_output_ms.clone();
         let stderr_task = child.stderr.take().map(|stderr| {
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 let mut captured = Vec::new();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    stderr_last.store(crate::proxy::activity_now_ms(), Ordering::Relaxed);
                     eprintln!("[fc-agent] [podman] {}", line);
                     captured.push(line);
                 }
@@ -1042,7 +1074,26 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
             })
         });
 
-        let status = child.wait().await.context("waiting for podman pull")?;
+        // podman's registry client sets no deadline on a response, so a request that
+        // never gets one leaves the pull silent for good. Say so once per silence, with
+        // what the egress proxy holds, so the stall can be placed (guest, vsock, host or
+        // registry) from the log.
+        let mut silence_check = tokio::time::interval(PULL_SILENCE_CHECK);
+        let mut reported_silence_from = None;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break status.context("waiting for podman pull")?,
+                _ = silence_check.tick() => {
+                    let now = crate::proxy::activity_now_ms();
+                    let last = last_output_ms.load(Ordering::Relaxed);
+                    if let Some(line) =
+                        pull_silence_report(last, now, &mut reported_silence_from)
+                    {
+                        eprintln!("[fc-agent] {line}");
+                    }
+                }
+            }
+        };
 
         if let Some(task) = stdout_task {
             let _ = task.await;
@@ -2282,6 +2333,29 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
+    /// A silent pull is reported once it has been silent for `PULL_SILENCE`, once per
+    /// silence, and again after podman prints and falls silent again.
+    #[test]
+    fn a_silent_pull_is_reported_once_per_silence() {
+        let threshold = PULL_SILENCE.as_millis() as u64;
+        let mut reported = None;
+        assert_eq!(
+            pull_silence_report(1_000, 1_000 + threshold - 1, &mut reported),
+            None
+        );
+        let line = pull_silence_report(1_000, 1_000 + threshold, &mut reported)
+            .expect("a pull silent for the threshold is reported");
+        assert!(
+            line.starts_with("podman pull has printed nothing for 10.0s; "),
+            "{line}"
+        );
+        assert_eq!(
+            pull_silence_report(1_000, 1_000 + 3 * threshold, &mut reported),
+            None
+        );
+        assert!(pull_silence_report(50_000, 50_000 + threshold, &mut reported).is_some());
+    }
+
     /// A one-shot process recovers the agent's prefix, and a missing record is an error
     /// rather than an empty (root) prefix.
     #[test]

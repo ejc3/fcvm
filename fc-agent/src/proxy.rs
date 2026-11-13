@@ -139,6 +139,144 @@ impl ProxyState {
     }
 }
 
+/// Milliseconds since fc-agent first asked, the clock the stream records use.
+pub(crate) fn activity_now_ms() -> u64 {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    EPOCH.elapsed().as_millis() as u64
+}
+
+/// What one redirected connection has carried, so a stalled pull can say whether its
+/// request left the guest and whether a reply came back. On 2026-11-13 a CI pull printed
+/// "Trying to pull" and then nothing for 117 s, and no log recorded where its request was.
+/// Times are `activity_now_ms() + 1`; 0 means never.
+pub(crate) struct StreamActivity {
+    stream_id: u32,
+    dest: SocketAddr,
+    opened_ms: u64,
+    open_ok: std::sync::atomic::AtomicBool,
+    to_host: std::sync::atomic::AtomicU64,
+    from_host: std::sync::atomic::AtomicU64,
+    last_to_host_ms: std::sync::atomic::AtomicU64,
+    last_from_host_ms: std::sync::atomic::AtomicU64,
+    /// Which way the latest bytes went ([`SENT`] or [`RECEIVED`], 0 before any). The
+    /// millisecond stamps cannot order a request written in the millisecond its
+    /// predecessor's reply arrived.
+    last_direction: std::sync::atomic::AtomicU8,
+}
+
+/// [`StreamActivity::last_direction`]: bytes went to the host.
+const SENT: u8 = 1;
+/// [`StreamActivity::last_direction`]: bytes came back from the host.
+const RECEIVED: u8 = 2;
+
+/// Every redirected connection that is still open, across sessions.
+static OPEN_STREAMS: std::sync::LazyLock<DashMap<u64, Arc<StreamActivity>>> =
+    std::sync::LazyLock::new(DashMap::new);
+static NEXT_ACTIVITY_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Removes its stream from `OPEN_STREAMS` on every exit path of the connection.
+struct OpenStream {
+    key: u64,
+    activity: Arc<StreamActivity>,
+}
+
+impl OpenStream {
+    fn register(stream_id: u32, dest: SocketAddr) -> Self {
+        let activity = Arc::new(StreamActivity {
+            stream_id,
+            dest,
+            opened_ms: activity_now_ms() + 1,
+            open_ok: Default::default(),
+            to_host: Default::default(),
+            from_host: Default::default(),
+            last_to_host_ms: Default::default(),
+            last_from_host_ms: Default::default(),
+            last_direction: Default::default(),
+        });
+        let key = NEXT_ACTIVITY_KEY.fetch_add(1, Ordering::Relaxed);
+        OPEN_STREAMS.insert(key, activity.clone());
+        Self { key, activity }
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        OPEN_STREAMS.remove(&self.key);
+    }
+}
+
+impl StreamActivity {
+    fn record(&self, direction: u8, n: usize) {
+        let (counter, last) = if direction == SENT {
+            (&self.to_host, &self.last_to_host_ms)
+        } else {
+            (&self.from_host, &self.last_from_host_ms)
+        };
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+        last.store(activity_now_ms() + 1, Ordering::Relaxed);
+        self.last_direction.store(direction, Ordering::Relaxed);
+    }
+
+    fn describe(&self, now_ms: u64) -> String {
+        let ago = |stamp: u64| {
+            if stamp == 0 {
+                "never".to_string()
+            } else {
+                format!(
+                    "{:.1}s ago",
+                    now_ms.saturating_sub(stamp - 1) as f64 / 1000.0
+                )
+            }
+        };
+        let to_host_ms = self.last_to_host_ms.load(Ordering::Relaxed);
+        let from_host_ms = self.last_from_host_ms.load(Ordering::Relaxed);
+        let state = if !self.open_ok.load(Ordering::Relaxed) {
+            "awaiting OPEN_OK"
+        } else if self.last_direction.load(Ordering::Relaxed) == SENT {
+            "awaiting a reply"
+        } else {
+            "relaying"
+        };
+        format!(
+            "stream {} to {} {state} for {:.1}s: sent {} B (last {}), received {} B (last {})",
+            self.stream_id,
+            self.dest,
+            now_ms.saturating_sub(self.opened_ms - 1) as f64 / 1000.0,
+            self.to_host.load(Ordering::Relaxed),
+            ago(to_host_ms),
+            self.from_host.load(Ordering::Relaxed),
+            ago(from_host_ms),
+        )
+    }
+}
+
+/// One line describing every open egress stream, oldest first and at most eight, or
+/// saying there are none: the guest half of what a stalled pull reports.
+pub(crate) fn open_streams_report(now_ms: u64) -> String {
+    const SHOWN: usize = 8;
+    let mut streams: Vec<Arc<StreamActivity>> = OPEN_STREAMS
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+    if streams.is_empty() {
+        return "no egress proxy stream is open".to_string();
+    }
+    streams.sort_by_key(|stream| stream.opened_ms);
+    let total = streams.len();
+    let mut line = format!("{total} egress proxy stream(s) open: ");
+    let described: Vec<String> = streams
+        .iter()
+        .take(SHOWN)
+        .map(|stream| stream.describe(now_ms))
+        .collect();
+    line.push_str(&described.join("; "));
+    if total > SHOWN {
+        line.push_str(&format!("; and {} more", total - SHOWN));
+    }
+    line
+}
+
 /// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
 ///
 /// `gen_tx` is a watch channel sender incremented after each successful vsock connect.
@@ -370,7 +508,7 @@ async fn vsock_reader(mut reader: VsockReadHalf, state: Arc<ProxyState>) {
 /// Handle a single redirected TCP connection: get original destination,
 /// open a multiplexed stream, relay data bidirectionally.
 async fn handle_redirected_connection(
-    mut client: tokio::net::TcpStream,
+    client: tokio::net::TcpStream,
     state: Arc<ProxyState>,
 ) -> anyhow::Result<()> {
     // Determine if this is an IPv4 or IPv6 connection from the local address
@@ -385,9 +523,20 @@ async fn handle_redirected_connection(
             (IpAddr::V6(ip), port)
         }
     };
+    relay_connection(client, dest_addr, dest_port, state).await
+}
 
+/// Open a multiplexed stream to `dest_addr:dest_port` for `client` and relay it.
+async fn relay_connection(
+    mut client: tokio::net::TcpStream,
+    dest_addr: IpAddr,
+    dest_port: u16,
+    state: Arc<ProxyState>,
+) -> anyhow::Result<()> {
     // Assign stream ID
     let stream_id = state.next_stream_id.fetch_add(1, Ordering::Relaxed);
+    let open_stream = OpenStream::register(stream_id, SocketAddr::new(dest_addr, dest_port));
+    let activity = open_stream.activity.clone();
 
     // Create per-stream channel for receiving frames from vsock reader
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
@@ -418,7 +567,7 @@ async fn handle_redirected_connection(
     let response = tokio::time::timeout(std::time::Duration::from_secs(30), stream_rx.recv()).await;
 
     match response {
-        Ok(Some((FRAME_OPEN_OK, _))) => {} // Connection succeeded
+        Ok(Some((FRAME_OPEN_OK, _))) => activity.open_ok.store(true, Ordering::Relaxed),
         Ok(Some((FRAME_OPEN_FAIL, _))) | Ok(Some((FRAME_RST, _))) => {
             state.streams.remove(&stream_id);
             anyhow::bail!("host refused connection to {}:{}", dest_addr, dest_port);
@@ -439,6 +588,7 @@ async fn handle_redirected_connection(
     // TCP → vsock: read from client, send DATA frames.
     // send_frame().await blocks when writer channel is full → backpressure to TCP read.
     let writer_state = state.clone();
+    let up = activity.clone();
     let tcp_to_vsock = async move {
         let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
         loop {
@@ -446,6 +596,8 @@ async fn handle_redirected_connection(
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            // Recorded before the send, so a frame the host has received is always counted.
+            up.record(SENT, n);
             if !writer_state
                 .send_frame(stream_id, FRAME_DATA, &buf[..n])
                 .await
@@ -462,6 +614,8 @@ async fn handle_redirected_connection(
         while let Some((frame_type, payload)) = stream_rx.recv().await {
             match frame_type {
                 FRAME_DATA => {
+                    // Recorded on arrival from the host, before the client takes it.
+                    activity.record(RECEIVED, payload.len());
                     if client_wr.write_all(&payload).await.is_err() {
                         break;
                     }
@@ -476,6 +630,7 @@ async fn handle_redirected_connection(
     tokio::join!(tcp_to_vsock, vsock_to_tcp);
 
     state.streams.remove(&stream_id);
+    drop(open_stream);
     Ok(())
 }
 
@@ -774,6 +929,107 @@ mod tests {
     }
 
     use super::*;
+
+    /// The report a silent pull prints shows a stream's request leaving the guest with no
+    /// reply, then the reply arriving, then the stream gone once it closes. Each count is
+    /// recorded before the step the test waits on, so no step races its record.
+    /// A request sent in the millisecond the previous reply arrived has the same stamp as
+    /// that reply, and is still the one awaiting an answer.
+    #[test]
+    fn a_request_in_the_reply_s_millisecond_reads_as_awaiting_a_reply() {
+        let open = OpenStream::register(11, "127.0.0.1:443".parse().unwrap());
+        let stream = &open.activity;
+        stream.open_ok.store(true, Ordering::Relaxed);
+        stream.record(SENT, 10);
+        stream.record(RECEIVED, 20);
+        stream.record(SENT, 30);
+        let stamp = stream.last_to_host_ms.load(Ordering::Relaxed);
+        stream.last_from_host_ms.store(stamp, Ordering::Relaxed);
+        let line = stream.describe(stamp - 1);
+        assert!(line.contains("awaiting a reply"), "{line}");
+        stream.record(RECEIVED, 5);
+        assert!(stream.describe(stamp - 1).contains("relaying"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_streams_report_shows_what_each_stream_carried() {
+        let (writer_tx, mut writer_rx) = mpsc::channel(16);
+        let state = Arc::new(ProxyState {
+            streams: DashMap::new(),
+            writer_tx,
+            next_stream_id: AtomicU32::new(1),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        // A documentation address no other test uses, to find this stream in the report.
+        let dest = "192.0.2.77:4431";
+        let relay = tokio::spawn(relay_connection(
+            accepted,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77)),
+            4431,
+            state.clone(),
+        ));
+        let ours = |now_ms: u64| {
+            open_streams_report(now_ms)
+                .split("; ")
+                .find(|stream| stream.contains(dest))
+                .map(str::to_string)
+        };
+
+        let open = writer_rx.recv().await.unwrap();
+        assert_eq!(open[4], FRAME_OPEN);
+        let stream_id = u32::from_le_bytes(open[0..4].try_into().unwrap());
+        let report = ours(activity_now_ms()).expect("the stream is open");
+        assert!(report.contains("awaiting OPEN_OK"), "{report}");
+
+        let send = |frame_type: u8, payload: &[u8]| {
+            state
+                .streams
+                .get(&stream_id)
+                .unwrap()
+                .send((frame_type, payload.to_vec()))
+                .unwrap();
+        };
+        send(FRAME_OPEN_OK, &[]);
+        let request = b"GET /v2/ HTTP/1.1\r\n\r\n";
+        app.write_all(request).await.unwrap();
+        let mut forwarded = 0;
+        while forwarded < request.len() {
+            let frame = writer_rx.recv().await.unwrap();
+            assert_eq!(frame[4], FRAME_DATA);
+            forwarded += frame.len() - FRAME_HEADER_SIZE;
+        }
+        let report = ours(activity_now_ms() + 12_000).expect("the stream is open");
+        assert!(report.contains("awaiting a reply"), "{report}");
+        assert!(
+            report.contains(&format!("sent {} B", request.len())),
+            "{report}"
+        );
+        assert!(report.contains("received 0 B (last never)"), "{report}");
+
+        let reply = b"HTTP/1.1 401 Unauthorized\r\n";
+        send(FRAME_DATA, reply);
+        let mut delivered = vec![0u8; reply.len()];
+        app.read_exact(&mut delivered).await.unwrap();
+        let report = ours(activity_now_ms()).expect("the stream is open");
+        assert!(report.contains(" relaying "), "{report}");
+        assert!(
+            report.contains(&format!("received {} B", reply.len())),
+            "{report}"
+        );
+
+        send(FRAME_CLOSE, &[]);
+        drop(app);
+        relay.await.unwrap().unwrap();
+        assert_eq!(
+            ours(activity_now_ms()),
+            None,
+            "a closed stream is still listed"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn egress_generation_timeout_is_a_readiness_error() {
