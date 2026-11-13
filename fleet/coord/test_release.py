@@ -800,6 +800,45 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
 
 
+class HostLocalTests(unittest.TestCase):
+    """The image factory's validator has a builder security group that admits no inbound port and
+    lets out only 80, 443 and 53 over IPv4, so a host-image acceptance that went out through the
+    host's public address, or that required a route to a public control address, refused every
+    image. Under SMOKE_HOST_LOCAL it reaches the host's public IPv4 address on its private one
+    and does not ask the host to prove it is a viewer."""
+
+    LOCAL = {"SMOKE_LIVE_URL": "ws://127.0.0.1:1/live", "SMOKE_HOST_LOCAL": "1.0.0.1=10.0.4.9"}
+
+    def test_the_public_address_is_reached_on_the_private_one(self):
+        with patch.dict(os.environ, self.LOCAL), \
+                patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+            self.assertEqual(smoke.lookup("x-v4.tiles.fleet.test", "v4", ["127.0.0.1:2"]),
+                             [ipaddress.ip_address("10.0.4.9")])
+        with patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+            self.assertEqual(smoke.lookup("x-v4.tiles.fcvm.dev", "v4", ["1.1.1.1"]),
+                             [ipaddress.ip_address("1.0.0.1")], "staging is untouched")
+
+    def test_it_is_refused_outside_an_acceptance_and_for_a_bad_mapping(self):
+        for env in ({"SMOKE_HOST_LOCAL": "1.0.0.1=10.0.4.9"},
+                    {**self.LOCAL, "SMOKE_HOST_LOCAL": "10.0.4.9=1.0.0.1"},
+                    {**self.LOCAL, "SMOKE_HOST_LOCAL": "2001:db8::1=10.0.4.9"}):
+            with self.subTest(env=env), patch.dict(os.environ, env), self.assertRaises(ValueError):
+                smoke.host_local()
+
+    def test_the_host_is_not_asked_to_prove_it_is_a_viewer(self):
+        # Without the change this is the control connection to a public address, which the
+        # builder group's egress refuses over IPv6 and the smoke then blocks on.
+        class Stop(Exception):
+            pass
+        def live_target():
+            raise Stop()
+        with patch.dict(os.environ, self.LOCAL), \
+                patch.object(smoke, "prove_viewer", side_effect=AssertionError("asked the host")), \
+                patch.object(smoke, "live_target", live_target), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(Stop):
+            smoke.main(family="v6", modes=("wall",), relaunch=False)
+
+
 class SmokeWorkflowTests(unittest.TestCase):
     """The deploys call fleet-viewer-smoke.yml. Its jobs read the Access token from the
     fleet-stage-deploy environment's secrets, which a called workflow gets only when its caller
