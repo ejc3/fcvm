@@ -319,7 +319,7 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
               onClick={() => void client.act("windows_reset", { slot: c.slot })}
             >
               {c.link ? (
-                <span className={`link ${c.link.state}`} role="status" data-testid={`sandbox-link-${c.slot}`}>
+                <span className={`win-link ${c.link.state}`} role="status" data-testid={`sandbox-link-${c.slot}`}>
                   <span className="text">{c.link.text}</span>
                   {c.link.detail ? <span className="detail">{c.link.detail}</span> : null}
                 </span>
