@@ -192,6 +192,82 @@ impl Drop for ProbeGroup {
     }
 }
 
+/// The command that starts pasta: `pasta_bin` with `args`, its stdout and stdin closed and
+/// its stderr piped, in a process group of its own and armed to die with fcvm.
+fn pasta_command(pasta_bin: &Path, args: &[OsString]) -> Command {
+    let mut cmd = Command::new(pasta_bin);
+    cmd.args(args);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
+    crate::utils::own_process_group(&mut cmd);
+
+    // Kill pasta if fcvm dies, including from SIGKILL — the same per-hop guarantee
+    // `install_namespace_pre_exec` gives the VMM and `spawn_namespace_holder` gives the
+    // holder, and the one hop that did not have it.
+    //
+    // This is hardening, not a fix for an observed leak: pasta joins the holder BY PID,
+    // and passt terminates itself when the PID whose namespaces it joined exits, so
+    // today pasta already dies whenever the holder does. Measured both ways on this
+    // branch — with the pre_exec removed, pasta still exited on fcvm SIGKILL (via the
+    // holder), and it still exited even with the holder's netns pinned open by an
+    // external fd, confirming the trigger is passt's PID watch rather than namespace
+    // teardown.
+    //
+    // Arming pdeathsig directly is still worth its ten lines. That chain runs through
+    // TWO things fcvm does not own: the holder's own pdeathsig, and an undocumented
+    // passt behaviour (`--no-netns-quit` documents only the filesystem-bound case) in a
+    // binary this repo pins to a patched fork and periodically rebases. AGENTS.md is
+    // explicit that teardown is per-hop and that one unprotected hop orphans everything
+    // below it; this makes pasta's death depend on nothing but the kernel.
+    //
+    // Must be the LAST pre_exec (there is only this one, but keep the invariant
+    // explicit): a credential change zeroes `task->pdeath_signal`, so anything that
+    // switches namespaces or identity first would silently drop it.
+    //
+    // pasta DOES change credentials after this exec: it setns()es into the holder's
+    // user namespace (measured CapEff 0x1ffffffffff -> 0x2014c2), and the signal
+    // survives it. `commit_creds()` clears it when uid/gid change or
+    // `cred_cap_issubset(old, new)` fails. Across user namespaces that check compares no
+    // capabilities: it passes when the new namespace's parent is the old one and its
+    // owner is the old euid, which holds for the holder fcvm creates, as root or not, and
+    // `--runas 0:0` keeps uid/gid at 0:0 under root. Measured as root, as an unprivileged
+    // user and as root inside rootless podman: with pasta stopped, so that passt's PID
+    // watch cannot run, killing pasta's parent killed pasta; without the pdeathsig it
+    // stayed stopped. `test_sigkill_reaps_rootless_vm_tree` checks the same thing on
+    // fcvm's own pasta in every lane it runs in. pasta does not fork either:
+    // `--foreground` is single-threaded and its own -P pidfile reports the PID armed here.
+    //
+    // The `getppid` re-check closes the fork/exec window: a parent that dies after
+    // fork() but before the prctl above would leave the signal unarmed and pasta
+    // orphaned — the very outcome this is here to prevent. If we have already been
+    // reparented, fail the exec so no pasta exists to leak.
+    //
+    // SAFETY: pre_exec runs between fork() and exec(). `prctl` and `getppid` are both
+    // async-signal-safe, `fcvm_pid` is copied in, and NEITHER return path allocates:
+    // both errors use the `Repr::Os` errno representation of `io::Error`, which stores
+    // a bare i32. A message-carrying error (`io::Error::other`) would box its payload,
+    // and malloc after fork(2) in a multi-threaded process can deadlock outright if
+    // another thread held the allocator lock at fork — which would hang the child in
+    // exactly the parent-death race the getppid check exists to handle. ESRCH ("no such
+    // process") is the errno for that case and needs no message.
+    let fcvm_pid = std::process::id() as libc::pid_t;
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != fcvm_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// [`run_probe_bounded`] with the expiry as a future: the probe runs until it exits or
 /// `abandon` completes, whichever comes first. A test passes the condition it waits for,
 /// so its child has no duration to beat. Dropping the returned future abandons the probe
@@ -1580,75 +1656,7 @@ impl PastaNetwork {
             nix::unistd::geteuid().is_root(),
         );
         debug!(pasta_args = ?args, "pasta arguments");
-        let mut cmd = Command::new(&pasta_bin);
-        cmd.args(&args);
-
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-
-        // Kill pasta if fcvm dies, including from SIGKILL — the same per-hop guarantee
-        // `install_namespace_pre_exec` gives the VMM and `spawn_namespace_holder` gives the
-        // holder, and the one hop that did not have it.
-        //
-        // This is hardening, not a fix for an observed leak: pasta joins the holder BY PID,
-        // and passt terminates itself when the PID whose namespaces it joined exits, so
-        // today pasta already dies whenever the holder does. Measured both ways on this
-        // branch — with the pre_exec removed, pasta still exited on fcvm SIGKILL (via the
-        // holder), and it still exited even with the holder's netns pinned open by an
-        // external fd, confirming the trigger is passt's PID watch rather than namespace
-        // teardown.
-        //
-        // Arming pdeathsig directly is still worth its ten lines. That chain runs through
-        // TWO things fcvm does not own: the holder's own pdeathsig, and an undocumented
-        // passt behaviour (`--no-netns-quit` documents only the filesystem-bound case) in a
-        // binary this repo pins to a patched fork and periodically rebases. AGENTS.md is
-        // explicit that teardown is per-hop and that one unprotected hop orphans everything
-        // below it; this makes pasta's death depend on nothing but the kernel.
-        //
-        // Must be the LAST pre_exec (there is only this one, but keep the invariant
-        // explicit): a credential change zeroes `task->pdeath_signal`, so anything that
-        // switches namespaces or identity first would silently drop it.
-        //
-        // pasta DOES change credentials after this exec: it setns()es into the holder's
-        // user namespace (measured CapEff 0x1ffffffffff -> 0x2014c2), and the signal
-        // survives it. `commit_creds()` clears it when uid/gid change or
-        // `cred_cap_issubset(old, new)` fails. Across user namespaces that check compares no
-        // capabilities: it passes when the new namespace's parent is the old one and its
-        // owner is the old euid, which holds for the holder fcvm creates, as root or not, and
-        // `--runas 0:0` keeps uid/gid at 0:0 under root. Measured as root, as an unprivileged
-        // user and as root inside rootless podman: with pasta stopped, so that passt's PID
-        // watch cannot run, killing pasta's parent killed pasta; without the pdeathsig it
-        // stayed stopped. `test_sigkill_reaps_rootless_vm_tree` checks the same thing on
-        // fcvm's own pasta in every lane it runs in. pasta does not fork either:
-        // `--foreground` is single-threaded and its own -P pidfile reports the PID armed here.
-        //
-        // The `getppid` re-check closes the fork/exec window: a parent that dies after
-        // fork() but before the prctl above would leave the signal unarmed and pasta
-        // orphaned — the very outcome this is here to prevent. If we have already been
-        // reparented, fail the exec so no pasta exists to leak.
-        //
-        // SAFETY: pre_exec runs between fork() and exec(). `prctl` and `getppid` are both
-        // async-signal-safe, `fcvm_pid` is copied in, and NEITHER return path allocates:
-        // both errors use the `Repr::Os` errno representation of `io::Error`, which stores
-        // a bare i32. A message-carrying error (`io::Error::other`) would box its payload,
-        // and malloc after fork(2) in a multi-threaded process can deadlock outright if
-        // another thread held the allocator lock at fork — which would hang the child in
-        // exactly the parent-death race the getppid check exists to handle. ESRCH ("no such
-        // process") is the errno for that case and needs no message.
-        let fcvm_pid = std::process::id() as libc::pid_t;
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != fcvm_pid {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                Ok(())
-            });
-        }
-
+        let mut cmd = pasta_command(&pasta_bin, &args);
         debug!(cmd = ?cmd, "pasta command");
         let stderr_tail = self.begin_stderr_attempt();
         let mut child = cmd.spawn().context("failed to spawn pasta")?;
@@ -2463,6 +2471,17 @@ impl NetworkManager for PastaNetwork {
 
 #[cfg(test)]
 mod tests {
+    /// pasta is started out of fcvm's process group, so a terminal's Ctrl+C reaches only
+    /// fcvm (`test_ctrlc_via_terminal`). `sleep` stands in for the pasta binary.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_terminal_interrupt_does_not_reach_pasta() {
+        let interrupt = crate::utils::TerminalInterrupt::arm();
+        let mut cmd = super::pasta_command(std::path::Path::new("sleep"), &["60".into()]);
+        cmd.kill_on_drop(true);
+        let mut pasta = cmd.spawn().expect("spawning the stand-in pasta");
+        interrupt.assert_misses(&mut pasta, "pasta").await;
+    }
+
     /// A rootless guest is given the host's HTTP and HTTPS proxies each for its own
     /// scheme (#1464). The variables are a map, not the process environment, which a
     /// test must not change while sibling threads read it.

@@ -1044,10 +1044,26 @@ fn create_mount_targets(redirects: &MountRedirects) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start `cmd` in a process group of its own.
+///
+/// A terminal sends Ctrl+C (SIGINT), Ctrl+Backslash (SIGQUIT) and Ctrl+Z (SIGTSTP) to every
+/// process in its foreground process group, and a child stays in its parent's group unless
+/// moved. The processes a VM depends on for its whole life (the VMM, the rootless namespace
+/// holder, pasta) must not get those signals: fcvm handles them and tears these processes
+/// down itself. In fcvm's group, one Ctrl+C also killed the holder and the VMM, and when the
+/// run loop saw the holder's death before its own cancellation it reported "a process this
+/// VM depends on died" and exited 1 (`test_ctrlc_via_terminal`, CI runs 43269557714 and
+/// 43295543245). Out of the group, fcvm's death still reaches each of them through its
+/// `PR_SET_PDEATHSIG`.
+pub fn own_process_group(cmd: &mut tokio::process::Command) {
+    cmd.process_group(0);
+}
+
 /// Install `pre_exec` hooks on a VMM command that (1) enter the configured user/mount/network
 /// namespaces and apply the clone mount redirects, and (2) set `PR_SET_PDEATHSIG=SIGKILL` so
 /// the VMM dies with fcvm. Shared by the Firecracker and Cloud Hypervisor backends so both
 /// get identical isolation + parent-death behavior. Call once on the command before spawn.
+/// It also moves the VMM out of fcvm's process group ([`own_process_group`]).
 ///
 /// The pdeathsig hook is installed LAST so it runs AFTER `setns(CLONE_NEWUSER)` — a credential
 /// change zeros `task->pdeath_signal`, so setting it earlier would be lost.
@@ -1320,6 +1336,8 @@ pub fn install_namespace_pre_exec(
         }
     }
 
+    own_process_group(cmd);
+
     // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
     // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
     unsafe {
@@ -1332,6 +1350,61 @@ pub fn install_namespace_pre_exec(
     }
 
     Ok(())
+}
+
+/// Ctrl+C as a terminal sends it, SIGINT to this test process's whole process group, for
+/// asserting that a child does not get it.
+#[cfg(test)]
+pub(crate) struct TerminalInterrupt {
+    sigint: tokio::signal::unix::Signal,
+}
+
+#[cfg(test)]
+impl TerminalInterrupt {
+    /// Arm before spawning the child. The handler keeps the test process alive through the
+    /// SIGINT, and the child inherits a handler rather than SIG_IGN, so it starts with SIGINT
+    /// at its default action (exec resets a handler and keeps an ignored signal ignored). A
+    /// test started from a shell that ignores SIGINT would otherwise pass without the fix.
+    pub(crate) fn arm() -> Self {
+        // SAFETY: getpgrp and getpid take no arguments and cannot fail.
+        let (group, me) = unsafe { (libc::getpgrp(), libc::getpid()) };
+        assert_eq!(
+            group, me,
+            "BLOCKED: this test signals its own process group and must lead one (nextest \
+             starts every test in a group of its own); here the signal would reach other \
+             processes"
+        );
+        let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("installing a SIGINT handler");
+        Self { sigint }
+    }
+
+    /// Send SIGINT to the group, then SIGTERM to `child`, and assert that `child` died of
+    /// the SIGTERM. A child in the group is already dying of the SIGINT when the SIGTERM is
+    /// sent (an unhandled fatal signal records the exit code at delivery, and a later one is
+    /// discarded), so the result does not depend on timing.
+    pub(crate) async fn assert_misses(mut self, child: &mut tokio::process::Child, what: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        let pid = child.id().expect("the child has not been reaped") as libc::pid_t;
+        // SAFETY: plain syscalls on this process's group and on a child it has not reaped.
+        let (group, child_group) = unsafe { (libc::getpgrp(), libc::getpgid(pid)) };
+        assert_eq!(
+            unsafe { libc::killpg(group, libc::SIGINT) },
+            0,
+            "sending SIGINT to the test's process group: {}",
+            std::io::Error::last_os_error()
+        );
+        // The probe fired: this process is in the group and got it.
+        self.sigint.recv().await.expect("the SIGINT stream closed");
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let status = child.wait().await.expect("waiting for the child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "{what} ended with {status}, not the SIGTERM sent to it: a terminal's Ctrl+C \
+             reached it (its process group {child_group}, the spawner's {group})"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1615,6 +1688,18 @@ mod tests {
                 PathBuf::from("/data/vm-disks/other"),
             ]
         );
+    }
+
+    /// A VMM spawned through `install_namespace_pre_exec` is not in the spawner's process
+    /// group, so a terminal's Ctrl+C reaches only fcvm (`test_ctrlc_via_terminal`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_terminal_interrupt_does_not_reach_the_vmm() {
+        let interrupt = TerminalInterrupt::arm();
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60").stdin(Stdio::null()).kill_on_drop(true);
+        install_namespace_pre_exec(&mut cmd, &NamespaceParams::default()).unwrap();
+        let mut vmm = cmd.spawn().expect("spawning the stand-in VMM");
+        interrupt.assert_misses(&mut vmm, "the VMM").await;
     }
 
     /// A clone's VMM reaches its own directory at the path its snapshot names,
