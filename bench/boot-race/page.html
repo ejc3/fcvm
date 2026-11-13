@@ -219,7 +219,7 @@ for (const [lid, text] of D.setup.checks || []){
   const p = document.createElement("p");
   p.innerHTML = `<b>${l.name}.</b> ` + text
     .replace("{n}", l.n).replace("{new_proc}", c.new_proc).replace("{new_boot}", c.new_boot)
-    .replace("{same_proc}", c.same_proc_as_previous).replace("{n_minus_1}", Math.max(0,l.n-1))
+    .replace("{same_proc}", c.same_proc_as_previous).replace("{same_boot}", c.same_boot_as_previous).replace("{n_minus_1}", Math.max(0,l.n-1))
     .replace("{init}", c.init_duration).replace("{report}", c.report);
   ck.appendChild(p);
 }

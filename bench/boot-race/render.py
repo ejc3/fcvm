@@ -44,9 +44,9 @@ LANES = {
         "start": "RunTask on a running container instance, image already pulled",
     },
     "lambda-cold": {
-        "name": "Lambda, cold every time",
-        "short": "Lambda cold",
-        "start": "HTTPS GET to the function URL; the previous request's runtime exited",
+        "name": "Lambda, new runtime every request",
+        "short": "Lambda new runtime",
+        "start": "HTTPS GET to the function URL; the runtime process that served the previous request exited",
     },
     "ec2-hibernate": {
         "name": "EC2 hibernate resume",
@@ -78,8 +78,9 @@ CHECKS = [
                   "resumed the snapshot's own process (race.py refuses any other)."],
     ["lambda-warm", "{n} samples answered from {new_proc} runtime process; {init} of {report} REPORT lines carried "
                     "an Init Duration. race.py refuses a warm sample from a new process."],
-    ["lambda-cold", "{n} samples answered from {new_proc} runtime processes and {new_boot} kernel boots; {init} of "
-                    "{report} REPORT lines carried an Init Duration."],
+    ["lambda-cold", "{n} samples answered from {new_proc} runtime processes on {new_boot} kernel boots; "
+                    "{same_boot} answered with the same kernel boot id as the sample before; {init} of {report} "
+                    "REPORT lines carried an Init Duration."],
     ["ecs-ec2", "{n} samples answered from {new_proc} container processes on {new_boot} kernel boot (the one "
                 "container instance)."],
     ["ecs-fargate", "{n} samples answered from {new_proc} processes on {new_boot} kernel boots: one per task."],
@@ -161,7 +162,8 @@ def build(results):
         samples = []
         raw = []
         seen_proc, seen_boot = set(), set()
-        checks = {"new_proc": 0, "new_boot": 0, "same_proc_as_previous": 0, "init_duration": 0, "report": 0}
+        checks = {"new_proc": 0, "new_boot": 0, "same_proc_as_previous": 0, "same_boot_as_previous": 0,
+                  "init_duration": 0, "report": 0}
         for i, r in enumerate(ok, 1):
             a = r["answer"]
             s = {"i": i, "round": r["round"], "t": r["t_start_unix_ms"], "ms": round(r["ms"], 1)}
@@ -174,6 +176,8 @@ def build(results):
             seen_boot.add(a["boot_id"])
             if r.get("same_proc_as_previous"):
                 checks["same_proc_as_previous"] += 1
+            if r.get("same_boot_as_previous"):
+                checks["same_boot_as_previous"] += 1
             if "api_ms" in r:
                 s["api_ms"] = round(r["api_ms"], 1)
             rep = reports.get(r.get("request_id") or "")

@@ -319,12 +319,23 @@ class Ecs:
         self.invoke({"action": "stop", "task": arn})
 
     def describe(self, arn):
-        return self.ecs.describe_tasks(cluster="boot-race", tasks=[arn])["tasks"][0]
+        """The task, or None while DescribeTasks still reports it MISSING (it can, just after RunTask)."""
+        tasks = self.ecs.describe_tasks(cluster="boot-race", tasks=[arn])["tasks"]
+        return tasks[0] if tasks else None
+
+    def describe_settled(self, arn, timeout=30):
+        end = time.time() + timeout
+        while (t := self.describe(arn)) is None:
+            if time.time() > end:
+                raise TimeoutError(f"DescribeTasks reported the task missing for {timeout} s")
+            time.sleep(0.5)
+        return t
 
     def wait_stopped(self, arn, timeout=300):
         end = time.time() + timeout
         while time.time() < end:
-            if self.describe(arn)["lastStatus"] == "STOPPED":
+            t = self.describe(arn)
+            if t is not None and t["lastStatus"] == "STOPPED":
                 return
             time.sleep(1)
         raise TimeoutError("task did not stop")
@@ -337,7 +348,7 @@ class Ecs:
             while ip is None:
                 if time.monotonic_ns() - launch.invoke_mono_ns > 300e9:
                     raise TimeoutError("no task address in 300 s")
-                t = self.describe(arn)
+                t = self.describe(arn) or {}
                 for a in t.get("attachments", []):
                     for d in a.get("details", []):
                         if d["name"] == "privateIPv4Address":
@@ -346,7 +357,7 @@ class Ecs:
                     await asyncio.sleep(0.2)
             t_ip = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
-            t = self.describe(arn)
+            t = self.describe_settled(arn)
         finally:
             await asyncio.to_thread(self.stop, arn)
         stamps = {
@@ -565,8 +576,8 @@ def setup_rows(cfg, s):
     # The checkout this driver runs from is the one fcvm was built from (box-setup.sh).
     commit = run_out(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"])
     rows.append(["fcvm", f"commit {commit[:12]}, {run_out([cfg['fcvm_bin'], '--version'])}"])
-    rows.append(["fcvm VM", "1 vCPU, 2048 MiB, rootless networking, port published on 127.0.0.1; one snapshot, "
-                 "restored by both fcvm lanes"])
+    rows.append(["fcvm VM", "1 vCPU, 2048 MiB, rootless networking, port published on the host's loopback; one "
+                 "snapshot, restored by both fcvm lanes"])
     lt = ec2.describe_launch_template_versions(LaunchTemplateName="boot-race-ec2", Versions=["$Default"])
     lt = lt["LaunchTemplateVersions"][0]["LaunchTemplateData"]
     root = lt["BlockDeviceMappings"][0]["Ebs"]

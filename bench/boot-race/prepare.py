@@ -6,7 +6,8 @@
     prepare.py --config cfg.json ami          make the EC2 lanes' AMI: base AL2023 + the workload as a systemd unit
     prepare.py --config cfg.json instances    launch the start and hibernate lanes' instances and stop them
     prepare.py --config cfg.json ecs-host     launch the ECS-on-EC2 container instance and pull the image on it
-    prepare.py --config cfg.json cleanup      terminate every Project=boot-race instance, deregister the AMI
+    prepare.py --config cfg.json cleanup      stop campaign tasks, terminate Project=boot-race instances, remove
+                                              tagged images and snapshots and the pushed image
     prepare.py --config cfg.json leftovers    fail unless nothing the campaign made is left billing
 
 Each step records what it made in the config file, which race.py reads.
@@ -192,23 +193,43 @@ def ecs_host(cfg, s):
     race.log("ECS host warm")
 
 
+def campaign_tasks(cfg):
+    path = cfg["results"] + "/tasks.txt"
+    return sorted(set(open(path).read().split())) if os.path.exists(path) else []
+
+
 def cleanup(cfg, s):
-    ec2 = s.client("ec2")
-    r = ec2.describe_instances(Filters=[{"Name": "tag:Project", "Values": ["boot-race"]},
-                                        {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}])
+    """Stop every campaign task still running, terminate every Project=boot-race instance, remove every tagged image
+    and snapshot of this account, and delete the pushed workload image. Safe to rerun after a partial cleanup."""
+    ec2, ecs, ecr = s.client("ec2"), s.client("ecs"), s.client("ecr")
+    tag = [{"Name": "tag:Project", "Values": ["boot-race"]}]
+    lane = race.Ecs(cfg)
+    running = []
+    arns = campaign_tasks(cfg)
+    for i in range(0, len(arns), 100):
+        for t in ecs.describe_tasks(cluster="boot-race", tasks=arns[i:i + 100])["tasks"]:
+            if t["lastStatus"] != "STOPPED":
+                lane.stop(t["taskArn"])
+                running.append(t["taskArn"])
+    if running:
+        ecs.get_waiter("tasks_stopped").wait(cluster="boot-race", tasks=running,
+                                             WaiterConfig={"Delay": 6, "MaxAttempts": 100})
+    race.log(f"stopped {len(running)} of {len(arns)} campaign tasks")
+    r = ec2.describe_instances(Filters=tag + [{"Name": "instance-state-name",
+                                               "Values": ["pending", "running", "stopping", "stopped"]}])
     ids = [i["InstanceId"] for res in r["Reservations"] for i in res["Instances"]]
     if ids:
         ec2.terminate_instances(InstanceIds=ids)
         ec2.get_waiter("instance_terminated").wait(InstanceIds=ids, WaiterConfig={"Delay": 10, "MaxAttempts": 90})
     race.log(f"terminated {len(ids)} instances")
-    if cfg.get("ami"):
-        snaps = [b["Ebs"]["SnapshotId"] for im in ec2.describe_images(ImageIds=[cfg["ami"]])["Images"]
-                 for b in im["BlockDeviceMappings"] if "Ebs" in b]
-        ec2.deregister_image(ImageId=cfg["ami"])
-        for sid in snaps:
-            ec2.delete_snapshot(SnapshotId=sid)
-        race.log(f"deregistered the AMI and {len(snaps)} snapshots")
-    ecr = s.client("ecr")
+    images = ec2.describe_images(Owners=["self"], Filters=tag)["Images"]
+    for im in images:
+        ec2.deregister_image(ImageId=im["ImageId"])
+    # Snapshots are found by their own tag, so a rerun after the image is gone still removes them.
+    snaps = ec2.describe_snapshots(OwnerIds=["self"], Filters=tag)["Snapshots"]
+    for sn in snaps:
+        ec2.delete_snapshot(SnapshotId=sn["SnapshotId"])
+    race.log(f"deregistered {len(images)} images and deleted {len(snaps)} snapshots")
     imgs = [{"imageDigest": d["imageDigest"]} for d in ecr.describe_images(repositoryName="boot-race")["imageDetails"]]
     if imgs:
         r = ecr.batch_delete_image(repositoryName="boot-race", imageIds=imgs)
@@ -228,8 +249,7 @@ def leftovers(cfg, s):
     left += [f"image {im['Name']}" for im in ec2.describe_images(Owners=["self"], Filters=tag)["Images"]]
     left += ["snapshot" for _ in ec2.describe_snapshots(OwnerIds=["self"], Filters=tag)["Snapshots"]]
     left += ["pushed image" for _ in ecr.describe_images(repositoryName="boot-race")["imageDetails"]]
-    path = cfg["results"] + "/tasks.txt"
-    arns = sorted(set(open(path).read().split())) if os.path.exists(path) else []
+    arns = campaign_tasks(cfg)
     for i in range(0, len(arns), 100):
         for t in ecs.describe_tasks(cluster="boot-race", tasks=arns[i:i + 100])["tasks"]:
             if t["lastStatus"] != "STOPPED":

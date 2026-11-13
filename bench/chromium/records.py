@@ -347,7 +347,9 @@ def cmd_manifest(args):
     with open(out, "w") as handle:
         json.dump(manifest, handle, indent=1, sort_keys=True)
         handle.write("\n")
-    _git("rm", "-q", "--", *[f["path"] for f in files])
+    # -f: a boot-race run's raw files are staged and never committed here, and a plain rm refuses a file whose
+    # index differs from HEAD. Every byte was checked against the records commit above.
+    _git("rm", "-q", "-f", "--", *[f["path"] for f in files])
     print(f"{os.path.relpath(out, REPO)}: {len(files)} files, "
           f"{sum(f['size'] for f in files)} bytes")
     return 0

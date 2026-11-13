@@ -13,7 +13,7 @@ snapshot restores and for the AWS ways of starting the same workload, in one int
 | `ec2-hibernate` | `StartInstances` | the same AMI, stopped with `Hibernate=true` |
 | `ecs-fargate` | `RunTask` (FARGATE), read inside boot-race-launcher | 1 vCPU, 2 GiB, ARM64, no public IP |
 | `ecs-ec2` | `RunTask` (EC2), read inside boot-race-launcher | one warm container instance, image cached, host network |
-| `lambda-cold` | HTTPS GET to the function URL | the runtime exits after every response |
+| `lambda-cold` | HTTPS GET to the function URL | the runtime exits after every response; the page counts how often Lambda kept the kernel |
 | `lambda-warm` | HTTPS GET to the function URL | the runtime keeps running |
 
 t1 for every lane: a GET from the campaign host has read a complete `200` answer.
@@ -91,6 +91,7 @@ runs after `ecs-host` and `run` starts right after it.
    python3 bench/boot-race/render.py $RESULTS --records-out bench/boot-race/results/$CAMPAIGN  # page + scrubbed records
    git add bench/boot-race/results/$CAMPAIGN      # staged, never committed: records.py moves them out
    python3 bench/chromium/records.py move --campaign $CAMPAIGN --records $RECORDS bench/boot-race/results/$CAMPAIGN
+   git -C $RECORDS add bench/boot-race/results/$CAMPAIGN && git -C $RECORDS commit -m "boot-race $CAMPAIGN" && git -C $RECORDS push
    python3 bench/chromium/records.py manifest --campaign $CAMPAIGN --records $RECORDS bench/boot-race/results/$CAMPAIGN
    ```
 

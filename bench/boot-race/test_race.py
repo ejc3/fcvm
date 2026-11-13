@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -45,6 +46,40 @@ class Identity(unittest.TestCase):
     def test_cold_lambda_is_not_refused_here(self):
         # its evidence (Init Duration, new process, new kernel) is reported on the page instead
         self.assertIsNone(race.check_identity("lambda-cold", A, A, {}))
+
+
+class FakeSession:
+    """The AWS answers setup_rows reads, shaped like the real ones, with real-looking ids in them."""
+
+    def client(self, name):
+        return self
+
+    def describe_launch_template_versions(self, LaunchTemplateName, Versions):
+        return {"LaunchTemplateVersions": [{"LaunchTemplateData": {
+            "ImageId": "ami-0123456789abcdef0", "InstanceType": "c8g.medium",
+            "BlockDeviceMappings": [{"Ebs": {"VolumeType": "gp3", "VolumeSize": 8}}]}}]}
+
+    def describe_images(self, ImageIds):
+        return {"Images": [{"Name": "al2023-ami-2023.12.20261102.0-kernel-6.1-arm64"}]}
+
+    def describe_task_definition(self, taskDefinition):
+        return {"taskDefinition": {"cpu": "1024", "memory": "2048", "networkMode": "awsvpc",
+                                   "runtimePlatform": {"cpuArchitecture": "ARM64"}}}
+
+    def get_function_configuration(self, FunctionName):
+        return {"Runtime": "provided.al2023", "Architectures": ["arm64"], "MemorySize": 2048,
+                "Environment": {"Variables": {"BOOT_RACE_EXIT_AFTER_RESPONSE": "1"}}}
+
+
+class Setup(unittest.TestCase):
+    def test_setup_rows_pass_both_public_checks(self):
+        import render
+
+        rows = race.setup_rows({"fcvm_bin": "/bin/echo"}, FakeSession())
+        text = json.dumps({"region": race.REGION, "rows": rows})
+        render.check_public(text)
+        render.check_public(text, render.FORBIDDEN_IN_RECORDS)
+        self.assertIn("c8g.medium", text)
 
 
 class LaunchTiming(unittest.TestCase):
