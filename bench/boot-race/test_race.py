@@ -99,6 +99,19 @@ class Lock(unittest.TestCase):
                 held.close()
 
 
+class Resume(unittest.TestCase):
+    def test_a_resumed_round_does_not_take_a_recorded_lane_again(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "samples.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"round": 0, "lane": "lambda-warm", "ok": False, "error": "x"}) + "\n")
+            asyncio.run(race.run({"results": d}, 1, 0, ["lambda-warm"]))
+            with open(path) as f:
+                self.assertEqual(len(f.read().splitlines()), 1)
+
+
 class LaunchTiming(unittest.TestCase):
     def test_t0_is_the_launchers_moment_before_runtask_not_the_invoke(self):
         # invoked at wall 1000.0 ms (monotonic 0); RunTask asked at 1040 and answered at 1090;

@@ -468,6 +468,15 @@ def last_answers(cfg):
     return prev
 
 
+def taken_pairs(cfg):
+    """(round, lane) of every attempt already recorded, failed ones included: a resumed run takes none of them again."""
+    path = cfg["results"] + "/samples.jsonl"
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        return {(r["round"], r["lane"]) for r in map(json.loads, filter(str.strip, f))}
+
+
 def campaign_lock(cfg):
     """Hold the results directory for one driver: a second run would share the instances and interleave records."""
     f = open(cfg["results"] + "/campaign.lock", "w")
@@ -482,14 +491,17 @@ def campaign_lock(cfg):
 async def run(cfg, rounds, first_round, lanes):
     lock = campaign_lock(cfg)  # held until the process exits
     prev_answer = last_answers(cfg)
+    taken = taken_pairs(cfg)
     out = open(cfg["results"] + "/samples.jsonl", "a")
     fcvm = Fcvm(cfg) if any(l.startswith("fcvm") for l in lanes) else None
     for rnd in range(first_round, first_round + rounds):
-        ec2 = Ec2(cfg) if any(l.startswith("ec2") for l in lanes) else None
-        ecs = Ecs(cfg) if any(l.startswith("ecs") for l in lanes) else None
-        lam = Lambda(cfg) if any(l.startswith("lambda") for l in lanes) else None
         k = rnd % len(lanes)
-        order = lanes[k:] + lanes[:k]
+        order = [l for l in lanes[k:] + lanes[:k] if (rnd, l) not in taken]
+        if len(order) < len(lanes):
+            log(f"round {rnd}: {len(lanes) - len(order)} lanes already recorded, not taken again")
+        ec2 = Ec2(cfg) if any(l.startswith("ec2") for l in order) else None
+        ecs = Ecs(cfg) if any(l.startswith("ecs") for l in order) else None
+        lam = Lambda(cfg) if any(l.startswith("lambda") for l in order) else None
         for lane in order:
             log(f"round {rnd} lane {lane}")
             rec = {"round": rnd, "lane": lane, "t_attempt_unix_ms": now_ms(), "load1": load1()}
