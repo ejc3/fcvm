@@ -501,7 +501,11 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
 /// Bring the GPUs up again and restore the parked processes onto them.
 /// `announced` names the GPUs the host attached (only the count is used).
 /// Returns the bring-up's report (the GPUs initialised and each step's duration).
-pub async fn unpark(parked: &Parked, announced: &[String]) -> Result<gpu::AttachReport> {
+pub async fn unpark(
+    parked: &Parked,
+    announced: &[String],
+    host_scrubbed: bool,
+) -> Result<gpu::AttachReport> {
     if announced.len() != parked.uuids.len() {
         bail!(
             "this VM's processes were checkpointed on {} GPU(s) and the host attached {}; a \
@@ -511,7 +515,7 @@ pub async fn unpark(parked: &Parked, announced: &[String]) -> Result<gpu::Attach
         );
     }
     let started = Instant::now();
-    let up = gpu::bring_up(announced, false).await?;
+    let up = gpu::bring_up(announced, false, host_scrubbed).await?;
     let up_ms = started.elapsed().as_secs_f64() * 1000.0;
     let map = device_map(&parked.uuids, &up.uuids)?;
     let restore_started = Instant::now();
@@ -560,7 +564,8 @@ pub async fn unpark_source() -> Result<()> {
     let Some(parked) = Parked::load(Path::new(PARKED_RECORD))? else {
         bail!("no GPUs are parked ({PARKED_RECORD} does not exist)");
     };
-    unpark(&parked, &parked.addresses).await.map(|_| ())
+    // The source keeps its own GPUs: they hold nobody else's memory, and no host scrub ran.
+    unpark(&parked, &parked.addresses, false).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -710,7 +715,7 @@ mod tests {
         let code = source.split("#[cfg(test)]").next().unwrap();
         let body = &code[code.find("pub async fn unpark(").unwrap()..];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("no {needle}"));
-        let up = at("gpu::bring_up(announced, false)");
+        let up = at("gpu::bring_up(announced, false, host_scrubbed)");
         let restore = at("action(\"restore\", pid)");
         let unlock = at("action(\"unlock\", pid)");
         let record = at("remove_file(&record)");

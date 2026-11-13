@@ -542,13 +542,13 @@ pub async fn preload(driver_root: &Path) -> Result<()> {
 /// memory: for it the GPUs are brought up again and those processes restored
 /// onto them ([`crate::gpu_park::unpark`]) instead of going through the launch
 /// gate, which refuses a GPU for a running container.
-pub async fn attach(announced: &[String]) -> Result<AttachReport> {
+pub async fn attach(announced: &[String], host_scrubbed: bool) -> Result<AttachReport> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
     if let Some(parked) = crate::gpu_park::Parked::load(Path::new(crate::gpu_park::PARKED_RECORD))?
     {
-        return crate::gpu_park::unpark(&parked, announced).await;
+        return crate::gpu_park::unpark(&parked, announced, host_scrubbed).await;
     }
-    GATE.attach(announced.len(), || attach_devices(announced))
+    GATE.attach(announced.len(), || attach_devices(announced, host_scrubbed))
         .await
 }
 
@@ -604,8 +604,8 @@ impl StepClock {
     }
 }
 
-async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
-    Ok(bring_up(announced, true).await?.report)
+async fn attach_devices(announced: &[String], host_scrubbed: bool) -> Result<AttachReport> {
+    Ok(bring_up(announced, true, host_scrubbed).await?.report)
 }
 
 /// What [`bring_up`] found.
@@ -620,7 +620,7 @@ pub struct BroughtUp {
 /// the device nodes, start nvidia-persistenced, zero the GPUs' memory and check
 /// that `nvidia-smi -L` lists every GPU. With `cdi`, also write the CDI spec
 /// the container's launch reads; a warm restore's container is already running.
-pub async fn bring_up(announced: &[String], cdi: bool) -> Result<BroughtUp> {
+pub async fn bring_up(announced: &[String], cdi: bool, host_scrubbed: bool) -> Result<BroughtUp> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
@@ -663,9 +663,14 @@ pub async fn bring_up(announced: &[String], cdi: bool) -> Result<BroughtUp> {
     steps.persistenced_ms = clock.lap("persistenced");
 
     // Zero the memory the previous VM on these GPUs left, before anything can
-    // hand them to the container.
-    let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
-    steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
+    // hand them to the container, unless the host says a scrub cleared every GPU and no VM
+    // has had one since (`fcvm` takes the GPU's clean token, src/gpu/scrub.rs).
+    if host_scrubbed {
+        eprintln!("[fc-agent] gpu: the host scrubbed every GPU since its last VM; not scrubbing");
+    } else {
+        let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
+        steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
+    }
 
     // The list and the spec only read the GPUs the daemon has initialised, and
     // the clocks change no state they read, so the three run together. The spec
@@ -1005,7 +1010,7 @@ mod tests {
             .expect("no attach_devices")..];
         let attach = &attach[..attach.find("\n}\n").expect("attach_devices does not end")];
         assert!(
-            attach.contains("bring_up(announced, true)"),
+            attach.contains("bring_up(announced, true, host_scrubbed)"),
             "attach_devices does not bring the GPUs up with the CDI spec"
         );
         let body = &code[code.find("pub async fn bring_up(").expect("no bring_up")..];
@@ -1089,6 +1094,30 @@ mod tests {
             daemon < clocks && joined < ok,
             "the clocks ({clocks}) must be set after nvidia-persistenced ({daemon}) and \
              awaited before bring_up returns ({ok})"
+        );
+    }
+
+    /// The guest's scrub is skipped only on the host's word that a scrub cleared every GPU
+    /// and no VM has had one since; every other bring-up scrubs.
+    #[test]
+    fn the_guest_scrub_is_skipped_only_when_the_host_vouches() {
+        let body = attach_devices_body();
+        let gate = body
+            .find("if host_scrubbed {")
+            .expect("the scrub is not gated");
+        let otherwise = body[gate..].find("} else {").map(|at| gate + at).unwrap();
+        let scrub = body.find("scrub_gpus(scrub_command(").expect("no scrub");
+        assert!(
+            otherwise < scrub,
+            "the scrub runs when the host vouched for the GPUs"
+        );
+        let source = include_str!("restore.rs");
+        assert!(source.contains("crate::gpu::attach(&gpus, gpus_host_scrubbed)"));
+        assert!(source.contains("let gpus_host_scrubbed = metadata.gpus_host_scrubbed;"));
+        let park = include_str!("gpu_park.rs");
+        assert!(
+            park.contains("unpark(&parked, &parked.addresses, false)"),
+            "the source must scrub"
         );
     }
 

@@ -39,6 +39,7 @@ install -d -m 0755 /var/lib/fcvm/gpu || bad=1
 for d in /sys/bus/pci/devices/*; do
   [ "$(cat "$d/vendor")" = 0x10de ] || continue
   make_lock_file "/var/lib/fcvm/gpu/${d##*/}.lock" || bad=1
+  make_lock_file "/var/lib/fcvm/gpu/${d##*/}.handoff" || bad=1
 done
 # GPU guest memory is 2 MiB hugepages (fcvm's hugepage spares, src/storage/hugepage_spares.rs).
 # Surplus pages come from the host's allocator when a spare or a GPU VM needs one and go back

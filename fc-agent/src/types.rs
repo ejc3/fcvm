@@ -162,6 +162,10 @@ pub struct LatestMetadata {
     /// spec before this restore is acknowledged (`gpu::attach`).
     #[serde(default)]
     pub gpus: Vec<String>,
+    /// Every GPU in `gpus` was scrubbed on the host since its last VM, so the guest skips its
+    /// own scrub (`gpu::bring_up`). Absent means scrub.
+    #[serde(rename = "gpus-host-scrubbed", default)]
+    pub gpus_host_scrubbed: bool,
     /// Transparent huge page mode for this clone (`--guest-thp`), applied before
     /// the restore is acknowledged; `default` is the kernel's boot-time mode.
     #[serde(rename = "transparent-hugepage", default)]
@@ -398,6 +402,21 @@ mod tests {
         assert_eq!(meta.gpus.len(), 2);
         let meta: LatestMetadata = serde_json::from_str(r#"{"host-time-ns": "1"}"#).unwrap();
         assert!(meta.gpus.is_empty());
+    }
+
+    /// The host's word that every GPU was scrubbed; absent, the guest scrubs.
+    #[test]
+    fn gpus_host_scrubbed_defaults_to_scrubbing() {
+        let plain: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "restore-epoch": "e", "gpus": ["0000:01:00.0"]}"#,
+        )
+        .unwrap();
+        assert!(!plain.gpus_host_scrubbed);
+        let vouched: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "restore-epoch": "e", "gpus": ["0000:01:00.0"], "gpus-host-scrubbed": true}"#,
+        )
+        .unwrap();
+        assert!(vouched.gpus_host_scrubbed);
     }
 
     #[test]

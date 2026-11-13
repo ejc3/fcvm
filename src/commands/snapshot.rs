@@ -3867,8 +3867,44 @@ async fn cmd_snapshot_run_inner(
     // The GPUs the snapshot load attaches. The guest kernel is not told of them, so
     // fc-agent rescans PCI, loads the driver and writes the CDI spec before it
     // acknowledges this restore (fc-agent `gpu::attach`).
+    let mut gpu_handoff: Option<crate::gpu::scrub::GpuHandoff> = None;
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
+        // Every GPU a host scrub cleared, with no VM given it since: the guest's scrub would
+        // zero memory that is already zero. Taken here, before the load opens the GPUs, and
+        // only all or nothing (the guest's scrub covers every GPU it has).
+        let state_dir = crate::gpu::scrub::state_dir();
+        // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
+        // below), so no other restore of these GPUs can use one between the token and the
+        // open.
+        // A failure unwinds the clone's setup like any other step here.
+        // The wait runs on a blocking thread: another restore of the same GPU in this process
+        // (`fcvm serve`) must keep its runtime threads to finish its load and let go.
+        let begun = {
+            let (state_dir, gpus) = (state_dir.clone(), gpus.clone());
+            tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        };
+        gpu_handoff = Some(setup_try!(begun));
+        let handoff = gpu_handoff.as_ref().expect("just taken");
+        // Every token is taken, not only up to the first missing one: a GPU this VM gets must
+        // not keep a token that tells the next VM it is clean.
+        // A token that cannot be voided stops the restore before any GPU is opened.
+        let taken: Result<Vec<bool>> = _gpu_leases
+            .iter()
+            .zip(&gpus)
+            .map(|(lease, sbdf)| {
+                crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease, handoff)
+            })
+            .collect();
+        let taken = setup_try!(taken);
+        let scrubbed = taken.iter().all(|&clean| clean);
+        if scrubbed {
+            info!(gpus = ?gpus, "every GPU was scrubbed on the host since its last VM");
+            restore_latest["gpus-host-scrubbed"] = serde_json::Value::Bool(true);
+        }
     }
     // Always sent: the snapshot's guest runs in whatever mode its source had, and
     // a clone that asked for none gets the kernel's own back.
@@ -3980,6 +4016,8 @@ async fn cmd_snapshot_run_inner(
             .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
         };
 
+    // The load has opened the GPUs (or failed), so the handoff is over.
+    drop(gpu_handoff);
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
     // of this clone.
@@ -6216,6 +6254,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// A restore takes every GPU's clean token before it decides, so a GPU it gets cannot keep
+    /// a token that would tell the next VM it is clean.
+    #[test]
+    fn a_restore_takes_every_clean_token() {
+        let code = include_str!("snapshot.rs");
+        let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let handoff = code
+            .find("begin_handoff(&state_dir, &gpus)")
+            .expect("no handoff");
+        let take = code
+            .find("take_clean_token(&state_dir, sbdf, lease, handoff)")
+            .expect("no take");
+        let load = code
+            .find("super::common::restore_from_snapshot(")
+            .expect("no load");
+        let released = code
+            .find("drop(gpu_handoff);")
+            .expect("the handoff is never released");
+        assert!(
+            handoff < take && take < load && load < released,
+            "the handoff must cover the token through the load that opens the GPU"
+        );
+        assert!(
+            code[..take].contains(
+                "tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))"
+            ) && code[..take].contains("gpu_handoff = Some(setup_try!(begun));")
+                && code[take..load].contains("let taken = setup_try!(taken);"),
+            "a failed handoff must unwind the clone's setup (setup_try!)"
+        );
+        let rest = &code[take..];
+        let collect = rest
+            .find(".collect();")
+            .expect("the takes are not collected");
+        let all = rest.find(".all(|&clean| clean)").expect("no decision");
+        assert!(collect < all, "the decision short-circuits the takes");
+    }
 
     #[test]
     fn a_binary_names_the_prefilled_backend_by_its_greeting() {
