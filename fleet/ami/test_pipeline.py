@@ -536,6 +536,19 @@ class PipelineTests(unittest.TestCase):
                 if name == "build":
                     self.assertLess(setup, phase.index("bg_start fleet-ami-windows-image"))
 
+    def test_the_bake_clears_untagged_images_before_it_packs_onto_the_root(self):
+        # Every generation built from a base image inherits its untagged images and adds its own;
+        # on 2026-11-13 they filled the 61 GB root during the pack (part 10 of 16). Both podman
+        # stores are pruned, and the phone app's stale build images removed, before the pack.
+        source = (HERE / "host/build.sh").read_text()
+        bake = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["bake"]
+        pack = bake.index('python3 "$HERE/store-pack.py"')
+        for step in ("podman image prune -f", 'as_user "podman image prune -f',
+                     "grep -vx 'localhost/fcvm-phone-app-build:$app' | xargs -r podman rmi"):
+            with self.subTest(step=step):
+                self.assertLess(bake.index(step), pack)
+        self.assertIn('app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)', bake)
+
     def test_the_minecraft_image_builds_beside_the_rest_into_roots_store(self):
         # In line it was the build phase's longest step (19 of 44 min on 2026-11-09). It starts
         # after the checkout, as root (a rootful build stays in its unit's cgroup), and the phase

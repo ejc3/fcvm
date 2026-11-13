@@ -327,6 +327,17 @@ bake)
   # cache by each driver and overlay image's SHA-256 and caches that digest in
   # version-cache/ under the image's path, mtime and length, so with whole-second mtimes a
   # host would hash the images again on its first GPU VM (#1219).
+  # Images a build left untagged, in root's podman store and the build user's: a build from a
+  # base image inherits the base's and adds its own, every generation. On 2026-11-13 they filled
+  # the 61 GB root while this phase packed part 10 of 16 (the 9993fb79 build: 66 untagged images
+  # in the user's store, 15 GB of it with the CUDA base), so the packed store, which is written to
+  # the root, no longer fit. Tagged images stay, the renderer's base and this build's own among
+  # them, and so do the phone app's build image of this checkout's Containerfile; the others go.
+  podman image prune -f >/dev/null
+  as_user "podman image prune -f >/dev/null"
+  app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)
+  as_user "podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/fcvm-phone-app-build:' | grep -vx 'localhost/fcvm-phone-app-build:$app' | xargs -r podman rmi >/dev/null"
+  df -h / | tee "$S/root-before-pack.txt"
   rm -rf /var/lib/fcvm-fleet/store
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
