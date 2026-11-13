@@ -82,6 +82,23 @@ class Setup(unittest.TestCase):
         self.assertIn("c8g.medium", text)
 
 
+class Lock(unittest.TestCase):
+    def test_a_second_run_on_the_same_results_refuses_before_touching_anything(self):
+        import fcntl
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"results": d}
+            held = open(os.path.join(d, "campaign.lock"), "w")  # another driver's lock
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with self.assertRaises(SystemExit):
+                    asyncio.run(race.run(cfg, 1, 0, ["lambda-warm"]))
+                self.assertFalse(os.path.exists(os.path.join(d, "samples.jsonl")))
+            finally:
+                held.close()
+
+
 class LaunchTiming(unittest.TestCase):
     def test_t0_is_the_launchers_moment_before_runtask_not_the_invoke(self):
         # invoked at wall 1000.0 ms (monotonic 0); RunTask asked at 1040 and answered at 1090;

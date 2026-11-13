@@ -16,6 +16,7 @@ Subcommands: run, reports (the Lambda REPORT lines), setup (setup.json for the p
 import argparse
 import asyncio
 import datetime
+import fcntl
 import http.client
 import json
 import os
@@ -467,7 +468,19 @@ def last_answers(cfg):
     return prev
 
 
+def campaign_lock(cfg):
+    """Hold the results directory for one driver: a second run would share the instances and interleave records."""
+    f = open(cfg["results"] + "/campaign.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise SystemExit(f"another race.py run holds {cfg['results']}; refusing to start a second one")
+    return f
+
+
 async def run(cfg, rounds, first_round, lanes):
+    lock = campaign_lock(cfg)  # held until the process exits
     prev_answer = last_answers(cfg)
     out = open(cfg["results"] + "/samples.jsonl", "a")
     fcvm = Fcvm(cfg) if any(l.startswith("fcvm") for l in lanes) else None
