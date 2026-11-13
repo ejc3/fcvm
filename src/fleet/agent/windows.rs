@@ -246,6 +246,58 @@ pub enum BridgeMode {
     },
 }
 
+/// The podman network a bridge that publishes on an IPv6 address runs on. podman's default
+/// network has no IPv6, and on it netavark forwards no IPv6 port: `--publish [<ipv6>]:443:443`
+/// leaves conmon holding the port with nothing behind it, so an IPv6 viewer's connection opens
+/// and never answers (staging, 2026-11-13: every sandbox, while its IPv4 port served). On a
+/// network with IPv6 the container has an address of each family and netavark forwards both.
+pub const BRIDGE_NETWORK: &str = "fcvm-windows-bridge";
+
+/// Make `BRIDGE_NETWORK` with IPv6, or check the one there has it. A network of that name
+/// without IPv6 (made by something else) is replaced: no bridge of this agent runs yet, and
+/// `reclaim_bridges` removed any left by an earlier one. Fails when podman cannot make it, so the
+/// gold flow fails with the reason rather than starting sandboxes no IPv6 viewer can reach.
+pub async fn ensure_bridge_network(cfg: &WindowsCfg) -> Result<()> {
+    async fn podman(cfg: &WindowsCfg, args: &[&str]) -> Result<String> {
+        let run = child(&cfg.podman).args(args).output();
+        let o = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .with_context(|| format!("podman {} timed out", args.join(" ")))?
+            .with_context(|| format!("podman {} did not start", args.join(" ")))?;
+        if !o.status.success() {
+            bail!(
+                "podman {}: {}: {}",
+                args.join(" "),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+    let create = ["network", "create", "--ipv6", "--ignore", BRIDGE_NETWORK];
+    let inspect = [
+        "network",
+        "inspect",
+        BRIDGE_NETWORK,
+        "--format",
+        "{{.IPv6Enabled}}",
+    ];
+    podman(cfg, &create).await?;
+    if podman(cfg, &inspect).await? == "true" {
+        return Ok(());
+    }
+    tracing::warn!(
+        network = BRIDGE_NETWORK,
+        "the bridge network has no IPv6: making it again"
+    );
+    podman(cfg, &["network", "rm", "-f", BRIDGE_NETWORK]).await?;
+    podman(cfg, &create).await?;
+    match podman(cfg, &inspect).await?.as_str() {
+        "true" => Ok(()),
+        other => bail!("podman made {BRIDGE_NETWORK} without IPv6 (IPv6Enabled: {other:?})"),
+    }
+}
+
 /// Every bridge container carries this label, so an agent that starts finds and removes the
 /// containers an agent before it left behind: a SIGKILLed agent stops nothing, and podman does
 /// not pass SIGKILL from its client on to the container, which keeps its published ports.
@@ -355,6 +407,9 @@ pub fn bridge_argv(
             tls_dir,
         } => {
             let ip = bracket(publish_ip);
+            if ipv6.is_some() && tls_dir.is_some() {
+                a.extend(strings(&["--network", BRIDGE_NETWORK]));
+            }
             a.extend(strings(&[
                 "--volume",
                 &format!("{}:{IN_REF}:ro", desktop_ref.display()),
@@ -747,12 +802,24 @@ impl Windows {
     ) -> Windows {
         let (gold_tx, gold) = watch::channel(GoldState::Building);
         let (stop, stop_rx) = watch::channel(false);
+        // A bridge publishes on its sandbox's IPv6 address exactly when this holds (bridge_argv).
+        let ipv6 = cfg.tls_dir.is_some() && places.iter().any(|p| p.ipv6.is_some());
         let flow = {
             let cfg = cfg.clone();
             let agent = agent.clone();
             tokio::spawn(async move {
                 reclaim_bridges(&cfg).await;
-                let r = gold_flow(&cfg, &agent, stop_rx.clone()).await;
+                let network = if ipv6 {
+                    ensure_bridge_network(&cfg)
+                        .await
+                        .context("making the bridges' IPv6 network")
+                } else {
+                    Ok(())
+                };
+                let r = match network {
+                    Ok(()) => gold_flow(&cfg, &agent, stop_rx.clone()).await,
+                    Err(e) => Err(e),
+                };
                 let state = match r {
                     Ok(tag) => {
                         tracing::info!(%tag, "the gold snapshot is ready");
@@ -2063,6 +2130,11 @@ mod tests {
         assert!(joined.contains("--volume /run/fcvm-fleet/tls:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443"));
         assert!(joined.contains("--publish [2001:db8::10]:21105:443"));
         assert!(joined.contains("--publish [2001:db8:1::7]:443:443"));
+        // podman's default network has no IPv6, and there the IPv6 publish forwards nothing.
+        assert!(
+            joined.contains(" --network fcvm-windows-bridge "),
+            "an IPv6 publish needs the bridge network: {joined}"
+        );
         assert!(
             joined.ends_with("localhost/windows-bridge:fleet serve"),
             "{joined}"
@@ -2085,6 +2157,66 @@ mod tests {
         .join(" ");
         assert!(!plain.contains("TLS"), "{plain}");
         assert_eq!(plain.matches("--publish").count(), 1, "{plain}");
+        assert!(!plain.contains("--network"), "{plain}");
+    }
+
+    /// A stand-in podman that logs its arguments and answers `network inspect` with the lines
+    /// of `inspect` in turn.
+    fn fake_podman(dir: &Path, inspect: &[&str]) -> PathBuf {
+        let answers = dir.join("inspect");
+        std::fs::write(&answers, inspect.join("\n") + "\n").unwrap();
+        let script = dir.join("podman");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$1 $2\" in\n\"network inspect\") head -n1 {a}; sed -i 1d {a} ;;\nesac\n",
+                log = dir.join("log").display(),
+                a = answers.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn the_bridge_network_has_ipv6_or_the_gold_flow_fails() {
+        let log = |d: &Path| std::fs::read_to_string(d.join("log")).unwrap();
+        let create = "network create --ipv6 --ignore fcvm-windows-bridge";
+        let inspect = "network inspect fcvm-windows-bridge --format {{.IPv6Enabled}}";
+
+        // Made, or already there with IPv6.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WindowsCfg {
+            podman: fake_podman(dir.path(), &["true"]),
+            ..test_cfg()
+        };
+        ensure_bridge_network(&cfg).await.unwrap();
+        assert_eq!(log(dir.path()), format!("{create}\n{inspect}\n"));
+
+        // There without IPv6 (--ignore keeps it): removed and made again.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WindowsCfg {
+            podman: fake_podman(dir.path(), &["false", "true"]),
+            ..test_cfg()
+        };
+        ensure_bridge_network(&cfg).await.unwrap();
+        assert_eq!(
+            log(dir.path()),
+            format!(
+                "{create}\n{inspect}\nnetwork rm -f fcvm-windows-bridge\n{create}\n{inspect}\n"
+            )
+        );
+
+        // Still without IPv6: an error, so no sandbox starts on it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WindowsCfg {
+            podman: fake_podman(dir.path(), &["false", "false"]),
+            ..test_cfg()
+        };
+        let e = ensure_bridge_network(&cfg).await.unwrap_err().to_string();
+        assert!(e.contains("without IPv6"), "{e}");
     }
 
     #[test]
