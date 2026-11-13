@@ -822,12 +822,17 @@ const NV_EXIT_FILES: [&str; 4] = [
 
 const NV_EXIT_PATCH: &str = "nv-guest-hypervisor-exits-without-calls.patch";
 
-/// The guest hypervisor exit fixture with the host's patch applied when it exists, in a
-/// temporary directory: (release, whether the patch was applied, directory).
-fn nv_exit_excerpts() -> (String, bool, tempfile::TempDir) {
-    let (release, patch, fixture) = host_kernel_port(NV_EXIT_PATCH, "nv-hyp-exit");
-    let temp = tempfile::tempdir().expect("create the guest hypervisor exit fixture directory");
-    for file in NV_EXIT_FILES {
+/// The excerpts in `tests/fixtures/<fixture>-<major>.<minor>` with the host's `patch` applied
+/// when it exists, in a temporary directory: (release, whether the patch was applied,
+/// directory).
+fn patched_host_excerpts(
+    patch: &str,
+    fixture: &str,
+    files: &[&str],
+) -> (String, bool, tempfile::TempDir) {
+    let (release, patch, fixture) = host_kernel_port(patch, fixture);
+    let temp = tempfile::tempdir().expect("create the excerpt directory");
+    for file in files {
         let dest = temp.path().join(file);
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::copy(fixture.join(file), &dest)
@@ -851,6 +856,11 @@ fn nv_exit_excerpts() -> (String, bool, tempfile::TempDir) {
         );
     }
     (release, patched, temp)
+}
+
+/// The guest hypervisor exit fixture with the host's patch applied when it exists.
+fn nv_exit_excerpts() -> (String, bool, tempfile::TempDir) {
+    patched_host_excerpts(NV_EXIT_PATCH, "nv-hyp-exit", &NV_EXIT_FILES)
 }
 
 #[test]
@@ -1054,5 +1064,95 @@ fn the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit() {
         "the VHE world switch's inline register masking in {NV_EXIT_PATCH} differs from \
          kvm_vcpu_apply_reg_masks():\n{}",
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+/// The headers of the VHE world switch helpers that
+/// `world-switch-helpers-inline.patch` marks `__always_inline`, excerpted in
+/// `tests/fixtures/world-switch-inline-<major>.<minor>` from the release the host pins.
+const WS_INLINE_FILES: [&str; 3] = [
+    "arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h",
+    "arch/arm64/kvm/hyp/include/hyp/switch.h",
+    "arch/arm64/include/asm/kvm_emulate.h",
+];
+
+const WS_INLINE_PATCH: &str = "world-switch-helpers-inline.patch";
+
+#[test]
+fn the_world_switch_inline_fixture_is_cut_from_the_pinned_arm64_host_kernel() {
+    let (release, _, fixture) = host_kernel_port(WS_INLINE_PATCH, "world-switch-inline");
+    for file in WS_INLINE_FILES {
+        let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
+            panic!(
+                "the arm64 host pins Linux {release}, and {} has no {file} excerpt: {e}",
+                fixture.display()
+            )
+        });
+        assert!(
+            text.contains(&format!("Linux v{release} {file}")),
+            "{}/{file} is not cut from Linux {release}, which the arm64 host kernel pins. \
+             Cut the same line ranges again from that release and record its SHA-256 in the \
+             header.",
+            fixture.display()
+        );
+    }
+}
+
+/// The helpers the VHE world switch runs on every exit must be inlined there (fcvm #659).
+/// Their source is the same in 6.18 and 7.3, and 6.18 inlined them, but on 7.3 GCC calls
+/// `__sysreg_save_common_state()`, `__sysreg_restore_common_state()`, `ctxt_mdscr_el1()`
+/// (four times per exit), `fpsimd_lazy_switch_to_guest()` and a partial copy of
+/// `vserror_state_is_nested()` out of line: an SMC exit with a vGICv3 ran 149 more host
+/// instructions on a c9g.metal-48xl host. `__always_inline` keeps them inline whatever
+/// the size of their callers, so the patched headers must declare each of them that way.
+#[test]
+fn the_world_switch_inlines_the_helpers_it_runs_on_every_exit() {
+    let (release, patched, temp) =
+        patched_host_excerpts(WS_INLINE_PATCH, "world-switch-inline", &WS_INLINE_FILES);
+    let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
+    let mut missing = Vec::new();
+    for (file, definition) in [
+        (
+            WS_INLINE_FILES[0],
+            "static __always_inline struct kvm_vcpu *ctxt_to_vcpu(",
+        ),
+        (
+            WS_INLINE_FILES[0],
+            "static __always_inline bool ctxt_is_guest(",
+        ),
+        (
+            WS_INLINE_FILES[0],
+            "static __always_inline u64 *ctxt_mdscr_el1(",
+        ),
+        (
+            WS_INLINE_FILES[0],
+            "static __always_inline void __sysreg_save_common_state(",
+        ),
+        (
+            WS_INLINE_FILES[0],
+            "static __always_inline void __sysreg_restore_common_state(",
+        ),
+        (
+            WS_INLINE_FILES[1],
+            "static __always_inline void fpsimd_lazy_switch_to_guest(",
+        ),
+        (
+            WS_INLINE_FILES[1],
+            "static __always_inline void fpsimd_lazy_switch_to_host(",
+        ),
+        (
+            WS_INLINE_FILES[2],
+            "static __always_inline bool vserror_state_is_nested(",
+        ),
+    ] {
+        if !read(file).lines().any(|line| line.starts_with(definition)) {
+            missing.push(format!("{file}: `{definition}`"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "Linux {release} with{} {WS_INLINE_PATCH} leaves the world switch calling out of line:\n{}",
+        if patched { "" } else { "out" },
+        missing.join("\n")
     );
 }
