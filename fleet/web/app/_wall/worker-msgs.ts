@@ -15,6 +15,8 @@ export type ToWorker =
   /** `cpuCanvas`: a 2D context the browser keeps in memory (`willReadFrequently`), not on the GPU. */
   | { type: "init"; canvas: OffscreenCanvas; width: number; height: number; dpr: number; mainTicks: boolean; cpuCanvas: boolean }
   | { type: "resize"; width: number; height: number; dpr: number }
+  /** Open the stream of source `id` now (the viewer pressed Retry on a tile that cannot reach it). */
+  | { type: "retry"; id: string }
   | { type: "plan"; plan: DrawPlan; settings: DrawSettings }
   | { type: "watch"; targets: { id: string; tEff: number }[] }
   | { type: "tick" }

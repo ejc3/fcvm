@@ -287,20 +287,23 @@ function solve4(A: number[][], y: number[]): number[] {
 }
 
 /**
- * Whether a Windows tile's demonstration label is whole: its text does not overflow its own box
+ * Whether the element with test id `id` is whole: its text does not overflow its own box
  * (`fits`: scrollWidth and scrollHeight within clientWidth and clientHeight), and the box lies
- * inside the tile's caption, which hides what overflows it (`inside`).
+ * inside the element with test id `within` (a tile's caption, which hides what overflows it).
  */
-export async function labelIsWhole(page: Page, slot: string): Promise<{ fits: boolean; inside: boolean }> {
-  return page.evaluate((slot) => {
-    const label = document.querySelector<HTMLElement>(`[data-testid="sandbox-label-${slot}"]`);
-    const caption = document.querySelector<HTMLElement>(`[data-testid="sandbox-caption-${slot}"]`);
-    if (!label || !caption) return { fits: false, inside: false };
-    const l = label.getBoundingClientRect();
-    const c = caption.getBoundingClientRect();
-    return {
-      fits: label.scrollWidth <= label.clientWidth + 1 && label.scrollHeight <= label.clientHeight + 1,
-      inside: l.left >= c.left - 1 && l.top >= c.top - 1 && l.right <= c.right + 1 && l.bottom <= c.bottom + 1,
-    };
-  }, slot);
+export async function wholeWithin(page: Page, id: string, within: string): Promise<{ fits: boolean; inside: boolean }> {
+  return page.evaluate(
+    ([id, within]) => {
+      const el = document.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+      const box = document.querySelector<HTMLElement>(`[data-testid="${within}"]`);
+      if (!el || !box) return { fits: false, inside: false };
+      const l = el.getBoundingClientRect();
+      const c = box.getBoundingClientRect();
+      return {
+        fits: el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight <= el.clientHeight + 1,
+        inside: l.left >= c.left - 1 && l.top >= c.top - 1 && l.right <= c.right + 1 && l.bottom <= c.bottom + 1,
+      };
+    },
+    [id, within] as const,
+  );
 }

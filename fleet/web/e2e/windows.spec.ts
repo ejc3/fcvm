@@ -4,7 +4,7 @@
 // fixed actions, and that nothing on the page sends anything but the four Windows intents.
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { COORD, admin, labelIsWhole, mockState } from "./helpers.ts";
+import { COORD, admin, mockState } from "./helpers.ts";
 
 const SANDBOXES = 4;
 const SLOTS = ["win-1", "win-2", "win-3", "win-4"];
@@ -49,10 +49,16 @@ test.beforeEach(async () => {
   await expect.poll(async () => (await mockWindows()).tiles.every((t) => t.phase === "running"), { timeout: 15_000 }).toBe(true);
 });
 
-test("shows the sandboxes, each drawing frames, and says its slot, edition, time to desktop and the label", async ({ page }) => {
+/** How many elements on the page show `text` as their own words (not through a child). */
+const shown = (page: Page, text: string) =>
+  page.evaluate((text) => [...document.querySelectorAll("body *")].filter((e) => [...e.childNodes].some((n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? "").includes(text))).length, text);
+
+test("shows the sandboxes, each drawing frames, says each one's slot and time to desktop, and the edition and the label once", async ({ page }) => {
   await openWindows(page);
   const v = await view(page);
   expect(v.title).toBe("Windows");
+  // The tab says which mode this is (the wall's title was on every mode's tab).
+  await expect(page).toHaveTitle("Windows");
   expect(v.plan.image).toBeNull();
   expect(v.plan.direct.map((d) => d.id)).toEqual(["d:win:1", "d:win:2", "d:win:3", "d:win:4"]);
   // Each desktop drew a frame at the same t, and the picture is not black.
@@ -66,10 +72,15 @@ test("shows the sandboxes, each drawing frames, and says its slot, edition, time
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   for (const slot of SLOTS) {
     await expect(page.getByTestId(`sandbox-slot-${slot}`)).toHaveText(slot);
-    await expect(page.getByTestId(`sandbox-edition-${slot}`)).toHaveText(EDITION);
     await expect(page.getByTestId(`sandbox-desktop-in-${slot}`)).toHaveText(/^Desktop in \d+\.\d\d s$/);
-    await expect(page.getByTestId(`sandbox-label-${slot}`)).toHaveText(LABEL);
+    await expect(page.getByTestId(`sandbox-link-${slot}`)).toHaveCount(0);
   }
+  // The edition and the evaluation notice: once each, in the header.
+  await expect(page.getByTestId("win-image")).toContainText(EDITION);
+  await expect(page.getByTestId("win-label")).toHaveText(LABEL);
+  await expect(page.getByTestId("win-label")).toBeInViewport();
+  expect(await shown(page, EDITION)).toBe(1);
+  expect(await shown(page, LABEL)).toBe(1);
   // The header: sandboxes up, the median and the slowest time to desktop, the last reset all.
   await expect(page.getByTestId("win-up")).toHaveText("4 of 4 sandboxes up");
   await expect(page.getByTestId("win-median")).toHaveText(/^Median time to desktop \d+\.\d\d s$/);
@@ -160,14 +171,15 @@ test("another viewer sees the last reset all as another viewer's", async ({ page
   await other.context().close();
 });
 
-test("taking a sandbox over gives exactly the fixed actions and Reset; an action is accepted, the label is on the panel, and giving it back ends the borrow", async ({ page }) => {
+test("taking a sandbox over gives exactly the fixed actions and Reset; an action is accepted, the label stays once on the page, and giving it back ends the borrow", async ({ page }) => {
   await openWindows(page);
   await page.getByTestId("sandbox-take-win-3").click();
   const panel = page.getByTestId("win-panel");
   await expect(panel).toBeVisible();
   await expect(page.getByTestId("win-panel-title")).toHaveText("win-3");
   await expect(page.getByTestId("win-countdown")).toHaveText(/^Returns in \d+ s$/);
-  await expect(page.getByTestId("win-panel-label")).toHaveText(LABEL);
+  await expect(page.getByTestId("win-label")).toBeInViewport();
+  expect(await shown(page, LABEL)).toBe(1);
   expect(await page.getByTestId("win-actions").getByRole("button").allTextContents()).toEqual(ACTIONS);
   // no field to type in, anywhere on the page
   await expect(page.locator("input, textarea, select, [contenteditable]")).toHaveCount(0);
@@ -273,6 +285,54 @@ test("nothing on the page sends an intent but the four, and none carries a point
   expect(got.map((i) => [i.name, i.outcome])).toEqual([["windows_reset", "committed"], ["claim_windows", "committed"], ["windows_action", "committed"], ["release_windows", "committed"]]);
 });
 
+test("a viewer with no IPv6 whose IPv4 port does not answer sees each tile say so, with Retry, and the desktops once IPv4 answers", async ({ page }) => {
+  await admin("/mock/fault", { ipv6_down: true, ipv4_silent: true });
+  try {
+    await page.goto("/?mode=windows&debug=1");
+    await page.waitForFunction(() => window.__windows !== undefined);
+    // While the page finds a route, and while a socket opens, the tile says so.
+    await expect(page.getByTestId("sandbox-link-win-1")).toContainText(/Finding the way to the sandboxes\.|Connecting to win-1\./);
+    // No socket of either family opens: the page settles on IPv4, each socket misses its open
+    // deadline, and every tile says it cannot reach its desktop, when it tries again, and offers Retry.
+    for (const slot of SLOTS) {
+      await expect(page.getByTestId(`sandbox-link-${slot}`)).toContainText(`Cannot reach ${slot}'s desktop over IPv4.`, { timeout: 30_000 });
+      await expect(page.getByTestId(`sandbox-link-${slot}`)).toContainText(/Trying again/);
+      await expect(page.getByTestId(`sandbox-link-${slot}`)).toBeInViewport();
+      await expect(page.getByTestId(`sandbox-retry-${slot}`)).toBeVisible();
+    }
+    expect((await page.evaluate(() => window.__windows!.client.getState().net)).family).toBe("v4");
+    // Retry does not reset the sandbox: the click lands on the button, not the tile.
+    const resets = async () => (await record()).intents.filter((i) => i.name === "windows_reset").length;
+    const before = await resets();
+    await page.getByTestId("sandbox-retry-win-1").click();
+    await page.waitForTimeout(500);
+    expect(await resets()).toBe(before);
+  } finally {
+    await admin("/mock/fault", { ipv6_down: false, ipv4_silent: false });
+  }
+  // IPv4 answers now: Retry connects at once, and every desktop draws.
+  await page.getByTestId("sandbox-retry-win-2").click().catch(() => {});
+  await expect.poll(async () => page.evaluate(() => window.__windows!.client.bench?.tilesSynced ?? 0), { timeout: 45_000 }).toBeGreaterThanOrEqual(SANDBOXES);
+  for (const slot of SLOTS) await expect(page.getByTestId(`sandbox-link-${slot}`)).toHaveCount(0);
+});
+
+test.describe("on a 1728 x 996 screen", () => {
+  test.use({ viewport: { width: 1728, height: 996 } });
+
+  test("the desktops fill the stage: two by two, with no empty band under them", async ({ page }) => {
+    await openWindows(page);
+    const v = await view(page);
+    const stage = (await page.getByTestId("win-stage").boundingBox())!;
+    const boxes = v.cards.map((c) => c.box!);
+    expect(new Set(boxes.map((b) => b.y)).size).toBe(2);
+    // One row of four was 411 px wide, with 500 px of empty page under the captions.
+    for (const b of boxes) expect(b.w).toBeGreaterThan(600);
+    const bottom = Math.max(...v.cards.map((c) => c.caption!.y + c.caption!.h));
+    expect(stage.y + stage.height - bottom).toBeLessThan(40);
+    for (const slot of SLOTS) await expect(hit(page, slot)).toBeInViewport({ ratio: 1 });
+  });
+});
+
 test.describe("on a 390 px phone", () => {
   test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
 
@@ -280,20 +340,17 @@ test.describe("on a 390 px phone", () => {
   const inside = (inner: { x: number; y: number; width: number; height: number } | null, outer: { x: number; y: number; width: number; height: number } | null) =>
     inner !== null && outer !== null && inner.x >= outer.x - 1 && inner.y >= outer.y - 1 && inner.x + inner.width <= outer.x + outer.width + 1 && inner.y + inner.height <= outer.y + outer.height + 1;
 
-  async function everyTileShowsTheLabel(page: Page): Promise<void> {
-    for (const slot of SLOTS) {
-      const label = page.getByTestId(`sandbox-label-${slot}`);
-      await expect(label).toHaveText(LABEL);
-      await expect(label).toBeVisible();
-      const caption = await page.getByTestId(`sandbox-caption-${slot}`).boundingBox();
-      expect(inside(await label.boundingBox(), caption), `${slot}'s label is clipped by its caption`).toBe(true);
-      expect(await labelIsWhole(page, slot), `${slot}'s label text overflows`).toEqual({ fits: true, inside: true });
-    }
+  async function theLabelIsWhole(page: Page): Promise<void> {
+    const label = page.getByTestId("win-label");
+    await expect(label).toHaveText(LABEL);
+    await expect(label).toBeInViewport({ ratio: 1 });
+    expect(await label.evaluate((e) => e.scrollWidth <= e.clientWidth + 1 && e.scrollHeight <= e.clientHeight + 1)).toBe(true);
+    expect(await shown(page, LABEL)).toBe(1);
   }
 
-  test("every tile keeps the demonstration label with the panel open or closed, and Take over is never clipped", async ({ page }) => {
+  test("the demonstration label is whole, once, with the panel open or closed, and Take over is never clipped", async ({ page }) => {
     await openWindows(page);
-    await everyTileShowsTheLabel(page);
+    await theLabelIsWhole(page);
     for (const slot of SLOTS) {
       const take = page.getByTestId(`sandbox-take-${slot}`);
       await expect(take).toBeVisible();
@@ -304,8 +361,7 @@ test.describe("on a 390 px phone", () => {
     }
     await page.getByTestId("sandbox-take-win-2").click();
     await expect(page.getByTestId("win-panel")).toBeVisible();
-    await expect(page.getByTestId("win-panel-label")).toHaveText(LABEL);
-    await everyTileShowsTheLabel(page);
+    await theLabelIsWhole(page);
     await page.getByTestId("win-give-back").click();
     await expect(page.getByTestId("win-panel")).toHaveCount(0);
   });
