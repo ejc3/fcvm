@@ -1664,6 +1664,7 @@ export class MockCoordinator {
             this.minecraft?.setV6Down(b["ipv6_down"]);
           }
           if (typeof b["minecraft_down"] === "boolean") this.minecraft?.setDown(b["minecraft_down"]);
+          if (typeof b["minecraft_hang"] === "boolean") this.minecraft?.setHang(b["minecraft_hang"]);
           return { ok: true };
         });
         return;

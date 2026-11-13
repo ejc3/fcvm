@@ -286,6 +286,20 @@ test("a server whose view cannot be reached says so on its tile with a Retry, ca
   await expect(page.getByTestId("mc-take-mc-1")).toBeEnabled();
 });
 
+test("a handshake that never answers is given up after the deadline, and Retry starts a fresh one at once", async ({ page }) => {
+  await admin("/mock/fault", { minecraft_hang: true });
+  try {
+    await page.goto("/?mode=minecraft&debug=1");
+    await page.waitForFunction(() => window.__minecraft !== undefined);
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
+  } finally {
+    await admin("/mock/fault", { minecraft_hang: false });
+  }
+  await page.getByTestId("mc-stream-retry-mc-1").click();
+  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 2000 });
+  await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 5000 }).toBeGreaterThan(0.9);
+});
+
 test("the held server is the large view, with the others off the stage, and Give back closes the panel at once", async ({ page }, info) => {
   await openMinecraft(page);
   const small = (await page.getByTestId("mc-tile-mc-2").boundingBox())!;

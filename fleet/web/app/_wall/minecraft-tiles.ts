@@ -7,6 +7,7 @@ import {
   markersOf,
   MC_BACKGROUND,
   parseViewMsg,
+  MC_CONNECT_DEADLINE_MS,
   reconnectDelayMs,
   remapOf,
   shadeWorld,
@@ -37,6 +38,8 @@ class TileSocket {
   open = false;
   attempt = 0;
   timer: ReturnType<typeof setTimeout> | null = null;
+  /** Ends a connect still pending after MC_CONNECT_DEADLINE_MS: a handshake that never answers is a failure too. */
+  connectTimer: ReturnType<typeof setTimeout> | null = null;
   viewer: string | null = null;
   botNames: string[] = [];
   remap: Uint8Array | null = null;
@@ -84,7 +87,16 @@ class TileSocket {
       return;
     }
     this.ws = ws;
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      if (this.ws !== ws || this.open) return;
+      this.abandon();
+      this.failures++;
+      this.owner.changed();
+      this.retry();
+    }, MC_CONNECT_DEADLINE_MS);
     ws.onopen = () => {
+      this.clearConnectTimer();
       this.open = true;
       this.attempt = 0;
       this.failures = 0;
@@ -104,6 +116,7 @@ class TileSocket {
       if (m !== null) this.take(m);
     };
     ws.onclose = () => {
+      this.clearConnectTimer();
       const was = this.open;
       this.open = false;
       this.ws = null;
@@ -119,9 +132,29 @@ class TileSocket {
     };
   }
 
-  /** Try again now instead of after the backoff (the page's Retry). */
+  private clearConnectTimer(): void {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+  }
+
+  /** Drop a connect that has not opened, without its close counting or retrying. */
+  private abandon(): void {
+    this.clearConnectTimer();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws === null) return;
+    ws.onopen = ws.onclose = ws.onmessage = null;
+    try {
+      ws.close();
+    } catch {
+      // A socket that is not connected yet may refuse a close; it is dropped either way.
+    }
+  }
+
+  /** Try again now instead of after the backoff (the page's Retry): a pending connect is dropped first. */
   retryNow(): void {
-    if (this.closed || this.open || this.ws !== null) return;
+    if (this.closed || this.open) return;
+    this.abandon();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.attempt = 0;
@@ -186,6 +219,7 @@ class TileSocket {
 
   close(): void {
     this.closed = true;
+    this.clearConnectTimer();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.ws) {
