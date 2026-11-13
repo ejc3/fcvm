@@ -3877,7 +3877,9 @@ async fn cmd_snapshot_run_inner(
         // Held until the load has opened the GPUs (dropped after `restore_from_snapshot`
         // below), so no other restore of these GPUs can use one between the token and the
         // open.
-        gpu_handoff = Some(crate::gpu::scrub::begin_handoff(&state_dir, &gpus)?);
+        // A failure unwinds the clone's setup like any other step here.
+        let begun = crate::gpu::scrub::begin_handoff(&state_dir, &gpus);
+        gpu_handoff = Some(setup_try!(begun));
         let handoff = gpu_handoff.as_ref().expect("just taken");
         // Every token is taken, not only up to the first missing one: a GPU this VM gets must
         // not keep a token that tells the next VM it is clean.
@@ -6264,6 +6266,10 @@ mod tests {
         assert!(
             handoff < take && take < load && load < released,
             "the handoff must cover the token through the load that opens the GPU"
+        );
+        assert!(
+            code[handoff..take].contains("gpu_handoff = Some(setup_try!(begun));"),
+            "a failed handoff must unwind the clone's setup (setup_try!)"
         );
         let rest = &code[take..];
         let collect = rest
