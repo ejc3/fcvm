@@ -299,6 +299,12 @@ test("a viewer with no IPv6 whose IPv4 port does not answer sees each tile say s
       await expect(page.getByTestId(`sandbox-link-${slot}`)).toContainText(/Trying again/);
       await expect(page.getByTestId(`sandbox-link-${slot}`)).toBeInViewport();
       await expect(page.getByTestId(`sandbox-retry-${slot}`)).toBeVisible();
+      // The message covers the whole desktop, so the tile reads as one box, not a strip at its top.
+      const msg = (await page.getByTestId(`sandbox-link-${slot}`).boundingBox())!;
+      const tile = (await hit(page, slot).boundingBox())!;
+      expect(Math.abs(msg.height - tile.height), `${slot}'s message height`).toBeLessThanOrEqual(2);
+      expect(Math.abs(msg.width - tile.width), `${slot}'s message width`).toBeLessThanOrEqual(2);
+      expect(await page.getByTestId(`sandbox-link-${slot}`).evaluate((e) => getComputedStyle(e).textDecorationLine)).toBe("none");
     }
     expect((await page.evaluate(() => window.__windows!.client.getState().net)).family).toBe("v4");
     // Retry does not reset the sandbox: the click lands on the button, not the tile.
