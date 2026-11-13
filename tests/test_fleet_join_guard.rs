@@ -4,6 +4,7 @@
 #![cfg(feature = "privileged-tests")]
 
 use fcvm::fleet::agent::joinguard;
+use std::io::Read;
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -64,13 +65,23 @@ fn one_source_holds_at_most_the_open_connection_cap() {
 fn one_source_opens_at_most_its_burst_of_new_connections_at_once() {
     let refused_at = in_guarded_namespace(|addr| {
         let l = TcpListener::bind(addr).unwrap();
-        // one connection at a time, each closed before the next: only the rate can refuse them
+        // One connection at a time, each closed before the next: only the rate can refuse them.
+        // Closed means its close handshake has finished: the per-source cap (connlimit) counts a
+        // connection until conntrack has seen it reach TIME_WAIT, so dropping both ends and
+        // connecting again at once let the cap refuse the 5th or 6th connection on CI's x64
+        // runners (the burst allows 6). The client half-closes, the server reads that and
+        // closes, and the client's read of the server's FIN returns only after the kernel has
+        // sent the last ACK, which moves the connection to TIME_WAIT, uncounted.
         for n in 1..=joinguard::NEW_BURST + 2 {
             match connect(addr) {
-                Ok(c) => {
-                    let (s, _) = l.accept().unwrap();
-                    drop(c);
+                Ok(mut c) => {
+                    let (mut s, _) = l.accept().unwrap();
+                    c.shutdown(std::net::Shutdown::Write).unwrap();
+                    let mut rest = Vec::new();
+                    s.read_to_end(&mut rest).unwrap();
                     drop(s);
+                    c.read_to_end(&mut rest).unwrap();
+                    drop(c);
                 }
                 Err(e) => {
                     assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
