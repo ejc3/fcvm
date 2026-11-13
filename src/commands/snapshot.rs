@@ -3878,18 +3878,28 @@ async fn cmd_snapshot_run_inner(
         // below), so no other restore of these GPUs can use one between the token and the
         // open.
         // A failure unwinds the clone's setup like any other step here.
-        let begun = crate::gpu::scrub::begin_handoff(&state_dir, &gpus);
+        // The wait runs on a blocking thread: another restore of the same GPU in this process
+        // (`fcvm serve`) must keep its runtime threads to finish its load and let go.
+        let begun = {
+            let (state_dir, gpus) = (state_dir.clone(), gpus.clone());
+            tokio::task::spawn_blocking(move || crate::gpu::scrub::begin_handoff(&state_dir, &gpus))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        };
         gpu_handoff = Some(setup_try!(begun));
         let handoff = gpu_handoff.as_ref().expect("just taken");
         // Every token is taken, not only up to the first missing one: a GPU this VM gets must
         // not keep a token that tells the next VM it is clean.
-        let taken: Vec<bool> = _gpu_leases
+        // A token that cannot be voided stops the restore before any GPU is opened.
+        let taken: Result<Vec<bool>> = _gpu_leases
             .iter()
             .zip(&gpus)
             .map(|(lease, sbdf)| {
                 crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease, handoff)
             })
             .collect();
+        let taken = setup_try!(taken);
         let scrubbed = taken.iter().all(|&clean| clean);
         if scrubbed {
             info!(gpus = ?gpus, "every GPU was scrubbed on the host since its last VM");
@@ -6268,7 +6278,8 @@ mod tests {
             "the handoff must cover the token through the load that opens the GPU"
         );
         assert!(
-            code[handoff..take].contains("gpu_handoff = Some(setup_try!(begun));"),
+            code[..take].contains("gpu_handoff = Some(setup_try!(begun));")
+                && code[take..load].contains("let taken = setup_try!(taken);"),
             "a failed handoff must unwind the clone's setup (setup_try!)"
         );
         let rest = &code[take..];

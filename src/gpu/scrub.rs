@@ -876,44 +876,60 @@ pub fn begin_handoff_as(
     Ok(GpuHandoff { _locks: locks })
 }
 
-/// Take the GPU's clean token, for a VM holding its lease and its handoff: `true` when a host
-/// scrub cleared the GPU's memory and no VM has had the GPU since, and this caller is the one
-/// VM that gets it that way. The guest's own scrub is then redundant. A root caller unlinks
-/// the token, so two VMs cannot both see it clean; any other caller empties it, which voids it
-/// for every later VM, since a rootless VM uses the GPU too. Any error reads as not clean.
+/// Take the GPU's clean token, for a VM holding its lease and its handoff: `Ok(true)` when a
+/// host scrub cleared the GPU's memory and no VM has had the GPU since, and this caller is the
+/// one VM that gets it that way. The guest's own scrub is then redundant. A root caller
+/// unlinks the token, so two VMs cannot both see it clean; any other caller empties it, which
+/// voids it for every later VM, since a rootless VM uses the GPU too. A token that exists and
+/// can be neither unlinked nor emptied is an error: the VM must not get the GPU while a token
+/// that still vouches for it remains.
 pub fn take_clean_token(
     state_dir: &Path,
     sbdf: &str,
     _lease: &GpuLease,
     _handoff: &GpuHandoff,
-) -> bool {
+) -> Result<bool> {
     take_clean_token_as(state_dir, sbdf, nix::unistd::geteuid().is_root())
 }
 
 /// [`take_clean_token`] with whether the caller can unlink the token supplied.
-fn take_clean_token_as(state_dir: &Path, sbdf: &str, root: bool) -> bool {
+fn take_clean_token_as(state_dir: &Path, sbdf: &str, root: bool) -> Result<bool> {
     let path = clean_token_path(state_dir, sbdf);
+    let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
     if !root {
-        // Voids the token: an empty one names no boot.
-        let _ = std::fs::OpenOptions::new()
+        // Voids the token: an empty one matches no key.
+        return match std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
-            .open(&path);
-        return false;
+            .open(&path)
+        {
+            Ok(_) => Ok(false),
+            Err(error) if gone(&error) => Ok(false),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "emptying {}, which would let a later VM skip its scrub of a GPU this VM used",
+                    path.display()
+                )
+            }),
+        };
     }
     // Only a scrub writes the token and the key, and none can run while the caller holds a
     // lease; a rootless restore can empty the token only under the handoff the caller holds.
     // So the contents read here are the contents unlinked below.
     let key_path = clean_key_path(state_dir, sbdf);
-    let (Ok(written), Ok(key)) = (
-        std::fs::read_to_string(&path),
-        std::fs::read_to_string(&key_path),
-    ) else {
-        let _ = std::fs::remove_file(&path);
-        return false;
-    };
-    if std::fs::remove_file(&path).is_err() {
-        return false;
+    let written = std::fs::read_to_string(&path);
+    let key = std::fs::read_to_string(&key_path).unwrap_or_default();
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if gone(&error) => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "removing {}, which would let a later VM skip its scrub of a GPU this VM used",
+                    path.display()
+                )
+            })
+        }
     }
     let _ = std::fs::remove_file(&key_path);
     // Durable before the VM opens the GPU: a crash cannot bring the token back.
@@ -921,7 +937,7 @@ fn take_clean_token_as(state_dir: &Path, sbdf: &str, root: bool) -> bool {
         .and_then(|dir| dir.sync_all())
         .is_ok();
     let this_boot = boot_id().is_ok_and(|boot| key.split(':').next() == Some(boot.as_str()));
-    synced && this_boot && !key.is_empty() && written == key
+    Ok(synced && this_boot && !key.is_empty() && written.is_ok_and(|w| w == key))
 }
 
 /// Refuse a quarantined GPU. Called for every `--gpu` before the VM starts.
@@ -1250,9 +1266,9 @@ mod tests {
         let (report, _) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
         assert!(token.exists(), "a successful scrub left no clean token");
-        assert!(take_clean_token_as(&state, sbdf, true));
+        assert!(take_clean_token_as(&state, sbdf, true).unwrap());
         assert!(
-            !take_clean_token_as(&state, sbdf, true),
+            !take_clean_token_as(&state, sbdf, true).unwrap(),
             "a second VM was told the GPU is clean"
         );
         // A token left from an earlier scrub is gone before the next scrub touches the GPU.
@@ -1269,26 +1285,26 @@ mod tests {
         // nothing.
         std::fs::write(&token, "another-boot").unwrap();
         assert!(
-            !take_clean_token_as(&state, sbdf, true),
+            !take_clean_token_as(&state, sbdf, true).unwrap(),
             "a token from another boot was honoured"
         );
         assert!(!token.exists());
         // A rootless VM that gets the GPU voids the token for every VM after it.
         let (report, _) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
-        assert!(!take_clean_token_as(&state, sbdf, false));
+        assert!(!take_clean_token_as(&state, sbdf, false).unwrap());
         assert!(
-            !take_clean_token_as(&state, sbdf, true),
+            !take_clean_token_as(&state, sbdf, true).unwrap(),
             "a token survived a rootless VM"
         );
         // A token anyone could write (this boot's id, readable by all) is not a valid one:
         // only the key, which only root can read, makes it valid.
         let (report, _) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
-        assert!(!take_clean_token_as(&state, sbdf, false));
+        assert!(!take_clean_token_as(&state, sbdf, false).unwrap());
         std::fs::write(&token, boot_id().unwrap()).unwrap();
         assert!(
-            !take_clean_token_as(&state, sbdf, true),
+            !take_clean_token_as(&state, sbdf, true).unwrap(),
             "a token rewritten with the boot id was honoured"
         );
         // The key is root's alone and the token cannot be read back by others.
@@ -1298,7 +1314,7 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&clean_key_path(&state, sbdf)), 0o600);
         assert_eq!(mode(&token), 0o622);
-        assert!(take_clean_token_as(&state, sbdf, true));
+        assert!(take_clean_token_as(&state, sbdf, true).unwrap());
         // A scrub that fails after the reset leaves no token.
         let failed = scrub_and_record_with(
             &fake.root.path().join("sys"),
@@ -1310,6 +1326,27 @@ mod tests {
         );
         assert_eq!(failed.outcome, "failed");
         assert!(!token.exists(), "a failed scrub left a clean token");
+    }
+
+    /// A token that cannot be voided stops the restore instead of reading as not clean, which
+    /// would leave it vouching for a GPU the VM is about to use.
+    #[test]
+    fn a_token_that_cannot_be_voided_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        let token = clean_token_path(&state, sbdf);
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if nix::unistd::geteuid().is_root() {
+            return; // root writes a read-only file anyway
+        }
+        assert!(
+            take_clean_token_as(&state, sbdf, false).is_err(),
+            "a token the restore could not empty read as not clean"
+        );
     }
 
     /// The token and its key are created new with mode 0600 and written before the token is
