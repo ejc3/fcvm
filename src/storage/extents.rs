@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
 const FIEMAP_FLAG_SYNC: u32 = 0x0000_0001;
 const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
+const FIEMAP_EXTENT_ENCODED: u32 = 0x0000_0008;
 const FIEMAP_EXTENT_SHARED: u32 = 0x0000_2000;
 
 /// Extents asked for in one call.
@@ -44,13 +45,18 @@ struct Fiemap {
     fm_extents: [FiemapExtent; EXTENTS_PER_CALL],
 }
 
-/// One extent of a file: the bytes `[start, start + len)` of the file, and whether another
-/// file shares its blocks.
+/// One extent of a file: the bytes `[start, start + len)` of the file, where they are on the
+/// device (`physical`, the filesystem's own address, comparable between files of one
+/// filesystem), whether another file shares its blocks, and whether it is stored encoded
+/// (compressed: `physical` is then where the whole compressed extent starts, whatever part of
+/// it this is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     pub start: u64,
+    pub physical: u64,
     pub len: u64,
     pub shared: bool,
+    pub encoded: bool,
 }
 
 /// Call `visit` with each extent of `file` in file order, until it breaks or the extents end.
@@ -95,8 +101,10 @@ pub fn for_each_extent(
             let end = extent.fe_logical + extent.fe_length;
             let flow = visit(Extent {
                 start: extent.fe_logical,
+                physical: extent.fe_physical,
                 len: extent.fe_length,
                 shared: extent.fe_flags & FIEMAP_EXTENT_SHARED != 0,
+                encoded: extent.fe_flags & FIEMAP_EXTENT_ENCODED != 0,
             });
             if flow.is_break() || extent.fe_flags & FIEMAP_EXTENT_LAST != 0 {
                 return Ok(());

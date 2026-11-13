@@ -1,3 +1,4 @@
+pub mod compact;
 pub mod disk;
 pub mod disk_dir;
 pub mod extents;
@@ -9,7 +10,8 @@ pub mod volume;
 
 pub use disk::{DiskConfig, DiskManager};
 pub use snapshot::{
-    validate_snapshot_name, SnapshotConfig, SnapshotExtraDisk, SnapshotGeneration, SnapshotKind,
-    SnapshotManager, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
+    validate_new_snapshot_name, validate_snapshot_name, SnapshotConfig, SnapshotExtraDisk,
+    SnapshotGeneration, SnapshotKind, SnapshotManager, SnapshotMetadata, SnapshotType,
+    SnapshotVolumeConfig,
 };
 pub use volume::{VolumeManager, VolumeMount};

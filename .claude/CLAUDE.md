@@ -2682,6 +2682,19 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   disk: that file took 47 GiB compressed and takes 128 GiB uncompressed. A Full snapshot gets a new nodatacow
   file; a diff, in place or merged, keeps its parent's flag (so its copy of the parent can share extents), and a
   chain made before this stays compressed until its next Full snapshot.
+- A diff written into a file that shares its parent's extents lands in new extents, and btrfs frees an extent
+  only when no block of it is referenced, so once the parent is deleted the diff snapshot keeps the whole of
+  every parent extent it still references: 189 GiB on disk for a 126 GiB memory file (#1810). `snapshots delete`
+  and `snapshots prune` then rewrite each surviving snapshot linked to the deleted one by `parent_snapshot` as
+  one sequential copy renamed over its memory file (`src/storage/compact.rs`), when the file shares no extent
+  with another (a copy of shared data would take its space again; a sibling is rewritten once it is the last)
+  and keeps at least one byte in eight more than it references. The copy keeps bytes, holes, owner, nodatacow
+  flag and nanosecond mtime, so the recorded working set stays valid, and is not published if it cannot keep the
+  file's owner and group. The copy and the rename run under the snapshot's generation lock shared and its
+  `<tag>.stage-lock` exclusively, which every create holds shared on its parent: a create staging from the
+  snapshot or replacing it meanwhile would carry the copy where its reclaim record does not follow, so it waits.
+  The rename runs only after checking the file is the one copied and still shares nothing.
+  `deleting_the_parent_frees_the_extents_its_diff_replaced` (tests/test_snapshot_memory_rewrite.rs) measures it.
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Per-VM Disk Sizing (`--rootfs-size`):**

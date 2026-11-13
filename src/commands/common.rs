@@ -5135,8 +5135,12 @@ pub async fn acquire_snapshot_dir_lock(
     snapshot_dir: &Path,
     exclusive: bool,
 ) -> Result<std::fs::File> {
-    let lock_path = snapshot_sibling(snapshot_dir, "lock");
-    let lock_file = std::fs::File::create(&lock_path)
+    acquire_flock(&snapshot_sibling(snapshot_dir, "lock"), exclusive).await
+}
+
+/// Take an flock on `lock_path`, created if missing, waiting for it.
+async fn acquire_flock(lock_path: &Path, exclusive: bool) -> Result<std::fs::File> {
+    let lock_file = std::fs::File::create(lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
@@ -5179,11 +5183,26 @@ pub async fn acquire_snapshot_dir_lock(
     Ok(lock_file)
 }
 
+/// Acquire a snapshot's stage lock (`<snapshot_dir>.stage-lock`).
+///
+/// A snapshot create holds it shared on its parent while the parent's memory file can come to
+/// share extents with the new snapshot (a subvolume snapshot, a clone, or a merge's copy of
+/// it). Rewriting a memory file to give it extents of its own (`storage::compact`) takes it
+/// exclusively around its last check and rename, so the file cannot be staged from between
+/// the check that it shares nothing and the rename.
+pub async fn acquire_snapshot_stage_lock(
+    snapshot_dir: &Path,
+    exclusive: bool,
+) -> Result<std::fs::File> {
+    acquire_flock(&snapshot_sibling(snapshot_dir, "stage-lock"), exclusive).await
+}
+
 /// Locks that pin every snapshot generation read or replaced by one snapshot create.
 ///
 /// The files stay locked until this value is dropped.  Callers acquire this before the
 /// per-VM snapshot lock and keep it through the parent's memory file being cloned (for an
 /// in-place diff, before the pause) or copied and merged, and the target's atomic replacement.
+/// It also holds the parent's stage lock shared ([`acquire_snapshot_stage_lock`]).
 pub struct SnapshotCreateGenerationLocks {
     _files: Vec<std::fs::File>,
 }
@@ -5215,6 +5234,10 @@ pub async fn acquire_snapshot_create_generation_locks(
     let mut files = Vec::new();
     for (snapshot_dir, exclusive) in snapshot_create_lock_requests(target_dir, parent_dir) {
         files.push(acquire_snapshot_dir_lock(&snapshot_dir, exclusive).await?);
+    }
+    // After the generation locks, in the order a memory file rewrite takes them.
+    if let Some(parent_dir) = parent_dir {
+        files.push(acquire_snapshot_stage_lock(parent_dir, false).await?);
     }
     Ok(SnapshotCreateGenerationLocks { _files: files })
 }

@@ -5,7 +5,7 @@ mod prefetch;
 mod release;
 mod server;
 mod warmup;
-mod working_set;
+pub(crate) mod working_set;
 
 pub use handler::UffdHandler;
 pub use holes::for_each_data_run;

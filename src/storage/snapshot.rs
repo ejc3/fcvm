@@ -26,6 +26,28 @@ pub fn validate_snapshot_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`validate_snapshot_name`], for a snapshot about to be created. A snapshot's lock, staging,
+/// replacement and stage-lock files sit beside its directory as `<name>.<suffix>`
+/// (`snapshot_sibling`), so a new name ending in one of those suffixes would be another snapshot's
+/// file: `base.stage-lock` is the stage lock of `base`. A snapshot that already has such a name
+/// can still be read, served and deleted, so only creation refuses it.
+pub fn validate_new_snapshot_name(name: &str) -> Result<()> {
+    validate_snapshot_name(name)?;
+    if let Some(suffix) = SNAPSHOT_SIBLING_SUFFIXES
+        .iter()
+        .find(|suffix| name.ends_with(&format!(".{suffix}")))
+    {
+        anyhow::bail!(
+            "invalid snapshot name '{name}': a name ending in '.{suffix}' names another snapshot's \
+             auxiliary file"
+        );
+    }
+    Ok(())
+}
+
+/// The suffixes of the files fcvm keeps beside a snapshot's directory (`<name>.<suffix>`).
+pub const SNAPSHOT_SIBLING_SUFFIXES: &[&str] = &["lock", "creating", "old", "stage-lock"];
+
 fn default_health_check_timeout() -> u64 {
     5
 }
@@ -487,9 +509,14 @@ impl SnapshotManager {
         Self { snapshots_dir }
     }
 
+    /// The directory holding the snapshots.
+    pub fn snapshots_dir(&self) -> &Path {
+        &self.snapshots_dir
+    }
+
     /// Save a snapshot
     pub async fn save_snapshot(&self, config: SnapshotConfig) -> Result<()> {
-        validate_snapshot_name(&config.name)?;
+        validate_new_snapshot_name(&config.name)?;
         info!(
             snapshot = %config.name,
             vm_id = %config.vm_id,
@@ -575,6 +602,16 @@ impl SnapshotManager {
 
     /// Delete a snapshot
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        self.delete_snapshot_compacting(name, None).await
+    }
+
+    /// Delete a snapshot, and record in `compaction` what its survivors may keep of its
+    /// memory file's extents (`storage::compact`), for a rewrite once the delete is done.
+    pub async fn delete_snapshot_compacting(
+        &self,
+        name: &str,
+        compaction: Option<&mut crate::storage::compact::Compaction>,
+    ) -> Result<()> {
         validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
         // Serialize deletion with creators and restores.  Removing the directory
@@ -588,6 +625,9 @@ impl SnapshotManager {
                 .with_context(|| format!("locking snapshot '{}' for deletion", name))?;
 
         if snapshot_dir.exists() {
+            if let Some(compaction) = compaction {
+                compaction.before_removal(&self.snapshots_dir, name).await;
+            }
             crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
                 .await
                 .context("removing snapshot directory")?;
@@ -609,6 +649,18 @@ impl SnapshotManager {
         &self,
         name: &str,
         expected: &SnapshotGeneration,
+    ) -> Result<bool> {
+        self.delete_snapshot_if_generation_compacting(name, expected, None)
+            .await
+    }
+
+    /// [`Self::delete_snapshot_if_generation`], recording in `compaction` what its survivors
+    /// may keep of its memory file's extents, as [`Self::delete_snapshot_compacting`] does.
+    pub async fn delete_snapshot_if_generation_compacting(
+        &self,
+        name: &str,
+        expected: &SnapshotGeneration,
+        compaction: Option<&mut crate::storage::compact::Compaction>,
     ) -> Result<bool> {
         validate_snapshot_name(name)?;
         let snapshot_dir = self.snapshots_dir.join(name);
@@ -633,6 +685,9 @@ impl SnapshotManager {
             return Ok(false);
         }
 
+        if let Some(compaction) = compaction {
+            compaction.before_removal(&self.snapshots_dir, name).await;
+        }
         crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
             .await
             .context("removing invalid snapshot generation")?;
@@ -711,6 +766,33 @@ fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotCon
 
 #[cfg(test)]
 mod tests {
+    /// A name that would be another snapshot's auxiliary file is refused; dotted names that are
+    /// not are kept (#1810 review: `base.stage-lock` made every create from `base` fail).
+    #[test]
+    fn a_name_ending_in_a_sibling_suffix_is_refused() {
+        for name in ["base.stage-lock", "base.lock", "base.creating", "base.old"] {
+            assert!(
+                super::validate_new_snapshot_name(name).is_err(),
+                "{name} was accepted"
+            );
+            // One made before the refusal can still be loaded and deleted.
+            assert!(
+                super::validate_snapshot_name(name).is_ok(),
+                "{name} was refused"
+            );
+        }
+        for name in ["app.v1", "base.locked", "old", "lock"] {
+            assert!(
+                super::validate_new_snapshot_name(name).is_ok(),
+                "{name} was refused"
+            );
+        }
+        let lock_of = |name: &str| {
+            crate::commands::common::snapshot_sibling(std::path::Path::new(name), "stage-lock")
+        };
+        assert_eq!(lock_of("base"), std::path::PathBuf::from("base.stage-lock"));
+    }
+
     use super::*;
 
     #[test]

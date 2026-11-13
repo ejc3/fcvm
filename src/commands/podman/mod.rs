@@ -415,7 +415,7 @@ fn prepare_install_target(options: &PrepareOptions, content_key: &str) -> Result
         // is for: `snapshots prune` must not reclaim a golden snapshot out from under the
         // caller that asked for it by name.
         Some(tag) => {
-            crate::storage::validate_snapshot_name(tag).context("invalid --tag")?;
+            crate::storage::validate_new_snapshot_name(tag).context("invalid --tag")?;
             (tag.to_string(), crate::storage::SnapshotType::User)
         }
         // The content-addressed cache entry `podman run` would have built. Prunable.
