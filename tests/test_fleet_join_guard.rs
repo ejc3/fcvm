@@ -64,14 +64,29 @@ fn one_source_holds_at_most_the_open_connection_cap() {
 #[test]
 fn one_source_opens_at_most_its_burst_of_new_connections_at_once() {
     let refused_at = in_guarded_namespace(|addr| {
+        // The open-connection rule leaves the chain, so only the rate can refuse. Finishing each
+        // connection's close is not enough on its own: before Linux 7.0 (de8a70cefcb2), connlimit
+        // does not collect closed connections on a SYN in the same jiffy as its previous one
+        // (`jiffies == list->last_gc` in net/netfilter/nf_conncount.c, since 5.19), so a loop
+        // faster than a jiffy still counts the connections it closed, and the cap refuses the
+        // 5th. CI's x64 runners boot Ubuntu's 6.14.0-1018-aws, which has that code.
+        let mut delete = joinguard::rules()
+            .into_iter()
+            .find(|r| r.iter().any(|a| a == "connlimit"))
+            .expect("the open-connection rule");
+        delete[0] = "-D".into();
+        let out = std::process::Command::new("/usr/sbin/ip6tables")
+            .args(&delete)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let l = TcpListener::bind(addr).unwrap();
-        // One connection at a time, each closed before the next: only the rate can refuse them.
-        // Closed means its close handshake has finished: the per-source cap (connlimit) counts a
-        // connection until conntrack has seen it reach TIME_WAIT, so dropping both ends and
-        // connecting again at once let the cap refuse the 5th or 6th connection on CI's x64
-        // runners (the burst allows 6). The client half-closes, the server reads that and
-        // closes, and the client's read of the server's FIN returns only after the kernel has
-        // sent the last ACK, which moves the connection to TIME_WAIT, uncounted.
+        // One connection at a time, each fully closed before the next: the client half-closes,
+        // the server reads that and closes, and the client reads the server's FIN.
         for n in 1..=joinguard::NEW_BURST + 2 {
             match connect(addr) {
                 Ok(mut c) => {
