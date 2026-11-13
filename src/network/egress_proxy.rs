@@ -25,8 +25,11 @@
 //!   until the queue drains; memory stays bounded either way.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,6 +71,115 @@ const FRAME_OPEN_FAIL: u8 = 6;
 // Address family constants (must match guest side)
 const AF_INET: u8 = 0x04;
 const AF_INET6: u8 = 0x06;
+
+/// How long a stream may wait on its destination before the session reports it: a
+/// connect still pending, or bytes written to the destination with nothing back since.
+/// A pull's first reply arrived within 5.5 s in 7,610 of 7,611 CI pulls (2026-11-13);
+/// the other waited 117 s with no record of where its request was.
+const STALL_REPORT_AFTER: Duration = Duration::from_secs(10);
+const STALL_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Milliseconds since this process first asked, the clock the stream records use.
+fn now_ms() -> u64 {
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_millis() as u64
+}
+
+/// What one stream has carried, the host half of a stall report. Times are
+/// `now_ms() + 1`; 0 means never.
+struct StreamActivity {
+    stream_id: u32,
+    dest: SocketAddr,
+    opened_ms: u64,
+    connected: AtomicBool,
+    to_dest: AtomicU64,
+    from_dest: AtomicU64,
+    last_to_dest_ms: AtomicU64,
+    last_from_dest_ms: AtomicU64,
+    /// Set when this wait was reported, cleared when the wait ends.
+    reported: AtomicBool,
+}
+
+impl StreamActivity {
+    fn new(stream_id: u32, dest: SocketAddr) -> Self {
+        Self {
+            stream_id,
+            dest,
+            opened_ms: now_ms() + 1,
+            connected: AtomicBool::new(false),
+            to_dest: AtomicU64::new(0),
+            from_dest: AtomicU64::new(0),
+            last_to_dest_ms: AtomicU64::new(0),
+            last_from_dest_ms: AtomicU64::new(0),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn record(counter: &AtomicU64, last: &AtomicU64, n: usize) {
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+        last.store(now_ms() + 1, Ordering::Relaxed);
+    }
+
+    /// What this stream has waited on for `threshold_ms` at `now_ms`, if anything.
+    fn waiting_on(&self, now_ms: u64, threshold_ms: u64) -> Option<&'static str> {
+        if !self.connected.load(Ordering::Relaxed) {
+            return (now_ms.saturating_sub(self.opened_ms - 1) >= threshold_ms)
+                .then_some("connecting to its destination");
+        }
+        let sent = self.last_to_dest_ms.load(Ordering::Relaxed);
+        let received = self.last_from_dest_ms.load(Ordering::Relaxed);
+        // Bytes sent after the last byte back, or with none back yet. A reply read in the
+        // same millisecond as the request counts as answered.
+        (sent != 0
+            && (received == 0 || sent > received)
+            && now_ms.saturating_sub(sent - 1) >= threshold_ms)
+            .then_some("awaiting a reply from its destination")
+    }
+
+    fn describe(&self, waiting_on: &str, now_ms: u64) -> String {
+        let ago = |stamp: u64| {
+            if stamp == 0 {
+                "never".to_string()
+            } else {
+                format!(
+                    "{:.1}s ago",
+                    now_ms.saturating_sub(stamp - 1) as f64 / 1000.0
+                )
+            }
+        };
+        format!(
+            "stream {} to {} {waiting_on} for {:.1}s since open: wrote {} B to it (last {}), read {} B from it (last {})",
+            self.stream_id,
+            self.dest,
+            now_ms.saturating_sub(self.opened_ms - 1) as f64 / 1000.0,
+            self.to_dest.load(Ordering::Relaxed),
+            ago(self.last_to_dest_ms.load(Ordering::Relaxed)),
+            self.from_dest.load(Ordering::Relaxed),
+            ago(self.last_from_dest_ms.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// A session's open streams, shared with its stall scan.
+type ActivityRegistry = Arc<Mutex<HashMap<u32, Arc<StreamActivity>>>>;
+
+/// Streams that started waiting on their destination at least `threshold_ms` before
+/// `now_ms`, each once per wait.
+fn newly_stalled(registry: &ActivityRegistry, now_ms: u64, threshold_ms: u64) -> Vec<String> {
+    let streams: Vec<Arc<StreamActivity>> = registry.lock().unwrap().values().cloned().collect();
+    let mut lines = Vec::new();
+    for stream in streams {
+        match stream.waiting_on(now_ms, threshold_ms) {
+            Some(waiting_on) => {
+                if !stream.reported.swap(true, Ordering::Relaxed) {
+                    lines.push(stream.describe(waiting_on, now_ms));
+                }
+            }
+            None => stream.reported.store(false, Ordering::Relaxed),
+        }
+    }
+    lines
+}
 
 /// Per-stream channel sender for routing incoming frames.
 /// Bounded so a guest uploading to a slow or stalled destination cannot grow
@@ -144,6 +256,29 @@ fn parse_open_payload(payload: &[u8]) -> Option<(IpAddr, u16)> {
 /// Handle a single multiplexed vsock session.
 /// Reads frames, dispatches to per-stream handlers, relays to real TCP destinations.
 async fn handle_mux_session(vsock_stream: UnixStream) -> Result<()> {
+    let registry = ActivityRegistry::default();
+    let scan_registry = registry.clone();
+    let stall_scan = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(STALL_SCAN_INTERVAL);
+        loop {
+            interval.tick().await;
+            for line in newly_stalled(
+                &scan_registry,
+                now_ms(),
+                STALL_REPORT_AFTER.as_millis() as u64,
+            ) {
+                info!("egress proxy: {line}");
+            }
+        }
+    });
+    let result = relay_mux_session(vsock_stream, registry).await;
+    stall_scan.abort();
+    result
+}
+
+/// Read frames from one vsock session, dispatch them to per-stream handlers, and relay to
+/// the real TCP destinations, recording each stream in `registry`.
+async fn relay_mux_session(vsock_stream: UnixStream, registry: ActivityRegistry) -> Result<()> {
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
 
     let (vsock_read, vsock_write) = vsock_stream.into_split();
@@ -214,8 +349,22 @@ async fn handle_mux_session(vsock_stream: UnixStream) -> Result<()> {
 
                 // Spawn handler for this stream
                 let wtx = writer_tx.clone();
+                let activity = Arc::new(StreamActivity::new(
+                    stream_id,
+                    SocketAddr::new(dest_ip, dest_port),
+                ));
+                registry.lock().unwrap().insert(stream_id, activity.clone());
+                let registry = registry.clone();
                 tokio::spawn(async move {
-                    handle_stream(stream_id, dest_ip, dest_port, stream_rx, wtx).await;
+                    handle_stream(stream_id, dest_ip, dest_port, stream_rx, wtx, &activity).await;
+                    let mut open = registry.lock().unwrap();
+                    // A stream id the guest has reused since names another stream.
+                    if open
+                        .get(&stream_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &activity))
+                    {
+                        open.remove(&stream_id);
+                    }
                 });
             }
             FRAME_DATA | FRAME_CLOSE | FRAME_RST => {
@@ -251,6 +400,7 @@ async fn handle_stream(
     dest_port: u16,
     mut stream_rx: mpsc::Receiver<(u8, Vec<u8>)>,
     writer_tx: mpsc::Sender<Vec<u8>>,
+    activity: &Arc<StreamActivity>,
 ) {
     // Connect to real destination (works for both IPv4 and IPv6)
     let tcp = match TcpStream::connect((dest_ip, dest_port)).await {
@@ -267,6 +417,7 @@ async fn handle_stream(
         }
     };
 
+    activity.connected.store(true, Ordering::Relaxed);
     // Send OPEN_OK
     send_frame(&writer_tx, stream_id, FRAME_OPEN_OK, &[]).await;
 
@@ -275,6 +426,7 @@ async fn handle_stream(
     // TCP → vsock: read from TCP, send DATA frames.
     // send_frame().await blocks when writer channel is full → backpressure to TCP read.
     let wtx = writer_tx.clone();
+    let down = activity.clone();
     let tcp_to_vsock = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
         loop {
@@ -282,6 +434,7 @@ async fn handle_stream(
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            StreamActivity::record(&down.from_dest, &down.last_from_dest_ms, n);
             if !send_frame(&wtx, stream_id, FRAME_DATA, &buf[..n]).await {
                 break; // Writer channel closed (vsock died)
             }
@@ -291,10 +444,14 @@ async fn handle_stream(
     });
 
     // vsock → TCP: receive DATA frames, write to TCP
+    let up = activity.clone();
     let vsock_to_tcp = tokio::spawn(async move {
         while let Some((frame_type, payload)) = stream_rx.recv().await {
             match frame_type {
                 FRAME_DATA => {
+                    // Recorded before the write, so bytes the destination has read are
+                    // always counted.
+                    StreamActivity::record(&up.to_dest, &up.last_to_dest_ms, payload.len());
                     if tcp_wr.write_all(&payload).await.is_err() {
                         break;
                     }
@@ -325,4 +482,82 @@ async fn send_frame(
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(payload);
     writer_tx.send(frame).await.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(stream_id: u32, frame_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = stream_id.to_le_bytes().to_vec();
+        frame.extend([frame_type, 0]);
+        frame.extend((payload.len() as u32).to_le_bytes());
+        frame.extend(payload);
+        frame
+    }
+
+    async fn read_frame(guest: &mut UnixStream) -> (u8, Vec<u8>) {
+        let mut header = [0u8; FRAME_HEADER_SIZE];
+        guest.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        guest.read_exact(&mut payload).await.unwrap();
+        (header[4], payload)
+    }
+
+    /// A request the destination never answers is reported once, with the bytes written
+    /// to it and none read back, and a reply ends the wait. Each count is recorded before
+    /// the step the test waits on, and the scan is handed a clock past the threshold, so
+    /// nothing here depends on timing.
+    #[tokio::test]
+    async fn a_request_its_destination_never_answers_is_reported_once_with_its_bytes() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = destination.local_addr().unwrap().port();
+        let (mut guest, host) = UnixStream::pair().unwrap();
+        let registry = ActivityRegistry::default();
+        let session = tokio::spawn(relay_mux_session(host, registry.clone()));
+
+        let mut open = vec![AF_INET, 127, 0, 0, 1];
+        open.extend(port.to_be_bytes());
+        guest.write_all(&frame(7, FRAME_OPEN, &open)).await.unwrap();
+        let (mut server, _) = destination.accept().await.unwrap();
+        assert_eq!(read_frame(&mut guest).await.0, FRAME_OPEN_OK);
+
+        let request = b"GET /v2/ HTTP/1.1\r\n\r\n";
+        guest
+            .write_all(&frame(7, FRAME_DATA, request))
+            .await
+            .unwrap();
+        let mut received = vec![0u8; request.len()];
+        server.read_exact(&mut received).await.unwrap();
+
+        let threshold = STALL_REPORT_AFTER.as_millis() as u64;
+        let lines = newly_stalled(&registry, now_ms() + threshold, threshold);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains(&format!("stream 7 to 127.0.0.1:{port} awaiting a reply")),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("wrote {} B to it", request.len())),
+            "{line}"
+        );
+        assert!(line.contains("read 0 B from it (last never)"), "{line}");
+        assert!(
+            newly_stalled(&registry, now_ms() + threshold, threshold).is_empty(),
+            "one wait was reported twice"
+        );
+
+        let reply = b"HTTP/1.1 401 Unauthorized\r\n\r\n";
+        server.write_all(reply).await.unwrap();
+        assert_eq!(read_frame(&mut guest).await, (FRAME_DATA, reply.to_vec()));
+        assert!(
+            newly_stalled(&registry, now_ms() + threshold, threshold).is_empty(),
+            "an answered request is still reported"
+        );
+
+        drop(guest);
+        session.await.unwrap().unwrap();
+    }
 }
