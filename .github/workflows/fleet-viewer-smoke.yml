@@ -73,11 +73,17 @@ jobs:
       group: fleet-viewer-smoke
       cancel-in-progress: false
     steps:
+      # As ci.yml's self-hosted jobs: a privileged run can leave root-owned files in the workspace.
+      - name: Fix workspace permissions (pre-checkout)
+        run: sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: fcvm
           persist-credentials: false
       - name: Install ffmpeg (the smoke decodes each tile's first picture)
-        run: command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg)
+        run: |
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y -q --no-install-recommends ffmpeg
       - name: Every mode over IPv6, take-over
         env:
           STAGING_API_URL: ${{ vars.STAGING_API_URL }}
@@ -86,7 +92,7 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -o pipefail
-          python3 -B fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+          python3 -B fcvm/fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: Failing tiles to the job summary
         if: ${{ failure() }}
         run: |
