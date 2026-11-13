@@ -59,15 +59,30 @@ def associated_priority(sha, token, fetch=github_json):
 
 
 def not_requestable(sha, token, fetch=github_json):
-    """Why this revision cannot enter the factory now, or None. The factory takes only the
-    current main revision with successful CI. A CI run that completes after the next merge
-    asks for a revision main has moved past, and the weekly schedule can fire while main's
-    newest CI is still running; in both cases the newer revision's own CI completion asks
-    for its image, so this request is not needed."""
+    """Why this revision should not be requested now, or None.
+
+    The head of main: skipped while its own CI still runs (the weekly schedule can fire then),
+    since that CI's completion requests it. A revision main has moved past: requested, because
+    the factory admits a recent ancestor of main with its own successful CI. Skipping it waited
+    for the newer revision's CI to complete, and on a busy main every merge cancels the CI run
+    before it (ci.yml's concurrency), so from 2026-11-12 21:16 no request was sent for a day
+    while two revisions passed CI (ejc3/aws#823). It is skipped only when a newer revision of
+    main has passed CI too, whose completion requested its own image."""
     head = fetch("git/ref/heads/main", token).get("object", {}).get("sha")
     need(isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head), "Invalid main revision")
     if head != sha:
-        return "main has moved on to " + head + ", whose CI completion requests its image"
+        runs = fetch("actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20", token)
+        runs = runs.get("workflow_runs")
+        need(isinstance(runs, list), "Invalid CI runs")
+        for run in runs:
+            newer = run.get("head_sha")
+            if run.get("conclusion") != "success" or newer == sha or not (
+                    isinstance(newer, str) and re.fullmatch(r"[0-9a-f]{40}", newer)):
+                continue
+            comparison = fetch("compare/" + sha + "..." + newer, token)
+            if comparison.get("status") == "ahead" and comparison.get("behind_by") == 0:
+                return "main's newer revision " + newer + " passed CI and requested its own image"
+        return None
     runs = fetch("actions/workflows/ci.yml/runs?branch=main&head_sha=" + sha + "&per_page=20", token)
     runs = runs.get("workflow_runs")
     need(isinstance(runs, list), "Invalid CI runs")
