@@ -130,11 +130,20 @@ impl StreamActivity {
         }
     }
 
-    /// Before a write of `n` bytes to the destination; [`Self::record`] with [`SENT`] once
-    /// it has completed.
+    /// Before a write of `n` bytes to the destination. The request is the latest event from
+    /// here on: a reply can arrive before the write returns, and must then stay the latest.
     fn begin_write(&self, n: usize) {
+        let now = now_ms() + 1;
         self.pending.store(n as u64, Ordering::Relaxed);
-        self.writing_since_ms.store(now_ms() + 1, Ordering::Relaxed);
+        self.writing_since_ms.store(now, Ordering::Relaxed);
+        self.last_to_dest_ms.store(now, Ordering::Relaxed);
+        self.last_direction.store(SENT, Ordering::Relaxed);
+    }
+
+    /// After the write [`Self::begin_write`] began has returned: its bytes are written.
+    fn end_write(&self, n: usize) {
+        self.to_dest.fetch_add(n as u64, Ordering::Relaxed);
+        self.writing_since_ms.store(0, Ordering::Relaxed);
     }
 
     fn record(&self, direction: u8, n: usize) {
@@ -498,8 +507,7 @@ async fn handle_stream(
                     if tcp_wr.write_all(&payload).await.is_err() {
                         break;
                     }
-                    up.writing_since_ms.store(0, Ordering::Relaxed);
-                    up.record(SENT, payload.len());
+                    up.end_write(payload.len());
                 }
                 FRAME_CLOSE | FRAME_RST => break,
                 _ => {}
@@ -612,6 +620,24 @@ mod tests {
         writer.abort();
         drop(guest_rd);
         session.abort();
+    }
+
+    /// A reply can be read before the relay's write of the request returns. Finishing the
+    /// write's bookkeeping afterwards must not make the reply look older than the request.
+    #[test]
+    fn a_reply_read_before_the_write_returns_still_answers_it() {
+        let stream = StreamActivity::new(9, "127.0.0.1:443".parse().unwrap());
+        stream.connected.store(true, Ordering::Relaxed);
+        stream.begin_write(30);
+        stream.record(RECEIVED, 20);
+        stream.end_write(30);
+        let threshold = STALL_REPORT_AFTER.as_millis() as u64;
+        assert_eq!(
+            stream.waiting_on(now_ms() + threshold, threshold),
+            None,
+            "an answered request was reported as waiting"
+        );
+        assert_eq!(stream.to_dest.load(Ordering::Relaxed), 30);
     }
 
     /// A request written in the millisecond the previous reply arrived carries the same
