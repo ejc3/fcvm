@@ -38,9 +38,11 @@ of a running server next to its source.
 ## The server: Pumpkin
 
 [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin) is a Minecraft Java Edition server written in
-Rust, GPL-3.0, pushed to daily. It is run unmodified, built from a pinned upstream commit
-(`PUMPKIN_COMMIT` in the Makefile, `3ea7d281` of 2026-11-08, which speaks Java Edition 26.3,
-protocol 777, and only that). Its README now lists world saving, lighting and world borders as
+Rust, GPL-3.0, pushed to daily. It is built from a pinned commit of the ejc3/Pumpkin fork
+(`PUMPKIN_COMMIT` in the Makefile, `1aa35ecc`): upstream `3ea7d281` of 2026-11-08, which speaks
+Java Edition 26.3, protocol 777, and only that, plus one commit that closes a connection which
+does not finish logging in within `login_timeout` (upstream holds it for as long as the client
+keeps it open; "Public joins" below). Its README now lists world saving, lighting and world borders as
 done; chunk generation, redstone, combat and commands are partly done. The demo needs what it has:
 world generation from a seed, chunk sending, movement, block placing and breaking, the tab list
 and creative mode.
@@ -159,7 +161,7 @@ fcvm's lockfile.
 
 - **Pumpkin** is GPL-3.0. The image carries its licence and a notice naming the repository and
   commit it was built from, and the build fetches that exact commit, so the source of every
-  binary is public. Nothing of it is changed.
+  binary is public. The one change from upstream, the login timeout, is public in ejc3/Pumpkin.
 - **azalea** is MIT. Both fixes are public in `ejc3/azalea`; both bugs are reported upstream in
   azalea-rs/azalea#404.
 - **No Mojang asset.** The page draws flat colours of our own; the image holds no client or
@@ -170,13 +172,62 @@ fcvm's lockfile.
   ends. A public player reaches only the Java listener: the fleet security group admits TCP
   25565 over IPv6 and nothing else of the server's beyond the view socket (on 443 over IPv6,
   and on its port of the host's IPv4 range over IPv4), and Pumpkin's
-  query, management, proxy, LAN and Bedrock services are off by name. At most 20 players join a
-  server, and Pumpkin's packet limiter is on. The page and the coordinator stay behind
-  Cloudflare Access.
+  query, management, proxy, LAN and Bedrock services are off by name. "Public joins" below has the
+  limits on a source and on a server. The page and the coordinator stay behind Cloudflare Access.
 - **The density comparison** runs Mojang's vanilla server and Paper beside Pumpkin, on the
   bench box only, with Mojang's EULA accepted there by the owner's decision (2026-11-08,
   "Compare is fine for research"). The jars are downloaded on that box and are never in git, a
   published image, a staging tile or the page.
+
+## Public joins (TCP 25565)
+
+The owner chose open joins in offline mode (2026-11-08). The fleet security group admits TCP 25565
+over IPv6 (ejc3/aws, `minecraft_public_join`, on by default), so anyone with a Java Edition 26.3
+client can reach a Minecraft server at its tile's address. This section is the scope of that
+opening: what answers, what limits a source, what a player can reach, and how to close it.
+
+**What answers.** Pumpkin, at the pinned commit of the ejc3/Pumpkin fork (upstream plus the login
+timeout below), in offline mode, speaking Java Edition 26.3 and nothing else, on the Minecraft VMs
+only. Nothing else in a Minecraft VM or on a host listens on 25565, and Pumpkin's query,
+management, proxy, LAN and Bedrock services are off by name
+(`the_config_is_offline_creative_and_reaches_nowhere`). Every other port of a VM is closed to the
+internet by the security group, except the tile's view socket (443 over IPv6, and its port of the
+host's IPv4 range over IPv4).
+
+**Limits**, each enforced by code and covered by a test that fails without it:
+
+| Limit | Value | Where | Test |
+|---|---|---|---|
+| Open connections per source /64 | 4 | the host's `FCVM-MC-JOIN` chain (`ip6tables` connlimit), reached from `FORWARD` for TCP 25565 | `one_source_holds_at_most_the_open_connection_cap` |
+| New connections per source /64 | a burst of 6, then 12 a minute | the same chain (hashlimit) | `one_source_opens_at_most_its_burst_of_new_connections_at_once` |
+| Players per server | 20, the tile's three bots among them | Pumpkin's `max_players` | `the_tile_caps_its_players_and_closes_a_login_that_does_not_finish` |
+| Login (handshake, login and configuration) | 15 s, then the connection is closed | Pumpkin's `login_timeout` (the fork's; upstream has none) | the same, and the fork's `pumpkin-tester` check `login timeout` |
+| Packets per connection | Pumpkin's packet limiter, on | Pumpkin | `the_config_is_offline_creative_and_reaches_nowhere` |
+
+A source is counted by its /64 because an IPv6 subscriber usually holds a whole /64. The agent
+installs the chain at every start, before any server, and does not start when it cannot
+(`src/fleet/agent/joinguard.rs`). Over the limits a connection is reset, not dropped, so a client
+sees the refusal at once.
+
+**Blast radius.** A player who gets past Pumpkin's protocol handling is inside one Minecraft VM:
+- The VM is its own fcvm microVM in routed mode. A Windows sandbox's network namespace has no
+  route out (`an_isolated_namespace_has_no_way_out`), and the cross-VM check found no Minecraft
+  VM port reachable from a sandbox. Minecraft VMs are reachable from the host and from other
+  routed VMs on 22, 111 and 8080 (the guest's own services and the tile's plain port), which the
+  security group does not admit from outside.
+- Every server is restored from the gold snapshot on Reset, when a borrow ends, and on the
+  schedule (`AUTO_RESET_MS`, 30 minutes), so nothing a player builds or breaks survives long.
+- The guest holds no credential: no instance role is reachable from it (routed VMs have no route to
+  the metadata service), and the only file the host maps in is the fleet's TLS certificate for the
+  tile's view socket, read-only.
+
+**Closing it.** `minecraft_public_join = false` in the ejc3/aws fleet module removes the
+security group's 25565 rule in every region with one apply. No new image, agent change or restart
+is needed, and the servers, their tiles and the page keep running for viewers.
+
+**Checking it.** Once the rule is applied, a port scan from outside the fleet must find only 25565
+and 443 answering on a Minecraft VM's address, and a load test from one source must see its
+fifth open connection and its seventh new connection in a burst reset.
 
 ## Density
 

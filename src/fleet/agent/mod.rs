@@ -4,6 +4,7 @@
 pub mod addr;
 pub mod dial;
 pub mod inventory;
+pub mod joinguard;
 pub mod minecraft;
 pub mod potato;
 pub mod slot;
@@ -552,6 +553,10 @@ where
             prefix.slot_address(base + m.count as usize)?,
             mc_places.first().and_then(|p| p.tls_port),
         ));
+        // The servers take public joins (TCP 25565 over IPv6, routed through this host): no server
+        // starts without the per-source limits in place (joinguard.rs).
+        joinguard::install("FORWARD", joinguard::JOIN_PORT)
+            .context("installing the public join limits for Minecraft mode")?;
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
     out.send(AgentMsg::Hello {

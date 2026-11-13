@@ -617,11 +617,12 @@ potato-image: cargo-target-link
 	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile "$$ctx/" && \
 	podman build --squash-all -t $(POTATO_IMAGE) -f "$$ctx/Containerfile" "$$ctx"
 
-# The Minecraft mode's tile (fleet/minecraft, docs/fleet/minecraft.md): Pumpkin built unmodified
-# from PUMPKIN_COMMIT, and mctile. Its own Cargo workspace on its own pinned toolchains (azalea,
-# the bot client, needs nightly); the build runs in the image and runs mctile's tests first.
+# The Minecraft mode's tile (fleet/minecraft, docs/fleet/minecraft.md): Pumpkin built from
+# PUMPKIN_COMMIT of the ejc3/Pumpkin fork (upstream plus a login timeout), and mctile. Its own
+# Cargo workspace on its own pinned toolchains (azalea, the bot client, needs nightly); the build
+# runs in the image and runs mctile's tests first.
 MINECRAFT_IMAGE ?= localhost/fcvm-minecraft:dev
-PUMPKIN_COMMIT ?= 3ea7d281654a03fdc4f4fee43734c098acd1fb52
+PUMPKIN_COMMIT ?= 1aa35ecca1e35a44d6fe7f10acb11d7750f8fc36
 # The one Java Edition version that commit speaks (its pumpkin-data CURRENT_MC_VERSION).
 MINECRAFT_JAVA_VERSION ?= 26.3
 # The podman that builds it. The fleet host recipe builds into root's store with
