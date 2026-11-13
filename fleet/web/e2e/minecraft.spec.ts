@@ -101,8 +101,12 @@ test("each tile draws its world from its own view socket, and says its slot, tic
   if (!isPhone(info)) {
     expect(await page.getByTestId("mc-join").evaluate((el) => el.getBoundingClientRect().height)).toBeLessThan(40);
   }
-  // the tab says which mode it is
+  // the tab says which mode it is, and a mode that is not one keeps the wall's title
   await expect(page).toHaveTitle("Minecraft");
+  const other = await page.context().newPage();
+  await other.goto("/?mode=constructor");
+  await expect(other).toHaveTitle("Every GPU, live");
+  await other.close();
   await expect(page.getByTestId("mc-panel")).toHaveCount(0);
   const dir = process.env.FLEET_SCREENSHOT_DIR;
   if (dir) await page.screenshot({ path: `${dir}/minecraft-${isPhone(info) ? "phone" : "desktop"}.png` });
@@ -275,8 +279,16 @@ test("a server whose view cannot be reached says so on its tile with a Retry, ca
     for (const slot of SLOTS) {
       await expect(page.getByTestId(`mc-stream-${slot}`)).toContainText(`Cannot reach ${slot}'s view. Trying again.`, { timeout: 10_000 });
       await expect(page.getByTestId(`mc-stream-retry-${slot}`)).toBeVisible();
+
       await expect(page.getByTestId(`mc-take-${slot}`)).toBeDisabled();
     }
+    // The browser's own accessibility tree holds each Retry and each message: inside an element
+    // with role img they would be presentational, and a screen reader would hear only the label.
+    const cdp = await page.context().newCDPSession(page);
+    const { nodes } = (await cdp.send("Accessibility.getFullAXTree")) as { nodes: { ignored: boolean; role?: { value: string }; name?: { value: string } }[] };
+    const exposed = nodes.filter((n) => !n.ignored);
+    expect(exposed.filter((n) => n.role?.value === "button" && n.name?.value === "Retry")).toHaveLength(SLOTS.length);
+    for (const slot of SLOTS) expect(exposed.some((n) => n.role?.value === "StaticText" && n.name?.value === `Cannot reach ${slot}'s view. Trying again.`), slot).toBe(true);
   } finally {
     await admin("/mock/fault", { minecraft_down: false });
   }
@@ -291,6 +303,11 @@ test("a handshake that never answers is given up after the deadline, and Retry s
   try {
     await page.goto("/?mode=minecraft&debug=1");
     await page.waitForFunction(() => window.__minecraft !== undefined);
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
+    // Retry under the same fault starts over: the tile says it is connecting again, without Retry
+    await page.getByTestId("mc-stream-retry-mc-1").click();
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Connecting to mc-1.", { timeout: 1000 });
+    await expect(page.getByTestId("mc-stream-retry-mc-1")).toHaveCount(0);
     await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
   } finally {
     await admin("/mock/fault", { minecraft_hang: false });

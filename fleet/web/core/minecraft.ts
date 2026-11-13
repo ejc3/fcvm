@@ -1001,19 +1001,24 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
         ? [[held.id, heldLayout(area, held.id, inp.narrow, inp.dpr)]]
         : layoutCaptioned({ area, tiles: m.tiles, imageAspect: m.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }, MINECRAFT_CAPTIONS).map((b) => [b.id, b]),
   );
+  const first = viewFirstMessage(s);
   /** What a running tile's stream says while its world is not in, and whether it failed. */
   const streamOf = (t: MinecraftTile, wanted: boolean): { text: string | null; failed: boolean } => {
     const slot = serverName(t);
     const live = inp.live[t.id];
     if (t.phase !== "running") return { text: null, failed: false };
     if (live?.open === true) return { text: live.hasMap ? null : `Loading ${slot}'s world.`, failed: false };
-    if (!wanted) return { text: s.net.family === null ? "Finding the way to the servers." : `${slot} has no address this network can reach.`, failed: s.net.family !== null };
+    // No socket to open: nothing to retry, so never a failure with a Retry.
+    if (!wanted) {
+      if (first === null) return { text: s.admission?.locked === true ? "No direct seat for this page: the worlds stay dark until one is free." : `Waiting for the fleet to admit this page.`, failed: false };
+      if (s.net.family === null) return { text: "Finding the way to the servers.", failed: false };
+      return { text: `${slot} has no ${s.net.family === "v6" ? "IPv6" : "IPv4"} address yet.`, failed: false };
+    }
     const since = live?.connectingSince ?? null;
     const late = since !== null && inp.now - since >= MC_CONNECT_DEADLINE_MS;
     if ((live?.failures ?? 0) > 0 || late) return { text: `Cannot reach ${slot}'s view. Trying again.`, failed: true };
     return { text: `Connecting to ${slot}.`, failed: false };
   };
-  const first = viewFirstMessage(s);
   const cards: MinecraftCard[] = m.tiles.map((t) => {
     const p = placed.get(t.id);
     const slot = serverName(t);

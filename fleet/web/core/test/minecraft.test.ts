@@ -709,6 +709,19 @@ describe("a tile whose view is not coming in", () => {
     expect(viewOf(minecraftOf(2), { live: {} }).cards[0]!.stream).toBe("Connecting to mc-1.");
   });
 
+  it("with no socket to open, says why and offers no Retry: there is nothing to retry", () => {
+    // no address in the family the page settled on
+    const m = minecraftOf(2);
+    m.tiles[0]!.frame_url = null;
+    const c = viewOf(m, { live: {} }).cards[0]!;
+    expect([c.socket, c.stream, c.streamFailed]).toEqual([null, "mc-1 has no IPv6 address yet.", false]);
+    // no direct seat: the banner says so, and the tile does not blame the network
+    const locked = minecraftView(input(stateWith(minecraftOf(2), "v-1", { type: "admission", seat: null, locked: true, reason: "Direct streams are full.", direct: null, broadcast: null, seat_free: false }), { live: {} })).cards[0]!;
+    expect(locked.socket).toBeNull();
+    expect(locked.streamFailed).toBe(false);
+    expect(locked.stream).not.toMatch(/address/);
+  });
+
   it("cannot be taken over while this page is not connected to it: the turn would run with nothing to drive", () => {
     const c = viewOf(minecraftOf(2), { live: { ...LIVE(2), "mc:2": closed(3, NOW - 9000) } as MinecraftInput["live"] }).cards;
     expect(c[0]!.take.disabled).toBe(false);

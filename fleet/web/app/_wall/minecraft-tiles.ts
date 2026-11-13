@@ -158,6 +158,10 @@ class TileSocket {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.attempt = 0;
+    // a fresh attempt: the tile says it is connecting again until this one fails or runs out
+    this.failures = 0;
+    this.connectingSince = now();
+    this.owner.changed();
     this.connect();
   }
 

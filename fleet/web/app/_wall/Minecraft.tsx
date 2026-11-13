@@ -521,8 +521,11 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       <div className="win-layer mc-layer">
         {view.cards.map((c) =>
           c.box ? (
-            <div key={c.id} className={`mc-tile${c.mine ? " mine" : ""}`} style={at(c.box)} data-testid={`mc-tile-${c.slot}`} data-phase={c.dark ? "dark" : "live"} role="img" aria-label={c.ariaLabel}>
+            <div key={c.id} className={`mc-tile${c.mine ? " mine" : ""}`} style={at(c.box)} data-testid={`mc-tile-${c.slot}`} data-phase={c.dark ? "dark" : "live"}>
+              {/* the picture is the canvas: the stream message and its Retry stay outside it, in reach of a screen reader */}
               <canvas
+                role="img"
+                aria-label={c.ariaLabel}
                 ref={(el) => {
                   if (el) canvases.current.set(c.id, el);
                   else canvases.current.delete(c.id);

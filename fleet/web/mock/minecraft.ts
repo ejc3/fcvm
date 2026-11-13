@@ -272,7 +272,10 @@ export class MockMinecraft {
       }
       // Tests: a handshake that is never answered (the connection stays open, silent).
       if (this.hang) {
-        this.hung.push(socket);
+        this.hung.add(socket);
+        // the page drops a pending connect with a reset: no handler would make that fatal here
+        socket.on("error", () => {});
+        socket.on("close", () => this.hung.delete(socket));
         return;
       }
       // Tests: no view socket can be reached at all.
@@ -328,7 +331,7 @@ export class MockMinecraft {
   }
 
   private hang = false;
-  private hung: import("node:stream").Duplex[] = [];
+  private hung = new Set<import("node:stream").Duplex>();
   /**
    * Tests: leave every new view socket's handshake unanswered. Turning it off answers new ones
    * again and leaves the held ones hanging, as a lost packet would: only the page can end them.
@@ -851,6 +854,8 @@ export class MockMinecraft {
       if (s.borrow) clearTimeout(s.borrow.timer);
       for (const v of s.sockets) v.ws.terminate();
     }
+    for (const s of this.hung) s.destroy();
+    this.hung.clear();
     this.wss.close();
     await new Promise<void>((r) => this.http.close(() => r()));
   }

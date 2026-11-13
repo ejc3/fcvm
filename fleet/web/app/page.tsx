@@ -19,7 +19,7 @@ const MODE_TITLES: Readonly<Record<string, string>> = { phones: "Phones", potato
 
 export async function generateMetadata({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }): Promise<Metadata> {
   const { mode } = await searchParams;
-  const title = typeof mode === "string" ? MODE_TITLES[mode] : undefined;
+  const title = typeof mode === "string" && Object.hasOwn(MODE_TITLES, mode) ? MODE_TITLES[mode] : undefined;
   return title === undefined ? {} : { title };
 }
 
