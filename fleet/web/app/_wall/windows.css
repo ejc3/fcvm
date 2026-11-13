@@ -9,6 +9,8 @@
 .win-page .win-top .brand h1 { font-size: 24px; }
 .win-stats { display: flex; flex-wrap: wrap; gap: 2px 18px; font: 500 14px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8); }
 .win-warning, .win-refused, .win-gold { margin: 0; font-size: 14px; max-width: 80ch; }
+/* The evaluation notice, once on the page. */
+.win-label { margin: 0; font-size: 13px; color: var(--muted); text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8); }
 .win-warning, .win-gold { color: var(--fcvm-soft); }
 .win-refused { color: var(--refused); }
 /* The room the desktops are laid out in, measured by the page. */
@@ -23,6 +25,14 @@
 .win-hit .dark { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 6px; }
 .win-hit .timer { font: 500 18px/1 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); }
 .win-hit .error { font: 400 13px/1.3 var(--sans); color: var(--refused); overflow-wrap: anywhere; }
+/* A running sandbox whose desktop is not drawn: connecting, can't reach or retrying. Not `.link`:
+   wall.css's .link (a text button) would underline it and shrink it to its words. */
+.win-hit .win-link { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 8px 8px 44px; text-align: center; background: rgba(6, 8, 11, 0.6); border: 1px solid var(--line); border-radius: 4px; }
+.win-hit .win-link .text { font: 500 15px/1.3 var(--sans); color: var(--text); }
+.win-hit .win-link .detail { font: 500 13px/1.3 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); }
+.win-hit .win-link.unreachable .text, .win-hit .win-link.retrying .text { color: var(--fcvm-soft); }
+/* Retry sits over the tile's bottom edge, above the hit area (a click on the tile resets it). */
+.win-retry { min-height: 28px; padding: 0 12px; font-size: 13px; position: absolute; transform: translate(-50%, -100%); pointer-events: auto; z-index: 1; background: rgba(11, 13, 16, 0.85); }
 
 .win-caption { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; pointer-events: none; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8); }
 /* The row wraps: on a phone the slot and the time take the first line and Take over the next,
@@ -31,14 +41,12 @@
 .win-caption .slot { flex: none; white-space: nowrap; font: 600 14px var(--mono); color: var(--fcvm); }
 .win-caption .in { font: 500 13px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
 .win-caption .take { flex: none; margin-left: auto; min-height: 28px; padding: 0 10px; font-size: 13px; white-space: nowrap; pointer-events: auto; background: rgba(11, 13, 16, 0.55); }
-.win-caption .edition { margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.win-caption .label { margin: 0; font-size: 11px; line-height: 1.3; color: var(--muted); overflow-wrap: anywhere; }
-.win-caption .lent { margin: 0; font-size: 11px; color: var(--fcvm-soft); }
+.win-caption .lent { margin: 0; font-size: 11px; line-height: 1.3; color: var(--fcvm-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .win-caption.compact .row { flex-direction: column; align-items: flex-start; gap: 0; }
 .win-caption.compact .slot { font-size: 12px; }
 .win-caption.compact .in { font-size: 9px; }
 .win-caption.compact .row > * { min-width: 0; }
-.win-caption.compact .label { font-size: 9px; line-height: 1.2; }
+.win-caption.compact .lent { font-size: 9px; }
 .win-caption.compact .take { min-height: 22px; padding: 0 6px; font-size: 11px; margin-left: 0; }
 
 .win-banner, .win-empty, .win-notice { position: fixed; z-index: 4; left: 50%; transform: translateX(-50%); width: max-content; max-width: min(560px, 92vw); padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); font-size: 15px; }

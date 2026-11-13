@@ -114,11 +114,14 @@ between the seamless picture and the phones apart in bezels is the fleet's (`pho
 every viewer sees it move; the phone a viewer has opened is that viewer's own.
 
 `/?mode=windows` shows the Windows sandboxes (PROTOCOL.md, "Windows mode"): each sandbox's desktop
-drawn from its own stream (one row of up to four 16:9 tiles, then rows of equal length), labelled
-with its slot, the image's edition, "Desktop in X.XX s" (click to first desktop frame) and
-"Windows Server 2025 evaluation, for demonstration only". The header gives the sandboxes up, the
-median and slowest time to desktop, the last "Reset all", and the image's warning, refusal and
-gold snapshot state. Clicking a tile resets that sandbox (`windows_reset`) and it shows a running
+drawn from its own stream (16:9 tiles in the number of columns that makes them largest, centred in
+the room under the header), labelled with its slot and "Desktop in X.XX s" (click to first desktop
+frame). A tile whose stream has not drawn says it is connecting, or that it cannot reach the
+desktop over the viewer's address family and when it tries again (a frame socket that has not
+opened in 5 s is closed and tried again). The header gives the sandboxes up, the median and
+slowest time to desktop, the last "Reset all", the image's edition, build and age, its warning,
+refusal and gold snapshot state, and, once on the page, "Windows Server 2025 evaluation, for
+demonstration only". Clicking a tile resets that sandbox (`windows_reset`) and it shows a running
 timer until its desktop is back; "Reset all" resets every sandbox. "Take over" borrows one
 (`claim_windows`) and opens a panel of the fixed actions its host lists, plus Reset and Give back.
 There is no free input: nothing typed or pointed at reaches Windows. The mock has none unless

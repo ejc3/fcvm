@@ -37,6 +37,19 @@ export function afterLiveFailure(t: LiveTry, count: number): { next: LiveTry; no
   return { next: { index: (t.index + 1) % count, failedInRow }, now: true };
 }
 
+/**
+ * How long frame socket attempt `attempt` (0-based, counting failures since the stream last
+ * decoded a frame) may take to open before it is closed and retried: 5 s, then 10 s, then 20 s.
+ * A connect whose packets are dropped is never refused, and Chrome's own connect timeout is
+ * minutes: a Windows sandbox's IPv4 port that a security group dropped left its tile black with
+ * nothing to say why (staging, 2026-11-13). A working frame socket opened in 186 to 243 ms over
+ * either family from a browser on a dev box (staging GPU tiles, 2026-11-13), so 5 s is twenty
+ * times the slower; the doubling gives a slow link more time on each try.
+ */
+export function frameOpenDeadlineMs(attempt: number): number {
+  return 5000 * 2 ** Math.max(0, Math.min(attempt, 2));
+}
+
 /** A frame socket URL: frame_url with h set, and q when it is not the default. */
 export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" | "std" | "lo" = "std"): string {
   const [base, query = ""] = frameUrl.split("?", 2) as [string, string?];
