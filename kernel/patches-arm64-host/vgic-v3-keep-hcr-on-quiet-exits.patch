@@ -1,6 +1,6 @@
-From 54575a2f46373ea8e84ed3b8f0ca77b94b2bbcb1 Mon Sep 17 00:00:00 2001
+From 4418427211884de18617100e0f96bdbeb2c1eb44 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Thu, 12 Nov 2026 18:06:43 +0000
+Date: Fri, 13 Nov 2026 03:05:29 +0000
 Subject: [PATCH] KVM: arm64: vgic: Do no vgic work on an exit with nothing in
  flight
 
@@ -9,14 +9,17 @@ Since 6.19 (the vgic-lr-overflow series, in particular dd598fc1139f
 interrupts" and 00c6d0d4a805 "KVM: arm64: GICv3: Decouple ICH_HCR_EL2
 programming from LRs"), every entry and exit runs the vgic flush and
 sync in full when no interrupt is in flight: the empty ap_list is walked
-under its lock to fill the LRs and again to prune it, ICH_HCR_EL2 is
-cleared and ICH_MISR_EL2 read on exit, and ICH_HCR_EL2 is written again
-on entry.
+under its lock to fill the LRs and again to prune it, the LRs are folded
+back, ICH_HCR_EL2 is cleared and ICH_MISR_EL2 read on exit, and
+ICH_HCR_EL2 is written again on entry.
 
 With an empty ap_list, compute the maintenance interrupt configuration
 from an empty summary without taking the lock, and do not prune. The
 list is checked without the lock, as before 6.19: an interrupt queued
-after the check makes a request and kicks the vcpu.
+after the check makes a request and kicks the vcpu. On GICv3, do not
+call vgic_fold_state() when no LR is in use and no interrupt is left
+past the LRs: vgic_v3_fold_lr_state() then only zeroes used_lrs, which
+is already zero.
 
 On VHE, leave ICH_HCR_EL2 programmed across an exit when no LR is in
 use and the value cannot raise a maintenance interrupt before the next
@@ -28,12 +31,14 @@ vgic_hcr_hw; vcpu load forgets it and vcpu put clears the register.
 
 fcvm #659: an in-kernel HVC exit on a c9g.metal-48xl host, one vCPU
 with a vGICv3, took 275.5 ns on 6.18.60, 313.7 ns on 7.3.3 and 295.8 ns
-with this patch; without a vGIC, 409.8, 460.3 and 416.3 ns.
+with this patch without the fold skip; without a vGIC, 409.8, 460.3 and
+416.3 ns. On a c8g.metal-48xl host the fold skip takes an SMC exit with
+a vGICv3 from 2058 to 2022 host instructions and 778 to 763 cycles.
 ---
  arch/arm64/kvm/hyp/vgic-v3-sr.c | 42 +++++++++++++++++++++++++++++++--
- arch/arm64/kvm/vgic/vgic.c      | 33 +++++++++++++++++++++++++-
+ arch/arm64/kvm/vgic/vgic.c      | 41 ++++++++++++++++++++++++++++++--
  include/kvm/arm_vgic.h          |  9 +++++++
- 3 files changed, 81 insertions(+), 3 deletions(-)
+ 3 files changed, 88 insertions(+), 4 deletions(-)
 
 diff --git a/arch/arm64/kvm/hyp/vgic-v3-sr.c b/arch/arm64/kvm/hyp/vgic-v3-sr.c
 index 74d4a50..5f4ffc6 100644
@@ -120,12 +125,21 @@ index 74d4a50..5f4ffc6 100644
  
  void __vgic_v3_save_aprs(struct vgic_v3_cpu_if *cpu_if)
 diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
-index 5cf5a1e..49c78b5 100644
+index 5cf5a1e..2b3bc3a 100644
 --- a/arch/arm64/kvm/vgic/vgic.c
 +++ b/arch/arm64/kvm/vgic/vgic.c
-@@ -1093,7 +1093,9 @@ void kvm_vgic_sync_hwstate(struct kvm_vcpu *vcpu)
+@@ -1091,9 +1091,17 @@ void kvm_vgic_sync_hwstate(struct kvm_vcpu *vcpu)
+ 	if (can_access_vgic_from_kernel())
+ 		vgic_save_state(vcpu);
  
- 	vgic_fold_state(vcpu);
+-	vgic_fold_state(vcpu);
++	/*
++	 * With no LR in use and no interrupt left past the LRs,
++	 * vgic_v3_fold_lr_state() has nothing to fold.
++	 */
++	if (kvm_vgic_global_state.type == VGIC_V2 || vgic_is_v5(vcpu->kvm) ||
++	    vcpu->arch.vgic_cpu.vgic_v3.used_lrs || *host_data_ptr(last_lr_irq))
++		vgic_fold_state(vcpu);
  
 -	if (!vgic_is_v5(vcpu->kvm))
 +	/* Nothing to prune on an empty ap_list. */
@@ -134,7 +148,7 @@ index 5cf5a1e..49c78b5 100644
  		vgic_prune_ap_list(vcpu);
  }
  
-@@ -1127,6 +1129,25 @@ static inline void vgic_restore_state(struct kvm_vcpu *vcpu)
+@@ -1127,6 +1135,25 @@ static inline void vgic_restore_state(struct kvm_vcpu *vcpu)
  		__vgic_v3_restore_state(&vcpu->arch.vgic_cpu.vgic_v3);
  }
  
@@ -160,7 +174,7 @@ index 5cf5a1e..49c78b5 100644
  static void vgic_flush_state(struct kvm_vcpu *vcpu)
  {
  	if (vgic_is_v5(vcpu->kvm)) {
-@@ -1134,6 +1155,16 @@ static void vgic_flush_state(struct kvm_vcpu *vcpu)
+@@ -1134,6 +1161,16 @@ static void vgic_flush_state(struct kvm_vcpu *vcpu)
  		return;
  	}
  
