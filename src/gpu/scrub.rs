@@ -326,29 +326,7 @@ fn scrub_device_marked(
 
     // Hold the group: while it is open no VM can open the GPU, and if a VM has
     // it open the kernel refuses this open with EBUSY.
-    let group = std::fs::read_link(device.join("iommu_group"))
-        .with_context(|| format!("GPU {sbdf} has no IOMMU group"))?;
-    let group = group
-        .file_name()
-        .with_context(|| format!("GPU {sbdf}: unreadable IOMMU group link"))?;
-    let group_node = dev.join("vfio").join(group);
-    let _group = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&group_node)
-    {
-        Ok(file) => file,
-        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
-            return Err(GpuBusy(format!(
-                "GPU {sbdf} is in use: {} is open (a VM still holds it)",
-                group_node.display()
-            ))
-            .into())
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("opening {}", group_node.display()))
-        }
-    };
+    let _group = hold_vfio_group(&device, dev, sbdf)?;
 
     before_touching()?;
     // Dropped in reverse order: memory decoding, then power control.
@@ -449,6 +427,33 @@ pub fn read_records(state_dir: &Path) -> Result<Vec<GpuRecord>> {
     }
     records.sort_by(|a, b| a.sbdf.cmp(&b.sbdf));
     Ok(records)
+}
+
+/// Open the GPU's VFIO group and hold it: a group has one opener, so while the returned file
+/// is open no VM can open the GPU, and a GPU a VM holds is refused with [`GpuBusy`]. `device`
+/// is the GPU's sysfs directory and `dev` the `/dev` the group node is under. The host scrub
+/// holds it across its reset, and so does a restore's early reset (src/gpu/reset.rs), which
+/// must never reset a GPU another VM is running on.
+pub fn hold_vfio_group(device: &Path, dev: &Path, sbdf: &str) -> Result<std::fs::File> {
+    let group = std::fs::read_link(device.join("iommu_group"))
+        .with_context(|| format!("GPU {sbdf} has no IOMMU group"))?;
+    let group = group
+        .file_name()
+        .with_context(|| format!("GPU {sbdf}: unreadable IOMMU group link"))?;
+    let group_node = dev.join("vfio").join(group);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&group_node)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Err(GpuBusy(format!(
+            "GPU {sbdf} is in use: {} is open (a VM still holds it)",
+            group_node.display()
+        ))
+        .into()),
+        Err(error) => Err(error).with_context(|| format!("opening {}", group_node.display())),
+    }
 }
 
 /// The GPU's lock file, `<state_dir>/<sbdf>.lock`. A scrub holds it

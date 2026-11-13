@@ -73,6 +73,7 @@ pub fn repair_reset_method(device: &Path) -> Result<String> {
 /// `reset` stands in for the sysfs write in tests.
 pub fn prepare_open(
     sysfs: &Path,
+    dev: &Path,
     sbdfs: &[String],
     host_scrubbed: bool,
     reset: &dyn Fn(&Path) -> Result<()>,
@@ -85,6 +86,10 @@ pub fn prepare_open(
         if repair_reset_method(&device)? != "bus" {
             continue;
         }
+        // The handoff orders fcvm's restores, not a VM that already runs: a second restore of
+        // a GPU in use must not reset it under that VM. Holding the group refuses a GPU a VM
+        // has open (as the load's own open would) and keeps any VM from opening it meanwhile.
+        let _group = crate::gpu::scrub::hold_vfio_group(&device, dev, sbdf)?;
         if !host_scrubbed {
             let started = Instant::now();
             reset(&device).with_context(|| format!("resetting GPU {sbdf}"))?;
@@ -114,7 +119,13 @@ impl EarlyReset {
     /// Start [`prepare_open`] for `sbdfs` with the sysfs reset.
     pub fn start(sbdfs: Vec<String>, host_scrubbed: bool) -> Result<Self> {
         Self::start_with(move || {
-            prepare_open(Path::new("/sys"), &sbdfs, host_scrubbed, &sysfs_reset)
+            prepare_open(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &sbdfs,
+                host_scrubbed,
+                &sysfs_reset,
+            )
         })
     }
 
@@ -160,6 +171,11 @@ mod tests {
         let device = root.join("bus/pci/devices").join(sbdf);
         std::fs::create_dir_all(&device).unwrap();
         std::fs::write(device.join("reset_method"), method).unwrap();
+        let group = root.join("kernel/iommu_groups").join(sbdf);
+        std::fs::create_dir_all(&group).unwrap();
+        std::os::unix::fs::symlink(&group, device.join("iommu_group")).unwrap();
+        std::fs::create_dir_all(root.join("dev/vfio")).unwrap();
+        std::fs::write(root.join("dev/vfio").join(sbdf), b"").unwrap();
         device
     }
 
@@ -173,7 +189,14 @@ mod tests {
     fn the_open_reset_is_turned_off_with_a_newline() {
         let root = tempfile::tempdir().unwrap();
         let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
-        let guard = prepare_open(root.path(), &["0000:18:00.0".into()], true, &|_| Ok(())).unwrap();
+        let guard = prepare_open(
+            root.path(),
+            &root.path().join("dev"),
+            &["0000:18:00.0".into()],
+            true,
+            &|_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(method(&device), "\n");
         drop(guard);
     }
@@ -185,10 +208,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
         let resets = std::cell::Cell::new(0);
-        let guard = prepare_open(root.path(), &["0000:18:00.0".into()], false, &|_| {
-            resets.set(resets.get() + 1);
-            Ok(())
-        })
+        let guard = prepare_open(
+            root.path(),
+            &root.path().join("dev"),
+            &["0000:18:00.0".into()],
+            false,
+            &|_| {
+                resets.set(resets.get() + 1);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(resets.get(), 1, "the GPU was not reset before the open");
         assert_eq!(
@@ -205,9 +234,13 @@ mod tests {
     fn a_host_scrubbed_gpu_is_not_reset_again() {
         let root = tempfile::tempdir().unwrap();
         let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
-        let guard = prepare_open(root.path(), &["0000:18:00.0".into()], true, &|_| {
-            panic!("a host-scrubbed GPU was reset again")
-        })
+        let guard = prepare_open(
+            root.path(),
+            &root.path().join("dev"),
+            &["0000:18:00.0".into()],
+            true,
+            &|_| panic!("a host-scrubbed GPU was reset again"),
+        )
         .unwrap();
         assert_eq!(method(&device).trim(), "");
         drop(guard);
@@ -224,6 +257,7 @@ mod tests {
         let resets = std::cell::Cell::new(0);
         let guard = prepare_open(
             root.path(),
+            &root.path().join("dev"),
             &["0000:18:00.0".into(), "0000:19:00.0".into()],
             false,
             &|_| {
@@ -251,10 +285,16 @@ mod tests {
         let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
         let sysfs = root.path().to_path_buf();
         let task = EarlyReset::start_with(move || {
-            prepare_open(&sysfs, &["0000:18:00.0".into()], false, &|_| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                Ok(())
-            })
+            prepare_open(
+                &sysfs,
+                &sysfs.join("dev"),
+                &["0000:18:00.0".into()],
+                false,
+                &|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    Ok(())
+                },
+            )
         })
         .unwrap();
         drop(task);
@@ -265,14 +305,44 @@ mod tests {
         );
     }
 
+    /// A GPU whose VFIO group cannot be held is never reset: the group is held before the
+    /// reset, as the host scrub holds it, so a GPU a running VM has open is refused (EBUSY on
+    /// hardware; here the group node is missing).
+    #[test]
+    fn a_gpu_whose_group_cannot_be_held_is_not_reset() {
+        let root = tempfile::tempdir().unwrap();
+        fake_gpu(root.path(), "0000:18:00.0", "bus\n");
+        std::fs::remove_file(root.path().join("dev/vfio/0000:18:00.0")).unwrap();
+        let error = prepare_open(
+            root.path(),
+            &root.path().join("dev"),
+            &["0000:18:00.0".into()],
+            false,
+            &|_| panic!("reset a GPU whose group was not held"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("opening"), "{error:#}");
+        let source = include_str!("reset.rs");
+        let body = &source[source.find("pub fn prepare_open(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.find("hold_vfio_group(").unwrap() < body.find("reset(&device)").unwrap(),
+            "the reset runs before the group is held"
+        );
+    }
+
     /// A reset that fails leaves the method as it was and fails the restore.
     #[test]
     fn a_failed_reset_changes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let device = fake_gpu(root.path(), "0000:18:00.0", "bus\n");
-        let error = prepare_open(root.path(), &["0000:18:00.0".into()], false, &|_| {
-            anyhow::bail!("no")
-        })
+        let error = prepare_open(
+            root.path(),
+            &root.path().join("dev"),
+            &["0000:18:00.0".into()],
+            false,
+            &|_| anyhow::bail!("no"),
+        )
         .unwrap_err();
         assert!(format!("{error:#}").contains("resetting GPU"));
         assert_eq!(method(&device), "bus\n");
