@@ -777,12 +777,27 @@ fn write_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     create_handoff_file(state_dir, sbdf)?;
     let secret = format!("{}:{}", boot_id()?, uuid::Uuid::new_v4().simple());
+    // Each file is created new with mode 0600, so no other user can hold a descriptor that
+    // reads the nonce; the token is opened up for emptying (`mode`) only once it is written.
     let write = |path: &Path, mode: u32| {
-        std::fs::File::create(path)
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
             .and_then(|mut file| {
-                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
                 file.write_all(secret.as_bytes())?;
-                file.sync_all()
+                file.sync_all()?;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
             })
             .with_context(|| format!("writing {}", path.display()))
     };
@@ -1295,6 +1310,30 @@ mod tests {
         );
         assert_eq!(failed.outcome, "failed");
         assert!(!token.exists(), "a failed scrub left a clean token");
+    }
+
+    /// The token and its key are created new with mode 0600 and written before the token is
+    /// opened up, so no other user can hold a descriptor that reads the nonce. A race on file
+    /// modes has no runtime test; the source pins it.
+    #[test]
+    fn the_clean_token_is_created_private_before_it_is_written() {
+        let source = include_str!("scrub.rs");
+        let start = source
+            .find("fn write_clean_token(")
+            .expect("no write_clean_token");
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("no `{needle}`"));
+        assert!(
+            !body.contains("File::create("),
+            "a file is created with the umask's mode"
+        );
+        assert!(at(".create_new(true)") < at(".mode(0o600)"));
+        assert!(at(".mode(0o600)") < at("file.write_all(secret.as_bytes())"));
+        assert!(
+            at("file.write_all(secret.as_bytes())")
+                < at("set_permissions(std::fs::Permissions::from_mode(mode))"),
+            "the token is opened up before its nonce is written"
+        );
     }
 
     /// A restore holding a GPU's handoff keeps every other restore of that GPU from starting
