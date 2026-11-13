@@ -2667,16 +2667,26 @@ async fn a_failed_state_write_is_kept_and_written_by_the_next_barrier() {
 /// A writer whose writes fail: shutdown asks again, and reports that the last state is not
 /// stored rather than counting it stored. A write that succeeds on a later attempt is
 /// reported stored.
-#[tokio::test]
+///
+/// The periodic store also writes a changed state, at start and once a second after, so the
+/// writer counts shutdown's attempts plus any periodic write that lands between the intent
+/// and the shutdown. Which store tick lands there used to depend on the scheduler (CI saw
+/// `(false, 4)`). The clock is paused here, so it moves only when the test advances it:
+/// the store tick at start is waited for before the intent, and between the intent and the
+/// shutdown runs exactly the one store tick the test places, or none.
+#[tokio::test(start_paused = true)]
 async fn shutdown_reports_a_last_state_that_was_not_stored() {
-    async fn run(fail_first: usize) -> (bool, usize) {
+    async fn run(fail_first: usize, store_tick_before_shutdown: bool) -> (bool, usize) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+        // One message per command the writer has handled: whether it carried a state.
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel::<bool>();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let a2 = attempts.clone();
         tokio::spawn(async move {
             let mut pending = false;
             while let Some(cmd) = rx.recv().await {
-                pending |= cmd.bytes.is_some();
+                let bytes = cmd.bytes.is_some();
+                pending |= bytes;
                 if pending {
                     let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     pending = n < fail_first;
@@ -2684,6 +2694,7 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
                 if let Some(a) = cmd.ack {
                     let _ = a.send(!pending);
                 }
+                let _ = seen_tx.send(bytes);
             }
         });
         let (handle, actor) = start(
@@ -2700,6 +2711,8 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
             None,
             None,
         );
+        // The store tick at start finds the state unchanged and writes nothing.
+        assert_eq!(seen.recv().await, Some(false));
         handle
             .apply(Event::Intent {
                 at: 0,
@@ -2713,6 +2726,14 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
             })
             .await
             .unwrap();
+        if store_tick_before_shutdown {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(
+                seen.recv().await,
+                Some(true),
+                "the store tick wrote the intent"
+            );
+        }
         let stored = handle.shutdown().await;
         tokio::time::timeout(Duration::from_secs(10), actor)
             .await
@@ -2720,8 +2741,12 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
             .unwrap();
         (stored, attempts.load(std::sync::atomic::Ordering::SeqCst))
     }
-    assert_eq!(run(usize::MAX).await, (false, 3));
-    assert_eq!(run(1).await, (true, 2));
+    assert_eq!(run(usize::MAX, false).await, (false, 3));
+    // The periodic store's failed write, then shutdown's three.
+    assert_eq!(run(usize::MAX, true).await, (false, 4));
+    assert_eq!(run(1, false).await, (true, 2));
+    // The periodic store's write fails, and shutdown's first attempt stores it.
+    assert_eq!(run(1, true).await, (true, 2));
 }
 
 /// A state write fails and the state then stays unchanged: the periodic store asks the
