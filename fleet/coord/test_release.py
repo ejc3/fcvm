@@ -511,14 +511,25 @@ def make_certs(directory):
     import subprocess
     d = Path(directory)
     run = lambda *a: subprocess.run(a, check=True, capture_output=True)
+    # A CA without keyUsage is refused under VERIFY_X509_STRICT ("CA cert does not include key
+    # usage extension"), which Python 3.13 and later set in create_default_context(), so on
+    # GitHub's ubuntu-latest (Python 3.14) every TLS probe here failed at "connect".
     run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-        "-keyout", str(d / "ca.key"), "-out", str(d / "ca.pem"), "-days", "1", "-subj", "/CN=viewer-path test CA")
+        "-keyout", str(d / "ca.key"), "-out", str(d / "ca.pem"), "-days", "1", "-subj", "/CN=viewer-path test CA",
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
     run("openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
         "-keyout", str(d / "leaf.key"), "-out", str(d / "leaf.csr"), "-subj", "/CN=tiles.fcvm.dev")
     (d / "ext").write_text("subjectAltName=DNS:*.tiles.fcvm.dev\nbasicConstraints=CA:FALSE\n")
     run("openssl", "x509", "-req", "-in", str(d / "leaf.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
         "-CAcreateserial", "-out", str(d / "leaf.pem"), "-days", "1", "-extfile", str(d / "ext"))
-    CERTS.update(ca=str(d / "ca.pem"), cert=str(d / "leaf.pem"), key=str(d / "leaf.key"))
+    # A second CA that signed nothing here: a viewer trusting only it must refuse the tile. The
+    # leaf itself is no such case: create_default_context() sets VERIFY_X509_PARTIAL_CHAIN on
+    # Python 3.13 and later, which trusts a leaf named in the CA file directly.
+    run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", str(d / "other-ca.key"), "-out", str(d / "other-ca.pem"), "-days", "1", "-subj", "/CN=another CA",
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    CERTS.update(ca=str(d / "ca.pem"), cert=str(d / "leaf.pem"), key=str(d / "leaf.key"),
+                 other_ca=str(d / "other-ca.pem"))
 
 
 def h264(source):
@@ -557,6 +568,27 @@ class ViewerPathTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.dir.cleanup()
+
+    def test_the_test_ca_passes_strict_verification(self):
+        # What create_default_context() does on Python 3.13 and later, whichever Python runs this.
+        import ssl
+        import threading
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(CERTS["cert"], CERTS["key"])
+        client_ctx = ssl.create_default_context(cafile=CERTS["ca"])
+        client_ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+        a, b = socket.socketpair()
+        def serve():
+            with contextlib.suppress(ssl.SSLError, OSError):
+                server_ctx.wrap_socket(b, server_side=True).close()
+        t = threading.Thread(target=serve)
+        t.start()
+        try:
+            client_ctx.wrap_socket(a, server_hostname="win-1-abcdefgh-v4.tiles.fcvm.dev").close()
+        finally:
+            a.close()
+            t.join(10)
+            b.close()
 
     def tile(self, mode, server=None, family="v4", **extra):
         port = server.port if server else 20208
@@ -641,7 +673,7 @@ class ViewerPathTests(unittest.TestCase):
     def test_a_certificate_the_viewer_does_not_trust_fails(self):
         server = FakeViewerServer(self, "v4", stream_of("testsrc"))
         tile = self.tile("windows", server)
-        with patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["cert"]}):
+        with patch.dict(os.environ, {"SMOKE_CA_FILE": CERTS["other_ca"]}):
             addr = ipaddress.ip_address(server.host)
             with patch.object(smoke, "lookup", lambda h, f, r: [addr]), \
                     patch.object(smoke, "declared_ports", lambda m, f, h="fcvm": {server.port}):
