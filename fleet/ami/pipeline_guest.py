@@ -482,8 +482,23 @@ def windows_proof():
                     raise RuntimeError("Windows validator did not stop") from None
 
 
-def verify(kind, expected_image, build_arn, test_arn, region):
+def viewer_proof():
+    """Every mode of the image, published as the fleet publishes it, answers a viewer over IPv4
+    and over IPv6: fleet/tools/viewer-acceptance.sh runs this host's agent under a coordinator on
+    loopback with a throwaway CA of its own, and the viewer-path smoke checks every tile through
+    the coordinator's names (docs/fleet/ARCHITECTURE.md, "When a mode counts as working")."""
+    script = AMI.parent / "tools" / "viewer-acceptance.sh"
+    need(script.is_file(), "the viewer-path acceptance is missing from the image source")
+    with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as out:
+        # Its logs stay on the validator: they name the host's addresses and its launch names.
+        done = subprocess.run(["bash", str(script), out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env={**os.environ, "FCVM": "/usr/local/bin/fcvm"}, timeout=3600)
+    need(done.returncode == 0, "the image's tiles did not answer a viewer over IPv4 and IPv6")
+
+
+def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
     need(kind in {"host", "tile"}, "invalid validator kind")
+    need(set(proofs) <= {"viewer-path"} and ("viewer-path" not in proofs or kind == "host"), "unknown validator proof")
     sanitized()
     guard()
     ordering(kind)
@@ -495,12 +510,14 @@ def verify(kind, expected_image, build_arn, test_arn, region):
         store_parts()
         host_proof(new, old)
         windows_proof()
+        if "viewer-path" in proofs:
+            viewer_proof()
     else:
         wait(lambda: (request(8080, "/health")[1] or {}).get("ready") is True)
         tls_proof(443, new)
         scene_proof(8080, new, old)
     return {**boot(), "guard": True, "frames": True, "phone_clone": kind == "host",
-            "windows_sandbox": kind == "host",
+            "windows_sandbox": kind == "host", "viewer_path": "viewer-path" in proofs,
             "tls_rotation": True, "sanitized": True,
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 

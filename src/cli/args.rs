@@ -594,8 +594,14 @@ pub struct FleetAgentArgs {
 
     /// The fleet's wildcard certificate secret, handed to every renderer (written into
     /// --tls-dir and mapped into each VM)
-    #[arg(long)]
+    #[arg(long, group = "tls")]
     pub tls_secret: Option<String>,
+
+    /// The certificate as a local file in the secret's format (`{"cert", "key",
+    /// "scene_token"}`), instead of --tls-secret: a host checked with a throwaway CA of its
+    /// own (fleet/tools/viewer-acceptance.sh). Read again every hour, as the secret is.
+    #[arg(long, group = "tls")]
+    pub tls_file: Option<std::path::PathBuf>,
 
     /// Where the renderers' certificate files are kept on the host
     #[arg(long, default_value = crate::fleet::agent::tls::HOST_DIR)]
@@ -691,7 +697,7 @@ pub struct FleetAgentArgs {
     /// (--public-ipv4-from-imds), and with an IPv6 prefix on port 443 of `<prefix>::1`,
     /// which the agent adds to the host's default IPv6 interface. The coordinator names
     /// both (`agg-<host>-<token>`).
-    #[arg(long, requires_all = ["aggregate_port", "tls_secret"])]
+    #[arg(long, requires_all = ["aggregate_port", "tls"])]
     pub aggregate_tls_port: Option<u16>,
 
     /// A file the host's boot writes once its store is mounted; its modification time is

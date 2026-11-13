@@ -223,22 +223,25 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     // The renderers' certificate: fetched once before any VM starts, then kept current.
     let mut fcvm_args = args.fcvm_args.clone();
     let scene_token = crate::fleet::coord::scene_token::SceneToken::default();
-    if let Some(secret) = &args.tls_secret {
-        let region = match &args.secret_region {
-            Some(r) => r.clone(),
-            None => crate::fleet::coord::aws::imds("placement/region")
-                .await
-                .context("reading the instance's region (or pass --secret-region)")?,
-        };
-        let secrets = crate::fleet::coord::secrets::Secrets::new(&region)?;
-        tls::refresh(&secrets, secret, &args.tls_dir, &scene_token).await?;
+    let tls_source = match (&args.tls_secret, &args.tls_file) {
+        (Some(secret), _) => {
+            let region = match &args.secret_region {
+                Some(r) => r.clone(),
+                None => crate::fleet::coord::aws::imds("placement/region")
+                    .await
+                    .context("reading the instance's region (or pass --secret-region)")?,
+            };
+            let secrets = crate::fleet::coord::secrets::Secrets::new(&region)?;
+            Some(tls::Source::Secret(secrets, secret.clone()))
+        }
+        (None, Some(file)) => Some(tls::Source::File(file.clone())),
+        (None, None) => None,
+    };
+    let tls_on = tls_source.is_some();
+    if let Some(source) = tls_source {
+        tls::refresh(&source, &args.tls_dir, &scene_token).await?;
         fcvm_args.extend(tls::vm_args(&args.tls_dir));
-        tokio::spawn(tls::run(
-            secrets,
-            secret.clone(),
-            args.tls_dir.clone(),
-            scene_token.clone(),
-        ));
+        tokio::spawn(tls::run(source, args.tls_dir.clone(), scene_token.clone()));
     }
     let ipv6_prefix = match (&args.ipv6_prefix, args.ipv6_prefix_from_imds) {
         (Some(p), _) => Some(addr::Prefix::parse(p)?),
@@ -328,7 +331,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 snapshot_deadline: Duration::from_secs(600),
                 start_timeout: Duration::from_secs(args.start_timeout_secs),
                 poll: Duration::from_millis(100),
-                tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
+                tls_dir: tls_on.then(|| args.tls_dir.clone()),
             })
         }
         _ => None,
@@ -349,8 +352,8 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             cpus: args.minecraft_cpus,
             bots: args.minecraft_bots,
             snapshot_dir: args.minecraft_snapshot_dir.clone(),
-            tls_dir: args.tls_secret.as_ref().map(|_| args.tls_dir.clone()),
-            publish_tls: args.tls_secret.is_some() && args.tls_publish_base.is_some(),
+            tls_dir: tls_on.then(|| args.tls_dir.clone()),
+            publish_tls: tls_on && args.tls_publish_base.is_some(),
             gold_deadline: Duration::from_secs(300),
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),

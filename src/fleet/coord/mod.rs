@@ -1275,14 +1275,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             // The certificate file, written before the aggregator starts and kept current.
             use crate::fleet::agent::tls;
             let dir = args.ec2_aggregate_tls_dir.clone();
-            let secrets = secrets::Secrets::new(&secrets_region()?)?;
-            tls::refresh(&secrets, secret, &dir, &scene_token::SceneToken::default()).await?;
-            tokio::spawn(tls::run(
-                secrets,
-                secret.clone(),
-                dir.clone(),
-                Default::default(),
-            ));
+            let source =
+                tls::Source::Secret(secrets::Secrets::new(&secrets_region()?)?, secret.clone());
+            tls::refresh(&source, &dir, &scene_token::SceneToken::default()).await?;
+            tokio::spawn(tls::run(source, dir.clone(), Default::default()));
             argv.extend([
                 "--tls-file".into(),
                 dir.join(tls::FILE).to_string_lossy().into_owned(),

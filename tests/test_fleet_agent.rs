@@ -1807,6 +1807,71 @@ async fn the_coordinator_keeps_its_scene_token() {
     );
 }
 
+/// `--tls-file`: a host checked with a throwaway CA of its own reads the certificate from a
+/// local file in the secret's format, and its renderers get the same `tls.json` and scene
+/// token a secret would give them.
+#[tokio::test]
+async fn the_agent_takes_the_certificate_from_a_local_file() {
+    use fcvm::fleet::agent::tls;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test-cert.json");
+    std::fs::write(
+        &file,
+        serde_json::json!({"cert": "TEST-CHAIN", "key": "TEST-KEY", "scene_token": "TEST-SCENE"})
+            .to_string(),
+    )
+    .unwrap();
+    let tls_dir = dir.path().join("tls");
+    let token = fcvm::fleet::coord::scene_token::SceneToken::default();
+    let source = tls::Source::File(file.clone());
+    assert!(tls::refresh(&source, &tls_dir, &token).await.unwrap());
+    let out = tls_dir.join("tls.json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&out).unwrap()).unwrap(),
+        serde_json::json!({"cert": "TEST-CHAIN", "key": "TEST-KEY", "scene_token": "TEST-SCENE"})
+    );
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(token.get().as_deref(), Some("TEST-SCENE"));
+    assert!(!tls::refresh(&source, &tls_dir, &token).await.unwrap());
+    std::fs::write(&file, "{\"cert\": \"TEST-CHAIN\"}").unwrap();
+    let err = tls::refresh(&source, &tls_dir, &token).await.unwrap_err();
+    assert!(format!("{err:#}").contains("has no key"), "{err:#}");
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        agent: fcvm::cli::FleetAgentArgs,
+    }
+    let parse = |argv: &[&str]| {
+        <Cli as clap::Parser>::try_parse_from(
+            [
+                &["fleet-agent", "--stdio", "--image", "x", "--base-port", "1"][..],
+                argv,
+            ]
+            .concat(),
+        )
+        .map(|c| c.agent.tls_file)
+    };
+    assert!(parse(&["--tls-file", "/x"]).is_ok());
+    assert!(
+        parse(&["--tls-file", "/x", "--tls-secret", "s"]).is_err(),
+        "one certificate source"
+    );
+    assert!(parse(&[
+        "--aggregate-port",
+        "2",
+        "--aggregate-tls-port",
+        "3",
+        "--tls-file",
+        "/x"
+    ])
+    .is_ok());
+    assert!(parse(&["--aggregate-port", "2", "--aggregate-tls-port", "3"]).is_err());
+}
+
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
 /// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
 /// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and
@@ -1833,15 +1898,14 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    let secrets = tls::Source::Secret(
+        Secrets::with_endpoint("us-east-2", &base).unwrap(),
+        "fcvm-fleet/tls-wildcard".into(),
+    );
     let dir = tempfile::tempdir().unwrap();
     let tls_dir = dir.path().join("tls");
     let token = fcvm::fleet::coord::scene_token::SceneToken::default();
-    assert!(
-        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
-            .await
-            .unwrap()
-    );
+    assert!(tls::refresh(&secrets, &tls_dir, &token).await.unwrap());
     let file = tls_dir.join("tls.json");
     let read = |p: &std::path::Path| -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
@@ -1856,17 +1920,9 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     );
     use std::os::unix::fs::MetadataExt;
     let inode = std::fs::metadata(&file).unwrap().ino();
-    assert!(
-        !tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
-            .await
-            .unwrap()
-    );
+    assert!(!tls::refresh(&secrets, &tls_dir, &token).await.unwrap());
     doc.lock().unwrap()["key"] = serde_json::json!("KEY-2");
-    assert!(
-        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
-            .await
-            .unwrap()
-    );
+    assert!(tls::refresh(&secrets, &tls_dir, &token).await.unwrap());
     assert_eq!(read(&file)["key"], "KEY-2");
     // A renewal is a new file renamed into place: the renderer notices the new inode.
     assert_ne!(std::fs::metadata(&file).unwrap().ino(), inode);
@@ -1877,11 +1933,7 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     );
     // The scene token goes to the renderers in the same file, and to the agent's own posts.
     doc.lock().unwrap()["scene_token"] = serde_json::json!("SCENE-1");
-    assert!(
-        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
-            .await
-            .unwrap()
-    );
+    assert!(tls::refresh(&secrets, &tls_dir, &token).await.unwrap());
     assert_eq!(
         read(&file),
         serde_json::json!({"cert": "CHAIN-1", "key": "KEY-2", "scene_token": "SCENE-1"})

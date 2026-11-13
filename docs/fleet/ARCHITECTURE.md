@@ -99,6 +99,14 @@ never a URL, host name or token. It runs after every coordinator and web deploy 
 and daily; a failure fails the job on main and opens or updates the `fleet-viewer-smoke`
 issue.
 
+A host image is checked the same way before it is published: the image factory's host validator
+runs `fleet/tools/viewer-acceptance.sh` on its cold boot (`viewer_path` in the validation
+record). It makes a throwaway CA and a certificate for a test zone, gives them to the host's
+agent (`--tls-file`) so every renderer, phone, sandbox and server publishes its TLS ports as on
+staging, runs a coordinator on loopback that names every launch in that zone and serves the
+zone's DNS, and runs the smoke over IPv4 and IPv6 against it, trusting only that CA. On a
+gpubox: `sudo FCVM=<fcvm> fleet/tools/viewer-acceptance.sh`.
+
 ## Components
 
 ```

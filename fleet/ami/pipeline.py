@@ -505,8 +505,13 @@ class Pipeline:
         for transition in (None, "reboot", "resume"):
             if transition:
                 self.reboot(slot, stop_start=transition == "resume")
+            # The viewer path (every mode, both families) runs once, on the cold boot: it takes
+            # the Windows gold flow and every mode's first launch, and the boots after it prove
+            # the image restarts, which the other proofs already cover.
+            viewer = kind == "host" and transition is None
             result = self.guest(slot, "verify", kind, renderer["image_id"],
-                self.config["tls_build_arn"], self.config["tls_test_arn"], self.config["secret_region"])
+                self.config["tls_build_arn"], self.config["tls_test_arn"], self.config["secret_region"],
+                *(["viewer-path"] if viewer else []))
             require(result.get("guard") is True and result.get("frames") is True
                     and result.get("sanitized") is True and result.get("tls_rotation") is True,
                     "candidate failed the boot, renderer or security proof")
@@ -514,6 +519,7 @@ class Pipeline:
                     "the validation TLS identity changed during this build")
             require(kind != "host" or result.get("phone_clone") is True, "candidate phone clone failed")
             require(kind != "host" or result.get("windows_sandbox") is True, "candidate Windows sandbox failed")
+            require(not viewer or result.get("viewer_path") is True, "candidate viewer path failed")
             require(re.fullmatch(r"[0-9a-f-]{36}", result.get("boot_id", "")), "candidate has no boot identity")
             boots.append(result["boot_id"])
         require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")

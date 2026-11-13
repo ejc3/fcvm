@@ -140,6 +140,7 @@ class Worker:
         self.uncertain = False
         self.fail_phase = False
         self.bad_proof = None
+        self.viewer_asks = []
         self.bad_renderer = False
         self.stale_boots = False
         self.invalidated = 0
@@ -236,7 +237,8 @@ class Worker:
                 elif action == "verify":
                     value = {"boot_id": identity, "guard": True, "frames": True, "tls_rotation": True,
                         "sanitized": True, "phone_clone": slot.startswith("host-"),
-                        "windows_sandbox": slot.startswith("host-")}
+                        "windows_sandbox": slot.startswith("host-"), "viewer_path": "viewer-path" in args[3:]}
+                    self.viewer_asks.append((slot, "viewer-path" in args[3:]))
                     value.update(self.tls)
                     if self.bad_proof:
                         value[self.bad_proof] = False
@@ -961,7 +963,7 @@ print("warm-log-permissions-pass")
                 self.assertEqual(output.getvalue(), "")
 
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
-        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox"):
+        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox", "viewer_path"):
             with self.subTest(proof=proof):
                 self.setUp()
                 self.worker.bad_proof = proof
@@ -969,6 +971,14 @@ print("warm-log-permissions-pass")
                     self.run_driver()
                 self.no_manifest()
                 self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+
+    def test_the_host_viewer_path_runs_once_on_the_cold_boot(self):
+        # Every mode over both families is the slowest proof (the Windows gold flow, every mode's
+        # first launch): the host's cold boot runs it, its reboot and stop/start boots do not.
+        self.run_driver()
+        self.assertEqual(sorted(self.worker.viewer_asks),
+                         sorted([("host-verify", True), ("host-verify", False), ("host-verify", False),
+                                 ("tile-verify", False), ("tile-verify", False), ("tile-verify", False)]))
 
     def test_renderer_mismatch_cannot_publish_a_mixed_pair(self):
         self.worker.bad_renderer = True
@@ -1501,6 +1511,24 @@ else:
             host_proof=lambda *args: self.fail("unsafe identity reached the GPU proof")):
             with self.assertRaisesRegex(RuntimeError, "not distinct"):
                 guest.verify("host", IMAGE, "a", "b", "region")
+
+    def test_the_viewer_path_is_a_host_proof_and_its_failure_fails_verify(self):
+        for proofs in (("viewer-path",), ("frames",)):
+            with self.subTest(proofs=proofs), self.assertRaisesRegex(RuntimeError, "unknown validator proof"):
+                guest.verify("tile" if proofs == ("viewer-path",) else "host", IMAGE, "a", "b", "region", *proofs)
+        ran = []
+        class Done:
+            def __init__(self, code): self.returncode = code
+        def run(argv, **kwargs):
+            ran.append(argv)
+            return Done(1)
+        real = tempfile.TemporaryDirectory
+        with real() as directory, \
+                patch.object(guest.tempfile, "TemporaryDirectory", lambda dir=None: real(dir=directory)), \
+                patch.object(guest.subprocess, "run", run):
+            with self.assertRaisesRegex(RuntimeError, "did not answer a viewer"):
+                guest.viewer_proof()
+        self.assertTrue(ran[0][1].endswith("fleet/tools/viewer-acceptance.sh"), ran)
 
     def test_frame_bound_accepts_real_binary_header_and_rejects_oversize(self):
         for wire, expected in ((b"\x82\x03abc", (2, b"abc")),
