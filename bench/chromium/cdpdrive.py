@@ -211,6 +211,51 @@ def resolve_target(cdp_host: str, deadline: float, retries: int,
     raise ConnectionError(msg)
 
 
+def connect_prewired(render_mod, ws_url: str, deadline: float, retries: int,
+                     stats: dict, poll_s: float = RESOLVE_RETRY_S):
+    """Open a prewired WebSocket, waiting for the clone's port the way resolve does.
+
+    Without `--ws-url` the readiness wait happens inside `resolve_target`: its
+    /json/list polls absorb the refused and reset connects of a clone whose
+    guest is not answering yet. A prewired run skips that lookup, so its first
+    connect is the first contact with the clone, and it used to be the only
+    one: pasta accepts on the host as soon as the clone exists and resets the
+    connection while the restored guest is not yet reachable behind the
+    restore gate, so every prewired cdp rep of a run failed with
+    ConnectionResetError at the connect stage, 58 ms after spawn.
+
+    A refused or reset connect, or a close during the upgrade, is that
+    readiness state and is retried at the resolve cadence under the same
+    deadline and attempt budget. A completed HTTP exchange that is not a 101
+    (wrong target id, bad accept key) is deterministic and raised at once.
+    `stats["connect_polls"]` records each attempt as resolve_polls does.
+    """
+    polls = []
+    stats["connect_polls"] = polls
+    started = time.monotonic()
+    attempts = 0
+    while True:
+        attempts += 1
+        stats["connect_attempts"] = attempts
+        attempt_started = time.monotonic()
+        try:
+            ws = TimedWs(render_mod, ws_url, deadline)
+            # Time spent on refused attempts and the sleeps between them.
+            ws.wait_ms = (attempt_started - started) * 1000
+            polls.append({"t_ms": (time.monotonic() - started) * 1000, "outcome": "open"})
+            return ws
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError,
+                render_mod.WsClosed) as e:
+            now = time.monotonic()
+            code = getattr(e, "errno", None)
+            outcome = (f"os-{errno.errorcode.get(code, code)}" if code is not None
+                       else f"os-{type(e).__name__}")
+            polls.append({"t_ms": (now - started) * 1000, "outcome": outcome})
+            if now >= deadline or attempts >= max(1, retries):
+                raise
+            time.sleep(min(poll_s, deadline - now))
+
+
 def socket_diagnostics(sock) -> dict:
     """The three fields that identify WHICH connection failed.
 
@@ -590,7 +635,14 @@ def drive(args) -> dict:
 
         stage = "connect"
         stage_started = time.monotonic()
-        ws = TimedWs(render, ws_url, deadline)
+        if args.ws_url:
+            poll_ms = getattr(args, "resolve_poll_ms", None)
+            ws = connect_prewired(render, ws_url, deadline, args.connect_retries, out,
+                                  RESOLVE_RETRY_S if poll_ms is None else poll_ms / 1000.0)
+            # The wait for the clone's port, which resolve_ms holds when unprewired.
+            stages["connect_wait_ms"] = ws.wait_ms
+        else:
+            ws = TimedWs(render, ws_url, deadline)
         stages["tcp_ms"] = ws.tcp_ms
         stages["upgrade_ms"] = ws.upgrade_ms
         cdp = render.Cdp(ws)
