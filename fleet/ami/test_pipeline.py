@@ -975,7 +975,9 @@ print("warm-log-permissions-pass")
     def test_the_host_viewer_path_runs_once_on_the_cold_boot(self):
         # Every mode over both families is the slowest proof (the Windows gold flow, every mode's
         # first launch): the host's cold boot runs it, its reboot and stop/start boots do not.
-        self.run_driver()
+        result = self.run_driver()
+        self.assertEqual({k: result["images"][k]["validation"]["viewer_path"] for k in ("host", "tile")},
+                         {"host": True, "tile": False})
         self.assertEqual(sorted(self.worker.viewer_asks),
                          sorted([("host-verify", True), ("host-verify", False), ("host-verify", False),
                                  ("tile-verify", False), ("tile-verify", False), ("tile-verify", False)]))

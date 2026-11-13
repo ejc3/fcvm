@@ -524,6 +524,9 @@ class Pipeline:
             boots.append(result["boot_id"])
         require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")
         result["boot_ids"] = boots
+        # The validation record (the manifest the publisher reads) is the last boot's result; the
+        # viewer path was proved on the cold boot.
+        result["viewer_path"] = kind == "host"
         del result["boot_id"]
         return result
 
