@@ -775,6 +775,10 @@ export interface McTileLive {
   viewer: string | null;
   tps: number | null;
   hasMap: boolean;
+  /** Connection attempts that ended without opening since the socket last opened. */
+  failures: number;
+  /** When it began trying to connect without being open (local ms); null while open. */
+  connectingSince: number | null;
 }
 
 /** The take-over's own figures: the time from each key to its first change, and the tile's last refusal. */
@@ -802,6 +806,10 @@ export interface MinecraftCard {
   showActions: boolean;
   /** The tile's view socket and its first message; null: no socket now. `key` changes when a new socket is needed. */
   socket: { url: string; first: string; key: string } | null;
+  /** What the tile shows over its canvas while its world is not coming in; null once it is. */
+  stream: string | null;
+  /** The stream failed: the tile offers to try again now. */
+  streamFailed: boolean;
   reset: { label: string; disabled: boolean; title: string | null };
   fork: { label: string; disabled: boolean; title: string | null };
   take: { label: string; disabled: boolean; title: string | null };
@@ -816,11 +824,24 @@ export interface MinecraftHeader {
   server: string | null;
   median: string;
   slowest: string;
-  lastFork: string;
-  lastResetAll: string;
-  /** For Java Edition players: the address of a tile and the port, when tiles have one. */
-  join: string | null;
+  /** The last fork with its age, while it is recent (HEADER_RECENT_MS); null otherwise. */
+  lastFork: string | null;
+  /** The last reset of every server with its age, while it is recent; null otherwise. */
+  lastResetAll: string | null;
+  /** For Java Edition players: the client to use, and one tile's address and port to copy, when tiles have one. */
+  join: { label: string; address: string } | null;
 }
+
+/**
+ * How long a tile's view socket may try to connect before the tile says it cannot reach the
+ * server. A healthy open takes well under a second (PROTOCOL.md, "Minecraft tile"); the address
+ * family probe that may come first gives up on IPv6 after at most FAMILY_PROBE_ATTEMPTS tries of
+ * FAMILY_PROBE_MS (core/net.ts), and a refused or reset connect fails at once, which also ends the wait.
+ */
+export const MC_CONNECT_DEADLINE_MS = 5000;
+
+/** How long the header keeps the last fork and the last reset all: past this they are history, not news. */
+export const HEADER_RECENT_MS = 60 * 60 * 1000;
 
 export interface MinecraftPanel {
   id: string;
@@ -835,6 +856,8 @@ export interface MinecraftPanel {
   driving: boolean;
   /** Why keys do not reach the bot, while they do not. */
   waiting: string | null;
+  /** The held server's view did not connect within MC_CONNECT_DEADLINE_MS: the panel offers Retry. */
+  failed: boolean;
   /** The tile's last refusal of a drive message. */
   refused: string | null;
   /** On-screen buttons, on a touch layout. */
@@ -854,6 +877,8 @@ export interface MinecraftInput {
   /** Per tile id. */
   live: Readonly<Record<string, McTileLive>>;
   drive: McDriveLive | null;
+  /** The session this page just gave back: its panel closes at once, before the coordinator says so. */
+  released?: string | null;
 }
 
 export interface MinecraftView {
@@ -886,18 +911,33 @@ function firstChangeText(samples: readonly number[]): string {
   return `Key to first change: last ${Math.round(last)} ms, median ${Math.round(med)} ms (${fmt.count(samples.length, "key", "keys")})`;
 }
 
-function headerOf(m: Minecraft, you: string | null): MinecraftHeader {
+/**
+ * The held server's place: the largest square in `area` that leaves room for a caption under it,
+ * at the top and centred across. `area` is the room beside the panel (above it on a phone).
+ */
+export function heldLayout(area: Box, id: string, narrow: boolean, dpr: number): { id: string; box: Box; caption: Box; compact: boolean } {
+  const capH = narrow ? MINECRAFT_CAPTIONS.compact : MINECRAFT_CAPTIONS.full;
+  const side = Math.max(0, Math.floor(Math.min(area.w, area.h - capH) * dpr) / dpr);
+  const x = area.x + Math.round((area.w - side) / 2);
+  return { id, box: { x, y: area.y, w: side, h: side }, caption: { x, y: area.y + side, w: side, h: capH }, compact: narrow };
+}
+
+function headerOf(m: Minecraft, you: string | null, srvNow: number): MinecraftHeader {
   const times = upTimes(m.tiles);
   const median = medianMs(times);
   const up = m.tiles.filter((t) => t.phase === "running").length;
   const servers = m.tiles.length === 1 ? "server" : "servers";
+  const recent = (at: number) => srvNow - at <= HEADER_RECENT_MS;
   const f = m.last_fork;
-  let lastFork = "Fork: not used yet";
-  if (f !== null) {
+  let lastFork: string | null = null;
+  if (f !== null && recent(f.first_chunk_at ?? f.clicked_at)) {
     const total = f.total_ms ?? (f.first_chunk_at === null ? null : f.first_chunk_at - f.clicked_at);
     const split = forkSplitText(f.snapshot_ms, f.restore_ms);
-    lastFork = `Last fork: ${f.from} to ${f.to}${total === null ? "" : ` in ${hundredthsText(total)}`}${split ? ` (${split})` : ""}`;
+    lastFork = `Last fork ${fmt.ago(srvNow - (f.first_chunk_at ?? f.clicked_at))}: ${f.from} to ${f.to}${total === null ? "" : ` in ${hundredthsText(total)}`}${split ? ` (${split})` : ""}`;
   }
+  const r = m.last_reset_all;
+  const lastResetAll =
+    r === null || !recent(r.clicked_at) ? null : `Last reset all ${fmt.ago(srvNow - r.clicked_at)}: ${fmt.count(r.servers, "server", "servers")}, by ${who(r.by, you)}`;
   const joinable = m.tiles.find((t) => t.join !== null && t.phase === "running") ?? m.tiles.find((t) => t.join !== null);
   const version = javaVersion(m.server);
   return {
@@ -906,14 +946,8 @@ function headerOf(m: Minecraft, you: string | null): MinecraftHeader {
     median: `Median restore to first chunk ${median === null ? "--" : hundredthsText(median)}`,
     slowest: `Slowest ${times.length === 0 ? "--" : hundredthsText(Math.max(...times))}`,
     lastFork,
-    lastResetAll:
-      m.last_reset_all === null
-        ? "Reset all: not used yet"
-        : `Last reset all: ${fmt.utcClock(m.last_reset_all.clicked_at)} UTC, ${fmt.count(m.last_reset_all.servers, "server", "servers")}, by ${who(m.last_reset_all.by, you)}`,
-    join:
-      joinable === undefined
-        ? null
-        : `Join from Minecraft: Java Edition${version ? ` ${version}` : ""} at ${joinable.join}, port ${MINECRAFT_JOIN_PORT}. Every tile has its own address, under it.`,
+    lastResetAll,
+    join: joinable === undefined ? null : { label: `Join with Java Edition${version ? ` ${version}` : ""}:`, address: `${joinable.join}:${MINECRAFT_JOIN_PORT}` },
   };
 }
 
@@ -955,13 +989,36 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     };
   }
   const mine = (t: MinecraftTile) => t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you);
-  const held = m.tiles.find((t) => mine(t) && t.borrowed?.session !== undefined) ?? null;
+  const held = m.tiles.find((t) => mine(t) && t.borrowed?.session !== undefined && t.borrowed.session !== (inp.released ?? null)) ?? null;
   const panelOpen = held !== null;
   const area = inp.stage === null ? null : panelOpen ? openedArea(inp.stage, inp.narrow) : inp.stage;
+  // While this viewer holds a server, it is the one view, as large as the room beside (or above)
+  // the panel allows; the other servers wait off the stage until it is given back.
   const placed = new Map(
-    area === null ? [] : layoutCaptioned({ area, tiles: m.tiles, imageAspect: m.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }, MINECRAFT_CAPTIONS).map((b) => [b.id, b]),
+    area === null
+      ? []
+      : held !== null
+        ? [[held.id, heldLayout(area, held.id, inp.narrow, inp.dpr)]]
+        : layoutCaptioned({ area, tiles: m.tiles, imageAspect: m.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }, MINECRAFT_CAPTIONS).map((b) => [b.id, b]),
   );
   const first = viewFirstMessage(s);
+  /** What a running tile's stream says while its world is not in, and whether it failed. */
+  const streamOf = (t: MinecraftTile, wanted: boolean): { text: string | null; failed: boolean } => {
+    const slot = serverName(t);
+    const live = inp.live[t.id];
+    if (t.phase !== "running") return { text: null, failed: false };
+    if (live?.open === true) return { text: live.hasMap ? null : `Loading ${slot}'s world.`, failed: false };
+    // No socket to open: nothing to retry, so never a failure with a Retry.
+    if (!wanted) {
+      if (first === null) return { text: s.admission?.locked === true ? "No direct seat for this page: the worlds stay dark until one is free." : `Waiting for the fleet to admit this page.`, failed: false };
+      if (s.net.family === null) return { text: "Finding the way to the servers.", failed: false };
+      return { text: `${slot} has no ${s.net.family === "v6" ? "IPv6" : "IPv4"} address yet.`, failed: false };
+    }
+    const since = live?.connectingSince ?? null;
+    const late = since !== null && inp.now - since >= MC_CONNECT_DEADLINE_MS;
+    if ((live?.failures ?? 0) > 0 || late) return { text: `Cannot reach ${slot}'s view. Trying again.`, failed: true };
+    return { text: `Connecting to ${slot}.`, failed: false };
+  };
   const cards: MinecraftCard[] = m.tiles.map((t) => {
     const p = placed.get(t.id);
     const slot = serverName(t);
@@ -972,6 +1029,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     if (held !== null && !mine(t)) takeTitle = `You are driving ${serverName(held)}. Give it back to take another.`;
     else if (lentToOther) takeTitle = "Lent to another viewer.";
     else if (!running) takeTitle = "It can be borrowed once it is running.";
+    else if (live?.open !== true) takeTitle = `This page is not connected to ${slot} yet: its turn would run with nothing to drive.`;
     const target = running ? forkTarget(m.tiles, t) : null;
     const forkTitle = !running ? "It can be copied once it is running." : target === null ? "No other server on its host can take a copy now." : `Copies its world into ${serverName(target)}.`;
     const resetTitle = mine(t) ? "Yours: give it back and it is reset." : lentToOther ? "Lent to another viewer." : null;
@@ -982,6 +1040,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     // a viewer with no IPv6 reaches the tile over its IPv4 name.
     const url = running ? streamUrl(t, s.net.family) : null;
     const socket = url !== null && first !== null ? { url, first, key: `${url}#${t.generation ?? 0}` } : null;
+    const stream = streamOf(t, socket !== null);
     const state = running ? "running" : t.phase === "failed" ? "failed" : t.phase === "forking" ? "forking" : "restoring";
     return {
       id: t.id,
@@ -999,9 +1058,11 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       compact: p?.compact ?? false,
       showActions: !(p?.compact === true && panelOpen),
       socket,
+      stream: stream.text,
+      streamFailed: stream.failed,
       reset: { label: "Reset", disabled: !online || t.borrowed !== null, title: resetTitle },
       fork: { label: "Fork", disabled: !online || !running || target === null, title: forkTitle },
-      take: { label: "Take over", disabled: !online || !running || t.borrowed !== null || held !== null, title: takeTitle },
+      take: { label: "Take over", disabled: !online || !running || t.borrowed !== null || held !== null || live?.open !== true, title: takeTitle },
       lentText: mine(t) ? "Yours" : lentToOther ? `Lent to another viewer until ${fmt.utcClock(t.borrowed!.until)} UTC` : null,
       mine: mine(t),
       lent: lentToOther,
@@ -1014,13 +1075,17 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     const left = Math.max(0, Math.ceil((b.until - srvNow) / 1000));
     const live = inp.live[held.id];
     const driving = held.phase === "running" && live?.open === true && sameViewer(live.viewer, b.viewer ?? null);
+    const heldCard = cards.find((c) => c.id === held.id);
+    const failed = heldCard?.streamFailed === true;
     const waiting = driving
       ? null
       : held.phase !== "running"
         ? `${serverName(held)} is ${held.phase === "forking" ? "taking a copy" : "restoring"}; the keys reach its bot once it is running.`
         : live?.open === true
           ? "This page's view of the server acts as another viewer, so it cannot drive."
-          : "Connecting to the server.";
+          : failed
+            ? `Lost the connection to ${serverName(held)}. Trying again; Retry tries now.`
+            : `Connecting to ${serverName(held)}.`;
     panel = {
       id: held.id,
       slot: serverName(held),
@@ -1030,6 +1095,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       firstChange: firstChangeText(inp.drive?.samples ?? []),
       driving,
       waiting,
+      failed,
       refused: inp.drive?.refused ?? null,
       pad: inp.touch ? DRIVE_PAD.map((x) => ({ ...x, label: x.input === "dig" ? "Break" : x.label })) : null,
       giveBack: "Give back",
@@ -1039,7 +1105,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     ...common,
     empty: null,
     banner,
-    header: headerOf(m, s.you),
+    header: headerOf(m, s.you, srvNow),
     resetAll: { label: "Reset all", disabled: !online || m.tiles.length === 0 },
     cards,
     panel,
