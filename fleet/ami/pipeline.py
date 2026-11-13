@@ -26,6 +26,19 @@ GUEST = REMOTE + "/fleet/ami/pipeline_guest.py"
 GUEST_PYTHON = "/opt/fcvm-image-sdk/bin/python"
 
 
+def viewer_summary(failures):
+    """The validator's failing viewer checks as one line: each check's mode, tile, family, step
+    and error, which the validator has already reduced to plain short strings."""
+    if not isinstance(failures, list) or not failures:
+        return "no failing check reported"
+    keys = ("mode", "tile", "family", "step", "error")
+    parts = []
+    for item in failures[:40]:
+        if isinstance(item, dict):
+            parts.append(" ".join(str(item[k]) for k in keys if isinstance(item.get(k), str)))
+    return "; ".join(parts)[:4000]
+
+
 def require(value, message):
     if not value:
         raise RuntimeError(message)
@@ -519,7 +532,8 @@ class Pipeline:
                     "the validation TLS identity changed during this build")
             require(kind != "host" or result.get("phone_clone") is True, "candidate phone clone failed")
             require(kind != "host" or result.get("windows_sandbox") is True, "candidate Windows sandbox failed")
-            require(not viewer or result.get("viewer_path") is True, "candidate viewer path failed")
+            require(not viewer or result.get("viewer_path") is True,
+                    "candidate viewer path failed: " + viewer_summary(result.get("viewer_failures")))
             require(re.fullmatch(r"[0-9a-f-]{36}", result.get("boot_id", "")), "candidate has no boot identity")
             boots.append(result["boot_id"])
         require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")

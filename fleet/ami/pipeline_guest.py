@@ -482,18 +482,57 @@ def windows_proof():
                     raise RuntimeError("Windows validator did not stop") from None
 
 
+# A failing viewer check as the validator reports it: stage-smoke.py's own fields, which carry
+# tile ids, mode and family names and its fixed error text, never a URL, host name or token. Any
+# value that is not a short plain string is dropped, and at most this many are reported.
+VIEWER_FIELDS = ("mode", "tile", "family", "step", "error")
+VIEWER_TEXT = re.compile(r"[A-Za-z0-9 :./,()'-]{1,120}")
+VIEWER_FAILURES_MAX = 40
+
+
+def viewer_failures(out):
+    """The failing checks in the smoke's result lines under `out`, sanitized; None when no line
+    could be read (the check could not run)."""
+    found, read = [], False
+    for family in ("v4", "v6"):
+        path = Path(out) / f"smoke-{family}.jsonl"
+        if not path.is_file():
+            continue
+        for line in path.read_text(errors="replace").splitlines()[:500]:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            read = True
+            if item.get("ok") is False or item.get("status") == "failed":
+                found.append({k: item[k] for k in VIEWER_FIELDS
+                              if isinstance(item.get(k), str) and VIEWER_TEXT.fullmatch(item[k])})
+    return found[:VIEWER_FAILURES_MAX] if read else None
+
+
 def viewer_proof():
     """Every mode of the image, published as the fleet publishes it, answers a viewer over IPv4
     and over IPv6: fleet/tools/viewer-acceptance.sh runs this host's agent under a coordinator on
     loopback with a throwaway CA of its own, and the viewer-path smoke checks every tile through
-    the coordinator's names (docs/fleet/ARCHITECTURE.md, "When a mode counts as working")."""
+    the coordinator's names (docs/fleet/ARCHITECTURE.md, "When a mode counts as working").
+    Returns the failing checks, empty when it passed."""
     script = AMI.parent / "tools" / "viewer-acceptance.sh"
     need(script.is_file(), "the viewer-path acceptance is missing from the image source")
     with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as out:
-        # Its logs stay on the validator: they name the host's addresses and its launch names.
+        # The coordinator's and agent's logs stay on the validator: they name the host's addresses
+        # and its launch names. The smoke's result lines do not, and are what the record keeps.
         done = subprocess.run(["bash", str(script), out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, env={**os.environ, "FCVM": "/usr/local/bin/fcvm"}, timeout=3600)
-    need(done.returncode == 0, "the image's tiles did not answer a viewer over IPv4 and IPv6")
+            stderr=subprocess.DEVNULL, env={**os.environ, "FCVM": "/usr/local/bin/fcvm", "KEEP": "1"}, timeout=3600)
+        failures = viewer_failures(out)
+    if done.returncode == 0:
+        need(failures == [], "the viewer-path acceptance passed with failing checks")
+        return []
+    if not failures:
+        return [{"step": "the viewer-path acceptance could not run" if failures is None
+                 else "the viewer-path acceptance failed without a failing check"}]
+    return failures
 
 
 def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
@@ -506,18 +545,19 @@ def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
     old, new = secret(build_arn, region), secret(test_arn, region)
     need(cert_hash(old["cert"]) != cert_hash(new["cert"]) and old["scene_token"] != new["scene_token"],
          "build and validation certificates/tokens are not distinct")
+    viewer = None
     if kind == "host":
         store_parts()
         host_proof(new, old)
         windows_proof()
-        if "viewer-path" in proofs:
-            viewer_proof()
+        viewer = viewer_proof() if "viewer-path" in proofs else None
     else:
         wait(lambda: (request(8080, "/health")[1] or {}).get("ready") is True)
         tls_proof(443, new)
         scene_proof(8080, new, old)
     return {**boot(), "guard": True, "frames": True, "phone_clone": kind == "host",
-            "windows_sandbox": kind == "host", "viewer_path": "viewer-path" in proofs,
+            "windows_sandbox": kind == "host",
+            "viewer_path": viewer == [], **({"viewer_failures": viewer} if viewer else {}),
             "tls_rotation": True, "sanitized": True,
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 

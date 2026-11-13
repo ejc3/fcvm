@@ -1514,23 +1514,42 @@ else:
             with self.assertRaisesRegex(RuntimeError, "not distinct"):
                 guest.verify("host", IMAGE, "a", "b", "region")
 
-    def test_the_viewer_path_is_a_host_proof_and_its_failure_fails_verify(self):
+    def test_the_viewer_path_is_a_host_proof_and_reports_its_failing_checks(self):
         for proofs in (("viewer-path",), ("frames",)):
             with self.subTest(proofs=proofs), self.assertRaisesRegex(RuntimeError, "unknown validator proof"):
                 guest.verify("tile" if proofs == ("viewer-path",) else "host", IMAGE, "a", "b", "region", *proofs)
+        # A failing check reaches the record as the smoke's own fields, and a value that is not a
+        # short plain string (a URL, here) is dropped rather than reported.
+        lines = [{"mode": "windows", "tile": "win:1", "family": "v6", "ok": False, "step": "connect",
+                  "error": "timed out"},
+                 {"mode": "wall", "tile": "fcvm:1", "family": "v6", "ok": True},
+                 {"mode": "minecraft", "tile": "mc:1", "family": "v4", "ok": False, "step": "connect",
+                  "error": "wss://mc-1-abcdefgh-v4.example/view?admit=secret"}]
         ran = []
         class Done:
             def __init__(self, code): self.returncode = code
-        def run(argv, **kwargs):
-            ran.append(argv)
-            return Done(1)
+        def run(code, written):
+            def go(argv, **kwargs):
+                ran.append((argv, kwargs["env"].get("KEEP")))
+                for family, items in written.items():
+                    (Path(argv[2]) / f"smoke-{family}.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
+                return Done(code)
+            return go
         real = tempfile.TemporaryDirectory
-        with real() as directory, \
-                patch.object(guest.tempfile, "TemporaryDirectory", lambda dir=None: real(dir=directory)), \
-                patch.object(guest.subprocess, "run", run):
-            with self.assertRaisesRegex(RuntimeError, "did not answer a viewer"):
-                guest.viewer_proof()
-        self.assertTrue(ran[0][1].endswith("fleet/tools/viewer-acceptance.sh"), ran)
+        for code, written, expected in (
+                (1, {"v6": lines}, [{"mode": "windows", "tile": "win:1", "family": "v6", "step": "connect", "error": "timed out"},
+                                    {"mode": "minecraft", "tile": "mc:1", "family": "v4", "step": "connect"}]),
+                (0, {"v4": lines[1:2], "v6": lines[1:2]}, []),
+                (2, {}, [{"step": "the viewer-path acceptance could not run"}])):
+            with self.subTest(code=code), real() as directory, \
+                    patch.object(guest.tempfile, "TemporaryDirectory", lambda dir=None: real(dir=directory)), \
+                    patch.object(guest.subprocess, "run", run(code, written)):
+                self.assertEqual(guest.viewer_proof(), expected)
+        self.assertTrue(ran[0][0][1].endswith("fleet/tools/viewer-acceptance.sh"), ran)
+        self.assertEqual({keep for _, keep in ran}, {"1"}, "the script keeps its results for the validator to read")
+        one = [{"mode": "windows", "tile": "win:1", "family": "v6", "step": "connect", "error": "timed out"}]
+        self.assertEqual(pipeline.viewer_summary(one), "windows win:1 v6 connect timed out")
+        self.assertEqual(pipeline.viewer_summary(None), "no failing check reported")
 
     def test_frame_bound_accepts_real_binary_header_and_rejects_oversize(self):
         for wire, expected in ((b"\x82\x03abc", (2, b"abc")),
