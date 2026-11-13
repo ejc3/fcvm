@@ -434,6 +434,8 @@ pub async fn spawn_namespace_holder(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
+        crate::utils::own_process_group(&mut cmd);
 
         // Kill holder if parent (fcvm) dies. Without this, holders orphan to init
         // and accumulate when fcvm is SIGKILL'd or crashes.
@@ -7026,6 +7028,24 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// The namespace holder is not in fcvm's process group. In it, the Ctrl+C that fcvm
+    /// handles also killed the holder, and the run loop could report that death and exit 1
+    /// instead of shutting down cleanly (`test_ctrlc_via_terminal`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_terminal_interrupt_does_not_reach_the_namespace_holder() {
+        let interrupt = crate::utils::TerminalInterrupt::arm();
+        let holder_cmd =
+            crate::network::PastaNetwork::new("vm-test".to_string(), "tap-fc".to_string(), vec![])
+                .build_holder_command();
+        let (mut holder, holder_pid) = super::spawn_namespace_holder(&holder_cmd)
+            .await
+            .expect("spawning the namespace holder");
+        interrupt
+            .assert_misses(&mut holder, "the namespace holder")
+            .await;
+        crate::companion::forget(holder_pid);
+    }
+
     /// The restore document carries the restoring host's identity in the shape
     /// fc-agent's `RestoreIdentity` reads. "host-ipv6" is written even when there is
     /// none, because the guest sets its address to exactly what it reads.

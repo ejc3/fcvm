@@ -1415,15 +1415,19 @@ test-computesdk:
 	@python3 -m unittest discover -s bench/computesdk -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
-# bench/boot-race: the workload is its own crate (not a workspace member) with its own target dir.
+# bench/boot-race: the workload is its own crate (not a workspace member) with its own target
+# dir, which its Cargo commands lease like every other (scripts/cargo-target-run.sh).
 BOOT_RACE_TARGET ?= bench/boot-race/workload/target
 build-boot-race-workload:
-	cd bench/boot-race/workload && CARGO_TARGET_DIR=$(abspath $(BOOT_RACE_TARGET)) \
-		cargo build --release --target aarch64-unknown-linux-musl
+	mkdir -p "$(abspath $(BOOT_RACE_TARGET))"
+	cd bench/boot-race/workload && CARGO_TARGET_DIR="$(abspath $(BOOT_RACE_TARGET))" \
+		"$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) build --release --target aarch64-unknown-linux-musl
 	@echo "$(abspath $(BOOT_RACE_TARGET))/aarch64-unknown-linux-musl/release/boot-race-workload"
 
 test-boot-race:
-	cd bench/boot-race/workload && CARGO_TARGET_DIR=$(abspath $(BOOT_RACE_TARGET)) cargo test --release
+	mkdir -p "$(abspath $(BOOT_RACE_TARGET))"
+	cd bench/boot-race/workload && CARGO_TARGET_DIR="$(abspath $(BOOT_RACE_TARGET))" \
+		"$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) test --release
 	@python3 -m unittest discover -s bench/boot-race -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 

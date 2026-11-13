@@ -110,18 +110,178 @@ async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether something holds a snapshot's memory file in use, as a release pass sees it: its
-/// exclusive lock is refused (`uffd::release`).
+/// Whether a reader holds a snapshot's memory file in use (`uffd::release`).
 fn memory_file_in_use(snapshot: &str) -> Result<bool> {
-    let path = fcvm::paths::snapshot_dir()
-        .join(snapshot)
-        .join("memory.bin");
-    let pass = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&pass) {
-        Ok(()) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(error).with_context(|| format!("locking {}", path.display())),
+    marked_in_use(
+        &fcvm::paths::snapshot_dir()
+            .join(snapshot)
+            .join("memory.bin"),
+    )
+}
+
+/// Whether some process holds a shared `flock` on `path`: the mark a memory server or a
+/// File-backed restore's VM manager takes (`uffd::mark_in_use`).
+///
+/// Not by asking for the lock: a refused exclusive lock cannot tell a reader's shared mark
+/// from a release pass, which holds an idle file exclusively, and any test that starts a
+/// memory server runs a pass over the shared snapshot directory. Not from /proc/locks
+/// either: it names a lock by superblock and inode number, and the btrfs subvolumes of one
+/// store share a superblock while a subvolume snapshot keeps its parent's inode numbers, so
+/// a reader of a parent or sibling snapshot's memory file would read as a mark on this one
+/// (`a_mark_is_found_on_its_own_file_only`). Each process's descriptors are matched to this
+/// file by path and inode, and `/proc/<pid>/fdinfo/<fd>` lists the locks held through that
+/// descriptor itself. Only readlink and reads of /proc are used, so a wedged mount
+/// elsewhere cannot stall the scan.
+fn marked_in_use(path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let want =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let ino = std::fs::metadata(&want)?.ino();
+    let mut scanned_self = false;
+    for process in std::fs::read_dir("/proc")?.flatten() {
+        let name = process.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        // A process can exit, or deny us its descriptors, between the listing and the read.
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        if pid == std::process::id().to_string() {
+            scanned_self = true;
+        }
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).ok().as_deref() != Some(want.as_path()) {
+                continue;
+            }
+            let fd_name = fd.file_name();
+            let Ok(info) = std::fs::read_to_string(format!(
+                "/proc/{pid}/fdinfo/{}",
+                fd_name.to_string_lossy()
+            )) else {
+                continue;
+            };
+            if fd_holds_shared_flock(&info, ino) {
+                return Ok(true);
+            }
+        }
     }
+    // A scan that could not read even its own descriptors has looked at nothing.
+    anyhow::ensure!(
+        scanned_self,
+        "could not read /proc/self/fd; the scan saw nothing"
+    );
+    Ok(false)
+}
+
+/// Whether an fdinfo listing is for inode `ino` and holds a shared `flock` through that
+/// descriptor. Its lock lines read `lock:\t1: FLOCK  ADVISORY  READ <pid> <maj>:<min>:<ino> 0 EOF`.
+fn fd_holds_shared_flock(info: &str, ino: u64) -> bool {
+    let same_inode = info
+        .lines()
+        .find_map(|line| line.strip_prefix("ino:"))
+        .is_none_or(|value| value.trim().parse::<u64>().ok() == Some(ino));
+    same_inode
+        && info.lines().any(|line| {
+            let Some(lock) = line.strip_prefix("lock:") else {
+                return false;
+            };
+            let fields: Vec<&str> = lock.split_whitespace().collect();
+            matches!(fields.as_slice(), [_, "FLOCK", _, "READ", ..])
+        })
+}
+
+/// A release pass (`uffd::release`) holds every idle memory file exclusively around one
+/// `posix_fadvise` call, and any test that starts a memory server runs one over the shared
+/// snapshot directory. That lock is not a reader's mark. In CI run 43447084079 a pass of
+/// another test's server held this suite's files from 15:36:35.897 to 15:36:36.392, and
+/// `test_restored_clone_reboot_comes_back_healthy` checked just after 15:36:36.05 that its clone's
+/// mark had gone, read the pass's lock as the mark, and failed.
+#[test]
+fn a_release_pass_holding_a_memory_file_is_not_a_mark() -> Result<()> {
+    let root = fcvm::paths::data_dir();
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    let dir = tempfile::tempdir_in(&root)?;
+    let path = dir.path().join("memory.bin");
+    std::fs::write(&path, b"memory")?;
+    assert!(!marked_in_use(&path)?, "an unlocked file is not marked");
+
+    let pass = std::fs::File::open(&path)?;
+    fs2::FileExt::lock_exclusive(&pass)?;
+    assert!(
+        !marked_in_use(&path)?,
+        "a release pass holding the file exclusively was read as a reader's mark"
+    );
+    drop(pass);
+
+    let reader = std::fs::File::open(&path)?;
+    fs2::FileExt::lock_shared(&reader)?;
+    assert!(marked_in_use(&path)?, "a reader's shared mark was not seen");
+    drop(reader);
+    assert!(!marked_in_use(&path)?, "a dropped mark was still seen");
+    Ok(())
+}
+
+/// A diff snapshot is staged as a btrfs subvolume snapshot of its parent
+/// (`stage_from_parent_subvolume`), so the two memory files share a superblock and an inode
+/// number. A reader's mark on one must not read as a mark on the other.
+#[test]
+fn a_mark_is_found_on_its_own_file_only() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = fcvm::paths::data_dir();
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    let dir = tempfile::tempdir_in(&root)?;
+    let btrfs = |args: &[&std::ffi::OsStr]| -> Result<()> {
+        let out = std::process::Command::new("btrfs").args(args).output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "btrfs {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+    let parent = dir.path().join("parent");
+    let child = dir.path().join("child");
+    btrfs(&["subvolume".as_ref(), "create".as_ref(), parent.as_os_str()])
+        .context("the snapshot store must be btrfs, which is where this collision happens")?;
+    std::fs::write(parent.join("memory.bin"), b"memory")?;
+    let made = btrfs(&[
+        "subvolume".as_ref(),
+        "snapshot".as_ref(),
+        parent.as_os_str(),
+        child.as_os_str(),
+    ]);
+    let result = made.and_then(|()| {
+        let (a, b) = (parent.join("memory.bin"), child.join("memory.bin"));
+        anyhow::ensure!(
+            std::fs::metadata(&a)?.ino() == std::fs::metadata(&b)?.ino(),
+            "the subvolume snapshot gave its memory file a new inode number, so this test \
+             no longer exercises the collision"
+        );
+        let reader = std::fs::File::open(&b)?;
+        fs2::FileExt::lock_shared(&reader)?;
+        anyhow::ensure!(
+            !marked_in_use(&a)?,
+            "a mark on the child snapshot's memory file read as a mark on the parent's"
+        );
+        anyhow::ensure!(marked_in_use(&b)?, "the child's own mark was not seen");
+        Ok(())
+    });
+    for subvolume in [&child, &parent] {
+        if subvolume.exists() {
+            let _ = btrfs(&[
+                "subvolume".as_ref(),
+                "delete".as_ref(),
+                subvolume.as_os_str(),
+            ]);
+        }
+    }
+    result
 }
 
 /// Write a marker into the container's writable layer and verify it.
