@@ -2752,6 +2752,80 @@ the File backend (three runs, 3.86 to 3.92 s). Warm llama.cpp clones through a
 serve answered their first token in 3.75 and 4.13 s after the recording clone
 (16.2 s), against 5.5 to 6.6 s through the File backend.
 
+#### GPU guest memory: prefilled hugepages
+
+A restore with `--gpu` and no serve process gives its guest 2 MiB hugetlbfs memory that
+already holds the snapshot (`src/storage/hugepage_spares.rs`). The DMA map's populate
+then finds every page present and the pin walks 3,072 huge pages instead of faulting
+1.5 million 4 KiB copy-on-write pages on one thread. fcvm claims a spare: a file on
+`/dev/hugepages/fcvm-<uid>` (`FCVM_HUGEPAGE_SPARES_DIR`) whose pages were allocated,
+and so zeroed by the kernel, before the restore asked, on the GPU's NUMA node. It
+copies the memory file's data extents into the spare on eight threads (a hole stays
+the spare's zeros) and hands the file to Firecracker over a socket (the fork's
+`Prefilled` backend, ejc3/firecracker#24), which maps it shared with no userfaultfd.
+With no spare the restore allocates the file itself. Once the clone is acknowledged a
+detached `fcvm gpu spares fill` replaces the spare it used.
+
+A spare is a `.tmp-<uuid>` file while it is being allocated (its creator holds its
+`flock`), and becomes `spare-<uuid>` only once every page is allocated. A claimer opens
+it, takes its lock without waiting and unlinks it before it writes a byte, so a named
+spare has never held guest memory and two restores never get one file. From the unlink
+on, the memory belongs to descriptors and mappings, and the kernel frees it when
+Firecracker exits, SIGKILL included. A fill that finds an unlocked `.tmp-` file removes
+it. `fill` creates a spare only while `MemAvailable` stays above the floor after it
+(`FCVM_HUGEPAGE_SPARES_FLOOR_MIB`, default the larger of 8 GiB and a tenth of memory),
+and `fcvm gpu spares trim` releases spares, largest first, while it is below. The fleet
+host allows surplus hugepages up to three quarters of memory
+(`vm.nr_overcommit_hugepages`, `fleet/ami/host/bind-vfio.sh`), which the kernel takes
+from its allocator when a spare or a VM faults one and gives back when the file is
+freed. A host that cannot give hugepages, a rootless run without a spare directory, a
+snapshot whose guest reports free pages, or a snapshot whose Firecracker has no
+`Prefilled` backend restores as before. `FCVM_GPU_GUEST_MEMORY=file` keeps the File
+backend.
+
+A clone in prefilled memory is a hugepage VM from then on (no dirty tracking, so its
+snapshots are full ones, and they record `hugepages`). A GPU restore of such a snapshot
+takes prefilled memory again; a restore without a GPU needs a hugepage pool.
+
+Measured on 2026-11-13 on one g4dn.metal (T4, driver 580.196.07), one boot, five
+restores per arm onto the same GPU on node 0, the memory file in the page cache: the
+fleet's 6 GiB phone VM (warm snapshot, Robot Park drawing) and a 6 GiB, 8 vCPU llama.cpp
+warm clone (Qwen2.5-0.5B, as above). The ACK column is the restored record's, which
+then started after the prefill, so the prefill is listed beside it; the last column is
+from the start of the fcvm command to the phone's first stamped frame or the first
+streamed token. Medians, with the range of the last column:
+
+| arm | prefill | load (populate, pin) | `gpu_ms` | ACK | first frame / token |
+|---|---|---|---|---|---|
+| phone, File backend (today) | | 3,316 | 2,192 | 5,558 | 6,448 (6,317 to 6,512) |
+| phone, File, 1 populate thread, timed | | 3,325 (2,789, 142) | 2,210 | 5,566 | 6,246 |
+| phone, File, 8 populate threads | | 3,263 (2,734, 140) | 2,217 | 5,505 | 6,230 |
+| phone, hugetlbfs through the UFFD server, 8 threads | | 389 (2, 5) | 2,446 | 2,955 | 3,558 (3,468 to 3,762) |
+| phone, prefilled spare | 256 | 406 (4, 5) | 2,435 | 2,869 | 3,750 (3,687 to 3,805) |
+| phone, prefilled, no spare | 1,997 | 406 | 2,509 | 2,939 | 5,542 |
+| llama, File backend (today) | | 3,639 | 1,731 | 5,402 | 5,478 (5,176 to 5,554) |
+| llama, File, 8 populate threads | | 3,137 | 1,721 | 5,038 | 5,114 |
+| llama, hugetlbfs through the UFFD server | | 1,186 | 1,358 | 2,582 | 2,723 (2,649 to 3,202) |
+| llama, prefilled spare | 158 | 406 | 1,993 | 2,448 | 2,686 (2,663 to 2,700) |
+| llama, prefilled, no spare | 2,025 | 410 | 1,996 | 2,454 | 4,564 |
+
+What the arms show:
+
+- The File backend's load is the populate: 2.8 s of 3.3 s faulting 1.5 million 4 KiB
+  copy-on-write pages, then 142 ms to pin them. Eight populate threads did not help
+  (2,734 ms): the faults do not scale on one private file mapping.
+- 2 MiB pages that are present pin in 5 ms. The UFFD arm got there by replaying the
+  recorded set (all of guest memory, since every page is a fault) during the load, and
+  needs a hugepage pool and a recording restore first; the spare arm copies 5.8 GiB of
+  data in 158 to 256 ms on eight threads and needs neither.
+- Without a spare the allocation costs 1.4 to 1.9 s (the kernel finding and zeroing 3,072
+  surplus huge pages), which is why the pool keeps one ready.
+- `gpu_ms` grew by 200 to 250 ms in every hugepage arm, and nvidia-persistenced took 1,045
+  instead of 477 ms. That is the T4 clearing its memory after the bus reset VFIO gives it
+  when Firecracker opens it, about 0.9 s (the host scrub's `clear_ms`), which the 2.8 s
+  populate used to hide. Holding the restored clone paused for 1.2 s before resuming it
+  brought nvidia-persistenced back to 466 to 469 ms and the PCI rescan from 120 to 48 ms.
+
 Measured on 2026-10-23 on a g4dn.metal (eight T4) with Qwen2.5-0.5B-Instruct and two
 servers: vLLM 0.32.0 (`vllm/vllm-openai:v0.32.0-cu129`, fp16, TRITON_ATTN,
 `--gpu-memory-utilization 0.2`, torch.compile and CUDA graphs on, 8 vCPU and 12 GiB

@@ -420,6 +420,11 @@ pub struct SnapshotLoad {
     /// Firecracker without the field never sees it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_passthrough: Option<Vec<DevicePassthrough>>,
+    /// The page size guest memory is restored with ("None" or "2M"), when it differs from the
+    /// one the snapshot recorded. Omitted when None, so a binary without the field never sees
+    /// it (ejc3/firecracker agent/vfio-uffd-populate has it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub huge_pages: Option<String>,
 }
 
 /// One passthrough device in a snapshot load.
