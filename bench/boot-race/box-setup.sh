@@ -31,7 +31,8 @@ mkdir -p /mnt/fcvm-btrfs/src && cd /mnt/fcvm-btrfs/src
 cd fcvm && git checkout -q "$1"
 
 cd /mnt/fcvm-btrfs/src/fcvm
-# a new login picks up the kvm group
-sg kvm -c ". ~/.cargo/env && make build && make setup-fcvm"
+# A new login picks up the kvm group. Not sg: it makes kvm the primary group, and newuidmap then refuses rootless
+# podman ("Target process ... is owned by a different user") in setup-fcvm's package download.
+sudo -u ubuntu -H bash -c "cd /mnt/fcvm-btrfs/src/fcvm && . ~/.cargo/env && make build && make setup-fcvm"
 podman build -t localhost/boot-race-workload ~/boot-race/img
 echo BOX_SETUP_DONE
