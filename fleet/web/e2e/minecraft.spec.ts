@@ -91,8 +91,22 @@ test("each tile draws its world from its own view socket, and says its slot, tic
   await expect(page.getByTestId("mc-server")).toHaveText(SERVER);
   await expect(page.getByTestId("mc-median")).toHaveText(/^Median restore to first chunk \d+\.\d\d s$/);
   await expect(page.getByTestId("mc-slowest")).toHaveText(/^Slowest \d+\.\d\d s$/);
-  await expect(page.getByTestId("mc-last-fork")).toHaveText("Fork: not used yet");
-  await expect(page.getByTestId("mc-join")).toHaveText("Join from Minecraft: Java Edition 26.3 at mc-1.mc.example.test, port 25565. Every tile has its own address, under it.");
+  // nothing used yet is no line at all
+  await expect(page.getByTestId("mc-last-fork")).toHaveCount(0);
+  await expect(page.getByTestId("mc-last-reset-all")).toHaveCount(0);
+  await expect(page.getByTestId("mc-stats")).not.toContainText("not used yet");
+  await expect(page.getByTestId("mc-join-address")).toHaveText("mc-1.mc.example.test:25565");
+  await expect(page.getByTestId("mc-join")).toContainText("Join with Java Edition 26.3:");
+  // the join line is one line on a desktop screen
+  if (!isPhone(info)) {
+    expect(await page.getByTestId("mc-join").evaluate((el) => el.getBoundingClientRect().height)).toBeLessThan(40);
+  }
+  // the tab says which mode it is, and a mode that is not one keeps the wall's title
+  await expect(page).toHaveTitle("Minecraft");
+  const other = await page.context().newPage();
+  await other.goto("/?mode=constructor");
+  await expect(other).toHaveTitle("Every GPU, live");
+  await other.close();
   await expect(page.getByTestId("mc-panel")).toHaveCount(0);
   const dir = process.env.FLEET_SCREENSHOT_DIR;
   if (dir) await page.screenshot({ path: `${dir}/minecraft-${isPhone(info) ? "phone" : "desktop"}.png` });
@@ -143,7 +157,7 @@ test("Fork copies a running server into the next one: the copy says Forked from,
   await expect(page.getByTestId("mc-tile-mc-4")).toHaveAttribute("data-phase", "live", { timeout: 15_000 });
   await expect(page.getByTestId("mc-forked-mc-4")).toHaveText(/^Forked from mc-3 in \d+\.\d\d s/);
   expect(seconds(await page.getByTestId("mc-forked-mc-4").textContent())).toBeGreaterThanOrEqual(2.5);
-  await expect(page.getByTestId("mc-last-fork")).toHaveText(/^Last fork: mc-3 to mc-4 in \d+\.\d\d s \(snapshot 0\.60 s, restore \d+\.\d\d s\)$/);
+  await expect(page.getByTestId("mc-last-fork")).toHaveText(/^Last fork (just now|\d+ s ago): mc-3 to mc-4 in \d+\.\d\d s \(snapshot 0\.60 s, restore \d+\.\d\d s\)$/);
   expect((await mockMc()).tiles[3]).toMatchObject({ forked_from: "mc-3", last_relaunch: { by: "fork:mc-3" } });
   await expect.poll(async () => (await drawnShare(page, "mc-4")).share, { timeout: 10_000 }).toBeGreaterThan(0.9);
   // one fork per 10 s per client
@@ -255,6 +269,70 @@ test("a viewer with no IPv6 reaches every server over its IPv4 name: the worlds 
   await openMinecraft(page);
   expect(await family()).toBe("v6");
   expect(await hosts()).toEqual(new Set(["localhost"]));
+});
+
+test("a server whose view cannot be reached says so on its tile with a Retry, cannot be taken over, and draws once it can be reached", async ({ page }) => {
+  await admin("/mock/fault", { minecraft_down: true });
+  try {
+    await page.goto("/?mode=minecraft&debug=1");
+    await page.waitForFunction(() => window.__minecraft !== undefined);
+    for (const slot of SLOTS) {
+      await expect(page.getByTestId(`mc-stream-${slot}`)).toContainText(`Cannot reach ${slot}'s view. Trying again.`, { timeout: 10_000 });
+      await expect(page.getByTestId(`mc-stream-retry-${slot}`)).toBeVisible();
+
+      await expect(page.getByTestId(`mc-take-${slot}`)).toBeDisabled();
+    }
+    // The browser's own accessibility tree holds each Retry and each message: inside an element
+    // with role img they would be presentational, and a screen reader would hear only the label.
+    const cdp = await page.context().newCDPSession(page);
+    const { nodes } = (await cdp.send("Accessibility.getFullAXTree")) as { nodes: { ignored: boolean; role?: { value: string }; name?: { value: string } }[] };
+    const exposed = nodes.filter((n) => !n.ignored);
+    expect(exposed.filter((n) => n.role?.value === "button" && n.name?.value === "Retry")).toHaveLength(SLOTS.length);
+    for (const slot of SLOTS) expect(exposed.some((n) => n.role?.value === "StaticText" && n.name?.value === `Cannot reach ${slot}'s view. Trying again.`), slot).toBe(true);
+  } finally {
+    await admin("/mock/fault", { minecraft_down: false });
+  }
+  await page.getByTestId("mc-stream-retry-mc-1").click();
+  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 10_000 });
+  await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 10_000 }).toBeGreaterThan(0.9);
+  await expect(page.getByTestId("mc-take-mc-1")).toBeEnabled();
+});
+
+test("a handshake that never answers is given up after the deadline, and Retry starts a fresh one at once", async ({ page }) => {
+  await admin("/mock/fault", { minecraft_hang: true });
+  try {
+    await page.goto("/?mode=minecraft&debug=1");
+    await page.waitForFunction(() => window.__minecraft !== undefined);
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
+    // Retry under the same fault starts over: the tile says it is connecting again, without Retry
+    await page.getByTestId("mc-stream-retry-mc-1").click();
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Connecting to mc-1.", { timeout: 1000 });
+    await expect(page.getByTestId("mc-stream-retry-mc-1")).toHaveCount(0);
+    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
+  } finally {
+    await admin("/mock/fault", { minecraft_hang: false });
+  }
+  await page.getByTestId("mc-stream-retry-mc-1").click();
+  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 2000 });
+  await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 5000 }).toBeGreaterThan(0.9);
+});
+
+test("the held server is the large view, with the others off the stage, and Give back closes the panel at once", async ({ page }, info) => {
+  await openMinecraft(page);
+  const small = (await page.getByTestId("mc-tile-mc-2").boundingBox())!;
+  await page.getByTestId("mc-take-mc-2").click();
+  await expect(page.getByTestId("mc-panel")).toBeVisible();
+  const big = (await page.getByTestId("mc-tile-mc-2").boundingBox())!;
+  // on a desktop it fills the room beside the panel; on a phone the half of the screen above it
+  expect(big.width).toBeGreaterThan((isPhone(info) ? 1.05 : 1.3) * small.width);
+  for (const slot of ["mc-1", "mc-3", "mc-4"]) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(0);
+  // the panel does not cover the held view
+  const sheet = (await page.getByTestId("mc-panel").boundingBox())!;
+  const overlap = !(big.x + big.width <= sheet.x || sheet.x + sheet.width <= big.x || big.y + big.height <= sheet.y || sheet.y + sheet.height <= big.y);
+  expect(overlap).toBe(false);
+  await page.getByTestId("mc-give-back").click();
+  await expect(page.getByTestId("mc-panel")).toHaveCount(0, { timeout: 150 });
+  for (const slot of SLOTS) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(1);
 });
 
 test("a place and a dig change the world on the tile, timed to the delta that shows them", async ({ page }, info) => {

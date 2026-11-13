@@ -5,6 +5,7 @@
 
 import { spawn } from "node:child_process";
 import http from "node:http";
+import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { buildFrame } from "../core/frame.ts";
 import { deliveredGeometry, tileGeometry, type TileGeometry } from "../core/layout.ts";
@@ -133,6 +134,13 @@ export class MockRenderers {
         socket.destroy();
         return;
       }
+      // A viewer whose IPv4 packets are dropped (a security group that does not admit the
+      // port): the connection is never answered, neither opened nor refused.
+      if (family === "v4" && this.v4Silent) {
+        this.unanswered.add(socket);
+        socket.on("close", () => this.unanswered.delete(socket));
+        return;
+      }
       const h = Number(url.searchParams.get("h") ?? "144");
       const q = url.searchParams.get("q") ?? "std";
       if (!(q in CRF)) {
@@ -175,6 +183,15 @@ export class MockRenderers {
   /** Tests: refuse every IPv6 frame socket, as for a viewer with no IPv6. */
   setV6Down(down: boolean): void {
     this.v6Down = down;
+  }
+
+  private v4Silent = false;
+  private readonly unanswered = new Set<Duplex>();
+  /** Tests: answer no IPv4 frame socket (until set back, when the held ones are closed). */
+  setV4Silent(silent: boolean): void {
+    this.v4Silent = silent;
+    if (!silent) for (const s of this.unanswered) s.destroy();
+    this.unanswered.clear();
   }
 
   setTile(id: string, rect: Rect, black: () => Rect[] = () => [], scene: (() => PatternScene) | null = null): void {

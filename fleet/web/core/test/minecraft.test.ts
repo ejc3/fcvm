@@ -9,6 +9,8 @@ import {
   driveInputOf,
   Driver,
   FIRST_CHANGE_GIVE_UP_MS,
+  HEADER_RECENT_MS,
+  MC_CONNECT_DEADLINE_MS,
   forkTarget,
   markersOf,
   MATERIAL_COLORS,
@@ -26,6 +28,7 @@ import {
   wrapYaw,
   type DriveMsg,
   type McPlayer,
+  type McTileLive,
   type McWorld,
   type MinecraftInput,
 } from "../minecraft.ts";
@@ -85,7 +88,7 @@ function stateWith(minecraft: Minecraft | null, you = "v-1", admission: Record<s
 
 const STAGE = { x: 0, y: 150, w: 1000, h: 520 };
 const LIVE = (n: number, tps: number | null = 19.98, viewer = "v-1") =>
-  Object.fromEntries(Array.from({ length: n }, (_, i) => [`mc:${i + 1}`, { open: true, viewer, tps, hasMap: true }]));
+  Object.fromEntries(Array.from({ length: n }, (_, i) => [`mc:${i + 1}`, { open: true, viewer, tps, hasMap: true, failures: 0, connectingSince: null }]));
 const input = (s: ClientState, over: Partial<MinecraftInput> = {}): MinecraftInput => ({ state: s, now: NOW, dpr: 1, stage: STAGE, narrow: false, touch: false, live: LIVE(8), drive: null, ...over });
 const viewOf = (m: Minecraft | null, over: Partial<MinecraftInput> = {}, you = "v-1") => minecraftView(input(stateWith(m, you), over));
 
@@ -522,31 +525,41 @@ describe("the header", () => {
     expect(h.server).toBe(SERVER);
     expect(h.median).toBe("Median restore to first chunk 1.90 s");
     expect(h.slowest).toBe("Slowest 2.60 s");
-    expect(h.lastFork).toBe("Fork: not used yet");
-    expect(h.lastResetAll).toBe("Reset all: not used yet");
+    // Nothing to report is no line at all, not "not used yet".
+    expect(h.lastFork).toBeNull();
+    expect(h.lastResetAll).toBeNull();
     const one = viewOf(with1(minecraftOf(1), 0, { phase: "pending", last_relaunch: null })).header!;
     expect([one.up, one.median, one.slowest]).toEqual(["0 of 1 server up", "Median restore to first chunk --", "Slowest --"]);
   });
 
-  it("gives the last fork with its snapshot and restore, and the last reset all by whom", () => {
-    const at = Date.UTC(2026, 10, 8, 9, 5, 0);
+  it("gives the last fork with its age, snapshot and restore, and the last reset all by whom, while they are recent", () => {
+    const at = NOW - 5 * 60_000;
     const m = minecraftOf(4, {
-      last_fork: { from: "mc-1", to: "mc-2", clicked_at: at, by: "viewer:v-5", first_chunk_at: at + 2300, snapshot_ms: 640, restore_ms: 1100, total_ms: 2300 },
+      last_fork: { from: "mc-1", to: "mc-2", clicked_at: at - 2300, by: "viewer:v-5", first_chunk_at: at, snapshot_ms: 640, restore_ms: 1100, total_ms: 2300 },
       last_reset_all: { clicked_at: at, by: "viewer:v-1", servers: 4 },
     });
     const h = viewOf(m).header!;
-    expect(h.lastFork).toBe("Last fork: mc-1 to mc-2 in 2.30 s (snapshot 0.64 s, restore 1.10 s)");
-    expect(h.lastResetAll).toBe("Last reset all: 09:05:00 UTC, 4 servers, by you");
-    expect(viewOf(m, {}, "v-9").header!.lastResetAll).toBe("Last reset all: 09:05:00 UTC, 4 servers, by another viewer");
+    expect(h.lastFork).toBe("Last fork 5 min ago: mc-1 to mc-2 in 2.30 s (snapshot 0.64 s, restore 1.10 s)");
+    expect(h.lastResetAll).toBe("Last reset all 5 min ago: 4 servers, by you");
+    expect(viewOf(m, {}, "v-9").header!.lastResetAll).toBe("Last reset all 5 min ago: 4 servers, by another viewer");
+    // Last night's fork and reset are history: the header drops them.
+    const old = NOW - HEADER_RECENT_MS - 1000;
+    const stale = viewOf(
+      minecraftOf(4, {
+        last_fork: { from: "mc-1", to: "mc-2", clicked_at: old - 3890, by: "viewer:v-5", first_chunk_at: old, snapshot_ms: 1090, restore_ms: 2010, total_ms: 3890 },
+        last_reset_all: { clicked_at: old, by: "viewer:v-1", servers: 4 },
+      }),
+    ).header!;
+    expect([stale.lastFork, stale.lastResetAll]).toEqual([null, null]);
   });
 
-  it("tells Java Edition players an address and the port when tiles have one, and nothing when none does", () => {
-    expect(viewOf(minecraftOf(2)).header!.join).toBe("Join from Minecraft: Java Edition 26.3 at mc-1.example.test, port 25565. Every tile has its own address, under it.");
+  it("tells Java Edition players the client and one address to copy when tiles have one, and nothing when none does", () => {
+    expect(viewOf(minecraftOf(2)).header!.join).toEqual({ label: "Join with Java Edition 26.3:", address: "mc-1.example.test:25565" });
     const none = minecraftOf(2);
     for (const t of none.tiles) t.join = null;
     expect(viewOf(none).header!.join).toBeNull();
     expect(viewOf(none).cards.every((c) => c.join === null)).toBe(true);
-    expect(viewOf(minecraftOf(1, { server: "Some server" })).header!.join).toBe("Join from Minecraft: Java Edition at mc-1.example.test, port 25565. Every tile has its own address, under it.");
+    expect(viewOf(minecraftOf(1, { server: "Some server" })).header!.join).toEqual({ label: "Join with Java Edition:", address: "mc-1.example.test:25565" });
   });
 
   it("Reset all is on while online, off when the socket is closed", () => {
@@ -609,7 +622,7 @@ describe("taking a server over", () => {
 
   it("keys do not reach the bot until the tile's socket is open and acts as the holder, nor while it restores", () => {
     const connecting = viewOf(held("v-1"), { live: {} }).panel!;
-    expect([connecting.driving, connecting.waiting]).toEqual([false, "Connecting to the server."]);
+    expect([connecting.driving, connecting.waiting]).toEqual([false, "Connecting to mc-3."]);
     const other = viewOf(held("v-1"), { live: LIVE(4, 20, "v-7") }).panel!;
     expect(other.driving).toBe(false);
     expect(other.waiting).toMatch(/acts as another viewer/);
@@ -670,11 +683,82 @@ describe("what there is to show, and where", () => {
     expect(new Set(boxes.map((b) => b.y)).size).toBe(Math.ceil(k / 4));
   });
 
-  it("on a phone with the panel open the tiles sit above it, with compact captions and no buttons", () => {
+  it("on a phone with the panel open the held server sits above it, with a compact caption and no buttons", () => {
     const m = minecraftOf(4);
     m.tiles[0]!.borrowed = { session: "minecraft-claim-1", viewer: "v-1", since: NOW, until: NOW + 100_000 };
     const v = viewOf(m, { stage: { x: 8, y: 150, w: 374, h: 640 }, narrow: true, touch: true });
-    expect(v.cards.every((c) => c.compact && !c.showActions)).toBe(true);
-    expect(Math.max(...v.cards.map((c) => c.caption!.y + c.caption!.h))).toBeLessThanOrEqual(150 + 320 + 1e-6);
+    const shown = v.cards.filter((c) => c.box !== null);
+    expect(shown.map((c) => c.slot)).toEqual(["mc-1"]);
+    expect(shown.every((c) => c.compact && !c.showActions)).toBe(true);
+    expect(Math.max(...shown.map((c) => c.caption!.y + c.caption!.h))).toBeLessThanOrEqual(150 + 320 + 1e-6);
+  });
+});
+
+describe("a tile whose view is not coming in", () => {
+  const closed = (failures: number, since: number | null) => ({ open: false, viewer: null, tps: null, hasMap: false, failures, connectingSince: since });
+
+  it("says so on the tile, never just dark: connecting, then cannot reach with a Retry, then loading", () => {
+    const at = (live: McTileLive) => viewOf(minecraftOf(2), { live: { ...LIVE(2), "mc:1": live } as MinecraftInput["live"] }).cards[0]!;
+    expect([at(closed(0, NOW - 100)).stream, at(closed(0, NOW - 100)).streamFailed]).toEqual(["Connecting to mc-1.", false]);
+    // a connect that failed, or one still pending past the deadline, is a failure the tile names
+    expect([at(closed(1, NOW - 100)).stream, at(closed(1, NOW - 100)).streamFailed]).toEqual(["Cannot reach mc-1's view. Trying again.", true]);
+    expect(at(closed(0, NOW - MC_CONNECT_DEADLINE_MS)).streamFailed).toBe(true);
+    expect(at({ open: true, viewer: "v-1", tps: 20, hasMap: false, failures: 0, connectingSince: null }).stream).toBe("Loading mc-1's world.");
+    expect(at({ open: true, viewer: "v-1", tps: 20, hasMap: true, failures: 0, connectingSince: null }).stream).toBeNull();
+    // no socket opened for the tile yet: still a line, not a black square
+    expect(viewOf(minecraftOf(2), { live: {} }).cards[0]!.stream).toBe("Connecting to mc-1.");
+  });
+
+  it("with no socket to open, says why and offers no Retry: there is nothing to retry", () => {
+    // no address in the family the page settled on
+    const m = minecraftOf(2);
+    m.tiles[0]!.frame_url = null;
+    const c = viewOf(m, { live: {} }).cards[0]!;
+    expect([c.socket, c.stream, c.streamFailed]).toEqual([null, "mc-1 has no IPv6 address yet.", false]);
+    // no direct seat: the banner says so, and the tile does not blame the network
+    const locked = minecraftView(input(stateWith(minecraftOf(2), "v-1", { type: "admission", seat: null, locked: true, reason: "Direct streams are full.", direct: null, broadcast: null, seat_free: false }), { live: {} })).cards[0]!;
+    expect(locked.socket).toBeNull();
+    expect(locked.streamFailed).toBe(false);
+    expect(locked.stream).not.toMatch(/address/);
+  });
+
+  it("cannot be taken over while this page is not connected to it: the turn would run with nothing to drive", () => {
+    const c = viewOf(minecraftOf(2), { live: { ...LIVE(2), "mc:2": closed(3, NOW - 9000) } as MinecraftInput["live"] }).cards;
+    expect(c[0]!.take.disabled).toBe(false);
+    expect(c[1]!.take.disabled).toBe(true);
+    expect(c[1]!.take.title).toMatch(/not connected to mc-2/);
+  });
+});
+
+describe("the held server", () => {
+  const holding = () => with1(minecraftOf(4), 1, { borrowed: { session: "minecraft-claim-7", viewer: "v-1", since: NOW - 1000, until: NOW + 119_000 } });
+
+  it("is the one large view beside the panel; the others leave the stage until it is given back", () => {
+    const before = viewOf(minecraftOf(4)).cards;
+    const v = viewOf(holding());
+    const held = v.cards.find((c) => c.slot === "mc-2")!;
+    expect(v.panel?.slot).toBe("mc-2");
+    expect(held.box!.w).toBeGreaterThan(1.5 * before[1]!.box!.w);
+    expect(held.box!.w).toBe(held.box!.h);
+    expect(v.cards.filter((c) => c.slot !== "mc-2").every((c) => c.box === null)).toBe(true);
+    // it fits the room left of the panel, with its caption under it
+    const room = STAGE.w - 360;
+    expect(held.box!.x + held.box!.w).toBeLessThanOrEqual(STAGE.x + room);
+    expect(held.caption!.y).toBe(held.box!.y + held.box!.h);
+  });
+
+  it("closes its panel the moment this page gives it back, before the coordinator says so", () => {
+    expect(viewOf(holding()).panel).not.toBeNull();
+    const v = viewOf(holding(), { released: "minecraft-claim-7" });
+    expect(v.panel).toBeNull();
+    expect(v.cards.every((c) => c.box !== null)).toBe(true);
+  });
+
+  it("says when its view does not connect, and offers Retry", () => {
+    const live = { ...LIVE(4), "mc:2": { open: false, viewer: null, tps: null, hasMap: false, failures: 2, connectingSince: NOW - 4000 } } as MinecraftInput["live"];
+    const p = viewOf(holding(), { live }).panel!;
+    expect(p.driving).toBe(false);
+    expect(p.failed).toBe(true);
+    expect(p.waiting).toBe("Lost the connection to mc-2. Trying again; Retry tries now.");
   });
 });

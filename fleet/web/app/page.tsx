@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import { headers } from "next/headers";
 import { NO_FLEET } from "../core/index.ts";
 import { pageDirectLiveUrl, pageLiveUrl } from "../core/live-proxy.ts";
@@ -12,6 +13,15 @@ import { Wall } from "./_wall/Wall.tsx";
 // first (directUrl: a hostname in the page's own Access application, the faster path) and
 // then its own origin, which the Worker forwards (core/live-proxy.ts, worker.ts).
 export const dynamic = "force-dynamic";
+
+/** Each mode's tab title, in the server-rendered head: a title set only after hydration was replaced by the layout's. */
+const MODE_TITLES: Readonly<Record<string, string>> = { phones: "Phones", potato: "Hot potato", windows: "Windows", minecraft: "Minecraft" };
+
+export async function generateMetadata({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }): Promise<Metadata> {
+  const { mode } = await searchParams;
+  const title = typeof mode === "string" && Object.hasOwn(MODE_TITLES, mode) ? MODE_TITLES[mode] : undefined;
+  return title === undefined ? {} : { title };
+}
 
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const h = await headers();

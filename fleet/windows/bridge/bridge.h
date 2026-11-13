@@ -49,6 +49,8 @@ class Bridge : public FrameSource, public RdpSink {
   bool post_budget(const std::string& body, std::string* err) override;
   bool raw_frame(double, std::string*, std::string*) override { return false; }
   bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) override;
+  // The desktop is private; fleet viewers must use the admitted /frames stream.
+  bool allows_fleet_still() const override { return false; }
   std::string health_json() override;
   bool admits(const std::string& token) override;
   bool requires_admit() override;
