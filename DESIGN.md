@@ -2684,6 +2684,39 @@ before the VM started. The host scrub is off the critical path (between
 tenants), confirms through the GPU's own registers that its memory was
 cleared, and quarantines a GPU that does not, but it runs only when the fleet
 agent runs it and only on Turing to Ada with a bus reset.
+
+**The clean token.** When the host scrub has run, the guest's scrub zeroes memory that
+is already zero, on the restore's path. A successful host scrub therefore leaves a
+token, `/var/lib/fcvm/gpu/<sbdf>.clean`, holding this boot's id: it removes any token
+before it touches the GPU (with the quarantine mark) and writes the new one, synced,
+after it records the success. A restore that holds the GPU's lease takes the token by
+unlinking it before the load opens the GPU (`take_clean_token`), so exactly one VM
+gets the GPU that way, and the restore document then says `gpus-host-scrubbed`
+(only when every GPU's token was taken). fc-agent skips its scrub on that word and
+scrubs on every other restore and on the source's unpark. A scrub that fails or dies,
+a VM killed after taking the token, a reboot, or a host image baked with a token
+(another boot's id) all leave the next VM without the word, so the cost of any of
+them is one in-guest scrub, never a skipped one. Only root can take a token, so a
+rootless restore always scrubs in the guest.
+
+Measured on 2026-11-13 on one g4dn.metal, prefilled hugepage restores (above), five per
+arm onto one T4, with and without `fcvm gpu scrub` of that GPU before each restore. The
+GPU phase's parts, medians: the PCI rescan 119 to 125 ms, nvidia-persistenced 1,046 ms,
+the scrub 251 to 252 ms, `nvidia-smi -L` 18 to 19 ms (run beside the clocks, 52 to 56 ms).
+nvidia-persistenced initialises the GPU, and 575 ms of it is the wait for the T4's own
+memory clear after the bus reset of the VFIO open (paused 1.2 s before resuming, it took
+466 to 469 ms); it has to finish before anything uses the GPU. `nvidia-smi -L` is the
+check that every GPU came up and costs nothing on the path. The scrub is the step the
+host can vouch for (these ACKs start after the prefill, 159 to 251 ms before them; the
+first frame and token are from the start of the fcvm command):
+
+| | without the token | with it |
+|---|---|---|
+| phone: ACK, first frame | 2,716, 3,402 ms | 2,468, 3,326 ms |
+| llama.cpp: ACK, first token | 2,451, 2,699 ms | 1,995, 2,238 ms |
+
+The llama clone also restored its CUDA process in 309 instead of 509 ms with no scrub
+before it.
 ### Warm GPU snapshots
 
 A restore ends at an empty GPU, so a model server in a clone loads its weights,

@@ -395,6 +395,7 @@ pub async fn handle_clone_restore(
     let host_time = metadata.host_time_ns.as_str();
     let restore_hook = metadata.restore_hook.as_deref();
     let gpus = metadata.gpus.as_slice();
+    let gpus_host_scrubbed = metadata.gpus_host_scrubbed;
     let identity = &metadata.identity;
     let restore_started = std::time::Instant::now();
     let mut phases = RestorePhases::default();
@@ -426,7 +427,7 @@ pub async fn handle_clone_restore(
         let gpus = gpus.to_vec();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let report = crate::gpu::attach(&gpus).await?;
+            let report = crate::gpu::attach(&gpus, gpus_host_scrubbed).await?;
             Ok::<_, anyhow::Error>((elapsed_ms(started), report))
         })
     });
@@ -1642,7 +1643,7 @@ mod tests {
     fn gpu_attach_completes_before_the_clone_is_published() {
         let body = handle_clone_restore_source();
         let start = body
-            .find("crate::gpu::attach(&gpus)")
+            .find("crate::gpu::attach(&gpus, gpus_host_scrubbed)")
             .expect("the restore path no longer attaches GPUs");
         let join = body
             .find(".context(\"restore phase gpu-attach\")?")

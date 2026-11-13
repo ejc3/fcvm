@@ -3869,6 +3869,22 @@ async fn cmd_snapshot_run_inner(
     // acknowledges this restore (fc-agent `gpu::attach`).
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
+        // Every GPU a host scrub cleared, with no VM given it since: the guest's scrub would
+        // zero memory that is already zero. Taken here, before the load opens the GPUs, and
+        // only all or nothing (the guest's scrub covers every GPU it has).
+        let state_dir = crate::gpu::scrub::state_dir();
+        // Every token is taken, not only up to the first missing one: a GPU this VM gets must
+        // not keep a token that tells the next VM it is clean.
+        let taken: Vec<bool> = _gpu_leases
+            .iter()
+            .zip(&gpus)
+            .map(|(lease, sbdf)| crate::gpu::scrub::take_clean_token(&state_dir, sbdf, lease))
+            .collect();
+        let scrubbed = taken.iter().all(|&clean| clean);
+        if scrubbed {
+            info!(gpus = ?gpus, "every GPU was scrubbed on the host since its last VM");
+            restore_latest["gpus-host-scrubbed"] = serde_json::Value::Bool(true);
+        }
     }
     // Always sent: the snapshot's guest runs in whatever mode its source had, and
     // a clone that asked for none gets the kernel's own back.
@@ -6216,6 +6232,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// A restore takes every GPU's clean token before it decides, so a GPU it gets cannot keep
+    /// a token that would tell the next VM it is clean.
+    #[test]
+    fn a_restore_takes_every_clean_token() {
+        let code = include_str!("snapshot.rs");
+        let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let take = code
+            .find("take_clean_token(&state_dir, sbdf, lease)")
+            .expect("no take");
+        let rest = &code[take..];
+        let collect = rest
+            .find(".collect();")
+            .expect("the takes are not collected");
+        let all = rest.find(".all(|&clean| clean)").expect("no decision");
+        assert!(collect < all, "the decision short-circuits the takes");
+    }
 
     #[test]
     fn a_binary_names_the_prefilled_backend_by_its_greeting() {

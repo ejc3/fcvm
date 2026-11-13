@@ -675,6 +675,8 @@ pub fn scrub_and_record_with(
         },
     };
     let mark = || {
+        remove_clean_token(state_dir, sbdf)
+            .context("removing the GPU's clean token; the GPU was not touched")?;
         update_record(state_dir, sbdf, |record| {
             record.quarantined = true;
             record.last_error = Some(format!(
@@ -692,7 +694,15 @@ pub fn scrub_and_record_with(
         }
     }
     let outcome = result.map_err(|error| format!("{error:#}"));
-    match update_record(state_dir, sbdf, |record| apply_outcome(record, &outcome)) {
+    let recorded = update_record(state_dir, sbdf, |record| apply_outcome(record, &outcome));
+    // The token follows the recorded success. A token that cannot be written leaves the GPU
+    // usable, scrubbed by the next VM's guest as well.
+    if recorded.is_ok() && outcome.is_ok() {
+        if let Err(error) = write_clean_token(state_dir, sbdf) {
+            tracing::warn!(sbdf, error = %format!("{error:#}"), "could not write the GPU's clean token");
+        }
+    }
+    match recorded {
         Ok(record) => ScrubReport {
             sbdf: sbdf.to_string(),
             outcome: if outcome.is_ok() {
@@ -710,6 +720,76 @@ pub fn scrub_and_record_with(
             outcome.err().map(|e| format!("{e}; ")).unwrap_or_default()
         )),
     }
+}
+
+/// The GPU's clean token, `<state_dir>/<sbdf>.clean`: present only between a successful host
+/// scrub and the first VM given the GPU after it. A scrub removes it before it touches the GPU
+/// and writes it, synced, once the outcome recording a success is written; a VM takes it by
+/// unlinking it ([`take_clean_token`]), which succeeds for exactly one process. So the token
+/// says the GPU's memory was cleared and no VM has had the GPU since, and anything that
+/// interrupts either side (a failed or killed scrub, a VM killed after taking it) leaves no
+/// token, which costs the next VM its in-guest scrub and never skips one that was needed.
+fn clean_token_path(state_dir: &Path, sbdf: &str) -> PathBuf {
+    state_dir.join(format!("{sbdf}.clean"))
+}
+
+/// Remove the clean token, durably. Called under the scrub's lock before the GPU is touched.
+fn remove_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
+    let path = clean_token_path(state_dir, sbdf);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+    std::fs::File::open(state_dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing {}", state_dir.display()))
+}
+
+/// This boot's id. A token names the boot its scrub ran in, so a token that outlives the boot
+/// (a host image baked with one, or a reboot) is not taken: the GPUs it would vouch for may be
+/// other devices, or have been used before this fcvm saw them.
+fn boot_id() -> Result<String> {
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("reading the boot id")?
+        .trim()
+        .to_string())
+}
+
+/// Write the clean token, durably. Called under the scrub's lock after a success is recorded.
+fn write_clean_token(state_dir: &Path, sbdf: &str) -> Result<()> {
+    let path = clean_token_path(state_dir, sbdf);
+    let boot = boot_id()?;
+    std::fs::File::create(&path)
+        .and_then(|mut file| {
+            file.write_all(boot.as_bytes())?;
+            file.sync_all()
+        })
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::File::open(state_dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing {}", state_dir.display()))
+}
+
+/// Take the GPU's clean token, for a VM holding its lease: `true` when a host scrub cleared
+/// the GPU's memory and no VM has had the GPU since, and this caller is the one VM that gets
+/// it that way. The guest's own scrub is then redundant. Only the token's unlink decides, so
+/// two VMs racing for one GPU cannot both see it clean. Any error reads as not clean.
+pub fn take_clean_token(state_dir: &Path, sbdf: &str, _lease: &GpuLease) -> bool {
+    let path = clean_token_path(state_dir, sbdf);
+    // Only a scrub writes the token, and none can run while the caller holds a lease, so the
+    // contents read here are the contents unlinked below.
+    let Ok(written) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if std::fs::remove_file(&path).is_err() {
+        return false;
+    }
+    // Durable before the VM opens the GPU: a crash cannot bring the token back.
+    let synced = std::fs::File::open(state_dir)
+        .and_then(|dir| dir.sync_all())
+        .is_ok();
+    synced && boot_id().is_ok_and(|boot| written.trim() == boot)
 }
 
 /// Refuse a quarantined GPU. Called for every `--gpu` before the VM starts.
@@ -1025,6 +1105,57 @@ mod tests {
         let (report, reset) = scrub_recorded(&fake, &state, &|| {});
         assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
         assert!(reset);
+    }
+
+    /// A successful scrub leaves a clean token that exactly one VM takes; the token is gone
+    /// while the GPU is being touched, and a failed scrub leaves none.
+    #[test]
+    fn the_clean_token_goes_to_one_vm_after_a_successful_scrub() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        let token = clean_token_path(&state, sbdf);
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(token.exists(), "a successful scrub left no clean token");
+        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
+        assert!(take_clean_token(&state, sbdf, &lease));
+        assert!(
+            !take_clean_token(&state, sbdf, &lease),
+            "a second VM was told the GPU is clean"
+        );
+        drop(lease);
+        // A token left from an earlier scrub is gone before the next scrub touches the GPU.
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        let seen = std::cell::Cell::new(true);
+        let (report, _) = scrub_recorded(&fake, &state, &|| seen.set(token.exists()));
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(
+            !seen.get(),
+            "the clean token was present while the GPU was reset"
+        );
+        // A token from another boot is taken (so it cannot be taken again) but vouches for
+        // nothing.
+        std::fs::write(&token, "another-boot").unwrap();
+        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
+        assert!(
+            !take_clean_token(&state, sbdf, &lease),
+            "a token from another boot was honoured"
+        );
+        assert!(!token.exists());
+        drop(lease);
+        // A scrub that fails after the reset leaves no token.
+        let failed = scrub_and_record_with(
+            &fake.root.path().join("sys"),
+            &fake.root.path().join("dev"),
+            &state,
+            sbdf,
+            Duration::from_millis(50),
+            &|_device: &Path| anyhow::bail!("the reset failed"),
+        );
+        assert_eq!(failed.outcome, "failed");
+        assert!(!token.exists(), "a failed scrub left a clean token");
     }
 
     /// The lease belongs to the VM, not the process: one process running two
