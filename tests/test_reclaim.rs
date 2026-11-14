@@ -641,12 +641,34 @@ async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Resul
         common::TEST_IMAGE,
     ])
     .await?;
-    let mut clone = None;
+    // The clone is restored once the baseline's network is gone: while the baseline's veth
+    // holds the guest address, no clone takes the host route to it (#1882).
     let observed = async {
         common::poll_health_by_pid(baseline_pid, 120).await?;
-        let baseline_objects = BridgedObjects::of(baseline_pid, false).await?;
+        let objects = BridgedObjects::of(baseline_pid, false).await?;
+        let present = objects.present()?;
+        anyhow::ensure!(
+            present.iter().any(|p| p.starts_with("namespace"))
+                && present.iter().any(|p| p.starts_with("interface"))
+                && present.iter().any(|p| p.contains("DNAT")),
+            "the running baseline's network is not all there, or it has no DNAT rule for \
+             --publish {publish}: {present:?} ({objects:?})"
+        );
         common::create_snapshot_by_pid(baseline_pid, &snapshot).await?;
-        let (child, clone_pid) = common::spawn_fcvm(&[
+        Ok(objects)
+    }
+    .await;
+    sigkill(&mut baseline, baseline_pid).await?;
+    let result = async {
+        let baseline_objects = observed?;
+        next_launch_on("bridged").await?;
+        let present = baseline_objects.present()?;
+        anyhow::ensure!(
+            present.is_empty(),
+            "the killed baseline's network survived the next launch: {present:?}"
+        );
+
+        let (mut child, clone_pid) = common::spawn_fcvm(&[
             "snapshot",
             "run",
             "--snapshot",
@@ -655,51 +677,29 @@ async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Resul
             &clone_name,
         ])
         .await?;
-        clone = Some((child, clone_pid));
-        common::poll_health_by_pid(clone_pid, 120).await?;
-        let clone_objects = BridgedObjects::of(clone_pid, true).await?;
-        for objects in [&baseline_objects, &clone_objects] {
+        let clone_objects = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let objects = BridgedObjects::of(clone_pid, true).await?;
             let present = objects.present()?;
-            // Namespace, veth, its FORWARD rule, and for the baseline four rules per
-            // published port and for the clone its route.
+            // Namespace, veth, its FORWARD rule, and the route to its guest.
             anyhow::ensure!(
                 present.iter().any(|p| p.starts_with("namespace"))
                     && present.iter().any(|p| p.starts_with("interface"))
-                    && present.iter().any(|p| p.starts_with("rule")),
-                "the running VM's network is not all there: {present:?} ({objects:?})"
+                    && present.iter().any(|p| p.starts_with("rule"))
+                    && present.iter().any(|p| p.starts_with("route")),
+                "the running clone's network is not all there: {present:?} ({objects:?})"
             );
+            Ok(objects)
         }
-        anyhow::ensure!(
-            baseline_objects
-                .present()?
-                .iter()
-                .any(|p| p.contains("DNAT")),
-            "the baseline has no DNAT rule for --publish {publish}"
-        );
-        anyhow::ensure!(
-            clone_objects
-                .present()?
-                .iter()
-                .any(|p| p.starts_with("route")),
-            "the clone has no host route to its guest"
-        );
-        Ok((baseline_objects, clone_objects))
-    }
-    .await;
-    sigkill(&mut baseline, baseline_pid).await?;
-    if let Some((mut child, pid)) = clone.take() {
-        sigkill(&mut child, pid).await?;
-    }
-    let result = async {
-        let (baseline_objects, clone_objects) = observed?;
+        .await;
+        sigkill(&mut child, clone_pid).await?;
+        let clone_objects = clone_objects?;
         next_launch_on("bridged").await?;
-        for objects in [&baseline_objects, &clone_objects] {
-            let present = objects.present()?;
-            anyhow::ensure!(
-                present.is_empty(),
-                "the killed VM's network survived the next launch: {present:?}"
-            );
-        }
+        let present = clone_objects.present()?;
+        anyhow::ensure!(
+            present.is_empty(),
+            "the killed clone's network survived the next launch: {present:?}"
+        );
         Ok(())
     }
     .await;

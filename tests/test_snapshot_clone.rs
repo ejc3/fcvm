@@ -1969,6 +1969,10 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
 /// veth address, see `test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route`),
 /// so the route itself is what this test reads.
 ///
+/// The baseline is stopped once the snapshot exists: while it runs its `/30` holds the
+/// guest address and no clone takes the route from it (#1882,
+/// `a_restored_vm_leaves_a_running_vms_guest_address_on_its_veth`).
+///
 /// This test spawns two clones from the same serve and verifies:
 /// 1. Clone1's route is created
 /// 2. Clone2 replaces clone1's route
@@ -2029,6 +2033,8 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
         anyhow::bail!("Snapshot creation failed: {}", stderr);
     }
     println!("  ✓ Snapshot created");
+    common::kill_process(baseline_pid).await;
+    println!("  Stopped baseline");
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
@@ -2191,8 +2197,6 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     println!("  Killed clone1");
     common::kill_process(serve_pid).await;
     println!("  Killed memory server");
-    common::kill_process(baseline_pid).await;
-    println!("  Killed baseline");
 
     println!("\n✅ ROUTE REPLACEMENT TEST PASSED!");
     Ok(())
