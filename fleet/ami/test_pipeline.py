@@ -549,6 +549,53 @@ class PipelineTests(unittest.TestCase):
                 self.assertLess(bake.index(step), pack)
         self.assertIn('app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)', bake)
 
+    def test_the_bake_drops_build_only_state_from_the_root(self):
+        # A host hydrates every root block it reads from the image's snapshot, and the image is
+        # what every host boots: the compiler cache (4.1 GB on the cad0ddad image), the Rust
+        # toolchain (2.9 GB) and the build's journal are build-only. The cache goes before the
+        # pack, which needs the room; prep and build install the toolchain again when it is
+        # missing.
+        source = (HERE / "host/build.sh").read_text()
+        phases = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+        bake = phases["bake"]
+        self.assertLess(bake.index('rm -rf "$UH/.cache/sccache"'), bake.index('python3 "$HERE/store-pack.py"'))
+        self.assertIn('rm -rf "$UH/.cargo" "$UH/.rustup"', bake)
+        self.assertIn("journalctl --vacuum-time=1s", bake)
+        self.assertLess(bake.index('rm -rf "$UH/.cargo" "$UH/.rustup"'), bake.index("\n  root_has_room"))
+        for phase in ("prep", "build"):
+            with self.subTest(phase=phase):
+                self.assertIn('[ -x "$UH/.cargo/bin/cargo" ] || as_user', phases[phase])
+
+    def test_the_bake_fails_unless_the_root_keeps_room(self):
+        # The image keeps its packed store on the root, which every host inherits; a gpubox from
+        # the cad0ddad image had 416 MB free there and a 7.3.3 host kernel install failed. The
+        # bake checks the root's free space last, once the store is packed and /tmp emptied, and
+        # fails under ROOT_FREE_MIN_GIB (8).
+        source = (HERE / "host/build.sh").read_text()
+        bake = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["bake"]
+        check = bake.index("\n  root_has_room")
+        self.assertLess(bake.index('python3 "$HERE/store-pack.py"'), check)
+        self.assertLess(bake.index("find /tmp /var/tmp -mindepth 1 -delete"), check)
+        # fleet/ami/check.sh holds the /tmp cleanup right before the final sync; the check is a
+        # read and comes after both.
+        self.assertLess(bake.index("\n  sync\n"), check)
+        fn = re.search(r"^root_has_room\(\) \{\n.*?^\}\n", source, re.S | re.M)
+        self.assertIsNotNone(fn, "build.sh defines no root_has_room")
+        with tempfile.TemporaryDirectory() as tmp:
+            df = Path(tmp) / "df"
+
+            def run(avail_bytes):
+                df.write_text(f"#!/bin/sh\nprintf 'Avail\\n%s\\n' '{avail_bytes}'\n")
+                df.chmod(0o755)
+                return subprocess.run(["bash", "-c", fn.group(0) + "root_has_room"], capture_output=True, text=True,
+                                      env={"PATH": f"{tmp}:/usr/bin:/bin"})
+
+            low = run(416 * 1024 * 1024)
+            self.assertNotEqual(low.returncode, 0)
+            self.assertIn("416 MiB free", low.stdout)
+            self.assertEqual(run(9 * 1024 ** 3).returncode, 0)
+            self.assertNotEqual(run("").returncode, 0, "an unreadable df must fail, not pass")
+
     def test_the_minecraft_image_builds_beside_the_rest_into_roots_store(self):
         # In line it was the build phase's longest step (19 of 44 min on 2026-11-09). It starts
         # after the checkout, as root (a rootful build stays in its unit's cgroup), and the phase

@@ -83,6 +83,19 @@ store_settled() {
   fi
   /usr/local/lib/fcvm-fleet/store.sh
 }
+# A host still writes to the root after the image is made: journals, packages, a host kernel
+# install. The image keeps its packed store (about 28 GB) on the root as the S3 restore's
+# fallback, and a gpubox from the cad0ddad image, whose root is 64 GB, had 416 MB free there:
+# installing a 7.3.3 host kernel failed. The bake fails unless ROOT_FREE_MIN_GIB stay free.
+root_has_room() {
+  local avail min=$(( ${ROOT_FREE_MIN_GIB:-8} * 1024 * 1024 * 1024 ))
+  avail=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+  [[ "$avail" =~ ^[0-9]+$ ]] || { echo "could not read the root's free space: '$avail'"; return 1; }
+  [ "$avail" -ge "$min" ] && return 0
+  echo "the root has $(( avail / 1024 / 1024 )) MiB free once the image is baked; ${ROOT_FREE_MIN_GIB:-8} GiB must stay free"
+  df -h /
+  return 1
+}
 # Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
 as_user() {
   local uid; uid=$(id -u "$U")
@@ -335,6 +348,10 @@ bake)
   # them, and so do the phone app's build image of this checkout's Containerfile; the others go.
   podman image prune -f >/dev/null
   as_user "podman image prune -f >/dev/null"
+  # Build-only state no host reads: the compiler cache (4.1 GB on the cad0ddad image). Every
+  # byte left on the root is hydrated from the snapshot when a host first reads it, and it
+  # leaves the pack less room.
+  rm -rf "$UH/.cache/sccache"
   app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)
   as_user "podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/fcvm-phone-app-build:' | grep -vx 'localhost/fcvm-phone-app-build:$app' | xargs -r podman rmi >/dev/null"
   df -h / | tee "$S/root-before-pack.txt"
@@ -351,7 +368,12 @@ bake)
     [ "$(stat -c %s "$f")" -lt $((5 * 1024 * 1024 * 1024)) ] || { echo "$f is 5 GiB or more: one PUT cannot upload it"; exit 1; }
   done
   # The user's rootless podman storage keeps the renderer image (the store holds its export).
-  rm -rf "$UH/.cargo/registry" "$UH/.cargo/git" "$UH/.rustup/toolchains"/*/share/doc
+  # The Rust toolchain only builds (2.9 GB with ~/.cargo); no host runs cargo, and prep and
+  # build install it again when a builder's base image has none. Nor does a host read the
+  # build's journal.
+  rm -rf "$UH/.cargo" "$UH/.rustup"
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-time=1s >/dev/null 2>&1 || true
   rm -f "$SRC/target"
   $APT clean
   cloud-init clean --logs --seed
@@ -364,6 +386,7 @@ bake)
   # the same pass over the 7f5fb7e6 image's volume. Empty both here, where it costs nothing.
   find /tmp /var/tmp -mindepth 1 -delete
   sync
+  root_has_room
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
 esac
