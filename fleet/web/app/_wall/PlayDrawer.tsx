@@ -216,6 +216,9 @@ function AboutSection({ view }: { view: WallView }) {
   return (
     <section className="about" data-testid="about">
       <p data-testid="sentence">{view.sentence}</p>
+      <p>
+        <a href="/boot-race" data-testid="boot-race-link">Boot race: recorded results</a> of fcvm restores against EC2, ECS and Lambda.
+      </p>
         {view.counter ? (
           <p className="counter" data-testid="counter">
             {view.counter.label}:{" "}
