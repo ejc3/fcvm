@@ -735,9 +735,9 @@ mod tests {
     fn the_snapshot_key_carries_the_host_kernel_only_when_set() {
         let plain = super::FirecrackerConfig::default();
         let mut nested = plain.clone();
-        nested.host_kernel = Some("7.3.3-fcvm-2611f28e467f".to_string());
+        nested.host_kernel = Some("example-kernel-a".to_string());
         let mut other = plain.clone();
-        other.host_kernel = Some("6.18.60-fcvm-217152eb14fe".to_string());
+        other.host_kernel = Some("example-kernel-b".to_string());
         assert_ne!(plain.snapshot_key(), nested.snapshot_key());
         assert_ne!(nested.snapshot_key(), other.snapshot_key());
         assert_ne!(

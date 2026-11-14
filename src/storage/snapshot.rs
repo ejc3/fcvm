@@ -794,25 +794,24 @@ mod tests {
     /// 6.18.60 otherwise lost its emulator (the GPU hook's retake exited 137).
     #[test]
     fn a_nested_kvm_snapshot_refuses_another_host_kernel() {
-        let json = r#"{"image":"i","vcpu":2,"memory_mib":1024,"network_config":{"tap_device":"t","guest_mac":"m"},"host_kernel":"7.3.3-fcvm-2611f28e467f"}"#;
+        let json = r#"{"image":"i","vcpu":2,"memory_mib":1024,"network_config":{"tap_device":"t","guest_mac":"m"},"host_kernel":"example-kernel-a"}"#;
         let recorded: super::SnapshotMetadata = serde_json::from_str(json).unwrap();
         let error = recorded
-            .check_host_kernel("phone-warm", "6.18.60-fcvm-217152eb14fe")
+            .check_host_kernel("phone-warm", "example-kernel-b")
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("7.3.3-fcvm-2611f28e467f")
-                && error.contains("6.18.60-fcvm-217152eb14fe"),
+            error.contains("example-kernel-a") && error.contains("example-kernel-b"),
             "{error}"
         );
         assert!(error.contains("phone-warm"), "{error}");
         recorded
-            .check_host_kernel("phone-warm", "7.3.3-fcvm-2611f28e467f")
+            .check_host_kernel("phone-warm", "example-kernel-a")
             .unwrap();
         let mut unrecorded = recorded.clone();
         unrecorded.host_kernel = None;
         unrecorded
-            .check_host_kernel("phone-warm", "6.18.60-fcvm-217152eb14fe")
+            .check_host_kernel("phone-warm", "example-kernel-b")
             .unwrap();
         // A snapshot without the field (every one taken before this, and every profile
         // without KVM in its guest) neither carries nor checks it.
