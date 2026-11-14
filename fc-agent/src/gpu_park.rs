@@ -419,7 +419,7 @@ async fn undo(done: &Done) -> Vec<String> {
         }
     }
     if done.persistenced_stopped {
-        if let Err(e) = gpu::start_persistenced(Path::new(gpu::DRIVER_ROOT)).await {
+        if let Err(e) = gpu::start_persistenced(Path::new(gpu::DRIVER_ROOT), false).await {
             errors.push(format!("{e:#}"));
         }
     }
