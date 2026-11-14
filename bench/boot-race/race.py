@@ -400,9 +400,26 @@ def parse_report(message):
     return dict(p.strip().split(": ", 1) for p in message.strip().split("\t") if ": " in p)
 
 
+def workload_zip(workload_bin, generation=None):
+    """The functions' code: the workload binary as the custom runtime's `bootstrap`, and, for a cold sample, a
+    `generation` file that makes the upload different code from the one before."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o100755 << 16
+        with open(workload_bin, "rb") as f:
+            z.writestr(info, f.read())
+        if generation is not None:
+            z.writestr("generation", generation)
+    return buf.getvalue()
+
+
 class Lambda:
-    """The Lambda lanes. lambda-cold makes every sample a cold start: before t0 it updates the function's
-    configuration (a new BOOT_RACE_GENERATION value), which retires the function's execution environments, and
+    """The Lambda lanes. lambda-cold makes every sample a cold start: before t0 it uploads new code (the workload and
+    a random generation file), which retires the function's execution environments, and
     after t1 it reads the invocation's REPORT line, whose Init Duration a cold start carries; run() refuses a
     cold sample without one. Neither step is timed."""
 
@@ -446,13 +463,13 @@ class Lambda:
         return {"t_start_unix_ms": start_ms, "ms": (t1 - t0) / 1e6, "request_id": rid, "answer": doc}
 
     def new_environment(self, name):
-        """Retire the function's execution environments: any configuration change sends the next invocation to a
-        new one. Returns the generation written."""
-        env = dict(self.lam.get_function_configuration(FunctionName=name)["Environment"]["Variables"])
-        env["BOOT_RACE_GENERATION"] = os.urandom(8).hex()
-        self.lam.update_function_configuration(FunctionName=name, Environment={"Variables": env})
+        """Retire the function's execution environments: new code sends the next invocation to a new one. The code is
+        the workload as `bootstrap` plus a file holding a random generation, so every upload is different code. (The
+        driver role may update the functions' code, not their configuration.) Returns the generation."""
+        generation = os.urandom(8).hex()
+        self.lam.update_function_code(FunctionName=name, ZipFile=workload_zip(self.cfg["workload_bin"], generation))
         self.lam.get_waiter("function_updated_v2").wait(FunctionName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 120})
-        return env["BOOT_RACE_GENERATION"]
+        return generation
 
     def init_duration_ms(self, name, rid, since_ms, deadline_s=120):
         """The Init Duration of one invocation's REPORT line (None when the line has none); waits for the line."""
