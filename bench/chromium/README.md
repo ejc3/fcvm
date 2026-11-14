@@ -195,6 +195,38 @@ against its requests. `ALLOW_BUSY=1` overrides
 the refusal and is recorded in the run. An overridden run is contaminated and
 must be excluded from comparisons or rerun before publication.
 
+## The hosted arms (`browserrun.py`)
+
+Cloudflare's Browser Run serves both its Chromium and Kitesurf (`?browser=kitesurf`)
+through the same Quick Actions its published Kitesurf table measured. `make
+bench-browserrun` drives `/screenshot` (JPEG q80, as the fcvm arm's driver asks) and
+`/content` against both, over the corpus's 14 URLs, one request at a time.
+
+Run this on the dedicated Ohio benchmark worker or the primary fcvm-arm host:
+
+~~~bash
+make bench-browserrun BR_REPS=28 BR_WARMUP=1
+~~~
+
+The runner retrieves the matching Secrets Manager credential and connects to
+Cloudflare directly. On the Ohio worker, use the same checkout and machine for
+the hosted and local trials. Its network path is measured directly, and only
+the worker's reserved addresses can use its token. There is no credential to
+copy. The region and the client's load are recorded automatically; set
+BR_CLIENT_LOCATION only to override the label. Regular pboxes cannot read the
+credential. Set `BROWSERRUN_RESULTS` to a new directory for each trial; the runner
+refuses to reuse an old trial’s output.
+
+- **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
+  a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.
+  Each record keeps the reply's status, size and digest, so content drift shows per page.
+- **The network path is part of wall time.** wall_ms runs from this host's POST to the last
+  byte of the reply; the colo that answered is on every record (from `cf-ray`), and any
+  browser-time header Cloudflare sends is kept.
+- **Correctness** is checked as in the local arm: one untimed PNG screenshot and one
+  `/content` per page and engine, kept under `correctness/<engine>/`, blank at 99.8% of one
+  colour, and a measured request on a page that did not complete counts as a failure.
+
 ## Results conventions
 
 Raw run output goes to `results/<timestamp>/` — **git-ignored** (see
