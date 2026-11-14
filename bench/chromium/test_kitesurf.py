@@ -222,6 +222,8 @@ class Measurement(unittest.TestCase):
             h.write("4096\n")
         with open(os.path.join(root, "cgroup.procs"), "w") as h:
             h.write("")
+        with open(os.path.join(root, "memory.stat"), "w") as h:
+            h.write("anon 2048\nfile 2048\n")
 
     def test_loop_records_failures_and_continues(self):
         km = load("kitesurf_measure")
@@ -261,6 +263,7 @@ class Measurement(unittest.TestCase):
         # The fcvm arm's driver arguments: JPEG q80, navigation timing on.
         self.assertTrue(all(c[2:] == ("jpeg", 80, True) for c in calls))
         self.assertEqual([c[1] for c in calls[:2]], ["screenshot", "html"])
+        self.assertEqual({r["memory_anon_after"] for r in rows}, {2048})
 
     def test_summary_counts_pages_that_failed_the_check_as_failures(self):
         km = load("kitesurf_measure")

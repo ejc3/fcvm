@@ -238,7 +238,9 @@ make bench-chromium-corpus-extra PHASES=kitesurf STAMP=ks REPS=202 WARMUP=28
   99.8% of its pixels. A measured request counts as a success only if its driver
   call succeeded and its page completed in that check, so a fast blank render is a
   failure. `summary.json` gives per-arm and per-page success, medians over
-  successful requests, cgroup and workerd CPU per request, and `memory.peak`.
+  successful requests, cgroup and workerd CPU per request, the scope's anon memory
+  per request (memory.current also counts the page cache wrangler's file reads leave
+  there) and `memory.peak`, which includes start-up.
 - **What it is not.** This is `wrangler dev` on one host: no network hop between client
   and engine, subresources from the local replay, every page isolate on this box's
   cores, and the open-source workerd that wrangler ships. Cloudflare's published

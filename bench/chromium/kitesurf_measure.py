@@ -110,6 +110,9 @@ def measure(args):
                 procs_after = proc_cpu_ms(args.cgroup)
                 with open(mem_current) as handle:
                     mem_after = int(handle.read())
+                # memory.current counts the page cache wrangler's file reads
+                # leave in the scope; anon is what the engine itself holds.
+                anon_after = read_int_field(os.path.join(args.cgroup, "memory.stat"), "anon")
                 ok = result.get("ok") is True
                 failures += not ok
                 proc_delta = {k: round(procs_after.get(k, 0.0) - procs_before.get(k, 0.0), 1)
@@ -119,7 +122,7 @@ def measure(args):
                     "warmup": rep < args.warmup, "url": url, "ok": ok, "wall_ms": wall_ms,
                     "loadavg1": load, "cgroup_cpu_usec_before": cpu_before,
                     "cgroup_cpu_usec_after": cpu_after, "proc_cpu_ms": proc_delta,
-                    "memory_current_after": mem_after,
+                    "memory_current_after": mem_after, "memory_anon_after": anon_after,
                     "driver": json.dumps(result, separators=(",", ":"), default=repr),
                 }) + "\n")
                 out.flush()
@@ -183,6 +186,10 @@ def summarize(args):
             "cgroup_cpu_ms_p50": pct(cpu, 50), "cgroup_cpu_ms_mean": round(statistics.fmean(cpu), 1) if cpu else None,
             "workerd_cpu_ms_p50": pct(workerd, 50),
             "memory_current_max_bytes": max((r["memory_current_after"] for r in measured), default=None),
+            "memory_anon_max_bytes": max((r.get("memory_anon_after", 0) for r in measured), default=None),
+            "memory_anon_first_last_bytes": ([measured[0].get("memory_anon_after"),
+                                              measured[-1].get("memory_anon_after")]
+                                             if measured else None),
             "per_page": per_page,
         }
     loads = [r["loadavg1"] for r in rows if isinstance(r.get("loadavg1"), (int, float))]

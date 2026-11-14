@@ -233,7 +233,7 @@ done
 cgroup_rel=$(systemctl --user show -p ControlGroup --value "$UNIT.scope")
 CGROUP="/sys/fs/cgroup$cgroup_rel"
 case "$cgroup_rel" in /?*) ;; *) echo "FAILED: scope $UNIT has no cgroup" >&2; exit 1 ;; esac
-for f in cpu.stat memory.current memory.peak cgroup.procs; do
+for f in cpu.stat memory.current memory.peak memory.stat cgroup.procs; do
     [ -r "$CGROUP/$f" ] || { echo "FAILED: $CGROUP/$f is not readable" >&2; exit 1; }
 done
 # The counters below are this cgroup's, so workerd has to be in it.
