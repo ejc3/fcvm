@@ -136,7 +136,7 @@ fn peer_of(host_ip: &str) -> Option<String> {
 ///
 /// `guest_ip` does not identify a VM. Every VM restored from one snapshot has the same
 /// one, and the host's `/32` route to it belongs to whichever of them set up last
-/// (`veth::add_host_route_to_guest`).
+/// (`veth::add_host_route_to_guest`), unless a running cold boot's `/30` holds it.
 pub fn host_reachable_ip(net: &NetworkConfig) -> Option<String> {
     peer_of(net.host_ip.as_deref()?)
 }

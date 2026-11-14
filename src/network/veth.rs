@@ -143,6 +143,25 @@ fn route_nexthop(route_output: &str) -> Option<&str> {
     None
 }
 
+/// The `veth0-*` interface, in `ip -o -4 addr show` output, whose subnet holds `address`:
+/// a cold-booted bridged VM's host veth, whose `/30` holds its guest's address.
+fn veth_whose_subnet_holds(addresses: &str, address: &str) -> Option<String> {
+    let address: std::net::Ipv4Addr = address.parse().ok()?;
+    addresses.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let dev = words.nth(1)?.split('@').next()?;
+        if !dev.starts_with("veth0-") {
+            return None;
+        }
+        let cidr = words.skip_while(|w| *w != "inet").nth(1)?;
+        let (ip, len) = cidr.split_once('/')?;
+        let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+        let len: u32 = len.parse().ok().filter(|l| *l <= 32)?;
+        let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
+        (u32::from(ip) & mask == u32::from(address) & mask).then(|| dev.to_string())
+    })
+}
+
 /// Check if a network namespace has any running processes
 async fn namespace_has_processes(ns_name: &str) -> bool {
     // Use ip netns pids to check for processes in the namespace
@@ -925,6 +944,16 @@ pub async fn setup_in_namespace_nat(
 /// Using just "dev veth0" doesn't work because the host would ARP for 172.30.90.2
 /// directly, but only devices on the veth L2 segment can respond, and the guest
 /// is on a different L2 segment (br0/TAP).
+///
+/// A cold-booted bridged VM whose `/30` holds `guest_ip` keeps it (#1882). Its guest
+/// has that address, its published ports DNAT to it, and the `/32` would take those
+/// connections to this VM instead. The VM's subnet was chosen so that the address
+/// routes through its veth (`bridged::kernel_routes_peer_via_veth`), and that holds
+/// while it runs: no route is added then, and this VM is reached at its own veth
+/// address as before (`bridged::host_reachable_ip`). The check and the route are made
+/// under `bridged-subnet.lock`, which a cold boot holds from choosing its subnet
+/// through that routing check, so neither can come between the other's check and its
+/// change.
 pub async fn add_host_route_to_guest(
     host_veth: &str,
     guest_ip: &str,
@@ -936,6 +965,31 @@ pub async fn add_host_route_to_guest(
         via = %veth_inner_ip,
         "adding host route to guest IP via namespace veth"
     );
+
+    let _subnet_lock = super::acquire_host_network_lock("bridged-subnet.lock")
+        .await
+        .context("acquiring the bridged subnet lock for the host route to the guest")?;
+    let addresses = Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+        .await
+        .context("listing the host's addresses")?;
+    anyhow::ensure!(
+        addresses.status.success(),
+        "`ip -o -4 addr show` failed: {}",
+        String::from_utf8_lossy(&addresses.stderr).trim()
+    );
+    if let Some(owner) =
+        veth_whose_subnet_holds(&String::from_utf8_lossy(&addresses.stdout), guest_ip)
+    {
+        info!(
+            veth = %host_veth,
+            guest_ip = %guest_ip,
+            owner = %owner,
+            "a running VM's veth holds the guest address; leaving its route there"
+        );
+        return Ok(());
+    }
 
     // Check for existing route and clean up if it's stale (points to dead veth)
     let route = format!("{}/32", guest_ip);
@@ -1173,6 +1227,27 @@ mod parse_tests {
     fn unmanaged_interface_does_not_match() {
         let line = "2: eth0    inet 172.30.0.1/30 brd 172.30.0.3 scope global eth0";
         assert!(!line_has_exact_ip_on_managed_veth(line, "172.30.0.1"));
+    }
+
+    #[test]
+    fn veth_whose_subnet_holds_names_the_cold_boot_whose_30_holds_the_address() {
+        let addresses = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+            2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0\n\
+            7: veth0-vm-aaaaaa    inet 172.30.40.1/30 scope global veth0-vm-aaaaaa\n\
+            9: veth0-vm-bbbbbb@if8    inet 10.20.30.1/30 scope global veth0-vm-bbbbbb\n";
+        assert_eq!(
+            veth_whose_subnet_holds(addresses, "172.30.40.2").as_deref(),
+            Some("veth0-vm-aaaaaa")
+        );
+        // The next /30 and the host's own network are no cold boot's guest address.
+        assert_eq!(veth_whose_subnet_holds(addresses, "172.30.40.6"), None);
+        assert_eq!(veth_whose_subnet_holds(addresses, "192.0.2.20"), None);
+        // `ip` writes `name@peer` for a veth in some versions.
+        assert_eq!(
+            veth_whose_subnet_holds(addresses, "10.20.30.2").as_deref(),
+            Some("veth0-vm-bbbbbb")
+        );
+        assert_eq!(veth_whose_subnet_holds(addresses, "not-an-address"), None);
     }
 
     #[test]
