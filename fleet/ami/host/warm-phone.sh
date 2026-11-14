@@ -117,8 +117,21 @@ done
 echo "warm-phone: clone ok=$ok click_to_first_scene_frame_ms=$(( $(ms) - click )) gpu=$G2"
 # The clone's guest memory came from a prefilled hugepage spare. A restore that fell back to
 # the File backend (a snapshot made by an older Firecracker, or no hugepages to fill) works
-# too, seconds slower for this phone, so only the record's backend tells them apart.
-restored=$(tail -n +"$(( before + 1 ))" "$LOG" | grep -a '^{' | jq -R -c 'fromjson? | select(.status? == "restored")' | tail -1)
+# too, seconds slower for this phone, so only the record's backend tells them apart. fcvm
+# prints the record after the guest's ACK, which can come after the first scene frame: wait
+# for it while the clone runs, up to 30 s.
+clone_record() {
+  local alive r=
+  for _ in $(seq 1 300); do
+    alive=0
+    kill -0 "$1" 2> /dev/null && alive=1
+    r=$(tail -n +"$(( before + 1 ))" "$LOG" | grep -a '^{' | jq -R -c 'fromjson? | select(.status? == "restored")' | tail -1)
+    if [ -n "$r" ] || [ $alive = 0 ]; then break; fi
+    sleep 0.1
+  done
+  echo "$r"
+}
+restored=$(clone_record $cp)
 echo "$restored" | jq -e '.backend == "hugepage-prefilled"' > /dev/null || { echo "warm-phone: the clone did not restore from prefilled hugepages: ${restored:-no restored record}"; ok=0; }
 # the browser the snapshot carries comes to the front in the clone and shows the page
 if [ $ok = 1 ]; then

@@ -6426,11 +6426,14 @@ mod tests {
 
     /// The host image's acceptance check (fleet/ami/host/warm-phone.sh) reads the clone's
     /// restored record as this build prints it: the keys come out sorted, so the record does
-    /// not start with `status`. It passes a prefilled restore and fails a File fallback and a
-    /// clone that printed no record.
+    /// not start with `status`. It passes a prefilled restore, also when the record lands
+    /// after the check started (fcvm prints it after the guest's ACK, which can come after
+    /// the first scene frame), and fails a File fallback and a clone that exited without one.
     #[test]
     fn the_warm_phone_check_reads_the_restored_record_this_build_prints() {
         let script = include_str!("../../fleet/ami/host/warm-phone.sh");
+        let function = &script[script.find("clone_record() {").expect("no clone_record")..];
+        let function = &function[..function.find("\n}\n").expect("clone_record does not end") + 3];
         let line = |start: &str| {
             script
                 .lines()
@@ -6439,36 +6442,54 @@ mod tests {
                 .to_string()
         };
         let check = format!(
-            "{}\n{}\necho \"ok=$ok\"\n",
-            line("restored=$("),
+            "{function}{}\n{}\necho \"ok=$ok\"\n",
+            line("restored=$(clone_record $cp)"),
             line(r#"echo "$restored" | jq -e"#)
         );
-        let run = |records: &[serde_json::Value]| {
+        let record = |backend| {
+            restored_record("c", "phone-warm", "v", backend, "firecracker", 1, None).to_string()
+        };
+        // Lines before the clone's: an earlier record and a line that is not JSON.
+        let earlier = format!("{}\n{{not json\n", record("hugepage-prefilled"));
+        let run = |log_now: &str, later: Option<String>, clone_runs: bool| {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("warm-phone.log");
-            let mut text =
-                String::from("{\"status\":\"restored\",\"backend\":\"hugepage-prefilled\"}\n");
-            text.push_str("2026-11-13T00:00:00Z  INFO fcvm: an earlier phone\n{not json\n");
-            for record in records {
-                text.push_str(&format!("{record}\n"));
+            std::fs::write(&log, format!("{earlier}{log_now}")).unwrap();
+            let mut clone = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            if !clone_runs {
+                clone.kill().unwrap();
+                clone.wait().unwrap();
             }
-            std::fs::write(&log, text).unwrap();
-            let out = std::process::Command::new("bash")
+            let check = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(format!(
-                    "set -u\nLOG={}\nbefore=2\nok=1\n{check}",
-                    log.display()
+                    "set -u\nLOG={}\nbefore=2\nok=1\ncp={}\n{check}",
+                    log.display(),
+                    clone.id()
                 ))
-                .output()
+                .stdout(std::process::Stdio::piped())
+                .spawn()
                 .expect("bash");
+            if let Some(line) = later {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut text = std::fs::read_to_string(&log).unwrap();
+                text.push_str(&format!("{line}\n"));
+                std::fs::write(&log, text).unwrap();
+            }
+            let out = check.wait_with_output().unwrap();
+            let _ = clone.kill();
+            let _ = clone.wait();
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             stdout.lines().last().unwrap_or_default().to_string()
         };
-        let record =
-            |backend| restored_record("c", "phone-warm", "v", backend, "firecracker", 1, None);
-        assert_eq!(run(&[record("hugepage-prefilled")]), "ok=1");
-        assert_eq!(run(&[record("file")]), "ok=0");
-        assert_eq!(run(&[]), "ok=0");
+        let line_of = |backend| format!("{}\n", record(backend));
+        assert_eq!(run(&line_of("hugepage-prefilled"), None, true), "ok=1");
+        assert_eq!(run(&line_of("file"), None, true), "ok=0");
+        assert_eq!(run("", Some(record("hugepage-prefilled")), true), "ok=1");
+        assert_eq!(run("", None, false), "ok=0");
     }
 
     #[test]
