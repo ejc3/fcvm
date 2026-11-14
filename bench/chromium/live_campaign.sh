@@ -76,7 +76,7 @@ trap 'touch "$DONE"; wait "$BR_PID" 2>/dev/null || true' EXIT
 log "fcvm live arm: $ARMS, $REPS measured + $WARMUP warmup over the 14 live URLs, Browser Run batches alongside"
 rb_start=$(now)
 rb_rc=0
-URL="$URLS" ARMS="$ARMS" make -C "$REPO" --no-print-directory bench-chromium-request-run TAG="$TAG" \
+URL="$URLS" ARMS="$ARMS" make -C "$REPO" --no-print-directory bench-chromium-request-run TAG="$TAG" CPU="$CPU" \
     REPS="$REPS" WARMUP="$WARMUP" RESULTS="$OUT/reqbench" > "$OUT/reqbench.log" 2>&1 || rb_rc=$?
 rb_end=$(now)
 touch "$DONE"

@@ -75,6 +75,9 @@ class LiveCampaign(unittest.TestCase):
         self.assertIn("bench-chromium-request-golden TAG=cb-live-t CPU=4 GUEST_DNS=1.1.1.1", log)
         self.assertIn("URL=https://example.com/,https://news.ycombinator.com/", log)
         self.assertIn("ARMS=cdp,html-fast,noop", log)
+        # CodeRabbit, #1898: without CPU in its environment the run defaulted to 2
+        # vCPUs and refused the 4-vCPU golden.
+        self.assertIn("bench-chromium-request-run TAG=cb-live-t CPU=4", log)
         self.assertEqual(live["resolver"], "guest resolv.conf 1.1.1.1 (GUEST_DNS baked into the golden): live sites")
 
     def test_the_fcvm_run_status_is_the_campaign_status(self):
