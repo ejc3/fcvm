@@ -169,6 +169,43 @@ class Hibernate(unittest.TestCase):
             self.assertEqual(events, [("start",), ("sleep", settle), ("stop", hibernate)])
 
 
+class FailedStart(unittest.TestCase):
+    def test_a_refused_start_fails_the_sample_without_waiting_or_stopping(self):
+        events = []
+
+        class Refused(Exception):
+            pass
+
+        class Client:
+            def describe_instances(self, InstanceIds):
+                return {"Reservations": [{"Instances": [{"PrivateIpAddress": "x", "State": {"Name": "stopped"}}]}]}
+
+            def start_instances(self, InstanceIds):
+                raise Refused("InsufficientInstanceCapacity")
+
+            def stop_instances(self, InstanceIds, Hibernate):
+                events.append(("stop", Hibernate))
+
+        async def slept(s):
+            events.append(("sleep", s))
+
+        lane = race.Ec2.__new__(race.Ec2)
+        lane.ec2 = Client()
+        real_wait = lane.wait_state
+
+        def wait_state(iid, want, timeout=900):
+            events.append(("wait", want))
+            if want != "stopped":
+                raise TimeoutError(f"instance did not reach {want}")
+            return real_wait(iid, want, timeout)
+
+        lane.wait_state = wait_state
+        with mock.patch.object(race.asyncio, "sleep", slept):
+            with self.assertRaises(Refused):
+                asyncio.run(lane.start_sample("i-1", True))
+        self.assertEqual(events, [("wait", "stopped")])
+
+
 class LaunchTiming(unittest.TestCase):
     def test_t0_is_the_launchers_moment_before_runtask_not_the_invoke(self):
         # invoked at wall 1000.0 ms (monotonic 0); RunTask asked at 1040 and answered at 1090;

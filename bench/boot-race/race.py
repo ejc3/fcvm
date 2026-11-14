@@ -245,17 +245,19 @@ class Ec2:
         ip, _ = self.ip(iid)
         t0 = time.monotonic_ns()
         start_ms = now_ms()
+        # A refused StartInstances (InsufficientInstanceCapacity happens) leaves the instance stopped: the sample
+        # fails at once with that error, and the instance is ready for the next round as it is.
+        self.ec2.start_instances(InstanceIds=[iid])
         try:
-            self.ec2.start_instances(InstanceIds=[iid])
             t_api = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
         finally:
             # Not timed: settle before the stop that readies the next sample. A hibernate stop sent 1 s after a
             # resume answered sat in "stopping" for 20 minutes and then became an ordinary stop, so the next start
             # booted; with 30 s, three resume-hibernate cycles in a row stopped in 10 to 20 s and resumed the same
-            # process.
-            await asyncio.sleep(HIBERNATE_SETTLE_S if hibernate else 1)
+            # process. The settle counts from "running", so a sample whose probe gave up still gets it.
             await asyncio.to_thread(self.wait_state, iid, "running")
+            await asyncio.sleep(HIBERNATE_SETTLE_S if hibernate else 1)
             self.ec2.stop_instances(InstanceIds=[iid], Hibernate=hibernate)
         return {
             "t_start_unix_ms": start_ms,
