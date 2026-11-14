@@ -256,6 +256,19 @@ class ColdLambda(unittest.TestCase):
         self.assertIsNone(s["init_duration_ms"])
         self.assertIn("not a cold start", race.check_cold("lambda-cold", s))
 
+    def test_the_report_line_is_found_past_an_empty_first_page(self):
+        pages = [{"events": [], "nextToken": "t1"},
+                 {"events": [{"message": "REPORT RequestId: r1\tDuration: 2.00 ms\tInit Duration: 11.50 ms"}]}]
+
+        class Logs:
+            def filter_log_events(self, **kw):
+                return pages[1] if kw.get("nextToken") == "t1" else pages[0]
+
+        lane = race.Lambda.__new__(race.Lambda)
+        lane.logs = Logs()
+        with mock.patch.object(race.time, "sleep"):
+            self.assertEqual(lane.init_duration_ms("boot-race-cold", "r1", 1000, deadline_s=0.05), 11.5)
+
     def test_the_warm_lane_does_not_touch_the_configuration(self):
         lane, events = self.lane(None)
         asyncio.run(lane.sample("lambda-warm"))

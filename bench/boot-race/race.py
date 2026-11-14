@@ -458,13 +458,18 @@ class Lambda:
         """The Init Duration of one invocation's REPORT line (None when the line has none); waits for the line."""
         end = time.time() + deadline_s
         while time.time() < end:
-            r = self.logs.filter_log_events(logGroupName=f"/aws/lambda/{name}", startTime=int(since_ms) - 60_000,
-                                            filterPattern=f'"REPORT RequestId: {rid}"')
-            for e in r["events"]:
-                parts = parse_report(e["message"])
-                if parts.get("REPORT RequestId") == rid:
-                    init = parts.get("Init Duration")
-                    return float(init.split()[0]) if init else None
+            kw = {"logGroupName": f"/aws/lambda/{name}", "startTime": int(since_ms) - 60_000,
+                  "filterPattern": f'"REPORT RequestId: {rid}"'}
+            while True:  # FilterLogEvents may return empty pages before the one holding the line
+                r = self.logs.filter_log_events(**kw)
+                for e in r["events"]:
+                    parts = parse_report(e["message"])
+                    if parts.get("REPORT RequestId") == rid:
+                        init = parts.get("Init Duration")
+                        return float(init.split()[0]) if init else None
+                if not r.get("nextToken"):
+                    break
+                kw["nextToken"] = r["nextToken"]
             time.sleep(2)
         raise TimeoutError(f"no REPORT line for the invocation in {deadline_s} s")
 
