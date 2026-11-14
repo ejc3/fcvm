@@ -385,8 +385,8 @@ bake)
   # there (/tmp/kernel-build-gpu-*, 210,696 files): 40.7 s of every boot, against 1.7 s for
   # the same pass over the 7f5fb7e6 image's volume. Empty both here, where it costs nothing.
   find /tmp /var/tmp -mindepth 1 -delete
-  root_has_room
   sync
+  root_has_room
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
 esac

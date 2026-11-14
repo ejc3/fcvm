@@ -561,7 +561,7 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(bake.index('rm -rf "$UH/.cache/sccache"'), bake.index('python3 "$HERE/store-pack.py"'))
         self.assertIn('rm -rf "$UH/.cargo" "$UH/.rustup"', bake)
         self.assertIn("journalctl --vacuum-time=1s", bake)
-        self.assertLess(bake.index('rm -rf "$UH/.cargo" "$UH/.rustup"'), bake.index("\n  root_has_room\n"))
+        self.assertLess(bake.index('rm -rf "$UH/.cargo" "$UH/.rustup"'), bake.index("\n  root_has_room"))
         for phase in ("prep", "build"):
             with self.subTest(phase=phase):
                 self.assertIn('[ -x "$UH/.cargo/bin/cargo" ] || as_user', phases[phase])
@@ -573,9 +573,12 @@ class PipelineTests(unittest.TestCase):
         # fails under ROOT_FREE_MIN_GIB (8).
         source = (HERE / "host/build.sh").read_text()
         bake = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["bake"]
-        check = bake.index("\n  root_has_room\n")
+        check = bake.index("\n  root_has_room")
         self.assertLess(bake.index('python3 "$HERE/store-pack.py"'), check)
         self.assertLess(bake.index("find /tmp /var/tmp -mindepth 1 -delete"), check)
+        # fleet/ami/check.sh holds the /tmp cleanup right before the final sync; the check is a
+        # read and comes after both.
+        self.assertLess(bake.index("\n  sync\n"), check)
         fn = re.search(r"^root_has_room\(\) \{\n.*?^\}\n", source, re.S | re.M)
         self.assertIsNotNone(fn, "build.sh defines no root_has_room")
         with tempfile.TemporaryDirectory() as tmp:
