@@ -63,6 +63,12 @@ pub fn link_exists(if_name: &str) -> bool {
 /// that move and the RTNL waits it caused made the veth and namespace step 184 ms
 /// at the median against 101 ms with the end created in place (interleaved A/B,
 /// 120 restores per arm).
+///
+/// Each end gets one queue each way. By default a veth gets one per possible CPU, and the
+/// kernel creates every queue's sysfs objects while it holds RTNL: on a 96-CPU host on Linux
+/// 7.3.3, `rtnl_newlink` for one pair took 15.8 to 44 ms with the default and 0.93 ms with
+/// one queue (function_graph). fcvm's veths run neither XDP nor GRO, so a frame never picks a
+/// queue: the extra queues cost every wake and teardown and carry nothing.
 fn veth_add_args(
     host_veth: &str,
     guest_veth: &str,
@@ -71,8 +77,28 @@ fn veth_add_args(
     ns_name: &str,
 ) -> Vec<String> {
     [
-        "link", "add", host_veth, "address", host_mac, "type", "veth", "peer", "name", guest_veth,
-        "address", guest_mac, "netns", ns_name,
+        "link",
+        "add",
+        host_veth,
+        "address",
+        host_mac,
+        "numtxqueues",
+        "1",
+        "numrxqueues",
+        "1",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        guest_veth,
+        "address",
+        guest_mac,
+        "numtxqueues",
+        "1",
+        "numrxqueues",
+        "1",
+        "netns",
+        ns_name,
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1291,6 +1317,23 @@ mod parse_tests {
         assert_eq!(args[at("peer") + 1], "name");
     }
 
+    /// RED BEFORE THE FIX: each end was created with the kernel's default queue count, one
+    /// per possible CPU, and the kernel makes the sysfs objects of every queue while it holds
+    /// RTNL. On a 96-CPU 7.3.3 host that made `rtnl_newlink` 15.8 to 44 ms against 0.93 ms
+    /// with one queue each way (`veth_add_args`).
+    #[test]
+    fn veth_pair_is_created_with_one_queue_each_way() {
+        let args = veth_add_args("veth0-vm-x", "veth1-vm-x", "m1", "m2", "fcvm-vm-x");
+        let peer = args.iter().position(|a| a == "peer").unwrap();
+        for end in [&args[..peer], &args[peer..]] {
+            let at = |name: &str| end.iter().position(|a| a == name);
+            for key in ["numtxqueues", "numrxqueues"] {
+                let i = at(key).unwrap_or_else(|| panic!("{key} missing from {end:?}"));
+                assert_eq!(end[i + 1], "1", "{end:?}");
+            }
+        }
+    }
+
     /// The guest end is created in the namespace, not moved there after: the move
     /// waits in an rcu_barrier while holding RTNL (`veth_add_args`).
     #[test]
@@ -1305,6 +1348,10 @@ mod parse_tests {
                 "veth1-vm-x",
                 "address",
                 "m2",
+                "numtxqueues",
+                "1",
+                "numrxqueues",
+                "1",
                 "netns",
                 "fcvm-vm-x"
             ]
