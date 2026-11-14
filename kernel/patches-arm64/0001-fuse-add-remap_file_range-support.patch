@@ -1,1 +1,208 @@
-../patches/0001-fuse-add-remap_file_range-support.patch
+From 9ccaee548a4cde305d963906cccca4f02e3d5ae9 Mon Sep 17 00:00:00 2001
+From: fcvm <fcvm@localhost>
+Date: Sat, 7 Nov 2026 14:52:16 +0000
+Subject: [PATCH] fuse: add remap_file_range support for FICLONE
+
+Enables FICLONE/reflink through FUSE, which fuse-pipe volumes rely on.
+Ported to 7.3.1: the fuse_conn flag and the fuse_file_operations entry
+needed new context.
+---
+ fs/fuse/file.c            | 126 ++++++++++++++++++++++++++++++++++++++
+ fs/fuse/fuse_i.h          |   3 +
+ include/uapi/linux/fuse.h |  17 +++++
+ 3 files changed, 146 insertions(+)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 9a36d03..0970692 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -3073,6 +3073,131 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+ 	return ret;
+ }
+ 
++
++static loff_t fuse_remap_file_range(struct file *file_in, loff_t pos_in,
++				    struct file *file_out, loff_t pos_out,
++				    loff_t len, unsigned int remap_flags)
++{
++	struct fuse_file *ff_in = file_in->private_data;
++	struct fuse_file *ff_out = file_out->private_data;
++	struct inode *inode_in = file_inode(file_in);
++	struct inode *inode_out = file_inode(file_out);
++	struct fuse_inode *fi_out = get_fuse_inode(inode_out);
++	struct fuse_mount *fm = ff_in->fm;
++	struct fuse_conn *fc = fm->fc;
++	FUSE_ARGS(args);
++	struct fuse_remap_file_range_in inarg = {
++		.fh_in = ff_in->fh,
++		.off_in = pos_in,
++		.nodeid_out = ff_out->nodeid,
++		.fh_out = ff_out->fh,
++		.off_out = pos_out,
++		.len = len,
++		.remap_flags = remap_flags,
++	};
++	struct fuse_write_out outarg;
++	loff_t err;
++	loff_t end_in, end_out;
++	loff_t effective;
++	bool is_unstable = false;
++
++	if (fc->no_remap_file_range)
++		return -EOPNOTSUPP;
++
++	/* Dedupe needs data comparison and must not modify the destination. */
++	if (remap_flags & REMAP_FILE_DEDUP)
++		return -EOPNOTSUPP;
++
++	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
++		return -EXDEV;
++
++	lock_two_nondirectories(inode_in, inode_out);
++
++	/* Refresh EOF before generic preparation expands a whole-file clone. */
++	if (len == 0) {
++		err = fuse_update_attributes(inode_in, file_in, STATX_SIZE);
++		if (err)
++			goto out;
++	}
++
++	/*
++	 * The VFS does not prepare a filesystem's remap callback. Do it while
++	 * both inodes are locked so the source cannot change between expanding
++	 * a zero-length FICLONE to EOF and issuing the userspace request.
++	 */
++	err = generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,
++					    &len, remap_flags);
++	if (err || len == 0)
++		goto out;
++
++	/*
++	 * Send the prepared, concrete length. Besides removing the source-size
++	 * race, this is the request-derived length used for the inode update:
++	 * fuse_write_out.size is only 32 bits and saturates above 4 GiB.
++	 */
++	effective = len;
++	inarg.len = effective;
++	end_in = pos_in + effective - 1;
++	end_out = pos_out + effective - 1;
++	is_unstable = !fc->writeback_cache &&
++		      pos_out + effective > i_size_read(inode_out);
++
++	err = fuse_writeback_range(inode_in, pos_in, end_in);
++	if (err)
++		goto out;
++
++	err = fuse_writeback_range(inode_out, pos_out, end_out);
++	if (err)
++		goto out;
++
++	if (is_unstable)
++		set_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
++
++	args.opcode = FUSE_REMAP_FILE_RANGE;
++	args.nodeid = ff_in->nodeid;
++	args.in_numargs = 1;
++	args.in_args[0].size = sizeof(inarg);
++	args.in_args[0].value = &inarg;
++	args.out_numargs = 1;
++	args.out_args[0].size = sizeof(outarg);
++	args.out_args[0].value = &outarg;
++
++	err = fuse_simple_request(fm, &args);
++	if (err == -ENOSYS) {
++		fc->no_remap_file_range = 1;
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	if (err)
++		goto out;
++
++	/*
++	 * The server's clone (host FICLONE/FICLONERANGE) is all-or-nothing:
++	 * success means the entire requested range was cloned. Derive the
++	 * result from the request, NOT from outarg.size — fuse_write_out's
++	 * size field is u32 and silently truncates large clones (a 10GiB
++	 * FICLONE reported 2GiB, and the truncated value poisoned the cached
++	 * inode size: reads past 2GiB went short until the attr cache
++	 * expired).
++	 */
++	truncate_inode_pages_range(inode_out->i_mapping,
++				   ALIGN_DOWN(pos_out, PAGE_SIZE),
++				   ALIGN(pos_out + effective, PAGE_SIZE) - 1);
++
++	file_update_time(file_out);
++	fuse_write_update_attr(inode_out, pos_out + effective, effective);
++
++	err = effective;
++out:
++	if (is_unstable)
++		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
++
++	unlock_two_nondirectories(inode_in, inode_out);
++	file_accessed(file_in);
++	fuse_flush_time_update(inode_out);
++
++	return err;
++}
+ static const struct file_operations fuse_file_operations = {
+ 	.llseek		= fuse_file_llseek,
+ 	.read_iter	= fuse_file_read_iter,
+@@ -3092,6 +3217,7 @@ static const struct file_operations fuse_file_operations = {
+ 	.poll		= fuse_file_poll,
+ 	.fallocate	= fuse_file_fallocate,
+ 	.copy_file_range = fuse_copy_file_range,
++	.remap_file_range = fuse_remap_file_range,
+ 	.setlease	= generic_setlease,
+ };
+ 
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index c8d4c5f..a2ef5ae 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -657,6 +657,9 @@ struct fuse_conn {
+ 	 */
+ 	unsigned no_copy_file_range_64:1;
+ 
++	/** @no_remap_file_range: Does the filesystem support remap_file_range (FICLONE)? */
++	unsigned no_remap_file_range:1;
++
+ 	/** @destroy: Send DESTROY request */
+ 	unsigned int destroy:1;
+ 
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 7435e09..e6c0139 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -680,6 +680,7 @@ enum fuse_opcode {
+ 	FUSE_TMPFILE		= 51,
+ 	FUSE_STATX		= 52,
+ 	FUSE_COPY_FILE_RANGE_64	= 53,
++	FUSE_REMAP_FILE_RANGE	= 54,
+ 
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+@@ -1367,4 +1368,20 @@ struct fuse_uring_cmd_req {
+ 	};
+ };
+ 
++
++/**
++ * struct fuse_remap_file_range_in - FUSE_REMAP_FILE_RANGE request
++ *
++ * Used for FICLONE/FICLONERANGE support through FUSE.
++ */
++struct fuse_remap_file_range_in {
++	uint64_t	fh_in;
++	uint64_t	off_in;
++	uint64_t	nodeid_out;
++	uint64_t	fh_out;
++	uint64_t	off_out;
++	uint64_t	len;
++	uint32_t	remap_flags;
++	uint32_t	padding;
++};
+ #endif /* _LINUX_FUSE_H */
+-- 
+2.43.0
+

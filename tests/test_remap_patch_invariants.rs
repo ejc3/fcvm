@@ -396,23 +396,26 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         );
     }
 
-    let host = "kernel_profiles.nested.arm64.host_kernel";
-    assert!(
-        toml_section(&config, host)
-            .lines()
-            .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
-        "[{host}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest wedges L2 \
-         (#659), and 7.3.1 hosts passed every nested check with 7.3.1 and 6.18.60 guests"
-    );
-
     for profile in [
         "kernel_profiles.default.arm64",
-        "kernel_profiles.default.amd64",
         "kernel_profiles.nested.arm64",
-        "kernel_profiles.nested.amd64",
-        "kernel_profiles.nested.amd64.host_kernel",
+        "kernel_profiles.nested.arm64.host_kernel",
         "kernel_profiles.btrfs.arm64",
         "kernel_profiles.btrfs.amd64",
+    ] {
+        assert!(
+            toml_section(&config, profile)
+                .lines()
+                .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
+            "[{profile}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest \
+             wedges L2 (#659), and 7.3.1 hosts passed every nested check with 7.3.1 guests"
+        );
+    }
+
+    for profile in [
+        "kernel_profiles.default.amd64",
+        "kernel_profiles.nested.amd64",
+        "kernel_profiles.nested.amd64.host_kernel",
     ] {
         let section = toml_section(&config, profile);
         assert!(
@@ -422,4 +425,26 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
             "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.60"
         );
     }
+}
+
+/// The arm64 nested guest kernel runs the L1 hypervisor, so it must pin the same series as the
+/// host kernel under it (#659). A guest newer than its host wedges L2 (6.19 and later on a 6.18
+/// host). A guest older than its host is slow: with 6.18.60 guests on a 7.3.3 host the guest
+/// hypervisors took 880 M system-register traps in one `test_nested_l3`, 732 M of them debug
+/// registers, against 331 M on a 6.18.60 host and 334 M with 7.3.3 guests on the 7.3.3 host,
+/// and the test ran 551 and 521 s against 441 and 411 s.
+#[test]
+fn the_arm64_nested_guest_runs_the_series_of_its_host() {
+    let config: toml::Value =
+        toml::from_str(&repo_file("rootfs-config.toml")).expect("parse rootfs-config.toml");
+    let nested = &config["kernel_profiles"]["nested"]["arm64"];
+    let series = |value: &toml::Value| {
+        let version = value["kernel_version"].as_str().expect("kernel_version");
+        version.splitn(3, '.').take(2).collect::<Vec<_>>().join(".")
+    };
+    assert_eq!(
+        series(nested),
+        series(&nested["host_kernel"]),
+        "[kernel_profiles.nested.arm64] and its host_kernel must pin the same Linux series"
+    );
 }

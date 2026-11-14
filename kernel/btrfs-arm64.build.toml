@@ -6,4 +6,4 @@
 build_spec = 1
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 kernel_config = "kernel/btrfs.conf"
-patches_dir = "kernel/patches"
+patches_dir = "kernel/patches-7.3"

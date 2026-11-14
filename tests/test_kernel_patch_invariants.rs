@@ -261,7 +261,10 @@ fn extract_block(text: &str, start: &str, end: &str) -> Option<String> {
 #[test]
 fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     let mut failures = Vec::new();
-    for port in s2_ports() {
+    let mut ports = s2_ports();
+    // The guest and host can share one patch set and release; run each once.
+    ports.dedup_by(|a, b| a.patch == b.patch && a.fixture == b.fixture);
+    for port in ports {
         failures.extend(
             run_s2_tracking_harness(&port)
                 .into_iter()
@@ -272,23 +275,17 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
 }
 
 /// The kernel functions the harness compiles, in source order:
-/// (file, first line, last line, present only with the patch). The 6.18
-/// backport frees records in kvm_destroy_guest_s2_mappings(); the 7.3 port
-/// (upstream's series from v7.4-rc1) frees them in guest_s2_tracking_destroy()
+/// (file, first line, last line, present only with the patch). The 7.3 port
+/// (upstream's series from v7.4-rc1) frees records in guest_s2_tracking_destroy()
 /// when kvm_free_stage2_pgd() tears down the canonical MMU.
-fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static str, bool)> {
+fn s2_tracking_blocks() -> Vec<(&'static str, &'static str, &'static str, bool)> {
     const HOST_H: &str = "arch/arm64/include/asm/kvm_host.h";
     const MMU_C: &str = "arch/arm64/kvm/mmu.c";
     const NESTED_C: &str = "arch/arm64/kvm/nested.c";
-    let upstream = series != "6.18";
-    let mut blocks = vec![
+    vec![
         (HOST_H, "struct kvm_guest_s2_mapping {", "};", true),
         (NESTED_C, "#define S2_MMU_PER_VCPU", "", false),
-    ];
-    if upstream {
-        blocks.push((NESTED_C, "#define S2_MMU_PER_VM", "", true));
-    }
-    blocks.extend([
+        (NESTED_C, "#define S2_MMU_PER_VM", "", true),
         (NESTED_C, "int kvm_init_nested(", "}", false),
         (NESTED_C, "void kvm_destroy_nested(", "}", false),
         (NESTED_C, "static int init_nested_s2_mmu(", "}", false),
@@ -309,11 +306,6 @@ fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static
         ),
         (NESTED_C, "void kvm_record_guest_s2_mapping(", "}", true),
         (NESTED_C, "void kvm_remove_guest_s2_mappings(", "}", true),
-    ]);
-    if !upstream {
-        blocks.push((NESTED_C, "void kvm_destroy_guest_s2_mappings(", "}", true));
-    }
-    blocks.extend([
         (NESTED_C, "void kvm_init_nested_s2_mmu(", "}", false),
         (
             NESTED_C,
@@ -347,22 +339,16 @@ fn s2_tracking_blocks(series: &str) -> Vec<(&'static str, &'static str, &'static
         (MMU_C, "void kvm_stage2_unmap_range(", "}", false),
         (MMU_C, "int kvm_init_stage2_mmu(", "}", false),
         (MMU_C, "void kvm_uninit_stage2_mmu(", "}", false),
-    ]);
-    if upstream {
-        blocks.push((MMU_C, "static void guest_s2_tracking_destroy(", "}", true));
-    }
-    blocks.extend([
+        (MMU_C, "static void guest_s2_tracking_destroy(", "}", true),
         (MMU_C, "void kvm_free_stage2_pgd(", "}", false),
         (MMU_C, "bool kvm_unmap_gfn_range(", "}", false),
         (MMU_C, "void kvm_arch_flush_shadow_memslot(", "}", false),
-    ]);
-    blocks
+    ]
 }
 
 /// Build the harness for one port and run its scenarios; returns the failures.
 fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     let release = port.release.as_str();
-    let series = release.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
     let temp = tempfile::tempdir().expect("create the shadow stage-2 fixture directory");
     for file in S2_TRACKING_FILES {
         let dest = temp.path().join(file);
@@ -394,7 +380,7 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
     if patched {
         extracted.push_str("#define HAVE_GUEST_S2_TRACKING 1\n");
     }
-    for (file, start, end, with_patch) in s2_tracking_blocks(&series) {
+    for (file, start, end, with_patch) in s2_tracking_blocks() {
         let source = fs::read_to_string(temp.path().join(file)).unwrap();
         match extract_block(&source, start, end) {
             Some(block) => extracted.push_str(&block),
@@ -1340,5 +1326,80 @@ fn every_sanitizer_harness_is_built_by_sanitized_harness() {
         "sanitizer flags must appear only in SanitizedHarness::build, so every harness is \
          linked with -no-pie; found them at:\n{}",
         sites.join("\n")
+    );
+}
+
+/// Every patch file kept under `kernel/` is applied by some kernel: a profile's
+/// `patches_dir`, a host kernel's, or a `kernel/*.build.toml`'s, directly or
+/// through a link. A rebase that pointed the arm64 host at the guest's set left
+/// `kernel/patches-arm64-host`'s three host-only KVM patches applied by nothing,
+/// while each still sat in the repository looking applied.
+#[test]
+fn every_kernel_patch_is_applied_by_some_kernel() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+
+    let mut dirs: Vec<String> = Vec::new();
+    for (_, arches) in config["kernel_profiles"]
+        .as_table()
+        .expect("[kernel_profiles] is a table")
+    {
+        for (_, table) in arches.as_table().into_iter().flatten() {
+            for t in [Some(table), table.get("host_kernel")]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(dir) = t.get("patches_dir").and_then(|v| v.as_str()) {
+                    dirs.push(dir.to_string());
+                }
+            }
+        }
+    }
+    for entry in fs::read_dir(root.join("kernel")).expect("read kernel/") {
+        let path = entry.unwrap().path();
+        if path.to_string_lossy().ends_with(".build.toml") {
+            let build: toml::Value =
+                toml::from_str(&fs::read_to_string(&path).unwrap()).expect("parse build.toml");
+            if let Some(dir) = build.get("patches_dir").and_then(|v| v.as_str()) {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    let mut applied = std::collections::BTreeSet::new();
+    for dir in &dirs {
+        for entry in fs::read_dir(root.join(dir)).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "patch") {
+                applied.insert(fs::canonicalize(&path).expect("resolve patch"));
+            }
+        }
+    }
+
+    let mut unapplied = Vec::new();
+    for entry in fs::read_dir(root.join("kernel")).expect("read kernel/") {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for patch in fs::read_dir(&dir).unwrap() {
+            let path = patch.unwrap().path();
+            let is_file = fs::symlink_metadata(&path).unwrap().file_type().is_file();
+            if is_file
+                && path.extension().is_some_and(|e| e == "patch")
+                && !applied.contains(&fs::canonicalize(&path).unwrap())
+            {
+                unapplied.push(path.strip_prefix(&root).unwrap().display().to_string());
+            }
+        }
+    }
+    assert!(
+        unapplied.is_empty(),
+        "no kernel applies these patches (no patches_dir reaches them, directly or through a \
+         link): {unapplied:?}. Point the kernel that needs each one at its directory, or link \
+         it from that kernel's patches_dir"
     );
 }

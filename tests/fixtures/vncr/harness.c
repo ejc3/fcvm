@@ -22,9 +22,9 @@ struct vncr_tlb {
     atomic_t cpu;
     bool valid;
 };
-struct kvm_s2_mmu { int refcnt; };
+struct kvm_s2_mmu { atomic_t refcnt; };
 struct kvm {
-    struct { struct kvm_s2_mmu mmu; } arch;
+    struct { struct kvm_s2_mmu mmu; atomic_t vncr_tlb_count; } arch;
     int mmu_lock, srcu;
     unsigned long mmu_invalidate_seq;
 };
@@ -47,7 +47,7 @@ static int clears, translation_result;
 #define smp_processor_id() 3
 #define is_hyp_ctxt(vcpu) false
 #define vncr_fixmap(cpu) (cpu)
-#define atomic_dec(value) (--*(value))
+#define atomic_dec(v) ((v)->counter--)
 #define atomic_read(v) ((v)->counter)
 #define atomic_set(v, i) ((v)->counter = (i))
 static int atomic_xchg_relaxed(atomic_t *v, int new)
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
     mapped = pte_present = initially_mapped;
     translation_result = scenario == 2 ? -EFAULT : 0;
     struct vncr_tlb vt = { .cpu = { initially_mapped ? 3 : -1 }, .valid = true };
-    struct kvm kvm = { 0 };
+    struct kvm kvm = { .arch.vncr_tlb_count = { 1 } };
     struct kvm_vcpu vcpu = { .arch.vncr_tlb = &vt, .kvm = &kvm };
     bool is_gmem = false;
 

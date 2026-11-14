@@ -1218,14 +1218,14 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Host Kernel
 
 **Install host kernel**: `make install-host-kernel` (builds kernel, installs to /boot, updates GRUB).
-Patches from `kernel/patches-arm64-host/` are applied automatically during the build. The
-6.18 nested guest kernel takes `kernel/patches-arm64/`.
+Patches from `kernel/patches-arm64-host/` are applied automatically during the build: the
+patches it shares with the 7.3.3 nested guest, linked from `kernel/patches-arm64/`, and the
+host-only KVM exit patches.
 
 **Current patches**:
-- `nv2-targeted-shadow-s2-unmap.patch` (both sets): upstream e6084aecaeef and its series, so an
+- `nv2-targeted-shadow-s2-unmap.patch`: upstream e6084aecaeef and its series, so an
   MMU notifier invalidation unmaps only the shadow stage-2 mappings of the invalidated range
-  (#1274). The host set cherry-picks the v7.4-rc1 series onto 7.3.3 and adds one record per
-  shadow block; the guest set is the 6.18 backport
+  (#1274): the v7.4-rc1 series cherry-picked onto 7.3.3, plus one record per shadow block
 - `mmfr4-override.vm.patch`: ID register override for recursive nesting (guest only)
 
 **VM Graceful Shutdown (PSCI)**:
@@ -1437,8 +1437,8 @@ userfaultfd, of file-backed memory, and of a memory file it overwrites in place.
 zero-page pages across one snapshot.
 
 **Targeted shadow stage-2 unmap (#1274).** `kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch`
-backports upstream e6084aecaeef and its series to the 6.18 nested kernel, and
-`kernel/patches-arm64-host/` carries the 7.3 port for the host: KVM records
+carries upstream e6084aecaeef and its series (v7.4-rc1) on the 7.3.3 host and nested
+kernels: KVM records
 each shadow mapping's canonical and nested IPA ranges, and an MMU-notifier invalidation unmaps
 only the shadow mappings that overlap the invalidated canonical range. With the host compacting
 memory every second, `test_nested_l2_with_large_files` passed in 32 s on the patched host
