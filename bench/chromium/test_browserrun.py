@@ -180,6 +180,12 @@ class HostedArms(unittest.TestCase):
         with patch.dict(os.environ, {"https_proxy": "http://not-the-worker:123"}, clear=True):
             opener = self.br.direct_opener()
         self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies for h in opener.handlers))
+        # Off the worker, the session's mandated HTTPS proxy is kept, never bypassed.
+        with patch.dict(os.environ, {"https_proxy": "http://session-proxy.invalid:123"}, clear=True):
+            arm = self.br.direct_opener(worker=False)
+        self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler)
+                            and h.proxies.get("https") == "http://session-proxy.invalid:123"
+                            for h in arm.handlers))
         handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
         self.assertEqual(len(handlers), 1)
         self.assertIsNone(handlers[0].redirect_request(None, None, 302, "", {}, "https://elsewhere.invalid"))

@@ -107,9 +107,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def direct_opener():
-    # Keep the token on its pinned route and never forward Authorization to a redirect.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+def direct_opener(worker=True):
+    """Never forward Authorization to a redirect. On the benchmark worker, connect
+    directly: its token is pinned to the worker's own addresses. On the ARM dev
+    host, keep the session's HTTPS proxy when the environment names one: that
+    proxy is the session's mandated egress, and it leaves from the addresses the
+    ARM token is pinned to."""
+    proxies = {} if worker else urllib.request.getproxies()
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect())
 
 
 
@@ -267,8 +272,9 @@ def correctness(args, opener, token, account, engines, urls, sites, sleep):
     return completed
 
 
-def run(args, token, account, opener=None, sleep=time.sleep) -> int:
-    opener = opener or direct_opener()
+def run(args, token, account, opener=None, sleep=time.sleep, worker=True) -> int:
+    via_proxy = (not worker) and bool(urllib.request.getproxies().get("https"))
+    opener = opener or direct_opener(worker)
     report = load("report")
     urls = list(report.KITESURF_CORPUS.values())
     sites = {url: key for key, url in report.KITESURF_CORPUS.items()}
@@ -291,7 +297,7 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
                    "corpus": "live sites, fetched by Browser Run with Cloudflare's DNS",
                    "client": "browserrun.py: one request at a time over HTTPS from this host",
                    "client_location": args.client_location,
-                   "via_https_proxy": False,
+                   "via_https_proxy": via_proxy,
                    "loadavg_at_start": loadavg1(),
                    "started_at": time.time()}, handle, indent=1, sort_keys=True)
     completed = correctness(args, opener, token, account, engines, urls, sites, sleep)
@@ -385,7 +391,7 @@ def main() -> int:
         if "CLOUDFLARE_API_TOKEN" in os.environ:
             raise SystemExit("REFUSING: pass --client-location when supplying an external credential")
         args.client_location = "us-east-2" if worker else "us-west-1"
-    return run(args, token, account)
+    return run(args, token, account, worker=worker)
 
 
 if __name__ == "__main__":
