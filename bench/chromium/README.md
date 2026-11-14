@@ -247,6 +247,33 @@ make bench-chromium-corpus-extra PHASES=kitesurf STAMP=ks REPS=202 WARMUP=28
   Kitesurf figures come from its hosted Browser Run, which places isolates across
   its network and fetches the live sites. The two are not the same measurement.
 
+## The hosted arms (`browserrun.py`)
+
+Cloudflare's Browser Run serves both its Chromium and Kitesurf (`?browser=kitesurf`)
+through the same Quick Actions its published Kitesurf table measured. `make
+bench-browserrun` drives `/screenshot` (JPEG q80, as the fcvm arm's driver asks) and
+`/content` against both, over the corpus's 14 URLs, one request at a time.
+
+```bash
+eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-browser-run \
+  --query SecretString --output text | jq -r '"export CLOUDFLARE_ACCOUNT_ID=\(.account_id|@sh)
+export CLOUDFLARE_API_TOKEN=\(.api_token|@sh)"')"
+make bench-browserrun BR_REPS=28 BR_WARMUP=1
+```
+
+A pbox's role cannot read the secret; hand it the two values on stdin, never on a command
+line or in a file (the module docstring has the form).
+
+- **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
+  a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.
+  Each record keeps the reply's status, size and digest, so content drift shows per page.
+- **The network path is part of wall time.** wall_ms runs from this host's POST to the last
+  byte of the reply; the colo that answered is on every record (from `cf-ray`), and any
+  browser-time header Cloudflare sends is kept.
+- **Correctness** is checked as in the local arm: one untimed PNG screenshot and one
+  `/content` per page and engine, kept under `correctness/<engine>/`, blank at 99.8% of one
+  colour, and a measured request on a page that did not complete counts as a failure.
+
 ## Results conventions
 
 Raw run output goes to `results/<timestamp>/` — **git-ignored** (see
