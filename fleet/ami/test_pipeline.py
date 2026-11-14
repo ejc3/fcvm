@@ -1584,35 +1584,46 @@ else:
 
 class LaunchPathTests(unittest.TestCase):
     # ejc3/aws#823: generation twelve's host booted, as the fleet launched it, without its user
-    # data. Its journal on a boot from the factory's image (g4dn.metal, 2026-11-14): ENA logged its
+    # data. On a first boot from the factory's image (g4dn.metal, 2026-11-14) ENA logged its
     # probe at 27.78 s and systemd started cloud-init-local at 25.96 s.
-    def journal(self, probe, start):
-        entries = [{"MESSAGE": "Linux version 6.18.60-fcvm", "_TRANSPORT": "kernel", "__MONOTONIC_TIMESTAMP": "1000"}]
-        nic = {"MESSAGE": "ena 0000:00:05.0: Elastic Network Adapter (ENA) found at mem fe800000, mac addr 0a:00:00:00:00:01",
-               "_TRANSPORT": "kernel", "__MONOTONIC_TIMESTAMP": str(probe)}
-        unit = {"MESSAGE": "Starting cloud-init-local.service - Cloud-init: Local Stage (pre-network)...",
-                "UNIT": "cloud-init-local.service", "_TRANSPORT": "journal", "__MONOTONIC_TIMESTAMP": str(start)}
-        return entries + sorted([nic, unit], key=lambda e: int(e["__MONOTONIC_TIMESTAMP"]))
+    DEVICE = "0000:00:05.0"
+
+    def journal(self, probe, received=None):
+        entries = [{"MESSAGE": "Linux version 6.18.60-fcvm", "_TRANSPORT": "kernel",
+                    "_SOURCE_MONOTONIC_TIMESTAMP": "1000", "__MONOTONIC_TIMESTAMP": "4000000"}]
+        nic = {"MESSAGE": "ena " + self.DEVICE + ": Elastic Network Adapter (ENA) found at mem fe800000, mac addr 0a:00:00:00:00:01",
+               "_TRANSPORT": "kernel", "_SOURCE_MONOTONIC_TIMESTAMP": str(probe),
+               "__MONOTONIC_TIMESTAMP": str(received if received is not None else probe)}
+        rename = {"MESSAGE": "ena " + self.DEVICE + " ens5: renamed from eth0", "_TRANSPORT": "kernel",
+                  "_SOURCE_MONOTONIC_TIMESTAMP": "40000000", "__MONOTONIC_TIMESTAMP": "40000000"}
+        return entries + [nic, rename]
 
     def test_generation_twelves_boot_order_fails_even_when_it_won_the_race(self):
-        self.assertFalse(guest.nic_bound_before_cloud_init(self.journal(27_784_460, 25_963_145), "ena", "0000:00:05.0"))
+        self.assertFalse(guest.nic_bound_before_cloud_init(self.journal(27_784_460), "ena", self.DEVICE, 25_963_145))
 
     def test_a_nic_bound_before_cloud_init_passes(self):
-        # ENA built in probes during the kernel's own boot, seconds before userspace
-        self.assertTrue(guest.nic_bound_before_cloud_init(self.journal(2_904_118, 10_412_771), "ena", "0000:00:05.0"))
+        # ENA built in probes during the kernel's own boot, seconds before userspace; journald reads
+        # the kernel's backlog later, so the kernel's own timestamp is the one compared
+        self.assertTrue(guest.nic_bound_before_cloud_init(self.journal(2_904_118, received=11_000_000),
+                                                          "ena", self.DEVICE, 10_412_771))
 
     def test_a_missing_probe_or_start_cannot_pass(self):
-        entries = self.journal(2_000_000, 10_000_000)
-        for drop in ("ena 0000", "Starting cloud-init-local"):
-            with self.subTest(drop=drop):
-                kept = [e for e in entries if not e["MESSAGE"].startswith(drop)]
-                with self.assertRaises(RuntimeError):
-                    guest.nic_bound_before_cloud_init(kept, "ena", "0000:00:05.0")
-        # another device's probe, or a later rename line, is not this NIC's probe
-        other = self.journal(2_000_000, 10_000_000)
-        other[1]["MESSAGE"] = other[1]["MESSAGE"].replace("0000:00:05.0", "0000:00:06.0")
         with self.assertRaises(RuntimeError):
-            guest.nic_bound_before_cloud_init(other, "ena", "0000:00:05.0")
+            guest.nic_bound_before_cloud_init(self.journal(2_000_000)[:1], "ena", self.DEVICE, 10_000_000)
+        for start in (0, None):
+            with self.subTest(start=start), self.assertRaises(RuntimeError):
+                guest.nic_bound_before_cloud_init(self.journal(2_000_000), "ena", self.DEVICE, start)
+        # another device's probe is not this NIC's
+        with self.assertRaises(RuntimeError):
+            guest.nic_bound_before_cloud_init(self.journal(2_000_000), "ena", "0000:00:06.0", 10_000_000)
+
+    def test_the_start_comes_from_systemd_not_the_journal_line(self):
+        # a generation-eleven first boot (2026-11-14) had no "Starting cloud-init-local" line in its
+        # journal: the start time is systemd's own record of the unit
+        source = Path(__file__).with_name("pipeline_guest.py").read_text()
+        body = source.split("def launch_path_proof():", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"--property=InactiveExitTimestampMonotonic"', body)
+        self.assertNotIn("Starting", body)
 
     def test_the_proof_runs_on_every_validator_boot(self):
         source = (Path(__file__).with_name("pipeline_guest.py")).read_text()
