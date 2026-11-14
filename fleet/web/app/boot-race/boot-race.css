@@ -1,0 +1,36 @@
+/* The boot-race page: a document on the wall's dark ground, in its type and colours. The global
+   stylesheet locks the body for the wall, so this page scrolls in its own box. Nothing is wider than
+   the viewport: long values wrap. */
+
+.br-page { position: fixed; inset: 0; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; background: var(--bg); }
+.br-wrap { max-width: 860px; margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) 16px max(40px, env(safe-area-inset-bottom)); }
+.br-page a { color: var(--fcvm); text-underline-offset: 2px; }
+.br-page code { font: 14px var(--mono); overflow-wrap: anywhere; }
+.br-page p, .br-page dd { overflow-wrap: anywhere; }
+.br-nav { font: 500 15px var(--mono); color: var(--muted); margin-bottom: 10px; }
+.br-page h1 { font-size: 28px; font-weight: 600; line-height: 1.15; letter-spacing: -0.01em; margin-bottom: 14px; }
+.br-page h2 { font-size: 20px; font-weight: 600; margin: 28px 0 6px; }
+.br-page h3 { font-size: 17px; font-weight: 600; }
+.br-recorded { border: 1px solid var(--ec2); background: rgba(245, 165, 36, 0.1); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }
+.br-recorded strong { color: var(--ec2-soft); }
+.br-lead { color: var(--text); margin-bottom: 16px; }
+.br-muted { color: var(--muted); font-size: 14px; }
+.br-facts { margin: 0 0 16px; display: grid; gap: 6px; }
+.br-facts > div { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.br-facts dt { color: var(--dim); font-size: 14px; }
+.br-facts dd { margin: 0; }
+.br-notrun { border-left: 3px solid var(--refused); padding: 4px 0 4px 12px; margin: 10px 0; }
+.br-lanes { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.br-lane { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--control); border-radius: 8px; padding: 12px 14px; display: grid; gap: 6px; }
+.br-lane.br-fcvm { border-left-color: var(--fcvm); }
+.br-lane.br-ec2, .br-lane.br-ecs { border-left-color: var(--ec2); }
+.br-lane-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.br-median { font: 600 22px var(--mono); }
+.br-stats { font: 14px var(--mono); color: var(--muted); }
+.br-k { color: var(--dim); }
+.br-foot { margin-top: 24px; }
+
+@media (max-width: 520px) {
+  .br-page h1 { font-size: 24px; }
+  .br-facts > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}

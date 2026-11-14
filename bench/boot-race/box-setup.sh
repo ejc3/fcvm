@@ -1,6 +1,6 @@
 #!/bin/bash
-# Set up a parallel box (pbox up N kvm-96 --local-nvme) for a boot-race campaign: host prep from CLAUDE.md "Fresh Bare-Metal
-# Box Quickstart", fcvm at a pinned commit, then the workload image. Run as ubuntu: box-setup.sh <fcvm commit>.
+# Set up the dedicated Ohio worker (ejc3/aws scripts/benchmark-worker.sh up): host packages, fcvm at a pinned
+# commit, then the workload image. Run as ubuntu: box-setup.sh <fcvm commit>.
 # Expects ~/boot-race/img/{boot-race-workload,Containerfile} copied from bench/boot-race/workload.
 set -euxo pipefail
 SCRATCH_HELPER="$(cd -- "$(dirname -- "$0")" && pwd)/scratch.py"

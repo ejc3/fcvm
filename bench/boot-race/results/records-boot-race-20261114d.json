@@ -1,0 +1,19 @@
+{
+ "campaign": "boot-race-20261114d",
+ "fcvm_commit": null,
+ "files": [
+  {
+   "path": "bench/boot-race/results/boot-race-20261114d/lambda-reports.json",
+   "sha256": "7dcc80545bbec7ae8b1677fa414f527034fa4142e777953939303ed782836779",
+   "size": 28795
+  },
+  {
+   "path": "bench/boot-race/results/boot-race-20261114d/samples.jsonl",
+   "sha256": "c637d4415ec5f39dd58398e2252b9023907c93f96535214ffa25ca700062d6d2",
+   "size": 123131
+  }
+ ],
+ "records_commit": "e7af8c2cce8e8d5507a2dd2814c212182f3a0fb7",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}
