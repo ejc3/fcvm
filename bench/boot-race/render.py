@@ -125,6 +125,18 @@ SCRUB = [
 ]
 
 
+def cold_evidence_missing(rec):
+    """A lambda-cold record the page may not call a cold start: one taken without a configuration update before it
+    or without an Init Duration after it (records from a driver that did neither, or a resumed campaign's)."""
+    if rec.get("lane") != "lambda-cold" or not rec.get("ok"):
+        return None
+    if not rec.get("generation"):
+        return "no configuration update before the sample: not shown to be a new execution environment"
+    if rec.get("init_duration_ms") is None:
+        return "no Init Duration in the invocation's REPORT line: not a cold start"
+    return None
+
+
 def scrub(text):
     for rx, sub in SCRUB:
         text = rx.sub(sub, text)
@@ -163,6 +175,10 @@ def build(results):
             if line.strip():
                 recs.append(json.loads(line))
     recs.sort(key=lambda r: r.get("t_start_unix_ms") or r.get("t_failed_unix_ms") or 0)
+    for r in recs:
+        refused = cold_evidence_missing(r)
+        if refused:
+            r.update(ok=False, error=f"IdentityCheck: {refused}")
 
     lanes = []
     for lid, meta in LANES.items():
