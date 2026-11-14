@@ -71,11 +71,13 @@ until upstream took it as 81d99abe2bd8, which 6.18.59 carries; it holds no
 x86-only patch today.
 
 The host kernels (`make install-host-kernel`) apply the `patches_dir` of their
-own `host_kernel` table, minus the `.vm.patch` files: `kernel/patches-x86` on
-x86_64 (6.18.60), shared with the nested guest, and `kernel/patches-arm64-host` on
-arm64 (7.3.3), which links the patches it shares with the 7.3.3 nested guest from
-`kernel/patches-arm64` and holds the host-only KVM patches below. An arm64 host must
-not be older than its L1 guest kernel: a newer guest wedges L2 (#659). Edit a host patch with
+own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.3:
+`kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches, and
+`kernel/patches-arm64-host` on arm64, which links the patches it shares with the
+7.3.3 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
+below. The x86_64 host also sets the Kconfig lines in `kernel/host-x86.conf` on top
+of the running kernel's config. A host must not be older than its L1 guest kernel:
+an arm64 guest newer than its host wedges L2 (#659). Edit a host patch with
 `scripts/kernel-patch.sh edit nested.host_kernel <patch>`. The host kernels pin
 6.18.60 or a later 6.18 release, or 7.2 or later: the first releases with Linux commit
 25ae123db10b (6.18 stable 39679927fa7a), which removes an `rcu_barrier()` from
