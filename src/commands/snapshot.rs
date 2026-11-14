@@ -6463,7 +6463,9 @@ mod tests {
     /// restored record as this build prints it: the keys come out sorted, so the record does
     /// not start with `status`. It passes a prefilled restore, also when the record lands
     /// after the check started (fcvm prints it after the guest's ACK, which can come after
-    /// the first scene frame), and fails a File fallback and a clone that exited without one.
+    /// the first scene frame), and fails a File fallback and a clone that exited without one
+    /// (also with jq 1.6, which the CI container has and which exits 0 for `-e` on empty
+    /// input).
     #[test]
     fn the_warm_phone_check_reads_the_restored_record_this_build_prints() {
         let script = include_str!("../../fleet/ami/host/warm-phone.sh");
@@ -6479,13 +6481,39 @@ mod tests {
         let check = format!(
             "{function}{}\n{}\necho \"ok=$ok\"\n",
             line("restored=$(clone_record $cp)"),
-            line(r#"echo "$restored" | jq -e"#)
+            line(r#"[ -n "$restored" ] && echo "$restored" | jq -e"#)
         );
         let record = |backend| {
             restored_record("c", "phone-warm", "v", backend, "firecracker", 1, None).to_string()
         };
         // Lines before the clone's: an earlier record and a line that is not JSON.
         let earlier = format!("{}\n{{not json\n", record("hugepage-prefilled"));
+        // jq as 1.6 behaves on empty input (`-e` exits 0), whichever jq this host has.
+        let real_jq = std::process::Command::new("bash")
+            .args(["-c", "command -v jq"])
+            .output()
+            .expect("bash");
+        let real_jq = String::from_utf8_lossy(&real_jq.stdout).trim().to_string();
+        assert!(!real_jq.is_empty(), "the check needs jq");
+        let shim = tempfile::tempdir().unwrap();
+        let shim_jq = shim.path().join("jq");
+        std::fs::write(
+            &shim_jq,
+            format!(
+                "#!/bin/bash\ninput=$(cat)\n[ -n \"$input\" ] || exit 0\nprintf '%s\\n' \"$input\" | exec {real_jq} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &shim_jq,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let path = format!(
+            "{}:{}",
+            shim.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let run = |log_now: &str, later: Option<String>, clone_runs: bool| {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("warm-phone.log");
@@ -6499,6 +6527,7 @@ mod tests {
                 clone.wait().unwrap();
             }
             let check = std::process::Command::new("bash")
+                .env("PATH", &path)
                 .arg("-c")
                 .arg(format!(
                     "set -u\nLOG={}\nbefore=2\nok=1\ncp={}\n{check}",

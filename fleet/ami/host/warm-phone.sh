@@ -132,7 +132,8 @@ clone_record() {
   echo "$r"
 }
 restored=$(clone_record $cp)
-echo "$restored" | jq -e '.backend == "hugepage-prefilled"' > /dev/null || { echo "warm-phone: the clone did not restore from prefilled hugepages: ${restored:-no restored record}"; ok=0; }
+# jq 1.6 exits 0 for -e on empty input, so an empty record is refused before jq.
+[ -n "$restored" ] && echo "$restored" | jq -e '.backend == "hugepage-prefilled"' > /dev/null || { echo "warm-phone: the clone did not restore from prefilled hugepages: ${restored:-no restored record}"; ok=0; }
 # the browser the snapshot carries comes to the front in the clone and shows the page
 if [ $ok = 1 ]; then
   cpid=$(fcvm ls --json | jq -r '.[] | select(.name == "warm-phone-clone") | .pid' | head -1)
