@@ -116,6 +116,21 @@ class MeasurementInterrupted(BaseException):
 
 _TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
+# The first INT/TERM either termination handler received, or 0. Optional work
+# in a request worker (the failure probe) reads it to get out of the way of the
+# teardown; the handlers keep their own records for the fence's logic.
+_termination_signal = 0
+
+
+def termination_pending() -> int:
+    return _termination_signal
+
+
+def _note_termination(signum: int) -> None:
+    global _termination_signal
+    if not _termination_signal:
+        _termination_signal = signum
+
 
 class TerminationFence:
     """Turn the first SIGINT/SIGTERM into a cleanup-capable interruption.
@@ -130,6 +145,7 @@ class TerminationFence:
         self.received: list[int] = []
 
     def _handle(self, signum, _frame):
+        _note_termination(signum)
         self.received.append(signum)
         if len(self.received) == 1:
             raise MeasurementInterrupted(signum)
@@ -139,6 +155,8 @@ class TerminationFence:
             raise MeasurementInvalid("termination fencing requires the main thread")
         if getattr(_termination_state, "fence", None) is not None:
             raise MeasurementInvalid("termination fencing cannot be nested")
+        global _termination_signal
+        _termination_signal = 0  # a new fence is a new run's shutdown record
         prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TERMINATION_SIGNALS)
         installed = []
         try:
@@ -186,6 +204,7 @@ class DeferredTermination:
         self.received: list[int] = []
 
     def _handle(self, signum, _frame):
+        _note_termination(signum)
         self.received.append(signum)
 
     def __enter__(self):
@@ -1558,9 +1577,12 @@ class CgroupAudit:
             return parse_cpu_stat(stream.read())
 
     def live_pids(self) -> list[int]:
+        # A set: the kernel may list one PID twice in a single read of
+        # cgroup.procs when the process moves out and back, or the PID is
+        # recycled, while the file is read (cgroup-v2.rst, "cgroup.procs").
         try:
             with open(os.path.join(self.path, "cgroup.procs")) as stream:
-                return sorted(int(value) for value in stream.read().split())
+                return sorted({int(value) for value in stream.read().split()})
         except (OSError, ValueError) as error:
             raise MeasurementInvalid(f"cannot read run cgroup.procs: {error}")
 
@@ -3579,8 +3601,13 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         # No request reads the memory server's counters: they would bracket
         # overlapping requests, and reqscale_analyze has its own whole-run
         # cgroup accounting.
+        # One probe per request: requests overlap, and a failed one is dumped
+        # before its teardown (reqbench.FailureProbe.failures_only).
+        failure_probe = reqbench.FailureProbe.failures_only(
+            args.fcvm, args.data_root, log_dir, args.run_id, args.cdp_port,
+            interrupt_pending=termination_pending)
         try:
-            record = reqbench.run_cdp_request(request_args, rep, fast=True)
+            record = reqbench.run_cdp_request(request_args, rep, fast=True, probe=failure_probe)
         except Exception as error:
             # A request that raised (a spawn refused with EAGAIN at an
             # overloaded rate, a teardown that left survivors) fails its rate.

@@ -870,20 +870,133 @@ def _control_gate(
         result = row.get("result")
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise AnalysisInvalid(f"host-control row {index} has no successful CDP result")
+    latencies = [float(row["latency_ms"]) for row in records]
     midpoint = len(records) // 2
-    first = statistics.median(float(row["latency_ms"]) for row in records[:midpoint])
-    second = statistics.median(float(row["latency_ms"]) for row in records[midpoint:])
+    first = statistics.median(latencies[:midpoint])
+    second = statistics.median(latencies[midpoint:])
     if first <= 0:
         raise AnalysisInvalid("host-control first-half median is not positive")
-    drift_pct = (second - first) * 100.0 / first
+    pooled_drift_pct = (second - first) * 100.0 / first
+    modes = _control_frame_modes(latencies, midpoint)
+    if modes is None:
+        statistic, drift_pct = "pooled-median", pooled_drift_pct
+    else:
+        statistic = "per-mode-median"
+        drift_pct = max((mode["drift_pct"] for mode in modes["modes"]), key=abs)
     limit = schedule["capacity_criteria"]["max_control_median_drift_pct"]
     return {
         "passed": abs(drift_pct) <= limit,
         "n": len(records),
         "first_half_median_ms": first,
         "second_half_median_ms": second,
+        "pooled_median_drift_pct": pooled_drift_pct,
+        "statistic": statistic,
+        "frame_modes": modes,
         "drift_pct": drift_pct,
         "absolute_limit_pct": limit,
+    }
+
+
+# The control's latency waits for one or two compositor frames, so it has two
+# modes about a frame and a half apart (45 and 69 ms on c8g.metal-48xl), and
+# which one a control lands in is a coin flip. The median of a half then falls
+# in whichever mode holds more than half of that half's controls: campaign
+# 81d631c4's 8 vCPU run had 42% and 51% of its controls in the slow mode, so its
+# halves' medians were 47.8 and 59.2 ms (+24.0%) while each mode moved +1.0%
+# and -0.4%, on a host whose busy CPUs (23.3 and 24.1 of 192), run cgroup CPU
+# and CPU pressure did not change between the halves. When the controls form
+# two such modes in both halves, each mode is compared with itself.
+MODE_SEPARATION_MIN = 4.0
+MODE_MIN_COUNT = 4
+MODE_MIN_FRACTION = 0.10
+
+
+def _otsu_split(values: list[float]):
+    """(threshold, fast, slow): Otsu's split, maximising between-class variance."""
+    ordered = sorted(values)
+    n = len(ordered)
+    prefix = [0.0]
+    for value in ordered:
+        prefix.append(prefix[-1] + value)
+    best = None
+    for k in range(1, n):
+        if ordered[k] == ordered[k - 1]:
+            continue
+        low_mean = prefix[k] / k
+        high_mean = (prefix[n] - prefix[k]) / (n - k)
+        between = (k / n) * (1 - k / n) * (low_mean - high_mean) ** 2
+        if best is None or between > best[0]:
+            best = (between, (ordered[k - 1] + ordered[k]) / 2)
+    if best is None:
+        return None
+    threshold = best[1]
+    return (threshold, [v for v in values if v <= threshold], [v for v in values if v > threshold])
+
+
+def _control_frame_modes(latencies: list[float], midpoint: int) -> "dict | None":
+    """Two latency modes in each half, compared mode with mode, or None.
+
+    Each half is split on its own (Otsu's threshold). A split computed over
+    both halves together would let a uniform slowdown move controls from one
+    mode to the other and hide itself: 40, 50 and 60 ms controls that all
+    become 20% slower leave the pooled split at 55 ms and both modes' medians
+    near where they were. Split per half, the fast and slow modes of each half
+    are that half's own, and a uniform slowdown moves both.
+
+    The modes of a half count only when their medians are at least
+    MODE_SEPARATION_MIN robust standard deviations apart (the difference over
+    1.4826 times the root mean square of their MADs; one normal population
+    split this way gives about 2.3) and each holds at least MODE_MIN_COUNT
+    controls and MODE_MIN_FRACTION of the half. Otherwise, or when a mode's
+    first-half median is not positive, the halves are compared as one
+    population.
+    """
+    halves = (latencies[:midpoint], latencies[midpoint:])
+    splits = []
+    for half in halves:
+        split = _otsu_split(half)
+        if split is None:
+            return None
+        threshold, fast, slow = split
+        if any(len(mode) < MODE_MIN_COUNT or len(mode) < MODE_MIN_FRACTION * len(half)
+               for mode in (fast, slow)):
+            return None
+
+        def mad(values):
+            centre = statistics.median(values)
+            return statistics.median(abs(value - centre) for value in values)
+
+        spread = 1.4826 * math.sqrt((mad(fast) ** 2 + mad(slow) ** 2) / 2)
+        gap = statistics.median(slow) - statistics.median(fast)
+        separation = gap / spread if spread > 0 else math.inf
+        if separation < MODE_SEPARATION_MIN:
+            return None
+        splits.append((threshold, fast, slow, separation))
+    rows = []
+    for index, name in ((1, "fast"), (2, "slow")):
+        first_half, second_half = splits[0][index], splits[1][index]
+        first_median = statistics.median(first_half)
+        second_median = statistics.median(second_half)
+        if first_median <= 0:
+            return None
+        rows.append({
+            "mode": name,
+            "first_half_n": len(first_half),
+            "second_half_n": len(second_half),
+            "first_half_median_ms": first_median,
+            "second_half_median_ms": second_median,
+            "drift_pct": (second_median - first_median) * 100.0 / first_median,
+        })
+    return {
+        "halves": [
+            {
+                "threshold_ms": threshold,
+                # JSON has no infinity: two modes with no spread at all.
+                "separation": separation if math.isfinite(separation) else None,
+            }
+            for threshold, _fast, _slow, separation in splits
+        ],
+        "modes": rows,
     }
 
 
@@ -2324,8 +2437,10 @@ def markdown_report(analysis: dict) -> str:
         "",
         f"The persistent host-native Chromium control changed "
         f"{analysis['control_gate']['drift_pct']:.3g}% between its first- and "
-        f"second-half medians (absolute limit "
-        f"{analysis['control_gate']['absolute_limit_pct']:.3g}%).",
+        f"second-half medians"
+        + (" (the larger change of its one- and two-frame modes, each compared with itself)"
+           if analysis['control_gate'].get('statistic') == "per-mode-median" else "")
+        + f" (absolute limit {analysis['control_gate']['absolute_limit_pct']:.3g}%).",
         "",
         "Fault counters and optional handle_mm_fault timings cover the Firecracker "
         "process from endpoint readiness through artifact return. They include all "

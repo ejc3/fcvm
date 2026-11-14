@@ -3609,6 +3609,27 @@ class FailureProbe:
         self.control_attempts = 0
         self.control_path = ""
         self.is_warmup = False
+        # The harness's own INT/TERM record by default; the scale run passes
+        # its termination record instead (reqscale.termination_pending).
+        self.interrupt_pending = harness_interrupt_pending
+
+    @classmethod
+    def failures_only(cls, *args, **kwargs) -> "FailureProbe":
+        """A probe that captures failed requests and never a healthy control.
+
+        For the scale run, whose requests overlap: a control capture there
+        would exec into a healthy clone in the middle of a scored burst, and
+        concurrent requests would race on the control counters. A failed
+        request still gets its dump (guest dmesg tail, Chromium processes,
+        listeners), which is what attributes a guest-side crash.
+        """
+        interrupt_pending = kwargs.pop("interrupt_pending", None)
+        probe = cls(*args, **kwargs)
+        probe.control_captured = True
+        probe.control_attempts = cls.CONTROL_ATTEMPTS
+        if interrupt_pending is not None:
+            probe.interrupt_pending = interrupt_pending
+        return probe
 
     def begin_request(self, is_warmup: bool) -> None:
         """Tell the probe whether the rep about to run is a discarded warmup.
@@ -3649,7 +3670,7 @@ class FailureProbe:
         role = self.role_for(rec)
         if role is None:
             return
-        pending = harness_interrupt_pending()
+        pending = self.interrupt_pending()
         if pending:
             rec["probe"] = {
                 "role": role,
@@ -3755,7 +3776,7 @@ class FailureProbe:
             dump, so a short dump reads as "we left early" rather than as a guest
             that answered nothing.
             """
-            pending = harness_interrupt_pending()
+            pending = self.interrupt_pending()
             if pending:
                 dump["interrupted_by_signal"] = pending
                 note(step, f"skipped, termination signal {pending} pending")
@@ -3948,7 +3969,7 @@ class FailureProbe:
         attempts = []
         resolved = None
         for variant, flags in variants:
-            pending = harness_interrupt_pending()
+            pending = self.interrupt_pending()
             if pending:
                 attempts.append({
                     "nsenter_variant": variant,
