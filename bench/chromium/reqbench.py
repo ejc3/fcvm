@@ -3160,11 +3160,13 @@ PROBE_GUEST_PASSIVE_SECTIONS = (
     # netns is the container's netns and this sees the container's listener.
     ("listening_sockets", "ss -ltnp"),
     ("proc_net_tcp", "cat /proc/net/tcp"),
-    # `awk '/[c]hrom/'`, not `grep chrom`: the bracket keeps the matcher's own
-    # argv from matching, and the full `args` column is the point: which
-    # Chromium flags are live, and on which port.
+    # Matched on the comm column ($5), not the whole line: the batch script
+    # runs as one `sh -c`, and its args hold every section's name, this one's
+    # included, so a whole-line /[c]hrom/ listed the probe itself and could not
+    # say whether Chromium was alive. The full `args` column is kept because
+    # it is the point: which Chromium flags are live, and on which port.
     ("chromium_processes",
-     "ps -eo pid,ppid,stat,etimes,comm,args | awk 'NR==1 || /[c]hrom/'"),
+     "ps -eo pid,ppid,stat,etimes,comm,args | awk 'NR==1 || $5 ~ /^chrom/'"),
     ("dmesg_tail", "dmesg | tail -50"),
     # fc-agent writes its restore-epoch narration to stderr, which lands on the
     # serial console rather than in a file, so this is usually empty. The
