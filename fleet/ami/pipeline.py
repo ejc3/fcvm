@@ -528,6 +528,9 @@ class Pipeline:
             require(result.get("guard") is True and result.get("frames") is True
                     and result.get("sanitized") is True and result.get("tls_rotation") is True,
                     "candidate failed the boot, renderer or security proof")
+            # every boot, cold, rebooted and resumed: the race it guards against is per boot
+            require(result.get("launch_path") is True,
+                    "candidate failed the launch-path proof (NIC before cloud-init, EC2 datasource, user data ran)")
             require(all(result.get(key) == value for key, value in self.tls.items()),
                     "the validation TLS identity changed during this build")
             require(kind != "host" or result.get("phone_clone") is True, "candidate phone clone failed")
