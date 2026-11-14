@@ -91,7 +91,7 @@ class Build(unittest.TestCase):
             labels = [r[0] for r in data["setup"]["rows"]]
             self.assertNotIn("ECS on Fargate", labels)
             self.assertIn("ECS on EC2", labels)
-            self.assertIn("Lambda, new runtime every request", labels)
+            self.assertIn("Lambda, cold start", labels)
             fargate = next(n for n in data["not_run"] if n["id"] == "ecs-fargate")
             self.assertIn("ECR interface endpoints", fargate["why"])
             self.assertEqual({n["id"] for n in data["not_run"]}, set(render.LANES) - {"fcvm-file", "ecs-ec2"})

@@ -206,6 +206,62 @@ class FailedStart(unittest.TestCase):
         self.assertEqual(events, [("wait", "stopped")])
 
 
+class ColdLambda(unittest.TestCase):
+    """Every lambda-cold sample is a cold start: a new execution environment before t0, an Init Duration after."""
+
+    def lane(self, init):
+        events = []
+
+        class Lam:
+            def get_function_configuration(self, FunctionName):
+                return {"Environment": {"Variables": {"BOOT_RACE_EXIT_AFTER_RESPONSE": "1"}}}
+
+            def update_function_configuration(self, FunctionName, Environment):
+                events.append(("update", FunctionName, sorted(Environment["Variables"])))
+
+            def get_waiter(self, name):
+                class W:
+                    def wait(self, **kw):
+                        events.append(("waited", name))
+                return W()
+
+        class Logs:
+            def filter_log_events(self, **kw):
+                tail = f"\tInit Duration: {init} ms" if init is not None else ""
+                return {"events": [{"message": f"REPORT RequestId: r1\tDuration: 2.00 ms{tail}\n"}]}
+
+        lane = race.Lambda.__new__(race.Lambda)
+        lane.cfg = {"function_urls": {"cold": "https://cold.example/", "warm": "https://warm.example/"}}
+        lane.lam, lane.logs = Lam(), Logs()
+
+        def call(url):
+            events.append(("call", url))
+            return {"t_start_unix_ms": 1000, "ms": 150.0, "request_id": "r1", "answer": {"proc_id": "a", "boot_id": "x"}}
+
+        lane.call = call
+        return lane, events
+
+    def test_each_cold_sample_retires_the_environment_before_the_timed_call(self):
+        lane, events = self.lane(12.27)
+        s = asyncio.run(lane.sample("lambda-cold"))
+        self.assertEqual(events[0], ("update", "boot-race-cold", ["BOOT_RACE_EXIT_AFTER_RESPONSE", "BOOT_RACE_GENERATION"]))
+        self.assertEqual(events[1], ("waited", "function_updated_v2"))
+        self.assertEqual(events[2], ("call", "https://cold.example/"))
+        self.assertEqual(s["init_duration_ms"], 12.27)
+        self.assertIsNone(race.check_cold("lambda-cold", s))
+
+    def test_a_cold_sample_without_init_duration_is_refused(self):
+        lane, events = self.lane(None)
+        s = asyncio.run(lane.sample("lambda-cold"))
+        self.assertIsNone(s["init_duration_ms"])
+        self.assertIn("not a cold start", race.check_cold("lambda-cold", s))
+
+    def test_the_warm_lane_does_not_touch_the_configuration(self):
+        lane, events = self.lane(None)
+        asyncio.run(lane.sample("lambda-warm"))
+        self.assertEqual(events, [("call", "https://warm.example/")])
+
+
 class LaunchTiming(unittest.TestCase):
     def test_t0_is_the_launchers_moment_before_runtask_not_the_invoke(self):
         # invoked at wall 1000.0 ms (monotonic 0); RunTask asked at 1040 and answered at 1090;

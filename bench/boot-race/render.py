@@ -44,9 +44,10 @@ LANES = {
         "start": "RunTask on a running container instance, image already pulled",
     },
     "lambda-cold": {
-        "name": "Lambda, new runtime every request",
-        "short": "Lambda new runtime",
-        "start": "HTTPS GET to the function URL; the runtime process that served the previous request exited",
+        "name": "Lambda, cold start",
+        "short": "Lambda cold",
+        "start": "HTTPS GET to the function URL, after an untimed configuration update that retires the function's "
+                 "execution environments",
     },
     "ec2-hibernate": {
         "name": "EC2 hibernate resume",
@@ -78,9 +79,9 @@ CHECKS = [
                   "resumed the snapshot's own process (race.py refuses any other)."],
     ["lambda-warm", "{n} samples answered from {new_proc} runtime process; {init} of {report} REPORT lines carried "
                     "an Init Duration. race.py refuses a warm sample from a new process."],
-    ["lambda-cold", "{n} samples answered from {new_proc} runtime processes on {new_boot} kernel boots; "
-                    "{same_boot} answered with the same kernel boot id as the sample before; {init} of {report} "
-                    "REPORT lines carried an Init Duration."],
+    ["lambda-cold", "{n} samples, each from a new runtime process; {init} of {report} REPORT lines carried an Init "
+                    "Duration. Before each sample race.py changes the function's configuration so Lambda starts a new "
+                    "execution environment, and it refuses a sample whose REPORT line has no Init Duration."],
     ["ecs-ec2", "{n} samples answered from {new_proc} container processes on {new_boot} kernel boot (the one "
                 "container instance)."],
     ["ecs-fargate", "{n} samples answered from {new_proc} processes on {new_boot} kernel boots: one per task."],
@@ -99,8 +100,7 @@ NOT_RUN = {
                    "change ECR DNS for the whole VPC, and they have no reviewed teardown yet.",
 }
 SETUP_ROW_LANE = {"ECS on Fargate": "ecs-fargate", "Fargate platform": "ecs-fargate"}
-# setup.json names the lambda-cold function "Lambda, cold"; the page names the lane by what it measures.
-SETUP_ROW_NAME = {"Lambda, cold": "Lambda, new runtime every request"}
+SETUP_ROW_NAME = {"Lambda, cold": "Lambda, cold start"}
 
 FORBIDDEN = [
     re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt)-[0-9a-f]{8,17}\b"),
