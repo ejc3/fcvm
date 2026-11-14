@@ -61,23 +61,36 @@ class ReplayServer:
         self.http, self.tls = free_port(), free_port()
 
     def __enter__(self):
+        # Output goes to a file, never a pipe nobody drains: CI's Python logs each
+        # refused handshake's traceback, which filled an undrained pipe and left
+        # the server blocked in write() at shutdown (repo CLAUDE.md, "Pipe Buffer
+        # Deadlock in Tests").
+        self.log_path = os.path.join(self.tmp, "serve.log")
+        self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "corpus_serve.py"), "--port", str(self.http),
              "--tls-port", str(self.tls), "--dns-addr", "127.0.0.1", "--dns-port", "0",
-             *self.extra], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+             *self.extra], stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            line = self.proc.stdout.readline()
-            if "replaying on" in line:
-                return self
-            if not line and self.proc.poll() is not None:
+            with open(self.log_path) as handle:
+                if "replaying on" in handle.read():
+                    return self
+            if self.proc.poll() is not None:
                 raise RuntimeError("corpus_serve exited during start-up")
+            time.sleep(0.05)
         raise RuntimeError("corpus_serve never started")
 
     def __exit__(self, *exc):
         self.proc.terminate()
-        self.proc.wait(timeout=30)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        try:
+            self.proc.wait(timeout=30)
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self.log.close()
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 def tls_handshake(port, host, cafile):
