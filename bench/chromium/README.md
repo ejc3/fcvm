@@ -258,11 +258,12 @@ bench-browserrun` drives `/screenshot` (JPEG q80, as the fcvm arm's driver asks)
 eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-browser-run \
   --query SecretString --output text | jq -r '"export CLOUDFLARE_ACCOUNT_ID=\(.account_id|@sh)
 export CLOUDFLARE_API_TOKEN=\(.api_token|@sh)"')"
-make bench-browserrun BR_REPS=28 BR_WARMUP=1
+make bench-browserrun BR_CLIENT_LOCATION=<region> BR_REPS=28 BR_WARMUP=1
 ```
 
-A pbox's role cannot read the secret; hand it the two values on stdin, never on a command
-line or in a file (the module docstring has the form).
+The token is accepted only from the dev box's own public addresses, so the hosted arms run
+from the dev box, through its HTTPS proxy when the session sets one (recorded in run.json),
+and record the box's 1-minute load per request because the box is shared.
 
 - **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
   a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.

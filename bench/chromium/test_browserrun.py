@@ -92,7 +92,8 @@ class FakeCloudflare:
 
 def args(out, **kw):
     base = dict(out=out, engines="chromium,kitesurf", ops="screenshot,content", reps=14, warmup=0,
-                seed=1, image_type="jpeg", timeout=5.0, max_retries=3, max_retry_wait=2.0)
+                seed=1, image_type="jpeg", timeout=5.0, max_retries=3, max_retry_wait=2.0,
+                client_location="test-region")
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -122,6 +123,10 @@ class HostedArms(unittest.TestCase):
         self.assertTrue(all(c[2]["screenshotOptions"] == {"type": "jpeg", "quality": 80} for c in measured_shots))
         self.assertTrue(all(r["colo"] == "IAD" and r["browser_headers"] == {"X-Browser-Ms-Used": "123"}
                             for r in rows))
+        self.assertTrue(all(isinstance(r["loadavg1"], float) for r in rows), "the client's load")
+        run = json.load(open(os.path.join(self.tmp, "run.json")))
+        self.assertEqual(run["client_location"], "test-region")
+        self.assertIn("via_https_proxy", run)
 
     def test_the_token_is_sent_and_never_written(self):
         cf = FakeCloudflare()

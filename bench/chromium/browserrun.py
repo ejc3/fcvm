@@ -15,8 +15,10 @@ kitesurf` selects Kitesurf; no parameter is Chromium), over the same 14 URLs
 What it measures. Each request is one HTTPS POST from this host to
 api.cloudflare.com, and wall_ms runs from the send to the last byte of the
 reply. It includes the network path from this host to the Cloudflare colo that
-answered (recorded per request from the cf-ray header) as well as the browser's
-work there. Browser Run fetches every page from the live site with Cloudflare's
+answered (recorded per request from the cf-ray header), through the HTTPS proxy
+when the environment names one (run.json says whether it did), as well as the
+browser's work there. --client-location names where the client ran, and every
+record carries this host's 1-minute load, since the client box may be shared. Browser Run fetches every page from the live site with Cloudflare's
 DNS: these arms read the live web at the moment of the request, not the byte
 replay the local arms read, because a Quick Action cannot be pointed at another
 resolver or proxy. Every reply header whose name mentions "browser" (Cloudflare's
@@ -38,9 +40,8 @@ an image, or a /content reply without a closed document is a failed request,
 and the run goes on.
 
 The token is read from the environment and never written to a record, a log
-line or a command line. A pbox cannot read the secret: pass it on stdin, e.g.
-`printf '%s\\n' "$CLOUDFLARE_API_TOKEN" | ssh BOX 'IFS= read -r CLOUDFLARE_API_TOKEN;
-export CLOUDFLARE_API_TOKEN; ...'` with CLOUDFLARE_ACCOUNT_ID exported the same way.
+line or a command line. Cloudflare accepts it only from the dev box's own public
+addresses, so these arms run from the dev box.
 """
 
 import argparse
@@ -149,8 +150,18 @@ def call(args, opener, token, account, engine, op, url, image_type, sleep):
     return status, headers, payload, wall_ms, waited
 
 
+def loadavg1():
+    """This host's 1-minute load at the request: the client box may be shared."""
+    try:
+        with open("/proc/loadavg") as handle:
+            return float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def record(engine, op, url, status, headers, payload, wall_ms, waited, ok, detail):
     return {"engine": engine, "op": op, "url": url, "ok": ok, "detail": detail,
+            "loadavg1": loadavg1(),
             "status": status, "wall_ms": round(wall_ms, 1), "bytes": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest() if ok else None,
             "colo": colo(headers),
@@ -216,6 +227,9 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
                    "quality": 80 if args.image_type == "jpeg" else None, "api": API,
                    "corpus": "live sites, fetched by Browser Run with Cloudflare's DNS",
                    "client": "browserrun.py: one request at a time over HTTPS from this host",
+                   "client_location": args.client_location,
+                   "via_https_proxy": bool(urllib.request.getproxies().get("https")),
+                   "loadavg_at_start": loadavg1(),
                    "started_at": time.time()}, handle, indent=1, sort_keys=True)
     completed = correctness(args, opener, token, account, engines, urls, sites, sleep)
     rows_path = os.path.join(args.out, "browserrun.jsonl")
@@ -265,7 +279,10 @@ def summarize(rows_path, out_path):
                     "bytes_min_max": [min(r["bytes"] for r in mine), max(r["bytes"] for r in mine)],
                     "distinct_outputs": len({r["sha256"] for r in mine if r["sha256"]}),
                 }
+            loads = [r["loadavg1"] for r in cell if isinstance(r.get("loadavg1"), (int, float))]
             summary["cells"][f"{engine}/{op}"] = {
+                "loadavg1": ({"min": min(loads), "median": statistics.median(loads), "max": max(loads)}
+                             if loads else None),
                 "attempts": len(cell), "succeeded": len(good), "failed": len(cell) - len(good),
                 "p50_ms": round(statistics.median([r["wall_ms"] for r in good]), 1) if good else None,
                 "colos": sorted({r["colo"] for r in cell if r["colo"]}),
@@ -294,6 +311,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=90.0)
     ap.add_argument("--max-retries", type=int, default=5)
     ap.add_argument("--max-retry-wait", type=float, default=30.0)
+    ap.add_argument("--client-location", required=True,
+                    help="where this client runs, e.g. a cloud region; recorded in run.json "
+                         "(never a host name or address)")
     args = ap.parse_args()
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
