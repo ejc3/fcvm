@@ -1,0 +1,81 @@
+name: Fleet image release gate
+
+# Every fleet image release (the factory's or a reviewed one) is smoked once on staging after it
+# goes live, and withdrawn by itself when the smoke fails. The gate (ejc3/aws
+# fcvm-fleet-ami-pipeline.tf, `fcvm_ami_release_gate`) says which generation is live and whether
+# it was verified; an unverified one gets the viewer-path smoke on both families
+# (fleet-viewer-smoke.yml). Both pass: the generation is verified and this workflow stops smoking
+# it. Either fails: the gate moves staging back to the live receipt's own previous release
+# (fleet/ami/release_gate.py), and records that rollback as verified, so it is not rolled back in
+# turn. A verified generation is never rolled back by the gate.
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-release-gate
+  cancel-in-progress: false
+
+jobs:
+  status:
+    name: Live release
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      generation: ${{ steps.gate.outputs.generation }}
+      verified: ${{ steps.gate.outputs.verified }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - id: gate
+        env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+        run: python3 -B fleet/ami/release_gate.py status
+
+  smoke:
+    name: Staging smoke
+    needs: status
+    if: needs.status.outputs.verified == 'false'
+    uses: ./.github/workflows/fleet-viewer-smoke.yml
+    secrets: inherit
+
+  decide:
+    name: Verify or roll back
+    needs: [status, smoke]
+    if: ${{ !cancelled() && needs.status.outputs.verified == 'false' }}
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+          GENERATION: ${{ needs.status.outputs.generation }}
+          SMOKE: ${{ needs.smoke.result }}
+        run: python3 -B fleet/ami/release_gate.py decide --generation "$GENERATION" --smoke "$SMOKE"
