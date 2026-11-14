@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -216,8 +217,12 @@ class ColdLambda(unittest.TestCase):
             def get_function_configuration(self, FunctionName):
                 return {"Environment": {"Variables": {"BOOT_RACE_EXIT_AFTER_RESPONSE": "1"}}}
 
-            def update_function_configuration(self, FunctionName, Environment):
-                events.append(("update", FunctionName, sorted(Environment["Variables"])))
+            def update_function_code(self, FunctionName, ZipFile):
+                import io
+                import zipfile
+
+                names = sorted(zipfile.ZipFile(io.BytesIO(ZipFile)).namelist())
+                events.append(("update", FunctionName, names))
 
             def get_waiter(self, name):
                 class W:
@@ -231,7 +236,12 @@ class ColdLambda(unittest.TestCase):
                 return {"events": [{"message": f"REPORT RequestId: r1\tDuration: 2.00 ms{tail}\n"}]}
 
         lane = race.Lambda.__new__(race.Lambda)
-        lane.cfg = {"function_urls": {"cold": "https://cold.example/", "warm": "https://warm.example/"}}
+        workload = tempfile.NamedTemporaryFile(delete=False)
+        workload.write(b"\x7fELF")
+        workload.close()
+        self.addCleanup(os.unlink, workload.name)
+        lane.cfg = {"function_urls": {"cold": "https://cold.example/", "warm": "https://warm.example/"},
+                    "workload_bin": workload.name}
         lane.lam, lane.logs = Lam(), Logs()
 
         def call(url):
@@ -244,7 +254,7 @@ class ColdLambda(unittest.TestCase):
     def test_each_cold_sample_retires_the_environment_before_the_timed_call(self):
         lane, events = self.lane(12.27)
         s = asyncio.run(lane.sample("lambda-cold"))
-        self.assertEqual(events[0], ("update", "boot-race-cold", ["BOOT_RACE_EXIT_AFTER_RESPONSE", "BOOT_RACE_GENERATION"]))
+        self.assertEqual(events[0], ("update", "boot-race-cold", ["bootstrap", "generation"]))
         self.assertEqual(events[1], ("waited", "function_updated_v2"))
         self.assertEqual(events[2], ("call", "https://cold.example/"))
         self.assertEqual(s["init_duration_ms"], 12.27)

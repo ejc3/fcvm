@@ -46,7 +46,7 @@ LANES = {
     "lambda-cold": {
         "name": "Lambda, cold start",
         "short": "Lambda cold",
-        "start": "HTTPS GET to the function URL, after an untimed configuration update that retires the function's "
+        "start": "HTTPS GET to the function URL, after an untimed code upload that retires the function's "
                  "execution environments",
     },
     "ec2-hibernate": {
@@ -80,7 +80,7 @@ CHECKS = [
     ["lambda-warm", "{n} samples answered from {new_proc} runtime process; {init} of {report} REPORT lines carried "
                     "an Init Duration. race.py refuses a warm sample from a new process."],
     ["lambda-cold", "{n} samples, each from a new runtime process; {init} of {report} REPORT lines carried an Init "
-                    "Duration. Before each sample race.py changes the function's configuration so Lambda starts a new "
+                    "Duration. Before each sample race.py uploads new code so Lambda starts a new "
                     "execution environment, and it refuses a sample whose REPORT line has no Init Duration."],
     ["ecs-ec2", "{n} samples answered from {new_proc} container processes on {new_boot} kernel boot (the one "
                 "container instance)."],
@@ -126,12 +126,12 @@ SCRUB = [
 
 
 def cold_evidence_missing(rec):
-    """A lambda-cold record the page may not call a cold start: one taken without a configuration update before it
+    """A lambda-cold record the page may not call a cold start: one taken without a code upload before it
     or without an Init Duration after it (records from a driver that did neither, or a resumed campaign's)."""
     if rec.get("lane") != "lambda-cold" or not rec.get("ok"):
         return None
     if not rec.get("generation"):
-        return "no configuration update before the sample: not shown to be a new execution environment"
+        return "no code upload before the sample: not shown to be a new execution environment"
     if rec.get("init_duration_ms") is None:
         return "no Init Duration in the invocation's REPORT line: not a cold start"
     return None

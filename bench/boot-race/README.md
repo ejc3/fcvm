@@ -13,7 +13,7 @@ snapshot restores and for the AWS ways of starting the same workload, in one int
 | `ec2-hibernate` | `StartInstances` | the same AMI, stopped with `Hibernate=true` |
 | `ecs-fargate` | `RunTask` (FARGATE), read inside boot-race-launcher | 1 vCPU, 2 GiB, ARM64, no public IP; **not run** (below) |
 | `ecs-ec2` | `RunTask` (EC2), read inside boot-race-launcher | one warm container instance, image cached, host network |
-| `lambda-cold` | HTTPS GET to the function URL | a cold start: before each sample, an untimed configuration update retires the function's execution environments; a sample without an Init Duration is refused |
+| `lambda-cold` | HTTPS GET to the function URL | a cold start: before each sample, an untimed code upload retires the function's execution environments; a sample without an Init Duration is refused |
 | `lambda-warm` | HTTPS GET to the function URL | the runtime keeps running |
 
 t1 for every lane: a GET from the campaign host has read a complete `200` answer.
