@@ -1,0 +1,140 @@
+{
+ "recorded": true,
+ "campaign": "boot-race-20261114",
+ "window_utc": {
+  "first_sample": "2026-11-14T15:05:37Z",
+  "last_sample": "2026-11-14T15:49:57Z"
+ },
+ "rounds": 30,
+ "fcvm_commit": "f0147cf7b023",
+ "region": "us-east-2",
+ "campaign_host": "c8gd.metal-24xl, 96 vCPUs, spot, kernel 7.0.0-1013-aws",
+ "host_load": "1-minute load average 0.00 to 1.64 when each lane attempt began (before any wait for the instance to be ready)",
+ "records": {
+  "repository": "ejc3/fcvm-bench-records",
+  "commit": "b63204fb7f3bc626720810813c002b389de657e8",
+  "url": "https://github.com/ejc3/fcvm-bench-records/tree/b63204fb7f3bc626720810813c002b389de657e8/bench/boot-race/results/boot-race-20261114"
+ },
+ "page_url": "https://ejc3.github.io/fcvm/boot-race.html",
+ "lanes": [
+  {
+   "id": "lambda-warm",
+   "name": "Lambda, warm",
+   "start": "HTTPS GET to the function URL, environment already running",
+   "config": "provided.al2023, arm64, 2048 MB, function URL with IAM auth, BOOT_RACE_EXIT_AFTER_RESPONSE=0",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 43.8,
+   "p95_ms": 50.5,
+   "p99_ms": 51.8,
+   "min_ms": 35.6,
+   "max_ms": 51.8,
+   "check": "30 samples answered from 1 runtime process; 0 of 30 REPORT lines carried an Init Duration. race.py refuses a warm sample from a new process."
+  },
+  {
+   "id": "lambda-cold",
+   "name": "Lambda, new runtime every request",
+   "start": "HTTPS GET to the function URL; the runtime process that served the previous request exited",
+   "config": "provided.al2023, arm64, 2048 MB, function URL with IAM auth, BOOT_RACE_EXIT_AFTER_RESPONSE=1",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 60.1,
+   "p95_ms": 71.0,
+   "p99_ms": 161.7,
+   "min_ms": 50.2,
+   "max_ms": 161.7,
+   "check": "30 samples answered from 30 runtime processes on 1 kernel boots; 29 answered with the same kernel boot id as the sample before; 1 of 30 REPORT lines carried an Init Duration."
+  },
+  {
+   "id": "fcvm-uffd",
+   "name": "fcvm restore, UFFD",
+   "start": "fcvm snapshot run --pid <serve> (memory paged in by a running fcvm snapshot serve)",
+   "config": "1 vCPU, 2048 MiB, rootless networking, port published on the host's loopback; one snapshot, restored by both fcvm lanes",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 63.7,
+   "p95_ms": 91.2,
+   "p99_ms": 152.2,
+   "min_ms": 59.4,
+   "max_ms": 152.2,
+   "check": "30 samples answered from 1 workload process and 1 kernel boot: every restore resumed the snapshot's own process (race.py refuses any other)."
+  },
+  {
+   "id": "fcvm-file",
+   "name": "fcvm restore, memory file",
+   "start": "fcvm snapshot run --snapshot <tag> (Firecracker maps the memory file; the wall's path)",
+   "config": "1 vCPU, 2048 MiB, rootless networking, port published on the host's loopback; one snapshot, restored by both fcvm lanes",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 81.4,
+   "p95_ms": 87.6,
+   "p99_ms": 129.9,
+   "min_ms": 72.0,
+   "max_ms": 129.9,
+   "check": "30 samples answered from 1 workload process and 1 kernel boot: every restore resumed the snapshot's own process (race.py refuses any other)."
+  },
+  {
+   "id": "ecs-ec2",
+   "name": "ECS on EC2, warm host",
+   "start": "RunTask on a running container instance, image already pulled",
+   "config": "task 1 vCPU, 1536 MiB, ARM64, network mode host; container instance c8g.medium from al2023-ami-ecs-hvm-2023.0.20261031-kernel-6.1-arm64, image cached",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 1491.5,
+   "p95_ms": 2307.9,
+   "p99_ms": 2368.9,
+   "min_ms": 672.9,
+   "max_ms": 2368.9,
+   "check": "30 samples answered from 30 container processes on 1 kernel boot (the one container instance)."
+  },
+  {
+   "id": "ec2-hibernate",
+   "name": "EC2 hibernate resume",
+   "start": "StartInstances of an instance stopped with Hibernate=true",
+   "config": "c8g.medium, gp3 8 GiB root, AMI made from al2023-ami-2023.12.20261102.0-kernel-6.1-arm64 with the workload as a systemd unit",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 5772.3,
+   "p95_ms": 5956.8,
+   "p99_ms": 6035.9,
+   "min_ms": 5567.1,
+   "max_ms": 6035.9,
+   "check": "30 samples, 30 of them from the same process that answered before the instance hibernated, on 1 kernel boot: every start resumed the hibernated kernel. race.py refuses a resume that booted."
+  },
+  {
+   "id": "ec2-start",
+   "name": "EC2 start of a stopped instance",
+   "start": "StartInstances of a stopped instance",
+   "config": "c8g.medium, gp3 8 GiB root, AMI made from al2023-ami-2023.12.20261102.0-kernel-6.1-arm64 with the workload as a systemd unit",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 7420.8,
+   "p95_ms": 7633.0,
+   "p99_ms": 7670.9,
+   "min_ms": 7258.3,
+   "max_ms": 7670.9,
+   "check": "30 samples answered from 30 processes and 30 kernel boots: every start booted."
+  },
+  {
+   "id": "ec2-launch",
+   "name": "EC2 launch from an AMI",
+   "start": "RunInstances from an AMI with the workload installed",
+   "config": "c8g.medium, gp3 8 GiB root, AMI made from al2023-ami-2023.12.20261102.0-kernel-6.1-arm64 with the workload as a systemd unit",
+   "n": 30,
+   "failures": 0,
+   "median_ms": 8014.6,
+   "p95_ms": 13665.3,
+   "p99_ms": 16827.3,
+   "min_ms": 7533.7,
+   "max_ms": 16827.3,
+   "check": "30 samples answered from 30 processes and 30 kernel boots: one per instance."
+  }
+ ],
+ "not_run": [
+  {
+   "id": "ecs-fargate",
+   "name": "ECS on Fargate",
+   "why": "The campaign's AWS configuration (ejc3/aws boot-race.tf) keeps this lane off. A Fargate task without a public IP pulls its image through ECR interface endpoints, which bill by the hour and change ECR DNS for the whole VPC, and they have no reviewed teardown yet."
+  }
+ ]
+}

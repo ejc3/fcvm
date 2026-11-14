@@ -38,6 +38,9 @@ export function ModeSwitch({ current, stream = null, onStream }: { current: Mode
       {item("potato", "Potato")}
       {item("windows", "Windows")}
       {item("minecraft", "Minecraft")}
+      <a className="mode-link" href="/boot-race" data-testid="mode-boot-race" title="Recorded results of the boot-race campaign">
+        Boot race
+      </a>
       {stream === null ? null : onStream ? (
         <button type="button" className="stream-mode" title={stream.detail} aria-label={`${stream.label}: ${stream.detail}`} data-testid="stream-mode" onClick={(e) => onStream(e.currentTarget)}>
           {stream.label}
