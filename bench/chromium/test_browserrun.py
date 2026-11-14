@@ -83,7 +83,13 @@ class FakeCloudflare:
         op = req.full_url.split("?")[0].rsplit("/", 1)[1]
         self.calls.append((engine, op, body, dict(req.header_items())))
         key = (engine, op, body["url"])
-        if key in self.script and self.script[key]:
+        if engine == "kitesurf" and "deviceScaleFactor" in body.get("viewport", {}):
+            # What Browser Run's Kitesurf answers (worker, 2026-11-14).
+            status, payload, headers = 500, json.dumps({"success": False, "errors": [{
+                "message": "The following Browser Run quickaction options are not yet implemented "
+                           "by kitesurf. Unsupported options: viewport.deviceScaleFactor",
+                "code": 2000}]}).encode(), {}
+        elif key in self.script and self.script[key]:
             status, payload, headers = self.script[key].pop(0)
         elif op == "content":
             status, payload, headers = 200, json.dumps({"success": True, "result": "<html></html>"}).encode(), {}
@@ -139,11 +145,16 @@ class HostedArms(unittest.TestCase):
     def test_viewport_matches_across_all_hosted_operations_and_is_recorded(self):
         cf = FakeCloudflare()
         self.br.run(args(self.tmp, reps=1, viewport=(1280, 655)), TOKEN, ACCOUNT, opener=cf)
-        expected = {"width": 1280, "height": 655, "deviceScaleFactor": 1}
+        expected = {"chromium": {"width": 1280, "height": 655, "deviceScaleFactor": 1},
+                    "kitesurf": {"width": 1280, "height": 655}}
         self.assertTrue(cf.calls)
-        self.assertTrue(all(req[2]["viewport"] == expected for req in cf.calls))
+        self.assertTrue(all(req[2]["viewport"] == expected[req[0]] for req in cf.calls))
+        self.assertEqual({req[0] for req in cf.calls}, {"chromium", "kitesurf"})
         with open(os.path.join(self.tmp, "run.json")) as handle:
             self.assertEqual(json.load(handle)["viewport"], expected)
+        # Kitesurf refuses deviceScaleFactor: every Kitesurf request must still succeed.
+        rows = [json.loads(line) for line in open(os.path.join(self.tmp, "browserrun.jsonl"))]
+        self.assertTrue(all(r["ok"] for r in rows if r["engine"] == "kitesurf"))
 
     def test_control_is_interleaved_and_separately_reported_without_credentials(self):
         cf = FakeCloudflare()
