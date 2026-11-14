@@ -6,7 +6,7 @@ The gate is a Lambda in the control account (ejc3/aws fcvm-fleet-ami-pipeline.tf
 fleet image release: `status` (its generation and whether the gate verified it), `verify N` and
 `rollback N`, which moves staging back to the live receipt's own previous release unless N was
 verified. The workflow asks for the status, runs the staging viewer smoke on an unverified
-generation, and reports the smoke's result here:
+generation while every live host and tile runs it (`current`), and reports the result here:
 
     release_gate.py status
     release_gate.py decide --generation N --smoke success|failure|cancelled|skipped
@@ -67,10 +67,13 @@ def main(argv=None, run=subprocess.run):
     args = parser.parse_args(argv)
     if args.command == "status":
         status = invoke({"action": "status"}, run)
-        if type(status.get("generation")) is not int or type(status.get("verified")) is not bool:
+        if (type(status.get("generation")) is not int or type(status.get("verified")) is not bool
+                or type(status.get("current")) is not bool):
             raise SystemExit(f"release_gate: unexpected status {status}")
         print(json.dumps(status))
-        outputs({"generation": status["generation"], "verified": "true" if status["verified"] else "false"})
+        # current: every live host and tile runs this release's images, so a smoke now tests it.
+        outputs({"generation": status["generation"], "verified": "true" if status["verified"] else "false",
+                 "current": "true" if status["current"] else "false"})
         return 0
     payload = request(args.smoke, args.generation)
     if payload is None:

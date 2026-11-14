@@ -59,9 +59,10 @@ class GateTests(unittest.TestCase):
 
     def test_status_writes_the_generation_and_whether_it_was_verified(self):
         with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}):
-            gate = Lambda({"generation": 15, "source_sha": "a" * 40, "verified": False, "rollback": False})
+            gate = Lambda({"generation": 15, "source_sha": "a" * 40, "verified": False, "rollback": False,
+                           "current": False})
             self.assertEqual(release_gate.main(["status"], run=gate), 0)
-            self.assertEqual(out.read(), "generation=15\nverified=false\n")
+            self.assertEqual(out.read(), "generation=15\nverified=false\ncurrent=false\n")
         self.assertEqual(gate.payloads, [{"action": "status"}])
 
     def test_only_the_gate_function_is_invoked(self):
@@ -78,6 +79,21 @@ class GateTests(unittest.TestCase):
         self.assertIn("  workflow_dispatch:", on)
         self.assertIn("    - cron: '*/5 * * * *'", on)
 
+    def test_the_smoke_runs_only_while_the_fleet_runs_the_release(self):
+        # A smoke on a host still running the previous image says nothing about this release, so the
+        # gate smokes (and decides) only while every live machine runs it; the next run tries again.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertIn("if: needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true'", smoke)
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1]
+        self.assertIn("if: ${{ !cancelled() && needs.status.outputs.verified == 'false' && "
+                      "needs.status.outputs.current == 'true' }}", decide)
+
+    def test_the_smoke_call_grants_what_the_smoke_workflow_needs(self):
+        # A called workflow cannot raise its caller's permissions: the smoke's report job opens an
+        # issue, so the calling job grants issues: write, as the deploy workflows that call it do.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertIn("    permissions:\n      contents: read\n      issues: write\n", smoke)
+
     def test_the_status_run_is_cheap(self):
         # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted
         # runner, a short limit, and a checkout of the one file it runs.
@@ -90,11 +106,9 @@ class GateTests(unittest.TestCase):
     def test_the_workflow_smokes_an_unverified_generation_and_reports_the_result(self):
         # The smoke runs only for an unverified generation, and its result, whatever it is, reaches
         # the decision: a failed smoke must not skip the job that rolls the generation back.
-        self.assertRegex(WORKFLOW, r"(?m)^  smoke:\n(?:    .*\n)*?    if: needs\.status\.outputs\.verified == 'false'\n")
         self.assertRegex(WORKFLOW, r"(?m)^    uses: \./\.github/workflows/fleet-viewer-smoke\.yml\n    secrets: inherit$")
         decide = WORKFLOW.split("\n  decide:\n", 1)[1]
         self.assertIn("needs: [status, smoke]", decide)
-        self.assertIn("if: ${{ !cancelled() && needs.status.outputs.verified == 'false' }}", decide)
         self.assertIn("SMOKE: ${{ needs.smoke.result }}", decide)
         self.assertIn('release_gate.py decide --generation "$GENERATION" --smoke "$SMOKE"', decide)
         smoke = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()

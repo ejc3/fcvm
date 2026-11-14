@@ -40,6 +40,7 @@ jobs:
     outputs:
       generation: ${{ steps.gate.outputs.generation }}
       verified: ${{ steps.gate.outputs.verified }}
+      current: ${{ steps.gate.outputs.current }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -59,14 +60,20 @@ jobs:
   smoke:
     name: Staging smoke
     needs: status
-    if: needs.status.outputs.verified == 'false'
+    # Only while every live host and tile runs the release: a smoke on a host still on the
+    # previous image says nothing about this one, and the next run tries again.
+    if: needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true'
+    # A called workflow cannot raise its caller's permissions; the smoke's report job opens an issue.
+    permissions:
+      contents: read
+      issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
     secrets: inherit
 
   decide:
     name: Verify or roll back
     needs: [status, smoke]
-    if: ${{ !cancelled() && needs.status.outputs.verified == 'false' }}
+    if: ${{ !cancelled() && needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true' }}
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
     timeout-minutes: 20
