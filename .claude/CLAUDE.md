@@ -1210,7 +1210,7 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
-- **Host kernel**: 7.3.3 with `kvm-arm.mode=nested`, built from `kernel/patches-arm64`.
+- **Host kernel**: 7.3.3 with `kvm-arm.mode=nested`, built from `kernel/patches-arm64-host`.
   The host must not be older than the L1 guest kernel: a 6.19 or later L1 on a 6.18 host
   wedges L2 (#659)
 - **Nested kernel**: Custom kernel with CONFIG_KVM=y (use `--kernel-profile nested`)
@@ -1218,8 +1218,9 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Host Kernel
 
 **Install host kernel**: `make install-host-kernel` (builds kernel, installs to /boot, updates GRUB).
-Patches from `kernel/patches-arm64/` are applied automatically during the build, minus the
-`.vm.patch` files, which only the 7.3.3 nested guest kernel takes.
+Patches from `kernel/patches-arm64-host/` are applied automatically during the build: the
+patches it shares with the 7.3.3 nested guest, linked from `kernel/patches-arm64/`, and the
+host-only KVM exit patches.
 
 **Current patches**:
 - `nv2-targeted-shadow-s2-unmap.patch`: upstream e6084aecaeef and its series, so an

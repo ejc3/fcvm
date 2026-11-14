@@ -1328,3 +1328,75 @@ fn every_sanitizer_harness_is_built_by_sanitized_harness() {
         sites.join("\n")
     );
 }
+
+/// Every patch file kept under `kernel/` is applied by some kernel: a profile's
+/// `patches_dir`, a host kernel's, or a `kernel/*.build.toml`'s, directly or
+/// through a link. A rebase that pointed the arm64 host at the guest's set left
+/// `kernel/patches-arm64-host`'s three host-only KVM patches applied by nothing,
+/// while each still sat in the repository looking applied.
+#[test]
+fn every_kernel_patch_is_applied_by_some_kernel() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+
+    let mut dirs: Vec<String> = Vec::new();
+    for (_, arches) in config["kernel_profiles"]
+        .as_table()
+        .expect("[kernel_profiles] is a table")
+    {
+        for (_, table) in arches.as_table().into_iter().flatten() {
+            for t in [Some(table), table.get("host_kernel")].into_iter().flatten() {
+                if let Some(dir) = t.get("patches_dir").and_then(|v| v.as_str()) {
+                    dirs.push(dir.to_string());
+                }
+            }
+        }
+    }
+    for entry in fs::read_dir(root.join("kernel")).expect("read kernel/") {
+        let path = entry.unwrap().path();
+        if path.to_string_lossy().ends_with(".build.toml") {
+            let build: toml::Value =
+                toml::from_str(&fs::read_to_string(&path).unwrap()).expect("parse build.toml");
+            if let Some(dir) = build.get("patches_dir").and_then(|v| v.as_str()) {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    let mut applied = std::collections::BTreeSet::new();
+    for dir in &dirs {
+        for entry in fs::read_dir(root.join(dir)).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "patch") {
+                applied.insert(fs::canonicalize(&path).expect("resolve patch"));
+            }
+        }
+    }
+
+    let mut unapplied = Vec::new();
+    for entry in fs::read_dir(root.join("kernel")).expect("read kernel/") {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for patch in fs::read_dir(&dir).unwrap() {
+            let path = patch.unwrap().path();
+            let is_file = fs::symlink_metadata(&path).unwrap().file_type().is_file();
+            if is_file
+                && path.extension().is_some_and(|e| e == "patch")
+                && !applied.contains(&fs::canonicalize(&path).unwrap())
+            {
+                unapplied.push(path.strip_prefix(&root).unwrap().display().to_string());
+            }
+        }
+    }
+    assert!(
+        unapplied.is_empty(),
+        "no kernel applies these patches (no patches_dir reaches them, directly or through a \
+         link): {unapplied:?}. Point the kernel that needs each one at its directory, or link \
+         it from that kernel's patches_dir"
+    );
+}
