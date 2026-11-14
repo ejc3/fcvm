@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -136,6 +137,36 @@ class Resume(unittest.TestCase):
             asyncio.run(race.run({"results": d}, 1, 0, ["lambda-warm"]))
             with open(path) as f:
                 self.assertEqual(len(f.read().splitlines()), 1)
+
+
+class Hibernate(unittest.TestCase):
+    def test_a_resumed_instance_settles_before_its_hibernate_stop(self):
+        events = []
+
+        class Client:
+            def describe_instances(self, InstanceIds):
+                state = "running" if any(e[0] == "start" for e in events) else "stopped"
+                return {"Reservations": [{"Instances": [{"PrivateIpAddress": "x", "State": {"Name": state}}]}]}
+
+            def start_instances(self, InstanceIds):
+                events.append(("start",))
+
+            def stop_instances(self, InstanceIds, Hibernate):
+                events.append(("stop", Hibernate))
+
+        async def answered(*a, **kw):
+            return 0, {"proc_id": "a", "boot_id": "x"}, 1
+
+        async def slept(s):
+            events.append(("sleep", s))
+
+        for hibernate, settle in ((True, 30), (False, 1)):
+            events.clear()
+            lane = race.Ec2.__new__(race.Ec2)
+            lane.ec2 = Client()
+            with mock.patch.object(race, "probe", answered), mock.patch.object(race.asyncio, "sleep", slept):
+                asyncio.run(lane.start_sample("i-1", hibernate))
+            self.assertEqual(events, [("start",), ("sleep", settle), ("stop", hibernate)])
 
 
 class LaunchTiming(unittest.TestCase):

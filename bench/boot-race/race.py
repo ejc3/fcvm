@@ -195,6 +195,7 @@ class Fcvm:
 
 
 # ------------------------------------------------------------------ EC2 lanes
+HIBERNATE_SETTLE_S = 30
 class Ec2:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -249,8 +250,11 @@ class Ec2:
             t_api = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
         finally:
-            # Give the workload a moment so a hibernating guest has nothing in flight, then stop it for next time.
-            await asyncio.sleep(1)
+            # Not timed: settle before the stop that readies the next sample. A hibernate stop sent 1 s after a
+            # resume answered sat in "stopping" for 20 minutes and then became an ordinary stop, so the next start
+            # booted; with 30 s, three resume-hibernate cycles in a row stopped in 10 to 20 s and resumed the same
+            # process.
+            await asyncio.sleep(HIBERNATE_SETTLE_S if hibernate else 1)
             await asyncio.to_thread(self.wait_state, iid, "running")
             self.ec2.stop_instances(InstanceIds=[iid], Hibernate=hibernate)
         return {
