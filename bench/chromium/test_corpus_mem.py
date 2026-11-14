@@ -78,6 +78,29 @@ def complete_record(path):
     return text if text.endswith("\n") else None
 
 
+def await_escaped_after_absence(env, producer, timeout):
+    """The escaped create descendant's pid once cleanup has probed absence, or None.
+
+    The producer's exit is read BEFORE the two files are, each round. Read
+    after them, a producer that probed absence and exited between the two
+    reads (its exit comes about 95 ms after the probe) was taken for one that
+    exited without reconciling: CI on 0ed388f7 failed this way once, the test
+    returning in 1.39 s, the producer's normal run time, with no record.
+    Read first, an exit seen there means both files are final when checked.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        exited = producer.poll() is not None
+        if os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"]):
+            record = complete_record(env["PODMAN_ESCAPED_STARTED_FILE"])
+            if record is not None:
+                return int(record.strip())
+        if exited:
+            return None
+        time.sleep(0.01)
+    return None
+
+
 def await_complete_record(path, timeout, fail, message, proc=None, early=None):
     """Return PATH's record once it lands, waiting for completeness.
 
@@ -87,10 +110,14 @@ def await_complete_record(path, timeout, fail, message, proc=None, early=None):
     """
     deadline = time.monotonic() + timeout
     while True:
+        # The exit is read before the record, as in await_escaped_after_absence:
+        # a launcher that writes the record and exits between the two reads
+        # would otherwise be reported as one that exited without writing it.
+        exited = proc is not None and proc.poll() is not None
         text = complete_record(path)
         if text is not None:
             return text
-        if proc is not None and proc.poll() is not None:
+        if exited:
             stdout, stderr = proc.communicate()
             fail(f"{early}: {proc.returncode}: {stdout}{stderr}")
         if time.monotonic() >= deadline:
@@ -2137,6 +2164,50 @@ exec {real_date!r} "$@"
             self.assertEqual(self.removed_ids(removed), [self.CONTAINER_ID])
             self.assertNotIn(self.PEER_ID, self.removed_ids(removed))
 
+    def test_reconciliation_wait_reads_the_exit_before_the_files(self):
+        # A producer that probes absence and exits between the wait's reads.
+        # Its poll() publishes both files and reports the exit, so a wait that
+        # reads the files first and the exit second gives up with the record
+        # on disk. Red before await_escaped_after_absence read the exit first:
+        # None.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PODMAN_PRIOR_ABSENCE_FILE": os.path.join(tmp, "absence"),
+                   "PODMAN_ESCAPED_STARTED_FILE": os.path.join(tmp, "started")}
+
+            class ExitsBetweenReads:
+                returncode = None
+
+                def poll(self):
+                    with open(env["PODMAN_ESCAPED_STARTED_FILE"], "w") as f:
+                        f.write("4242\n")
+                    open(env["PODMAN_PRIOR_ABSENCE_FILE"], "w").close()
+                    self.returncode = 124
+                    return 124
+
+            self.assertEqual(await_escaped_after_absence(env, ExitsBetweenReads(), 5), 4242)
+
+    def test_record_wait_reads_the_exit_before_the_record(self):
+        # The same ordering in await_complete_record. Red before it read the
+        # exit first: the early-exit failure fired with the record on disk.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "record")
+
+            class WritesThenExits:
+                returncode = None
+
+                def poll(self):
+                    with open(path, "w") as f:
+                        f.write("77\n")
+                    self.returncode = 0
+                    return 0
+
+                def communicate(self):
+                    return "", ""
+
+            self.assertEqual(
+                await_complete_record(path, 5, self.fail, "timed out", WritesThenExits(), "exited"),
+                "77\n")
+
     def test_closed_fd_double_fork_cannot_commit_after_absence(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, removed, state = self.environment(
@@ -2149,19 +2220,16 @@ exec {real_date!r} "$@"
             )
             escaped_pid = None
             try:
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    if os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"]):
-                        record = complete_record(
-                            env["PODMAN_ESCAPED_STARTED_FILE"])
-                        if record is not None:
-                            escaped_pid = int(record.strip())
-                            break
+                escaped_pid = await_escaped_after_absence(env, producer, 10)
+                if escaped_pid is None:
+                    stdout, stderr = ("", "")
                     if producer.poll() is not None:
-                        break
-                    time.sleep(0.01)
-                self.assertIsNotNone(
-                    escaped_pid, "closed-FD create descendant never reached reconciliation")
+                        stdout, stderr = producer.communicate()
+                    self.fail(
+                        "closed-FD create descendant never reached reconciliation: "
+                        f"absence probed={os.path.exists(env['PODMAN_PRIOR_ABSENCE_FILE'])} "
+                        f"started record={complete_record(env['PODMAN_ESCAPED_STARTED_FILE'])!r} "
+                        f"producer rc={producer.returncode}: {stdout}{stderr}")
                 with open(env["PODMAN_ESCAPED_RELEASE_FILE"], "w"):
                     pass
                 stdout, stderr = producer.communicate(timeout=10)
