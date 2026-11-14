@@ -389,6 +389,41 @@ class Wiring(unittest.TestCase):
                        "cdpdrive.py"):
             self.assertIn(f'"$HERE/{helper}"', ks, helper)
 
+    def publish(self, results):
+        block = self.SRC[self.SRC.index("publish_campaign_completion() {"):]
+        block = block[:block.index("\nPY\n}\n") + 6]
+        env = dict(os.environ, RESULTS=results, RUN_ID="a" * 32, PHASES="kitesurf",
+                   HOSTCDP_ARMS="free", CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="b" * 64)
+        return subprocess.run(["bash", "-c", block + "\npublish_campaign_completion"],
+                              env=env, capture_output=True, text=True)
+
+    def test_the_campaign_completion_seals_the_kitesurf_artifacts(self):
+        """The first box run measured and then failed publication: corpus_extra's
+        completion knew only hostcdp and memory ("invalid campaign phases
+        'kitesurf'"), so the run was withdrawn after its numbers were taken."""
+        km = load("kitesurf_measure")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        arm = os.path.join(tmp, "kitesurf")
+        os.makedirs(os.path.join(arm, "correctness", "kitesurf"))
+        for rel in ("kitesurf-build.json", "run.json", "kitesurf.jsonl", "summary.json",
+                    "correctness/kitesurf/correctness.jsonl"):
+            with open(os.path.join(arm, rel), "w") as h:
+                h.write(rel)
+        km.complete(argparse.Namespace(results=arm, run_id="a" * 32 + "-kitesurf",
+                                       out=os.path.join(arm, "complete.json")))
+        r = self.publish(tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        record = json.load(open(os.path.join(tmp, "campaign-complete.json")))
+        self.assertEqual(record["phases"], ["kitesurf"])
+        self.assertEqual(record["kitesurf_complete"]["path"], "kitesurf/complete.json")
+        os.unlink(os.path.join(tmp, "campaign-complete.json"))
+        with open(os.path.join(arm, "summary.json"), "a") as h:
+            h.write("edited")
+        r = self.publish(tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("differs from its completion", r.stderr)
+
     def test_build_and_run_read_one_set_of_pins(self):
         for script in ("kitesurf.sh", "kitesurf_build.sh"):
             self.assertIn('. "$HERE/kitesurf_pins.sh"', open(os.path.join(HERE, script)).read())

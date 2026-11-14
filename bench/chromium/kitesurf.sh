@@ -320,4 +320,8 @@ seal_after=$(python3 "$HERE/kitesurf_seal.py" verify --src "$SRC" --seal "$SEAL"
 python3 "$HERE/kitesurf_measure.py" summarize --jsonl "$RESULTS/kitesurf.jsonl" \
     --run-json "$RESULTS/run.json" --memory-peak "$peak" \
     --correctness "$RESULTS/correctness" --out "$RESULTS/summary.json"
+# Last: the record corpus_extra.sh's campaign completion seals. It names every
+# artifact the arm's numbers come from by size and sha256.
+python3 "$HERE/kitesurf_measure.py" complete --results "$RESULTS" --run-id "$RUNID" \
+    --out "$RESULTS/complete.json"
 log "results in $RESULTS"

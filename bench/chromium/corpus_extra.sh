@@ -923,6 +923,11 @@ publish_campaign_completion() {
     if [[ ",$PHASES," == *",memory,"* ]]; then
         memory_complete="$RESULTS/memory/complete.json"
     fi
+    local kitesurf_complete=""
+    if [[ ",$PHASES," == *",kitesurf,"* ]]; then
+        kitesurf_complete="$RESULTS/kitesurf/complete.json"
+    fi
+    KITESURF_COMPLETE="$kitesurf_complete" \
     python3 - "$RESULTS/campaign-complete.json" "$RESULTS" "$RUN_ID" \
             "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" "$PHASES" \
             "$memory_complete" "${host_completes[@]}" <<'PY'
@@ -937,9 +942,12 @@ import tempfile
 output_path, results, run_id, runtime_bundle_sha256, phases_raw, memory_path, \
     *host_paths = sys.argv[1:]
 phases = phases_raw.split(",")
-if (not phases or any(phase not in {"hostcdp", "memory"} for phase in phases)
+kitesurf_path = os.environ.get("KITESURF_COMPLETE", "")
+if (not phases or any(phase not in {"hostcdp", "memory", "kitesurf"} for phase in phases)
         or len(phases) != len(set(phases))):
     sys.exit(f"FAILED: invalid campaign phases {phases_raw!r}")
+if ("kitesurf" in phases) != bool(kitesurf_path):
+    sys.exit("FAILED: kitesurf phase and kitesurf completion disagree")
 if ("hostcdp" in phases) != bool(host_paths):
     sys.exit("FAILED: hostcdp phase and host completion set disagree")
 if ("memory" in phases) != bool(memory_path):
@@ -1055,13 +1063,34 @@ if memory_path:
             f"FAILED: memory completion artifacts have paths={artifact_paths!r}; "
             f"expected {expected_paths!r}"
         )
-if not host_records and memory_record is None:
+kitesurf_record = None
+if kitesurf_path:
+    kitesurf_record, kitesurf_payload = completion_record(
+        kitesurf_path, "kitesurf", "kitesurf/complete.json", capture=True
+    )
+    try:
+        kitesurf_completion = json.loads(kitesurf_payload)
+    except (TypeError, ValueError) as exc:
+        sys.exit(f"FAILED: kitesurf completion is not JSON: {exc}")
+    if (not isinstance(kitesurf_completion, dict)
+            or kitesurf_completion.get("schema_version") != 1
+            or kitesurf_completion.get("run_id") != f"{run_id}-kitesurf"
+            or not kitesurf_completion.get("artifacts")):
+        sys.exit("FAILED: kitesurf completion does not name this campaign's run and artifacts")
+    for artifact in kitesurf_completion["artifacts"]:
+        current, _payload = completion_record(
+            os.path.join(results, "kitesurf", artifact.get("path", "")), "kitesurf artifact")
+        if (current["size"], current["sha256"]) != (artifact.get("size"), artifact.get("sha256")):
+            sys.exit(f"FAILED: kitesurf artifact {artifact.get('path')!r} differs from its completion")
+if not host_records and memory_record is None and kitesurf_record is None:
     sys.exit("FAILED: campaign completion would authorize zero phase completions")
 
 host_records.sort(key=lambda item: item["path"])
 sources.extend((record["path"], record) for record in host_records)
 if memory_record is not None:
     sources.append((memory_record["path"], memory_record))
+if kitesurf_record is not None:
+    sources.append((kitesurf_record["path"], kitesurf_record))
 
 record = {
     "schema_version": 2,
@@ -1071,6 +1100,10 @@ record = {
     "host_completes": host_records,
     "memory_complete": memory_record,
 }
+# Only a kitesurf campaign carries the key, so the hostcdp and memory records
+# compare.py reads keep exactly the shape they had.
+if kitesurf_record is not None:
+    record["kitesurf_complete"] = kitesurf_record
 directory = os.path.dirname(output_path)
 fd, temporary = tempfile.mkstemp(prefix=".campaign-complete.", dir=directory)
 try:
@@ -1083,7 +1116,8 @@ try:
         seen.remove(relative)
         current, _payload = completion_record(
             os.path.join(results, relative),
-            "memory" if relative == "memory/complete.json" else "host",
+            {"memory/complete.json": "memory",
+             "kitesurf/complete.json": "kitesurf"}.get(relative, "host"),
             relative,
         )
         if current != expected:

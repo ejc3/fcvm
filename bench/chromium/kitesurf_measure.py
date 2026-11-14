@@ -208,7 +208,40 @@ def summarize(args):
     return 0
 
 
+COMPLETION_ARTIFACTS = ("kitesurf-build.json", "run.json", "kitesurf.jsonl", "summary.json",
+                        "correctness/kitesurf/correctness.jsonl",
+                        "correctness/chromium/correctness.jsonl")
+
+
+def complete(args):
+    """complete.json: schema_version 1, the run id, and each artifact's size and sha256."""
+    import hashlib
+    artifacts = []
+    for rel in COMPLETION_ARTIFACTS:
+        path = os.path.join(args.results, rel)
+        if not os.path.exists(path):
+            if rel == "correctness/chromium/correctness.jsonl":
+                continue  # CHROMIUM_CHECK=0
+            raise SystemExit(f"FAILED: {rel} is missing; the run is not complete")
+        with open(path, "rb") as handle:
+            data = handle.read()
+        artifacts.append({"path": rel, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    record = {"schema_version": 1, "run_id": args.run_id, "artifacts": artifacts}
+    with open(args.out + ".tmp", "w") as handle:
+        json.dump(record, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(args.out + ".tmp", args.out)
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "complete":
+        ap = argparse.ArgumentParser()
+        ap.add_argument("cmd")
+        ap.add_argument("--results", required=True)
+        ap.add_argument("--run-id", required=True)
+        ap.add_argument("--out", required=True)
+        return complete(ap.parse_args())
     if len(sys.argv) > 1 and sys.argv[1] == "summarize":
         ap = argparse.ArgumentParser()
         ap.add_argument("cmd")
