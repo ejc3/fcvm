@@ -42,8 +42,8 @@ after RunTask; t0 is the time before, and the invoke's own cost is recorded besi
 
 ## Running a campaign
 
-A campaign is 30 rounds (30 samples per lane), run once, on one fresh campaign box, with the AWS side enabled for
-that one run (ejc3/aws `boot_race_enabled`). The AWS resources and the `boot-race-driver` role are in ejc3/aws
+A campaign is 30 rounds (30 samples per lane), run once, on one fresh campaign box, with the AWS side enabled
+(ejc3/aws `boot_race_enabled`). The AWS resources and the `boot-race-driver` role are in ejc3/aws
 `boot-race.tf`. The reaper there terminates any boot-race instance whose current run began more than 3 hours ago,
 so the ECS container instance (launched by `ecs-host`, never restarted) bounds the time from `ecs-host` to the end
 of `cleanup`. Lambda recycles an idle environment after some minutes, so `lambda`, which primes the warm function,
@@ -66,7 +66,7 @@ runs after `ecs-host` and `run` starts right after it.
    already prepared mount is reused only after the same storage checks. If the check fails, use a fresh compatible
    pbox. Setup restores the original ext4 mount on pre-format failures when the same filesystem can still be
    verified; if formatting starts but Btrfs cannot mount, setup stops and a fresh pbox is the safe retry.
-3. Start `creds.sh <ssh to the box>` on the dev box and leave it running until step 6. It assumes
+3. Start `creds.sh <ssh to the box>` on the primary FCVM ARM dev box and leave it running until step 6. It assumes
    `boot-race-driver` (one hour at most) and writes `/dev/shm/boot-race-creds.json` on the box every 30 minutes.
 4. On the box, from `/mnt/fcvm-btrfs/src/fcvm`, with `RESULTS=/mnt/fcvm-btrfs/boot-race/results`:
 
@@ -82,9 +82,12 @@ runs after `ecs-host` and `run` starts right after it.
    python3 bench/boot-race/prepare.py --config cfg.json leftovers       # fails unless nothing is left billing
    ```
 
+   With the standing AWS driver, `cleanup` stops the campaign's ECS tasks directly even if the monthly
+   budget denies the launcher. Run cleanup with this checkout or newer; the old harness needs that launcher.
+
    Copy `$RESULTS` back to the dev box while the run goes; it is on the box's instance store.
 5. Stop `fcvm snapshot serve`, copy the results back, and `pbox down N --instance i-...`.
-6. Stop `creds.sh`, and open the ejc3/aws change that sets `boot_race_enabled` back to false for review.
+6. Stop `creds.sh` after cleanup. There is no per-campaign AWS change.
 7. On the dev box, render the page and the scrubbed records, then move the raw records out of the repository:
 
    ```bash

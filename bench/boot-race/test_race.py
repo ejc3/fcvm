@@ -10,6 +10,8 @@ import os
 import sys
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import race  # noqa: E402
@@ -46,6 +48,39 @@ class Identity(unittest.TestCase):
     def test_cold_lambda_is_not_refused_here(self):
         # its evidence (Init Duration, new process, new kernel) is reported on the page instead
         self.assertIsNone(race.check_identity("lambda-cold", A, A, {}))
+
+
+class EcsStop(unittest.TestCase):
+    arn = "arn:aws:ecs:us-east-2:123456789012:task/boot-race/0123456789abcdef0123456789abcdef"
+
+    class ClientError(Exception):
+        def __init__(self, code):
+            self.response = {"Error": {"Code": code}}
+
+    def setUp(self):
+        # CI tests the harness without boto3/botocore installed.
+        fake_exceptions = SimpleNamespace(ClientError=self.ClientError)
+        with patch.object(race, "session", return_value=Mock()):
+            self.lane = race.Ecs({})
+        self.lane.invoke = Mock()
+        self.enterContext(patch.dict(sys.modules, {"botocore.exceptions": fake_exceptions}))
+
+    def test_stop_uses_ecs_without_the_run_capable_launcher(self):
+        self.lane.stop(self.arn)
+        self.lane.ecs.stop_task.assert_called_once_with(
+            cluster="boot-race", task=self.arn, reason="boot-race sample taken")
+        self.lane.invoke.assert_not_called()
+
+    def test_older_infrastructure_can_still_stop_through_its_launcher(self):
+        self.lane.ecs.stop_task.side_effect = self.ClientError("AccessDeniedException")
+        self.lane.stop(self.arn)
+        self.lane.invoke.assert_called_once_with({"action": "stop", "task": self.arn})
+
+    def test_other_ecs_errors_do_not_retry_through_the_launcher(self):
+        self.lane.ecs.stop_task.side_effect = self.ClientError("InvalidParameterException")
+        with self.assertRaises(self.ClientError):
+            self.lane.stop(self.arn)
+        self.lane.invoke.assert_not_called()
 
 
 class FakeSession:
