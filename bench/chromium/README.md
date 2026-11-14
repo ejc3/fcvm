@@ -290,6 +290,17 @@ reuse an old trial's output.
   `/content` per page and engine, kept under `correctness/<engine>/`, blank at 99.8% of one
   colour, and a measured request on a page that did not complete counts as a failure.
 
+## The live-site campaign (`live_campaign.sh`)
+
+The hosted arms read the live web, so `make bench-live-campaign` puts an fcvm arm on the
+same live pages in the same window, on the same host: a golden whose guest resolves with
+1.1.1.1 (`LIVE_DNS`, baked as `GUEST_DNS`, so reqanalyze can name the resolver), reqbench's `cdp`, `html-fast` and
+`noop` arms over the 14 corpus URLs, and Browser Run batches (`browserrun.py`) running
+beside it until reqbench finishes. The two streams overlap in time; they are not
+interleaved request by request. `live.json` records each stream's window. Run it on the
+Ohio benchmark worker, whose own Browser Run credential is pinned to its addresses, so
+both arms leave from one network location.
+
 ## Results conventions
 
 Raw run output goes to `results/<timestamp>/` — **git-ignored** (see
