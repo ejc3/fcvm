@@ -91,6 +91,15 @@ CHECKS = [
     ["ec2-launch", "{n} samples answered from {new_proc} processes and {new_boot} kernel boots: one per instance."],
 ]
 
+# Lanes the driver has but a campaign may not run, with the reason the page gives, and the setup row that describes
+# each one (dropped when the lane did not run).
+NOT_RUN = {
+    "ecs-fargate": "The campaign's AWS configuration (ejc3/aws boot-race.tf) keeps this lane off. A Fargate task "
+                   "without a public IP pulls its image through ECR interface endpoints, which bill by the hour and "
+                   "change ECR DNS for the whole VPC, and they have no reviewed teardown yet.",
+}
+SETUP_ROW_LANE = {"ECS on Fargate": "ecs-fargate", "Fargate platform": "ecs-fargate"}
+
 FORBIDDEN = [
     re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt)-[0-9a-f]{8,17}\b"),
     re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"),
@@ -223,8 +232,13 @@ def build(results):
     if loads:
         derived.append(["Campaign host load", f"1-minute load average {min(loads):.2f} to {max(loads):.2f} "
                         f"at the start of each sample"])
-    setup["rows"] = derived + list(setup.get("rows", []))
+    run = {r["lane"] for r in recs}
+    setup["rows"] = [row for row in derived + list(setup.get("rows", []))
+                     if row[0] not in SETUP_ROW_LANE or SETUP_ROW_LANE[row[0]] in run]
+    not_run = [{"id": lid, "name": LANES[lid]["name"], "why": NOT_RUN.get(lid, "Not run in this campaign.")}
+               for lid in LANES if lid not in run]
     data = {
+        "not_run": not_run,
         "setup": setup,
         "first_sample_unix_ms": min(starts) if starts else None,
         "last_sample_unix_ms": max(starts) if starts else None,

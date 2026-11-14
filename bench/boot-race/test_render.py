@@ -80,6 +80,20 @@ class Build(unittest.TestCase):
             self.assertEqual(rows["Region"], "us-east-2")
             self.assertEqual({lid for lid, _ in setup["checks"]}, set(render.LANES))
 
+    def test_a_lane_not_run_is_named_with_its_reason_and_its_setup_row_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_results(d, [sample("fcvm-file", 0, 1793851066938, 200.0), sample("ecs-ec2", 0, 1793851067938, 900.0)])
+            with open(os.path.join(d, "setup.json"), "w") as f:
+                json.dump({"region": "us-east-2", "rows": [["ECS on Fargate", "task 1 vCPU"], ["ECS on EC2", "x"]]}, f)
+            data = render.build(d)
+            labels = [r[0] for r in data["setup"]["rows"]]
+            self.assertNotIn("ECS on Fargate", labels)
+            self.assertIn("ECS on EC2", labels)
+            fargate = next(n for n in data["not_run"] if n["id"] == "ecs-fargate")
+            self.assertIn("ECR interface endpoints", fargate["why"])
+            self.assertEqual({n["id"] for n in data["not_run"]}, set(render.LANES) - {"fcvm-file", "ecs-ec2"})
+            render.check_public(json.dumps(data))
+
     def test_init_duration_is_joined_by_request_id(self):
         with tempfile.TemporaryDirectory() as d:
             recs = [sample("lambda-cold", 0, 1, 120.0, request_id="r1"), sample("lambda-cold", 1, 2, 130.0, request_id="r2")]

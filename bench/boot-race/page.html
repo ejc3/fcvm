@@ -112,6 +112,7 @@ percentile and p99 the 99th, which with fewer than 100 samples is the slowest on
 is counted here and left out of the times. So is a sample whose answer came from the wrong process (an identity
 check below).</p>
 <div id="failures" class="muted" style="font-size:15px"></div>
+<div id="notrun" class="muted" style="font-size:15px"></div>
 
 <h2>Where each lane starts the clock</h2>
 <ul id="starts"></ul>
@@ -202,6 +203,15 @@ else {
     ul.appendChild(li);
   }
   fl.appendChild(ul);
+}
+
+const nr = document.getElementById("notrun");
+for (const l of D.not_run || []){
+  const p = document.createElement("p");
+  p.innerHTML = "<b></b> ";
+  p.querySelector("b").textContent = `Not run: ${l.name}.`;
+  p.appendChild(document.createTextNode(l.why));
+  nr.appendChild(p);
 }
 
 // ---------------------------------------------------------------- setup table
