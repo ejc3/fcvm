@@ -157,7 +157,12 @@ class ProcessPss(unittest.TestCase):
     """One unreadable process cannot become a plausible nonzero subtotal."""
 
     def test_unreadable_smaps_refuses_the_process_set(self):
-        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+        # The sudo retry is stubbed to refuse too: unstubbed, it read the real
+        # /proc/4001/smaps_rollup whenever pid 4001 existed on the test host
+        # (it did after a reboot), and the test went red for no code change.
+        refused = subprocess.CompletedProcess(["sudo"], 1, "", "sudo: a password is required")
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")), \
+             mock.patch.object(report.subprocess, "run", return_value=refused):
             with self.assertRaises(report.CgroupReadError):
                 report.smaps_rollup_kb(4001)
 

@@ -451,6 +451,33 @@ class ProcAndCgroupAccounting(unittest.TestCase):
         self.assertIn("reqbench.FailureProbe.failures_only(", body)
         self.assertIn("probe=failure_probe", body)
 
+    def test_scale_termination_stops_the_failure_probe(self):
+        # Review of #1881: the scale run's TerminationFence and
+        # DeferredTermination recorded INT/TERM only in their own lists, while
+        # the probe read reqbench's flag, which the scale run never sets, so a
+        # failed request kept capturing for its whole budget after shutdown
+        # was asked for. Red before termination_pending existed.
+        # Other tests drive the handlers, so start from a clean record.
+        reqscale._termination_signal = 0
+        self.addCleanup(setattr, reqscale, "_termination_signal", 0)
+        self.assertEqual(reqscale.termination_pending(), 0)
+        probe = reqscale.reqbench.FailureProbe.failures_only(
+            "fcvm", "/d", "/o", "r" * 32, 9222, interrupt_pending=reqscale.termination_pending)
+        self.assertEqual(probe.interrupt_pending(), 0)
+        reqscale.DeferredTermination()._handle(signal.SIGTERM, None)
+        self.assertEqual(probe.interrupt_pending(), signal.SIGTERM)
+        reqscale._termination_signal = 0
+        with self.assertRaises(reqscale.MeasurementInterrupted):
+            reqscale.TerminationFence()._handle(signal.SIGINT, None)
+        self.assertEqual(reqscale.termination_pending(), signal.SIGINT)
+        source = open(os.path.join(HERE, "reqscale.py")).read()
+        body = source[source.index("def _make_request_fn"):source.index("def _augment_burst_accounting")]
+        self.assertIn("interrupt_pending=termination_pending", body)
+        probe_source = open(os.path.join(HERE, "reqbench.py")).read()
+        probe_body = probe_source[probe_source.index("class FailureProbe:"):]
+        probe_body = probe_body[:probe_body.index("\ndef ")]
+        self.assertNotIn("harness_interrupt_pending()", probe_body)
+
     def test_cgroup_audit_does_not_collapse_reused_pids(self):
         with tempfile.TemporaryDirectory() as d:
             proc = os.path.join(d, "proc")
@@ -1326,6 +1353,32 @@ class CapacityGates(unittest.TestCase):
         self.assertEqual(gate["statistic"], "pooled-median")
         self.assertFalse(gate["passed"])
         self.assertAlmostEqual(gate["drift_pct"], 20.0)
+
+    def test_drift_gate_split_per_half_cannot_hide_a_uniform_slowdown(self):
+        # Review of #1881: with one split over both halves, 40/50/60 ms
+        # controls that all became 20% slower kept the split at 55 ms, and the
+        # fast and slow medians read 50 -> 48 and 60 -> 60 (-4%, passed). Red
+        # before each half was split on its own.
+        first = [40.0] * 4 + [50.0] * 12 + [60.0] * 10
+        second = [value * 1.2 for value in first]
+        gate = self._control_gate_for(first + second)
+        self.assertFalse(gate["passed"], gate)
+        self.assertGreater(abs(gate["drift_pct"]), 15.0)
+
+    def test_drift_gate_survives_a_zero_mode_median(self):
+        # Red before the guard: ZeroDivisionError from the fast mode's median.
+        half = [0.0] * 4 + [45.0] * 5
+        gate = self._control_gate_for(half + half)
+        self.assertEqual(gate["drift_pct"], 0.0)
+
+    def test_drift_gate_result_is_json_when_modes_have_no_spread(self):
+        # Two modes with zero MAD have infinite separation, which json.dumps
+        # with allow_nan=False (write_json_exclusive) refuses. Red before the
+        # result carried null for it: ValueError.
+        half = [45.0] * 20 + [69.0] * 20
+        gate = self._control_gate_for(half + half)
+        self.assertEqual(gate["statistic"], "per-mode-median")
+        json.dumps(gate, allow_nan=False)
 
     def test_control_deadlines_take_a_seeded_phase_within_one_frame(self):
         """RED BEFORE THE FIX: host-control deadlines fell on exact 10 s

@@ -911,20 +911,9 @@ MODE_MIN_COUNT = 4
 MODE_MIN_FRACTION = 0.10
 
 
-def _control_frame_modes(latencies: list[float], midpoint: int) -> "dict | None":
-    """Two latency modes present in both halves, or None for one population.
-
-    The split is Otsu's threshold (the one maximising the between-class
-    variance). The modes count only when they are separated by at least
-    MODE_SEPARATION_MIN robust standard deviations (difference of the modes'
-    medians over 1.4826 times the root mean square of their MADs; one normal
-    population split this way gives about 2.3) and each holds at least
-    MODE_MIN_COUNT controls and MODE_MIN_FRACTION of each half. A uniform
-    slowdown of one population moves controls from one side of the split to
-    the other between the halves, which fails the last condition, so it is
-    compared as one population, as before.
-    """
-    ordered = sorted(latencies)
+def _otsu_split(values: list[float]):
+    """(threshold, fast, slow): Otsu's split, maximising between-class variance."""
+    ordered = sorted(values)
     n = len(ordered)
     prefix = [0.0]
     for value in ordered:
@@ -941,28 +930,55 @@ def _control_frame_modes(latencies: list[float], midpoint: int) -> "dict | None"
     if best is None:
         return None
     threshold = best[1]
-    low = [value for value in latencies if value <= threshold]
-    high = [value for value in latencies if value > threshold]
+    return (threshold, [v for v in values if v <= threshold], [v for v in values if v > threshold])
 
-    def mad(values):
-        centre = statistics.median(values)
-        return statistics.median(abs(value - centre) for value in values)
 
-    spread = 1.4826 * math.sqrt((mad(low) ** 2 + mad(high) ** 2) / 2)
-    gap = statistics.median(high) - statistics.median(low)
-    separation = gap / spread if spread > 0 else math.inf
-    if separation < MODE_SEPARATION_MIN:
-        return None
+def _control_frame_modes(latencies: list[float], midpoint: int) -> "dict | None":
+    """Two latency modes in each half, compared mode with mode, or None.
+
+    Each half is split on its own (Otsu's threshold). A split computed over
+    both halves together would let a uniform slowdown move controls from one
+    mode to the other and hide itself: 40, 50 and 60 ms controls that all
+    become 20% slower leave the pooled split at 55 ms and both modes' medians
+    near where they were. Split per half, the fast and slow modes of each half
+    are that half's own, and a uniform slowdown moves both.
+
+    The modes of a half count only when their medians are at least
+    MODE_SEPARATION_MIN robust standard deviations apart (the difference over
+    1.4826 times the root mean square of their MADs; one normal population
+    split this way gives about 2.3) and each holds at least MODE_MIN_COUNT
+    controls and MODE_MIN_FRACTION of the half. Otherwise, or when a mode's
+    first-half median is not positive, the halves are compared as one
+    population.
+    """
     halves = (latencies[:midpoint], latencies[midpoint:])
+    splits = []
+    for half in halves:
+        split = _otsu_split(half)
+        if split is None:
+            return None
+        threshold, fast, slow = split
+        if any(len(mode) < MODE_MIN_COUNT or len(mode) < MODE_MIN_FRACTION * len(half)
+               for mode in (fast, slow)):
+            return None
+
+        def mad(values):
+            centre = statistics.median(values)
+            return statistics.median(abs(value - centre) for value in values)
+
+        spread = 1.4826 * math.sqrt((mad(fast) ** 2 + mad(slow) ** 2) / 2)
+        gap = statistics.median(slow) - statistics.median(fast)
+        separation = gap / spread if spread > 0 else math.inf
+        if separation < MODE_SEPARATION_MIN:
+            return None
+        splits.append((threshold, fast, slow, separation))
     rows = []
-    for name, member in (("fast", lambda v: v <= threshold), ("slow", lambda v: v > threshold)):
-        first_half = [value for value in halves[0] if member(value)]
-        second_half = [value for value in halves[1] if member(value)]
-        for half, values in zip(halves, (first_half, second_half)):
-            if len(values) < MODE_MIN_COUNT or len(values) < MODE_MIN_FRACTION * len(half):
-                return None
+    for index, name in ((1, "fast"), (2, "slow")):
+        first_half, second_half = splits[0][index], splits[1][index]
         first_median = statistics.median(first_half)
         second_median = statistics.median(second_half)
+        if first_median <= 0:
+            return None
         rows.append({
             "mode": name,
             "first_half_n": len(first_half),
@@ -971,7 +987,17 @@ def _control_frame_modes(latencies: list[float], midpoint: int) -> "dict | None"
             "second_half_median_ms": second_median,
             "drift_pct": (second_median - first_median) * 100.0 / first_median,
         })
-    return {"threshold_ms": threshold, "separation": separation, "modes": rows}
+    return {
+        "halves": [
+            {
+                "threshold_ms": threshold,
+                # JSON has no infinity: two modes with no spread at all.
+                "separation": separation if math.isfinite(separation) else None,
+            }
+            for threshold, _fast, _slow, separation in splits
+        ],
+        "modes": rows,
+    }
 
 
 def _validate_control_warmup(warmup: dict, schedule: dict, status: dict) -> None:
