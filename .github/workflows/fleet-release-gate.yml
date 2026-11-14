@@ -1,0 +1,96 @@
+name: Fleet image release gate
+
+# Every fleet image release (the factory's or a reviewed one) is smoked once on staging after it
+# goes live, and withdrawn by itself when the smoke fails. The gate (ejc3/aws
+# fcvm-fleet-ami-pipeline.tf, `fcvm_ami_release_gate`) says which generation is live and whether
+# it was verified; an unverified one gets the viewer-path smoke on both families
+# (fleet-viewer-smoke.yml). Both pass: the generation is verified and this workflow stops smoking
+# it. Either fails: the gate moves staging back to the live receipt's own previous release
+# (fleet/ami/release_gate.py), and records that rollback as verified, so it is not rolled back in
+# turn. A verified generation is never rolled back by the gate.
+
+# A promotion starts it at once: the publisher, or whoever sees the new receipt, sends
+# repository_dispatch `fleet-release-promoted` or runs `gh workflow run fleet-release-gate.yml`.
+# The schedule is the fallback for a promotion nobody announced; when the live generation is
+# already verified a run ends after the status job.
+on:
+  repository_dispatch:
+    types: [fleet-release-promoted]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-release-gate
+  cancel-in-progress: false
+
+jobs:
+  status:
+    name: Live release
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      generation: ${{ steps.gate.outputs.generation }}
+      verified: ${{ steps.gate.outputs.verified }}
+      current: ${{ steps.gate.outputs.current }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/ami/release_gate.py
+          sparse-checkout-cone-mode: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - id: gate
+        env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+        run: python3 -B fleet/ami/release_gate.py status
+
+  smoke:
+    name: Staging smoke
+    needs: status
+    # Only while every live host and tile runs the release: a smoke on a host still on the
+    # previous image says nothing about this one, and the next run tries again.
+    if: needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true'
+    # A called workflow cannot raise its caller's permissions; the smoke's report job opens an issue.
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-viewer-smoke.yml
+    secrets: inherit
+
+  decide:
+    name: Verify or roll back
+    needs: [status, smoke]
+    if: ${{ !cancelled() && needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true' }}
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+          GENERATION: ${{ needs.status.outputs.generation }}
+          SMOKE: ${{ needs.smoke.result }}
+        run: python3 -B fleet/ami/release_gate.py decide --generation "$GENERATION" --smoke "$SMOKE"

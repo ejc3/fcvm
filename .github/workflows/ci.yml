@@ -314,6 +314,7 @@ jobs:
         run: |
           python3 -B fleet/ami/test_pipeline.py
           python3 -B fleet/ami/test_request.py
+          python3 -B fleet/ami/test_release_gate.py
       - name: Operator script tests (fleet/tools)
         run: make -C fleet/tools test
       - name: Windows image build tests (fleet/windows)
