@@ -1,0 +1,41 @@
+{
+ "region": "us-east-2",
+ "rows": [
+  [
+   "Region",
+   "us-east-2"
+  ],
+  [
+   "Campaign host",
+   "c8gd.metal-24xl, 96 vCPUs, spot, kernel 7.0.0-1013-aws"
+  ],
+  [
+   "fcvm",
+   "commit f0147cf7b023, fcvm 0.1.0"
+  ],
+  [
+   "fcvm VM",
+   "1 vCPU, 2048 MiB, rootless networking, port published on the host's loopback; one snapshot, restored by both fcvm lanes"
+  ],
+  [
+   "EC2 lanes",
+   "c8g.medium, gp3 8 GiB root, AMI made from al2023-ami-2023.12.20261102.0-kernel-6.1-arm64 with the workload as a systemd unit"
+  ],
+  [
+   "ECS on Fargate",
+   "task 1 vCPU, 2048 MiB, ARM64, network mode awsvpc; no public IP, image pulled through ECR endpoints in the VPC"
+  ],
+  [
+   "ECS on EC2",
+   "task 1 vCPU, 1536 MiB, ARM64, network mode host; container instance c8g.medium from al2023-ami-ecs-hvm-2023.0.20261031-kernel-6.1-arm64, image cached"
+  ],
+  [
+   "Lambda, cold",
+   "provided.al2023, arm64, 2048 MB, function URL with IAM auth, BOOT_RACE_EXIT_AFTER_RESPONSE=1"
+  ],
+  [
+   "Lambda, warm",
+   "provided.al2023, arm64, 2048 MB, function URL with IAM auth, BOOT_RACE_EXIT_AFTER_RESPONSE=0"
+  ]
+ ]
+}

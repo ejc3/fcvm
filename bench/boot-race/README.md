@@ -11,12 +11,17 @@ snapshot restores and for the AWS ways of starting the same workload, in one int
 | `ec2-launch` | `RunInstances` | c8g.medium from an AMI holding the workload |
 | `ec2-start` | `StartInstances` | the same AMI, stopped |
 | `ec2-hibernate` | `StartInstances` | the same AMI, stopped with `Hibernate=true` |
-| `ecs-fargate` | `RunTask` (FARGATE), read inside boot-race-launcher | 1 vCPU, 2 GiB, ARM64, no public IP |
+| `ecs-fargate` | `RunTask` (FARGATE), read inside boot-race-launcher | 1 vCPU, 2 GiB, ARM64, no public IP; **not run** (below) |
 | `ecs-ec2` | `RunTask` (EC2), read inside boot-race-launcher | one warm container instance, image cached, host network |
 | `lambda-cold` | HTTPS GET to the function URL | the runtime exits after every response; the page counts how often Lambda kept the kernel |
 | `lambda-warm` | HTTPS GET to the function URL | the runtime keeps running |
 
 t1 for every lane: a GET from the campaign host has read a complete `200` answer.
+
+The published campaign runs eight lanes, every one but `ecs-fargate`. The AWS side (ejc3/aws `boot-race.tf`) keeps
+the Fargate lane off: a task without a public IP pulls its image through ECR interface endpoints, which bill by the
+hour and change ECR DNS for the whole VPC, and they have no reviewed teardown yet. boot-race-launcher refuses the lane
+while its subnet is unset. The page names it as not run, with that reason.
 
 The ECS lanes start through boot-race-launcher (ejc3/aws `boot-race/launcher.py`), the only caller of RunTask, which
 fixes the cluster, the task definitions and the Fargate network. It returns its wall-clock time just before and just
