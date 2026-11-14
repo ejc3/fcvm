@@ -528,10 +528,14 @@ firecracker_commit = "ddc1969f8dba126a1c771aa7be9d4ec09ffc177c"
 [kernel_profiles.nested.amd64.host_kernel]
 kernel_version = "6.18.60"
 patches_dir = "kernel/patches-x86"
+# Kconfig lines set on top of the running kernel's config and checked after olddefconfig:
+# ENA built in, so cloud-init finds the NIC at boot (ejc3/aws#823).
+config_fragment = "kernel/host-x86.conf"
 
 # Build inputs for SHA calculation
 build_inputs = [
     "kernel/patches-x86/*.patch",
+    "kernel/host-x86.conf",
 ]
 
 # arm64 btrfs profile (FUSE + btrfs, no KVM/nested)

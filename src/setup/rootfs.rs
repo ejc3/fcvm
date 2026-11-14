@@ -27,7 +27,7 @@ pub fn set_config_path(path: &str) {
 }
 
 /// Embedded default config (used by --generate-config)
-const EMBEDDED_CONFIG: &str = include_str!("../../rootfs-config.toml");
+pub(crate) const EMBEDDED_CONFIG: &str = include_str!("../../rootfs-config.toml");
 
 /// Size of the Layer 2 disk image
 const LAYER2_SIZE: &str = "10G";
@@ -247,6 +247,13 @@ pub struct HostKernelConfig {
     /// Files to hash for kernel SHA (globs supported, *.vm.patch excluded)
     #[serde(default)]
     pub build_inputs: Vec<String>,
+
+    /// Kconfig lines (`CONFIG_X=y|m|n`, relative to repo root) set on top of the running
+    /// kernel's config, then checked in the final .config. The host kernel takes everything
+    /// else from whichever kernel the builder runs, so anything the host needs at boot is
+    /// pinned here. List the file in `build_inputs` too, so a change rebuilds the kernel.
+    #[serde(default)]
+    pub config_fragment: Option<String>,
 }
 
 impl KernelProfile {
