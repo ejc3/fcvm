@@ -19,15 +19,13 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import race  # noqa: E402
-
-KEYDIR = "/dev/shm/boot-race-ssh"
-
 
 def save(path, cfg):
     tmp = path + ".tmp"
@@ -48,9 +46,12 @@ def image(cfg, s):
     user, pw = base64.b64decode(tok["authorizationToken"]).decode().split(":", 1)
     registry = tok["proxyEndpoint"].replace("https://", "")
     repo = f"{registry}/boot-race"
-    subprocess.run(["podman", "login", "-u", user, "--password-stdin", registry], input=pw.encode(), check=True)
-    subprocess.run(["podman", "tag", "localhost/boot-race-workload", f"{repo}:workload"], check=True)
-    subprocess.run(["podman", "push", f"{repo}:workload"], check=True)
+    with tempfile.TemporaryDirectory(prefix="boot-race-registry-", dir="/dev/shm") as directory:
+        auth = ["--authfile", os.path.join(directory, "auth.json")]
+        subprocess.run(["podman", "login", *auth, "-u", user, "--password-stdin", registry],
+                       input=pw.encode(), check=True)
+        subprocess.run(["podman", "tag", "localhost/boot-race-workload", f"{repo}:workload"], check=True)
+        subprocess.run(["podman", "push", *auth, f"{repo}:workload"], check=True)
     d = ecr.describe_images(repositoryName="boot-race", imageIds=[{"imageTag": "workload"}])["imageDetails"][0]
     race.log(f"pushed {d['imageDigest']} ({d['imageSizeInBytes']} bytes)")
 
@@ -81,26 +82,24 @@ def lambda_code(cfg, s):
     cfg.setdefault("identities", {})["lambda-warm"] = again
 
 
-def ssh_key():
-    os.makedirs(KEYDIR, mode=0o700, exist_ok=True)
-    key = f"{KEYDIR}/id"
-    if not os.path.exists(key):
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
-    with open(key + ".pub") as f:
-        return key, f.read().strip()
-
-
 def ssh(key, ip, cmd, stdin=None):
     return subprocess.run(
-        ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+        ["ssh", "-F", "/dev/null", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
          "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", f"ec2-user@{ip}", cmd],
         input=stdin, check=True, capture_output=True,
     )
 
 
 def ami(cfg, s):
-    ec2 = s.client("ec2")
-    key, pub = ssh_key()
+    with tempfile.TemporaryDirectory(prefix="boot-race-ssh-", dir="/dev/shm") as directory:
+        key = os.path.join(directory, "id")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        with open(key + ".pub") as f:
+            build_ami(cfg, s.client("ec2"), key, f.read().strip())
+
+
+def build_ami(cfg, ec2, key, pub):
     ud = f"#cloud-config\nssh_authorized_keys:\n  - {pub}\n"
     r = ec2.run_instances(
         LaunchTemplate={"LaunchTemplateName": "boot-race-ec2"},
