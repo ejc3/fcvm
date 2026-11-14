@@ -285,7 +285,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-system-image phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
-	bench-chromium-corpus bench-chromium-corpus-extra bench-kitesurf-build bench-stop \
+	bench-chromium-corpus bench-chromium-corpus-extra bench-kitesurf-build bench-live-campaign bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-request-diag bench-webkit-request-diag test-boot-race build-boot-race-workload \
 	bench-chromium-scale check-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
@@ -373,6 +373,7 @@ help:
 	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=, NETMODE=)"
 	@echo "  bench-chromium-corpus-extra   Host-control and matched-memory corpus campaign (PHASES=, RESULTS=)"
 	@echo "  bench-kitesurf-build          Build the pinned Kitesurf engine for PHASES=kitesurf (KITESURF_DIR=)"
+	@echo "  bench-live-campaign           fcvm + Browser Run over the live corpus, one host, one window (LIVE_STAMP=, CPU=, REPS=, WARMUP=, BR_REPS=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
 	@echo "  bench-chromium-hostcdp         Host direct-CDP baseline (COMPARISON_LABEL=standalone CPU_BUDGET=unlimited; CPUS= needs CPU_BUDGET=vm-matched)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
@@ -1307,6 +1308,12 @@ require-clean-tree:
 # is `make bench-chromium-corpus-extra PHASES=kitesurf`, which never builds.
 bench-kitesurf-build:
 	@bash bench/chromium/kitesurf_build.sh
+
+# The live-site arms in one window on one host (bench/chromium/live_campaign.sh):
+# an fcvm golden resolving with 1.1.1.1 (LIVE_DNS), reqbench over the 14 live corpus URLs,
+# and Browser Run batches (browserrun.py) beside it until it finishes.
+bench-live-campaign:
+	@bash bench/chromium/live_campaign.sh
 
 bench-chromium-corpus-extra: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-corpus-extra: require-clean-tree build setup-default
