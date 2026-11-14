@@ -148,8 +148,15 @@ def endpoint(account: str, op: str, engine: str) -> str:
     return API.format(account=account, op=op) + ENGINE_QUERY[engine]
 
 
-def viewport_options(viewport):
-    return {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1}
+def viewport_options(viewport, engine="chromium"):
+    """The CSS viewport both engines are asked for. Kitesurf's Quick Actions refuse
+    viewport.deviceScaleFactor ("not yet implemented by kitesurf", HTTP 500 on every
+    request, measured from the benchmark worker on 2026-11-14) and render at scale 1,
+    so it is sent to Chromium only; both render at 1x."""
+    options = {"width": viewport[0], "height": viewport[1]}
+    if engine != "kitesurf":
+        options["deviceScaleFactor"] = 1
+    return options
 
 
 def viewport_size(value):
@@ -159,8 +166,8 @@ def viewport_size(value):
     return tuple(map(int, match.groups()))
 
 
-def request_body(op: str, url: str, image_type: str, viewport) -> dict:
-    body = {"url": url, "viewport": viewport_options(viewport)}
+def request_body(op: str, url: str, image_type: str, viewport, engine="chromium") -> dict:
+    body = {"url": url, "viewport": viewport_options(viewport, engine)}
     if op == "screenshot" and image_type == "jpeg":
         body["screenshotOptions"] = {"type": "jpeg", "quality": 80}
     return body
@@ -229,7 +236,7 @@ def call(args, opener, token, account, engine, op, url, image_type, sleep):
     waited = 0.0
     for _attempt in range(args.max_retries + 1):
         status, headers, payload, wall_ms = post(
-            endpoint(account, op, engine), token, request_body(op, url, image_type, args.viewport),
+            endpoint(account, op, engine), token, request_body(op, url, image_type, args.viewport, engine),
             args.timeout, opener)
         if status != 429:
             break
@@ -341,7 +348,7 @@ def run(args, token, account, opener=None, sleep=time.sleep, worker=True) -> int
         json.dump({"engines": engines, "ops": ops, "reps": args.reps, "warmup": args.warmup,
                    "seed": args.seed, "urls": urls, "image_type": args.image_type,
                    "quality": 80 if args.image_type == "jpeg" else None, "api": API,
-                   "viewport": viewport_options(args.viewport),
+                   "viewport": {e: viewport_options(args.viewport, e) for e in engines},
                    "drift_control": {"endpoint": TRACE_URL, "method": "GET",
                                      "scope": "client-to-Cloudflare edge, not browser backend"},
                    "corpus": "live sites, fetched by Browser Run with Cloudflare's DNS",
