@@ -195,6 +195,49 @@ against its requests. `ALLOW_BUSY=1` overrides
 the refusal and is recorded in the run. An overridden run is contaminated and
 must be excluded from comparisons or rerun before publication.
 
+## The hosted arms (`browserrun.py`)
+
+Cloudflare's Browser Run serves both its Chromium and Kitesurf (`?browser=kitesurf`)
+through the same Quick Actions its published Kitesurf table measured. The runner
+drives `/screenshot` (JPEG q80, as the fcvm arm's driver asks) and `/content` against
+both, over the corpus's 14 URLs, one request at a time.
+
+Run this on the dedicated Ohio benchmark worker or the primary fcvm-arm host:
+
+~~~bash
+python3 bench/chromium/browserrun.py \
+  --out "/tmp/browserrun-$(date -u +%Y%m%d-%H%M%S)" --reps 28 --warmup 1
+~~~
+
+The runner retrieves the matching Secrets Manager credential and connects to
+Cloudflare directly. On the Ohio worker, use the same checkout and machine for
+the hosted and local trials. Its network path is measured directly, and only
+the worker's reserved addresses can use its token. There is no credential to
+copy. The region and the client's load are recorded automatically; set
+`--client-location` only to override the label. Regular pboxes cannot read the
+credential. Pass a new `--out` directory for each trial; the runner refuses to
+reuse an old trial's output.
+
+- **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
+  a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.
+  Each record keeps the reply's status, size and digest, so content drift shows per page.
+- **Match the viewport.** Both hosted operations request the same explicit CSS viewport
+  and scale (default 1280×600 at 1×, measured from the current local Chromium CDP screenshot).
+  A flag such as `--window-size=1280,800` reports the outer window and is not proof of the
+  screenshot size. Check the local trial's returned width and height before comparing a
+  different Chromium build; use `--viewport WIDTHxHEIGHT` to match it. `run.json` records
+  the actual request setting.
+- **Watch network drift.** Each repetition interleaves one unauthenticated GET to the same
+  Cloudflare API hostname without starting a browser. `drift.jsonl` records time, status
+  and colo, with a separate summary. This isolates the client-to-edge path only; it
+  neither measures browser backend contention nor corrects the results automatically.
+- **The network path is part of wall time.** wall_ms runs from this host's POST to the last
+  byte of the reply; the colo that answered is on every record (from `cf-ray`), and any
+  browser-time header Cloudflare sends is kept.
+- **Correctness** is checked as in the local arm: one untimed PNG screenshot and one
+  `/content` per page and engine, kept under `correctness/<engine>/`, blank at 99.8% of one
+  colour, and a measured request on a page that did not complete counts as a failure.
+
 ## Results conventions
 
 Raw run output goes to `results/<timestamp>/` — **git-ignored** (see
