@@ -206,7 +206,7 @@ Run this on the dedicated Ohio benchmark worker or the primary fcvm-arm host:
 
 ~~~bash
 python3 bench/chromium/browserrun.py \
-  --out "bench/chromium/results/browserrun-$(date -u +%Y%m%d-%H%M%S)" --reps 28 --warmup 1
+  --out "/tmp/browserrun-$(date -u +%Y%m%d-%H%M%S)" --reps 28 --warmup 1
 ~~~
 
 The runner retrieves the matching Secrets Manager credential and connects to
