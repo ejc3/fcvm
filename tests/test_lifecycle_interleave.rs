@@ -3247,3 +3247,123 @@ async fn test_lifecycle_interleave_cloud_hypervisor_restore_never_recreates_a_so
 ) -> Result<()> {
     restore_never_recreates_the_source_dir("ilv-ch-recreated", "cloud-hypervisor").await
 }
+
+// ---------------------------------------------------------------------------
+// CASE: bridged_subnet_lock_spans_data_dirs
+// ---------------------------------------------------------------------------
+
+/// Two fcvm processes with different data directories share the host's routing table and
+/// bridged subnets, so subnet selection serializes between them (#1882).
+///
+/// Process A parks at `bridged.subnet_locked`, inside the subnet lock. Process B, with a
+/// data directory of its own, reaches the line it logs just before taking that lock and
+/// must not get past it until A is released.
+///
+/// RED BEFORE THE CHANGE: the lock was a file in each process's own state directory, so B
+/// took a lock of its own and reached `bridged.subnet_locked` while A was parked there.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_lifecycle_interleave_bridged_subnet_lock_spans_data_dirs() -> Result<()> {
+    let (a_name, b_name, _, _) = common::unique_names("ilv-hostlock");
+    let scratch = tempfile::tempdir().context("creating the go-file directory")?;
+    let go = scratch.path().join("go");
+    let data_dir = |tag: &str| {
+        // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths
+        // stop at 108 bytes.
+        fcvm::paths::data_dir().join(format!(
+            "rt-{tag}{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..7]
+        ))
+    };
+    let (a_dir, b_dir) = (data_dir("a"), data_dir("b"));
+    let a_fp = format!("bridged.subnet_locked:block_until_file:{}", go.display());
+    let b_fp = "bridged.subnet_locked:sleep:0".to_string();
+    let mut children: Vec<tokio::process::Child> = Vec::new();
+
+    let exercise: Result<()> = async {
+        let run = |name: &str| {
+            [
+                "podman",
+                "run",
+                "--name",
+                name,
+                "--network",
+                "bridged",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ]
+            .map(str::to_string)
+        };
+        let a_args = run(&a_name);
+        let a_dir_str = a_dir.to_str().context("data dir path")?;
+        let (a, _, a_log) = common::spawn_fcvm_with_env_and_log_path(
+            &a_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &[("FCVM_DATA_DIR", a_dir_str), ("FCVM_FAILPOINT", &a_fp)],
+        )
+        .await?;
+        children.push(a);
+        wait_for_marker(
+            &a_log,
+            "FAILPOINT bridged.subnet_locked reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await
+        .context("process A never reached the subnet lock")?;
+
+        let b_args = run(&b_name);
+        let b_dir_str = b_dir.to_str().context("data dir path")?;
+        let (b, _, b_log) = common::spawn_fcvm_with_env_and_log_path(
+            &b_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &[("FCVM_DATA_DIR", b_dir_str), ("FCVM_FAILPOINT", &b_fp)],
+        )
+        .await?;
+        children.push(b);
+        // B logs this immediately before it takes the subnet lock.
+        let at_lock = wait_for_marker(
+            &b_log,
+            "setting up network namespace",
+            0,
+            Duration::from_secs(120),
+        )
+        .await
+        .context("process B never reached bridged setup")?;
+        // Without a shared lock B is inside within milliseconds of that line.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        anyhow::ensure!(
+            search_log_from(&b_log, "FAILPOINT bridged.subnet_locked reached", at_lock).is_none(),
+            "process B (data dir {}) entered the bridged subnet lock while process A (data dir {}) \
+             held it: the lock does not span data directories",
+            b_dir.display(),
+            a_dir.display()
+        );
+
+        std::fs::write(&go, b"").context("releasing process A")?;
+        wait_for_marker(
+            &b_log,
+            "FAILPOINT bridged.subnet_locked reached",
+            at_lock,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("process B never took the subnet lock after A released it")?;
+        Ok(())
+    }
+    .await;
+
+    let _ = std::fs::write(&go, b"");
+    for child in &mut children {
+        if let Some(pid) = child.id() {
+            sigterm(pid).await;
+        }
+    }
+    for child in &mut children {
+        let _ = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+    for dir in [&a_dir, &b_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    exercise
+}

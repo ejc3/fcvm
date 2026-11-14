@@ -393,6 +393,7 @@ impl NetworkManager for BridgedNetwork {
         let subnet_lock = super::acquire_host_network_lock("bridged-subnet.lock")
             .await
             .context("acquiring bridged subnet allocation lock")?;
+        failpoint::hit_async("bridged.subnet_locked").await;
 
         // Everything below outlives this process unless cleanup() removes it, so it is
         // recorded with the VM's owner (crate::reclaim): the shared NAT first, so that it
