@@ -751,29 +751,103 @@ struct PrefilledBacking {
     refill: PrefillRefill,
 }
 
-/// [`prepare_prefilled_memory`] running beside the clone's setup.
+/// Whether a restore's prefill may still take a spare from the pool, and what it took.
+#[derive(Debug, Default)]
+enum SpareClaim {
+    /// Nothing taken yet; the prefill may take one.
+    #[default]
+    Open,
+    /// A spare was taken: the pool owes this refill unless the restore uses the memory.
+    Taken(PrefillRefill),
+    /// The pool had none, so the memory was allocated outside it.
+    Unclaimed,
+    /// The restore gave the prefill up before it took one; it takes none now.
+    Cancelled,
+}
+
+type SpareGate = std::sync::Arc<std::sync::Mutex<SpareClaim>>;
+
+/// Take a spare through `gate`: `claim` runs under the gate's lock unless the restore has
+/// cancelled, so a cancel either comes first (nothing is taken) or sees what was taken.
+/// `None` when cancelled.
+fn claim_through<T>(
+    gate: &SpareGate,
+    refill: PrefillRefill,
+    claim: impl FnOnce() -> Result<Option<T>>,
+) -> Result<Option<Option<T>>> {
+    let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if matches!(*state, SpareClaim::Cancelled) {
+        return Ok(None);
+    }
+    let claimed = claim()?;
+    *state = if claimed.is_some() {
+        SpareClaim::Taken(refill)
+    } else {
+        SpareClaim::Unclaimed
+    };
+    Ok(Some(claimed))
+}
+
+/// Close `gate` and return the refill the pool is owed, if the prefill took a spare.
+fn cancel_claim(gate: &SpareGate) -> Option<PrefillRefill> {
+    let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match std::mem::replace(&mut *state, SpareClaim::Cancelled) {
+        SpareClaim::Taken(refill) => Some(refill),
+        _ => None,
+    }
+}
+
+/// [`prepare_prefilled_memory`] running beside the clone's setup. A restore that stops
+/// before it uses the memory drops this: the prefill takes no spare from then on, and one it
+/// already took is refilled at once (a started copy cannot be cancelled; it finishes and frees
+/// its memory on its own).
 struct EarlyPrefill {
     started: std::time::Instant,
-    task: tokio::task::JoinHandle<Option<PrefilledBacking>>,
+    task: Option<tokio::task::JoinHandle<Option<PrefilledBacking>>>,
+    gate: SpareGate,
 }
 
 impl EarlyPrefill {
     fn start(gpus: Vec<String>, memory_path: PathBuf) -> Self {
+        let gate = SpareGate::default();
+        let task_gate = gate.clone();
         Self {
             started: std::time::Instant::now(),
-            task: tokio::spawn(async move { prepare_prefilled_memory(&gpus, &memory_path).await }),
+            task: Some(tokio::spawn(async move {
+                prepare_prefilled_memory(&gpus, &memory_path, task_gate).await
+            })),
+            gate,
         }
     }
 
-    /// The prefilled backing, or none (the restore then loads without hugepages, as
-    /// `prepare_prefilled_memory` does when it fails).
-    async fn wait(self) -> Option<PrefilledBacking> {
-        match self.task.await {
+    /// The prefilled backing, or none: the restore then loads without hugepages, and a spare
+    /// the failed prefill took is refilled.
+    async fn wait(mut self) -> Option<PrefilledBacking> {
+        let task = self.task.take().expect("waited once");
+        let backing = match task.await {
             Ok(backing) => backing,
             Err(error) => {
                 warn!(error = %error, "the hugepage prefill task ended; restoring without it");
                 None
             }
+        };
+        if backing.is_none() {
+            if let Some(refill) = cancel_claim(&self.gate) {
+                spawn_refill(&refill);
+            }
+        }
+        backing
+    }
+}
+
+impl Drop for EarlyPrefill {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        if let Some(refill) = cancel_claim(&self.gate) {
+            spawn_refill(&refill);
         }
     }
 }
@@ -788,13 +862,17 @@ struct PrefillRefill {
 /// Claim a hugepage spare on the first GPU's NUMA node (or allocate one) and copy the memory
 /// file into it. `None`, with a warning, when the host cannot give hugepages: the restore then
 /// uses the transport it would have used without them.
-async fn prepare_prefilled_memory(gpus: &[String], memory_path: &Path) -> Option<PrefilledBacking> {
+async fn prepare_prefilled_memory(
+    gpus: &[String],
+    memory_path: &Path,
+    gate: SpareGate,
+) -> Option<PrefilledBacking> {
     use crate::storage::hugepage_spares as spares;
     let node = gpus.first().and_then(|g| spares::pci_numa_node(g));
     let memory_path = memory_path.to_path_buf();
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(
-        move || -> Result<(std::fs::File, bool, spares::FillStats, u64)> {
+        move || -> Result<Option<(std::fs::File, bool, spares::FillStats, u64)>> {
             let size = std::fs::metadata(&memory_path)
                 .with_context(|| format!("stat {}", memory_path.display()))?
                 .len();
@@ -802,7 +880,12 @@ async fn prepare_prefilled_memory(gpus: &[String], memory_path: &Path) -> Option
             let mib = size >> 20;
             let dir = spares::default_dir();
             let pool = spares::Spares::open(&dir)?;
-            let (file, claimed) = match pool.claim(node, mib)? {
+            let Some(claimed) =
+                claim_through(&gate, PrefillRefill { node, mib }, || pool.claim(node, mib))?
+            else {
+                return Ok(None);
+            };
+            let (file, claimed) = match claimed {
                 Some(file) => (file, true),
                 None => (
                     spares::allocate_unnamed(&dir, size, node, spares::COPY_THREADS)?,
@@ -810,12 +893,16 @@ async fn prepare_prefilled_memory(gpus: &[String], memory_path: &Path) -> Option
                 ),
             };
             let stats = spares::fill_from(&file, &memory_path, spares::FILL_THREADS, node)?;
-            Ok((file, claimed, stats, mib))
+            Ok(Some((file, claimed, stats, mib)))
         },
     )
     .await;
     match result {
-        Ok(Ok((file, claimed, stats, mib))) => {
+        Ok(Ok(None)) => {
+            info!("the restore no longer needs its hugepage prefill");
+            None
+        }
+        Ok(Ok(Some((file, claimed, stats, mib)))) => {
             info!(
                 node = ?node,
                 mib,
@@ -3014,6 +3101,46 @@ async fn cmd_snapshot_run_inner(
         snapshot_config.metadata.firecracker_bin.as_deref(),
     )
     .await?;
+    // A GPU restore's hugepage prefill starts here, as soon as the restore's Firecracker is
+    // known, beside the checks and the clone's setup (its state, volume servers and network);
+    // the memory backend below waits for it. Only a direct Firecracker restore prefills. GPUs
+    // or a map count that cannot be read are left to the steps below, which fail the restore
+    // with them; a restore that stops before the backend drops the prefill (`EarlyPrefill`).
+    let mut early_prefill: Option<EarlyPrefill> = None;
+    let early_gpus = crate::gpu::canonical_sbdfs(&args.gpu).unwrap_or_default();
+    if uffd_socket.is_none()
+        && snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker
+    {
+        if let Ok(map_count) = restore_map_count_shortfall(
+            &snapshot_config.metadata,
+            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+        ) {
+            let direct_memory = direct_restore_memory(
+                args.hugepages.unwrap_or(snapshot_config.metadata.hugepages),
+                runtime_config
+                    .effective_firecracker_args()
+                    .as_deref()
+                    .is_some_and(crate::setup::firecracker_args_enable_nv2),
+                std::env::var("FCVM_FORCE_UFFD").is_ok(),
+                map_count,
+            );
+            if prefill_gpu_memory(
+                &early_gpus,
+                direct_memory,
+                snapshot_config.metadata.balloon_free_page_reporting,
+            ) && restore_vmm_accepts_prefilled(
+                &runtime_config,
+                snapshot_config.metadata.kernel_profile.as_deref(),
+                direct_memory,
+            ) {
+                early_prefill = Some(EarlyPrefill::start(
+                    early_gpus.clone(),
+                    snapshot_config.memory_path.clone(),
+                ));
+            }
+        }
+    }
+
     // A clone that reboots in place cold-boots with its profile's driver image. The
     // restore itself never needs it (Firecracker reopens the drive the snapshot
     // recorded), so an image that is missing or does not resolve leaves the reboot
@@ -3175,44 +3302,6 @@ async fn cmd_snapshot_run_inner(
         }
     }
 
-    // A GPU restore's hugepage prefill starts here, beside the clone's setup (its state,
-    // volume servers and network), instead of after it; the memory backend below waits for
-    // it. Only a direct Firecracker restore prefills. A map count that cannot be read is left
-    // to the backend choice below, which fails the restore with it.
-    let mut early_prefill: Option<EarlyPrefill> = None;
-    if uffd_socket.is_none()
-        && snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker
-    {
-        if let Ok(map_count) = restore_map_count_shortfall(
-            &snapshot_config.metadata,
-            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
-        ) {
-            let direct_memory = direct_restore_memory(
-                args.hugepages.unwrap_or(snapshot_config.metadata.hugepages),
-                runtime_config
-                    .effective_firecracker_args()
-                    .as_deref()
-                    .is_some_and(crate::setup::firecracker_args_enable_nv2),
-                std::env::var("FCVM_FORCE_UFFD").is_ok(),
-                map_count,
-            );
-            if prefill_gpu_memory(
-                &gpus,
-                direct_memory,
-                snapshot_config.metadata.balloon_free_page_reporting,
-            ) && restore_vmm_accepts_prefilled(
-                &runtime_config,
-                snapshot_config.metadata.kernel_profile.as_deref(),
-                direct_memory,
-            ) {
-                early_prefill = Some(EarlyPrefill::start(
-                    gpus.clone(),
-                    snapshot_config.memory_path.clone(),
-                ));
-            }
-        }
-    }
-
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone());
@@ -3220,6 +3309,10 @@ async fn cmd_snapshot_run_inner(
     // Every fallible operation after setup ownership begins must use this
     // funnel.  It waits for the complete teardown transaction before returning
     // the original error, and reports a cleanup failure as additional context.
+    // Set when the restore's guest memory comes from the hugepage spare pool: the pool is
+    // refilled for this node and size once the clone is acknowledged, or when the setup
+    // fails after it took the memory.
+    let mut prefilled_restore: Option<PrefillRefill> = None;
     macro_rules! setup_try {
         ($result:expr) => {
             match $result {
@@ -3231,6 +3324,11 @@ async fn cmd_snapshot_run_inner(
                             "clone setup cleanup also failed: {cleanup_error:#}"
                         )),
                     };
+                    // The pool slot of a prefill the restore took goes back; an early
+                    // prefill it never waited for gives its own back when it is dropped.
+                    if let Some(refill) = prefilled_restore.take() {
+                        spawn_refill(&refill);
+                    }
                     return Err(error);
                 }
             }
@@ -3697,9 +3795,6 @@ async fn cmd_snapshot_run_inner(
         None
     };
 
-    // Set when the restore's guest memory comes from the hugepage spare pool: the pool is
-    // refilled for this node and size once the clone is acknowledged.
-    let mut prefilled_restore: Option<PrefillRefill> = None;
     // When the memory backend was chosen for a direct restore: a prefill copies guest memory
     // there, so the restore clock starts there.
     let mut prefill_started: Option<std::time::Instant> = None;
@@ -4288,9 +4383,10 @@ async fn cmd_snapshot_run_inner(
             )
         );
     }
-    // The clone is acknowledged; replace the spare it used.
-    if let Some(refill) = &prefilled_restore {
-        spawn_refill(refill);
+    // The clone is acknowledged; replace the spare it used (once: a later failure finds
+    // nothing to give back).
+    if let Some(refill) = prefilled_restore.take() {
+        spawn_refill(&refill);
     }
 
     // Handle --exec: run command in container then cleanup and exit
@@ -6404,9 +6500,9 @@ mod tests {
 
     use super::*;
 
-    /// A GPU restore's hugepage prefill starts before the clone's setup (its name, volume
-    /// servers and network) and the memory backend waits for that prefill instead of starting
-    /// one after the setup.
+    /// A GPU restore's hugepage prefill starts as soon as the restore's Firecracker is known,
+    /// before the GPU checks, the early reset and the clone's setup (its name, volume servers
+    /// and network), and the memory backend waits for that prefill instead of starting one.
     #[test]
     fn the_prefill_starts_before_the_clone_setup() {
         let code = include_str!("snapshot.rs");
@@ -6415,16 +6511,21 @@ mod tests {
             .find("async fn cmd_snapshot_run_inner(")
             .expect("no restore")..];
         let at = |needle: &str| run.find(needle).unwrap_or_else(|| panic!("no `{needle}`"));
-        let reset = at("crate::gpu::reset::EarlyReset::start(");
+        let runtime = at("snapshot_restore_runtime_config(");
         let prefill = at("early_prefill = Some(EarlyPrefill::start(");
+        let checks = at("crate::gpu::check_host_device(");
+        let reset = at("crate::gpu::reset::EarlyReset::start(");
         let setup = at("let mut setup = CloneSetupResources::new(");
-        let name = at("state_manager\n        .claim_name(");
         let volumes = at("spawn_volume_servers_with_tables(");
         let network = at("\"network configured for clone\"");
         let waited = at("let prefilled = match early_prefill.take() {");
         assert!(
-            reset < prefill && prefill < setup && prefill < name && prefill < volumes,
-            "the prefill must start before the clone's setup"
+            runtime < prefill
+                && prefill < checks
+                && prefill < reset
+                && prefill < setup
+                && prefill < volumes,
+            "the prefill must start before the checks and the clone's setup"
         );
         assert!(
             network < waited,
@@ -6434,6 +6535,56 @@ mod tests {
             run.matches("prepare_prefilled_memory(").count(),
             0,
             "the restore must not start a second prefill"
+        );
+        // A setup that fails after the backend took the memory gives its pool slot back
+        // (review of #1875); one that fails before drops the EarlyPrefill, which does.
+        let funnel = &run[at("macro_rules! setup_try {")..];
+        let funnel = &funnel[..funnel.find("return Err(error);").unwrap()];
+        assert!(funnel.contains("if let Some(refill) = prefilled_restore.take() {"));
+        assert!(at("let mut prefilled_restore") < at("macro_rules! setup_try {"));
+    }
+
+    /// A prefill takes a spare only while the restore still wants it, and a restore that gives
+    /// it up learns what it took, so the pool is refilled exactly when a spare was taken
+    /// (review of #1875).
+    #[test]
+    fn a_dropped_prefill_takes_no_spare_or_gives_back_the_one_it_took() {
+        let refill = || PrefillRefill {
+            node: Some(0),
+            mib: 6144,
+        };
+        // Cancelled first: the claim never runs.
+        let gate = SpareGate::default();
+        assert!(cancel_claim(&gate).is_none());
+        let mut ran = false;
+        let claimed = claim_through(&gate, refill(), || {
+            ran = true;
+            Ok(Some(1))
+        })
+        .unwrap();
+        assert!(claimed.is_none() && !ran);
+        // Taken first: the cancel returns the refill once.
+        let gate = SpareGate::default();
+        assert_eq!(
+            claim_through(&gate, refill(), || Ok(Some(1))).unwrap(),
+            Some(Some(1))
+        );
+        let owed = cancel_claim(&gate).expect("a taken spare is owed");
+        assert_eq!((owed.node, owed.mib), (Some(0), 6144));
+        assert!(cancel_claim(&gate).is_none());
+        // The pool had none: nothing is owed.
+        let gate = SpareGate::default();
+        assert_eq!(
+            claim_through(&gate, refill(), || Ok(None::<u8>)).unwrap(),
+            Some(None)
+        );
+        assert!(cancel_claim(&gate).is_none());
+        // Dropping an EarlyPrefill that was never waited for closes its gate.
+        let source = include_str!("snapshot.rs");
+        let drop = &source[source.find("impl Drop for EarlyPrefill {").unwrap()..];
+        let drop = &drop[..drop.find("\n}\n").unwrap()];
+        assert!(
+            drop.contains("cancel_claim(&self.gate)") && drop.contains("spawn_refill(&refill)")
         );
     }
 
