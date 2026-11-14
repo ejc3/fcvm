@@ -18,38 +18,49 @@ pub use types::*;
 use anyhow::{Context, Result};
 use std::net::IpAddr;
 
+/// Where the host network locks live. Under /run, like the routed address leases
+/// (`routed::ADDRESS_LEASE_DIR`), so the scope matches the routing table, veth addresses
+/// and NAT rules they guard: one per kernel, shared by every fcvm data directory on it,
+/// and empty after a reboot.
+///
+/// A lock under the data directory's state directory did not serialize fcvm processes
+/// with different `FCVM_DATA_DIR`s (CI's per-test data directories, a second checkout),
+/// which still change one routing table and draw from one bridged subnet space (#1882,
+/// `test_lifecycle_interleave_bridged_subnet_lock_spans_data_dirs`). A nested guest has a
+/// kernel, routing table and /run of its own, and so does a test container in a network
+/// namespace of its own, so each takes the locks of the table it changes.
+///
+/// Only root takes these locks: bridged and routed networking refuse to start without it,
+/// and rootless networking changes nothing in the host's routing table.
+pub(crate) const HOST_NETWORK_LOCK_DIR: &str = "/run/fcvm/host-network";
+
 /// Acquire a cross-process lock serializing host-global bridged network configuration.
 ///
 /// Bridged networking mutates state shared by every fcvm process on the host
 /// (veth host IPs, global MASQUERADE rules). The check-then-act sequences on that
 /// state must hold one of these locks so two fcvm processes cannot interleave.
 ///
-/// Lock files live in the state directory, following the same flock pattern as
-/// `loopback-ip.lock` (world-writable so root and non-root processes can coordinate,
-/// never deleted to avoid the recreate-while-locked race).
+/// The lock files live in [`HOST_NETWORK_LOCK_DIR`] and are never deleted, to avoid the
+/// recreate-while-locked race.
 ///
 /// Lock ordering: `bridged-subnet.lock` may be held while `bridged-nat.lock` is
 /// acquired (setup error paths that call cleanup()); the reverse never happens.
 pub(crate) async fn acquire_host_network_lock(
     name: &str,
 ) -> Result<nix::fcntl::Flock<std::fs::File>> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let dir = crate::paths::state_dir();
-    tokio::fs::create_dir_all(&dir)
+    let dir = std::path::Path::new(HOST_NETWORK_LOCK_DIR);
+    tokio::fs::create_dir_all(dir)
         .await
-        .with_context(|| format!("creating state directory {}", dir.display()))?;
+        .with_context(|| format!("creating the host network lock directory {}", dir.display()))?;
     let path = dir.join(name);
 
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
-        .truncate(true)
-        .mode(0o666)
+        .truncate(false)
         .open(&path)
         .with_context(|| format!("opening lock file {}", path.display()))?;
-    // Force permissions regardless of umask (only effective if we own the file or are root)
-    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
 
     // Acquire in spawn_blocking: flock blocks until the lock is free, and these
     // critical sections span multiple subprocess invocations, so don't pin a

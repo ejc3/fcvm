@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """boot-race driver: time from asking for compute to the workload answering, for every lane, interleaved.
 
-Runs on a parallel box (bare metal, /dev/kvm) in us-east-2. The fcvm lanes restore a snapshot on this host; the AWS
-lanes start the same workload through the AWS APIs, with boot-race-driver credentials read from a JSON file
-(BOOT_RACE_CREDS, default /dev/shm/boot-race-creds.json) that the operator refreshes.
+Runs on the dedicated bare-metal benchmark worker (/dev/kvm) in us-east-2. The fcvm lanes restore a snapshot
+on this host; the AWS lanes use the worker's instance profile to assume boot-race-driver and refresh in memory.
 
 Every lane is timed the same way: t0 is taken immediately before the call that asks for compute (Popen of
 `fcvm snapshot run`, RunInstances, StartInstances, RunTask, or the HTTPS request to a function URL), and t1 when an
@@ -17,6 +16,7 @@ import argparse
 import asyncio
 import datetime
 import fcntl
+import functools
 import http.client
 import json
 import os
@@ -26,7 +26,8 @@ import sys
 import time
 import urllib.parse
 
-REGION = "us-east-2"
+from worker_aws import REGION, make_session, metadata_reader
+
 TAG = {"Key": "Project", "Value": "boot-race"}
 LANES = [
     "fcvm-file",
@@ -56,22 +57,19 @@ def log(*a):
 
 
 # ------------------------------------------------------------------ AWS
-def session():
-    import boto3
+@functools.lru_cache(maxsize=1)
+def _driver_session():
+    return make_session()
 
-    path = os.environ.get("BOOT_RACE_CREDS", "/dev/shm/boot-race-creds.json")
-    with open(path) as f:
-        c = json.load(f)
-    exp = datetime.datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00"))
-    left = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-    if left < 120:
-        raise SystemExit(f"boot-race credentials expire in {left:.0f} s; refresh {path}")
-    return boto3.Session(
-        aws_access_key_id=c["AccessKeyId"],
-        aws_secret_access_key=c["SecretAccessKey"],
-        aws_session_token=c["SessionToken"],
-        region_name=REGION,
-    )
+
+def session():
+    try:
+        sdk = _driver_session()
+        # Resolve credentials before timing a sample. Existing clients also refresh automatically.
+        sdk.get_credentials().get_frozen_credentials()
+        return sdk
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(f"benchmark worker credentials unavailable: {exc}") from None
 
 
 def tags(name):
@@ -197,6 +195,7 @@ class Fcvm:
 
 
 # ------------------------------------------------------------------ EC2 lanes
+HIBERNATE_SETTLE_S = 30
 class Ec2:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -251,8 +250,11 @@ class Ec2:
             t_api = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
         finally:
-            # Give the workload a moment so a hibernating guest has nothing in flight, then stop it for next time.
-            await asyncio.sleep(1)
+            # Not timed: settle before the stop that readies the next sample. A hibernate stop sent 1 s after a
+            # resume answered sat in "stopping" for 20 minutes and then became an ordinary stop, so the next start
+            # booted; with 30 s, three resume-hibernate cycles in a row stopped in 10 to 20 s and resumed the same
+            # process.
+            await asyncio.sleep(HIBERNATE_SETTLE_S if hibernate else 1)
             await asyncio.to_thread(self.wait_state, iid, "running")
             self.ec2.stop_instances(InstanceIds=[iid], Hibernate=hibernate)
         return {
@@ -317,7 +319,7 @@ class Ecs:
         return Launch((wall, mono, out)), returned
 
     def stop(self, arn):
-        self.invoke({"action": "stop", "task": arn})
+        self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
 
     def describe(self, arn):
         """The task, or None while DescribeTasks still reports it MISSING (it can, just after RunTask)."""
@@ -394,15 +396,14 @@ class Ecs:
 class Lambda:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.creds = session().get_credentials().get_frozen_credentials()
+        self.creds = session().get_credentials()
 
     def signed_get(self, url):
         from botocore.auth import SigV4Auth
         from botocore.awsrequest import AWSRequest
-        from botocore.credentials import Credentials
 
         req = AWSRequest(method="GET", url=url, headers={"Host": urllib.parse.urlparse(url).netloc})
-        SigV4Auth(Credentials(*self.creds), "lambda", REGION).add_auth(req)
+        SigV4Auth(self.creds.get_frozen_credentials(), "lambda", REGION).add_auth(req)
         return dict(req.headers.items())
 
     def call(self, url):
@@ -575,16 +576,9 @@ def fetch_reports(cfg):
 # ------------------------------------------------------------------ setup.json
 def imds(path):
     """One instance metadata value of the campaign host (IMDSv2), or None off EC2."""
-    import urllib.request
-
     try:
-        tok = urllib.request.urlopen(urllib.request.Request(
-            "http://169.254.169.254/latest/api/token", method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
-        return urllib.request.urlopen(urllib.request.Request(
-            f"http://169.254.169.254/latest/meta-data/{path}",
-            headers={"X-aws-ec2-metadata-token": tok}), timeout=2).read().decode()
-    except OSError:
+        return metadata_reader()("meta-data/" + path)
+    except (OSError, RuntimeError):
         return None
 
 

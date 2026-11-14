@@ -7,6 +7,7 @@
 /// Points hit by fcvm on the host. Any of them can `park`.
 pub const HOST_POINTS: &[&str] = &[
     "balloon.post_set_pre_report",
+    "bridged.subnet_locked",
     "cache.miss",
     "cache.pre_ack",
     "exec.post_connect_pre_send",
