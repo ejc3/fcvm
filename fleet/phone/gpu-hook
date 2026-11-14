@@ -14,6 +14,13 @@
 #                      phone's next frame on that GPU and prints retaken_ms, first_frame_ms
 #                      and first_frame_at_ms (the wall clock, in ms since the epoch, when it
 #                      saw the frame; a restore steps the guest clock to the host's)
+#   gpu-hook prepared-retake
+#                      the same retake, started while the VM's GPU is still coming up: the
+#                      container exec and the console's 'gpu status' happen first, then the
+#                      hook prints 'prepared' and waits for a line 'go' on its input, which
+#                      fc-agent writes once the GPU may be used. Input that ends without 'go'
+#                      takes nothing up and fails. The image label dev.fcvm.gpu-hook-prepared
+#                      tells fc-agent the hook has this action.
 #
 # No emulator started is not an error: there is nothing to let go of. An emulator that was
 # started and exited fails a retake (the phone is gone) but not a release. Each call's
@@ -59,18 +66,27 @@ release)
   echo "$out"
   grep -q '^released_ms=' <<< "$out"
   ;;
-retake)
+retake | prepared-retake)
+  # prepared-retake: nothing that uses the GPU, the streamer included, starts before 'go'
+  go() {
+    [ "$1" = prepared-retake ] || return 0
+    echo prepared
+    local line
+    IFS= read -r line || { echo "the input ended before 'go': nothing taken up"; exit 1; }
+    [ "$line" = go ] || { echo "expected 'go' on the input, read '$line'"; exit 1; }
+  }
   # an emulator that exited leaves no phone to take the GPU up for: the restore fails
-  started || { echo "no emulator running"; free_streamer; exit 0; }
+  started || { echo "no emulator running"; go "$1"; free_streamer; exit 0; }
   running || { echo "the emulator (pid $(cat "$STATE/emulator.pid")) exited: no phone to take the GPU up for"; exit 1; }
   # Only an answer of "held" means there is nothing to take up again; a console that
   # does not answer is an error, or a released phone would stay paused.
   status=$(console gpu status) || { echo "the emulator's console did not answer 'gpu status'"; exit 1; }
   case "$(head -1 <<< "$status")" in
   released) ;;
-  held) echo "the emulator holds the GPU"; free_streamer; exit 0 ;;
+  held) echo "the emulator holds the GPU"; go "$1"; free_streamer; exit 0 ;;
   *) echo "unexpected 'gpu status' answer: $status"; exit 1 ;;
   esac
+  go "$1"
   t0=$(mono_ms)
   out=$(console gpu retake)
   echo "$out"
@@ -89,7 +105,7 @@ retake)
   exit 1
   ;;
 *)
-  echo "usage: gpu-hook release|retake" >&2
+  echo "usage: gpu-hook release|retake|prepared-retake" >&2
   exit 2
   ;;
 esac

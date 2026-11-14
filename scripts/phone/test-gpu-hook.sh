@@ -2,7 +2,8 @@
 # fleet/phone/gpu-hook against a stub adb: a retake takes up the GPU only when the
 # emulator's console says it is released, returns success without one only when the console
 # says "held", and fails when the console does not answer, which would otherwise leave a
-# released phone paused while the caller is told it was taken up. A streamer that ignores
+# released phone paused while the caller is told it was taken up. A prepared retake waits
+# for 'go' on its input before it takes anything up. A streamer that ignores
 # SIGTERM is killed, not waited for, and an emulator that exited and was never reaped (a
 # zombie) is not running.
 #   scripts/phone/test-gpu-hook.sh
@@ -59,6 +60,52 @@ fi
 
 printf 'what\r\n' > "$dir/status"
 if run; then bad "a retake succeeded on an unexpected status: $(cat "$dir/out")"; else ok "an unexpected status fails"; fi
+
+# prepared-retake (fc-agent starts it while the GPU is coming up): the console's status is
+# asked before 'go' and the retake only after it; input that ends without 'go' takes
+# nothing up and fails; the streamer stays held until 'go'.
+prep() { GPU_HOOK_ADB="$dir/adb" GPU_HOOK_STATE="$dir" FRAME_TIMEOUT_MS=500 "$hook" prepared-retake > "$dir/out" 2>&1; }
+printf 'released\r\nOK\r\n' > "$dir/status"
+rm -f "$dir/asked"
+if prep < /dev/null; then bad "a prepared retake whose input ended succeeded: $(cat "$dir/out")"; else ok "a prepared retake whose input ends without go fails"; fi
+if grep -q 'gpu status' "$dir/asked" && ! grep -q 'gpu retake' "$dir/asked"; then
+  ok "a prepared retake without go asked the status and took nothing up"
+else
+  bad "a prepared retake without go asked: '$(cat "$dir/asked" 2> /dev/null)'"
+fi
+# held for a 'go' from a fifo: status asked, nothing taken up, the streamer held, until go
+prep_go() {
+  rm -f "$dir/asked" "$dir/go" "$dir/out"
+  touch "$dir/streamer.hold"
+  mkfifo "$dir/go"
+  prep < "$dir/go" &
+  p=$!
+  exec 9> "$dir/go"
+  until grep -q '^prepared' "$dir/out" 2> /dev/null; do sleep 0.01; done
+  sleep 0.2
+  if grep -q 'gpu status' "$dir/asked" && ! grep -q 'gpu retake' "$dir/asked" && [ -e "$dir/streamer.hold" ]; then
+    ok "a prepared retake ($1) asks the status and holds the GPU and the streamer until go"
+  else
+    bad "a prepared retake ($1) before go: asked '$(cat "$dir/asked" 2> /dev/null)', hold $([ -e "$dir/streamer.hold" ] && echo kept || echo gone)"
+  fi
+  echo go >&9
+  exec 9>&-
+  rc=0
+  wait "$p" || rc=$?
+}
+prep_go released
+if [ "$rc" = 0 ] && grep -q 'gpu retake' "$dir/asked" && grep -q 'first_frame_at_ms=' "$dir/out" && [ ! -e "$dir/streamer.hold" ]; then
+  ok "a prepared retake takes the GPU up after go and lets the streamer start"
+else
+  bad "a prepared retake after go: exit $rc, asked '$(cat "$dir/asked")': $(cat "$dir/out")"
+fi
+printf 'held\r\nOK\r\n' > "$dir/status"
+prep_go held
+if [ "$rc" = 0 ] && ! grep -q 'gpu retake' "$dir/asked" && [ ! -e "$dir/streamer.hold" ]; then
+  ok "a prepared retake of a held GPU lets the streamer start after go"
+else
+  bad "a prepared retake of a held GPU: exit $rc: $(cat "$dir/out")"
+fi
 
 # The phone streamer holds a CUDA context: a release stops it and holds it stopped (the
 # phone.sh serve loop waits on the hold file), a retake lets it start again.

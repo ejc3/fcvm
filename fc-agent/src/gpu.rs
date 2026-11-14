@@ -605,22 +605,64 @@ impl StepClock {
 }
 
 async fn attach_devices(announced: &[String], host_scrubbed: bool) -> Result<AttachReport> {
-    Ok(bring_up(announced, true, host_scrubbed).await?.report)
+    let up = bring_up(announced, true, host_scrubbed, None).await?;
+    let mut report = up.report;
+    report.steps.clocks_ms = up.clocks.wait().await;
+    Ok(report)
 }
 
 /// What [`bring_up`] found.
 pub struct BroughtUp {
-    /// The GPUs `nvidia-smi -L` lists and each step's duration.
+    /// The GPUs `nvidia-smi -L` lists and each step's duration, but for the clocks'.
     pub report: AttachReport,
     /// Their UUIDs, in `nvidia-smi -L` order.
     pub uuids: Vec<String>,
+    /// The application clocks being set; the caller waits for them (and records their
+    /// duration) once its own work on the GPUs is under way.
+    pub clocks: Clocks,
+}
+
+/// [`set_max_application_clocks`] running on a task of its own.
+pub struct Clocks(tokio::task::JoinHandle<f64>);
+
+impl Clocks {
+    fn start() -> Self {
+        Self(tokio::spawn(async {
+            let (ms, ()) = timed(set_max_application_clocks(Path::new(DRIVER_ROOT))).await;
+            eprintln!("[fc-agent] gpu: step=clocks elapsed_ms={ms:.3}");
+            ms
+        }))
+    }
+
+    /// Wait for the clocks; their milliseconds, or 0 when the task did not finish (it logs
+    /// its own failures and never fails the attach).
+    pub async fn wait(self) -> f64 {
+        self.0.await.unwrap_or(0.0)
+    }
 }
 
 /// Rescan for the announced GPUs, load the driver if it is not loaded, create
 /// the device nodes, start nvidia-persistenced, zero the GPUs' memory and check
 /// that `nvidia-smi -L` lists every GPU. With `cdi`, also write the CDI spec
 /// the container's launch reads; a warm restore's container is already running.
-pub async fn bring_up(announced: &[String], cdi: bool, host_scrubbed: bool) -> Result<BroughtUp> {
+///
+/// `usable` is told when the container may use the GPUs, which can be before the bring-up
+/// ends: once the device nodes exist when the host scrubbed every GPU (nothing of a previous
+/// VM is on them, and the guest does not scrub), else once the guest's scrub has zeroed
+/// them. The first open of a GPU initialises it whether nvidia-persistenced or the container
+/// opens it first.
+pub async fn bring_up(
+    announced: &[String],
+    cdi: bool,
+    host_scrubbed: bool,
+    mut usable: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<BroughtUp> {
+    let mut tell_usable = || {
+        if let Some(usable) = usable.take() {
+            // A caller that stopped waiting has nothing to start.
+            let _ = usable.send(());
+        }
+    };
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
@@ -658,6 +700,9 @@ pub async fn bring_up(announced: &[String], cdi: bool, host_scrubbed: bool) -> R
     let proc_devices = std::fs::read_to_string("/proc/devices").context("reading /proc/devices")?;
     create_device_nodes(&device_nodes(&parse_char_majors(&proc_devices), &minors)?)?;
     steps.nodes_ms = clock.lap("device-nodes");
+    if host_scrubbed {
+        tell_usable();
+    }
 
     start_persistenced(driver_root).await?;
     steps.persistenced_ms = clock.lap("persistenced");
@@ -671,24 +716,22 @@ pub async fn bring_up(announced: &[String], cdi: bool, host_scrubbed: bool) -> R
         let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
         steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
     }
+    tell_usable();
 
     // The list and the spec only read the GPUs the daemon has initialised, and
-    // the clocks change no state they read, so the three run together. The spec
-    // is generated after the daemon starts so it mounts its socket.
-    let ((smi_ms, listed), (cdi_ms, spec), (clocks_ms, ())) = tokio::join!(
-        timed(list_gpus(driver_root)),
-        async {
-            if cdi {
-                timed(generate_cdi_spec(driver_root)).await
-            } else {
-                (0.0, Ok(()))
-            }
-        },
-        timed(set_max_application_clocks(driver_root))
-    );
+    // the clocks change no state they read, so they all run together; the clocks
+    // keep running after the bring-up returns, beside what the caller does next. The
+    // spec is generated after the daemon starts so it mounts its socket.
+    let clocks = Clocks::start();
+    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(timed(list_gpus(driver_root)), async {
+        if cdi {
+            timed(generate_cdi_spec(driver_root)).await
+        } else {
+            (0.0, Ok(()))
+        }
+    });
     steps.smi_ms = smi_ms;
     steps.cdi_ms = cdi_ms;
-    steps.clocks_ms = clocks_ms;
     eprintln!("[fc-agent] gpu: step=nvidia-smi elapsed_ms={smi_ms:.3}");
     eprintln!("[fc-agent] gpu: step=cdi elapsed_ms={cdi_ms:.3}");
     let listed = listed?;
@@ -711,6 +754,7 @@ pub async fn bring_up(announced: &[String], cdi: bool, host_scrubbed: bool) -> R
             steps,
         },
         uuids: parse_smi_uuids(&listed),
+        clocks,
     })
 }
 
@@ -1010,7 +1054,7 @@ mod tests {
             .expect("no attach_devices")..];
         let attach = &attach[..attach.find("\n}\n").expect("attach_devices does not end")];
         assert!(
-            attach.contains("bring_up(announced, true, host_scrubbed)"),
+            attach.contains("bring_up(announced, true, host_scrubbed, None)"),
             "attach_devices does not bring the GPUs up with the CDI spec"
         );
         let body = &code[code.find("pub async fn bring_up(").expect("no bring_up")..];
@@ -1073,27 +1117,76 @@ mod tests {
     }
 
     /// Every bring-up sets the GPUs' application clocks to their maximum, once the
-    /// daemon has initialised them and before the attach returns (the container
-    /// starts after it). Without it a T4 drew a wall renderer's paced frames at its
-    /// 585 MHz default (fleet/renderer/README.md, "GPU clocks").
+    /// daemon has initialised them, and the attach and the unpark wait for them before
+    /// they return (the container starts, or the restore is acknowledged, after). The
+    /// clocks run beside what follows the bring-up, not before it. Without them a T4 drew a
+    /// wall renderer's paced frames at its 585 MHz default (fleet/renderer/README.md, "GPU
+    /// clocks").
     #[test]
-    fn bring_up_sets_the_application_clocks_before_it_returns() {
+    fn bring_up_starts_the_application_clocks_and_its_callers_wait_for_them() {
         let body = attach_devices_body();
         let daemon = body
             .find("start_persistenced(driver_root)")
             .expect("no nvidia-persistenced");
         let clocks = body
-            .find("set_max_application_clocks(driver_root)")
+            .find("Clocks::start()")
             .expect("bring_up does not set the GPUs' application clocks");
-        let joined = body[clocks..]
-            .find(");")
-            .map(|end| clocks + end)
-            .expect("the clocks are not awaited");
         let ok = body.find("Ok(BroughtUp {").expect("no result");
         assert!(
-            daemon < clocks && joined < ok,
-            "the clocks ({clocks}) must be set after nvidia-persistenced ({daemon}) and \
-             awaited before bring_up returns ({ok})"
+            daemon < clocks && clocks < ok,
+            "the clocks ({clocks}) must start after nvidia-persistenced ({daemon}) and \
+             before bring_up returns ({ok})"
+        );
+        let source = include_str!("gpu.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let start = &code[code.find("impl Clocks {").expect("no Clocks")..];
+        assert!(start.contains("set_max_application_clocks(Path::new(DRIVER_ROOT))"));
+        for (file, function) in [
+            (code, "async fn attach_devices("),
+            (include_str!("gpu_park.rs"), "pub async fn unpark("),
+        ] {
+            let f = &file[file.find(function).unwrap()..];
+            let f = &f[..f.find("\n}\n").unwrap()];
+            let wait = f
+                .find("clocks.wait().await")
+                .unwrap_or_else(|| panic!("{function} does not wait for the clocks"));
+            let ok = f
+                .rfind("Ok(report)")
+                .unwrap_or_else(|| panic!("{function}: no Ok(report)"));
+            assert!(wait < ok, "{function} returns before the clocks are set");
+        }
+    }
+
+    /// The container may use the GPUs once the device nodes exist when the host scrubbed
+    /// every GPU, and only after the guest's scrub otherwise: nothing a previous VM left on
+    /// a GPU may reach the next container.
+    #[test]
+    fn the_gpus_are_usable_after_the_nodes_on_a_host_scrub_else_after_the_guest_scrub() {
+        let body = attach_devices_body();
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        let calls: Vec<usize> = body
+            .match_indices("tell_usable();")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "tell_usable is called {} times",
+            calls.len()
+        );
+        let nodes = at("clock.lap(\"device-nodes\")");
+        let daemon = at("start_persistenced(driver_root)");
+        let scrub = at("scrub_gpus(");
+        let list = at("list_gpus(driver_root)");
+        assert!(nodes < calls[0] && calls[0] < daemon);
+        assert!(
+            body[nodes..calls[0]].contains("if host_scrubbed {"),
+            "the GPUs are usable before the daemon starts without a host scrub"
+        );
+        assert!(scrub < calls[1] && calls[1] < list);
+        assert!(
+            body.contains(".await?;\n    }\n    tell_usable();"),
+            "the second tell_usable does not follow the scrub's branch"
         );
     }
 

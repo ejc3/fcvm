@@ -30,7 +30,12 @@
 //! [`GPU_HOOK_LABEL`] image label: park runs it with `release` first, and the hook
 //! lets go of the GPU (no `/dev/nvidia*` descriptor or mapping left) while its
 //! process keeps running; unpark runs it with `retake` once the GPUs are up and the
-//! CUDA processes are restored.
+//! CUDA processes are restored. A hook whose image also sets [`GPU_HOOK_PREPARED_LABEL`]
+//! takes `prepared-retake`: unpark starts it before it brings the GPUs up, so the container
+//! exec and the hook's own checks are done by then, and writes `go` to its input once the
+//! container may use the GPUs ([`gpu::bring_up`] says when). With no CUDA process to
+//! restore first, that is while nvidia-persistenced is still initialising the GPU, and the
+//! retake's own GPU initialisation overlaps it.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -57,6 +62,8 @@ const PERSISTENCED_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The image label naming the container's GPU hook: an executable in the container
 /// that `release` makes let go of the GPU and `retake` makes take it up again.
 pub const GPU_HOOK_LABEL: &str = "dev.fcvm.gpu-hook";
+/// The image label saying the GPU hook also takes `prepared-retake` (any non-empty value).
+pub const GPU_HOOK_PREPARED_LABEL: &str = "dev.fcvm.gpu-hook-prepared";
 /// One hook call. The emulator's release and retake each measure under a second on a
 /// T4; the rest is the margin a cold page cache and a busy guest need.
 const GPU_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -75,6 +82,9 @@ pub struct Parked {
     /// The container's GPU hook, which released the GPU and must retake it.
     #[serde(default)]
     pub hook: Option<String>,
+    /// Whether the hook takes `prepared-retake` ([`GPU_HOOK_PREPARED_LABEL`]).
+    #[serde(default)]
+    pub hook_prepared: bool,
 }
 
 impl Parked {
@@ -189,10 +199,19 @@ fn podman(args: &[&str]) -> tokio::process::Command {
     command
 }
 
+/// The running container's GPU hook.
+#[derive(Debug, PartialEq, Eq)]
+struct ContainerHook {
+    /// What [`GPU_HOOK_LABEL`] names.
+    path: String,
+    /// Whether [`GPU_HOOK_PREPARED_LABEL`] is set.
+    prepared: bool,
+}
+
 /// The GPU hook the running container's image names in [`GPU_HOOK_LABEL`], if any.
 /// No container running means no hook; a container podman cannot inspect is an error,
 /// since a hook that is not run leaves its process holding the GPU.
-async fn container_gpu_hook() -> Result<Option<String>> {
+async fn container_gpu_hook() -> Result<Option<ContainerHook>> {
     let mut exists = podman(&["container", "exists", CONTAINER]);
     exists.kill_on_drop(true);
     let status = tokio::time::timeout(GPU_HOOK_TIMEOUT, exists.status())
@@ -202,20 +221,34 @@ async fn container_gpu_hook() -> Result<Option<String>> {
     if status.code() == Some(1) {
         return Ok(None);
     }
-    let format = format!("{{{{index .Config.Labels \"{GPU_HOOK_LABEL}\"}}}}");
-    let label = gpu::run_checked(
+    let format = format!(
+        "{{{{index .Config.Labels \"{GPU_HOOK_LABEL}\"}}}}\n\
+         {{{{index .Config.Labels \"{GPU_HOOK_PREPARED_LABEL}\"}}}}"
+    );
+    let labels = gpu::run_checked(
         &format!("podman inspect {CONTAINER}"),
         podman(&["inspect", "--format", &format, CONTAINER]),
         GPU_HOOK_TIMEOUT,
     )
     .await?;
-    Ok(parse_hook_label(&label))
+    Ok(parse_hook_labels(&labels))
 }
 
-/// `podman inspect`'s rendering of the label: empty or `<no value>` when unset.
-fn parse_hook_label(rendered: &str) -> Option<String> {
-    let hook = rendered.trim();
-    (!hook.is_empty() && hook != "<no value>").then(|| hook.to_string())
+/// `podman inspect`'s rendering of [`GPU_HOOK_LABEL`] and [`GPU_HOOK_PREPARED_LABEL`], one
+/// per line; each is empty or `<no value>` when unset.
+fn parse_hook_labels(rendered: &str) -> Option<ContainerHook> {
+    let set = |label: Option<&str>| {
+        label
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "<no value>")
+            .map(str::to_string)
+    };
+    let mut lines = rendered.lines();
+    let path = set(lines.next())?;
+    Some(ContainerHook {
+        path,
+        prepared: set(lines.next()).is_some(),
+    })
 }
 
 /// Runs `hook action` in the container and returns what it printed.
@@ -226,6 +259,69 @@ async fn run_gpu_hook(hook: &str, action: &str) -> Result<String> {
         GPU_HOOK_TIMEOUT,
     )
     .await
+}
+
+/// A hook's `prepared-retake`, started before the GPUs are up: it does its checks and then
+/// waits for `go` on its input.
+struct PreparedRetake {
+    what: String,
+    child: tokio::process::Child,
+    input: tokio::process::ChildStdin,
+}
+
+impl PreparedRetake {
+    /// Start `hook prepared-retake` in the container.
+    fn start(hook: &str) -> Result<Self> {
+        Self::spawn(
+            format!("the container's GPU hook ({hook} prepared-retake)"),
+            podman(&["exec", "-i", CONTAINER, hook, "prepared-retake"]),
+        )
+    }
+
+    fn spawn(what: String, mut command: tokio::process::Command) -> Result<Self> {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("starting {what}"))?;
+        let input = child.stdin.take().context("the hook has no input")?;
+        Ok(Self { what, child, input })
+    }
+
+    /// Tell the hook the GPUs may be used, and wait for it to take them up. A hook
+    /// dropped without this is killed, and its input ends without `go`.
+    async fn go(mut self) -> Result<String> {
+        use tokio::io::AsyncWriteExt;
+        // A hook whose checks failed has exited and closed its input; its status and
+        // output then say why, so a failed write is reported only if it exited 0.
+        let sent = self.input.write_all(b"go\n").await;
+        drop(self.input);
+        let output = tokio::time::timeout(GPU_HOOK_TIMEOUT, self.child.wait_with_output())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("{} did not finish within {GPU_HOOK_TIMEOUT:?}", self.what)
+            })?
+            .with_context(|| format!("waiting for {}", self.what))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            bail!("{} failed ({}): {}", self.what, output.status, text.trim());
+        }
+        sent.with_context(|| {
+            format!(
+                "{} exited before it was told to go: {}",
+                self.what,
+                text.trim()
+            )
+        })?;
+        Ok(text)
+    }
 }
 
 fn cuda_checkpoint(args: &[String]) -> tokio::process::Command {
@@ -394,7 +490,9 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
 
     // A process holding the GPU outside CUDA lets go of it through its container's
     // hook first; whatever still holds a device afterwards must be a CUDA process.
-    let hook = container_gpu_hook().await?;
+    let container_hook = container_gpu_hook().await?;
+    let hook_prepared = container_hook.as_ref().is_some_and(|h| h.prepared);
+    let hook = container_hook.map(|h| h.path);
     let mut release_ms = 0.0;
     if let Some(hook) = &hook {
         // Recorded before the release runs: a hook that released the GPU and then failed
@@ -484,6 +582,7 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
         uuids,
         addresses,
         hook,
+        hook_prepared,
     };
     parked.store(Path::new(PARKED_RECORD))?;
     eprintln!(
@@ -515,8 +614,43 @@ pub async fn unpark(
         );
     }
     let started = Instant::now();
-    let up = gpu::bring_up(announced, false, host_scrubbed).await?;
-    let up_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // A hook that takes `prepared-retake` starts now, beside the bring-up. One that cannot
+    // be started is retaken as before, after the bring-up.
+    let mut prepared = match (&parked.hook, parked.hook_prepared) {
+        (Some(hook), true) => match PreparedRetake::start(hook) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                eprintln!("[fc-agent] gpu: WARNING {error:#}; retaking after the bring-up");
+                None
+            }
+        },
+        _ => None,
+    };
+    // With no CUDA process to restore onto the GPUs first, the hook goes as soon as the
+    // bring-up says the container may use them.
+    let early = prepared.is_some() && parked.pids.is_empty();
+    let (usable_tx, usable_rx) = tokio::sync::oneshot::channel();
+    let bring_up = |usable| async move {
+        let started = Instant::now();
+        let up = gpu::bring_up(announced, false, host_scrubbed, usable).await;
+        (up, started.elapsed().as_secs_f64() * 1000.0)
+    };
+    let ((up, up_ms), early_retake) = if early {
+        let prepared = prepared.take().expect("checked above");
+        let retake = async move {
+            usable_rx.await.map_err(|_| {
+                anyhow::anyhow!("the GPU bring-up ended before the GPUs were usable")
+            })?;
+            let retake_started = Instant::now();
+            let out = prepared.go().await?;
+            Ok::<_, anyhow::Error>((out, retake_started.elapsed().as_secs_f64() * 1000.0))
+        };
+        let (up, retake) = tokio::join!(bring_up(Some(usable_tx)), retake);
+        (up, Some(retake))
+    } else {
+        (bring_up(None).await, None)
+    };
+    let up = up?;
     let map = device_map(&parked.uuids, &up.uuids)?;
     let restore_started = Instant::now();
     for &pid in &parked.pids {
@@ -534,29 +668,42 @@ pub async fn unpark(
             .await
             .with_context(|| format!("unlocking parked process {pid}"))?;
     }
+    let retaken = match (early_retake, &parked.hook) {
+        (Some(retake), _) => Some(retake),
+        (None, Some(hook)) => {
+            let retake_started = Instant::now();
+            let out = match prepared {
+                Some(prepared) => prepared.go().await,
+                None => run_gpu_hook(hook, "retake").await,
+            };
+            Some(out.map(|out| (out, retake_started.elapsed().as_secs_f64() * 1000.0)))
+        }
+        (None, None) => None,
+    };
     let mut retake_ms = 0.0;
-    if let Some(hook) = &parked.hook {
-        let retake_started = Instant::now();
-        let out = run_gpu_hook(hook, "retake")
-            .await
-            .context("the container's GPU hook could not take the GPU up again")?;
-        retake_ms = retake_started.elapsed().as_secs_f64() * 1000.0;
+    if let Some(retaken) = retaken {
+        let (out, ms) =
+            retaken.context("the container's GPU hook could not take the GPU up again")?;
+        retake_ms = ms;
         eprintln!(
-            "[fc-agent] gpu: the container's hook retook the GPU in {retake_ms:.1} ms: {}",
-            out.trim()
+            "[fc-agent] gpu: the container's hook retook the GPU in {retake_ms:.1} ms{}: {}",
+            if early { ", beside the bring-up" } else { "" },
+            out.trim().replace('\n', "; ")
         );
     }
+    let mut report = up.report;
+    report.steps.clocks_ms = up.clocks.wait().await;
     let record = PathBuf::from(PARKED_RECORD);
     std::fs::remove_file(&record).with_context(|| format!("removing {}", record.display()))?;
     eprintln!(
         "[fc-agent] gpu: unparked {} process(es) onto {} GPU(s){}: bring_up_ms={up_ms:.1} \
          cuda_restore_ms={restore_ms:.1} hook_retake_ms={retake_ms:.1} total_ms={:.1}",
         parked.pids.len(),
-        up.report.gpus,
+        report.gpus,
         if map.is_some() { " (other GPUs)" } else { "" },
         started.elapsed().as_secs_f64() * 1000.0
     );
-    Ok(up.report)
+    Ok(report)
 }
 
 /// `fc-agent --gpu-unpark`, in the source VM after the host attached its GPUs again.
@@ -636,6 +783,7 @@ mod tests {
             uuids: vec!["GPU-1".to_string()],
             addresses: vec!["0000:00:06.0".to_string()],
             hook: Some("/usr/local/bin/gpu-hook".to_string()),
+            hook_prepared: true,
         };
         parked.store(&path).unwrap();
         assert_eq!(Parked::load(&path).unwrap(), Some(parked));
@@ -651,17 +799,96 @@ mod tests {
             r#"{"pids":[7],"uuids":["GPU-1"],"addresses":["0000:00:06.0"]}"#,
         )
         .unwrap();
-        assert_eq!(Parked::load(&path).unwrap().unwrap().hook, None);
+        let parked = Parked::load(&path).unwrap().unwrap();
+        assert_eq!(parked.hook, None);
+        assert!(!parked.hook_prepared);
+    }
+
+    /// A snapshot parked by a hook without `prepared-retake` is retaken as before.
+    #[test]
+    fn a_record_without_hook_prepared_loads_unprepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parked.json");
+        std::fs::write(
+            &path,
+            r#"{"pids":[],"uuids":["GPU-1"],"addresses":["0000:00:06.0"],"hook":"/h"}"#,
+        )
+        .unwrap();
+        let parked = Parked::load(&path).unwrap().unwrap();
+        assert_eq!(parked.hook.as_deref(), Some("/h"));
+        assert!(!parked.hook_prepared);
     }
 
     #[test]
-    fn an_unset_hook_label_is_no_hook() {
-        assert_eq!(parse_hook_label("\n"), None);
-        assert_eq!(parse_hook_label("<no value>\n"), None);
+    fn the_hook_labels_name_the_hook_and_whether_it_is_prepared() {
+        assert_eq!(parse_hook_labels("\n"), None);
+        assert_eq!(parse_hook_labels("<no value>\n<no value>\n"), None);
+        assert_eq!(parse_hook_labels("<no value>\n1\n"), None);
+        let hook = |prepared| ContainerHook {
+            path: "/usr/local/bin/gpu-hook".to_string(),
+            prepared,
+        };
         assert_eq!(
-            parse_hook_label("/usr/local/bin/gpu-hook\n").as_deref(),
-            Some("/usr/local/bin/gpu-hook")
+            parse_hook_labels("/usr/local/bin/gpu-hook\n<no value>\n"),
+            Some(hook(false))
         );
+        assert_eq!(
+            parse_hook_labels("/usr/local/bin/gpu-hook\n"),
+            Some(hook(false))
+        );
+        assert_eq!(
+            parse_hook_labels("/usr/local/bin/gpu-hook\n1\n"),
+            Some(hook(true))
+        );
+    }
+
+    fn prepared(script: &str) -> PreparedRetake {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script);
+        PreparedRetake::spawn("a test hook".to_string(), command).unwrap()
+    }
+
+    /// The hook runs before `go` and takes the GPU up only after it.
+    #[tokio::test]
+    async fn a_prepared_retake_waits_for_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("retaken");
+        let hook = prepared(&format!(
+            "echo prepared; IFS= read -r line; [ \"$line\" = go ] || exit 1; touch {}; echo retaken_ms=5",
+            mark.display()
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!mark.exists(), "the hook retook before it was told to go");
+        let out = hook.go().await.unwrap();
+        assert!(mark.exists());
+        assert!(
+            out.contains("prepared") && out.contains("retaken_ms=5"),
+            "{out}"
+        );
+    }
+
+    /// A hook whose checks failed before `go` fails the unpark with what it printed.
+    #[tokio::test]
+    async fn a_prepared_retake_that_failed_its_checks_says_why() {
+        let hook = prepared("echo 'the emulator exited'; exit 1");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let error = format!("{:#}", hook.go().await.unwrap_err());
+        assert!(error.contains("the emulator exited"), "{error}");
+    }
+
+    /// A prepared retake dropped without `go` (the bring-up failed) is killed, and its
+    /// input ends: the hook takes nothing up.
+    #[tokio::test]
+    async fn a_prepared_retake_dropped_without_go_takes_nothing_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("retaken");
+        let hook = prepared(&format!(
+            "IFS= read -r line && [ \"$line\" = go ] && touch {}",
+            mark.display()
+        ));
+        drop(hook);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!mark.exists());
     }
 
     /// The hook releases the GPU before any holder is read or checkpointed (a process
@@ -686,8 +913,26 @@ mod tests {
         let unpark = &code[code.find("pub async fn unpark(").unwrap()..];
         let unlock = at(unpark, "action(\"unlock\", pid)");
         let retake = at(unpark, "run_gpu_hook(hook, \"retake\")");
+        let go = at(unpark, "Some(prepared) => prepared.go().await");
         let record = at(unpark, "remove_file(&record)");
         assert!(unlock < retake && retake < record);
+        assert!(unlock < go && go < record);
+    }
+
+    /// A prepared hook goes beside the bring-up only when no CUDA process must be restored
+    /// onto the GPUs first, and only once the bring-up says they are usable.
+    #[test]
+    fn a_prepared_hook_goes_beside_the_bring_up_only_without_cuda_processes() {
+        let source = include_str!("gpu_park.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = &code[code.find("pub async fn unpark(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("(Some(hook), true) => match PreparedRetake::start(hook)"));
+        assert!(body.contains("let early = prepared.is_some() && parked.pids.is_empty();"));
+        let wait = body.find("usable_rx").unwrap();
+        let go = body.find("prepared.go().await?").unwrap();
+        assert!(wait < go, "the early hook goes before the GPUs are usable");
+        assert!(body.contains("tokio::join!(bring_up(Some(usable_tx)), retake)"));
     }
 
     /// The park order is fixed: every process is locked before any is
@@ -715,7 +960,7 @@ mod tests {
         let code = source.split("#[cfg(test)]").next().unwrap();
         let body = &code[code.find("pub async fn unpark(").unwrap()..];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("no {needle}"));
-        let up = at("gpu::bring_up(announced, false, host_scrubbed)");
+        let up = at("gpu::bring_up(announced, false, host_scrubbed, usable)");
         let restore = at("action(\"restore\", pid)");
         let unlock = at("action(\"unlock\", pid)");
         let record = at("remove_file(&record)");
