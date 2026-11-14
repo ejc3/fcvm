@@ -91,15 +91,27 @@ class Build(unittest.TestCase):
             labels = [r[0] for r in data["setup"]["rows"]]
             self.assertNotIn("ECS on Fargate", labels)
             self.assertIn("ECS on EC2", labels)
-            self.assertIn("Lambda, new runtime every request", labels)
+            self.assertIn("Lambda, cold start", labels)
             fargate = next(n for n in data["not_run"] if n["id"] == "ecs-fargate")
             self.assertIn("ECR interface endpoints", fargate["why"])
             self.assertEqual({n["id"] for n in data["not_run"]}, set(render.LANES) - {"fcvm-file", "ecs-ec2"})
             render.check_public(json.dumps(data))
 
+    def test_a_cold_record_without_cold_start_evidence_is_not_a_cold_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            recs = [sample("lambda-cold", 0, 1, 160.0, request_id="r1", generation="g1", init_duration_ms=12.3),
+                    sample("lambda-cold", 1, 2, 60.0, request_id="r2"),
+                    sample("lambda-cold", 2, 3, 61.0, request_id="r3", generation="g3", init_duration_ms=None)]
+            write_results(d, recs)
+            lc = render.build(d)["lanes"][0]
+            self.assertEqual(lc["n"], 1)
+            self.assertEqual(lc["median_ms"], 160.0)
+            self.assertEqual(lc["failures"], 2)
+            self.assertTrue(all("not" in f["error"] for f in lc["failed"]))
+
     def test_init_duration_is_joined_by_request_id(self):
         with tempfile.TemporaryDirectory() as d:
-            recs = [sample("lambda-cold", 0, 1, 120.0, request_id="r1"), sample("lambda-cold", 1, 2, 130.0, request_id="r2")]
+            recs = [sample("lambda-warm", 0, 1, 120.0, request_id="r1"), sample("lambda-warm", 1, 2, 130.0, request_id="r2")]
             write_results(d, recs, {"r1": {"init_duration": "30.12 ms"}, "r2": {"init_duration": None}})
             lc = render.build(d)["lanes"][0]
             self.assertEqual(lc["checks"]["report"], 2)

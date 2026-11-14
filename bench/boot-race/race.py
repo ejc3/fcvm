@@ -395,10 +395,25 @@ class Ecs:
 
 
 # ------------------------------------------------------------------ Lambda lanes
+def parse_report(message):
+    """The fields of one Lambda REPORT log line, by name ("REPORT RequestId", "Duration", "Init Duration", ...)."""
+    return dict(p.strip().split(": ", 1) for p in message.strip().split("\t") if ": " in p)
+
+
 class Lambda:
+    """The Lambda lanes. lambda-cold makes every sample a cold start: before t0 it updates the function's
+    configuration (a new BOOT_RACE_GENERATION value), which retires the function's execution environments, and
+    after t1 it reads the invocation's REPORT line, whose Init Duration a cold start carries; run() refuses a
+    cold sample without one. Neither step is timed."""
+
+    COLD = "boot-race-cold"
+
     def __init__(self, cfg):
         self.cfg = cfg
-        self.creds = session().get_credentials()
+        s = session()
+        self.creds = s.get_credentials()
+        self.lam = s.client("lambda")
+        self.logs = s.client("logs")
 
     def signed_get(self, url):
         from botocore.auth import SigV4Auth
@@ -430,9 +445,52 @@ class Lambda:
             raise RuntimeError("answer without ok")
         return {"t_start_unix_ms": start_ms, "ms": (t1 - t0) / 1e6, "request_id": rid, "answer": doc}
 
+    def new_environment(self, name):
+        """Retire the function's execution environments: any configuration change sends the next invocation to a
+        new one. Returns the generation written."""
+        env = dict(self.lam.get_function_configuration(FunctionName=name)["Environment"]["Variables"])
+        env["BOOT_RACE_GENERATION"] = os.urandom(8).hex()
+        self.lam.update_function_configuration(FunctionName=name, Environment={"Variables": env})
+        self.lam.get_waiter("function_updated_v2").wait(FunctionName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 120})
+        return env["BOOT_RACE_GENERATION"]
+
+    def init_duration_ms(self, name, rid, since_ms, deadline_s=120):
+        """The Init Duration of one invocation's REPORT line (None when the line has none); waits for the line."""
+        end = time.time() + deadline_s
+        while time.time() < end:
+            kw = {"logGroupName": f"/aws/lambda/{name}", "startTime": int(since_ms) - 60_000,
+                  "filterPattern": f'"REPORT RequestId: {rid}"'}
+            while True:  # FilterLogEvents may return empty pages before the one holding the line
+                r = self.logs.filter_log_events(**kw)
+                for e in r["events"]:
+                    parts = parse_report(e["message"])
+                    if parts.get("REPORT RequestId") == rid:
+                        init = parts.get("Init Duration")
+                        return float(init.split()[0]) if init else None
+                if not r.get("nextToken"):
+                    break
+                kw["nextToken"] = r["nextToken"]
+            time.sleep(2)
+        raise TimeoutError(f"no REPORT line for the invocation in {deadline_s} s")
+
+    def cold_sample(self, url):
+        generation = self.new_environment(self.COLD)
+        s = self.call(url)
+        s["generation"] = generation
+        s["init_duration_ms"] = self.init_duration_ms(self.COLD, s["request_id"], s["t_start_unix_ms"])
+        return s
+
     async def sample(self, lane):
-        url = self.cfg["function_urls"]["cold" if lane == "lambda-cold" else "warm"]
-        return await asyncio.to_thread(self.call, url)
+        if lane == "lambda-cold":
+            return await asyncio.to_thread(self.cold_sample, self.cfg["function_urls"]["cold"])
+        return await asyncio.to_thread(self.call, self.cfg["function_urls"]["warm"])
+
+
+def check_cold(lane, sample):
+    """Refuse a lambda-cold sample whose invocation was not a cold start; return the reason or None."""
+    if lane == "lambda-cold" and sample.get("init_duration_ms") is None:
+        return "no Init Duration in the invocation's REPORT line: not a cold start"
+    return None
 
 
 # ------------------------------------------------------------------ the campaign
@@ -529,7 +587,7 @@ async def run(cfg, rounds, first_round, lanes):
                     rec["same_proc_as_previous"] = prev["proc_id"] == s["answer"]["proc_id"]
                     rec["same_boot_as_previous"] = prev["boot_id"] == s["answer"]["boot_id"]
                 prev_answer[lane] = s["answer"]
-                why = check_identity(lane, prev, s["answer"], cfg)
+                why = check_identity(lane, prev, s["answer"], cfg) or check_cold(lane, s)
                 if why:
                     rec.update(ok=False, error=f"IdentityCheck: {why}")
                     log(f"  {lane}: {s['ms']:.1f} ms REFUSED {why}")
@@ -555,9 +613,7 @@ def fetch_reports(cfg):
                 kw["nextToken"] = token
             r = logs.filter_log_events(**kw)
             for e in r["events"]:
-                parts = dict(
-                    p.strip().split(": ", 1) for p in e["message"].strip().split("\t") if ": " in p
-                )
+                parts = parse_report(e["message"])
                 rid = parts.get("REPORT RequestId")
                 if rid:
                     found[rid] = {
