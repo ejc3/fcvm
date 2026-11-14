@@ -372,7 +372,7 @@ help:
 	@echo "  bench-webkit-request-diag      WebKit twin of bench-chromium-request-diag (TAG=, BACKEND=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=, NETMODE=)"
 	@echo "  bench-chromium-corpus-extra   Host-control and matched-memory corpus campaign (PHASES=, RESULTS=)"
-	@echo "  bench-browserrun             Hosted Browser Run Chromium and Kitesurf (BR_REPS=, BR_WARMUP=, BROWSERRUN_RESULTS=)"
+	@echo "  bench-browserrun             Hosted Browser Run Chromium and Kitesurf (BR_REPS=, BR_VIEWPORT=, BROWSERRUN_RESULTS=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
 	@echo "  bench-chromium-hostcdp         Host direct-CDP baseline (COMPARISON_LABEL=standalone CPU_BUDGET=unlimited; CPUS= needs CPU_BUDGET=vm-matched)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
@@ -1311,7 +1311,7 @@ bench-chromium-corpus-extra: require-clean-tree build setup-default
 BROWSERRUN_RESULTS ?= bench/chromium/results/browserrun-$(shell date -u +%Y%m%d-%H%M%S)
 bench-browserrun:
 	@python3 bench/chromium/browserrun.py --out "$(BROWSERRUN_RESULTS)" \
-		--client-location "$(BR_CLIENT_LOCATION)" \
+		--client-location "$(BR_CLIENT_LOCATION)" $(if $(BR_VIEWPORT),--viewport "$(BR_VIEWPORT)",) \
 		$(if $(BR_REPS),--reps $(BR_REPS),) $(if $(BR_WARMUP),--warmup $(BR_WARMUP),) \
 		$(if $(BR_ENGINES),--engines $(BR_ENGINES),) $(if $(BR_OPS),--ops $(BR_OPS),)
 

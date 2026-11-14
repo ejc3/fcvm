@@ -2,7 +2,7 @@
 """Cloudflare's hosted Browser Run as measured arms: its Chromium and its Kitesurf.
 
     browserrun.py --out DIR [--engines chromium,kitesurf] [--ops screenshot,content]
-                  [--reps 28] [--warmup 1]
+                  [--reps 28] [--warmup 1] [--viewport 1280x600]
 
 Cloudflare's published Kitesurf table is the median of five Browser Run Quick
 Action runs over the 14-URL corpus, Kitesurf against Browser Run's default
@@ -32,7 +32,9 @@ a failure, as in the local Kitesurf arm.
 Measured requests run one at a time. Rep r renders urls[r % 14]; within a rep
 the (engine, op) order is shuffled from a recorded seed. The measured
 screenshot is JPEG at quality 80 by default, as cdpdrive takes it for the fcvm
-arm. A 429 is waited out (Retry-After, capped) and retried; the wait is recorded
+arm. An unauthenticated same-host Cloudflare edge probe is shuffled into each rep; it
+measures network/edge drift, without invoking either browser or fetching any
+corpus page. A 429 is waited out (Retry-After, capped) and retried; the wait is recorded
 and not timed. Any other non-2xx reply, an empty body, a screenshot that is not
 an image, or a /content reply without a closed document is a failed request,
 and the run goes on.
@@ -61,6 +63,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.cloudflare.com/client/v4/accounts/{account}/browser-run/{op}"
+TRACE_URL = "https://api.cloudflare.com/cdn-cgi/trace"
+# Reference Page.captureScreenshot dimensions measured on ARM with current headless Chromium.
+# --window-size=1280,800 sets the outer window; check the local trial before comparing builds.
+DEFAULT_VIEWPORT = (1280, 600)
 ENGINE_QUERY = {"chromium": "", "kitesurf": "?browser=kitesurf"}
 OPS = ("screenshot", "content")
 WORKER_MARKER = Path("/etc/fcvm-benchmark-worker")
@@ -132,8 +138,19 @@ def endpoint(account: str, op: str, engine: str) -> str:
     return API.format(account=account, op=op) + ENGINE_QUERY[engine]
 
 
-def request_body(op: str, url: str, image_type: str) -> dict:
-    body = {"url": url}
+def viewport_options(viewport):
+    return {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1}
+
+
+def viewport_size(value):
+    match = re.fullmatch(r"([1-9][0-9]{0,3})x([1-9][0-9]{0,3})", value)
+    if match is None or any(int(x) > 4096 for x in match.groups()):
+        raise argparse.ArgumentTypeError("viewport must be WIDTHxHEIGHT, with dimensions in 1..4096")
+    return tuple(map(int, match.groups()))
+
+
+def request_body(op: str, url: str, image_type: str, viewport) -> dict:
+    body = {"url": url, "viewport": viewport_options(viewport)}
     if op == "screenshot" and image_type == "jpeg":
         body["screenshotOptions"] = {"type": "jpeg", "quality": 80}
     return body
@@ -202,7 +219,7 @@ def call(args, opener, token, account, engine, op, url, image_type, sleep):
     waited = 0.0
     for _attempt in range(args.max_retries + 1):
         status, headers, payload, wall_ms = post(
-            endpoint(account, op, engine), token, request_body(op, url, image_type),
+            endpoint(account, op, engine), token, request_body(op, url, image_type, args.viewport),
             args.timeout, opener)
         if status != 429:
             break
@@ -233,6 +250,25 @@ def record(engine, op, url, status, headers, payload, wall_ms, waited, ok, detai
             "colo": colo(headers),
             "browser_headers": {k: v for k, v in headers.items() if "browser" in k.lower()},
             "rate_limit_wait_s": round(waited, 3), "ts": time.time()}
+
+
+def drift_probe(opener, timeout):
+    """Time a fixed unauthenticated edge response; never retain the trace body or client IP."""
+    req = urllib.request.Request(TRACE_URL, headers={"Cache-Control": "no-cache"})
+    started = time.monotonic_ns()
+    status, location = 0, None
+    try:
+        with opener.open(req, timeout=min(timeout, 8)) as response:
+            response.read(4096)
+            status = response.status
+            location = colo(dict(response.headers.items()))
+    except urllib.error.HTTPError as err:
+        with err:
+            status = err.code
+    except (http.client.HTTPException, OSError, ValueError):
+        pass
+    return {"status": status, "ok": status == 200, "colo": location, "loadavg1": loadavg1(),
+            "wall_ms": round((time.monotonic_ns() - started) / 1e6, 1), "ts": time.time()}
 
 
 def correctness(args, opener, token, account, engines, urls, sites, sleep):
@@ -294,6 +330,9 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
         json.dump({"engines": engines, "ops": ops, "reps": args.reps, "warmup": args.warmup,
                    "seed": args.seed, "urls": urls, "image_type": args.image_type,
                    "quality": 80 if args.image_type == "jpeg" else None, "api": API,
+                   "viewport": viewport_options(args.viewport),
+                   "drift_control": {"endpoint": TRACE_URL, "method": "GET",
+                                     "scope": "client-to-Cloudflare edge, not browser backend"},
                    "corpus": "live sites, fetched by Browser Run with Cloudflare's DNS",
                    "client": "browserrun.py: one request at a time over HTTPS from this host",
                    "client_location": args.client_location,
@@ -302,31 +341,47 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
                    "started_at": time.time()}, handle, indent=1, sort_keys=True)
     completed = correctness(args, opener, token, account, engines, urls, sites, sleep)
     rows_path = os.path.join(args.out, "browserrun.jsonl")
+    drift_path = os.path.join(args.out, "drift.jsonl")
     rng = random.Random(args.seed)
-    with open(rows_path, "x") as out:
+    with open(rows_path, "x") as out, open(drift_path, "x") as drift:
         for rep in range(args.warmup + args.reps):
             url = urls[rep % len(urls)]
-            order = [(e, o) for e in engines for o in ops]
+            order = [(e, o) for e in engines for o in ops] + [(None, None)]
             rng.shuffle(order)
-            for engine, op in order:
+            warmup = rep < args.warmup
+            for pos, (engine, op) in enumerate(order):
+                if engine is None:
+                    trace = drift_probe(opener, args.timeout)
+                    trace.update(rep=rep, warmup=warmup, position=pos)
+                    drift.write(json.dumps(trace, separators=(",", ":")) + "\n")
+                    drift.flush()
+                    continue
                 status, headers, payload, wall_ms, waited = call(
                     args, opener, token, account, engine, op, url, args.image_type, sleep)
                 ok, detail = judge(op, args.image_type, status, payload)
                 row = record(engine, op, url, status, headers, payload, wall_ms, waited, ok, detail)
-                row.update(rep=rep, warmup=rep < args.warmup,
+                row.update(rep=rep, warmup=warmup, position=pos,
                            page_completed=completed.get((engine, url), False))
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
                 out.flush()
                 print(f"{engine:8} {op:10} rep {rep:3} {'ok ' if ok else 'FAIL'} "
                       f"{wall_ms:8.1f} ms {row['colo'] or '-'} {detail[:80]}", file=sys.stderr, flush=True)
-    summarize(rows_path, os.path.join(args.out, "summary.json"))
+    summarize(rows_path, drift_path, os.path.join(args.out, "summary.json"))
     return 0
 
 
-def summarize(rows_path, out_path):
+def summarize(rows_path, drift_path, out_path):
     with open(rows_path) as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
-    summary = {"success_rule": "2xx with a well-formed body, and the page completed in the "
+    with open(drift_path) as handle:
+        controls = [json.loads(line) for line in handle if line.strip()]
+    measured = [row for row in controls if not row["warmup"]]
+    valid = [row for row in measured if row["ok"]]
+    walls = [row["wall_ms"] for row in valid]
+    drift = {"attempts": len(measured), "succeeded": len(valid), "failed": len(measured) - len(valid),
+             "wall_ms": {"min": min(walls), "median": statistics.median(walls), "max": max(walls)} if walls else None,
+             "colos": sorted({row["colo"] for row in valid if row["colo"]})}
+    summary = {"drift_control": drift, "success_rule": "2xx with a well-formed body, and the page completed in the "
                                "correctness pass (not blank, screenshot and content both worked)",
                "p50_convention": "statistics.median over successful measured requests",
                "cells": {}}
@@ -377,6 +432,8 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--seed", type=int, default=20261114)
     ap.add_argument("--image-type", choices=("png", "jpeg"), default="jpeg")
+    ap.add_argument("--viewport", type=viewport_size, default=DEFAULT_VIEWPORT,
+                    help="match actual local screenshot dimensions (default: %(default)s)")
     ap.add_argument("--timeout", type=float, default=90.0)
     ap.add_argument("--max-retries", type=int, default=5)
     ap.add_argument("--max-retry-wait", type=float, default=30.0)

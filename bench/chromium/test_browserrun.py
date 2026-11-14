@@ -72,8 +72,12 @@ class FakeCloudflare:
     def __init__(self, script=None):
         self.script = script or {}
         self.calls = []
+        self.controls = []
 
     def open(self, req, timeout):
+        if req.full_url == "https://api.cloudflare.com/cdn-cgi/trace":
+            self.controls.append((req.get_method(), dict(req.header_items()), len(self.calls)))
+            return Reply(200, b"ip=192.0.2.7\ncolo=IAD\n", {"cf-ray": "trace-IAD"})
         body = json.loads(req.data)
         engine = "kitesurf" if req.full_url.endswith("?browser=kitesurf") else "chromium"
         op = req.full_url.split("?")[0].rsplit("/", 1)[1]
@@ -96,7 +100,7 @@ class FakeCloudflare:
 def args(out, **kw):
     base = dict(out=out, engines="chromium,kitesurf", ops="screenshot,content", reps=14, warmup=0,
                 seed=1, image_type="jpeg", timeout=5.0, max_retries=3, max_retry_wait=2.0,
-                client_location="test-region")
+                client_location="test-region", viewport=(1280, 600))
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -131,6 +135,39 @@ class HostedArms(unittest.TestCase):
         run = json.load(open(os.path.join(self.tmp, "run.json")))
         self.assertEqual(run["client_location"], "test-region")
         self.assertIn("via_https_proxy", run)
+
+    def test_viewport_matches_across_all_hosted_operations_and_is_recorded(self):
+        cf = FakeCloudflare()
+        self.br.run(args(self.tmp, reps=1, viewport=(1280, 655)), TOKEN, ACCOUNT, opener=cf)
+        expected = {"width": 1280, "height": 655, "deviceScaleFactor": 1}
+        self.assertTrue(cf.calls)
+        self.assertTrue(all(req[2]["viewport"] == expected for req in cf.calls))
+        with open(os.path.join(self.tmp, "run.json")) as handle:
+            self.assertEqual(json.load(handle)["viewport"], expected)
+
+    def test_control_is_interleaved_and_separately_reported_without_credentials(self):
+        cf = FakeCloudflare()
+        self.br.run(args(self.tmp, reps=4, warmup=1), TOKEN, ACCOUNT, opener=cf)
+        self.assertEqual(len(cf.controls), 5)
+        self.assertTrue(all(method == "GET" and "Authorization" not in headers
+                            for method, headers, _ in cf.controls))
+        # Correctness uses 56 calls; every rep then has four measurements and one control,
+        # whose position is shuffled together with the measured treatments.
+        positions = [n - 56 - 4 * i for i, (_, _, n) in enumerate(cf.controls)]
+        self.assertTrue(all(0 <= position <= 4 for position in positions))
+        self.assertGreater(len(set(positions)), 1)
+        with open(os.path.join(self.tmp, "drift.jsonl")) as handle:
+            traces = [json.loads(line) for line in handle]
+        self.assertEqual([row["position"] for row in traces], positions)
+        self.assertEqual([row["warmup"] for row in traces], [True, False, False, False, False])
+        self.assertTrue(all(row["ok"] and row["colo"] == "IAD" for row in traces))
+        self.assertNotIn("192.0.2.7", json.dumps(traces))
+        with open(os.path.join(self.tmp, "summary.json")) as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["drift_control"]["attempts"], 4)
+        self.assertEqual(summary["drift_control"]["succeeded"], 4)
+        self.assertEqual(set(summary["cells"]), {"chromium/screenshot", "chromium/content",
+                                                 "kitesurf/screenshot", "kitesurf/content"})
 
     def test_the_token_is_sent_and_never_written(self):
         cf = FakeCloudflare()
@@ -282,6 +319,8 @@ class HostedArms(unittest.TestCase):
             seen = set()
 
             def open(inner, req, timeout):
+                if req.data is None:
+                    return super().open(req, timeout)
                 url = json.loads(req.data)["url"]
                 if req.full_url.endswith("/content"):
                     if url in inner.seen and url == a:

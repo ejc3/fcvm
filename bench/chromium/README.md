@@ -220,6 +220,16 @@ refuses to reuse an old trial’s output.
 - **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
   a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.
   Each record keeps the reply's status, size and digest, so content drift shows per page.
+- **Match the viewport.** Both hosted operations request the same explicit CSS viewport
+  and scale (default 1280×600 at 1×, measured from the current local Chromium CDP screenshot).
+  A flag such as `--window-size=1280,800` reports the outer window and is not proof of the
+  screenshot size. Check the local trial's returned width and height before comparing a
+  different Chromium build; use `BR_VIEWPORT=WIDTHxHEIGHT` to match it. `run.json` records
+  the actual request setting.
+- **Watch network drift.** Each repetition interleaves one unauthenticated GET to the same
+  Cloudflare API hostname without starting a browser. `drift.jsonl` records time, status
+  and colo, with a separate summary. This isolates the client-to-edge path only; it
+  neither measures browser backend contention nor corrects the results automatically.
 - **The network path is part of wall time.** wall_ms runs from this host's POST to the last
   byte of the reply; the colo that answered is on every record (from `cf-ray`), and any
   browser-time header Cloudflare sends is kept.
