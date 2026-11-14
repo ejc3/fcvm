@@ -747,60 +747,166 @@ fn binary_names_prefilled(bytes: &[u8]) -> bool {
 
 /// A prefilled backing and the pool slot it came from.
 struct PrefilledBacking {
-    file: std::sync::Arc<std::fs::File>,
-    refill: PrefillRefill,
+    file: std::sync::Arc<PrefillMemory>,
+    gate: SpareGate,
 }
 
-/// Whether a restore's prefill may still take a spare from the pool, and what it took.
+/// Whether a restore's prefill may still take a spare from the pool, what it took, and who
+/// refills it.
+///
+/// A spare the restore does not keep is refilled only once its memory is freed (#1880): on a
+/// fixed hugepage pool the refill needs those pages, and a cancelled copy (a blocking task
+/// that cannot be aborted) holds them until it finishes.
 #[derive(Debug, Default)]
 enum SpareClaim {
     /// Nothing taken yet; the prefill may take one.
     #[default]
     Open,
-    /// A spare was taken: the pool owes this refill unless the restore uses the memory.
+    /// A spare is in the restore's memory.
     Taken(PrefillRefill),
-    /// The pool had none, so the memory was allocated outside it.
-    Unclaimed,
-    /// The restore gave the prefill up before it took one; it takes none now.
-    Cancelled,
+    /// The memory of a taken spare was freed before the restore gave it up.
+    Released(PrefillRefill),
+    /// The restore gave up a taken spare whose memory is not freed yet: freeing it refills.
+    Owed(PrefillRefill),
+    /// The pool had none, so the memory was allocated outside it: a clone that runs on it
+    /// still fills the pool, so restores warm a cold pool.
+    Unclaimed(PrefillRefill),
+    /// Given up before a spare was taken, or settled: nothing more to refill.
+    Closed,
 }
 
-type SpareGate = std::sync::Arc<std::sync::Mutex<SpareClaim>>;
+/// A restore's [`SpareClaim`] and how it starts a refill.
+#[derive(Debug)]
+struct ClaimGate {
+    state: std::sync::Mutex<SpareClaim>,
+    refill: fn(&PrefillRefill),
+}
 
-/// Take a spare through `gate`: `claim` runs under the gate's lock unless the restore has
-/// cancelled, so a cancel either comes first (nothing is taken) or sees what was taken.
-/// `None` when cancelled.
-fn claim_through<T>(
-    gate: &SpareGate,
-    refill: PrefillRefill,
-    claim: impl FnOnce() -> Result<Option<T>>,
-) -> Result<Option<Option<T>>> {
-    let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if matches!(*state, SpareClaim::Cancelled) {
-        return Ok(None);
+type SpareGate = std::sync::Arc<ClaimGate>;
+
+impl ClaimGate {
+    fn new(refill: fn(&PrefillRefill)) -> SpareGate {
+        std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new(SpareClaim::Open),
+            refill,
+        })
     }
-    let claimed = claim()?;
-    *state = if claimed.is_some() {
-        SpareClaim::Taken(refill)
-    } else {
-        SpareClaim::Unclaimed
-    };
-    Ok(Some(claimed))
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SpareClaim> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take a spare: `claim` runs under the lock unless the restore has given the prefill up,
+    /// so giving up either comes first (nothing is taken) or sees what was taken. `None` when
+    /// given up.
+    fn claim<T>(
+        &self,
+        refill: PrefillRefill,
+        claim: impl FnOnce() -> Result<Option<T>>,
+    ) -> Result<Option<Option<T>>> {
+        let mut state = self.state();
+        if !matches!(*state, SpareClaim::Open) {
+            return Ok(None);
+        }
+        let claimed = claim()?;
+        *state = if claimed.is_some() {
+            SpareClaim::Taken(refill)
+        } else {
+            SpareClaim::Unclaimed(refill)
+        };
+        Ok(Some(claimed))
+    }
+
+    /// The restore gives the memory up: a spare whose memory is already freed is refilled now,
+    /// one still held is refilled when it is freed, and none is taken from now on.
+    fn give_up(&self) {
+        let mut state = self.state();
+        let refill = match std::mem::replace(&mut *state, SpareClaim::Closed) {
+            SpareClaim::Released(refill) => Some(refill),
+            SpareClaim::Taken(refill) => {
+                *state = SpareClaim::Owed(refill);
+                None
+            }
+            SpareClaim::Owed(refill) => {
+                *state = SpareClaim::Owed(refill);
+                None
+            }
+            _ => None,
+        };
+        drop(state);
+        if let Some(refill) = refill {
+            (self.refill)(&refill);
+        }
+    }
+
+    /// The memory was freed: a spare the restore gave up is refilled now.
+    fn released(&self) {
+        let mut state = self.state();
+        let refill = match std::mem::replace(&mut *state, SpareClaim::Closed) {
+            SpareClaim::Owed(refill) => Some(refill),
+            SpareClaim::Taken(refill) => {
+                *state = SpareClaim::Released(refill);
+                None
+            }
+            other => {
+                *state = other;
+                None
+            }
+        };
+        drop(state);
+        if let Some(refill) = refill {
+            (self.refill)(&refill);
+        }
+    }
+
+    /// The clone runs on the memory: the pool gets a spare for it now, once, whether the
+    /// memory came from the pool or was allocated because the pool had none.
+    fn settle(&self) {
+        let refill = match std::mem::replace(&mut *self.state(), SpareClaim::Closed) {
+            SpareClaim::Taken(refill)
+            | SpareClaim::Released(refill)
+            | SpareClaim::Unclaimed(refill) => Some(refill),
+            _ => None,
+        };
+        if let Some(refill) = refill {
+            (self.refill)(&refill);
+        }
+    }
 }
 
-/// Close `gate` and return the refill the pool is owed, if the prefill took a spare.
-fn cancel_claim(gate: &SpareGate) -> Option<PrefillRefill> {
-    let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match std::mem::replace(&mut *state, SpareClaim::Cancelled) {
-        SpareClaim::Taken(refill) => Some(refill),
-        _ => None,
+/// The hugepage memory a prefill fills. Its pages are freed when it is dropped (and every
+/// mapping of it is gone), and only then is a spare the restore gave up refilled.
+#[derive(Debug)]
+struct PrefillMemory {
+    file: Option<std::fs::File>,
+    gate: SpareGate,
+}
+
+impl PrefillMemory {
+    fn file(&self) -> &std::fs::File {
+        self.file.as_ref().expect("held until drop")
+    }
+}
+
+impl std::os::fd::AsRawFd for PrefillMemory {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file().as_raw_fd()
+    }
+}
+
+impl Drop for PrefillMemory {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        self.gate.released();
     }
 }
 
 /// [`prepare_prefilled_memory`] running beside the clone's setup. A restore that stops
 /// before it uses the memory drops this: the prefill takes no spare from then on, and one it
-/// already took is refilled at once (a started copy cannot be cancelled; it finishes and frees
-/// its memory on its own).
+/// already took is refilled once its memory is freed (a started copy cannot be cancelled; it
+/// finishes and frees its memory on its own).
 struct EarlyPrefill {
     started: std::time::Instant,
     task: Option<tokio::task::JoinHandle<Option<PrefilledBacking>>>,
@@ -809,7 +915,7 @@ struct EarlyPrefill {
 
 impl EarlyPrefill {
     fn start(gpus: Vec<String>, memory_path: PathBuf) -> Self {
-        let gate = SpareGate::default();
+        let gate = ClaimGate::new(spawn_refill);
         let task_gate = gate.clone();
         Self {
             started: std::time::Instant::now(),
@@ -832,9 +938,7 @@ impl EarlyPrefill {
             }
         };
         if backing.is_none() {
-            if let Some(refill) = cancel_claim(&self.gate) {
-                spawn_refill(&refill);
-            }
+            self.gate.give_up();
         }
         backing
     }
@@ -846,9 +950,10 @@ impl Drop for EarlyPrefill {
             return;
         };
         task.abort();
-        if let Some(refill) = cancel_claim(&self.gate) {
-            spawn_refill(&refill);
-        }
+        // Given up before the task's output (the memory, if it finished) is dropped with it,
+        // so freeing the memory finds the refill owed.
+        self.gate.give_up();
+        drop(task);
     }
 }
 
@@ -872,7 +977,7 @@ async fn prepare_prefilled_memory(
     let memory_path = memory_path.to_path_buf();
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(
-        move || -> Result<Option<(std::fs::File, bool, spares::FillStats, u64)>> {
+        move || -> Result<Option<(PrefillMemory, bool, spares::FillStats, u64)>> {
             let size = std::fs::metadata(&memory_path)
                 .with_context(|| format!("stat {}", memory_path.display()))?
                 .len();
@@ -881,7 +986,7 @@ async fn prepare_prefilled_memory(
             let dir = spares::default_dir();
             let pool = spares::Spares::open(&dir)?;
             let Some(claimed) =
-                claim_through(&gate, PrefillRefill { node, mib }, || pool.claim(node, mib))?
+                gate.claim(PrefillRefill { node, mib }, || pool.claim(node, mib))?
             else {
                 return Ok(None);
             };
@@ -892,8 +997,13 @@ async fn prepare_prefilled_memory(
                     false,
                 ),
             };
-            let stats = spares::fill_from(&file, &memory_path, spares::FILL_THREADS, node)?;
-            Ok(Some((file, claimed, stats, mib)))
+            // Owned with the gate from here, so whatever drops it reports the pages freed.
+            let memory = PrefillMemory {
+                file: Some(file),
+                gate: gate.clone(),
+            };
+            let stats = spares::fill_from(memory.file(), &memory_path, spares::FILL_THREADS, node)?;
+            Ok(Some((memory, claimed, stats, mib)))
         },
     )
     .await;
@@ -902,7 +1012,7 @@ async fn prepare_prefilled_memory(
             info!("the restore no longer needs its hugepage prefill");
             None
         }
-        Ok(Ok(Some((file, claimed, stats, mib)))) => {
+        Ok(Ok(Some((memory, claimed, stats, mib)))) => {
             info!(
                 node = ?node,
                 mib,
@@ -914,8 +1024,8 @@ async fn prepare_prefilled_memory(
                 "guest memory prefilled into hugepages"
             );
             Some(PrefilledBacking {
-                file: std::sync::Arc::new(file),
-                refill: PrefillRefill { node, mib },
+                gate: memory.gate.clone(),
+                file: std::sync::Arc::new(memory),
             })
         }
         Ok(Err(error)) => {
@@ -3312,7 +3422,7 @@ async fn cmd_snapshot_run_inner(
     // Set when the restore's guest memory comes from the hugepage spare pool: the pool is
     // refilled for this node and size once the clone is acknowledged, or when the setup
     // fails after it took the memory.
-    let mut prefilled_restore: Option<PrefillRefill> = None;
+    let mut prefilled_restore: Option<SpareGate> = None;
     macro_rules! setup_try {
         ($result:expr) => {
             match $result {
@@ -3326,8 +3436,8 @@ async fn cmd_snapshot_run_inner(
                     };
                     // The pool slot of a prefill the restore took goes back; an early
                     // prefill it never waited for gives its own back when it is dropped.
-                    if let Some(refill) = prefilled_restore.take() {
-                        spawn_refill(&refill);
+                    if let Some(gate) = prefilled_restore.take() {
+                        gate.give_up();
                     }
                     return Err(error);
                 }
@@ -3878,7 +3988,7 @@ async fn cmd_snapshot_run_inner(
             }
         };
         if let Some(backing) = prefilled {
-            prefilled_restore = Some(backing.refill);
+            prefilled_restore = Some(backing.gate);
             MemoryBackend::Prefilled {
                 socket_path: data_dir.join("mem.sock"),
                 backing: backing.file,
@@ -4385,8 +4495,8 @@ async fn cmd_snapshot_run_inner(
     }
     // The clone is acknowledged; replace the spare it used (once: a later failure finds
     // nothing to give back).
-    if let Some(refill) = prefilled_restore.take() {
-        spawn_refill(&refill);
+    if let Some(gate) = prefilled_restore.take() {
+        gate.settle();
     }
 
     // Handle --exec: run command in container then cleanup and exit
@@ -6540,56 +6650,135 @@ mod tests {
         // (review of #1875); one that fails before drops the EarlyPrefill, which does.
         let funnel = &run[at("macro_rules! setup_try {")..];
         let funnel = &funnel[..funnel.find("return Err(error);").unwrap()];
-        assert!(funnel.contains("if let Some(refill) = prefilled_restore.take() {"));
+        assert!(funnel.contains("if let Some(gate) = prefilled_restore.take() {"));
         assert!(at("let mut prefilled_restore") < at("macro_rules! setup_try {"));
     }
 
-    /// A prefill takes a spare only while the restore still wants it, and a restore that gives
-    /// it up learns what it took, so the pool is refilled exactly when a spare was taken
-    /// (review of #1875).
-    #[test]
-    fn a_dropped_prefill_takes_no_spare_or_gives_back_the_one_it_took() {
-        let refill = || PrefillRefill {
-            node: Some(0),
-            mib: 6144,
-        };
-        // Cancelled first: the claim never runs.
-        let gate = SpareGate::default();
-        assert!(cancel_claim(&gate).is_none());
-        let mut ran = false;
-        let claimed = claim_through(&gate, refill(), || {
-            ran = true;
-            Ok(Some(1))
-        })
-        .unwrap();
-        assert!(claimed.is_none() && !ran);
-        // Taken first: the cancel returns the refill once.
-        let gate = SpareGate::default();
-        assert_eq!(
-            claim_through(&gate, refill(), || Ok(Some(1))).unwrap(),
-            Some(Some(1))
-        );
-        let owed = cancel_claim(&gate).expect("a taken spare is owed");
-        assert_eq!((owed.node, owed.mib), (Some(0), 6144));
-        assert!(cancel_claim(&gate).is_none());
-        // The pool had none: nothing is owed.
-        let gate = SpareGate::default();
-        assert_eq!(
-            claim_through(&gate, refill(), || Ok(None::<u8>)).unwrap(),
-            Some(None)
-        );
-        assert!(cancel_claim(&gate).is_none());
-        // Dropping an EarlyPrefill that was never waited for closes its gate.
-        let source = include_str!("snapshot.rs");
-        let drop = &source[source.find("impl Drop for EarlyPrefill {").unwrap()..];
-        let drop = &drop[..drop.find("\n}\n").unwrap()];
-        assert!(
-            drop.contains("cancel_claim(&self.gate)") && drop.contains("spawn_refill(&refill)")
-        );
+    /// Refills the tests start, by node, instead of a `fcvm gpu spares fill` process.
+    static TEST_REFILLS: std::sync::Mutex<Vec<Option<u32>>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_refill(refill: &PrefillRefill) {
+        TEST_REFILLS.lock().unwrap().push(refill.node);
     }
 
-    /// A restore takes every GPU's clean token before it decides, so a GPU it gets cannot keep
-    /// a token that would tell the next VM it is clean.
+    fn refills() -> usize {
+        TEST_REFILLS.lock().unwrap().len()
+    }
+
+    fn test_refill() -> PrefillRefill {
+        PrefillRefill {
+            node: Some(0),
+            mib: 6144,
+        }
+    }
+
+    /// A prefill takes a spare only while the restore still wants it, and a spare the restore
+    /// gives up is refilled once (review of #1875).
+    #[test]
+    fn a_dropped_prefill_takes_no_spare_or_gives_back_the_one_it_took() {
+        TEST_REFILLS.lock().unwrap().clear();
+        // Given up first: the claim never runs and nothing is refilled.
+        let gate = ClaimGate::new(record_refill);
+        gate.give_up();
+        let mut ran = false;
+        let claimed = gate
+            .claim(test_refill(), || {
+                ran = true;
+                Ok(Some(1))
+            })
+            .unwrap();
+        assert!(claimed.is_none() && !ran);
+        assert_eq!(refills(), 0);
+        // The pool had none and the restore gave the memory up: nothing is owed.
+        let gate = ClaimGate::new(record_refill);
+        assert_eq!(
+            gate.claim(test_refill(), || Ok(None::<u8>)).unwrap(),
+            Some(None)
+        );
+        gate.give_up();
+        gate.released();
+        assert_eq!(refills(), 0);
+        // The pool had none and the clone runs on the memory: the pool is filled, once, so
+        // restores warm a cold pool (review of #1884).
+        let gate = ClaimGate::new(record_refill);
+        gate.claim(test_refill(), || Ok(None::<u8>)).unwrap();
+        gate.settle();
+        gate.give_up();
+        gate.released();
+        assert_eq!(refills(), 1, "a cold pool is not filled after a restore");
+        TEST_REFILLS.lock().unwrap().clear();
+        // The clone kept the memory: settled once, and a later release or give-up adds none.
+        let gate = ClaimGate::new(record_refill);
+        assert_eq!(
+            gate.claim(test_refill(), || Ok(Some(1))).unwrap(),
+            Some(Some(1))
+        );
+        gate.settle();
+        gate.give_up();
+        gate.released();
+        assert_eq!(refills(), 1);
+    }
+
+    /// #1880: a spare the restore gives up is refilled only after its memory is freed, so on a
+    /// fixed hugepage pool the refill has the pages a cancelled copy was still holding; and
+    /// memory freed before the give-up is refilled at the give-up.
+    #[test]
+    fn a_given_up_spare_is_refilled_after_its_memory_is_freed() {
+        TEST_REFILLS.lock().unwrap().clear();
+        let gate = ClaimGate::new(record_refill);
+        let claimed = gate.claim(test_refill(), || Ok(Some(()))).unwrap();
+        assert_eq!(claimed, Some(Some(())));
+        let memory = PrefillMemory {
+            file: Some(tempfile::tempfile().unwrap()),
+            gate: gate.clone(),
+        };
+        gate.give_up();
+        assert_eq!(refills(), 0, "refilled while the memory is still held");
+        drop(memory);
+        assert_eq!(refills(), 1, "not refilled once the memory was freed");
+        gate.give_up();
+        assert_eq!(refills(), 1, "refilled twice");
+
+        // A copy that failed after it took the spare frees its memory before the give-up.
+        let gate = ClaimGate::new(record_refill);
+        gate.claim(test_refill(), || Ok(Some(()))).unwrap();
+        drop(PrefillMemory {
+            file: Some(tempfile::tempfile().unwrap()),
+            gate: gate.clone(),
+        });
+        assert_eq!(refills(), 1);
+        gate.give_up();
+        assert_eq!(refills(), 2);
+    }
+
+    /// Dropping an EarlyPrefill gives the spare up before its task's output (the memory) is
+    /// dropped with the task, so freeing that memory finds the refill owed.
+    #[tokio::test]
+    async fn dropping_an_early_prefill_refills_after_the_memory_it_holds() {
+        TEST_REFILLS.lock().unwrap().clear();
+        let gate = ClaimGate::new(record_refill);
+        gate.claim(test_refill(), || Ok(Some(()))).unwrap();
+        let memory = PrefillMemory {
+            file: Some(tempfile::tempfile().unwrap()),
+            gate: gate.clone(),
+        };
+        let backing = PrefilledBacking {
+            file: std::sync::Arc::new(memory),
+            gate: gate.clone(),
+        };
+        let task = tokio::spawn(async move { Some(backing) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let early = EarlyPrefill {
+            started: std::time::Instant::now(),
+            task: Some(task),
+            gate,
+        };
+        drop(early);
+        assert_eq!(refills(), 1);
+    }
+
     #[test]
     fn a_restore_takes_every_clean_token() {
         let code = include_str!("snapshot.rs");
