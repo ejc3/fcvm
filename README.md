@@ -11,7 +11,6 @@ fcvm avoids paying the VM boot cost on every run: the first run of an image boot
 - Interactive containers behave like local ones: `-it`, colors, Ctrl+C, vim
 
 Benchmarks were measured on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and results.
-To measure Cloudflare’s hosted Chromium and Kitesurf directly, see the [Browser Run benchmark](bench/chromium/README.md#the-hosted-arms-browserrunpy).
 
 ---
 
