@@ -242,6 +242,14 @@ pub struct FirecrackerConfig {
     /// None (every Firecracker run) is skip-serialized so existing keys are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_hypervisor_bin: Option<PathBuf>,
+    /// The host kernel release, for a kernel profile that runs KVM in its guest
+    /// (`KernelProfile::guest_kvm`) and only then. Such a snapshot's vCPUs hold nested
+    /// virtualization state the host kernel's KVM wrote, a difference a restore cannot
+    /// reconcile (CLAUDE.md, "MAXIMUM REUSE"), so another host kernel misses the cache rather
+    /// than restore it. None, every other profile, is skip-serialized so existing keys are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_kernel: Option<String>,
 }
 
 impl Default for FirecrackerConfig {
@@ -288,6 +296,7 @@ impl Default for FirecrackerConfig {
             no_writeback_cache: false,
             hypervisor: crate::hypervisor::Backend::Firecracker,
             cloud_hypervisor_bin: None,
+            host_kernel: None,
         }
     }
 }
@@ -720,6 +729,26 @@ pub struct MmdsRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// A profile with KVM in its guest keys its snapshots by host kernel, so another kernel
+    /// misses the cache instead of restoring state it cannot; every other key is unchanged.
+    #[test]
+    fn the_snapshot_key_carries_the_host_kernel_only_when_set() {
+        let plain = super::FirecrackerConfig::default();
+        let mut nested = plain.clone();
+        nested.host_kernel = Some("7.3.3-fcvm-2611f28e467f".to_string());
+        let mut other = plain.clone();
+        other.host_kernel = Some("6.18.60-fcvm-217152eb14fe".to_string());
+        assert_ne!(plain.snapshot_key(), nested.snapshot_key());
+        assert_ne!(nested.snapshot_key(), other.snapshot_key());
+        assert_ne!(
+            nested.startup_snapshot_base_key(),
+            other.startup_snapshot_base_key()
+        );
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("host_kernel"));
+    }
+
     use super::*;
 
     /// A guest booted with the PCI transport on must not get `pci=off`: on x86 it stops

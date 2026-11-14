@@ -131,6 +131,13 @@ pub struct KernelProfile {
     #[serde(default)]
     pub description: String,
 
+    /// Whether the guest kernel runs KVM itself (`CONFIG_KVM=y`: the phone's Android
+    /// Emulator, nested VMs). Such a guest's vCPU state holds nested virtualization state the
+    /// host kernel's KVM wrote, which only the same host kernel restores, so its snapshots
+    /// record the host kernel release and refuse another (`SnapshotMetadata::host_kernel`).
+    #[serde(default)]
+    pub guest_kvm: bool,
+
     /// Root filesystem type: "ext4" (default) or "btrfs"
     /// When "btrfs", the rootfs is converted from ext4 to btrfs before setup VM boot.
     #[serde(default)]
@@ -1238,6 +1245,26 @@ pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
         .get(name)
         .and_then(|arch_profiles| arch_profiles.get(arch))
         .cloned())
+}
+
+/// The running host kernel's release (`uname -r`) when kernel profile `name` (None:
+/// "default") runs KVM in its guest (`KernelProfile::guest_kvm`), else None. A snapshot of
+/// such a guest restores only under the host kernel that took it.
+pub fn guest_kvm_host_kernel(name: Option<&str>) -> Result<Option<String>> {
+    let Some(profile) = get_kernel_profile(name.unwrap_or("default"))? else {
+        return Ok(None);
+    };
+    if !profile.guest_kvm {
+        return Ok(None);
+    }
+    Ok(Some(host_kernel_release()?))
+}
+
+/// The running host kernel's release, as `uname -r` prints it.
+pub fn host_kernel_release() -> Result<String> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("reading /proc/sys/kernel/osrelease")?;
+    Ok(release.trim().to_string())
 }
 
 /// The Firecracker commit this fcvm build's own config (the one `fcvm setup --generate-config`
@@ -2875,6 +2902,44 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every profile whose guest kernel builds KVM (`CONFIG_KVM=y` or `=m`) runs VMs inside
+    /// the guest, and its snapshots hold the host kernel's nested virtualization state, so
+    /// `guest_kvm` must say so: its snapshots then record the host kernel and refuse another.
+    /// Read from each profile's own kernel config, so a new profile cannot miss it; a profile
+    /// whose config cannot be read fails the test rather than being skipped.
+    #[test]
+    fn guest_kvm_marks_exactly_the_profiles_whose_guest_kernel_has_kvm() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut marked = Vec::new();
+        for (name, by_arch) in &plan.kernel_profiles {
+            for (arch, profile) in by_arch {
+                let config = profile
+                    .kernel_config
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{name}.{arch} names no kernel_config to read"));
+                let text = std::fs::read_to_string(repo.join(config))
+                    .unwrap_or_else(|e| panic!("{name}.{arch}: {config}: {e}"));
+                let kvm = text
+                    .lines()
+                    .any(|line| matches!(line.trim(), "CONFIG_KVM=y" | "CONFIG_KVM=m"));
+                assert_eq!(
+                    profile.guest_kvm, kvm,
+                    "{name}.{arch}: guest_kvm must say whether {config} builds KVM"
+                );
+                if kvm {
+                    marked.push(format!("{name}.{arch}"));
+                }
+            }
+        }
+        for expected in ["phone.amd64", "nested.arm64", "nested.amd64"] {
+            assert!(
+                marked.iter().any(|m| m == expected),
+                "{expected} runs KVM in its guest: {marked:?}"
+            );
+        }
+    }
 
     /// The commit a build pins for a profile comes from its embedded config, per
     /// architecture, as a loaded config resolves it: a default profile inherits the global
