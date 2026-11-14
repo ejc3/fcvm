@@ -2419,7 +2419,7 @@ guest: the `gpu` kernel profile, the NVIDIA driver image, and fc-agent.
 | `CONFIG_PCI`, `CONFIG_PCI_MSI`, `CONFIG_PCI_HOST_GENERIC` / `CONFIG_PCI_MMCONFIG`, `CONFIG_ARM_GIC_V3_ITS` | Firecracker's PCI transport: ECAM config space and MSI-X only (no INTx). All are in Firecracker's base config; declaring them makes the build fail if a base-config change drops one. |
 | `CONFIG_MODULES`, `CONFIG_MODULE_UNLOAD` | The NVIDIA driver is out of tree. |
 | `CONFIG_FW_LOADER` | GSP firmware, which the open modules boot on Turing and later. |
-| `CONFIG_MMU_NOTIFIER` | nvidia-uvm calls `__mmu_notifier_register()`. The option has no prompt upstream and nothing in this kernel selects it, so `kernel/patches-gpu` carries a one-line Kconfig patch giving it one. |
+| `CONFIG_MMU_NOTIFIER` | nvidia-uvm calls `__mmu_notifier_register()`. The option has no prompt upstream and nothing in this kernel selects it, so `kernel/patches-gpu-7.3` carries a one-line Kconfig patch giving it one. |
 
 It is a separate profile, not the default, because module support and the
 Kconfig patch would change the default kernel's release identity and every

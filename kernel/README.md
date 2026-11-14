@@ -113,8 +113,8 @@ switch. `a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies` runs t
 masking; `the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit` fails without it on
 the `static inline` declarations.
 
-The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
-x86_64): the default patches, linked, plus one Kconfig patch that gives
+The gpu and phone profiles apply `kernel/patches-gpu-7.3` on both arches: the
+fuse attribute patch, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
 option has no prompt upstream, and nothing in this kernel selects it. The gpu
 profile is not published as a release yet; `make setup-gpu` builds it.
