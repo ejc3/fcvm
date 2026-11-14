@@ -768,8 +768,9 @@ enum SpareClaim {
     Released(PrefillRefill),
     /// The restore gave up a taken spare whose memory is not freed yet: freeing it refills.
     Owed(PrefillRefill),
-    /// The pool had none, so the memory was allocated outside it.
-    Unclaimed,
+    /// The pool had none, so the memory was allocated outside it: a clone that runs on it
+    /// still fills the pool, so restores warm a cold pool.
+    Unclaimed(PrefillRefill),
     /// Given up before a spare was taken, or settled: nothing more to refill.
     Closed,
 }
@@ -813,7 +814,7 @@ impl ClaimGate {
         *state = if claimed.is_some() {
             SpareClaim::Taken(refill)
         } else {
-            SpareClaim::Unclaimed
+            SpareClaim::Unclaimed(refill)
         };
         Ok(Some(claimed))
     }
@@ -860,10 +861,13 @@ impl ClaimGate {
         }
     }
 
-    /// The clone runs on the memory: the spare it took is replaced now, once.
+    /// The clone runs on the memory: the pool gets a spare for it now, once, whether the
+    /// memory came from the pool or was allocated because the pool had none.
     fn settle(&self) {
         let refill = match std::mem::replace(&mut *self.state(), SpareClaim::Closed) {
-            SpareClaim::Taken(refill) | SpareClaim::Released(refill) => Some(refill),
+            SpareClaim::Taken(refill)
+            | SpareClaim::Released(refill)
+            | SpareClaim::Unclaimed(refill) => Some(refill),
             _ => None,
         };
         if let Some(refill) = refill {
@@ -6685,7 +6689,7 @@ mod tests {
             .unwrap();
         assert!(claimed.is_none() && !ran);
         assert_eq!(refills(), 0);
-        // The pool had none: nothing is owed.
+        // The pool had none and the restore gave the memory up: nothing is owed.
         let gate = ClaimGate::new(record_refill);
         assert_eq!(
             gate.claim(test_refill(), || Ok(None::<u8>)).unwrap(),
@@ -6694,6 +6698,15 @@ mod tests {
         gate.give_up();
         gate.released();
         assert_eq!(refills(), 0);
+        // The pool had none and the clone runs on the memory: the pool is filled, once, so
+        // restores warm a cold pool (review of #1884).
+        let gate = ClaimGate::new(record_refill);
+        gate.claim(test_refill(), || Ok(None::<u8>)).unwrap();
+        gate.settle();
+        gate.give_up();
+        gate.released();
+        assert_eq!(refills(), 1, "a cold pool is not filled after a restore");
+        TEST_REFILLS.lock().unwrap().clear();
         // The clone kept the memory: settled once, and a later release or give-up adds none.
         let gate = ClaimGate::new(record_refill);
         assert_eq!(
