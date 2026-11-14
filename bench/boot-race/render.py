@@ -109,7 +109,7 @@ FORBIDDEN = [
     re.compile(r"lambda-url|amazonaws\.com"),
     re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b", re.I),
     re.compile(r"\bami-[0-9a-f]{8,17}\b"),
-    re.compile(r"(?<![\w.-])\d{12}(?![\w.-])"),
+    re.compile(r"(?<![\w-])(?<!\d\.)\d{12}(?![\w-])(?!\.\d)"),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     re.compile(r"arn:aws:"),
 ]
@@ -121,7 +121,7 @@ SCRUB = [
     (re.compile(r"arn:aws:\S+"), "<arn>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<id>"),
     (re.compile(r"https?://\S+"), "<url>"),
-    (re.compile(r"(?<![\w.-])\d{12}(?![\w.-])"), "<account>"),
+    (re.compile(r"(?<![\w-])(?<!\d\.)\d{12}(?![\w-])(?!\.\d)"), "<account>"),
 ]
 
 

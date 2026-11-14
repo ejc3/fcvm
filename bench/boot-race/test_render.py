@@ -148,6 +148,10 @@ class Public(unittest.TestCase):
             render.check_public(json.dumps({"ms": 7205.763916015625}))
             with self.assertRaises(SystemExit):
                 render.check_public(json.dumps({"note": "account 123456789012 here"}))
+            for text in ("Access denied for account 123456789012.", "account 123456789012, then"):
+                with self.assertRaises(SystemExit, msg=text):
+                    render.check_public(json.dumps({"error": text}))
+                self.assertNotIn("123456789012", render.scrub(text))
 
     def test_public_records_refuse_an_unscrubbed_field(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
