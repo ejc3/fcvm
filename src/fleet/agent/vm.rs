@@ -992,6 +992,37 @@ mod tests {
         assert_eq!(shape(&words), shape(&slot.args()), "warm-root.sh: {line}");
     }
 
+    /// The host image's acceptance restore of the warm phone fails the image when the clone's
+    /// guest memory did not load as prefilled hugepages: a snapshot made by an older
+    /// Firecracker restores on the File backend, seconds slower for the phone, and otherwise
+    /// works.
+    #[test]
+    fn the_ami_warm_phone_fails_a_clone_without_prefilled_memory() {
+        let script = include_str!("../../../fleet/ami/host/warm-phone.sh");
+        let check = script
+            .find(r#"jq -e '.backend == "hugepage-prefilled"'"#)
+            .expect("warm-phone.sh does not check the clone's memory backend");
+        let clone = script
+            .find("fcvm snapshot run --snapshot")
+            .expect("no clone restore");
+        assert!(
+            clone < check,
+            "the backend is checked before the clone restores"
+        );
+        let line = script[check..].lines().next().unwrap();
+        assert!(
+            line.contains("ok=0"),
+            "a clone without prefilled memory does not fail the image"
+        );
+        let fail = script
+            .rfind(r#"[ $ok = 1 ] || { tail -30 "$LOG"; exit 1; }"#)
+            .unwrap();
+        assert!(
+            check < fail,
+            "the backend check comes after the line that fails the image"
+        );
+    }
+
     /// fleet/ami/host/warm-phone.sh takes the warm snapshot every phone is a clone of, of a
     /// phone launched as the agent launches a phone slot that boots cold: the same flags in
     /// the same order, the same guest ports and maps, the agent's certificate, `phone.sh serve`.

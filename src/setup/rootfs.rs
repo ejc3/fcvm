@@ -1233,6 +1233,23 @@ pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
         .cloned())
 }
 
+/// The Firecracker commit this fcvm build's own config (the one `fcvm setup --generate-config`
+/// writes) pins for kernel profile `name` on this architecture. A host whose active config
+/// pins another commit is running an older or newer config than the binary.
+pub fn embedded_profile_firecracker_commit(name: &str) -> Option<String> {
+    embedded_commit_in(EMBEDDED_CONFIG, name, config_arch())
+}
+
+fn embedded_commit_in(config: &str, name: &str, arch: &str) -> Option<String> {
+    let tree: toml::Value = toml::from_str(config).ok()?;
+    tree.get("kernel_profiles")?
+        .get(name)?
+        .get(arch)?
+        .get("firecracker_commit")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Resolve rootfs filesystem type from CLI override and kernel profile name.
 ///
 /// Priority: explicit CLI `--rootfs-type` flag > kernel profile config > None (ext4 default).
@@ -2850,6 +2867,23 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commit a build pins for a profile comes from its embedded config, per architecture.
+    #[test]
+    fn the_embedded_config_names_each_profiles_firecracker_commit() {
+        let config = "[kernel_profiles.gpu.amd64]\nfirecracker_commit = \"abc\"\n[kernel_profiles.gpu.arm64]\nfirecracker_commit = \"def\"\n";
+        assert_eq!(
+            embedded_commit_in(config, "gpu", "amd64").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            embedded_commit_in(config, "gpu", "arm64").as_deref(),
+            Some("def")
+        );
+        assert_eq!(embedded_commit_in(config, "phone", "amd64"), None);
+        // This build's own config pins the phone profile on amd64.
+        assert!(embedded_commit_in(EMBEDDED_CONFIG, "phone", "amd64").is_some());
+    }
 
     /// A [pasta] section without its source archives is refused when the config
     /// loads, not accepted until a pasta build needs them: make build regenerates

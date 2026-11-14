@@ -673,15 +673,56 @@ fn prefill_gpu_memory(
 /// binary carries the greeting the backend expects (`FCVM_PREFILLED_MEMORY`). A snapshot
 /// records the binary that made it, and one made before the backend existed restores on that
 /// binary, which would refuse the load.
-fn restore_vmm_accepts_prefilled(runtime_config: &RuntimeConfig) -> bool {
-    let accepts = super::common::find_firecracker(runtime_config)
-        .ok()
+fn restore_vmm_accepts_prefilled(
+    runtime_config: &RuntimeConfig,
+    kernel_profile: Option<&str>,
+) -> bool {
+    let firecracker = super::common::find_firecracker(runtime_config).ok();
+    let accepts = firecracker
+        .as_ref()
         .and_then(|bin| std::fs::read(bin).ok())
         .is_some_and(|bytes| binary_names_prefilled(&bytes));
     if !accepts {
-        info!("this restore's Firecracker has no prefilled memory backend; restoring without hugepages");
+        // Loud: the restore still works, seconds slower for a GPU guest, and nothing else
+        // says why.
+        let profile = kernel_profile.unwrap_or("default");
+        let configured = crate::setup::get_kernel_profile(profile)
+            .ok()
+            .flatten()
+            .and_then(|p| p.firecracker_commit);
+        let built = crate::setup::embedded_profile_firecracker_commit(profile);
+        warn!(
+            firecracker = ?firecracker,
+            profile,
+            configured_commit = ?configured,
+            this_build_commit = ?built,
+            backend = "file",
+            "{}",
+            prefilled_fallback_message(profile, configured.as_deref(), built.as_deref())
+        );
     }
     accepts
+}
+
+/// Why a GPU restore runs on the File backend, and what puts it on prefilled hugepages.
+fn prefilled_fallback_message(
+    profile: &str,
+    configured: Option<&str>,
+    built: Option<&str>,
+) -> String {
+    let base = "this GPU restore loads guest memory through the File backend, not prefilled \
+                hugepages, because its Firecracker has no Prefilled memory backend";
+    match (configured, built) {
+        (Some(configured), Some(built)) if configured != built => format!(
+            "{base}: the host's rootfs-config.toml pins Firecracker {configured} for profile \
+             '{profile}' and this fcvm build pins {built}. Run `fcvm setup --generate-config \
+             --force` and `fcvm setup --kernel-profile {profile}`, then remake the snapshot"
+        ),
+        _ => format!(
+            "{base}: the snapshot records a Firecracker built before the backend existed. \
+             Remake the snapshot with this host's profile '{profile}'"
+        ),
+    }
 }
 
 fn binary_names_prefilled(bytes: &[u8]) -> bool {
@@ -955,7 +996,7 @@ enum RestoreAck {
 /// after the guest acknowledges the exact restore generation. Same contract
 /// rules as the serve record: add fields, never rename or remove them.
 ///
-/// `backend` is the memory transport (`uffd` | `uffd-file` | `file`), the
+/// `backend` is the memory transport (`uffd` | `uffd-file` | `hugepage-prefilled` | `file`), the
 /// vocabulary benchmark arms use; `hypervisor` names the VMM, so a
 /// cloud-hypervisor file restore is distinguishable from a firecracker one.
 /// `ack_ms` is the host-observed clock from the start of the restore call to
@@ -3655,8 +3696,10 @@ async fn cmd_snapshot_run_inner(
             &gpus,
             direct_memory,
             snapshot_config.metadata.balloon_free_page_reporting,
-        ) && restore_vmm_accepts_prefilled(&runtime_config)
-        {
+        ) && restore_vmm_accepts_prefilled(
+            &runtime_config,
+            snapshot_config.metadata.kernel_profile.as_deref(),
+        ) {
             prepare_prefilled_memory(&gpus, &snapshot_config.memory_path).await
         } else {
             None
@@ -6350,6 +6393,82 @@ mod tests {
             .expect("the takes are not collected");
         let all = rest.find(".all(|&clean| clean)").expect("no decision");
         assert!(collect < all, "the decision short-circuits the takes");
+    }
+
+    /// A GPU restore that falls back to the File backend says so, naming the Firecracker the
+    /// host's config pins and the one this build pins, and the fix.
+    #[test]
+    fn the_prefilled_fallback_names_both_firecrackers_and_the_fix() {
+        let stale = prefilled_fallback_message("phone", Some("69894de0"), Some("4fc14097"));
+        for needle in [
+            "File backend",
+            "69894de0",
+            "4fc14097",
+            "--generate-config",
+            "--kernel-profile phone",
+        ] {
+            assert!(stale.contains(needle), "no `{needle}` in: {stale}");
+        }
+        let old_snapshot = prefilled_fallback_message("phone", Some("4fc14097"), Some("4fc14097"));
+        assert!(
+            old_snapshot.contains("Remake the snapshot"),
+            "{old_snapshot}"
+        );
+        assert!(!old_snapshot.contains("--generate-config"));
+        let code = include_str!("snapshot.rs");
+        let body = &code[code.find("fn restore_vmm_accepts_prefilled(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.contains("warn!("),
+            "the fallback is not a warning: {body}"
+        );
+    }
+
+    /// The host image's acceptance check (fleet/ami/host/warm-phone.sh) reads the clone's
+    /// restored record as this build prints it: the keys come out sorted, so the record does
+    /// not start with `status`. It passes a prefilled restore and fails a File fallback and a
+    /// clone that printed no record.
+    #[test]
+    fn the_warm_phone_check_reads_the_restored_record_this_build_prints() {
+        let script = include_str!("../../fleet/ami/host/warm-phone.sh");
+        let line = |start: &str| {
+            script
+                .lines()
+                .find(|l| l.starts_with(start))
+                .unwrap_or_else(|| panic!("warm-phone.sh has no line starting `{start}`"))
+                .to_string()
+        };
+        let check = format!(
+            "{}\n{}\necho \"ok=$ok\"\n",
+            line("restored=$("),
+            line(r#"echo "$restored" | jq -e"#)
+        );
+        let run = |records: &[serde_json::Value]| {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("warm-phone.log");
+            let mut text =
+                String::from("{\"status\":\"restored\",\"backend\":\"hugepage-prefilled\"}\n");
+            text.push_str("2026-11-13T00:00:00Z  INFO fcvm: an earlier phone\n{not json\n");
+            for record in records {
+                text.push_str(&format!("{record}\n"));
+            }
+            std::fs::write(&log, text).unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "set -u\nLOG={}\nbefore=2\nok=1\n{check}",
+                    log.display()
+                ))
+                .output()
+                .expect("bash");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            stdout.lines().last().unwrap_or_default().to_string()
+        };
+        let record =
+            |backend| restored_record("c", "phone-warm", "v", backend, "firecracker", 1, None);
+        assert_eq!(run(&[record("hugepage-prefilled")]), "ok=1");
+        assert_eq!(run(&[record("file")]), "ok=0");
+        assert_eq!(run(&[]), "ok=0");
     }
 
     #[test]
