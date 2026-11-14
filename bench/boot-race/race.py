@@ -317,15 +317,7 @@ class Ecs:
         return Launch((wall, mono, out)), returned
 
     def stop(self, arn):
-        from botocore.exceptions import ClientError
-
-        try:
-            self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] != "AccessDeniedException":
-                raise
-            # Compatibility with the older role, which can stop tasks only through the launcher.
-            self.invoke({"action": "stop", "task": arn})
+        self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
 
     def describe(self, arn):
         """The task, or None while DescribeTasks still reports it MISSING (it can, just after RunTask)."""

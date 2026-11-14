@@ -82,8 +82,8 @@ runs after `ecs-host` and `run` starts right after it.
    python3 bench/boot-race/prepare.py --config cfg.json leftovers       # fails unless nothing is left billing
    ```
 
-   With the standing AWS driver, `cleanup` stops the campaign's ECS tasks directly even if the monthly
-   budget denies the launcher. Run cleanup with this checkout or newer; the old harness needs that launcher.
+   `cleanup` stops the campaign's ECS tasks directly even if the monthly budget denies the launcher.
+   The AWS driver policy must grant `ecs:StopTask` on the boot-race cluster before starting a campaign.
 
    Copy `$RESULTS` back to the dev box while the run goes; it is on the box's instance store.
 5. Stop `fcvm snapshot serve`, copy the results back, and `pbox down N --instance i-...`.
