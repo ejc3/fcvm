@@ -33,9 +33,15 @@ KITESURF_DIR="$(cd "$KITESURF_DIR" && pwd -P)"
 case "$KITESURF_DIR/" in
     "$REPO"/*) echo "BLOCKED: KITESURF_DIR is inside this checkout; the build must not dirty it" >&2; exit 2 ;;
 esac
-for tool in curl git python3 sha256sum tar xz; do
+for tool in curl flock git python3 sha256sum tar xz; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
+# One writer at a time, and never under a measurement: kitesurf.sh holds this
+# lock shared for its whole phase. Taken before anything in KITESURF_DIR changes.
+exec {BUILD_LOCK_FD}<>"$KITESURF_DIR/.build.lock" \
+    || { echo "BLOCKED: cannot open $KITESURF_DIR/.build.lock" >&2; exit 2; }
+flock -x -n "$BUILD_LOCK_FD" \
+    || { echo "BLOCKED: another Kitesurf build or a Kitesurf measurement holds $KITESURF_DIR" >&2; exit 2; }
 
 arch=$(uname -m)
 case "$arch" in

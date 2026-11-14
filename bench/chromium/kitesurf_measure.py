@@ -9,8 +9,8 @@
 The loop imports cdpdrive once and times one drive() per request, as hostcdp.sh
 and reqbench.py do, with the arguments reqbench's cdp arm gives it (JPEG at
 quality 80, navigation timing on; the html arm swaps the screenshot for
-outerHTML). Rep r renders urls[r % len(urls)], every arm once per rep, so the
-arms interleave. A failed request is recorded and the loop goes on: Kitesurf
+outerHTML). Rep r renders urls[r % len(urls)], every arm once per rep, in an
+order shuffled per rep from --seed (recorded in run.json). A failed request is recorded and the loop goes on: Kitesurf
 does not render every page, and its failures are part of the result, not a
 reason to stop. Each row is written before the next request starts.
 
@@ -86,10 +86,17 @@ def measure(args):
     cpu_stat = os.path.join(args.cgroup, "cpu.stat")
     mem_current = os.path.join(args.cgroup, "memory.current")
     failures = 0
+    # Arm order is shuffled per rep from the recorded seed (AGENTS.md defect 2):
+    # a fixed cdp-then-html order would tie each arm to its position after the
+    # other's request on the same page.
+    import random
+    rng = random.Random(args.seed)
     with open(args.out, "a") as out:
         for rep in range(total):
             url = urls[rep % len(urls)]
-            for arm in arms:
+            order = list(arms)
+            rng.shuffle(order)
+            for position, arm in enumerate(order):
                 ns = argparse.Namespace(
                     cdp_host=args.address, url=url, format="jpeg", quality=80, timeout=30.0,
                     idle_wait_ms=0.0, out_prefix="", ws_url="", connect_retries=2000,
@@ -119,6 +126,7 @@ def measure(args):
                               for k in set(procs_before) | set(procs_after)}
                 out.write(json.dumps({
                     "run_json_sha256": run_sha, "engine": "kitesurf", "arm": arm, "rep": rep,
+                    "position": position,
                     "warmup": rep < args.warmup, "url": url, "ok": ok, "wall_ms": wall_ms,
                     "loadavg1": load, "cgroup_cpu_usec_before": cpu_before,
                     "cgroup_cpu_usec_after": cpu_after, "proc_cpu_ms": proc_delta,
@@ -277,6 +285,7 @@ def main():
     ap.add_argument("--reps", type=int, required=True)
     ap.add_argument("--warmup", type=int, required=True)
     ap.add_argument("--cgroup", required=True)
+    ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--loadavg-file", default="/proc/loadavg")
     ap.add_argument("--run-json", required=True)
     ap.add_argument("--out", required=True)

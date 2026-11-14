@@ -55,6 +55,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CORPUS_ROOT:?CORPUS_ROOT is required: the corpus-live directory the replay serves}"
 : "${CORPUS_ACCESS_LOG:?CORPUS_ACCESS_LOG is required: the replay's access log}"
 REPS="${REPS:-202}"
+SEED="${KITESURF_SEED:-20260808}"
 WARMUP="${WARMUP:-28}"
 ARMS="${KITESURF_ARMS:-cdp,html}"
 KITESURF_DIR="${KITESURF_DIR:-/mnt/fcvm-btrfs/kitesurf}"
@@ -73,6 +74,7 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 [[ "$RUNID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] \
     || { echo "REFUSING: RUNID must be 1-96 filename-safe characters" >&2; exit 2; }
+[[ "$SEED" =~ ^[0-9]+$ ]] || { echo "REFUSING: KITESURF_SEED must be a nonnegative integer" >&2; exit 2; }
 [[ "$REPS" =~ ^[1-9][0-9]*$ && "$WARMUP" =~ ^[0-9]+$ ]] \
     || { echo "REFUSING: REPS must be a positive integer and WARMUP a nonnegative one" >&2; exit 2; }
 case ",$ARMS," in
@@ -87,13 +89,19 @@ for port in "$KITESURF_PORT" "$KITESURF_INSPECTOR_PORT" "$CHROMIUM_CDP_PORT"; do
         || { echo "REFUSING: port '$port' is not in 1..65535" >&2; exit 2; }
 done
 [ -s "$CA_CERT" ] || { echo "REFUSING: CA_CERT $CA_CERT is missing or empty" >&2; exit 2; }
-for tool in awk curl grep id pgrep podman python3 sha256sum systemctl systemd-run timeout unshare; do
+for tool in awk curl flock grep id pgrep podman python3 sha256sum systemctl systemd-run timeout unshare; do
     command -v "$tool" >/dev/null 2>&1 || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
 done
 
 SRC="$KITESURF_DIR/src"
 SEAL="$KITESURF_DIR/BUILD.json"
 [ -f "$SEAL" ] || { echo "REFUSING: no Kitesurf build at $KITESURF_DIR; run make bench-kitesurf-build" >&2; exit 2; }
+# Held shared for the whole phase: kitesurf_build.sh takes it exclusively, so a
+# rebuild cannot change the tree under a measurement, nor start beside one.
+exec {BUILD_LOCK_FD}<>"$KITESURF_DIR/.build.lock" \
+    || { echo "REFUSING: cannot open $KITESURF_DIR/.build.lock" >&2; exit 2; }
+flock -s -n "$BUILD_LOCK_FD" \
+    || { echo "REFUSING: a Kitesurf build holds $KITESURF_DIR" >&2; exit 2; }
 arch=$(uname -m)
 case "$arch" in aarch64) node_arch=arm64 ;; x86_64) node_arch=x64 ;; *) echo "REFUSING: $arch" >&2; exit 2 ;; esac
 NODE_BIN="$KITESURF_DIR/tools/node-$KITESURF_NODE_VERSION-linux-$node_arch/bin"
@@ -267,10 +275,10 @@ log "engine up: $version_json"
 
 python3 - "$RESULTS/run.json" "$RUNID" "$KITESURF_REV" "$KITESURF_REPO_URL" "$tree_sha256" \
         "$SEAL" "$version_json" "$SOURCE_REVISION" "$URLS_ARG" "$REPS" "$WARMUP" "$ARMS" \
-        "$cgroup_rel" "$LOADAVG_FILE" <<'PY'
+        "$cgroup_rel" "$LOADAVG_FILE" "$SEED" <<'PY'
 import json, os, platform, sys
 (out, run_id, rev, repo, tree, seal, version_json, source_revision, urls, reps, warmup,
- arms, cgroup, loadavg_file) = sys.argv[1:]
+ arms, cgroup, loadavg_file, seed) = sys.argv[1:]
 with open(seal) as handle:
     build = json.load(handle)
 with open(loadavg_file) as handle:
@@ -281,7 +289,8 @@ record = {
     "kitesurf_build": build, "json_version": json.loads(version_json),
     "source_revision": source_revision or None,
     "urls": urls.split(","), "reps": int(reps), "warmup": int(warmup),
-    "arms": arms.split(","), "driver": "cdpdrive.py", "driver_process": "in-process",
+    "arms": arms.split(","), "seed": int(seed), "arm_order": "shuffled per rep from seed",
+    "driver": "cdpdrive.py", "driver_process": "in-process",
     "format": "jpeg", "quality": 80, "nav_timing": True,
     "network": "host loopback; names from the namespace's /etc/hosts (captured hosts -> 127.0.0.1)",
     "wrangler_command": "wrangler dev --env local -c wrangler.jsonc -c test/fixtures-worker/wrangler.jsonc",
@@ -327,7 +336,7 @@ find_strays_but_engine || exit 2
 log "measuring: arms $ARMS, $REPS measured reps plus $WARMUP warmup each, interleaved"
 measure_status=0
 python3 "$HERE/kitesurf_measure.py" --address "127.0.0.1:$KITESURF_PORT" --urls "$URLS_ARG" \
-    --arms "$ARMS" --reps "$REPS" --warmup "$WARMUP" --cgroup "$CGROUP" \
+    --arms "$ARMS" --reps "$REPS" --warmup "$WARMUP" --seed "$SEED" --cgroup "$CGROUP" \
     --loadavg-file "$LOADAVG_FILE" --run-json "$RESULTS/run.json" \
     --out "$RESULTS/kitesurf.jsonl" || measure_status=$?
 

@@ -250,7 +250,7 @@ class Measurement(unittest.TestCase):
             out = os.path.join(tmp, "k.jsonl")
             km.measure(argparse.Namespace(
                 address="127.0.0.1:1", urls="https://a/,https://b/", arms="cdp,html",
-                reps=2, warmup=1, cgroup=cgroup, loadavg_file="/proc/loadavg",
+                reps=2, warmup=1, seed=7, cgroup=cgroup, loadavg_file="/proc/loadavg",
                 run_json=run_json, out=out))
         finally:
             km.load_module = original
@@ -262,8 +262,44 @@ class Measurement(unittest.TestCase):
         self.assertEqual([r["warmup"] for r in rows], [True, True] + [False] * 4)
         # The fcvm arm's driver arguments: JPEG q80, navigation timing on.
         self.assertTrue(all(c[2:] == ("jpeg", 80, True) for c in calls))
-        self.assertEqual([c[1] for c in calls[:2]], ["screenshot", "html"])
+        self.assertEqual({c[1] for c in calls[:2]}, {"screenshot", "html"})
         self.assertEqual({r["memory_anon_after"] for r in rows}, {2048})
+
+    def test_arm_order_is_shuffled_per_rep_from_the_seed(self):
+        """Codex, #1887: with a fixed cdp-then-html order every html request ran
+        right after a screenshot of the same page, tying arm to position."""
+        km = load("kitesurf_measure")
+
+        def orders(seed):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, tmp, True)
+            cgroup = os.path.join(tmp, "cg")
+            self.fake_cgroup(cgroup)
+            run_json = os.path.join(tmp, "run.json")
+            with open(run_json, "w") as h:
+                h.write("{}")
+
+            class FakeDrive:
+                @staticmethod
+                def drive(ns):
+                    return {"ok": True}
+            original = km.load_module
+            km.load_module = lambda name, path: FakeDrive
+            try:
+                out = os.path.join(tmp, "k.jsonl")
+                km.measure(argparse.Namespace(
+                    address="x", urls="https://a/", arms="cdp,html", reps=40, warmup=0,
+                    seed=seed, cgroup=cgroup, loadavg_file="/proc/loadavg",
+                    run_json=run_json, out=out))
+            finally:
+                km.load_module = original
+            rows = [json.loads(line) for line in open(out)]
+            return [tuple(r["arm"] for r in rows if r["rep"] == rep) for rep in range(40)]
+
+        first = orders(3)
+        self.assertEqual(first, orders(3), "the order is a function of the seed")
+        self.assertIn(("cdp", "html"), first)
+        self.assertIn(("html", "cdp"), first)
 
     def test_summary_counts_pages_that_failed_the_check_as_failures(self):
         km = load("kitesurf_measure")
@@ -355,6 +391,32 @@ class ChromiumCheckTeardown(unittest.TestCase):
         ks = open(os.path.join(HERE, "kitesurf.sh")).read()
         self.assertIn('--name "kschk-$RUNID"', ks)
         self.assertIn('RUNID="$RUN_ID-kitesurf"', src)
+
+
+class BuildLock(unittest.TestCase):
+    """Codex, #1887: two builds, or a build and a measurement, shared
+    KITESURF_DIR with no lock, so a rebuild could rewrite the tree mid-run."""
+
+    def test_a_build_refuses_while_the_directory_is_held(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        holder = subprocess.Popen(["flock", "-s", os.path.join(tmp, ".build.lock"), "sleep", "30"])
+        self.addCleanup(holder.kill)
+        deadline = time.monotonic() + 10
+        while not os.path.exists(os.path.join(tmp, ".build.lock")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        r = subprocess.run(["bash", os.path.join(HERE, "kitesurf_build.sh")],
+                           env=dict(os.environ, KITESURF_DIR=tmp), capture_output=True, text=True,
+                           timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("holds", r.stderr)
+        self.assertEqual(sorted(os.listdir(tmp)), [".build.lock"], "nothing was touched")
+
+    def test_the_run_holds_the_lock_shared_for_its_whole_phase(self):
+        ks = open(os.path.join(HERE, "kitesurf.sh")).read()
+        self.assertIn('flock -s -n "$BUILD_LOCK_FD"', ks)
+        self.assertLess(ks.index('flock -s -n "$BUILD_LOCK_FD"'), ks.index("kitesurf_seal.py\" verify"))
 
 
 class Seal(unittest.TestCase):
