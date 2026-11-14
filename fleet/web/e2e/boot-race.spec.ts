@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
 import summary from "../app/boot-race/summary.json" with { type: "json" };
 
-// /boot-race: recorded campaign results, linked from every view's switch. It must say it is recorded, name what
+// /boot-race: recorded campaign results, linked from the wall's About panel. It must say it is recorded, name what
 // was not run, and fit a phone without scrolling sideways.
 
-test("the wall links to the recorded boot race", async ({ page }) => {
+test("the wall's About panel links to the recorded boot race", async ({ page }) => {
   await page.goto("/?debug=1");
-  const link = page.getByTestId("mode-boot-race");
+  await page.getByTestId("menu").first().click();
+  const link = page.getByTestId("boot-race-link");
   await expect(link).toHaveAttribute("href", "/boot-race");
   await link.click();
   await expect(page).toHaveURL(/\/boot-race$/);
