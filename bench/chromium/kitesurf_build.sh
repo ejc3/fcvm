@@ -117,5 +117,5 @@ bazel --output_user_root="$KITESURF_DIR/bazel-root" shutdown
 log "sealing the built engine tree"
 python3 "$HERE/kitesurf_seal.py" write --src "$SRC" --out "$KITESURF_DIR/BUILD.json" \
     --rev "$KITESURF_REV" --node "$(node --version)" --pnpm "$(pnpm --version)" \
-    --bazel "$bazel_version" --arch "$arch"
+    --bazel "$bazel_version" --arch "$arch" --node-bin "$(command -v node)"
 log "built: $KITESURF_DIR/BUILD.json"

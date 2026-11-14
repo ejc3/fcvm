@@ -1077,6 +1077,13 @@ if kitesurf_path:
             or kitesurf_completion.get("run_id") != f"{run_id}-kitesurf"
             or not kitesurf_completion.get("artifacts")):
         sys.exit("FAILED: kitesurf completion does not name this campaign's run and artifacts")
+    listed = [a.get("path") if isinstance(a, dict) else None
+              for a in kitesurf_completion["artifacts"]]
+    required = ["kitesurf-build.json", "run.json", "kitesurf.jsonl", "summary.json",
+                "correctness/kitesurf/correctness.jsonl"]
+    optional = ["correctness/chromium/correctness.jsonl"]
+    if listed not in (required, required + optional):
+        sys.exit(f"FAILED: kitesurf completion lists {listed!r}, not the arm's artifact set")
     for artifact in kitesurf_completion["artifacts"]:
         current, _payload = completion_record(
             os.path.join(results, "kitesurf", artifact.get("path", "")), "kitesurf artifact")

@@ -77,8 +77,12 @@ class ReplayServer:
                 if "replaying on" in handle.read():
                     return self
             if self.proc.poll() is not None:
+                self.log.close()
                 raise RuntimeError("corpus_serve exited during start-up")
             time.sleep(0.05)
+        self.proc.kill()
+        self.proc.wait()
+        self.log.close()
         raise RuntimeError("corpus_serve never started")
 
     def __exit__(self, *exc):
@@ -180,6 +184,20 @@ class BlankScreenshots(unittest.TestCase):
         # A white page with a dark band covering 5% of it, as a line of text does.
         stats = rc.colour_stats(png(40, 30, lambda x, y: (20, 20, 20) if y < 2 and x < 23 else (255, 255, 255)))
         self.assertFalse(stats["blank"])
+
+    def test_a_truncated_png_is_a_value_error(self):
+        """CodeRabbit, #1887: a cut-off IHDR raised struct.error and a short
+        scanline IndexError, neither caught, so one bad screenshot ended the
+        whole correctness pass instead of failing its page."""
+        rc = load("render_check")
+        good = png(8, 8, lambda x, y: (x * 30, y * 30, 0))
+        with self.assertRaises(ValueError):
+            rc.colour_stats(good[:20])          # signature and part of IHDR
+        ihdr_end = 8 + 8 + 13 + 4
+        short = zlib.compress(b"\x00" + b"\x01" * 24)  # one 8-pixel row of 8
+        body = struct.pack(">I", len(short)) + b"IDAT" + short + struct.pack(">I", zlib.crc32(b"IDAT" + short))
+        with self.assertRaises(ValueError):
+            rc.colour_stats(good[:ihdr_end] + body)
 
     def test_every_png_filter_decodes(self):
         rc = load("render_check")
@@ -460,14 +478,29 @@ class Seal(unittest.TestCase):
         rev = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True,
                              text=True, check=True).stdout.strip()
         seal = os.path.join(tmp, "BUILD.json")
+        self.node = os.path.join(tmp, "tools", "node")
+        os.makedirs(os.path.dirname(self.node))
+        with open(self.node, "wb") as h:
+            h.write(b"ELF node")
         subprocess.run([sys.executable, os.path.join(HERE, "kitesurf_seal.py"), "write", "--src", src,
                         "--out", seal, "--rev", rev, "--node", "v", "--pnpm", "v", "--bazel", "v",
-                        "--arch", "a"], check=True, capture_output=True)
+                        "--arch", "a", "--node-bin", self.node], check=True, capture_output=True)
         return src, seal, rev
 
     def verify(self, src, seal, rev):
         return subprocess.run([sys.executable, os.path.join(HERE, "kitesurf_seal.py"), "verify",
-                               "--src", src, "--seal", seal, "--rev", rev], capture_output=True, text=True)
+                               "--src", src, "--seal", seal, "--rev", rev, "--node-bin", self.node],
+                              capture_output=True, text=True)
+
+    def test_a_replaced_node_binary_is_refused(self):
+        """CodeRabbit, #1887: the engine runs under KITESURF_DIR/tools' node,
+        outside the sealed tree, so a replaced node passed both checks."""
+        src, seal, rev = self.tree()
+        with open(self.node, "ab") as h:
+            h.write(b"!")
+        r = self.verify(src, seal, rev)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not the node binary the build sealed", r.stderr)
 
     def test_wrangler_state_anywhere_is_not_a_change(self):
         src, seal, rev = self.tree()
@@ -562,6 +595,38 @@ class Wiring(unittest.TestCase):
         r = self.publish(tmp)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("differs from its completion", r.stderr)
+
+    def test_a_completion_missing_an_artifact_is_refused(self):
+        """CodeRabbit, #1887: a completion naming only summary.json passed
+        publication, so a campaign could seal a Kitesurf run without its rows."""
+        km = load("kitesurf_measure")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        arm = os.path.join(tmp, "kitesurf")
+        os.makedirs(arm)
+        with open(os.path.join(arm, "summary.json"), "w") as h:
+            h.write("{}")
+        data = open(os.path.join(arm, "summary.json"), "rb").read()
+        with open(os.path.join(arm, "complete.json"), "w") as h:
+            json.dump({"schema_version": 1, "run_id": "a" * 32 + "-kitesurf",
+                       "artifacts": [{"path": "summary.json", "size": len(data),
+                                      "sha256": hashlib.sha256(data).hexdigest()}]}, h)
+        r = self.publish(tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not the arm's artifact set", r.stderr)
+
+    def test_the_chromium_check_waits_for_its_own_ready_chromium(self):
+        """Codex and CodeRabbit, #1887: the check started as soon as /json/list
+        listed a page, while entry.sh was still warming up the same target, and
+        any Chromium already on the port could answer instead of the container."""
+        ks = open(os.path.join(HERE, "kitesurf.sh")).read()
+        start = ks.index('CHROMIUM_CONTAINER=$(timeout')
+        check = ks.index('"$HERE/render_check.py" "127.0.0.1:$CHROMIUM_CDP_PORT"')
+        self.assertLess(ks.index("is in use before the Chromium check"), start)
+        wait = ks[start:check]
+        self.assertIn("test -f /run/bench-ready", wait)
+        self.assertIn("chromium_container_owns_cdp", wait)
+        self.assertIn('[ "$chromium_ready" = true ]', wait)
 
     def test_build_and_run_read_one_set_of_pins(self):
         for script in ("kitesurf.sh", "kitesurf_build.sh"):

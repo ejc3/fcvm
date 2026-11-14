@@ -43,7 +43,17 @@ def load(name, path):
 
 
 def png_pixels(data: bytes):
-    """(width, height, channels, rows) of an 8-bit RGB or RGBA PNG, unfiltered."""
+    """(width, height, channels, rows) of an 8-bit RGB or RGBA PNG, unfiltered.
+
+    Every malformed input raises ValueError, so the caller records the page as
+    failed rather than the pass dying on a struct or index error."""
+    try:
+        return _png_pixels(data)
+    except (struct.error, IndexError, zlib.error) as error:
+        raise ValueError(f"malformed PNG: {type(error).__name__}: {error}") from error
+
+
+def _png_pixels(data: bytes):
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("not a PNG")
     pos, idat, ihdr = 8, [], None
@@ -66,6 +76,8 @@ def png_pixels(data: bytes):
         raise ValueError(f"unsupported PNG (depth {depth}, colour type {color}, interlace {interlace})")
     raw = zlib.decompress(b"".join(idat))
     stride = width * channels
+    if len(raw) < height * (stride + 1):
+        raise ValueError(f"PNG data holds {len(raw)} bytes, {height} rows need {height * (stride + 1)}")
     rows, prev = [], bytearray(stride)
     for y in range(height):
         start = y * (stride + 1)

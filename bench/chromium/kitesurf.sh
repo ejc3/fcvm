@@ -113,7 +113,7 @@ WRANGLER="$SRC/packages/engine/node_modules/wrangler/bin/wrangler.js"
 
 mkdir -p "$RESULTS"
 log "verifying the Kitesurf build seal ($KITESURF_REV)"
-seal_before=$(python3 "$HERE/kitesurf_seal.py" verify --src "$SRC" --seal "$SEAL" --rev "$KITESURF_REV") \
+seal_before=$(python3 "$HERE/kitesurf_seal.py" verify --src "$SRC" --seal "$SEAL" --rev "$KITESURF_REV" --node-bin "$NODE_BIN/node") \
     || exit 2
 tree_sha256=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["tree_sha256"])' "$seal_before")
 cp "$SEAL" "$RESULTS/kitesurf-build.json"
@@ -194,6 +194,44 @@ stop_chromium() {
     }
     CHROMIUM_CONTAINER=""
 }
+# hostcdp.sh's container_owns_cdp: a process inside the container holds the
+# socket listening on the CDP port.
+chromium_container_owns_cdp() {
+    timeout --kill-after=5s 30s podman exec "$CHROMIUM_CONTAINER" python3 -c '
+import os, sys
+port = int(sys.argv[1])
+inodes = set()
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        rows = open(table).read().splitlines()[1:]
+    except OSError:
+        continue
+    for row in rows:
+        fields = row.split()
+        if len(fields) <= 9 or fields[3] != "0A":
+            continue
+        try:
+            if int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(fields[9])
+        except (IndexError, ValueError):
+            continue
+if not inodes:
+    raise SystemExit(1)
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inodes:
+            raise SystemExit(0)
+raise SystemExit(1)
+' "$CHROMIUM_CDP_PORT" >/dev/null 2>&1
+}
 on_exit() {
     local rc=$?
     trap - EXIT
@@ -213,15 +251,36 @@ if [ "$CHROMIUM_CHECK" = 1 ]; then
     [[ "$CONTAINER_OWNER_TOKEN" =~ ^[0-9a-f]{32}$ ]] \
         || { echo "REFUSING: CONTAINER_OWNER_TOKEN must be 32 hex characters for the Chromium check" >&2; exit 2; }
     image_ref="${IMAGE_ID:-$IMAGE}"
+    # The port must be free before the container starts, and the listener the
+    # check talks to must be the container's own: a Chromium already on the port
+    # would otherwise supply the reference renders.
+    python3 -c 'import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)' "$CHROMIUM_CDP_PORT" \
+        || { echo "REFUSING: 127.0.0.1:$CHROMIUM_CDP_PORT is in use before the Chromium check" >&2; exit 2; }
     log "correctness: starting the bench image's Chromium for its own render check"
     CHROMIUM_CONTAINER=$(timeout --kill-after=5s 120s podman run -d --rm \
         --name "kschk-$RUNID" --label "io.fcvm.bench.owner=$CONTAINER_OWNER_TOKEN" \
         --network host -e BENCH_RESOLVE_ALL_TO=127.0.0.1 "$image_ref")
+    # Ready means what hostcdp.sh means: entry.sh's warm marker (its warm-up
+    # navigations are over) and a CDP listener owned by a process in this
+    # container that lists a page target.
+    chromium_ready=false
     for _ in $(seq 1 240); do
-        curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$CHROMIUM_CDP_PORT/json/list" 2>/dev/null \
-            | grep -q '"type": *"page"' && break
+        if timeout --kill-after=5s 30s podman exec "$CHROMIUM_CONTAINER" test -f /run/bench-ready 2>/dev/null \
+                && chromium_container_owns_cdp \
+                && curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$CHROMIUM_CDP_PORT/json/list" 2>/dev/null \
+                    | grep -q '"type": *"page"'; then
+            chromium_ready=true
+            break
+        fi
         sleep 0.5
     done
+    [ "$chromium_ready" = true ] \
+        || { echo "FAILED: the check's Chromium never became ready with its own CDP listener" >&2; exit 1; }
     python3 "$HERE/render_check.py" "127.0.0.1:$CHROMIUM_CDP_PORT" --urls "$URLS_ARG" \
         --out "$RESULTS/correctness/chromium" --engine chromium > "$RESULTS/correctness-chromium.log" 2>&1 \
         || { cat "$RESULTS/correctness-chromium.log" >&2; echo "FAILED: Chromium render check" >&2; exit 1; }
@@ -342,7 +401,7 @@ python3 "$HERE/kitesurf_measure.py" --address "127.0.0.1:$KITESURF_PORT" --urls 
 
 peak=$(cat "$CGROUP/memory.peak")
 stop_engine
-seal_after=$(python3 "$HERE/kitesurf_seal.py" verify --src "$SRC" --seal "$SEAL" --rev "$KITESURF_REV") \
+seal_after=$(python3 "$HERE/kitesurf_seal.py" verify --src "$SRC" --seal "$SEAL" --rev "$KITESURF_REV" --node-bin "$NODE_BIN/node") \
     || { echo "FAILED: the Kitesurf tree changed during the run" >&2; exit 5; }
 [ "$measure_status" -eq 0 ] || { echo "FAILED: the measurement loop exited $measure_status" >&2; exit "$measure_status"; }
 

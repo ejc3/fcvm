@@ -87,6 +87,14 @@ def relocated(target: str, base: bytes) -> str:
     return os.fsencode(target).replace(base, PLACEHOLDER).decode("utf-8", "surrogateescape")
 
 
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def git(src, *args):
     return subprocess.run(["git", "-C", src, *args], check=True, capture_output=True,
                           text=True).stdout.strip()
@@ -129,6 +137,7 @@ def write(args):
         "wrangler": package_version(args.src, "wrangler"),
         "miniflare": package_version(args.src, "miniflare"),
         "workerd": {rel: files[rel].split(":", 1)[1] for rel in workerd},
+        "node_sha256": file_sha256(args.node_bin),
     }
     if not workerd:
         sys.exit("BLOCKED: the installed tree holds no workerd binary for this platform")
@@ -150,6 +159,9 @@ def verify(args):
         sys.exit(f"BLOCKED: {args.src} is not at {args.rev}")
     if not tracked_clean(args.src):
         sys.exit(f"BLOCKED: tracked files in {args.src} differ from {args.rev}")
+    # The engine runs under the pinned node from KITESURF_DIR/tools, outside the tree.
+    if file_sha256(args.node_bin) != seal.get("node_sha256"):
+        sys.exit(f"BLOCKED: {args.node_bin} is not the node binary the build sealed; rebuild")
     digest, count, _files = manifest(args.src)
     if digest != seal.get("tree_sha256"):
         sys.exit(f"BLOCKED: the built Kitesurf tree changed since it was sealed "
@@ -166,10 +178,12 @@ def main():
     w.add_argument("--rev", required=True)
     for name in ("node", "pnpm", "bazel", "arch"):
         w.add_argument(f"--{name}", required=True)
+    w.add_argument("--node-bin", required=True)
     v = sub.add_parser("verify")
     v.add_argument("--src", required=True)
     v.add_argument("--seal", required=True)
     v.add_argument("--rev", required=True)
+    v.add_argument("--node-bin", required=True)
     args = ap.parse_args()
     (write if args.cmd == "write" else verify)(args)
 
