@@ -1348,7 +1348,10 @@ fn every_kernel_patch_is_applied_by_some_kernel() {
         .expect("[kernel_profiles] is a table")
     {
         for (_, table) in arches.as_table().into_iter().flatten() {
-            for t in [Some(table), table.get("host_kernel")].into_iter().flatten() {
+            for t in [Some(table), table.get("host_kernel")]
+                .into_iter()
+                .flatten()
+            {
                 if let Some(dir) = t.get("patches_dir").and_then(|v| v.as_str()) {
                     dirs.push(dir.to_string());
                 }
