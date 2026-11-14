@@ -44,9 +44,10 @@ LANES = {
         "start": "RunTask on a running container instance, image already pulled",
     },
     "lambda-cold": {
-        "name": "Lambda, new runtime every request",
-        "short": "Lambda new runtime",
-        "start": "HTTPS GET to the function URL; the runtime process that served the previous request exited",
+        "name": "Lambda, cold start",
+        "short": "Lambda cold",
+        "start": "HTTPS GET to the function URL, after an untimed code upload that retires the function's "
+                 "execution environments",
     },
     "ec2-hibernate": {
         "name": "EC2 hibernate resume",
@@ -78,9 +79,9 @@ CHECKS = [
                   "resumed the snapshot's own process (race.py refuses any other)."],
     ["lambda-warm", "{n} samples answered from {new_proc} runtime process; {init} of {report} REPORT lines carried "
                     "an Init Duration. race.py refuses a warm sample from a new process."],
-    ["lambda-cold", "{n} samples answered from {new_proc} runtime processes on {new_boot} kernel boots; "
-                    "{same_boot} answered with the same kernel boot id as the sample before; {init} of {report} "
-                    "REPORT lines carried an Init Duration."],
+    ["lambda-cold", "{n} samples, each from a new runtime process; {init} of {report} REPORT lines carried an Init "
+                    "Duration. Before each sample race.py uploads new code so Lambda starts a new "
+                    "execution environment, and it refuses a sample whose REPORT line has no Init Duration."],
     ["ecs-ec2", "{n} samples answered from {new_proc} container processes on {new_boot} kernel boot (the one "
                 "container instance)."],
     ["ecs-fargate", "{n} samples answered from {new_proc} processes on {new_boot} kernel boots: one per task."],
@@ -91,6 +92,16 @@ CHECKS = [
     ["ec2-launch", "{n} samples answered from {new_proc} processes and {new_boot} kernel boots: one per instance."],
 ]
 
+# Lanes the driver has but a campaign may not run, with the reason the page gives, and the setup row that describes
+# each one (dropped when the lane did not run).
+NOT_RUN = {
+    "ecs-fargate": "The campaign's AWS configuration (ejc3/aws boot-race.tf) keeps this lane off. A Fargate task "
+                   "without a public IP pulls its image through ECR interface endpoints, which bill by the hour and "
+                   "change ECR DNS for the whole VPC, and they have no reviewed teardown yet.",
+}
+SETUP_ROW_LANE = {"ECS on Fargate": "ecs-fargate", "Fargate platform": "ecs-fargate"}
+SETUP_ROW_NAME = {"Lambda, cold": "Lambda, cold start"}
+
 FORBIDDEN = [
     re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt)-[0-9a-f]{8,17}\b"),
     re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"),
@@ -98,7 +109,7 @@ FORBIDDEN = [
     re.compile(r"lambda-url|amazonaws\.com"),
     re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b", re.I),
     re.compile(r"\bami-[0-9a-f]{8,17}\b"),
-    re.compile(r"(?<![\w-])\d{12}(?![\w-])"),
+    re.compile(r"(?<![\w-])(?<!\d\.)\d{12}(?![\w-])(?!\.\d)"),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     re.compile(r"arn:aws:"),
 ]
@@ -110,8 +121,20 @@ SCRUB = [
     (re.compile(r"arn:aws:\S+"), "<arn>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<id>"),
     (re.compile(r"https?://\S+"), "<url>"),
-    (re.compile(r"(?<![\w-])\d{12}(?![\w-])"), "<account>"),
+    (re.compile(r"(?<![\w-])(?<!\d\.)\d{12}(?![\w-])(?!\.\d)"), "<account>"),
 ]
+
+
+def cold_evidence_missing(rec):
+    """A lambda-cold record the page may not call a cold start: one taken without a code upload before it
+    or without an Init Duration after it (records from a driver that did neither, or a resumed campaign's)."""
+    if rec.get("lane") != "lambda-cold" or not rec.get("ok"):
+        return None
+    if not rec.get("generation"):
+        return "no code upload before the sample: not shown to be a new execution environment"
+    if rec.get("init_duration_ms") is None:
+        return "no Init Duration in the invocation's REPORT line: not a cold start"
+    return None
 
 
 def scrub(text):
@@ -152,6 +175,10 @@ def build(results):
             if line.strip():
                 recs.append(json.loads(line))
     recs.sort(key=lambda r: r.get("t_start_unix_ms") or r.get("t_failed_unix_ms") or 0)
+    for r in recs:
+        refused = cold_evidence_missing(r)
+        if refused:
+            r.update(ok=False, error=f"IdentityCheck: {refused}")
 
     lanes = []
     for lid, meta in LANES.items():
@@ -222,9 +249,14 @@ def build(results):
         derived.append(["Fargate platform", ", ".join(fargate)])
     if loads:
         derived.append(["Campaign host load", f"1-minute load average {min(loads):.2f} to {max(loads):.2f} "
-                        f"at the start of each sample"])
-    setup["rows"] = derived + list(setup.get("rows", []))
+                        f"when each lane attempt began (before any wait for the instance to be ready)"])
+    run = {r["lane"] for r in recs}
+    setup["rows"] = [[SETUP_ROW_NAME.get(row[0], row[0]), row[1]] for row in derived + list(setup.get("rows", []))
+                     if row[0] not in SETUP_ROW_LANE or SETUP_ROW_LANE[row[0]] in run]
+    not_run = [{"id": lid, "name": LANES[lid]["name"], "why": NOT_RUN.get(lid, "Not run in this campaign.")}
+               for lid in LANES if lid not in run]
     data = {
+        "not_run": not_run,
         "setup": setup,
         "first_sample_unix_ms": min(starts) if starts else None,
         "last_sample_unix_ms": max(starts) if starts else None,

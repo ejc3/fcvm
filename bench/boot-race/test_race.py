@@ -8,8 +8,10 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
+from unittest import mock
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -136,6 +138,151 @@ class Resume(unittest.TestCase):
             asyncio.run(race.run({"results": d}, 1, 0, ["lambda-warm"]))
             with open(path) as f:
                 self.assertEqual(len(f.read().splitlines()), 1)
+
+
+class Hibernate(unittest.TestCase):
+    def test_a_resumed_instance_settles_before_its_hibernate_stop(self):
+        events = []
+
+        class Client:
+            def describe_instances(self, InstanceIds):
+                state = "running" if any(e[0] == "start" for e in events) else "stopped"
+                return {"Reservations": [{"Instances": [{"PrivateIpAddress": "x", "State": {"Name": state}}]}]}
+
+            def start_instances(self, InstanceIds):
+                events.append(("start",))
+
+            def stop_instances(self, InstanceIds, Hibernate):
+                events.append(("stop", Hibernate))
+
+        async def answered(*a, **kw):
+            return 0, {"proc_id": "a", "boot_id": "x"}, 1
+
+        async def slept(s):
+            events.append(("sleep", s))
+
+        for hibernate, settle in ((True, 30), (False, 1)):
+            events.clear()
+            lane = race.Ec2.__new__(race.Ec2)
+            lane.ec2 = Client()
+            with mock.patch.object(race, "probe", answered), mock.patch.object(race.asyncio, "sleep", slept):
+                asyncio.run(lane.start_sample("i-1", hibernate))
+            self.assertEqual(events, [("start",), ("sleep", settle), ("stop", hibernate)])
+
+
+class FailedStart(unittest.TestCase):
+    def test_a_refused_start_fails_the_sample_without_waiting_or_stopping(self):
+        events = []
+
+        class Refused(Exception):
+            pass
+
+        class Client:
+            def describe_instances(self, InstanceIds):
+                return {"Reservations": [{"Instances": [{"PrivateIpAddress": "x", "State": {"Name": "stopped"}}]}]}
+
+            def start_instances(self, InstanceIds):
+                raise Refused("InsufficientInstanceCapacity")
+
+            def stop_instances(self, InstanceIds, Hibernate):
+                events.append(("stop", Hibernate))
+
+        async def slept(s):
+            events.append(("sleep", s))
+
+        lane = race.Ec2.__new__(race.Ec2)
+        lane.ec2 = Client()
+        real_wait = lane.wait_state
+
+        def wait_state(iid, want, timeout=900):
+            events.append(("wait", want))
+            if want != "stopped":
+                raise TimeoutError(f"instance did not reach {want}")
+            return real_wait(iid, want, timeout)
+
+        lane.wait_state = wait_state
+        with mock.patch.object(race.asyncio, "sleep", slept):
+            with self.assertRaises(Refused):
+                asyncio.run(lane.start_sample("i-1", True))
+        self.assertEqual(events, [("wait", "stopped")])
+
+
+class ColdLambda(unittest.TestCase):
+    """Every lambda-cold sample is a cold start: a new execution environment before t0, an Init Duration after."""
+
+    def lane(self, init):
+        events = []
+
+        class Lam:
+            def get_function_configuration(self, FunctionName):
+                return {"Environment": {"Variables": {"BOOT_RACE_EXIT_AFTER_RESPONSE": "1"}}}
+
+            def update_function_code(self, FunctionName, ZipFile):
+                import io
+                import zipfile
+
+                names = sorted(zipfile.ZipFile(io.BytesIO(ZipFile)).namelist())
+                events.append(("update", FunctionName, names))
+
+            def get_waiter(self, name):
+                class W:
+                    def wait(self, **kw):
+                        events.append(("waited", name))
+                return W()
+
+        class Logs:
+            def filter_log_events(self, **kw):
+                tail = f"\tInit Duration: {init} ms" if init is not None else ""
+                return {"events": [{"message": f"REPORT RequestId: r1\tDuration: 2.00 ms{tail}\n"}]}
+
+        lane = race.Lambda.__new__(race.Lambda)
+        workload = tempfile.NamedTemporaryFile(delete=False)
+        workload.write(b"\x7fELF")
+        workload.close()
+        self.addCleanup(os.unlink, workload.name)
+        lane.cfg = {"function_urls": {"cold": "https://cold.example/", "warm": "https://warm.example/"},
+                    "workload_bin": workload.name}
+        lane.lam, lane.logs = Lam(), Logs()
+
+        def call(url):
+            events.append(("call", url))
+            return {"t_start_unix_ms": 1000, "ms": 150.0, "request_id": "r1", "answer": {"proc_id": "a", "boot_id": "x"}}
+
+        lane.call = call
+        return lane, events
+
+    def test_each_cold_sample_retires_the_environment_before_the_timed_call(self):
+        lane, events = self.lane(12.27)
+        s = asyncio.run(lane.sample("lambda-cold"))
+        self.assertEqual(events[0], ("update", "boot-race-cold", ["bootstrap", "generation"]))
+        self.assertEqual(events[1], ("waited", "function_updated_v2"))
+        self.assertEqual(events[2], ("call", "https://cold.example/"))
+        self.assertEqual(s["init_duration_ms"], 12.27)
+        self.assertIsNone(race.check_cold("lambda-cold", s))
+
+    def test_a_cold_sample_without_init_duration_is_refused(self):
+        lane, events = self.lane(None)
+        s = asyncio.run(lane.sample("lambda-cold"))
+        self.assertIsNone(s["init_duration_ms"])
+        self.assertIn("not a cold start", race.check_cold("lambda-cold", s))
+
+    def test_the_report_line_is_found_past_an_empty_first_page(self):
+        pages = [{"events": [], "nextToken": "t1"},
+                 {"events": [{"message": "REPORT RequestId: r1\tDuration: 2.00 ms\tInit Duration: 11.50 ms"}]}]
+
+        class Logs:
+            def filter_log_events(self, **kw):
+                return pages[1] if kw.get("nextToken") == "t1" else pages[0]
+
+        lane = race.Lambda.__new__(race.Lambda)
+        lane.logs = Logs()
+        with mock.patch.object(race.time, "sleep"):
+            self.assertEqual(lane.init_duration_ms("boot-race-cold", "r1", 1000, deadline_s=0.05), 11.5)
+
+    def test_the_warm_lane_does_not_touch_the_configuration(self):
+        lane, events = self.lane(None)
+        asyncio.run(lane.sample("lambda-warm"))
+        self.assertEqual(events, [("call", "https://warm.example/")])
 
 
 class LaunchTiming(unittest.TestCase):

@@ -5008,6 +5008,9 @@ pub fn build_snapshot_config(
             tty: vm_state.config.tty,
             interactive: vm_state.config.interactive,
             kernel_profile: vm_state.config.kernel_profile.clone(),
+            host_kernel: crate::setup::rootfs::guest_kvm_host_kernel(
+                vm_state.config.kernel_profile.as_deref(),
+            )?,
             image_mode: vm_state.config.image_mode.clone(),
             image_disk_path: vm_state.config.image_disk_path.clone(),
             image_disk_identity: vm_state.config.image_disk_identity.clone(),

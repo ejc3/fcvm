@@ -3097,6 +3097,12 @@ async fn cmd_snapshot_run_inner(
         .await
         .context("loading snapshot configuration")?;
     *attempted_generation = Some(snapshot_generation);
+    if snapshot_config.kind != crate::storage::SnapshotKind::DiskOnly {
+        snapshot_config.metadata.check_host_kernel(
+            &snapshot_name,
+            &crate::setup::rootfs::host_kernel_release()?,
+        )?;
+    }
 
     // Which host directories this clone serves, settled before anything is allocated and
     // applied to the config every later step reads: the volume servers, the clone's own
@@ -7373,6 +7379,22 @@ mod tests {
         );
     }
 
+    /// A snapshot records the host kernel when its profile runs KVM in the guest, and a
+    /// restore checks it right after loading the snapshot, before anything is set up.
+    #[test]
+    fn a_restore_checks_the_recorded_host_kernel_before_it_sets_anything_up() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let check = body
+            .find("snapshot_config.metadata.check_host_kernel(")
+            .expect("no host kernel check");
+        assert!(body.find("load_snapshot_with_generation").unwrap() < check);
+        assert!(check < body.find("clone_volumes(").unwrap());
+        assert!(check < body.find("SnapshotRestoreConfig {").unwrap());
+        let builder = include_str!("common.rs");
+        assert!(builder.contains("host_kernel: crate::setup::rootfs::guest_kvm_host_kernel("));
+    }
+
     /// A snapshot's metadata, for the tests that read it back.
     fn metadata_fixture() -> crate::storage::SnapshotMetadata {
         crate::storage::SnapshotMetadata {
@@ -7413,6 +7435,7 @@ mod tests {
             guest: Default::default(),
             health_port: None,
             firmware: None,
+            host_kernel: None,
         }
     }
 

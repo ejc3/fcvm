@@ -82,5 +82,27 @@ class GuestDevtoolsProbe(unittest.TestCase):
         self.assertRegex(source, re.escape("printf '{DEVTOOLS_VERSION_REQUEST.format(port=port)}'"))
 
 
+class ChromiumProcessSection(unittest.TestCase):
+    """The chromium_processes section lists Chromium, not the probe itself.
+
+    The guest sections run as one `sh -c` whose args hold every section's
+    name, and a whole-line /[c]hrom/ matched "chromium_processes" in them: a
+    repro probe of a timed-out clone listed only the probe's own sh lines.
+    Red before matching the comm column: the batch's sh line is listed."""
+
+    def test_only_processes_named_chrom_are_listed(self):
+        command = dict(reqbench.PROBE_GUEST_PASSIVE_SECTIONS)["chromium_processes"]
+        ps_output = (
+            "    PID    PPID STAT ELAPSED COMMAND         COMMAND\n"
+            "    101       1 S        30 chromium        /usr/lib/chromium/chromium --headless=new\n"
+            "   1256    1180 S         0 sh              sh -c printf '===fcvm-probe-section %s\\n' chromium_processes\n"
+        )
+        script = command.replace("ps -eo pid,ppid,stat,etimes,comm,args", "cat")
+        out = subprocess.run(["sh", "-c", script], input=ps_output, capture_output=True,
+                             text=True, timeout=10)
+        lines = out.stdout.splitlines()
+        self.assertEqual(len(lines), 2, out.stdout)
+        self.assertIn("chromium --headless=new", lines[1])
+
 if __name__ == "__main__":
     unittest.main()

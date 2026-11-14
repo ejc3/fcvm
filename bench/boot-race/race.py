@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """boot-race driver: time from asking for compute to the workload answering, for every lane, interleaved.
 
-Runs on a parallel box (bare metal, /dev/kvm) in us-east-2. The fcvm lanes restore a snapshot on this host; the AWS
-lanes start the same workload through the AWS APIs, with boot-race-driver credentials read from a JSON file
-(BOOT_RACE_CREDS, default /dev/shm/boot-race-creds.json) that the operator refreshes.
+Runs on the dedicated bare-metal benchmark worker (/dev/kvm) in us-east-2. The fcvm lanes restore a snapshot
+on this host; the AWS lanes use the worker's instance profile to assume boot-race-driver and refresh in memory.
 
 Every lane is timed the same way: t0 is taken immediately before the call that asks for compute (Popen of
 `fcvm snapshot run`, RunInstances, StartInstances, RunTask, or the HTTPS request to a function URL), and t1 when an
@@ -17,6 +16,7 @@ import argparse
 import asyncio
 import datetime
 import fcntl
+import functools
 import http.client
 import json
 import os
@@ -26,7 +26,8 @@ import sys
 import time
 import urllib.parse
 
-REGION = "us-east-2"
+from worker_aws import REGION, make_session, metadata_reader
+
 TAG = {"Key": "Project", "Value": "boot-race"}
 LANES = [
     "fcvm-file",
@@ -56,22 +57,19 @@ def log(*a):
 
 
 # ------------------------------------------------------------------ AWS
-def session():
-    import boto3
+@functools.lru_cache(maxsize=1)
+def _driver_session():
+    return make_session()
 
-    path = os.environ.get("BOOT_RACE_CREDS", "/dev/shm/boot-race-creds.json")
-    with open(path) as f:
-        c = json.load(f)
-    exp = datetime.datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00"))
-    left = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-    if left < 120:
-        raise SystemExit(f"boot-race credentials expire in {left:.0f} s; refresh {path}")
-    return boto3.Session(
-        aws_access_key_id=c["AccessKeyId"],
-        aws_secret_access_key=c["SecretAccessKey"],
-        aws_session_token=c["SessionToken"],
-        region_name=REGION,
-    )
+
+def session():
+    try:
+        sdk = _driver_session()
+        # Resolve credentials before timing a sample. Existing clients also refresh automatically.
+        sdk.get_credentials().get_frozen_credentials()
+        return sdk
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(f"benchmark worker credentials unavailable: {exc}") from None
 
 
 def tags(name):
@@ -197,6 +195,7 @@ class Fcvm:
 
 
 # ------------------------------------------------------------------ EC2 lanes
+HIBERNATE_SETTLE_S = 30
 class Ec2:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -246,14 +245,19 @@ class Ec2:
         ip, _ = self.ip(iid)
         t0 = time.monotonic_ns()
         start_ms = now_ms()
+        # A refused StartInstances (InsufficientInstanceCapacity happens) leaves the instance stopped: the sample
+        # fails at once with that error, and the instance is ready for the next round as it is.
+        self.ec2.start_instances(InstanceIds=[iid])
         try:
-            self.ec2.start_instances(InstanceIds=[iid])
             t_api = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
         finally:
-            # Give the workload a moment so a hibernating guest has nothing in flight, then stop it for next time.
-            await asyncio.sleep(1)
+            # Not timed: settle before the stop that readies the next sample. A hibernate stop sent 1 s after a
+            # resume answered sat in "stopping" for 20 minutes and then became an ordinary stop, so the next start
+            # booted; with 30 s, three resume-hibernate cycles in a row stopped in 10 to 20 s and resumed the same
+            # process. The settle counts from "running", so a sample whose probe gave up still gets it.
             await asyncio.to_thread(self.wait_state, iid, "running")
+            await asyncio.sleep(HIBERNATE_SETTLE_S if hibernate else 1)
             self.ec2.stop_instances(InstanceIds=[iid], Hibernate=hibernate)
         return {
             "t_start_unix_ms": start_ms,
@@ -391,18 +395,49 @@ class Ecs:
 
 
 # ------------------------------------------------------------------ Lambda lanes
+def parse_report(message):
+    """The fields of one Lambda REPORT log line, by name ("REPORT RequestId", "Duration", "Init Duration", ...)."""
+    return dict(p.strip().split(": ", 1) for p in message.strip().split("\t") if ": " in p)
+
+
+def workload_zip(workload_bin, generation=None):
+    """The functions' code: the workload binary as the custom runtime's `bootstrap`, and, for a cold sample, a
+    `generation` file that makes the upload different code from the one before."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o100755 << 16
+        with open(workload_bin, "rb") as f:
+            z.writestr(info, f.read())
+        if generation is not None:
+            z.writestr("generation", generation)
+    return buf.getvalue()
+
+
 class Lambda:
+    """The Lambda lanes. lambda-cold makes every sample a cold start: before t0 it uploads new code (the workload and
+    a random generation file), which retires the function's execution environments, and
+    after t1 it reads the invocation's REPORT line, whose Init Duration a cold start carries; run() refuses a
+    cold sample without one. Neither step is timed."""
+
+    COLD = "boot-race-cold"
+
     def __init__(self, cfg):
         self.cfg = cfg
-        self.creds = session().get_credentials().get_frozen_credentials()
+        s = session()
+        self.creds = s.get_credentials()
+        self.lam = s.client("lambda")
+        self.logs = s.client("logs")
 
     def signed_get(self, url):
         from botocore.auth import SigV4Auth
         from botocore.awsrequest import AWSRequest
-        from botocore.credentials import Credentials
 
         req = AWSRequest(method="GET", url=url, headers={"Host": urllib.parse.urlparse(url).netloc})
-        SigV4Auth(Credentials(*self.creds), "lambda", REGION).add_auth(req)
+        SigV4Auth(self.creds.get_frozen_credentials(), "lambda", REGION).add_auth(req)
         return dict(req.headers.items())
 
     def call(self, url):
@@ -427,9 +462,52 @@ class Lambda:
             raise RuntimeError("answer without ok")
         return {"t_start_unix_ms": start_ms, "ms": (t1 - t0) / 1e6, "request_id": rid, "answer": doc}
 
+    def new_environment(self, name):
+        """Retire the function's execution environments: new code sends the next invocation to a new one. The code is
+        the workload as `bootstrap` plus a file holding a random generation, so every upload is different code. (The
+        driver role may update the functions' code, not their configuration.) Returns the generation."""
+        generation = os.urandom(8).hex()
+        self.lam.update_function_code(FunctionName=name, ZipFile=workload_zip(self.cfg["workload_bin"], generation))
+        self.lam.get_waiter("function_updated_v2").wait(FunctionName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 120})
+        return generation
+
+    def init_duration_ms(self, name, rid, since_ms, deadline_s=120):
+        """The Init Duration of one invocation's REPORT line (None when the line has none); waits for the line."""
+        end = time.time() + deadline_s
+        while time.time() < end:
+            kw = {"logGroupName": f"/aws/lambda/{name}", "startTime": int(since_ms) - 60_000,
+                  "filterPattern": f'"REPORT RequestId: {rid}"'}
+            while True:  # FilterLogEvents may return empty pages before the one holding the line
+                r = self.logs.filter_log_events(**kw)
+                for e in r["events"]:
+                    parts = parse_report(e["message"])
+                    if parts.get("REPORT RequestId") == rid:
+                        init = parts.get("Init Duration")
+                        return float(init.split()[0]) if init else None
+                if not r.get("nextToken"):
+                    break
+                kw["nextToken"] = r["nextToken"]
+            time.sleep(2)
+        raise TimeoutError(f"no REPORT line for the invocation in {deadline_s} s")
+
+    def cold_sample(self, url):
+        generation = self.new_environment(self.COLD)
+        s = self.call(url)
+        s["generation"] = generation
+        s["init_duration_ms"] = self.init_duration_ms(self.COLD, s["request_id"], s["t_start_unix_ms"])
+        return s
+
     async def sample(self, lane):
-        url = self.cfg["function_urls"]["cold" if lane == "lambda-cold" else "warm"]
-        return await asyncio.to_thread(self.call, url)
+        if lane == "lambda-cold":
+            return await asyncio.to_thread(self.cold_sample, self.cfg["function_urls"]["cold"])
+        return await asyncio.to_thread(self.call, self.cfg["function_urls"]["warm"])
+
+
+def check_cold(lane, sample):
+    """Refuse a lambda-cold sample whose invocation was not a cold start; return the reason or None."""
+    if lane == "lambda-cold" and sample.get("init_duration_ms") is None:
+        return "no Init Duration in the invocation's REPORT line: not a cold start"
+    return None
 
 
 # ------------------------------------------------------------------ the campaign
@@ -526,7 +604,7 @@ async def run(cfg, rounds, first_round, lanes):
                     rec["same_proc_as_previous"] = prev["proc_id"] == s["answer"]["proc_id"]
                     rec["same_boot_as_previous"] = prev["boot_id"] == s["answer"]["boot_id"]
                 prev_answer[lane] = s["answer"]
-                why = check_identity(lane, prev, s["answer"], cfg)
+                why = check_identity(lane, prev, s["answer"], cfg) or check_cold(lane, s)
                 if why:
                     rec.update(ok=False, error=f"IdentityCheck: {why}")
                     log(f"  {lane}: {s['ms']:.1f} ms REFUSED {why}")
@@ -552,9 +630,7 @@ def fetch_reports(cfg):
                 kw["nextToken"] = token
             r = logs.filter_log_events(**kw)
             for e in r["events"]:
-                parts = dict(
-                    p.strip().split(": ", 1) for p in e["message"].strip().split("\t") if ": " in p
-                )
+                parts = parse_report(e["message"])
                 rid = parts.get("REPORT RequestId")
                 if rid:
                     found[rid] = {
@@ -575,16 +651,9 @@ def fetch_reports(cfg):
 # ------------------------------------------------------------------ setup.json
 def imds(path):
     """One instance metadata value of the campaign host (IMDSv2), or None off EC2."""
-    import urllib.request
-
     try:
-        tok = urllib.request.urlopen(urllib.request.Request(
-            "http://169.254.169.254/latest/api/token", method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
-        return urllib.request.urlopen(urllib.request.Request(
-            f"http://169.254.169.254/latest/meta-data/{path}",
-            headers={"X-aws-ec2-metadata-token": tok}), timeout=2).read().decode()
-    except OSError:
+        return metadata_reader()("meta-data/" + path)
+    except (OSError, RuntimeError):
         return None
 
 

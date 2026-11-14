@@ -326,6 +326,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # Set per request in handle_one_request; end_headers sends the CORS
     # headers once, on whichever reply the request gets.
     _cors_sent = False
+    # --connection-close: say "Connection: close" on every reply. The replay
+    # speaks HTTP/1.0 and closes each connection after one reply, which a 1.0
+    # reply already means; workerd's HTTP client (the Kitesurf arm) reuses the
+    # connection anyway, finds it closed, and fails the request with "Network
+    # connection lost". Off by default, so the other arms' replies are as before.
+    close_header = False
 
     def handle_one_request(self):
         # One access line per parsed request, written after the response has
@@ -415,6 +421,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if origin:
                 self.send_header("Access-Control-Allow-Credentials", "true")
                 self.send_header("Vary", "Origin")
+            if self.close_header:
+                self.send_header("Connection", "close")
         super().end_headers()
 
     # A request body larger than this is not read through; the connection
@@ -849,6 +857,59 @@ def selfsigned(tmpdir: Path):
     return crt, key
 
 
+def replay_hosts(exact, noquery, redirects) -> list:
+    """Every host name the capture can answer, from the three index tables."""
+    hosts = set()
+    for table in (exact, noquery, redirects):
+        for key in table:
+            name = urllib.parse.urlsplit("//" + key[0]).hostname
+            if name:
+                hosts.add(name)
+    return sorted(hosts)
+
+
+def ca_signed(tmpdir: Path, hosts, ca_out: Path):
+    """A leaf for every captured host name, signed by a CA made for this run.
+
+    For a client that verifies certificates and has no switch to stop it
+    (workerd, which the Kitesurf arm runs, trusts NODE_EXTRA_CA_CERTS through
+    miniflare). The default self-signed certificate's `DNS:*` matches no name
+    under RFC 6125, so such a client refuses every connection. Only the CA's
+    certificate is written to ca_out; both private keys die with tmpdir, as the
+    default key pair does. The leaf keeps `DNS:*` too, so a client that
+    ignores errors sees the same names it did before.
+    """
+    ca_key, ca_crt = tmpdir / "ca.key", tmpdir / "ca.crt"
+    key, csr, crt = tmpdir / "replay.key", tmpdir / "replay.csr", tmpdir / "replay.crt"
+    ext = tmpdir / "leaf.ext"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(ca_key), "-out", str(ca_crt), "-days", "2",
+         "-subj", "/CN=corpus-replay CA",
+         "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+        check=True, capture_output=True)
+    subprocess.run(
+        ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(key), "-out", str(csr), "-subj", "/CN=corpus-replay"],
+        check=True, capture_output=True)
+    names = ",".join(f"DNS:{h}" for h in hosts)
+    ext.write_text(
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        f"subjectAltName={names}{',' if names else ''}DNS:*,DNS:localhost,IP:127.0.0.1\n")
+    subprocess.run(
+        ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca_crt),
+         "-CAkey", str(ca_key), "-set_serial", str(int.from_bytes(os.urandom(8), "big")),
+         "-days", "2", "-extfile", str(ext), "-out", str(crt)],
+        check=True, capture_output=True)
+    tmp_out = ca_out.with_name(ca_out.name + ".tmp")
+    tmp_out.write_bytes(ca_crt.read_bytes())
+    os.replace(tmp_out, ca_out)
+    return crt, key
+
+
 def family_of(addr: str) -> int:
     """AF_INET6 for an IPv6 address literal, AF_INET otherwise."""
     return socket.AF_INET6 if ":" in addr else socket.AF_INET
@@ -995,6 +1056,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="listen() backlog of both listeners (default "
                          f"{ReplayServer.DEFAULT_BACKLOG}). The kernel caps it at "
                          "net.core.somaxconn")
+    ap.add_argument("--connection-close", action="store_true",
+                    help="send Connection: close on every reply (Handler.close_header)")
+    ap.add_argument("--tls-ca-out", default=None, metavar="PATH",
+                    help="serve a leaf naming every captured host, signed by a CA made "
+                         "for this run, and write that CA's certificate to PATH "
+                         "(see ca_signed); default: one self-signed certificate")
     ap.add_argument("--tls-handshake-in-accept", action="store_true",
                     help="run the TLS handshake in the accept thread, with no time "
                          "limit, instead of in the connection's handler thread")
@@ -1015,6 +1082,7 @@ def main():
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     Handler.access_log = JsonlLog(args.access_log) if args.access_log else None
+    Handler.close_header = args.connection_close
     print(f"loaded {len(Handler.exact)} urls", flush=True)
 
     dns_log = JsonlLog(args.dns_log) if args.dns_log else None
@@ -1033,7 +1101,12 @@ def main():
     # The key pair lives only until it is loaded: a fixed path under /tmp was
     # shared by every server on the box, whatever user each ran as.
     with tempfile.TemporaryDirectory(prefix="corpus-replay-cert-") as tmp:
-        crt, key = selfsigned(Path(tmp))
+        if args.tls_ca_out:
+            crt, key = ca_signed(Path(tmp), replay_hosts(Handler.exact, Handler.noquery,
+                                                         Handler.redirects),
+                                 Path(args.tls_ca_out))
+        else:
+            crt, key = selfsigned(Path(tmp))
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(crt), str(key))
     tls.socket = ctx.wrap_socket(tls.socket, server_side=True,

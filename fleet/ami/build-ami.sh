@@ -86,7 +86,7 @@ case "$1" in
 launch)
   kind=$2
   case "$kind" in
-    host) type=${TYPE:-g4dn.metal}; profile=fcvm-fleet-host; size=64 ;;
+    host) type=${TYPE:-g4dn.metal}; profile=fcvm-fleet-host; size=96 ;;
     tile) type=${TYPE:-g4dn.xlarge}; profile=fcvm-fleet-tile; size=32 ;;
     *) echo "launch host|tile" >&2; exit 2 ;;
   esac
