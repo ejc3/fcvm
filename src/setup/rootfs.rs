@@ -1233,6 +1233,24 @@ pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
         .cloned())
 }
 
+/// The Firecracker commit this fcvm build's own config (the one `fcvm setup --generate-config`
+/// writes) pins for kernel profile `name` on this architecture. A host whose active config
+/// pins another commit is running an older or newer config than the binary.
+pub fn embedded_profile_firecracker_commit(name: &str) -> Option<String> {
+    embedded_commit_in(EMBEDDED_CONFIG, name, config_arch())
+}
+
+fn embedded_commit_in(config: &str, name: &str, arch: &str) -> Option<String> {
+    // Parsed as a loaded config is, so a default profile inherits the global Firecracker.
+    let mut plan: Plan = toml::from_str(config).ok()?;
+    apply_default_firecracker_config(&mut plan);
+    plan.kernel_profiles
+        .get(name)?
+        .get(arch)?
+        .firecracker_commit
+        .clone()
+}
+
 /// Resolve rootfs filesystem type from CLI override and kernel profile name.
 ///
 /// Priority: explicit CLI `--rootfs-type` flag > kernel profile config > None (ext4 default).
@@ -2850,6 +2868,37 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commit a build pins for a profile comes from its embedded config, per
+    /// architecture, as a loaded config resolves it: a default profile inherits the global
+    /// `[firecracker]` commit (review of #1871).
+    #[test]
+    fn the_embedded_config_names_each_profiles_firecracker_commit() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        apply_default_firecracker_config(&mut plan);
+        for arch in ["amd64", "arm64"] {
+            for (name, by_arch) in &plan.kernel_profiles {
+                let Some(profile) = by_arch.get(arch) else {
+                    continue;
+                };
+                assert_eq!(
+                    embedded_commit_in(EMBEDDED_CONFIG, name, arch),
+                    profile.firecracker_commit,
+                    "{name}.{arch}"
+                );
+            }
+        }
+        let global = plan.firecracker.as_ref().unwrap().commit.clone();
+        assert_eq!(
+            embedded_commit_in(EMBEDDED_CONFIG, "default", "amd64"),
+            Some(global)
+        );
+        assert!(embedded_commit_in(EMBEDDED_CONFIG, "phone", "amd64").is_some());
+        assert_eq!(
+            embedded_commit_in(EMBEDDED_CONFIG, "no-such-profile", "amd64"),
+            None
+        );
+    }
 
     /// A [pasta] section without its source archives is refused when the config
     /// loads, not accepted until a pasta build needs them: make build regenerates

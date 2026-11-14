@@ -18,8 +18,9 @@
 #    GPU hook releases the emulator's GPU and stops the streamer, and retakes both after.
 # 3. Restores one clone of it on <second gpu> as the agent does (`fcvm snapshot run`), posts
 #    it a scene, and waits for the streamer's first stamped scene frame: the snapshot works
-#    before it is baked. Prints the click to that frame. Then the clone's browser comes to the
-#    front and shows the NVIDIA page.
+#    before it is baked. Prints the click to that frame. Fails unless the clone's guest memory
+#    came from prefilled hugepages. Then the clone's browser comes to the front and shows the
+#    NVIDIA page.
 # 4. Writes <env file>: the agent's phone arguments (PHONE_AGENT_ARGS), which
 #    fcvm-fleet-agent.service adds to the host's own (ejc3/aws adds `--phones N`).
 set -uo pipefail
@@ -96,6 +97,7 @@ echo "warm-phone: warm snapshot $TAG in $(( $(ms) - t1 )) ms"
 kill -TERM $wp; wait $wp
 
 # 3. one clone, as a phone slot restores it
+before=$(wc -l < "$LOG")
 click=$(ms)
 RUST_LOG=info setsid fcvm snapshot run --snapshot "$TAG" --name warm-phone-clone --gpu "$G2" \
   --publish 127.0.0.1:20095:8080 --ipv6-prefix "$P" --ipv6-address "$A2" --publish 127.0.0.1:20094:443 \
@@ -113,6 +115,25 @@ for _ in $(seq 1 600); do
   sleep 0.1
 done
 echo "warm-phone: clone ok=$ok click_to_first_scene_frame_ms=$(( $(ms) - click )) gpu=$G2"
+# The clone's guest memory came from a prefilled hugepage spare. A restore that fell back to
+# the File backend (a snapshot made by an older Firecracker, or no hugepages to fill) works
+# too, seconds slower for this phone, so only the record's backend tells them apart. fcvm
+# prints the record after the guest's ACK, which can come after the first scene frame: wait
+# for it while the clone runs, up to 30 s.
+clone_record() {
+  local alive r=
+  for _ in $(seq 1 300); do
+    alive=0
+    kill -0 "$1" 2> /dev/null && alive=1
+    r=$(tail -n +"$(( before + 1 ))" "$LOG" | grep -a '^{' | jq -R -c 'fromjson? | select(.status? == "restored")' | tail -1)
+    if [ -n "$r" ] || [ $alive = 0 ]; then break; fi
+    sleep 0.1
+  done
+  echo "$r"
+}
+restored=$(clone_record $cp)
+# jq 1.6 exits 0 for -e on empty input, so an empty record is refused before jq.
+[ -n "$restored" ] && echo "$restored" | jq -e '.backend == "hugepage-prefilled"' > /dev/null || { echo "warm-phone: the clone did not restore from prefilled hugepages: ${restored:-no restored record}"; ok=0; }
 # the browser the snapshot carries comes to the front in the clone and shows the page
 if [ $ok = 1 ]; then
   cpid=$(fcvm ls --json | jq -r '.[] | select(.name == "warm-phone-clone") | .pid' | head -1)
