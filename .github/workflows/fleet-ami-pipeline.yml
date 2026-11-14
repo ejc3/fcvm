@@ -45,6 +45,21 @@ jobs:
           persist-credentials: false
       - name: Check the request boundary without AWS credentials
         run: python3 -B fleet/ami/test_request.py
+      # Generation twelve, the factory's first published pair, broke staging (ejc3/aws#823): its
+      # host kernel loads ENA as a module after cloud-init looks for a NIC, so the host booted
+      # without its user data, and the acceptance never booted the candidate through the fleet's
+      # launch path. This step runs from main's copy of this file whichever revision asked, and
+      # refuses a source without both fixes: ENA built into the host kernel
+      # (kernel/host-x86.conf) and the launch-path acceptance (launch_path_proof in
+      # fleet/ami/pipeline_guest.py).
+      - name: Refuse a source without the boot fix and the launch-path acceptance
+        env:
+          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          git show "$SOURCE_SHA:kernel/host-x86.conf" 2>/dev/null | grep -qx 'CONFIG_ENA_ETHERNET=y' \
+            || { echo "::error::$SOURCE_SHA does not build ENA into the host kernel (kernel/host-x86.conf); not requested (ejc3/aws#823)"; exit 1; }
+          git show "$SOURCE_SHA:fleet/ami/pipeline_guest.py" 2>/dev/null | grep -q '^def launch_path_proof(' \
+            || { echo "::error::$SOURCE_SHA has no launch-path acceptance (fleet/ami/pipeline_guest.py launch_path_proof); not requested (ejc3/aws#823)"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
