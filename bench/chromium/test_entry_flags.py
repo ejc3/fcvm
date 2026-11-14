@@ -321,3 +321,24 @@ class EntryResolverRule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowserExitIsNamed(unittest.TestCase):
+    """entry.sh names how Chromium ended before the container exits.
+
+    Campaign 81d631c4's 2 vCPU scale run lost three requests when guest
+    Chromium crashed: each clone log held only crashpad's two cpufreq lines.
+    The tail of entry.sh (cleanup_chromium onward) is run here against a stub
+    browser that dies of SIGSEGV. Red before the fix: no "exited with status"
+    line on stderr (the exit code was already 139)."""
+
+    def test_a_crashed_browser_is_reported_with_its_signal_status(self):
+        source = open(ENTRY).read()
+        tail = source[source.index("cleanup_chromium() {"):]
+        script = 'sh -c \'kill -SEGV $$\' &\nCHROME_PID=$!\n' + tail
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                out = subprocess.run([shell, "-c", script], capture_output=True, text=True,
+                                     timeout=30)
+                self.assertEqual(out.returncode, 139, out.stderr)
+                self.assertIn("chromium-bench: chromium exited with status 139", out.stderr)

@@ -420,6 +420,37 @@ class ProcAndCgroupAccounting(unittest.TestCase):
             with self.assertRaisesRegex(reqscale.MeasurementInvalid, "outside run cgroup"):
                 audit.observe(11, "firecracker")
 
+    def test_cgroup_audit_live_pids_are_a_set_when_cgroup_procs_repeats_a_pid(self):
+        # cgroup v2 (Documentation/admin-guide/cgroup-v2.rst, cgroup.procs): "The
+        # same PID may show up more than once if the process got moved to another
+        # cgroup and then back or the PID got recycled while reading." A scale run
+        # recorded host sample 218 with pid 4071157 twice in the uffd leaf, and the
+        # analysis refused the whole run ("invalid PID membership"). Red before the
+        # fix: [4, 9, 9].
+        with tempfile.TemporaryDirectory() as d:
+            group = os.path.join(d, "sys", "fs", "cgroup", "run")
+            os.makedirs(group)
+            with open(os.path.join(group, "cgroup.procs"), "w") as f:
+                f.write("9\n4\n9\n")
+            audit = reqscale.CgroupAudit(group, proc_root=os.path.join(d, "proc"),
+                                         cgroup_root=os.path.join(d, "sys", "fs", "cgroup"))
+            self.assertEqual(audit.live_pids(), [4, 9])
+
+    def test_scale_requests_dump_failures_and_never_a_control(self):
+        # Campaign 81d631c4's 2 vCPU scale run lost three requests to a guest
+        # Chromium crash (crashpad lines in the clone log, the page socket
+        # closed mid-frame) and kept nothing else: the scale path ran its
+        # requests with no failure probe, so the guest's dmesg and process list
+        # were gone with the clone. Red before the fix: AttributeError, no
+        # failures_only, and run_cdp_request called without a probe.
+        probe = reqscale.reqbench.FailureProbe.failures_only("fcvm", "/d", "/o", "r" * 32, 9222)
+        self.assertIsNone(probe.role_for({"ok": True}))
+        self.assertEqual(probe.role_for({"ok": False}), "failure")
+        source = open(os.path.join(HERE, "reqscale.py")).read()
+        body = source[source.index("def _make_request_fn"):source.index("def _augment_burst_accounting")]
+        self.assertIn("reqbench.FailureProbe.failures_only(", body)
+        self.assertIn("probe=failure_probe", body)
+
     def test_cgroup_audit_does_not_collapse_reused_pids(self):
         with tempfile.TemporaryDirectory() as d:
             proc = os.path.join(d, "proc")
@@ -1226,6 +1257,75 @@ class CapacityGates(unittest.TestCase):
             reqscale_analyze._control_gate(
                 records, schedule, status, origin, records[-1]["artifact_ns"]
             )
+
+    def _control_gate_for(self, latencies):
+        schedule = {
+            "control": {"interval_ns": 10_000_000_000, "phase_offset_ns": 123, "phase_seed": 7},
+            "capacity_criteria": {**self.CRITERIA, "max_control_median_drift_pct": 15.0},
+        }
+
+        def deadline(index):
+            return 1123 + index * 10_000_000_000 + reqscale.control_frame_jitter_ns(7, index)
+
+        records = [
+            {
+                "schema": reqscale.RECORD_SCHEMA, "kind": "host-control",
+                "control_index": index, "scheduled_ns": deadline(index),
+                "actual_launch_ns": 1_000_000 + deadline(index),
+                "artifact_ns": 1_000_000 + deadline(index) + round(latency * 1_000_000),
+                "latency_ms": latency, "launch_lag_ms": 1.0, "ok": True, "result": {"ok": True},
+            }
+            for index, latency in enumerate(latencies)
+        ]
+        status = {"control": {
+            "started": True, "origin_monotonic_ns": 1000, "phase_offset_ns": 123,
+            "interval_ns": 10_000_000_000, "requests": len(records),
+            "stop_requested_monotonic_ns": records[-1]["scheduled_ns"] + 1_000_000_000,
+        }}
+        return reqscale_analyze._control_gate(
+            records, schedule, status, 1000, records[-1]["artifact_ns"])
+
+    @staticmethod
+    def _two_frame_half(slow, n=70, scale=1.0):
+        # Fast mode near 45 ms, slow mode near 69 ms, as the c8g.metal-48xl
+        # control renders; a fixed pattern of offsets keeps each mode's spread.
+        offsets = [-2.0, -1.0, 0.0, 1.0, 2.0]
+        values = []
+        for i in range(n):
+            base = 69.0 if i < slow else 45.0
+            values.append((base + offsets[i % 5]) * scale)
+        return values
+
+    def test_drift_gate_compares_each_frame_mode_with_itself(self):
+        """RED BEFORE THE FIX: campaign 81d631c4's 8 vCPU scale run refused
+        itself with `host drift control changed 24.038%`. Its controls sit in a
+        one-frame mode near 45 ms and a two-frame mode near 69 ms, 42% of the
+        first half and 51% of the second in the slow one, so the halves'
+        medians fell in different modes (47.8 and 59.2 ms) while each mode
+        moved +1.0% and -0.4%. Here 40% then 60% of controls are slow and
+        neither mode moves; the pooled-median gate read +50%."""
+        gate = self._control_gate_for(self._two_frame_half(28) + self._two_frame_half(42))
+        self.assertGreater(gate["pooled_median_drift_pct"], 15.0)
+        self.assertEqual(gate["statistic"], "per-mode-median")
+        self.assertTrue(gate["passed"], gate)
+        self.assertAlmostEqual(gate["drift_pct"], 0.0)
+
+    def test_drift_gate_still_fails_when_both_frame_modes_slow_down(self):
+        # Whichever statistic the split picks, a host 20% slower fails.
+        gate = self._control_gate_for(self._two_frame_half(35) + self._two_frame_half(35, scale=1.2))
+        self.assertFalse(gate["passed"], gate)
+        self.assertGreater(gate["drift_pct"], 15.0)
+        gate = self._control_gate_for(self._two_frame_half(28) + self._two_frame_half(42, scale=1.2))
+        self.assertFalse(gate["passed"], gate)
+        self.assertGreater(gate["drift_pct"], 15.0)
+
+    def test_drift_gate_compares_one_population_as_one(self):
+        # A uniform 20% slowdown of a single population puts every second-half
+        # control above Otsu's split, so it is not read as two frame modes.
+        gate = self._control_gate_for(self._two_frame_half(0) + self._two_frame_half(0, scale=1.2))
+        self.assertEqual(gate["statistic"], "pooled-median")
+        self.assertFalse(gate["passed"])
+        self.assertAlmostEqual(gate["drift_pct"], 20.0)
 
     def test_control_deadlines_take_a_seeded_phase_within_one_frame(self):
         """RED BEFORE THE FIX: host-control deadlines fell on exact 10 s

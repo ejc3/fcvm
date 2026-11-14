@@ -1558,9 +1558,12 @@ class CgroupAudit:
             return parse_cpu_stat(stream.read())
 
     def live_pids(self) -> list[int]:
+        # A set: the kernel may list one PID twice in a single read of
+        # cgroup.procs when the process moves out and back, or the PID is
+        # recycled, while the file is read (cgroup-v2.rst, "cgroup.procs").
         try:
             with open(os.path.join(self.path, "cgroup.procs")) as stream:
-                return sorted(int(value) for value in stream.read().split())
+                return sorted({int(value) for value in stream.read().split()})
         except (OSError, ValueError) as error:
             raise MeasurementInvalid(f"cannot read run cgroup.procs: {error}")
 
@@ -3579,8 +3582,12 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         # No request reads the memory server's counters: they would bracket
         # overlapping requests, and reqscale_analyze has its own whole-run
         # cgroup accounting.
+        # One probe per request: requests overlap, and a failed one is dumped
+        # before its teardown (reqbench.FailureProbe.failures_only).
+        failure_probe = reqbench.FailureProbe.failures_only(
+            args.fcvm, args.data_root, log_dir, args.run_id, args.cdp_port)
         try:
-            record = reqbench.run_cdp_request(request_args, rep, fast=True)
+            record = reqbench.run_cdp_request(request_args, rep, fast=True, probe=failure_probe)
         except Exception as error:
             # A request that raised (a spawn refused with EAGAIN at an
             # overloaded rate, a teardown that left survivors) fails its rate.

@@ -3610,6 +3610,21 @@ class FailureProbe:
         self.control_path = ""
         self.is_warmup = False
 
+    @classmethod
+    def failures_only(cls, *args, **kwargs) -> "FailureProbe":
+        """A probe that captures failed requests and never a healthy control.
+
+        For the scale run, whose requests overlap: a control capture there
+        would exec into a healthy clone in the middle of a scored burst, and
+        concurrent requests would race on the control counters. A failed
+        request still gets its dump (guest dmesg tail, Chromium processes,
+        listeners), which is what attributes a guest-side crash.
+        """
+        probe = cls(*args, **kwargs)
+        probe.control_captured = True
+        probe.control_attempts = cls.CONTROL_ATTEMPTS
+        return probe
+
     def begin_request(self, is_warmup: bool) -> None:
         """Tell the probe whether the rep about to run is a discarded warmup.
 

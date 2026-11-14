@@ -325,4 +325,10 @@ cleanup_chromium() {
     exit 0
 }
 trap cleanup_chromium TERM INT
-wait "$CHROME_PID"
+# Name how the browser ended: 128+N is signal N (139 SIGSEGV, 133 SIGTRAP, 134
+# SIGABRT). A clone whose page socket closed mid-frame had only crashpad's two
+# cpufreq lines in its log, which say a crash dump ran and not what crashed.
+chrome_status=0
+wait "$CHROME_PID" || chrome_status=$?
+echo "chromium-bench: chromium exited with status $chrome_status" >&2
+exit "$chrome_status"
