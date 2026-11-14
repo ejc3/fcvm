@@ -1310,7 +1310,7 @@ bench-kitesurf-build:
 	@bash bench/chromium/kitesurf_build.sh
 
 # The live-site arms in one window on one host (bench/chromium/live_campaign.sh):
-# an fcvm golden with no baked resolver, reqbench over the 14 live corpus URLs,
+# an fcvm golden resolving with 1.1.1.1 (LIVE_DNS), reqbench over the 14 live corpus URLs,
 # and Browser Run batches (browserrun.py) beside it until it finishes.
 bench-live-campaign:
 	@bash bench/chromium/live_campaign.sh

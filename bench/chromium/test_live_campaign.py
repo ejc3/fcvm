@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 FAKE_MAKE = """#!/bin/bash
 # Records its target and, for the run, takes long enough for batches to overlap.
-printf '%s\\n' "$*" >> "$FAKE_MAKE_LOG"
+printf '%s GUEST_DNS=%s\\n' "$*" "${GUEST_DNS:-}" >> "$FAKE_MAKE_LOG"
 for arg in "$@"; do case "$arg" in
   bench-chromium-request-run) env | grep -E '^(URL|ARMS)=' >> "$FAKE_MAKE_LOG"; sleep "${FAKE_RUN_SECS:-2}"; exit "${FAKE_RUN_RC:-0}" ;;
 esac; done
@@ -71,10 +71,11 @@ class LiveCampaign(unittest.TestCase):
         self.assertLessEqual(min(b["first_ts"] for b in batches), live["reqbench"]["start"] + 2)
         self.assertGreaterEqual(max(b["last_ts"] for b in batches), live["reqbench"]["end"] - 2)
         log = open(self.make_log).read()
-        self.assertIn("bench-chromium-request-golden TAG=cb-live-t CPU=4", log)
+        # reqanalyze refused the first worker run: its metadata named no resolver.
+        self.assertIn("bench-chromium-request-golden TAG=cb-live-t CPU=4 GUEST_DNS=1.1.1.1", log)
         self.assertIn("URL=https://example.com/,https://news.ycombinator.com/", log)
         self.assertIn("ARMS=cdp,html-fast,noop", log)
-        self.assertEqual(live["resolver"], "guest default (pasta, the host's DNS): live sites")
+        self.assertEqual(live["resolver"], "guest resolv.conf 1.1.1.1 (GUEST_DNS baked into the golden): live sites")
 
     def test_the_fcvm_run_status_is_the_campaign_status(self):
         r = self.run_campaign(FAKE_RUN_RC="5", FAKE_RUN_SECS="1")
