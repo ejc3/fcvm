@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Cloudflare's hosted Browser Run as measured arms: its Chromium and its Kitesurf.
 
-    CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... \\
-        browserrun.py --out DIR [--engines chromium,kitesurf] [--ops screenshot,content] \\
-                      [--reps 28] [--warmup 1]
+    browserrun.py --out DIR [--engines chromium,kitesurf] [--ops screenshot,content]
+                  [--reps 28] [--warmup 1]
 
 Cloudflare's published Kitesurf table is the median of five Browser Run Quick
 Action runs over the 14-URL corpus, Kitesurf against Browser Run's default
@@ -15,10 +14,9 @@ kitesurf` selects Kitesurf; no parameter is Chromium), over the same 14 URLs
 What it measures. Each request is one HTTPS POST from this host to
 api.cloudflare.com, and wall_ms runs from the send to the last byte of the
 reply. It includes the network path from this host to the Cloudflare colo that
-answered (recorded per request from the cf-ray header), through the HTTPS proxy
-when the environment names one (run.json says whether it did), as well as the
-browser's work there. --client-location names where the client ran, and every
-record carries this host's 1-minute load, since the client box may be shared. Browser Run fetches every page from the live site with Cloudflare's
+answered (recorded per request from the cf-ray header), as well as the browser's
+work there. --client-location can override the region label, and every record
+carries this host's 1-minute load. Browser Run fetches every page from the live site with Cloudflare's
 DNS: these arms read the live web at the moment of the request, not the byte
 replay the local arms read, because a Quick Action cannot be pointed at another
 resolver or proxy. Every reply header whose name mentions "browser" (Cloudflare's
@@ -39,9 +37,10 @@ and not timed. Any other non-2xx reply, an empty body, a screenshot that is not
 an image, or a /content reply without a closed document is a failed request,
 and the run goes on.
 
-The token is read from the environment and never written to a record, a log
-line or a command line. Cloudflare accepts it only from the dev box's own public
-addresses, so these arms run from the dev box.
+The dedicated Ohio benchmark worker and primary ARM dev host read their own
+Cloudflare Browser Run credential directly from Secrets Manager. Cloudflare
+accepts each token only from its own host's public addresses. Both environment
+overrides may be supplied for an external trial. The token stays in memory.
 """
 
 import argparse
@@ -49,9 +48,11 @@ import hashlib
 import importlib.util
 import json
 import os
+from pathlib import Path
 import random
 import re
 import statistics
+import subprocess
 import sys
 import time
 import urllib.error
@@ -61,6 +62,54 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.cloudflare.com/client/v4/accounts/{account}/browser-run/{op}"
 ENGINE_QUERY = {"chromium": "", "kitesurf": "?browser=kitesurf"}
 OPS = ("screenshot", "content")
+WORKER_MARKER = Path("/etc/fcvm-benchmark-worker")
+ARM_SECRET = "cloudflare-browser-run"
+WORKER_SECRET = "cloudflare-browser-run-worker"
+
+
+def worker_host():
+    try:
+        info = WORKER_MARKER.stat()
+    except FileNotFoundError:
+        return False
+    if info.st_uid != 0 or info.st_mode & 0o022 or not WORKER_MARKER.is_file():
+        raise SystemExit("REFUSING: the FCVM benchmark worker marker must be root-owned and not writable by others")
+    return True
+
+
+def credentials(env, worker, run=subprocess.run):
+    token = env.get("CLOUDFLARE_API_TOKEN", "").strip()
+    account = env.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    if bool(token) != bool(account):
+        raise SystemExit("REFUSING: supply both Cloudflare environment overrides, or neither")
+    if not token:
+        secret = WORKER_SECRET if worker else ARM_SECRET
+        try:
+            result = run(
+                ["aws", "secretsmanager", "get-secret-value", "--region", "us-west-1",
+                 "--secret-id", secret, "--version-stage", "AWSCURRENT",
+                 "--query", "SecretString", "--output", "text", "--no-cli-pager"],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            payload = json.loads(result.stdout)
+            token, account = payload["api_token"], payload["account_id"]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
+            raise SystemExit(f"REFUSING: could not load the {secret} credential from Secrets Manager") from None
+    if not isinstance(account, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", account) or not isinstance(token, str) \
+            or not re.fullmatch(r"[A-Za-z0-9_-]{20,120}", token):
+        raise SystemExit("REFUSING: invalid Cloudflare account ID or token format")
+    return token, account
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def direct_opener():
+    # Keep the token on its pinned route and never forward Authorization to a redirect.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
 
 
 def load(name):
@@ -97,6 +146,9 @@ def post(url: str, token: str, body: dict, timeout: float, opener):
         status, headers = err.code, dict(err.headers.items()) if err.headers else {}
     except (OSError, ValueError) as err:
         payload, status, headers = f"{type(err).__name__}: {err}".encode(), 0, {}
+    if not 200 <= status < 300:
+        payload = payload.replace(token.encode(), b"[redacted]")
+    headers = {key: value.replace(token, "[redacted]") for key, value in headers.items()}
     return status, headers, payload, (time.monotonic_ns() - started) / 1e6
 
 
@@ -210,7 +262,7 @@ def correctness(args, opener, token, account, engines, urls, sites, sleep):
 
 
 def run(args, token, account, opener=None, sleep=time.sleep) -> int:
-    opener = opener or urllib.request.build_opener()
+    opener = opener or direct_opener()
     report = load("report")
     urls = list(report.KITESURF_CORPUS.values())
     sites = {url: key for key, url in report.KITESURF_CORPUS.items()}
@@ -228,7 +280,7 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
                    "corpus": "live sites, fetched by Browser Run with Cloudflare's DNS",
                    "client": "browserrun.py: one request at a time over HTTPS from this host",
                    "client_location": args.client_location,
-                   "via_https_proxy": bool(urllib.request.getproxies().get("https")),
+                   "via_https_proxy": False,
                    "loadavg_at_start": loadavg1(),
                    "started_at": time.time()}, handle, indent=1, sort_keys=True)
     completed = correctness(args, opener, token, account, engines, urls, sites, sleep)
@@ -311,17 +363,17 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=90.0)
     ap.add_argument("--max-retries", type=int, default=5)
     ap.add_argument("--max-retry-wait", type=float, default=30.0)
-    ap.add_argument("--client-location", required=True,
-                    help="where this client runs, e.g. a cloud region; recorded in run.json "
-                         "(never a host name or address)")
+    ap.add_argument("--client-location",
+                    help="override the AWS region label in run.json (never a host name or address)")
     args = ap.parse_args()
-    token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
-    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
-    if not token or not re.fullmatch(r"[0-9a-f]{32}", account):
-        raise SystemExit("REFUSING: CLOUDFLARE_API_TOKEN and a 32-hex CLOUDFLARE_ACCOUNT_ID "
-                         "must be in the environment")
     if args.reps < 1 or args.warmup < 0:
         raise SystemExit("REFUSING: --reps must be positive and --warmup nonnegative")
+    worker = worker_host()
+    token, account = credentials(os.environ, worker)
+    if not args.client_location:
+        if "CLOUDFLARE_API_TOKEN" in os.environ:
+            raise SystemExit("REFUSING: pass --client-location when supplying an external credential")
+        args.client_location = "us-east-2" if worker else "us-west-1"
     return run(args, token, account)
 
 

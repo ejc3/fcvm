@@ -254,16 +254,19 @@ through the same Quick Actions its published Kitesurf table measured. `make
 bench-browserrun` drives `/screenshot` (JPEG q80, as the fcvm arm's driver asks) and
 `/content` against both, over the corpus's 14 URLs, one request at a time.
 
-```bash
-eval "$(aws secretsmanager get-secret-value --region us-west-1 --secret-id cloudflare-browser-run \
-  --query SecretString --output text | jq -r '"export CLOUDFLARE_ACCOUNT_ID=\(.account_id|@sh)
-export CLOUDFLARE_API_TOKEN=\(.api_token|@sh)"')"
-make bench-browserrun BR_CLIENT_LOCATION=<region> BR_REPS=28 BR_WARMUP=1
-```
+Run this on the dedicated Ohio benchmark worker or the primary fcvm-arm host:
 
-The token is accepted only from the dev box's own public addresses, so the hosted arms run
-from the dev box, through its HTTPS proxy when the session sets one (recorded in run.json),
-and record the box's 1-minute load per request because the box is shared.
+~~~bash
+make bench-browserrun BR_REPS=28 BR_WARMUP=1
+~~~
+
+The runner retrieves the matching Secrets Manager credential and connects to
+Cloudflare directly. On the Ohio worker, use the same checkout and machine for
+the hosted and local trials. Its network path is measured directly, and only
+the worker's reserved addresses can use its token. There is no credential to
+copy. The region and the client's load are recorded automatically; set
+BR_CLIENT_LOCATION only to override the label. Regular pboxes cannot read the
+credential.
 
 - **Live sites, not the replay.** Browser Run fetches each URL with Cloudflare's DNS;
   a Quick Action takes no resolver or proxy, so these arms cannot read the byte replay.

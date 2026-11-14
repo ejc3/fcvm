@@ -1310,8 +1310,8 @@ bench-kitesurf-build:
 	@bash bench/chromium/kitesurf_build.sh
 
 # Cloudflare's hosted Browser Run, Chromium and Kitesurf, over the corpus's live sites
-# (bench/chromium/browserrun.py). Reads CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN
-# from the environment (secret cloudflare-browser-run); never builds.
+# (bench/chromium/browserrun.py). Reads the worker or ARM credential from Secrets Manager;
+# optional environment overrides are for external trials. Never builds.
 BROWSERRUN_RESULTS ?= bench/chromium/results/browserrun-$(shell date -u +%Y%m%d-%H%M%S)
 bench-browserrun:
 	@python3 bench/chromium/browserrun.py --out "$(BROWSERRUN_RESULTS)" \

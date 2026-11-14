@@ -11,9 +11,11 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import urllib.error
 import zlib
 
@@ -132,6 +134,62 @@ class HostedArms(unittest.TestCase):
         cf = FakeCloudflare()
         self.br.run(args(self.tmp, reps=2), TOKEN, ACCOUNT, opener=cf, sleep=lambda s: None)
         self.assertTrue(all(c[3].get("Authorization") == f"Bearer {TOKEN}" for c in cf.calls))
+        for root, _dirs, files in os.walk(self.tmp):
+            for name in files:
+                with open(os.path.join(root, name), "rb") as handle:
+                    self.assertNotIn(TOKEN.encode(), handle.read(), name)
+
+    def test_default_credentials_are_read_for_the_local_host_only(self):
+        for worker, wanted in ((False, "cloudflare-browser-run"),
+                               (True, "cloudflare-browser-run-worker")):
+            with self.subTest(worker=worker):
+                def read(argv, **kwargs):
+                    self.assertEqual(argv[:3], ["aws", "secretsmanager", "get-secret-value"])
+                    self.assertEqual(argv[argv.index("--secret-id") + 1], wanted)
+                    self.assertEqual(argv[argv.index("--version-stage") + 1], "AWSCURRENT")
+                    self.assertNotIn(TOKEN, argv)
+                    self.assertTrue(kwargs["capture_output"])
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "account_id": ACCOUNT, "api_token": TOKEN,
+                    }))
+                self.assertEqual(self.br.credentials({}, worker, run=read), (TOKEN, ACCOUNT))
+
+    def test_an_override_needs_both_fields_and_never_reads_aws(self):
+        def unexpected(*args, **kwargs):
+            self.fail("read the secret with an explicit override")
+        with self.assertRaisesRegex(SystemExit, "supply both"):
+            self.br.credentials({"CLOUDFLARE_API_TOKEN": TOKEN}, True, run=unexpected)
+        self.assertEqual(self.br.credentials({"CLOUDFLARE_API_TOKEN": TOKEN, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT},
+                                             True, run=unexpected), (TOKEN, ACCOUNT))
+
+    def test_an_aws_failure_does_not_echo_data_or_switch_hosts(self):
+        requests = []
+
+        def denied(argv, **kwargs):
+            requests.append(argv[argv.index("--secret-id") + 1])
+            raise subprocess.CalledProcessError(1, argv, output=TOKEN, stderr=TOKEN)
+
+        with self.assertRaisesRegex(SystemExit, "could not load the cloudflare-browser-run-worker credential") as err:
+            self.br.credentials({}, True, run=denied)
+        self.assertNotIn(TOKEN, str(err.exception))
+        self.assertEqual(requests, ["cloudflare-browser-run-worker"])
+
+    def test_the_direct_opener_ignores_proxy_and_declines_redirects(self):
+        with patch.dict(os.environ, {"https_proxy": "http://not-the-worker:123"}, clear=True):
+            opener = self.br.direct_opener()
+        self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies for h in opener.handlers))
+        handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        self.assertEqual(len(handlers), 1)
+        self.assertIsNone(handlers[0].redirect_request(None, None, 302, "", {}, "https://elsewhere.invalid"))
+
+    def test_an_error_reply_cannot_echo_the_bearer_to_the_results(self):
+        cf = FakeCloudflare({
+            ("chromium", "content", self.urls[0]): [
+                (403, TOKEN.encode(), {"X-Browser-Ms-Used": TOKEN}),
+            ],
+        })
+        self.br.run(args(self.tmp, reps=1, engines="chromium", ops="content"), TOKEN, ACCOUNT,
+                    opener=cf, sleep=lambda _: None)
         for root, _dirs, files in os.walk(self.tmp):
             for name in files:
                 with open(os.path.join(root, name), "rb") as handle:
