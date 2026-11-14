@@ -704,7 +704,10 @@ pub async fn bring_up(
         tell_usable();
     }
 
-    start_persistenced(driver_root).await?;
+    // When the guest scrubs, the scrub is the first CUDA process, and its exit would otherwise
+    // tear down UVM's per-GPU state that the container's first CUDA call then builds again
+    // (`persistenced_keeps_uvm_registered_when_the_guest_scrubs`).
+    start_persistenced(driver_root, !host_scrubbed).await?;
     steps.persistenced_ms = clock.lap("persistenced");
 
     // Zero the memory the previous VM on these GPUs left, before anything can
@@ -986,10 +989,13 @@ pub fn parse_scrub_summary(output: &str) -> Option<(usize, u64)> {
 /// 0.023 to 0.031 s with the daemon running. It starts before `nvidia-smi -L`,
 /// so that check opens a GPU the daemon has initialised, and before the CDI spec
 /// is generated, which then mounts the daemon's socket into the container.
-pub(crate) async fn start_persistenced(driver_root: &Path) -> Result<()> {
+///
+/// With `uvm_persistence` the daemon also keeps the GPUs registered with UVM, so a CUDA
+/// process's exit does not tear UVM's per-GPU state down.
+pub(crate) async fn start_persistenced(driver_root: &Path, uvm_persistence: bool) -> Result<()> {
     run_checked(
         "nvidia-persistenced",
-        persistenced_command(driver_root),
+        persistenced_command(driver_root, uvm_persistence),
         PERSISTENCED_TIMEOUT,
     )
     .await?;
@@ -999,9 +1005,12 @@ pub(crate) async fn start_persistenced(driver_root: &Path) -> Result<()> {
 
 /// The nvidia-persistenced command: the image's binary, as root (its default),
 /// with the image's libraries. It forks the daemon and exits.
-pub fn persistenced_command(driver_root: &Path) -> tokio::process::Command {
+pub fn persistenced_command(driver_root: &Path, uvm_persistence: bool) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-persistenced"));
     command.env("LD_LIBRARY_PATH", library_dir(driver_root));
+    if uvm_persistence {
+        command.arg("--uvm-persistence-mode");
+    }
     command
 }
 
@@ -1031,7 +1040,7 @@ mod tests {
     #[test]
     fn persistenced_runs_the_images_binary_with_its_libraries() {
         let root = std::path::Path::new("/run/fcvm-gpu/driver");
-        let command = super::persistenced_command(root);
+        let command = super::persistenced_command(root, false);
         let command = command.as_std();
         assert_eq!(
             command.get_program(),
@@ -1042,6 +1051,31 @@ mod tests {
             .find(|(key, _)| *key == "LD_LIBRARY_PATH")
             .and_then(|(_, value)| value);
         assert_eq!(libraries, Some(super::library_dir(root).as_os_str()));
+    }
+
+    /// When the guest scrubs, nvidia-persistenced keeps the GPUs registered with UVM, so the
+    /// scrub's exit does not tear UVM's per-GPU state down for the container's first CUDA call
+    /// to build again. That teardown destroys UVM's per-GPU slab caches, and on Linux 7.3 every
+    /// `kmem_cache_destroy()` waits in `rcu_barrier()` (6.18 waited only for caches with
+    /// sheaves): closing `/dev/nvidia-uvm` took 47 to 74 ms on a 7.3.3 guest against 18 to 50
+    /// on 6.18.60, and 0.1 to 0.7 ms on both with the GPU kept registered. A host-scrubbed
+    /// restore runs no CUDA process before the container, so it starts the daemon as before.
+    #[test]
+    fn persistenced_keeps_uvm_registered_when_the_guest_scrubs() {
+        let root = std::path::Path::new("/run/fcvm-gpu/driver");
+        let args = |uvm| -> Vec<String> {
+            super::persistenced_command(root, uvm)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(true), ["--uvm-persistence-mode"]);
+        assert!(args(false).is_empty());
+        assert!(
+            attach_devices_body().contains("start_persistenced(driver_root, !host_scrubbed)"),
+            "bring_up does not keep UVM registered exactly when the guest scrubs"
+        );
     }
 
     /// The body of `bring_up`, the steps `attach_devices` runs, for the
@@ -1069,7 +1103,7 @@ mod tests {
         let body = attach_devices_body();
         let nodes = body.find("create_device_nodes(").expect("no device nodes");
         let daemon = body
-            .find("start_persistenced(driver_root)")
+            .find("start_persistenced(driver_root, ")
             .expect("attach_devices does not start nvidia-persistenced");
         let smi = body
             .find("list_gpus(driver_root)")
@@ -1092,7 +1126,7 @@ mod tests {
     fn the_scrub_runs_before_the_cdi_spec_and_the_container() {
         let body = attach_devices_body();
         let daemon = body
-            .find("start_persistenced(driver_root)")
+            .find("start_persistenced(driver_root, ")
             .expect("no nvidia-persistenced");
         let scrub = body
             .find("scrub_gpus(scrub_command(driver_root, parallel), announced.len())")
@@ -1126,7 +1160,7 @@ mod tests {
     fn bring_up_starts_the_application_clocks_and_its_callers_wait_for_them() {
         let body = attach_devices_body();
         let daemon = body
-            .find("start_persistenced(driver_root)")
+            .find("start_persistenced(driver_root, ")
             .expect("no nvidia-persistenced");
         let clocks = body
             .find("Clocks::start()")
@@ -1175,7 +1209,7 @@ mod tests {
             calls.len()
         );
         let nodes = at("clock.lap(\"device-nodes\")");
-        let daemon = at("start_persistenced(driver_root)");
+        let daemon = at("start_persistenced(driver_root, ");
         let scrub = at("scrub_gpus(");
         let list = at("list_gpus(driver_root)");
         assert!(nodes < calls[0] && calls[0] < daemon);
