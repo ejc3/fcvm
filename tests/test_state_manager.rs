@@ -774,3 +774,81 @@ async fn test_load_state_by_pid_rejects_pid_reuse() {
         "save_state should record the process start time"
     );
 }
+
+/// Bind `name` in the abstract Unix socket namespace without close-on-exec, from a forked
+/// child before it execs, so the exec'd program holds the socket. Only raw calls: this runs
+/// between fork and exec.
+#[cfg(feature = "privileged-tests")]
+fn bind_abstract_in_child(addr: &libc::sockaddr_un, len: libc::socklen_t) -> std::io::Result<()> {
+    // SAFETY: socket(2) and bind(2) with a fully initialised address of `len` bytes.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::bind(fd, addr as *const _ as *const libc::sockaddr, len) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// A loopback address is host-wide: another user's VM holding one keeps it from a root VM
+/// (#1882). A process of uid 65534 holds the lease of an address, the way a user's fcvm
+/// does; a root allocation with a data directory of its own must hand out another. Before
+/// the lease, the allocation read only its own state files and returned 127.0.0.2.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn a_loopback_address_another_user_holds_is_not_handed_out() {
+    use std::os::unix::process::CommandExt;
+
+    // The first address whose lease no process holds now, and its socket address.
+    let mut held = None;
+    'search: for b2 in 0..=255u8 {
+        for b3 in 2..=254u8 {
+            let ip = format!("127.0.{b2}.{b3}");
+            let name = format!("{}{ip}", fcvm::state::manager::LOOPBACK_LEASE_PREFIX);
+            // SAFETY: an all-zero sockaddr_un is valid; the name fits in sun_path.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (slot, byte) in addr.sun_path[1..].iter_mut().zip(name.as_bytes()) {
+                *slot = *byte as libc::c_char;
+            }
+            let len =
+                (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len()) as libc::socklen_t;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("600").uid(65534).gid(65534);
+            // SAFETY: the closure makes only raw socket(2) and bind(2) calls.
+            unsafe {
+                command.pre_exec(move || bind_abstract_in_child(&addr, len));
+            }
+            match command.spawn() {
+                Ok(child) => {
+                    held = Some((ip, child));
+                    break 'search;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(e) => panic!("starting the uid 65534 lease holder: {e}"),
+            }
+        }
+    }
+    let (held_ip, mut holder) = held.expect("no loopback address lease was free");
+
+    let dir = TempDir::new().unwrap();
+    let manager = StateManager::new(dir.path().to_path_buf());
+    let mut state = VmState::new(
+        "vm-root-lease".to_string(),
+        "alpine:latest".to_string(),
+        1,
+        512,
+    );
+    let allocated = manager.allocate_loopback_ip(&mut state).await;
+    let _ = manager.delete_state("vm-root-lease").await;
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let allocated = allocated.unwrap();
+    assert_ne!(
+        allocated, held_ip,
+        "root was handed the loopback address {held_ip} that a process of uid 65534 holds"
+    );
+}
