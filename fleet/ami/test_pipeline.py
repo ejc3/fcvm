@@ -549,6 +549,23 @@ class PipelineTests(unittest.TestCase):
                 self.assertLess(bake.index(step), pack)
         self.assertIn('app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)', bake)
 
+    def test_the_bake_drops_build_only_state_from_the_root(self):
+        # A host hydrates every root block it reads from the image's snapshot, and the image is
+        # what every host boots: the compiler cache (4.1 GB on the cad0ddad image), the Rust
+        # toolchain (2.9 GB) and the build's journal are build-only. The cache goes before the
+        # pack, which needs the room; prep and build install the toolchain again when it is
+        # missing.
+        source = (HERE / "host/build.sh").read_text()
+        phases = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+        bake = phases["bake"]
+        self.assertLess(bake.index('rm -rf "$UH/.cache/sccache"'), bake.index('python3 "$HERE/store-pack.py"'))
+        self.assertIn('rm -rf "$UH/.cargo" "$UH/.rustup"', bake)
+        self.assertIn("journalctl --vacuum-time=1s", bake)
+        self.assertLess(bake.index('rm -rf "$UH/.cargo" "$UH/.rustup"'), bake.index("\n  root_has_room\n"))
+        for phase in ("prep", "build"):
+            with self.subTest(phase=phase):
+                self.assertIn('[ -x "$UH/.cargo/bin/cargo" ] || as_user', phases[phase])
+
     def test_the_bake_fails_unless_the_root_keeps_room(self):
         # The image keeps its packed store on the root, which every host inherits; a gpubox from
         # the cad0ddad image had 416 MB free there and a 7.3.3 host kernel install failed. The

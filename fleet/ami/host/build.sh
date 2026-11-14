@@ -348,6 +348,10 @@ bake)
   # them, and so do the phone app's build image of this checkout's Containerfile; the others go.
   podman image prune -f >/dev/null
   as_user "podman image prune -f >/dev/null"
+  # Build-only state no host reads: the compiler cache (4.1 GB on the cad0ddad image). Every
+  # byte left on the root is hydrated from the snapshot when a host first reads it, and it
+  # leaves the pack less room.
+  rm -rf "$UH/.cache/sccache"
   app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)
   as_user "podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/fcvm-phone-app-build:' | grep -vx 'localhost/fcvm-phone-app-build:$app' | xargs -r podman rmi >/dev/null"
   df -h / | tee "$S/root-before-pack.txt"
@@ -364,7 +368,12 @@ bake)
     [ "$(stat -c %s "$f")" -lt $((5 * 1024 * 1024 * 1024)) ] || { echo "$f is 5 GiB or more: one PUT cannot upload it"; exit 1; }
   done
   # The user's rootless podman storage keeps the renderer image (the store holds its export).
-  rm -rf "$UH/.cargo/registry" "$UH/.cargo/git" "$UH/.rustup/toolchains"/*/share/doc
+  # The Rust toolchain only builds (2.9 GB with ~/.cargo); no host runs cargo, and prep and
+  # build install it again when a builder's base image has none. Nor does a host read the
+  # build's journal.
+  rm -rf "$UH/.cargo" "$UH/.rustup"
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-time=1s >/dev/null 2>&1 || true
   rm -f "$SRC/target"
   $APT clean
   cloud-init clean --logs --seed
