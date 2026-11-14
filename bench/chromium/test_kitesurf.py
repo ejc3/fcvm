@@ -627,6 +627,11 @@ class Wiring(unittest.TestCase):
         self.assertIn("test -f /run/bench-ready", wait)
         self.assertIn("chromium_container_owns_cdp", wait)
         self.assertIn('[ "$chromium_ready" = true ]', wait)
+        # Codex, #1887 round 4: the page target is read with jq, not a regex, and
+        # the container's Chromium listens on the port the check reads.
+        self.assertIn("""jq -e 'any(.[]; .type == "page")'""", wait)
+        self.assertNotIn("grep -q '\"type\"", wait)
+        self.assertIn('-e BENCH_CDP_PORT="$CHROMIUM_CDP_PORT"', ks[start:check])
 
     def test_build_and_run_read_one_set_of_pins(self):
         for script in ("kitesurf.sh", "kitesurf_build.sh"):

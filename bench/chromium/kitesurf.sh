@@ -89,7 +89,7 @@ for port in "$KITESURF_PORT" "$KITESURF_INSPECTOR_PORT" "$CHROMIUM_CDP_PORT"; do
         || { echo "REFUSING: port '$port' is not in 1..65535" >&2; exit 2; }
 done
 [ -s "$CA_CERT" ] || { echo "REFUSING: CA_CERT $CA_CERT is missing or empty" >&2; exit 2; }
-for tool in awk curl flock grep id pgrep podman python3 sha256sum systemctl systemd-run timeout unshare; do
+for tool in awk curl flock grep id jq pgrep podman python3 sha256sum systemctl systemd-run timeout unshare; do
     command -v "$tool" >/dev/null 2>&1 || { echo "REFUSING: '$tool' missing" >&2; exit 2; }
 done
 
@@ -264,7 +264,8 @@ except OSError:
     log "correctness: starting the bench image's Chromium for its own render check"
     CHROMIUM_CONTAINER=$(timeout --kill-after=5s 120s podman run -d --rm \
         --name "kschk-$RUNID" --label "io.fcvm.bench.owner=$CONTAINER_OWNER_TOKEN" \
-        --network host -e BENCH_RESOLVE_ALL_TO=127.0.0.1 "$image_ref")
+        --network host -e BENCH_RESOLVE_ALL_TO=127.0.0.1 \
+        -e BENCH_CDP_PORT="$CHROMIUM_CDP_PORT" "$image_ref")
     # Ready means what hostcdp.sh means: entry.sh's warm marker (its warm-up
     # navigations are over) and a CDP listener owned by a process in this
     # container that lists a page target.
@@ -273,7 +274,7 @@ except OSError:
         if timeout --kill-after=5s 30s podman exec "$CHROMIUM_CONTAINER" test -f /run/bench-ready 2>/dev/null \
                 && chromium_container_owns_cdp \
                 && curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$CHROMIUM_CDP_PORT/json/list" 2>/dev/null \
-                    | grep -q '"type": *"page"'; then
+                    | jq -e 'any(.[]; .type == "page")' >/dev/null 2>&1; then
             chromium_ready=true
             break
         fi
