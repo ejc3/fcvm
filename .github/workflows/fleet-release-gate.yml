@@ -9,10 +9,16 @@ name: Fleet image release gate
 # (fleet/ami/release_gate.py), and records that rollback as verified, so it is not rolled back in
 # turn. A verified generation is never rolled back by the gate.
 
+# A promotion starts it at once: the publisher, or whoever sees the new receipt, sends
+# repository_dispatch `fleet-release-promoted` or runs `gh workflow run fleet-release-gate.yml`.
+# The schedule is the fallback for a promotion nobody announced; when the live generation is
+# already verified a run ends after the status job.
 on:
-  schedule:
-    - cron: '*/20 * * * *'
+  repository_dispatch:
+    types: [fleet-release-promoted]
   workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read

@@ -69,6 +69,15 @@ class GateTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "must name"):
                 release_gate.main(["status"], run=Lambda())
 
+    def test_a_promotion_starts_the_gate_at_once_and_the_schedule_is_the_fallback(self):
+        # Whatever records a promotion starts the gate directly (repository_dispatch from the
+        # publisher, or `gh workflow run` by whoever saw the new receipt), so a bad release does not
+        # wait for the schedule; the schedule only catches a promotion nobody announced.
+        on = WORKFLOW.split("\non:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("  repository_dispatch:\n    types: [fleet-release-promoted]", on)
+        self.assertIn("  workflow_dispatch:", on)
+        self.assertIn("    - cron: '*/5 * * * *'", on)
+
     def test_the_workflow_smokes_an_unverified_generation_and_reports_the_result(self):
         # The smoke runs only for an unverified generation, and its result, whatever it is, reaches
         # the decision: a failed smoke must not skip the job that rolls the generation back.
