@@ -10639,7 +10639,9 @@ class ProvenanceNamesBytes(unittest.TestCase):
                      "reqbench.py", "reqbench.sh", "reqanalyze.py", "wddrive.py",
                      "owned_process.py", "phase_supervisor.py",
                      "host_resource_finalizer.py", "serve_guardian.py",
-                     "cleanup_owner.py", "corpus_campaign.sh", "fcvm"):
+                     "cleanup_owner.py", "corpus_campaign.sh", "kitesurf.sh",
+                     "kitesurf_measure.py", "kitesurf_seal.py", "kitesurf_pins.sh",
+                     "kitesurf_build.sh", "render_check.py", "fcvm"):
             if bench_has_files:
                 with open(os.path.join(bench, name), "w") as handle:
                     handle.write(name)
@@ -10690,6 +10692,8 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "cleanup_owner.py", "corpus_campaign.sh", "reqscale.py", "reqscale_analyze.py",
         "faulttrace.bt", "guardexec.py", "guardsupervise.py",
         "campaign_summary.py", "records.py",
+        "kitesurf.sh", "kitesurf_measure.py", "kitesurf_seal.py", "kitesurf_pins.sh",
+        "kitesurf_build.sh", "render_check.py",
     )
     # reqbench.sh's sealed bundle, in its order (test_run_facts pins the two).
     REQBENCH_SOURCES = (

@@ -6,6 +6,11 @@
 #            driven by the same cdpdrive.py, over the same schedule.
 #   memory   per-instance memory for fcvm clones and for host containers, both on
 #            the same two bases (see corpus_mem.py).
+#   kitesurf Cloudflare's Kitesurf engine at a pinned commit, under wrangler dev on
+#            this host, driven by the same cdpdrive.py (see kitesurf.sh). It runs
+#            alone: its replay serves a CA-signed certificate and Connection: close
+#            (corpus_serve.py --tls-ca-out, --connection-close), which the other
+#            phases' replay does not.
 #
 # The replay wiring is the campaign's: corpus_serve.py owns 127.0.0.1 DNS 53 /
 # HTTP 80 / HTTPS 443 and answers every name with --answer-ip, dnsmasq is stopped
@@ -48,6 +53,8 @@ MEM_SEED="${MEM_SEED:-20260830}"
 MEM_OP="${MEM_OP:-screenshot}"
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
+# The Kitesurf build make bench-kitesurf-build made (kitesurf_build.sh).
+KITESURF_DIR="${KITESURF_DIR:-/mnt/fcvm-btrfs/kitesurf}"
 
 # The campaign's 14 URLs, in the campaign's order. Copied from corpus_campaign.sh
 # and checked against it below: a corpus that has drifted would make the host
@@ -106,12 +113,17 @@ PY
 
 validate_phases() {
     local remaining="$PHASES" phase seen=","
+    case ",$PHASES," in
+        *,kitesurf,*) [ "$PHASES" = kitesurf ] || {
+            echo "BLOCKED: PHASES=kitesurf runs alone; its replay differs from the other phases'" >&2
+            return 2; } ;;
+    esac
     [ -n "$remaining" ] || { echo "BLOCKED: PHASES names no phases" >&2; return 2; }
     while :; do
         phase="${remaining%%,*}"
         [ -n "$phase" ] || { echo "BLOCKED: PHASES contains an empty phase" >&2; return 2; }
         case "$phase" in
-            hostcdp|memory) ;;
+            hostcdp|memory|kitesurf) ;;
             *) echo "BLOCKED: unknown phase '$phase'" >&2; return 2 ;;
         esac
         case "$seen" in
@@ -156,6 +168,8 @@ stage_runtime_bundle() {
         serve_guardian.py cleanup_owner.py corpus_campaign.sh
         reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py
         campaign_summary.py records.py
+        kitesurf.sh kitesurf_measure.py kitesurf_seal.py kitesurf_pins.sh kitesurf_build.sh
+        render_check.py
     )
     [ "${SOURCE_REVISION+x}" = x ] && [ "${SOURCE_GIT_DIRTY+x}" = x ] \
         || { echo "BLOCKED: runtime staging requires a complete source identity" >&2; return 2; }
@@ -555,6 +569,7 @@ if [ "$CORPUS_EXTRA_STAGED" = 0 ]; then
         REPS="$REPS" WARMUP="$WARMUP" MEM_NS="$MEM_NS" MEM_REPS="$MEM_REPS" \
         MEM_SEED="$MEM_SEED" MEM_OP="$MEM_OP" \
         UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
+        KITESURF_DIR="$KITESURF_DIR" \
         bash "$bundle_dir/corpus_extra.sh"
 fi
 
@@ -590,7 +605,9 @@ campaign_urls=$(grep -m1 '^URLS="https://example.com/' "$BENCH/corpus_campaign.s
     for f in corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py \
             corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py \
             owned_process.py phase_supervisor.py host_resource_finalizer.py \
-            serve_guardian.py cleanup_owner.py corpus_campaign.sh; do
+            serve_guardian.py cleanup_owner.py corpus_campaign.sh \
+            kitesurf.sh kitesurf_measure.py kitesurf_seal.py kitesurf_pins.sh \
+            kitesurf_build.sh render_check.py; do
         echo " \"$f\": \"$(sha256sum "$BENCH/$f" | cut -d' ' -f1)\","
     done
     echo " \"fcvm\": \"$(sha256sum "$BENCH/fcvm" | cut -d' ' -f1)\""
@@ -821,7 +838,7 @@ cleanup_owned_containers() {
             continue
         fi
         case "$name" in
-            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*)
+            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*|kschk-"$RUN_ID"-*)
                 identity=$(timeout --kill-after=5s 30s podman inspect --format \
                     '{{.Id}} {{ index .Config.Labels "io.fcvm.bench.owner" }}' "$id") \
                     || { echo "FAILED: cannot inspect possible owned container $name ($id)" >&2; rc=1; continue; }
@@ -906,6 +923,11 @@ publish_campaign_completion() {
     if [[ ",$PHASES," == *",memory,"* ]]; then
         memory_complete="$RESULTS/memory/complete.json"
     fi
+    local kitesurf_complete=""
+    if [[ ",$PHASES," == *",kitesurf,"* ]]; then
+        kitesurf_complete="$RESULTS/kitesurf/complete.json"
+    fi
+    KITESURF_COMPLETE="$kitesurf_complete" \
     python3 - "$RESULTS/campaign-complete.json" "$RESULTS" "$RUN_ID" \
             "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" "$PHASES" \
             "$memory_complete" "${host_completes[@]}" <<'PY'
@@ -920,9 +942,12 @@ import tempfile
 output_path, results, run_id, runtime_bundle_sha256, phases_raw, memory_path, \
     *host_paths = sys.argv[1:]
 phases = phases_raw.split(",")
-if (not phases or any(phase not in {"hostcdp", "memory"} for phase in phases)
+kitesurf_path = os.environ.get("KITESURF_COMPLETE", "")
+if (not phases or any(phase not in {"hostcdp", "memory", "kitesurf"} for phase in phases)
         or len(phases) != len(set(phases))):
     sys.exit(f"FAILED: invalid campaign phases {phases_raw!r}")
+if ("kitesurf" in phases) != bool(kitesurf_path):
+    sys.exit("FAILED: kitesurf phase and kitesurf completion disagree")
 if ("hostcdp" in phases) != bool(host_paths):
     sys.exit("FAILED: hostcdp phase and host completion set disagree")
 if ("memory" in phases) != bool(memory_path):
@@ -1038,13 +1063,41 @@ if memory_path:
             f"FAILED: memory completion artifacts have paths={artifact_paths!r}; "
             f"expected {expected_paths!r}"
         )
-if not host_records and memory_record is None:
+kitesurf_record = None
+if kitesurf_path:
+    kitesurf_record, kitesurf_payload = completion_record(
+        kitesurf_path, "kitesurf", "kitesurf/complete.json", capture=True
+    )
+    try:
+        kitesurf_completion = json.loads(kitesurf_payload)
+    except (TypeError, ValueError) as exc:
+        sys.exit(f"FAILED: kitesurf completion is not JSON: {exc}")
+    if (not isinstance(kitesurf_completion, dict)
+            or kitesurf_completion.get("schema_version") != 1
+            or kitesurf_completion.get("run_id") != f"{run_id}-kitesurf"
+            or not kitesurf_completion.get("artifacts")):
+        sys.exit("FAILED: kitesurf completion does not name this campaign's run and artifacts")
+    listed = [a.get("path") if isinstance(a, dict) else None
+              for a in kitesurf_completion["artifacts"]]
+    required = ["kitesurf-build.json", "run.json", "kitesurf.jsonl", "summary.json",
+                "correctness/kitesurf/correctness.jsonl"]
+    optional = ["correctness/chromium/correctness.jsonl"]
+    if listed not in (required, required + optional):
+        sys.exit(f"FAILED: kitesurf completion lists {listed!r}, not the arm's artifact set")
+    for artifact in kitesurf_completion["artifacts"]:
+        current, _payload = completion_record(
+            os.path.join(results, "kitesurf", artifact.get("path", "")), "kitesurf artifact")
+        if (current["size"], current["sha256"]) != (artifact.get("size"), artifact.get("sha256")):
+            sys.exit(f"FAILED: kitesurf artifact {artifact.get('path')!r} differs from its completion")
+if not host_records and memory_record is None and kitesurf_record is None:
     sys.exit("FAILED: campaign completion would authorize zero phase completions")
 
 host_records.sort(key=lambda item: item["path"])
 sources.extend((record["path"], record) for record in host_records)
 if memory_record is not None:
     sources.append((memory_record["path"], memory_record))
+if kitesurf_record is not None:
+    sources.append((kitesurf_record["path"], kitesurf_record))
 
 record = {
     "schema_version": 2,
@@ -1054,6 +1107,10 @@ record = {
     "host_completes": host_records,
     "memory_complete": memory_record,
 }
+# Only a kitesurf campaign carries the key, so the hostcdp and memory records
+# compare.py reads keep exactly the shape they had.
+if kitesurf_record is not None:
+    record["kitesurf_complete"] = kitesurf_record
 directory = os.path.dirname(output_path)
 fd, temporary = tempfile.mkstemp(prefix=".campaign-complete.", dir=directory)
 try:
@@ -1066,7 +1123,8 @@ try:
         seen.remove(relative)
         current, _payload = completion_record(
             os.path.join(results, relative),
-            "memory" if relative == "memory/complete.json" else "host",
+            {"memory/complete.json": "memory",
+             "kitesurf/complete.json": "kitesurf"}.get(relative, "host"),
             relative,
         )
         if current != expected:
@@ -1132,6 +1190,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# The Kitesurf phase's engine verifies certificates and reuses HTTP/1.0
+# connections (kitesurf.sh): its replay names every captured host in a
+# certificate signed by a CA it writes here, and says Connection: close.
+if [ "$PHASES" = kitesurf ]; then
+    CORPUS_SERVE_ARGS="${CORPUS_SERVE_ARGS:-} --tls-ca-out $RESULTS/replay-ca.crt --connection-close"
+fi
 say "starting corpus_serve (DNS 127.0.0.1:53 -> 10.0.2.2, HTTP 80, HTTPS 443)"
 rm -f "$RESULTS/corpus-serve.status"
 SERVE_CONTROL_PATH="$LOGDIR/corpus-serve.control"
@@ -1321,6 +1385,20 @@ if [[ ",$PHASES," == *",memory,"* ]]; then
         --runtime-bundle-sha256 "$REQBENCH_RUNTIME_BUNDLE_SHA256" \
         --corpus-extra-runtime-bundle-sha256 "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" \
         --fcvm "$BENCH/fcvm"
+fi
+
+if [[ ",$PHASES," == *",kitesurf,"* ]]; then
+    say "kitesurf over the corpus: $REPS measured reps plus $WARMUP warmup per arm, engine $KITESURF_DIR"
+    run_logged "$LOGDIR/kitesurf.log" env \
+        URLS="$URLS" REPS="$REPS" WARMUP="$WARMUP" RUNID="$RUN_ID-kitesurf" \
+        CA_CERT="$RESULTS/replay-ca.crt" CORPUS_ROOT="$BENCH/corpus-live" \
+        CORPUS_ACCESS_LOG="$RESULTS/corpus-access.log" \
+        KITESURF_DIR="$KITESURF_DIR" \
+        IMAGE="$IMAGE" IMAGE_ID="$RUNTIME_IMAGE" \
+        CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
+        SOURCE_REVISION="$SOURCE_REVISION" \
+        CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" \
+        RESULTS="$RESULTS/kitesurf" bash "$BENCH/kitesurf.sh"
 fi
 
 stop_corpus_serve

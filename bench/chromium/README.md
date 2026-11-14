@@ -52,6 +52,9 @@ Fan-out phases add burst latency and marginal memory per concurrent request.
 | `report.py` | `sample` (host memory + per-clone PSS one-liner) and `finalize` (requests/samples → `raw.json` + `report.md`) |
 | `gen_images.py` | regenerates the deterministic PNG fixtures in `pages/` (stdlib only) |
 | `pages/` | fixture site: `minimal` / `medium` / `heavy` / `warmup` HTML + CSS + JS + 4 PNGs, byte-identical whether served in-guest or from the host |
+| `kitesurf.sh` / `kitesurf_measure.py` | the Kitesurf arm (corpus_extra.sh `PHASES=kitesurf`): engine under `wrangler dev`, measured loop, summary; see "The Kitesurf arm" below |
+| `kitesurf_build.sh` / `kitesurf_pins.sh` / `kitesurf_seal.py` | pinned Kitesurf build outside the checkout and its seal |
+| `render_check.py` | untimed per-page correctness pass over any CDP engine: PNG screenshot, HTML, blank detection |
 | `upstream/` | ready-to-file upstream report + patch for the ANGLE `setenv(VK_ICD_FILENAMES)` vs `getenv()` startup SIGSEGV (see `upstream/ANGLE-setenv-race.md`) |
 
 ## Build the golden image
@@ -194,6 +197,55 @@ carries the 1-minute load at its start (`loadavg1`), so a run's load can be set
 against its requests. `ALLOW_BUSY=1` overrides
 the refusal and is recorded in the run. An overridden run is contaminated and
 must be excluded from comparisons or rerun before publication.
+
+## The Kitesurf arm (`kitesurf.sh`)
+
+Cloudflare's Kitesurf (github.com/cloudflare/kitesurf) is a browser engine that runs
+in V8 isolates on Workers and speaks CDP. The arm runs it on the campaign's own box,
+over the same corpus replay and through the same `cdpdrive.py` as the fcvm arm, so
+the report can set measured Kitesurf beside measured fcvm.
+
+```bash
+make bench-kitesurf-build                     # once per box; KITESURF_DIR= (default /mnt/fcvm-btrfs/kitesurf)
+make bench-chromium-corpus-extra PHASES=kitesurf STAMP=ks REPS=202 WARMUP=28
+```
+
+- **Build.** `kitesurf_build.sh` clones the commit `kitesurf_pins.sh` names, installs
+  the pinned Node.js, pnpm and Bazelisk (sha256-checked), runs `pnpm install
+  --frozen-lockfile` and `bazel run //packages/engine:dev_build`, all under
+  `KITESURF_DIR`, outside this checkout. On a c8g.metal-48xl the first build took
+  4.5 minutes. `kitesurf_seal.py` hashes every file `wrangler dev` reads (the staged
+  WebAssembly and bundles, the npm graph, workerd's binary) into `BUILD.json`; the
+  run refuses a tree that differs from it, before the engine starts and after the
+  last request. Nothing in the build needs x86; arm64 builds and runs it.
+- **Engine.** The command `pnpm run dev` runs after its Bazel prebuild: `wrangler dev
+  --env local` over workerd, CDP on 127.0.0.1, in a systemd user scope of its own.
+  Names resolve from a namespace `/etc/hosts` that maps every host the capture holds
+  to the replay on 127.0.0.1, with no DNS, so nothing reaches the live web. The
+  replay for this phase serves a certificate naming those hosts, signed by a CA it
+  writes for the run (`corpus_serve.py --tls-ca-out`, trusted through
+  `NODE_EXTRA_CA_CERTS`), and sends `Connection: close` (`--connection-close`):
+  workerd reused the replay's HTTP/1.0 connections and failed half its requests
+  without it. The phase therefore runs alone.
+- **Requests.** Arms `cdp` (navigate + JPEG q80 screenshot) and `html` (navigate +
+  outerHTML), both with navigation timing, as the fcvm arm's driver arguments are.
+  Rep r renders `urls[r % 14]`, with the arm order shuffled per rep from
+  `KITESURF_SEED`; each request opens its own CDP connection. Failed requests are recorded and the run continues.
+- **Correctness.** Before the measured reps, `render_check.py` renders every page once
+  on Kitesurf and once on the bench image's Chromium (a host container, the image
+  fcvm's arm restores), keeps each PNG screenshot and HTML document under
+  `kitesurf/correctness/<engine>/`, and marks a page blank when one colour covers
+  99.8% of its pixels. A measured request counts as a success only if its driver
+  call succeeded and its page completed in that check, so a fast blank render is a
+  failure. `summary.json` gives per-arm and per-page success, medians over
+  successful requests, cgroup and workerd CPU per request, the scope's anon memory
+  per request (memory.current also counts the page cache wrangler's file reads leave
+  there) and `memory.peak`, which includes start-up.
+- **What it is not.** This is `wrangler dev` on one host: no network hop between client
+  and engine, subresources from the local replay, every page isolate on this box's
+  cores, and the open-source workerd that wrangler ships. Cloudflare's published
+  Kitesurf figures come from its hosted Browser Run, which places isolates across
+  its network and fetches the live sites. The two are not the same measurement.
 
 ## The hosted arms (`browserrun.py`)
 
