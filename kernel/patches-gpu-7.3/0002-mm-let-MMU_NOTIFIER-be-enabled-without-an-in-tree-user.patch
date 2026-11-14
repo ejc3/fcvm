@@ -13,11 +13,11 @@ option a prompt so the gpu config fragment can request it directly.
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/mm/Kconfig b/mm/Kconfig
-index 76001e9..ee056a7 100644
+index 604c58199acb..9364cac23dfc 100644
 --- a/mm/Kconfig
 +++ b/mm/Kconfig
-@@ -705,8 +705,13 @@ config BOUNCE
- 	  selected, but you may say n to override this.
+@@ -722,8 +722,13 @@ config PHYS_ADDR_T_64BIT
+ 	def_bool 64BIT
  
  config MMU_NOTIFIER
 -	bool
@@ -33,4 +33,3 @@ index 76001e9..ee056a7 100644
  	bool "Enable KSM for page merging"
 -- 
 2.43.0
-

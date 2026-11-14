@@ -302,16 +302,16 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # profile yet, so setup builds the kernel locally (--build-kernels).
 [kernel_profiles.gpu.arm64]
 description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules)"
-kernel_version = "6.18.60"
+kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
 build_inputs = [
     "kernel/gpu.conf",
-    "kernel/patches-gpu/*.patch",
+    "kernel/patches-gpu-7.3/*.patch",
 ]
 kernel_config = "kernel/gpu.conf"
-patches_dir = "kernel/patches-gpu"
+patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 # Device passthrough (PUT /device-passthrough and LoadSnapshot
 # device_passthrough) on the PCI transport. A detach keeps the VFIO device open,
@@ -356,16 +356,16 @@ cuda_checkpoint_sha256 = "4636b2615135b87e5ff524d2e80ecc0d4a4e599f1e61fab0737474
 
 [kernel_profiles.gpu.amd64]
 description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules) (x86_64)"
-kernel_version = "6.18.60"
+kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
 build_inputs = [
     "kernel/gpu-x86.conf",
-    "kernel/patches-gpu-x86/*.patch",
+    "kernel/patches-gpu-7.3/*.patch",
 ]
 kernel_config = "kernel/gpu-x86.conf"
-patches_dir = "kernel/patches-gpu-x86"
+patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-uffd-populate"
@@ -402,16 +402,16 @@ cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474
 description = "GPU passthrough guest kernel with KVM for an Android Emulator (x86_64)"
 # The guest runs KVM itself: its snapshots restore only under the host kernel that took them.
 guest_kvm = true
-kernel_version = "6.18.60"
+kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 # No release is published; `fcvm setup --build-kernels` builds it.
 published = false
 build_inputs = [
     "kernel/phone-x86.conf",
-    "kernel/patches-gpu-x86/*.patch",
+    "kernel/patches-gpu-7.3/*.patch",
 ]
 kernel_config = "kernel/phone-x86.conf"
-patches_dir = "kernel/patches-gpu-x86"
+patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 # The fork's VFIO branch with the nested state in snapshots (ejc3/firecracker#23) and the
 # Prefilled memory backend (ejc3/firecracker#24) merged.
