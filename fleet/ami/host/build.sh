@@ -83,6 +83,19 @@ store_settled() {
   fi
   /usr/local/lib/fcvm-fleet/store.sh
 }
+# A host still writes to the root after the image is made: journals, packages, a host kernel
+# install. The image keeps its packed store (about 28 GB) on the root as the S3 restore's
+# fallback, and a gpubox from the cad0ddad image, whose root is 64 GB, had 416 MB free there:
+# installing a 7.3.3 host kernel failed. The bake fails unless ROOT_FREE_MIN_GIB stay free.
+root_has_room() {
+  local avail min=$(( ${ROOT_FREE_MIN_GIB:-8} * 1024 * 1024 * 1024 ))
+  avail=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+  [[ "$avail" =~ ^[0-9]+$ ]] || { echo "could not read the root's free space: '$avail'"; return 1; }
+  [ "$avail" -ge "$min" ] && return 0
+  echo "the root has $(( avail / 1024 / 1024 )) MiB free once the image is baked; ${ROOT_FREE_MIN_GIB:-8} GiB must stay free"
+  df -h /
+  return 1
+}
 # Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
 as_user() {
   local uid; uid=$(id -u "$U")
@@ -363,6 +376,7 @@ bake)
   # there (/tmp/kernel-build-gpu-*, 210,696 files): 40.7 s of every boot, against 1.7 s for
   # the same pass over the 7f5fb7e6 image's volume. Empty both here, where it costs nothing.
   find /tmp /var/tmp -mindepth 1 -delete
+  root_has_room
   sync
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
