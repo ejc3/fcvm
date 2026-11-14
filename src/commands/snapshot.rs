@@ -751,6 +751,33 @@ struct PrefilledBacking {
     refill: PrefillRefill,
 }
 
+/// [`prepare_prefilled_memory`] running beside the clone's setup.
+struct EarlyPrefill {
+    started: std::time::Instant,
+    task: tokio::task::JoinHandle<Option<PrefilledBacking>>,
+}
+
+impl EarlyPrefill {
+    fn start(gpus: Vec<String>, memory_path: PathBuf) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            task: tokio::spawn(async move { prepare_prefilled_memory(&gpus, &memory_path).await }),
+        }
+    }
+
+    /// The prefilled backing, or none (the restore then loads without hugepages, as
+    /// `prepare_prefilled_memory` does when it fails).
+    async fn wait(self) -> Option<PrefilledBacking> {
+        match self.task.await {
+            Ok(backing) => backing,
+            Err(error) => {
+                warn!(error = %error, "the hugepage prefill task ended; restoring without it");
+                None
+            }
+        }
+    }
+}
+
 /// The pool a restore took its memory from, refilled after the clone is acknowledged.
 #[derive(Debug, Clone)]
 struct PrefillRefill {
@@ -3148,6 +3175,44 @@ async fn cmd_snapshot_run_inner(
         }
     }
 
+    // A GPU restore's hugepage prefill starts here, beside the clone's setup (its state,
+    // volume servers and network), instead of after it; the memory backend below waits for
+    // it. Only a direct Firecracker restore prefills. A map count that cannot be read is left
+    // to the backend choice below, which fails the restore with it.
+    let mut early_prefill: Option<EarlyPrefill> = None;
+    if uffd_socket.is_none()
+        && snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker
+    {
+        if let Ok(map_count) = restore_map_count_shortfall(
+            &snapshot_config.metadata,
+            args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+        ) {
+            let direct_memory = direct_restore_memory(
+                args.hugepages.unwrap_or(snapshot_config.metadata.hugepages),
+                runtime_config
+                    .effective_firecracker_args()
+                    .as_deref()
+                    .is_some_and(crate::setup::firecracker_args_enable_nv2),
+                std::env::var("FCVM_FORCE_UFFD").is_ok(),
+                map_count,
+            );
+            if prefill_gpu_memory(
+                &gpus,
+                direct_memory,
+                snapshot_config.metadata.balloon_free_page_reporting,
+            ) && restore_vmm_accepts_prefilled(
+                &runtime_config,
+                snapshot_config.metadata.kernel_profile.as_deref(),
+                direct_memory,
+            ) {
+                early_prefill = Some(EarlyPrefill::start(
+                    gpus.clone(),
+                    snapshot_config.memory_path.clone(),
+                ));
+            }
+        }
+    }
+
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone());
@@ -3706,19 +3771,16 @@ async fn cmd_snapshot_run_inner(
             std::env::var("FCVM_FORCE_UFFD").is_ok(),
             map_count,
         );
-        prefill_started = Some(std::time::Instant::now());
-        let prefilled = if prefill_gpu_memory(
-            &gpus,
-            direct_memory,
-            snapshot_config.metadata.balloon_free_page_reporting,
-        ) && restore_vmm_accepts_prefilled(
-            &runtime_config,
-            snapshot_config.metadata.kernel_profile.as_deref(),
-            direct_memory,
-        ) {
-            prepare_prefilled_memory(&gpus, &snapshot_config.memory_path).await
-        } else {
-            None
+        // The prefill started beside the setup, on the same inputs as this choice.
+        let prefilled = match early_prefill.take() {
+            Some(early) => {
+                prefill_started = Some(early.started);
+                early.wait().await
+            }
+            None => {
+                prefill_started = Some(std::time::Instant::now());
+                None
+            }
         };
         if let Some(backing) = prefilled {
             prefilled_restore = Some(backing.refill);
@@ -6341,6 +6403,39 @@ mod tests {
     }
 
     use super::*;
+
+    /// A GPU restore's hugepage prefill starts before the clone's setup (its name, volume
+    /// servers and network) and the memory backend waits for that prefill instead of starting
+    /// one after the setup.
+    #[test]
+    fn the_prefill_starts_before_the_clone_setup() {
+        let code = include_str!("snapshot.rs");
+        let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let run = &code[code
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("no restore")..];
+        let at = |needle: &str| run.find(needle).unwrap_or_else(|| panic!("no `{needle}`"));
+        let reset = at("crate::gpu::reset::EarlyReset::start(");
+        let prefill = at("early_prefill = Some(EarlyPrefill::start(");
+        let setup = at("let mut setup = CloneSetupResources::new(");
+        let name = at("state_manager\n        .claim_name(");
+        let volumes = at("spawn_volume_servers_with_tables(");
+        let network = at("\"network configured for clone\"");
+        let waited = at("let prefilled = match early_prefill.take() {");
+        assert!(
+            reset < prefill && prefill < setup && prefill < name && prefill < volumes,
+            "the prefill must start before the clone's setup"
+        );
+        assert!(
+            network < waited,
+            "the backend must wait for the prefill after the network"
+        );
+        assert_eq!(
+            run.matches("prepare_prefilled_memory(").count(),
+            0,
+            "the restore must not start a second prefill"
+        );
+    }
 
     /// A restore takes every GPU's clean token before it decides, so a GPU it gets cannot keep
     /// a token that would tell the next VM it is clean.
