@@ -232,6 +232,12 @@ class HostedArms(unittest.TestCase):
         self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler)
                             and h.proxies.get("https") == "http://session-proxy.invalid:123"
                             for h in arm.handlers))
+        # A no_proxy entry covering the API would route around the proxy: refused.
+        for bypass in ("api.cloudflare.com", "*", ".cloudflare.com"):
+            with patch.dict(os.environ, {"https_proxy": "http://session-proxy.invalid:123",
+                                         "no_proxy": bypass}, clear=True):
+                with self.assertRaises(SystemExit, msg=bypass):
+                    self.br.direct_opener(worker=False)
         arm_redirects = [h for h in arm.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
         self.assertIsNone(arm_redirects[0].redirect_request(None, None, 302, "", {}, "https://elsewhere.invalid"))
         handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]

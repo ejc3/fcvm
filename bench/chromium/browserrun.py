@@ -128,6 +128,11 @@ def direct_opener(worker=True):
     environment names: it is that session's mandated egress, must not be
     bypassed, and leaves from the addresses the ARM token is pinned to."""
     proxies = {} if worker else urllib.request.getproxies()
+    if proxies.get("https") and urllib.request.proxy_bypass("api.cloudflare.com"):
+        # no_proxy would send these requests around the mandated proxy while
+        # run.json said they went through it.
+        raise SystemExit("REFUSING: no_proxy excludes api.cloudflare.com; "
+                         "the session's HTTPS proxy would be bypassed")
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect())
 
 
