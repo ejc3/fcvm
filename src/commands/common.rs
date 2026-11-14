@@ -5217,6 +5217,24 @@ pub(crate) fn snapshot_sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
     dir.with_file_name(format!("{name}.{suffix}"))
 }
 
+/// Record the staging directory of `snapshot_dir` (`<snapshot_dir>.creating`) for reclaim,
+/// before making it: a SIGKILLed create leaves it, with a memory image inside, and the next
+/// launch removes it (`crate::reclaim::Resource::SnapshotStaging`).
+///
+/// The caller holds the snapshot's lock exclusively ([`acquire_snapshot_dir_lock`]), which is
+/// what keeps a reclaim pass from removing the directory under it, and keeps the returned
+/// record until it has renamed the staging directory into place or removed it. Every path
+/// that stages a snapshot directory goes through here.
+pub(crate) fn record_snapshot_staging(
+    snapshot_dir: &Path,
+) -> Result<crate::reclaim::SnapshotStagingRecord> {
+    crate::reclaim::record_snapshot_staging(
+        &snapshot_sibling(snapshot_dir, "creating"),
+        &snapshot_sibling(snapshot_dir, "lock"),
+    )
+    .context("recording the snapshot staging directory")
+}
+
 /// Acquire the per-snapshot directory lock (`<snapshot_dir>.lock`).
 ///
 /// Creators take it exclusively while writing or atomically replacing a snapshot
@@ -5523,6 +5541,7 @@ pub async fn create_disk_only_snapshot_core(
         .to_path_buf();
     let temp_snapshot_dir = snapshot_sibling(&snapshot_dir, "creating");
 
+    let _staging = record_snapshot_staging(&snapshot_dir)?;
     crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
     crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
         .await
@@ -6168,6 +6187,7 @@ pub async fn create_snapshot_core(
 
     // Clean up any leftover temp directory from previous failed attempt
     let stage_started = std::time::Instant::now();
+    let _staging = record_snapshot_staging(snapshot_dir)?;
     crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
 
     // A diff snapshot whose parent's directory is a btrfs subvolume is staged as a subvolume
@@ -6947,6 +6967,7 @@ pub async fn create_snapshot_ch(
     }
 
     // Fresh temp dir + the CH sub-dir CH dumps its files into.
+    let _staging = record_snapshot_staging(snapshot_dir)?;
     crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
     crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
         .await
@@ -8991,6 +9012,40 @@ mod tests {
             "publish_snapshot_dir",
             body_of(source, "async fn publish_snapshot_dir("),
             &["in extra_files", "\"config.json\"", "atomic_replace_dir("],
+        );
+    }
+
+    /// A SIGKILLed snapshot create leaves its staging directory, with a memory image of up
+    /// to the guest's size in it, so each creator records the directory for reclaim before
+    /// it clears a leftover one or makes its own (`record_snapshot_staging`), and keeps the
+    /// record for its whole body. Nothing else names the staging directory. No fake VMM can
+    /// drive the creators, so this is pinned by their source;
+    /// `a_sigkilled_snapshot_create_leaves_its_staging_directory_to_the_next_launch`
+    /// (tests/test_reclaim.rs) kills a real one.
+    #[test]
+    fn every_snapshot_creator_records_its_staging_directory_before_making_it() {
+        let source = include_str!("common.rs");
+        for signature in [
+            "pub async fn create_disk_only_snapshot_core(",
+            "pub async fn create_snapshot_core(",
+            "pub async fn create_snapshot_ch(",
+        ] {
+            assert_in_order(
+                signature,
+                body_of(source, signature),
+                &[
+                    "let _staging = record_snapshot_staging(",
+                    "clear_staging(",
+                    "create_dir_or_subvolume(",
+                ],
+            );
+        }
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(
+            production.matches(", \"creating\")").count(),
+            4,
+            "a function other than record_snapshot_staging and the three creators names a \
+             snapshot's staging directory: record it there and list it here"
         );
     }
 

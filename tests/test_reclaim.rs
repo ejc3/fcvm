@@ -279,6 +279,79 @@ async fn a_sigkilled_restore_leaves_its_runtime_dir_to_the_next_launch() -> Resu
     result
 }
 
+/// A `snapshot create` SIGKILLed after it staged leaves `<tag>.creating`, with the guest's
+/// memory image in it, and nothing but a later create of the same tag removed it. The next
+/// launch removes it. The unit tests in `src/reclaim.rs` cover a pass that finds a later
+/// create of the tag using the directory.
+#[cfg(feature = "integration-slow")]
+#[tokio::test]
+async fn a_sigkilled_snapshot_create_leaves_its_staging_directory_to_the_next_launch() -> Result<()>
+{
+    let (source_name, _, snapshot, _) = common::unique_names("reclaim-staging");
+    let staging = fcvm::paths::snapshot_dir().join(format!("{snapshot}.creating"));
+    let (mut source, source_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &source_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(source_pid, 120).await?;
+        // Killed with the snapshot complete in its staging directory, before the rename
+        // that publishes it. The source VM has resumed by then.
+        let park = tempfile::tempdir()?;
+        let spec = format!("snapshot.install.pre_rename:park:{}", park.path().display());
+        let (mut create, create_pid) = common::spawn_fcvm_with_env(
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &source_pid.to_string(),
+                "--tag",
+                &snapshot,
+            ],
+            &[("FCVM_FAILPOINT", spec.as_str())],
+        )
+        .await?;
+        let observed = async {
+            wait_for(
+                "the create did not park at snapshot.install.pre_rename",
+                Duration::from_secs(180),
+                || parked(park.path()),
+            )
+            .await?;
+            anyhow::ensure!(
+                staging.join("memory.bin").is_file(),
+                "the parked create has no memory image in {}",
+                staging.display()
+            );
+            Ok(())
+        }
+        .await;
+        sigkill(&mut create, create_pid).await?;
+        observed?;
+
+        next_launch().await?;
+        anyhow::ensure!(
+            !staging.exists(),
+            "the killed create's staging directory survived the next launch: {}",
+            staging.display()
+        );
+        Ok(())
+    }
+    .await;
+    let stopped = stop(&mut source, source_pid).await;
+    // What a failed run leaves: the staging directory, or a snapshot the create published.
+    let _ = fcvm::storage::disk::remove_snapshot_dir(&staging).await;
+    common::delete_snapshot(&snapshot).await.ok();
+    result.and(stopped)
+}
+
 /// Build a localhost image whose content, and so whose digest, is this test's own, and
 /// return its image-cache key (the manifest digest, or the image id when there is none).
 async fn unique_localhost_image(name: &str) -> Result<String> {
