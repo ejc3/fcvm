@@ -2544,9 +2544,12 @@ pub enum MemoryBackend {
     /// a passthrough device pins guest memory without faulting it.
     Prefilled {
         socket_path: PathBuf,
-        backing: std::sync::Arc<std::fs::File>,
+        backing: PrefilledBackingFd,
     },
 }
+
+/// A prefilled backing's descriptor, kept open for as long as anything holds this.
+pub type PrefilledBackingFd = std::sync::Arc<dyn std::os::fd::AsRawFd + Send + Sync>;
 
 /// The greeting Firecracker expects with a prefilled backing's descriptor
 /// (ejc3/firecracker `PREFILLED_BACKING_HELLO_V1`).
@@ -2559,9 +2562,8 @@ const PREFILLED_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// and the thread gives up after [`PREFILLED_ACCEPT_TIMEOUT`].
 fn serve_prefilled_backing(
     socket_path: &Path,
-    backing: std::sync::Arc<std::fs::File>,
+    backing: PrefilledBackingFd,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    use std::os::fd::AsRawFd;
     use vmm_sys_util::sock_ctrl_msg::ScmSocket;
     let _ = std::fs::remove_file(socket_path);
     let listener = std::os::unix::net::UnixListener::bind(socket_path)
