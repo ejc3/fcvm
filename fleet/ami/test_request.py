@@ -173,5 +173,48 @@ class RequestTests(unittest.TestCase):
                            lambda *a, **k: self.fail("AWS must not run"))
 
 
+    def test_the_request_workflow_refuses_a_source_without_the_boot_fix_and_launch_gate(self):
+        # ejc3/aws#823: generation twelve booted without its user data. Until a source has ENA
+        # built into the host kernel and the launch-path acceptance, no revision is requested.
+        workflow = (Path(__file__).parents[2] / ".github/workflows/fleet-ami-pipeline.yml").read_text()
+        name = "- name: Refuse a source without the boot fix and the launch-path acceptance"
+        self.assertIn(name, workflow)
+        self.assertLess(workflow.index(name), workflow.index("aws-actions/configure-aws-credentials"))
+        self.assertLess(workflow.index(name), workflow.index("- name: Request the immutable main image build"))
+        block = workflow[workflow.index(name):].split("\n      - ", 1)[0]
+        script = block.split("run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+
+        def gate(files):
+            with tempfile.TemporaryDirectory() as root:
+                run = lambda *a: subprocess.run(a, cwd=root, check=True, capture_output=True)
+                run("git", "init", "-q")
+                for path, text in files.items():
+                    Path(root, path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(root, path).write_text(text)
+                run("git", "add", "-A")
+                run("git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "s")
+                sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+                return subprocess.run(["bash", "-c", script], cwd=root, env={"SOURCE_SHA": sha, "PATH": "/usr/bin:/bin"},
+                                      capture_output=True, text=True)
+
+        fixed = {"kernel/host-x86.conf": "CONFIG_ENA_ETHERNET=y\n",
+                 "fleet/ami/pipeline_guest.py": "def launch_path_proof(image):\n    pass\n"}
+        self.assertEqual(gate(fixed).returncode, 0)
+        for missing, text in (("kernel/host-x86.conf", None), ("kernel/host-x86.conf", "CONFIG_ENA_ETHERNET=m\n"),
+                              ("fleet/ami/pipeline_guest.py", None), ("fleet/ami/pipeline_guest.py", "def verify():\n    pass\n")):
+            with self.subTest(missing=missing, text=text):
+                files = dict(fixed)
+                if text is None:
+                    del files[missing]
+                else:
+                    files[missing] = text
+                result = gate(files)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not requested", result.stdout)
+        # this repository's own main is refused today
+        here = gate({"README.md": "x\n"})
+        self.assertNotEqual(here.returncode, 0)
+
 if __name__ == "__main__":
     unittest.main(buffer=True)
