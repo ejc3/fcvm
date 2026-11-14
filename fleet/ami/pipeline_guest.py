@@ -538,30 +538,30 @@ def viewer_proof():
 CLOUD_INIT_STAGES = ("init-local", "init", "modules-config", "modules-final")
 
 
-def nic_bound_before_cloud_init(entries, driver, device):
+def nic_bound_before_cloud_init(entries, driver, device, cloud_init_local_us):
     """True when the primary NIC's driver logged its probe (`<driver> <device>: ...`) before
-    systemd started cloud-init-local, in this boot's journal `entries` (journalctl -o json
-    objects). On generation twelve ENA was a module the kernel loaded after cloud-init-local
+    systemd started cloud-init-local (`cloud_init_local_us`, its InactiveExitTimestampMonotonic,
+    both on the boot's monotonic clock). The probe comes from this boot's kernel messages in the
+    journal (journalctl -o json objects), at the kernel's own timestamp
+    (_SOURCE_MONOTONIC_TIMESTAMP; __MONOTONIC_TIMESTAMP, when journald read the message, only
+    without it). On generation twelve ENA was a module the kernel loaded after cloud-init-local
     had started (27.8 s against 26.0 s), and on a boot where cloud-init-local looked for a NIC
     first it found none, used DataSourceNone and never ran the user data (ejc3/aws#823). The
-    order is checked, not the outcome, so a boot that happened to win the race still fails."""
-    probe = start = None
+    order is checked, not the outcome, so a boot that happened to win the race still fails.
+    The start comes from systemd, not from the journal's "Starting" line, which one generation
+    eleven boot did not have."""
+    need(isinstance(cloud_init_local_us, int) and cloud_init_local_us > 0, "cloud-init-local did not start this boot")
     prefix = driver + " " + device + ":"
     for entry in entries:
         message = entry.get("MESSAGE")
-        if not isinstance(message, str):
+        if entry.get("_TRANSPORT") != "kernel" or not isinstance(message, str) or not message.startswith(prefix):
             continue
         try:
-            at = int(entry.get("__MONOTONIC_TIMESTAMP", ""))
+            at = int(entry.get("_SOURCE_MONOTONIC_TIMESTAMP") or entry.get("__MONOTONIC_TIMESTAMP", ""))
         except ValueError:
             continue
-        if probe is None and entry.get("_TRANSPORT") == "kernel" and message.startswith(prefix):
-            probe = at
-        if start is None and entry.get("UNIT") == "cloud-init-local.service" and message.startswith("Starting "):
-            start = at
-    need(probe is not None, "the primary NIC's driver logged no probe this boot")
-    need(start is not None, "cloud-init-local did not start this boot")
-    return probe < start
+        return at < cloud_init_local_us
+    raise RuntimeError("the primary NIC's driver logged no probe this boot")
 
 
 def primary_nic():
@@ -596,13 +596,16 @@ def launch_path_proof():
     launched by the fleet, booted without its user data and ran no agent (ejc3/aws#823)."""
     driver, device = primary_nic()
     entries = []
-    for line in command(["journalctl", "-b", "-o", "json", "--no-pager",
-                         "--output-fields=MESSAGE,UNIT,_TRANSPORT,__MONOTONIC_TIMESTAMP"], timeout=120).splitlines():
+    for line in command(["journalctl", "-b", "-k", "-o", "json", "--no-pager",
+                         "--output-fields=MESSAGE,_TRANSPORT,_SOURCE_MONOTONIC_TIMESTAMP,__MONOTONIC_TIMESTAMP"],
+                        timeout=120).splitlines():
         try:
             entries.append(json.loads(line))
         except ValueError:
             continue
-    need(nic_bound_before_cloud_init(entries, driver, device),
+    started = command(["systemctl", "show", "cloud-init-local.service", "--property=InactiveExitTimestampMonotonic", "--value"])
+    need(started.isdigit(), "cloud-init-local has no start time this boot")
+    need(nic_bound_before_cloud_init(entries, driver, device, int(started)),
          f"the NIC driver {driver} bound after cloud-init-local started: a host can boot without its user data")
     command(["cloud-init", "status", "--wait"], timeout=600)
     status = json.loads(Path("/run/cloud-init/status.json").read_text())["v1"]
