@@ -5,6 +5,7 @@ Each test was observed failing against a mutation of the behaviour it pins.
 """
 
 import argparse
+import http.client
 import importlib.util
 import io
 import json
@@ -103,8 +104,9 @@ def args(out, **kw):
 class HostedArms(unittest.TestCase):
     def setUp(self):
         self.br = load()
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.parent = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.parent, True)
+        self.tmp = os.path.join(self.parent, "run")
         report = self.br.load("report")
         self.urls = list(report.KITESURF_CORPUS.values())
 
@@ -229,6 +231,42 @@ class HostedArms(unittest.TestCase):
         shots = os.listdir(os.path.join(self.tmp, "correctness", "kitesurf"))
         self.assertIn("correctness.jsonl", shots)
         self.assertTrue(any(name.endswith(".png") for name in shots))
+
+    def test_a_reused_output_directory_is_refused(self):
+        """Codex, #1888: a second run into one directory appended its rows to the
+        first's and summarized both under the second run's metadata."""
+        self.br.run(args(self.tmp, reps=1), TOKEN, ACCOUNT, opener=FakeCloudflare(), sleep=lambda s: None)
+        with self.assertRaises(SystemExit) as refused:
+            self.br.run(args(self.tmp, reps=2), TOKEN, ACCOUNT, opener=FakeCloudflare(), sleep=lambda s: None)
+        self.assertIn("exists", str(refused.exception))
+        self.assertEqual(len(self.rows()), 4, "the first run's rows are untouched")
+
+    def test_a_reply_cut_short_is_a_failed_request_and_the_run_goes_on(self):
+        """Codex, #1888: http.client.IncompleteRead is not an OSError, escaped
+        post() and ended the run."""
+        url = self.urls[0]
+
+        class Cut(Reply):
+            def read(self, *a):
+                raise http.client.IncompleteRead(b"partial", 100)
+        cf = FakeCloudflare()
+        original = cf.open
+        state = {"n": 0}
+
+        def open_(req, timeout):
+            body = json.loads(req.data)
+            if body["url"] == url and "screenshotOptions" in body and state["n"] == 0:
+                state["n"] += 1
+                return Cut(200, b"", {})
+            return original(req, timeout)
+        cf.open = open_
+        self.br.run(args(self.tmp, reps=14, engines="chromium", ops="screenshot"), TOKEN, ACCOUNT,
+                    opener=cf, sleep=lambda s: None)
+        rows = self.rows()
+        self.assertEqual(len(rows), 14)
+        cut = [r for r in rows if r["url"] == url]
+        self.assertEqual((cut[0]["ok"], cut[0]["status"]), (False, 0))
+        self.assertIn("IncompleteRead", cut[0]["detail"])
 
     def test_judge_rejects_what_is_not_a_render(self):
         j = self.br.judge

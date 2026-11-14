@@ -45,6 +45,7 @@ overrides may be supplied for an external trial. The token stays in memory.
 
 import argparse
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -142,9 +143,14 @@ def post(url: str, token: str, body: dict, timeout: float, opener):
             payload = resp.read()
             status, headers = resp.status, dict(resp.headers.items())
     except urllib.error.HTTPError as err:
-        payload = err.read() or b""
         status, headers = err.code, dict(err.headers.items()) if err.headers else {}
-    except (OSError, ValueError) as err:
+        try:
+            payload = err.read() or b""
+        except (OSError, ValueError, http.client.HTTPException) as body_err:
+            payload = f"error body unreadable: {type(body_err).__name__}: {body_err}".encode()
+    except (OSError, ValueError, http.client.HTTPException) as err:
+        # IncompleteRead (a reply cut short) is an HTTPException, not an OSError:
+        # it is a failed request like any transport failure, not the end of the run.
         payload, status, headers = f"{type(err).__name__}: {err}".encode(), 0, {}
     if not 200 <= status < 300:
         payload = payload.replace(token.encode(), b"[redacted]")
@@ -272,7 +278,12 @@ def run(args, token, account, opener=None, sleep=time.sleep) -> int:
         raise SystemExit(f"REFUSING: --engines must name chromium and/or kitesurf, got {args.engines!r}")
     if not ops or any(o not in OPS for o in ops):
         raise SystemExit(f"REFUSING: --ops must name screenshot and/or content, got {args.ops!r}")
-    os.makedirs(args.out, exist_ok=True)
+    # A run owns its directory: a reused one would mix two runs' rows under the
+    # second run's metadata.
+    try:
+        os.makedirs(args.out)
+    except FileExistsError:
+        raise SystemExit(f"REFUSING: {args.out} exists; every run writes a new directory")
     with open(os.path.join(args.out, "run.json"), "w") as handle:
         json.dump({"engines": engines, "ops": ops, "reps": args.reps, "warmup": args.warmup,
                    "seed": args.seed, "urls": urls, "image_type": args.image_type,
