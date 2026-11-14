@@ -676,6 +676,7 @@ fn prefill_gpu_memory(
 fn restore_vmm_accepts_prefilled(
     runtime_config: &RuntimeConfig,
     kernel_profile: Option<&str>,
+    fallback: DirectRestoreMemory,
 ) -> bool {
     let firecracker = super::common::find_firecracker(runtime_config).ok();
     let accepts = firecracker
@@ -691,27 +692,41 @@ fn restore_vmm_accepts_prefilled(
             .flatten()
             .and_then(|p| p.firecracker_commit);
         let built = crate::setup::embedded_profile_firecracker_commit(profile);
+        let (backend, transport) = fallback_transport(fallback);
         warn!(
             firecracker = ?firecracker,
             profile,
             configured_commit = ?configured,
             this_build_commit = ?built,
-            backend = "file",
+            backend,
             "{}",
-            prefilled_fallback_message(profile, configured.as_deref(), built.as_deref())
+            prefilled_fallback_message(transport, profile, configured.as_deref(), built.as_deref())
         );
     }
     accepts
 }
 
-/// Why a GPU restore runs on the File backend, and what puts it on prefilled hugepages.
+/// The restored record's backend name and a description of the transport a GPU restore
+/// uses instead of prefilled hugepages: the File backend, or the implicit UFFD server a
+/// hugepage snapshot restores through.
+fn fallback_transport(fallback: DirectRestoreMemory) -> (&'static str, &'static str) {
+    match fallback {
+        DirectRestoreMemory::File => ("file", "the File backend"),
+        DirectRestoreMemory::ImplicitUffd(_) => ("uffd-file", "an implicit UFFD server"),
+    }
+}
+
+/// Why a GPU restore runs on `transport`, and what puts it on prefilled hugepages.
 fn prefilled_fallback_message(
+    transport: &str,
     profile: &str,
     configured: Option<&str>,
     built: Option<&str>,
 ) -> String {
-    let base = "this GPU restore loads guest memory through the File backend, not prefilled \
-                hugepages, because its Firecracker has no Prefilled memory backend";
+    let base = format!(
+        "this GPU restore loads guest memory through {transport}, not prefilled hugepages, \
+         because its Firecracker has no Prefilled memory backend"
+    );
     match (configured, built) {
         (Some(configured), Some(built)) if configured != built => format!(
             "{base}: the host's rootfs-config.toml pins Firecracker {configured} for profile \
@@ -3699,6 +3714,7 @@ async fn cmd_snapshot_run_inner(
         ) && restore_vmm_accepts_prefilled(
             &runtime_config,
             snapshot_config.metadata.kernel_profile.as_deref(),
+            direct_memory,
         ) {
             prepare_prefilled_memory(&gpus, &snapshot_config.memory_path).await
         } else {
@@ -6399,7 +6415,12 @@ mod tests {
     /// host's config pins and the one this build pins, and the fix.
     #[test]
     fn the_prefilled_fallback_names_both_firecrackers_and_the_fix() {
-        let stale = prefilled_fallback_message("phone", Some("69894de0"), Some("4fc14097"));
+        let stale = prefilled_fallback_message(
+            fallback_transport(DirectRestoreMemory::File).1,
+            "phone",
+            Some("69894de0"),
+            Some("4fc14097"),
+        );
         for needle in [
             "File backend",
             "69894de0",
@@ -6409,12 +6430,26 @@ mod tests {
         ] {
             assert!(stale.contains(needle), "no `{needle}` in: {stale}");
         }
-        let old_snapshot = prefilled_fallback_message("phone", Some("4fc14097"), Some("4fc14097"));
+        let old_snapshot = prefilled_fallback_message(
+            fallback_transport(DirectRestoreMemory::File).1,
+            "phone",
+            Some("4fc14097"),
+            Some("4fc14097"),
+        );
         assert!(
             old_snapshot.contains("Remake the snapshot"),
             "{old_snapshot}"
         );
         assert!(!old_snapshot.contains("--generate-config"));
+        // A hugepage snapshot falls back to the implicit UFFD server, not the File backend,
+        // and the warning and its backend field say so, in the restored record's names.
+        let hugepages = fallback_transport(DirectRestoreMemory::ImplicitUffd(
+            ImplicitUffdReason::Hugepages,
+        ));
+        assert_eq!(hugepages.0, "uffd-file");
+        let message = prefilled_fallback_message(hugepages.1, "phone", None, None);
+        assert!(message.contains("implicit UFFD server") && !message.contains("File backend"));
+        assert_eq!(fallback_transport(DirectRestoreMemory::File).0, "file");
         let code = include_str!("snapshot.rs");
         let body = &code[code.find("fn restore_vmm_accepts_prefilled(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];

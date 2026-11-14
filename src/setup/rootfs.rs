@@ -1241,13 +1241,14 @@ pub fn embedded_profile_firecracker_commit(name: &str) -> Option<String> {
 }
 
 fn embedded_commit_in(config: &str, name: &str, arch: &str) -> Option<String> {
-    let tree: toml::Value = toml::from_str(config).ok()?;
-    tree.get("kernel_profiles")?
+    // Parsed as a loaded config is, so a default profile inherits the global Firecracker.
+    let mut plan: Plan = toml::from_str(config).ok()?;
+    apply_default_firecracker_config(&mut plan);
+    plan.kernel_profiles
         .get(name)?
         .get(arch)?
-        .get("firecracker_commit")?
-        .as_str()
-        .map(str::to_string)
+        .firecracker_commit
+        .clone()
 }
 
 /// Resolve rootfs filesystem type from CLI override and kernel profile name.
@@ -2868,21 +2869,35 @@ fn path_to_str(path: &Path) -> Result<&str> {
 mod tests {
     use super::*;
 
-    /// The commit a build pins for a profile comes from its embedded config, per architecture.
+    /// The commit a build pins for a profile comes from its embedded config, per
+    /// architecture, as a loaded config resolves it: a default profile inherits the global
+    /// `[firecracker]` commit (review of #1871).
     #[test]
     fn the_embedded_config_names_each_profiles_firecracker_commit() {
-        let config = "[kernel_profiles.gpu.amd64]\nfirecracker_commit = \"abc\"\n[kernel_profiles.gpu.arm64]\nfirecracker_commit = \"def\"\n";
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        apply_default_firecracker_config(&mut plan);
+        for arch in ["amd64", "arm64"] {
+            for (name, by_arch) in &plan.kernel_profiles {
+                let Some(profile) = by_arch.get(arch) else {
+                    continue;
+                };
+                assert_eq!(
+                    embedded_commit_in(EMBEDDED_CONFIG, name, arch),
+                    profile.firecracker_commit,
+                    "{name}.{arch}"
+                );
+            }
+        }
+        let global = plan.firecracker.as_ref().unwrap().commit.clone();
         assert_eq!(
-            embedded_commit_in(config, "gpu", "amd64").as_deref(),
-            Some("abc")
+            embedded_commit_in(EMBEDDED_CONFIG, "default", "amd64"),
+            Some(global)
         );
-        assert_eq!(
-            embedded_commit_in(config, "gpu", "arm64").as_deref(),
-            Some("def")
-        );
-        assert_eq!(embedded_commit_in(config, "phone", "amd64"), None);
-        // This build's own config pins the phone profile on amd64.
         assert!(embedded_commit_in(EMBEDDED_CONFIG, "phone", "amd64").is_some());
+        assert_eq!(
+            embedded_commit_in(EMBEDDED_CONFIG, "no-such-profile", "amd64"),
+            None
+        );
     }
 
     /// A [pasta] section without its source archives is refused when the config
