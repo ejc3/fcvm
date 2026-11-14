@@ -78,6 +78,15 @@ class GateTests(unittest.TestCase):
         self.assertIn("  workflow_dispatch:", on)
         self.assertIn("    - cron: '*/5 * * * *'", on)
 
+    def test_the_status_run_is_cheap(self):
+        # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted
+        # runner, a short limit, and a checkout of the one file it runs.
+        status = WORKFLOW.split("\n  status:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        self.assertIn("runs-on: ubuntu-24.04", status)
+        self.assertIn("timeout-minutes: 5", status)
+        self.assertIn("sparse-checkout: fleet/ami/release_gate.py", status)
+        self.assertIn("sparse-checkout-cone-mode: false", status)
+
     def test_the_workflow_smokes_an_unverified_generation_and_reports_the_result(self):
         # The smoke runs only for an unverified generation, and its result, whatever it is, reaches
         # the decision: a failed smoke must not skip the job that rolls the generation back.

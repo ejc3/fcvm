@@ -33,7 +33,7 @@ jobs:
     if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
       contents: read
       id-token: write
@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          sparse-checkout: fleet/ami/release_gate.py
+          sparse-checkout-cone-mode: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
