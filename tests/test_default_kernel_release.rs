@@ -23,6 +23,25 @@ fn rootfs_config() -> toml::Value {
     toml::from_str(&text).unwrap()
 }
 
+/// Every `kernel_profiles.<name>.<arch>.host_kernel.config_fragment` in the config: the
+/// fragments that configure a host kernel rather than a guest.
+fn host_kernel_fragments() -> Vec<PathBuf> {
+    let config = rootfs_config();
+    let mut fragments = Vec::new();
+    for profile in config["kernel_profiles"].as_table().unwrap().values() {
+        for arch in profile.as_table().unwrap().values() {
+            if let Some(fragment) = arch
+                .get("host_kernel")
+                .and_then(|host| host.get("config_fragment"))
+                .and_then(|fragment| fragment.as_str())
+            {
+                fragments.push(repo_root().join(fragment));
+            }
+        }
+    }
+    fragments
+}
+
 fn default_profile<'a>(config: &'a toml::Value, arch: &str) -> &'a toml::Value {
     &config["kernel_profiles"]["default"][arch]
 }
@@ -137,10 +156,20 @@ fn default_release_manifest_matches_immutable_build_recipe_on_both_arches() {
 #[test]
 fn every_guest_kernel_fragment_supports_snapshot_socket_cleanup() {
     let kernel_dir = repo_root().join("kernel");
+    let host_fragments = host_kernel_fragments();
+    assert!(
+        host_fragments.iter().all(|path| path.exists()),
+        "a host kernel config_fragment names a missing file: {host_fragments:?}"
+    );
     let mut checked = 0usize;
     for entry in std::fs::read_dir(&kernel_dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+            continue;
+        }
+        // A host kernel's fragment (a profile's `host_kernel.config_fragment`) configures
+        // the host, not a guest: the snapshot boundary's options are a guest's.
+        if host_fragments.contains(&path) {
             continue;
         }
         checked += 1;

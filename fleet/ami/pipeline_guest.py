@@ -535,12 +535,98 @@ def viewer_proof():
     return failures
 
 
+CLOUD_INIT_STAGES = ("init-local", "init", "modules-config", "modules-final")
+
+
+def nic_bound_before_cloud_init(entries, driver, device, cloud_init_local_us):
+    """True when the primary NIC's driver logged its probe (`<driver> <device>: ...`) before
+    systemd started cloud-init-local (`cloud_init_local_us`, its InactiveExitTimestampMonotonic,
+    both on the boot's monotonic clock). The probe comes from this boot's kernel messages in the
+    journal (journalctl -o json objects), at the kernel's own timestamp
+    (_SOURCE_MONOTONIC_TIMESTAMP; __MONOTONIC_TIMESTAMP, when journald read the message, only
+    without it). On generation twelve ENA was a module the kernel loaded after cloud-init-local
+    had started (27.8 s against 26.0 s), and on a boot where cloud-init-local looked for a NIC
+    first it found none, used DataSourceNone and never ran the user data (ejc3/aws#823). The
+    order is checked, not the outcome, so a boot that happened to win the race still fails.
+    The start comes from systemd, not from the journal's "Starting" line, which one generation
+    eleven boot did not have."""
+    need(isinstance(cloud_init_local_us, int) and cloud_init_local_us > 0, "cloud-init-local did not start this boot")
+    prefix = driver + " " + device + ":"
+    for entry in entries:
+        message = entry.get("MESSAGE")
+        if entry.get("_TRANSPORT") != "kernel" or not isinstance(message, str) or not message.startswith(prefix):
+            continue
+        try:
+            at = int(entry.get("_SOURCE_MONOTONIC_TIMESTAMP") or entry.get("__MONOTONIC_TIMESTAMP", ""))
+        except ValueError:
+            continue
+        return at < cloud_init_local_us
+    raise RuntimeError("the primary NIC's driver logged no probe this boot")
+
+
+def primary_nic():
+    """The driver and PCI device of the interface the default route uses."""
+    for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 2 and fields[1] == "00000000":
+            device = Path("/sys/class/net", fields[0], "device").resolve()
+            return Path(device, "driver").resolve().name, device.name
+    raise RuntimeError("this boot has no default route")
+
+
+def imds_user_data():
+    token = urllib.request.Request("http://169.254.169.254/latest/api/token", method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+    with urllib.request.urlopen(token, timeout=5) as response:
+        imds = response.read(4096).decode()
+    req = urllib.request.Request("http://169.254.169.254/latest/user-data", headers={"X-aws-ec2-metadata-token": imds})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.read(16 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        need(error.code == 404, "IMDS refused the user data")
+        return b""
+
+
+def launch_path_proof():
+    """This boot took the path a fleet host's boot takes, the one its launch template's user
+    data depends on: the NIC's driver was bound before cloud-init-local looked for a NIC,
+    cloud-init used EC2's metadata (not DataSourceNone) without an error in any stage, and the
+    user data it ran is this instance's. Generation twelve passed every other proof and then,
+    launched by the fleet, booted without its user data and ran no agent (ejc3/aws#823)."""
+    driver, device = primary_nic()
+    entries = []
+    for line in command(["journalctl", "-b", "-k", "-o", "json", "--no-pager",
+                         "--output-fields=MESSAGE,_TRANSPORT,_SOURCE_MONOTONIC_TIMESTAMP,__MONOTONIC_TIMESTAMP"],
+                        timeout=120).splitlines():
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
+    started = command(["systemctl", "show", "cloud-init-local.service", "--property=InactiveExitTimestampMonotonic", "--value"])
+    need(started.isdigit(), "cloud-init-local has no start time this boot")
+    need(nic_bound_before_cloud_init(entries, driver, device, int(started)),
+         f"the NIC driver {driver} bound after cloud-init-local started: a host can boot without its user data")
+    command(["cloud-init", "status", "--wait"], timeout=600)
+    status = json.loads(Path("/run/cloud-init/status.json").read_text())["v1"]
+    source = status.get("datasource") or ""
+    need(isinstance(source, str) and source.startswith("DataSourceEc2"), f"cloud-init used {source or 'no datasource'}, not EC2's metadata")
+    for stage in CLOUD_INIT_STAGES:
+        errors = (status.get(stage) or {}).get("errors")
+        need(errors == [], f"cloud-init {stage} reported errors or did not run")
+    ran = Path("/var/lib/cloud/instance/user-data.txt").read_bytes()
+    need(hashlib.sha256(ran).digest() == hashlib.sha256(imds_user_data()).digest(),
+         "the user data cloud-init ran is not this instance's")
+    return True
+
+
 def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
     need(kind in {"host", "tile"}, "invalid validator kind")
     need(set(proofs) <= {"viewer-path"} and ("viewer-path" not in proofs or kind == "host"), "unknown validator proof")
     sanitized()
     guard()
     ordering(kind)
+    launch_path_proof()
     need(renderer()["image_id"] == expected_image, "validated renderer differs from the paired build")
     old, new = secret(build_arn, region), secret(test_arn, region)
     need(cert_hash(old["cert"]) != cert_hash(new["cert"]) and old["scene_token"] != new["scene_token"],
@@ -555,7 +641,7 @@ def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
         wait(lambda: (request(8080, "/health")[1] or {}).get("ready") is True)
         tls_proof(443, new)
         scene_proof(8080, new, old)
-    return {**boot(), "guard": True, "frames": True, "phone_clone": kind == "host",
+    return {**boot(), "guard": True, "frames": True, "launch_path": True, "phone_clone": kind == "host",
             "windows_sandbox": kind == "host",
             "viewer_path": viewer == [], **({"viewer_failures": viewer} if viewer else {}),
             "tls_rotation": True, "sanitized": True,

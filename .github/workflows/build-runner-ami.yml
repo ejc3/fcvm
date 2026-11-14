@@ -74,10 +74,5 @@ jobs:
             echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
             echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Update \`firecracker_ami\` in terraform:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
-            echo "variable \"firecracker_ami\" {" >> $GITHUB_STEP_SUMMARY
-            echo "  default = \"${{ steps.build.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
-            echo "}" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "No terraform change is needed. The image carries Purpose=github-runner; the AMI replicator copies it to the runner regions and the autoscaler launches runners from the newest copy." >> $GITHUB_STEP_SUMMARY
           fi

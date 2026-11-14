@@ -1282,6 +1282,62 @@ async fn build_kernel_locally(
 
 use crate::setup::rootfs::HostKernelConfig;
 
+/// The host kernel's pinned Kconfig lines as a build script block: each is set on top of
+/// the running kernel's config, and after `olddefconfig` each must hold, or the build stops.
+/// The rest of the host kernel's config comes from whichever kernel the builder runs, which
+/// is how a factory builder from Ubuntu produced a host with ENA as a module (ejc3/aws#823).
+fn host_config_fragment_block(config: &HostKernelConfig, repo_root: &Path) -> Result<String> {
+    let Some(fragment) = config.config_fragment.as_deref() else {
+        return Ok(String::new());
+    };
+    let path = repo_root.join(fragment);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading host kernel config fragment {}", path.display()))?;
+    let mut set = Vec::new();
+    let mut check = Vec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let (name, value) = line
+            .split_once('=')
+            .filter(|(n, v)| {
+                n.starts_with("CONFIG_")
+                    && n[7..]
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    && matches!(*v, "y" | "m" | "n")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("{}: '{}' is not CONFIG_NAME=y|m|n", path.display(), line)
+            })?;
+        let option = match value {
+            "y" => "--enable",
+            "m" => "--module",
+            _ => "--disable",
+        };
+        set.push(format!("scripts/config {} {}", option, &name[7..]));
+        check.push(if value == "n" {
+            format!(
+                "! grep -q '^{name}=' .config || {{ echo \"ERROR: {name} is set, the fragment says n\"; exit 1; }}"
+            )
+        } else {
+            format!(
+                "grep -qx '{name}={value}' .config || {{ echo \"ERROR: {name} is not {value} after olddefconfig (a dependency is missing)\"; exit 1; }}"
+            )
+        });
+    }
+    if set.is_empty() {
+        bail!("{} sets nothing", path.display());
+    }
+    Ok(format!(
+        "\n# Pinned host config ({fragment}), checked after olddefconfig\n{}\nmake ARCH=\"$KERNEL_ARCH\" olddefconfig\n{}\n",
+        set.join("\n"),
+        check.join("\n")
+    ))
+}
+
 /// Generate host kernel build script dynamically from config.
 ///
 /// Uses the running kernel's config as base (includes EC2/AWS modules),
@@ -1398,7 +1454,7 @@ scripts/config --disable MODULE_SIG_ALL
 scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
 make ARCH="$KERNEL_ARCH" olddefconfig
-
+{config_fragment_block}
 # Build deb packages
 echo ""
 echo "Building kernel deb packages with $NPROC parallel jobs..."
@@ -1422,6 +1478,7 @@ echo "  sudo reboot"
         kernel_major = kernel_major,
         sha = sha,
         kernel_source_cache = kernel_source_cache_shell(),
+        config_fragment_block = host_config_fragment_block(config, repo_root)?,
         patches_dir_line = patches_dir
             .as_ref()
             .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
@@ -3247,6 +3304,107 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn amd64_host_kernel() -> HostKernelConfig {
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        plan.kernel_profiles["nested"]["amd64"]
+            .host_kernel
+            .clone()
+            .expect("amd64 host_kernel")
+    }
+
+    /// ejc3/aws#823: a factory builder from Ubuntu built the x86 host kernel from Ubuntu's
+    /// running config, with ENA as a module; the host booted without an initramfs, ENA probed
+    /// after cloud-init-local looked for a NIC, and the host came up without its user data.
+    /// The x86 host kernel pins ENA built in, the pin rebuilds the kernel (it is a build
+    /// input), and the build script sets it and stops if olddefconfig drops it.
+    #[test]
+    fn the_x86_host_kernel_builds_ena_in_and_the_build_stops_if_it_is_not() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let host = amd64_host_kernel();
+        let fragment = host
+            .config_fragment
+            .clone()
+            .expect("the amd64 host kernel names a config fragment");
+        assert!(
+            host.build_inputs.contains(&fragment),
+            "{fragment} must be a build input"
+        );
+        let text = std::fs::read_to_string(repo.join(&fragment)).unwrap();
+        assert!(
+            text.lines().any(|l| l == "CONFIG_ENA_ETHERNET=y"),
+            "{fragment}: ENA is not built in"
+        );
+
+        let block = host_config_fragment_block(&host, repo).unwrap();
+        assert!(
+            block.contains("scripts/config --enable ENA_ETHERNET"),
+            "{block}"
+        );
+        let script = generate_host_kernel_build_script(&host, "0123456789ab", repo).unwrap();
+        let (set, build) = (
+            script.find("--enable ENA_ETHERNET").unwrap(),
+            script.find("bindeb-pkg").unwrap(),
+        );
+        assert!(set < build, "the pin must be applied before the build");
+
+        // the block, run against a .config: passes when olddefconfig keeps ENA=y, stops when not
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(bin.join("scripts")).unwrap();
+        let run = |after: &str| {
+            std::fs::write(dir.path().join(".config"), "CONFIG_ENA_ETHERNET=m\n").unwrap();
+            std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+            std::fs::write(dir.path().join("scripts/config"), "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::write(
+                bin.join("make"),
+                format!("#!/bin/sh\nprintf '{after}\\n' > .config\n"),
+            )
+            .unwrap();
+            for f in [dir.path().join("scripts/config"), bin.join("make")] {
+                std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+            }
+            std::process::Command::new("bash")
+                .args(["-euo", "pipefail", "-c", &block])
+                .current_dir(dir.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("KERNEL_ARCH", "x86")
+                .output()
+                .unwrap()
+        };
+        assert!(run("CONFIG_ENA_ETHERNET=y").status.success());
+        let dropped = run("CONFIG_ENA_ETHERNET=m");
+        assert!(!dropped.status.success());
+        assert!(String::from_utf8_lossy(&dropped.stdout).contains("CONFIG_ENA_ETHERNET is not y"));
+    }
+
+    #[test]
+    fn a_host_config_fragment_takes_only_config_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = amd64_host_kernel();
+        host.config_fragment = Some("f.conf".into());
+        for bad in [
+            "ENA_ETHERNET=y",
+            "CONFIG_X=\"s\"",
+            "CONFIG_x=y",
+            "# only a comment",
+        ] {
+            std::fs::write(dir.path().join("f.conf"), format!("{bad}\n")).unwrap();
+            assert!(
+                host_config_fragment_block(&host, dir.path()).is_err(),
+                "{bad} was accepted"
+            );
+        }
+        std::fs::write(dir.path().join("f.conf"), "CONFIG_A=n\nCONFIG_B=m\n").unwrap();
+        let block = host_config_fragment_block(&host, dir.path()).unwrap();
+        assert!(
+            block.contains("scripts/config --disable A")
+                && block.contains("scripts/config --module B"),
+            "{block}"
+        );
+    }
 
     /// Two setups building the same profile and SHA into different stores hold different
     /// store locks, so each needs a tree of its own: a shared one would let the first to

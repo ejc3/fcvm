@@ -235,7 +235,7 @@ class Worker:
                 elif action == "renderer":
                     value = {"image_id": "sha256:" + "5" * 64 if self.bad_renderer else IMAGE}
                 elif action == "verify":
-                    value = {"boot_id": identity, "guard": True, "frames": True, "tls_rotation": True,
+                    value = {"boot_id": identity, "guard": True, "frames": True, "launch_path": True, "tls_rotation": True,
                         "sanitized": True, "phone_clone": slot.startswith("host-"),
                         "windows_sandbox": slot.startswith("host-"), "viewer_path": "viewer-path" in args[3:]}
                     self.viewer_asks.append((slot, "viewer-path" in args[3:]))
@@ -976,7 +976,7 @@ print("warm-log-permissions-pass")
                 self.assertEqual(output.getvalue(), "")
 
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
-        for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox", "viewer_path"):
+        for proof in ("guard", "frames", "launch_path", "tls_rotation", "sanitized", "phone_clone", "windows_sandbox", "viewer_path"):
             with self.subTest(proof=proof):
                 self.setUp()
                 self.worker.bad_proof = proof
@@ -1521,7 +1521,7 @@ else:
     def test_rotated_tls_identity_is_mandatory_before_any_video_proof(self):
         document = {"cert": "same", "key": "private", "scene_token": "same-token"}
         with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True,
-            ordering=lambda kind: None, renderer=lambda: {"image_id": IMAGE},
+            ordering=lambda kind: None, launch_path_proof=lambda: True, renderer=lambda: {"image_id": IMAGE},
             secret=lambda arn, region: document, cert_hash=lambda cert: cert,
             host_proof=lambda *args: self.fail("unsafe identity reached the GPU proof")):
             with self.assertRaisesRegex(RuntimeError, "not distinct"):
@@ -1581,6 +1581,55 @@ else:
                     left.close()
                     right.close()
 
+
+class LaunchPathTests(unittest.TestCase):
+    # ejc3/aws#823: generation twelve's host booted, as the fleet launched it, without its user
+    # data. On a first boot from the factory's image (g4dn.metal, 2026-11-14) ENA logged its
+    # probe at 27.78 s and systemd started cloud-init-local at 25.96 s.
+    DEVICE = "0000:00:05.0"
+
+    def journal(self, probe, received=None):
+        entries = [{"MESSAGE": "Linux version 6.18.60-fcvm", "_TRANSPORT": "kernel",
+                    "_SOURCE_MONOTONIC_TIMESTAMP": "1000", "__MONOTONIC_TIMESTAMP": "4000000"}]
+        nic = {"MESSAGE": "ena " + self.DEVICE + ": Elastic Network Adapter (ENA) found at mem fe800000, mac addr 0a:00:00:00:00:01",
+               "_TRANSPORT": "kernel", "_SOURCE_MONOTONIC_TIMESTAMP": str(probe),
+               "__MONOTONIC_TIMESTAMP": str(received if received is not None else probe)}
+        rename = {"MESSAGE": "ena " + self.DEVICE + " ens5: renamed from eth0", "_TRANSPORT": "kernel",
+                  "_SOURCE_MONOTONIC_TIMESTAMP": "40000000", "__MONOTONIC_TIMESTAMP": "40000000"}
+        return entries + [nic, rename]
+
+    def test_generation_twelves_boot_order_fails_even_when_it_won_the_race(self):
+        self.assertFalse(guest.nic_bound_before_cloud_init(self.journal(27_784_460), "ena", self.DEVICE, 25_963_145))
+
+    def test_a_nic_bound_before_cloud_init_passes(self):
+        # ENA built in probes during the kernel's own boot, seconds before userspace; journald reads
+        # the kernel's backlog later, so the kernel's own timestamp is the one compared
+        self.assertTrue(guest.nic_bound_before_cloud_init(self.journal(2_904_118, received=11_000_000),
+                                                          "ena", self.DEVICE, 10_412_771))
+
+    def test_a_missing_probe_or_start_cannot_pass(self):
+        with self.assertRaises(RuntimeError):
+            guest.nic_bound_before_cloud_init(self.journal(2_000_000)[:1], "ena", self.DEVICE, 10_000_000)
+        for start in (0, None):
+            with self.subTest(start=start), self.assertRaises(RuntimeError):
+                guest.nic_bound_before_cloud_init(self.journal(2_000_000), "ena", self.DEVICE, start)
+        # another device's probe is not this NIC's
+        with self.assertRaises(RuntimeError):
+            guest.nic_bound_before_cloud_init(self.journal(2_000_000), "ena", "0000:00:06.0", 10_000_000)
+
+    def test_the_start_comes_from_systemd_not_the_journal_line(self):
+        # a generation-eleven first boot (2026-11-14) had no "Starting cloud-init-local" line in its
+        # journal: the start time is systemd's own record of the unit
+        source = Path(__file__).with_name("pipeline_guest.py").read_text()
+        body = source.split("def launch_path_proof():", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"--property=InactiveExitTimestampMonotonic"', body)
+        self.assertNotIn("Starting", body)
+
+    def test_the_proof_runs_on_every_validator_boot(self):
+        source = (Path(__file__).with_name("pipeline_guest.py")).read_text()
+        body = source.split("def verify(kind, expected_image", 1)[1].split("\ndef ", 1)[0]
+        self.assertLess(body.index("ordering(kind)"), body.index("launch_path_proof()"))
+        self.assertIn('"launch_path": True', body)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
