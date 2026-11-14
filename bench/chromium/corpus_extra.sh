@@ -838,7 +838,7 @@ cleanup_owned_containers() {
             continue
         fi
         case "$name" in
-            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*)
+            cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*|kschk-"$RUN_ID"-*)
                 identity=$(timeout --kill-after=5s 30s podman inspect --format \
                     '{{.Id}} {{ index .Config.Labels "io.fcvm.bench.owner" }}' "$id") \
                     || { echo "FAILED: cannot inspect possible owned container $name ($id)" >&2; rc=1; continue; }

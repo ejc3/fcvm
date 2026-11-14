@@ -269,10 +269,14 @@ class Measurement(unittest.TestCase):
         km = load("kitesurf_measure")
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
+        run_json = os.path.join(tmp, "run.json")
+        with open(run_json, "w") as h:
+            h.write('{"run_id": "r"}')
+        run_sha = hashlib.sha256(open(run_json, "rb").read()).hexdigest()
         rows = []
         for rep in range(4):
             for url in ("https://good/", "https://blank/"):
-                rows.append({"run_json_sha256": "x", "engine": "kitesurf", "arm": "cdp", "rep": rep,
+                rows.append({"run_json_sha256": run_sha, "engine": "kitesurf", "arm": "cdp", "rep": rep,
                              "warmup": False, "url": url, "ok": True, "wall_ms": 100.0 if url == "https://good/" else 5.0,
                              "loadavg1": 0.1, "cgroup_cpu_usec_before": 0, "cgroup_cpu_usec_after": 50000,
                              "proc_cpu_ms": {"workerd": 40.0}, "memory_current_after": 1,
@@ -286,7 +290,7 @@ class Measurement(unittest.TestCase):
             h.write(json.dumps({"url": "https://good/", "site": "g", "completed": True}) + "\n")
             h.write(json.dumps({"url": "https://blank/", "site": "b", "completed": False, "blank": True}) + "\n")
         out = os.path.join(tmp, "s.json")
-        km.summarize(argparse.Namespace(jsonl=jsonl, run_json="", memory_peak="10",
+        km.summarize(argparse.Namespace(jsonl=jsonl, run_json=run_json, memory_peak="10",
                                         correctness=os.path.join(tmp, "c"), out=out))
         s = json.load(open(out))
         cdp = s["arms"]["cdp"]
@@ -294,6 +298,63 @@ class Measurement(unittest.TestCase):
         self.assertEqual(cdp["p50_ms"], 100.0, "the fast blank page must not pull the median down")
         self.assertEqual(cdp["per_page"]["https://blank/"]["succeeded"], 0)
         self.assertEqual(s["pages_completed"], {"kitesurf": 1})
+        self.assertEqual(s["run_json_sha256"], run_sha)
+        # A row from another run (Codex, #1887): the summary refuses, rather than
+        # aggregating it under this run's name.
+        rows[3]["run_json_sha256"] = "0" * 64
+        with open(jsonl, "w") as h:
+            for r in rows:
+                h.write(json.dumps(r) + "\n")
+        with self.assertRaises(SystemExit) as refused:
+            km.summarize(argparse.Namespace(jsonl=jsonl, run_json=run_json, memory_peak="10",
+                                            correctness=os.path.join(tmp, "c"), out=out))
+        self.assertIn("do not name this run.json", str(refused.exception))
+
+
+class ChromiumCheckTeardown(unittest.TestCase):
+    """The correctness check's Chromium must be proved gone before Kitesurf is
+    measured (Codex, #1887): stop_chromium swallowed a failed or timed-out
+    podman rm, cleared the id and let the measurement start beside it."""
+
+    def stop(self, exists_rc):
+        src = open(os.path.join(HERE, "kitesurf.sh")).read()
+        block = src[src.index("stop_chromium() {"):]
+        block = block[:block.index("\n}\n") + 3]
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        podman = os.path.join(tmp, "podman")
+        with open(podman, "w") as h:
+            h.write(f"#!/bin/sh\ncase \"$1 $2\" in 'container exists') exit {exists_rc} ;; esac\nexit 0\n")
+        os.chmod(podman, 0o755)
+        script = (block + '\nCHROMIUM_CONTAINER=abc\nstop_chromium; rc=$?\n'
+                  'echo "rc=$rc id=$CHROMIUM_CONTAINER"\n')
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}"))
+
+    def test_a_container_that_survives_stops_the_run(self):
+        r = self.stop(0)
+        self.assertIn("rc=1 id=abc", r.stdout, r.stderr)
+        self.assertIn("survived podman rm", r.stderr)
+
+    def test_an_unverifiable_removal_stops_the_run(self):
+        r = self.stop(125)
+        self.assertIn("rc=1 id=abc", r.stdout, r.stderr)
+
+    def test_a_proved_removal_clears_the_id(self):
+        r = self.stop(1)
+        self.assertIn("rc=0 id=", r.stdout, r.stderr)
+        self.assertNotIn("id=abc", r.stdout)
+
+    def test_kitesurf_sh_stops_when_teardown_is_not_proved(self):
+        src = open(os.path.join(HERE, "kitesurf.sh")).read()
+        self.assertIn("stop_chromium || exit 1", src)
+
+    def test_the_campaign_sweep_owns_the_check_container(self):
+        src = open(os.path.join(HERE, "corpus_extra.sh")).read()
+        self.assertIn('kschk-"$RUN_ID"-*)', src)
+        ks = open(os.path.join(HERE, "kitesurf.sh")).read()
+        self.assertIn('--name "kschk-$RUNID"', ks)
+        self.assertIn('RUNID="$RUN_ID-kitesurf"', src)
 
 
 class Seal(unittest.TestCase):

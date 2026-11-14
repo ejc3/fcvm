@@ -134,7 +134,19 @@ def measure(args):
 
 
 def summarize(args):
-    rows = [json.loads(line) for line in open(args.jsonl) if line.strip()]
+    import hashlib
+    with open(args.jsonl) as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    # Every row must name the exact run.json bytes it was measured under, so
+    # rows copied in from another run cannot be summarized as this one.
+    with open(args.run_json, "rb") as handle:
+        run_sha = hashlib.sha256(handle.read()).hexdigest()
+    if not rows:
+        raise SystemExit("FAILED: no measured rows to summarize")
+    stray = [r.get("rep") for r in rows if r.get("run_json_sha256") != run_sha]
+    if stray:
+        raise SystemExit(f"FAILED: {len(stray)} row(s) do not name this run.json "
+                         f"({run_sha}); first rep {stray[0]!r}")
     completed = {}
     correctness = {}
     for engine in ("kitesurf", "chromium"):
@@ -195,7 +207,7 @@ def summarize(args):
     loads = [r["loadavg1"] for r in rows if isinstance(r.get("loadavg1"), (int, float))]
     summary = {
         "engine": "kitesurf",
-        "run_json_sha256": rows[0]["run_json_sha256"] if rows else None,
+        "run_json_sha256": run_sha,
         "success_rule": "driver ok AND the page completed (not blank, screenshot and HTML) in render_check",
         "p50_convention": "statistics.median over successful measured requests",
         "arms": arms,

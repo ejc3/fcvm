@@ -166,13 +166,33 @@ stop_engine() {
         ENGINE_PID=""
     fi
 }
+# The check's Chromium must be gone before Kitesurf is measured: a container
+# left running would be foreign CPU the stray check cannot see. Removal is
+# proved with `podman container exists`; on any doubt the id is kept (so the
+# exit trap tries again) and the caller stops.
 stop_chromium() {
-    if [ -n "$CHROMIUM_CONTAINER" ]; then
-        timeout --kill-after=5s 60s podman rm -f -t 5 "$CHROMIUM_CONTAINER" >/dev/null 2>&1 || true
-        CHROMIUM_CONTAINER=""
+    local exists_rc
+    [ -n "$CHROMIUM_CONTAINER" ] || return 0
+    timeout --kill-after=5s 60s podman rm -f -t 5 "$CHROMIUM_CONTAINER" >/dev/null 2>&1
+    if timeout --kill-after=5s 30s podman container exists "$CHROMIUM_CONTAINER" >/dev/null 2>&1; then
+        echo "FAILED: the correctness check's Chromium ($CHROMIUM_CONTAINER) survived podman rm" >&2
+        return 1
+    else
+        exists_rc=$?
     fi
+    [ "$exists_rc" -eq 1 ] || {
+        echo "FAILED: cannot verify removal of the correctness check's Chromium ($CHROMIUM_CONTAINER)" >&2
+        return 1
+    }
+    CHROMIUM_CONTAINER=""
 }
-on_exit() { local rc=$?; trap - EXIT; stop_engine; stop_chromium; exit "$rc"; }
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    stop_engine
+    stop_chromium || { [ "$rc" -ne 0 ] || rc=1; }
+    exit "$rc"
+}
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -197,7 +217,7 @@ if [ "$CHROMIUM_CHECK" = 1 ]; then
     python3 "$HERE/render_check.py" "127.0.0.1:$CHROMIUM_CDP_PORT" --urls "$URLS_ARG" \
         --out "$RESULTS/correctness/chromium" --engine chromium > "$RESULTS/correctness-chromium.log" 2>&1 \
         || { cat "$RESULTS/correctness-chromium.log" >&2; echo "FAILED: Chromium render check" >&2; exit 1; }
-    stop_chromium
+    stop_chromium || exit 1
 fi
 
 log "starting Kitesurf (wrangler dev, workerd) on 127.0.0.1:$KITESURF_PORT in scope $UNIT"
