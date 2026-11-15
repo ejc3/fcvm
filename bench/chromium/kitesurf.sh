@@ -336,7 +336,7 @@ log "engine up: $version_json"
 python3 - "$RESULTS/run.json" "$RUNID" "$KITESURF_REV" "$KITESURF_REPO_URL" "$tree_sha256" \
         "$SEAL" "$version_json" "$SOURCE_REVISION" "$URLS_ARG" "$REPS" "$WARMUP" "$ARMS" \
         "$cgroup_rel" "$LOADAVG_FILE" "$SEED" <<'PY'
-import json, os, platform, sys
+import hashlib, json, os, platform, sys
 (out, run_id, rev, repo, tree, seal, version_json, source_revision, urls, reps, warmup,
  arms, cgroup, loadavg_file, seed) = sys.argv[1:]
 with open(seal) as handle:
@@ -355,6 +355,10 @@ record = {
     "network": "host loopback; names from the namespace's /etc/hosts (captured hosts -> 127.0.0.1)",
     "wrangler_command": "wrangler dev --env local -c wrangler.jsonc -c test/fixtures-worker/wrangler.jsonc",
     "cgroup": cgroup, "host_machine": platform.machine(), "host_kernel": platform.release(),
+    # The same boot identity as reqbench.host_boot_sha256, so the run names the
+    # boot it ran in as every serial record does.
+    "host_boot_sha256": hashlib.sha256(
+        b"fcvm-bench-boot\0" + open("/proc/sys/kernel/random/boot_id").read().strip().encode()).hexdigest(),
     "loadavg_at_start": load,
     "hosted_comparison": ("local wrangler dev on this host: no network hop to the engine, "
                           "subresources from the local replay, one host's cores; not Browser Run"),

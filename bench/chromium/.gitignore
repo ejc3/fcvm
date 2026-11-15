@@ -51,6 +51,14 @@ results/**
 !results/**/WITHDRAWN
 !results/**/cpuprobe-*-curated.json
 !results/**/webkit-host-probe.json
+# A Kitesurf phase's per-request rows and its correctness verdicts (the
+# screenshots and HTML they were judged on stay in the records repository).
+!results/**/kitesurf/kitesurf.jsonl
+!results/**/kitesurf/correctness/*/correctness.jsonl
+# The live-site run's numbers and the manifest of its raw files, which are
+# kept in ejc3/fcvm-bench-records.
+!results/live-*/hosted.json
+!results/live-*/external-records.json
 __pycache__/
 # fc-agent's restore phases, read out of the per-request clone logs
 # (restore_ack.py), and the memory server's log of the measured run, which
