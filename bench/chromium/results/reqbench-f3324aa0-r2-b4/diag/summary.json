@@ -1,0 +1,184 @@
+{
+  "backend": "uffd",
+  "engine": "chromium",
+  "limits": {
+    "expect_ips": [
+      "192.168.53.2"
+    ],
+    "max_load_ms": 15000
+  },
+  "passed": true,
+  "reps": 3,
+  "runtime_bundle_intact": true,
+  "runtime_bundle_sha256": "849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f",
+  "snapshot_config_sha256": "eb5b8729cd378f815a28255990c4b175570e05ed60f73175281e231f890b2ea1",
+  "snapshot_generation_id": "ff85fc4d-03bd-4bf1-b9e9-f6e693f3f5f7",
+  "tag": "cb-r2-b4",
+  "teardown_failures": 0,
+  "timestamp": "2026-11-15T00:49:27Z",
+  "uffd_mode": "minor",
+  "uffd_prefetch": "off",
+  "urls": {
+    "https://blog.cloudflare.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 405.89967100095237,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 174
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developer.mozilla.org/en-US/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 382.4566330004018,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 222
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developers.cloudflare.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 458.19817099982174,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 93
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://en.wikipedia.org/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 417.5049099994794,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 108
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://example.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 78.4261989992956,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 3
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://news.ycombinator.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 140.12603200171725,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 21
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 258.6335230007535,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "192.168.53.2": 27
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 176.90649400174152,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "192.168.53.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 167.1803480003291,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "192.168.53.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 196.40410100146255,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "192.168.53.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 180.7361139999557,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "192.168.53.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.elmundo.es/": {
+      "answered_by_replay": 0,
+      "errors": {
+        "net::ERR_ABORTED": 57
+      },
+      "max_load_ms": 2672.8755710009864,
+      "max_pending_at_load": 9,
+      "remote_ips": {
+        "192.168.53.2": 631
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.rtp.pt/noticias/": {
+      "answered_by_replay": 0,
+      "errors": {
+        "net::ERR_ABORTED": 7
+      },
+      "max_load_ms": 1796.5083700000832,
+      "max_pending_at_load": 2,
+      "remote_ips": {
+        "192.168.53.2": 597
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.theguardian.com/international": {
+      "answered_by_replay": 0,
+      "errors": {
+        "net::ERR_ABORTED": 27
+      },
+      "max_load_ms": 965.6809230000363,
+      "max_pending_at_load": 2,
+      "remote_ips": {
+        "192.168.53.2": 255
+      },
+      "renders_ok": 3,
+      "reps": 3
+    }
+  },
+  "violations": []
+}

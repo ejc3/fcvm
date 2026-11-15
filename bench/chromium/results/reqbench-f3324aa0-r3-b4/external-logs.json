@@ -1,0 +1,18 @@
+{
+  "files": {
+    "corpus-access.log": {
+      "commit": "7c2106f98c47a84376376e877db8e4f792aeff12",
+      "path": "bench/chromium/results/reqbench-f3324aa0-r3-b4/corpus-access.log",
+      "sha256": "e8c72447a3c1f5abba3b2e67d065bcda2caaee1636796c25d5027c794f2ea653",
+      "size": 12069100
+    },
+    "corpus-dns.log": {
+      "commit": "7c2106f98c47a84376376e877db8e4f792aeff12",
+      "path": "bench/chromium/results/reqbench-f3324aa0-r3-b4/corpus-dns.log",
+      "sha256": "511345ee9c3dab753e7fba41a083c22bd1283b68d5d3f465e5c0495265d7d4ce",
+      "size": 1915411
+    }
+  },
+  "repository": "ejc3/fcvm-bench-records",
+  "schema": 1
+}

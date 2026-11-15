@@ -1,0 +1,148 @@
+{
+  "backend": "uffd",
+  "engine": "webkit",
+  "limits": {
+    "expect_ips": null,
+    "max_load_ms": 15000
+  },
+  "passed": true,
+  "reps": 3,
+  "runtime_bundle_intact": true,
+  "runtime_bundle_sha256": "849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f",
+  "snapshot_config_sha256": "3dce1b0c72009c05834055466c64d7254088ad1c59f546a0d192e0c48f6a0229",
+  "snapshot_generation_id": "e3389dbc-9f87-468c-90cd-c092a5bd5a0d",
+  "tag": "cb-r3-w4",
+  "teardown_failures": 0,
+  "timestamp": "2026-11-15T00:25:29Z",
+  "uffd_mode": "minor",
+  "uffd_prefetch": "off",
+  "urls": {
+    "https://blog.cloudflare.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 954.6141159999024,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developer.mozilla.org/en-US/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 771.4959920003821,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developers.cloudflare.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 1335.7157619993814,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://en.wikipedia.org/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 883.5235370006558,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://example.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 99.8134729998128,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://news.ycombinator.com/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 504.2451389999769,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 496.6194879998511,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 300.6463829997301,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 304.7785710004973,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 605.6824790002793,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 301.9211159999031,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.elmundo.es/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 5331.635289000587,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.rtp.pt/noticias/": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 4279.867950000153,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.theguardian.com/international": {
+      "answered_by_replay": 0,
+      "errors": {},
+      "max_load_ms": 1835.6493490000503,
+      "max_pending_at_load": null,
+      "remote_ips": {},
+      "renders_ok": 3,
+      "reps": 3
+    }
+  },
+  "violations": []
+}

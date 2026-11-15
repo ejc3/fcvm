@@ -1,0 +1,13 @@
+{
+  "kind": "uffd-serve",
+  "pid": 3572072,
+  "pid_start_time_ticks": 1749741,
+  "run_id": "88cc39f8751e4d6db9a65e82dfa27513",
+  "schema": "fcvm.chromium.reqscale.record.v2",
+  "snapshot_config_sha256": "79ceb09494ca6af1f5d82d29cf526f4f6d184154aab3a7a0df78a3e1dc3431b2",
+  "snapshot_generation_id": "50f16eaa-0cc8-462a-8b11-707695e403fb",
+  "snapshot_tag": "cb-s8",
+  "state_path": "state/vm-3619c24506f54fb58412b227ff187c24.json",
+  "uffd_mode": "minor",
+  "uffd_prefetch": "on"
+}

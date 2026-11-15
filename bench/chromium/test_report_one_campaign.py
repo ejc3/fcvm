@@ -154,6 +154,26 @@ class OneCampaign(unittest.TestCase):
     def setUp(self):
         self.page = read(REPORT).replace("<wbr>", "")
 
+    def section(self, anchor):
+        """The page's text from the h2 with this id to the next h2."""
+        start = self.page.find(f'<h2 id="{anchor}"')
+        if start < 0:
+            return ""
+        end = self.page.find("<h2 ", start + 1)
+        return self.page[start:end if end > 0 else len(self.page)]
+
+    def plan_box(self, cid, name):
+        """The host the campaign plan ran this record's step on, or None."""
+        path = os.path.join(RESULTS, f"campaign-{cid}-plan.tsv")
+        if not os.path.exists(path):
+            return None
+        label = name[len(f"corpusextra-{cid}-"):] if name.startswith("corpusextra-") else name[len(f"reqbench-{cid}-"):]
+        for line in read(path).splitlines():
+            step, box, args = (line.split("\t") + ["", "", ""])[:3]
+            if step == label or re.search(rf"(?:^| )(?:CORPUS_)?STAMP={re.escape(label)}(?: |$)", args):
+                return box
+        return None
+
     def campaign(self):
         ids = set(INDEX.findall(self.page))
         self.assertEqual(len(ids), 1, f"the page must cite exactly one campaign index, found {sorted(ids)}")
@@ -164,7 +184,13 @@ class OneCampaign(unittest.TestCase):
         prefixes = (f"reqbench-{cid}-", f"corpusextra-{cid}-", f"campaign-{cid}-")
         cited = sorted(set(CITED.findall(self.page)))
         self.assertTrue(cited, "the page cites no record; the check is vacuous")
-        foreign = [name for name in cited if not name.startswith(prefixes)]
+        # The live-site run is the one record outside the campaign the page may
+        # cite, and only in its own section, which says it ran outside it.
+        live = self.section("live")
+        foreign = [name for name in cited if not name.startswith(prefixes)
+                   and not (re.fullmatch(r"live-w\d+", name) and f"results/{name}" in live
+                            and self.page.count(f"results/{name}") == live.count(f"results/{name}")
+                            and os.path.exists(os.path.join(RESULTS, name, "hosted.json")))]
         self.assertEqual(foreign, [], f"records outside campaign {cid}")
 
     def test_the_cited_records_share_one_commit_boot_and_build(self):
@@ -192,6 +218,17 @@ class OneCampaign(unittest.TestCase):
                 # A host-control record names its boot but not the instance
                 # type; its boot must then be one a serial record names, with
                 # that record's type (checked below).
+                if kind == "extra" and not row.get("host_boot_sha256"):
+                    # A Kitesurf record from before kitesurf.sh recorded the boot
+                    # (f3324aa0): it is bound to the boot of the serial records
+                    # the campaign plan ran on the same host.
+                    box = self.plan_box(cid, name)
+                    peers = {record_identity(n)[1]["host_boot_sha256"] for n in cited
+                             if n.startswith(f"reqbench-{cid}-") and self.plan_box(cid, n) == box
+                             and record_identity(n)[0] == "serial"}
+                    self.assertTrue(box and len(peers) == 1,
+                                    f"{name}: names no boot, and the plan binds it to no one host")
+                    row["host_boot_sha256"] = peers.pop()
                 needed = ("source_revision", "host_boot_sha256") + (
                     ("instance_type",) if kind == "serial" else ())
                 for field in needed:
@@ -244,6 +281,13 @@ class OneCampaign(unittest.TestCase):
         for name, row in extras:
             # Every non-serial record names the build it ran: the Chromium
             # image and runtime bundle of the serial runs, and their fcvm.
+            # A Kitesurf phase's own run.json describes workerd, not an fcvm
+            # build: its record's top provenance.json names the bundle and is
+            # checked as its own row.
+            if row["path"].endswith("/kitesurf/run.json"):
+                self.assertTrue(any(n == name and r.get("top") for n, r in extras),
+                                f"{row['path']}: its record has no build provenance")
+                continue
             self.assertEqual(row["runtime_bundle_sha256"], chromium_bundle,
                              f"{row['path']}: another runtime bundle")
             if row.get("image_id") is not None:
