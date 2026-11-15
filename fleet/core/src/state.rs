@@ -776,8 +776,8 @@ pub struct Registration {
 }
 
 impl Registrations {
-    /// Hosts kept; past this the one registered longest ago goes. A staging release has a
-    /// handful of hosts, and an EC2 id is never reused.
+    /// Hosts kept; past this the one registered longest ago goes, and `since` moves past its
+    /// latest hello. A staging release has a handful of hosts, and an EC2 id is never reused.
     pub const MAX: usize = 256;
 
     pub fn registered(&mut self, host: &str, at: u64) {
@@ -787,13 +787,16 @@ impl Registrations {
         });
         r.last_at = r.last_at.max(at);
         while self.hosts.len() > Self::MAX {
-            let oldest = self
+            let (oldest, r) = self
                 .hosts
                 .iter()
                 .min_by_key(|(name, r)| (r.last_at, (*name).clone()))
-                .map(|(name, _)| name.clone())
+                .map(|(name, r)| (name.clone(), *r))
                 .expect("over the bound means not empty");
             self.hosts.remove(&oldest);
+            // The record no longer holds what that host did, so it vouches only for later: a
+            // host absent from it must not have registered since `since`.
+            self.since = self.since.max(r.last_at + 1);
         }
     }
 }
@@ -1122,6 +1125,10 @@ mod tests {
             s = crate::apply(s, &hello(&format!("i-{i:017x}"), 2000 + i));
         }
         assert_eq!(s.fleet.registrations.hosts.len(), Registrations::MAX);
+        // The record no longer vouches for the time the evicted hosts registered in: `since` moves
+        // past the latest of them, so an evicted host never reads as one that never registered
+        // (Codex on #1925).
+        assert_eq!(s.fleet.registrations.since, 2000 + 19 + 1);
         assert!(!s
             .fleet
             .registrations

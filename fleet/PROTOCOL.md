@@ -459,8 +459,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 - `fleet.agents` is the coordinator's record of every host whose agent said hello since
   `since` (Unix ms): when this coordinator process started or resumed. Each entry is `name`
   (the agent's host name, the EC2 instance id on fleet hosts), `first_at` and `last_at` (its
-  first and latest hello). A host whose agent has gone stays in it, and the record keeps the
-  256 most recently registered hosts. A resume starts it again, because a restart may lose
+  first and latest hello). A host whose agent has gone stays in it. The record keeps the 256
+  most recently registered hosts, and dropping one moves `since` past its latest hello. A resume starts it again, because a restart may lose
   registrations it had not stored. The image release gate reads it (`fleet/ami/release_gate.py`,
   through `fleet/coord/stage-smoke.py --agents`): a release host absent from it never
   registered since `since`.
