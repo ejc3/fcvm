@@ -8506,6 +8506,15 @@ fn fcvm_as(
         let file = std::fs::File::create(log)?;
         command.stdout(file.try_clone()?).stderr(file);
     }
+    // The umask fcvm creates the snapshot's files under is the shipped default, not the one
+    // `make test-root` was started with: under 077 the image is 0600 whatever fcvm does.
+    // SAFETY: umask is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
     common::set_test_pdeathsig(&mut command);
     Ok(command)
 }
