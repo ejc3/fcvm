@@ -3968,6 +3968,39 @@ class SpawnedArgv(unittest.TestCase):
             argv = self._capture(control.start)
         self.assertIn("--host-resolver-rules=MAP * 127.0.0.1", argv)
 
+    def test_the_control_chromium_writes_nothing_under_the_users_home(self):
+        """Red on the parent: the control inherited the invoking user's HOME, so
+        a root control's crash-report database (created at startup in
+        $XDG_CONFIG_HOME/chromium, else $HOME/.config/chromium) landed in the
+        user's home and made a root-owned ~/.config. Here a stub browser makes
+        that directory, and everything else a browser keeps under HOME and the
+        XDG directories, with the environment start() hands Popen."""
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "user-home")
+            os.mkdir(home)
+            args = SimpleNamespace(control_chromium="/c", control_resolve_all_to="",
+                                   control_tmp_root=d, run_id="r")
+            control = reqscale.NativeChromiumControl(args, mock.Mock(), "/sys/fs/cgroup/x/c", d)
+            seen = []
+
+            def refuse(argv, **kw):
+                seen.append(kw.get("env"))
+                raise RuntimeError("captured")
+
+            with mock.patch.dict(os.environ, {"HOME": home}), \
+                 mock.patch.object(reqscale.subprocess, "Popen", side_effect=refuse):
+                for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+                    os.environ.pop(name, None)
+                with self.assertRaises(Exception):
+                    control.start()
+                # No env= means the parent's environment, the user's HOME.
+                env = seen[0] if seen and seen[0] is not None else dict(os.environ)
+            subprocess.run(["sh", "-c",
+                            'mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/chromium/Crash Reports" '
+                            '"${XDG_CACHE_HOME:-$HOME/.cache}/chromium" "$HOME/.pki/nssdb"'],
+                           env=env, check=True)
+            self.assertEqual(os.listdir(home), [])
+
     def test_the_control_chromium_starts_no_software_gpu_process(self):
         """Red on the parent: with --disable-gpu alone the control's GPU process
         tries SwANGLE, fails and exits several times while the browser starts,

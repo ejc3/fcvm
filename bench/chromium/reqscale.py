@@ -3263,6 +3263,25 @@ class NativeChromiumControl:
             "about:blank",
         ]
 
+    def environment(self) -> dict:
+        """The control's environment, with HOME and the XDG directories in its profile.
+
+        The scale run runs as root under sudo, which keeps the invoking user's
+        HOME. Chromium's crash-report database ignores --user-data-dir and goes
+        to $XDG_CONFIG_HOME/chromium (else $HOME/.config/chromium), so a root
+        control created $HOME/.config/chromium/Crash Reports, and a root-owned
+        $HOME/.config with it when that directory did not exist yet: the next
+        phase's wrangler then failed with EACCES on mkdir $HOME/.config/.wrangler.
+        Everything the browser writes now stays under its own profile, which
+        stop() removes.
+        """
+        env = dict(os.environ)
+        env["HOME"] = self.profile_dir
+        for name, sub in (("XDG_CONFIG_HOME", ".config"), ("XDG_CACHE_HOME", ".cache"),
+                          ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state")):
+            env[name] = os.path.join(self.profile_dir, sub)
+        return env
+
     def start(self) -> dict:
         self.profile_dir = tempfile.mkdtemp(
             prefix=f"fcvm-reqscale-control-{self.args.run_id}-",
@@ -3277,6 +3296,7 @@ class NativeChromiumControl:
                 stdout=self.log_stream,
                 stderr=self.log_stream,
                 stdin=subprocess.DEVNULL,
+                env=self.environment(),
             )
             pidfd = reqbench.pidfd_open(self.proc.pid)
             poller = select.poll()
