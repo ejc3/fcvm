@@ -374,6 +374,7 @@
       "after": 0,
       "checks": {
         "/view/potato/capacity": 4,
+        "/view/potato/host": "h1",
         "/view/potato/next_round_at": 2000,
         "/view/potato/round": null,
         "/view/potato/size": 2
@@ -554,6 +555,7 @@
       "after": 27,
       "checks": {
         "/view/potato/capacity": 0,
+        "/view/potato/host": null,
         "/view/potato/ladder/0/record_hold_ms": 2000,
         "/view/potato/players": []
       },
@@ -690,6 +692,7 @@
     "potato": {
       "capacity": 0,
       "colours": 12,
+      "host": null,
       "ladder": [
         {
           "broke": {

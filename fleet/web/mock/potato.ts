@@ -203,6 +203,7 @@ export class MockPotato {
       next_round_at: this.nextRoundAt,
       colours: COLOURS,
       capacity: this.opts.players,
+      host: "mock-host-1",
     };
   }
 

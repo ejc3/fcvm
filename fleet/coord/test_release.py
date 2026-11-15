@@ -914,6 +914,36 @@ class AttributionTests(unittest.TestCase):
         # A tile /live names no host for has no attribution, and the gate then decides nothing.
         self.assertEqual(smoke.tile_attribution({"id": "fcvm:9", "half": "fcvm"}), ([], []))
 
+    def test_every_running_tile_of_a_real_view_is_attributed(self):
+        # The browser views fleet-core's replayed vectors produce (tests/vectors/*.json
+        # final_view, rewritten from the Rust code by FLEET_VECTORS_BLESS=1): what /live really
+        # serializes, not a fixture written to match the smoke.
+        vectors = sorted((HERE.parent / "core" / "tests" / "vectors").glob("*.json"))
+        seen = set()
+        for path in vectors:
+            view = json.loads(path.read_text()).get("final_view") or {}
+            modes = tuple(m for m in ("wall", "phones", "windows", "minecraft") if smoke.tiles_of(view, m))
+            jobs, _ = smoke.sweep_jobs(view, modes, "v4", None, "v-1", [])
+            for job in jobs:
+                mode, tile = job[0], job[2]
+                with self.subTest(vector=path.name, tile=tile.get("id")):
+                    hosts, instances = smoke.tile_attribution(tile)
+                    self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
+                    seen.add((mode, tile.get("half")))
+            # No vector serves an aggregate's URLs, so the sweep skips them; their attribution
+            # is the view's own fields all the same.
+            for aggregate in view.get("aggregates") or []:
+                with self.subTest(vector=path.name, tile=aggregate.get("id")):
+                    self.assertTrue(aggregate.get("host"), "a GPU host's aggregate names no host")
+                    self.assertEqual(smoke.tile_attribution(aggregate), ([aggregate["host"]], []))
+                    seen.add(("aggregate", aggregate.get("half")))
+        # Every kind of probe the smoke attributes from a tile appears in some vector. The potato
+        # game's host is pinned by 33_potato.json's /view/potato/host checks: its final view is
+        # after the host has gone.
+        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("phones", "fcvm"), ("windows", "fcvm"),
+                     ("minecraft", "fcvm"), ("aggregate", "fcvm")):
+            self.assertIn(kind, seen)
+
     def test_the_summary_line_holds_digests_and_no_line_holds_an_id(self):
         clock, current = [0.0], [{"potato": {"capacity": 96, "host": "i-0example0host00b",
                                              "round": {"id": 1, "size": 2, "seq": 0}}}]
