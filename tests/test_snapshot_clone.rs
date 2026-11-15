@@ -8465,3 +8465,233 @@ async fn test_routed_clone_answers_without_resolving_its_ipv6_gateway() -> Resul
     common::kill_process(serve_pid).await;
     Ok(())
 }
+
+/// The user a root test runs for (`SUDO_UID`), who can run rootless VMs on this host.
+#[cfg(feature = "privileged-tests")]
+fn sudo_invoker() -> Result<nix::unistd::User> {
+    let uid: u32 = std::env::var("SUDO_UID")
+        .context("BLOCKED: this root test needs SUDO_UID, the user who runs the rootless VMs")?
+        .parse()
+        .context("SUDO_UID is not a number")?;
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
+        .with_context(|| format!("SUDO_UID {uid} has no passwd entry"))?;
+    anyhow::ensure!(!user.uid.is_root(), "SUDO_UID is root");
+    Ok(user)
+}
+
+/// `fcvm args` run as `user` with `data_dir` as its data directory. `setpriv` switches the
+/// uid in place (sudo is shimmed out of test lanes) and arms PR_SET_PDEATHSIG after the
+/// switch, which clears the one `set_test_pdeathsig` sets.
+#[cfg(feature = "privileged-tests")]
+fn fcvm_as(
+    user: &nix::unistd::User,
+    data_dir: &std::path::Path,
+    args: &[&str],
+    log: Option<&std::path::Path>,
+) -> Result<tokio::process::Command> {
+    let fcvm = common::find_fcvm_binary()?;
+    let mut command = tokio::process::Command::new("setpriv");
+    command
+        .arg(format!("--reuid={}", user.uid))
+        .arg(format!("--regid={}", user.gid))
+        .args(["--init-groups", "--pdeathsig", "KILL", "--"])
+        .arg(fcvm)
+        .args(args)
+        .env("FCVM_DATA_DIR", data_dir)
+        .env("HOME", &user.dir)
+        .env("USER", &user.name)
+        .env("LOGNAME", &user.name)
+        .env("XDG_RUNTIME_DIR", format!("/run/user/{}", user.uid));
+    if let Some(log) = log {
+        let file = std::fs::File::create(log)?;
+        command.stdout(file.try_clone()?).stderr(file);
+    }
+    common::set_test_pdeathsig(&mut command);
+    Ok(command)
+}
+
+/// Poll `fcvm ls` as `user` until the VM `name` is healthy, for at most `limit`, failing
+/// early if `child` (the process that runs it) exits. Its pid.
+#[cfg(feature = "privileged-tests")]
+async fn healthy_as(
+    user: &nix::unistd::User,
+    data_dir: &std::path::Path,
+    name: &str,
+    child: &mut tokio::process::Child,
+    log: &std::path::Path,
+    limit: Duration,
+) -> Result<u32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let tail = || {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(20)..].join("\n")
+        };
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("{name} exited before it was healthy: {status}\n{}", tail());
+        }
+        let listed = fcvm_as(user, data_dir, &["ls", "--json"], None)?
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await?;
+        if listed.status.success() {
+            let vms: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout)?;
+            if let Some(vm) = vms.iter().find(|vm| vm["name"] == name) {
+                if vm["health_status"] == "healthy" {
+                    return vm["pid"]
+                        .as_u64()
+                        .map(|pid| pid as u32)
+                        .with_context(|| format!("{name} has no pid: {vm}"));
+                }
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{name} was not healthy within {limit:?}\n{}",
+            tail()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// An unprivileged user restores a snapshot another uid owns: a snapshot is made by the
+/// invoking user, its directory is given to root, and the user's `snapshot run --snapshot`
+/// (Firecracker's File backend, which opens `memory.bin` as that user) comes up healthy.
+/// `crate::storage::disk::can_own_subvolume_snapshot_of` handles this case for the disks,
+/// and it is why #1918 left `memory.bin` at the umask's mode: with the image created 0600
+/// the restore fails with "Failed to load guest memory: Permission denied".
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn an_unprivileged_user_restores_a_snapshot_another_uid_owns() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let user = sudo_invoker()?;
+    let data = tempfile::Builder::new()
+        .prefix("xu-")
+        .tempdir_in(fcvm::paths::assets_dir())?;
+    std::os::unix::fs::chown(
+        data.path(),
+        Some(user.uid.as_raw()),
+        Some(user.gid.as_raw()),
+    )?;
+    let (vm_name, clone_name, tag, _) = common::unique_names("xuser");
+    let logs = std::path::Path::new("/tmp/fcvm-test-logs");
+    std::fs::create_dir_all(logs)?;
+    let base_log = logs.join(format!("{vm_name}.log"));
+    let clone_log = logs.join(format!("{clone_name}.log"));
+
+    let mut base = fcvm_as(
+        &user,
+        data.path(),
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--no-snapshot",
+            common::TEST_IMAGE,
+        ],
+        Some(&base_log),
+    )?
+    .spawn()
+    .context("starting the base VM")?;
+    let mut clone = None;
+    let outcome = async {
+        let base_pid = healthy_as(
+            &user,
+            data.path(),
+            &vm_name,
+            &mut base,
+            &base_log,
+            Duration::from_secs(300),
+        )
+        .await?;
+        let created = fcvm_as(
+            &user,
+            data.path(),
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &base_pid.to_string(),
+                "--tag",
+                &tag,
+            ],
+            None,
+        )?
+        .output()
+        .await?;
+        anyhow::ensure!(
+            created.status.success(),
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        common::kill_process(base_pid).await;
+        let _ = base.wait().await;
+
+        // Another uid's snapshot, as a snapshot root made in a shared data directory is.
+        let snapshot = data.path().join("snapshots").join(&tag);
+        fn give_to_root(path: &std::path::Path) -> std::io::Result<()> {
+            std::os::unix::fs::lchown(path, Some(0), Some(0))?;
+            if std::fs::symlink_metadata(path)?.is_dir() {
+                for entry in std::fs::read_dir(path)? {
+                    give_to_root(&entry?.path())?;
+                }
+            }
+            Ok(())
+        }
+        give_to_root(&snapshot)?;
+        let memory = std::fs::metadata(snapshot.join("memory.bin"))?;
+        anyhow::ensure!(memory.uid() == 0, "memory.bin is not root's");
+
+        let child = clone.insert(
+            fcvm_as(
+                &user,
+                data.path(),
+                &["snapshot", "run", "--snapshot", &tag, "--name", &clone_name],
+                Some(&clone_log),
+            )?
+            .spawn()
+            .context("starting the clone")?,
+        );
+        healthy_as(
+            &user,
+            data.path(),
+            &clone_name,
+            child,
+            &clone_log,
+            Duration::from_secs(300),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "uid {} could not restore a snapshot root owns, memory.bin mode {:o}",
+                user.uid,
+                memory.mode() & 0o7777
+            )
+        })?;
+        anyhow::Ok(())
+    }
+    .await;
+
+    for child in [Some(&mut base), clone.as_mut()].into_iter().flatten() {
+        if let Some(pid) = child.id() {
+            common::kill_process(pid).await;
+        }
+        let _ = child.wait().await;
+    }
+    let removed = tokio::process::Command::new("rm")
+        .arg("-rf")
+        .arg(data.path())
+        .status()
+        .await;
+    outcome?;
+    anyhow::ensure!(
+        removed.is_ok_and(|status| status.success()),
+        "could not remove {}",
+        data.path().display()
+    );
+    Ok(())
+}
