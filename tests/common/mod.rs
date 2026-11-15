@@ -1021,7 +1021,8 @@ pub fn find_fcvm_binary() -> anyhow::Result<PathBuf> {
 
     for path in candidates {
         if path.exists() {
-            return Ok(path);
+            // Absolute, so a command that sets its own current_dir still finds it.
+            return Ok(std::path::absolute(&path)?);
         }
     }
 

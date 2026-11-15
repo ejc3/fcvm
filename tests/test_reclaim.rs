@@ -467,7 +467,7 @@ fn every_hand_built_export_and_import_command_dies_with_its_test() {
     const RUNS: [&str; 3] = ["spawn()", ".status()", ".output()"];
     // Per file: how many places build an export command, and an import command.
     for (file, source, exports, imports) in [
-        ("test_reclaim.rs", include_str!("test_reclaim.rs"), 4, 3),
+        ("test_reclaim.rs", include_str!("test_reclaim.rs"), 5, 4),
         (
             "test_lifecycle_interleave.rs",
             include_str!("test_lifecycle_interleave.rs"),
@@ -610,6 +610,101 @@ async fn a_sigkilled_import_leaves_its_staging_directory_to_the_next_import() ->
     anyhow::ensure!(
         !snapshots.join(killed_tag).exists(),
         "the killed import's tag exists"
+    );
+    anyhow::ensure!(
+        snapshots.join(next_tag).join("config.json").is_file(),
+        "the next import did not install its snapshot"
+    );
+    Ok(())
+}
+
+/// #1918: a relative FCVM_DATA_DIR is taken against the working directory once, so the
+/// records a killed import leaves name its staging directory from anywhere. An import from
+/// another working directory, with the same data directory given as an absolute path, finds
+/// those records and removes the staging directory. When the value was used as given, the
+/// record held `data/snapshots/<tag>.creating`, which that import resolved against its own
+/// working directory, and the staging directory stayed.
+#[tokio::test]
+async fn a_killed_import_with_a_relative_data_dir_is_reclaimed_from_another_directory() -> Result<()>
+{
+    let base = tempfile::tempdir()?;
+    let elsewhere = tempfile::tempdir()?;
+    let archives = tempfile::tempdir()?;
+    let data = base.path().join("data");
+    let snapshots = data.join("snapshots");
+    let (killed_tag, next_tag) = ("reclaim-relative-killed", "reclaim-relative-next");
+    let archive_of = |tag: &str| archives.path().join(format!("{tag}.archive"));
+    let fcvm = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
+        command.args(args);
+        // An import parked at its failpoint must not outlive a test that nextest killed.
+        common::set_test_pdeathsig(&mut command);
+        command
+    };
+    for tag in [killed_tag, next_tag] {
+        snapshot_without_a_vm(&data, tag)?;
+        let status = fcvm(&["snapshot", "export", tag, "--output"])
+            .arg(archive_of(tag))
+            .env("FCVM_DATA_DIR", &data)
+            .status()
+            .await
+            .context("exporting a snapshot to import")?;
+        anyhow::ensure!(status.success(), "the export of {tag} failed: {status}");
+        std::fs::remove_dir_all(snapshots.join(tag))?;
+    }
+    // The killed import runs in `base` with the data directory given relative to it, the
+    // next one in another directory with the same data directory given absolute.
+    let import = |tag: &str, cwd: &Path, data_dir: &Path| {
+        let mut command = fcvm(&["snapshot", "import", "--input"]);
+        command
+            .arg(archive_of(tag))
+            .current_dir(cwd)
+            .env("FCVM_DATA_DIR", data_dir);
+        command
+    };
+    let staging = snapshots.join(format!("{killed_tag}.creating"));
+
+    let park = tempfile::tempdir()?;
+    let spec = format!("snapshot.import.pre_publish:park:{}", park.path().display());
+    let mut killed = import(killed_tag, base.path(), Path::new("data"))
+        .env("FCVM_FAILPOINT", &spec)
+        .spawn()
+        .context("spawning the import to kill")?;
+    let killed_pid = killed.id().context("the import has no pid")?;
+    let observed = wait_for(
+        "the import did not park at snapshot.import.pre_publish",
+        Duration::from_secs(120),
+        || match killed.try_wait() {
+            Ok(Some(status)) => Some(Err(anyhow::anyhow!(
+                "the import with FCVM_DATA_DIR=data exited before it parked: {status}"
+            ))),
+            _ => parked(park.path()).map(|_| Ok(())),
+        },
+    )
+    .await
+    .and_then(|outcome| outcome);
+    // An import that exited on its own is already reaped, and the kill finds no process.
+    let kill = sigkill(&mut killed, killed_pid).await;
+    observed?;
+    kill?;
+    anyhow::ensure!(
+        staging.join("memory.bin").is_file(),
+        "the killed import, run with FCVM_DATA_DIR=data in {}, has not staged its snapshot \
+         in {}",
+        base.path().display(),
+        staging.display()
+    );
+
+    let status = import(next_tag, elsewhere.path(), &data)
+        .status()
+        .await
+        .context("running the next import")?;
+    anyhow::ensure!(status.success(), "the next import failed: {status}");
+    anyhow::ensure!(
+        !staging.exists(),
+        "the staging directory of an import killed with a relative FCVM_DATA_DIR survived \
+         the next import from another working directory: {}",
+        staging.display()
     );
     anyhow::ensure!(
         snapshots.join(next_tag).join("config.json").is_file(),

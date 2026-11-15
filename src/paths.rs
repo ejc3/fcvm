@@ -27,17 +27,43 @@ pub fn init_from_config() {
 /// sharing a directory such as `reclaim/0` with host root fails its ownership check.
 pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
     let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
-    let _ = ASSETS_DIR.set(PathBuf::from(&config.paths.assets_dir));
+    let _ = ASSETS_DIR.set(resolve_assets_dir(&config.paths.assets_dir));
 }
 
-/// FCVM_DATA_DIR when set, otherwise the configured data_dir.
+/// FCVM_DATA_DIR when set, otherwise the configured data_dir, as an absolute path.
 fn resolve_data_dir(configured: &str) -> PathBuf {
     resolve_data_dir_from(std::env::var_os("FCVM_DATA_DIR"), configured)
 }
 
 fn resolve_data_dir_from(env: Option<std::ffi::OsString>, configured: &str) -> PathBuf {
-    env.map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(configured))
+    match env {
+        Some(env) => absolute(PathBuf::from(env), "FCVM_DATA_DIR"),
+        None => absolute(PathBuf::from(configured), "paths.data_dir"),
+    }
+}
+
+/// The configured assets_dir, as an absolute path.
+fn resolve_assets_dir(configured: &str) -> PathBuf {
+    absolute(PathBuf::from(configured), "paths.assets_dir")
+}
+
+/// `path` as an absolute path, a relative one taken against the working directory.
+///
+/// Every directory the path functions return goes through here once, when its `OnceLock` is
+/// set, so a run names one directory whatever its working directory is later. Reclaim
+/// records, state files and snapshot configs store paths under these directories as given:
+/// with a relative FCVM_DATA_DIR, a record of `data/snapshots/<tag>.creating` meant another
+/// directory, or none, to a reclaim pass that ran from another working directory, and the
+/// staging directory it recorded was never removed (#1918). `source` names the setting in
+/// the panic, which, like a config that will not load, leaves the run nothing to work in.
+fn absolute(path: PathBuf, source: &str) -> PathBuf {
+    std::path::absolute(&path).unwrap_or_else(|error| {
+        panic!(
+            "{source} {:?} cannot be made an absolute path: {error}. Give it as an absolute \
+             path",
+            path
+        )
+    })
 }
 
 /// Initialize directories with default values (no config file required).
@@ -50,18 +76,19 @@ pub fn init_with_defaults() {
 /// Initialize directories with explicit paths (for testing).
 /// This allows tests to use custom directories without requiring a config file.
 pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathBuf>) {
-    let _ = DATA_DIR.set(data_dir.into());
-    let _ = ASSETS_DIR.set(assets_dir.into());
+    let _ = DATA_DIR.set(absolute(data_dir.into(), "data_dir"));
+    let _ = ASSETS_DIR.set(absolute(assets_dir.into(), "assets_dir"));
 }
 
 /// Directory for mutable per-instance data (vm-disks, state, snapshots).
 /// Configure via `paths.data_dir` in rootfs-config.toml for nested VM nesting.
-/// FCVM_DATA_DIR environment variable overrides config value.
+/// FCVM_DATA_DIR environment variable overrides config value. Always absolute: a relative
+/// value is taken against the working directory once, when it is first read.
 pub fn data_dir() -> PathBuf {
     DATA_DIR
         .get_or_init(|| {
             if let Some(data_dir) = std::env::var_os("FCVM_DATA_DIR") {
-                return PathBuf::from(data_dir);
+                return absolute(PathBuf::from(data_dir), "FCVM_DATA_DIR");
             }
             let (config, _, _) =
                 crate::setup::rootfs::load_config(None).expect("Failed to load config");
@@ -77,7 +104,7 @@ pub fn assets_dir() -> PathBuf {
         .get_or_init(|| {
             let (config, _, _) =
                 crate::setup::rootfs::load_config(None).expect("Failed to load config");
-            PathBuf::from(&config.paths.assets_dir)
+            resolve_assets_dir(&config.paths.assets_dir)
         })
         .clone()
 }
@@ -284,6 +311,26 @@ mod data_dir_override_tests {
         assert_eq!(
             resolve_data_dir_from(None, "/mnt/store"),
             PathBuf::from("/mnt/store")
+        );
+    }
+
+    /// A relative FCVM_DATA_DIR or paths value is taken against the working directory, so
+    /// what a run records under its data directory names that directory from any other
+    /// working directory too (#1918).
+    #[test]
+    fn a_relative_data_or_assets_dir_is_made_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            resolve_data_dir_from(Some("relative/data".into()), "/mnt/store"),
+            cwd.join("relative/data")
+        );
+        assert_eq!(
+            resolve_data_dir_from(None, "relative/configured"),
+            cwd.join("relative/configured")
+        );
+        assert_eq!(
+            resolve_assets_dir("relative/assets"),
+            cwd.join("relative/assets")
         );
     }
 
