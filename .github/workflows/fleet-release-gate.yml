@@ -1,0 +1,106 @@
+name: Fleet image release gate
+
+# Run the staging viewer smoke on both address families for each new image release. Both pass:
+# verify the generation. A probe receives invalid application data from a host or tile on a
+# changed image and neither family has an inconclusive probe: the gate may return to the live receipt's own
+# previous release, and marks the rollback verified so it cannot roll back in turn. Transport,
+# credentials, runner and coordinator failures fail the smoke without writing a release verdict.
+# The release gate (ejc3/aws fcvm-fleet-ami-pipeline.tf) rechecks the exact receipt, placement
+# digest and failing probe's attribution under its publication lock before changing the pointer.
+
+# A promotion starts it at once: the publisher, or whoever sees the new receipt, sends
+# repository_dispatch `fleet-release-promoted` or runs `gh workflow run fleet-release-gate.yml`.
+# The schedule is the fallback for a promotion nobody announced; when the live generation is
+# already verified a run ends after the status job.
+on:
+  repository_dispatch:
+    types: [fleet-release-promoted]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-release-gate
+  cancel-in-progress: false
+
+jobs:
+  status:
+    name: Live release
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      # ready: the live generation is unverified and its placement can carry a verdict (every live
+      # host and tile on the release's images, settled, at least one release host). status: the
+      # gate's whole answer, which the decision compares with a second status after the probes.
+      ready: ${{ steps.gate.outputs.ready }}
+      status: ${{ steps.gate.outputs.status }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/ami/release_gate.py
+          sparse-checkout-cone-mode: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - id: gate
+        env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+        run: python3 -B fleet/ami/release_gate.py status
+
+  smoke:
+    name: Staging smoke
+    needs: status
+    # Only while every live host and tile runs the release and has settled: a smoke on a host
+    # still on the previous image, or still coming up, says nothing about this one, and the next
+    # run tries again.
+    if: needs.status.outputs.ready == 'true'
+    # A called workflow cannot raise its caller's permissions; the smoke's report job opens an issue.
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-viewer-smoke.yml
+    # No relaunches: an EC2 relaunch replaces the tile's instance and so the placement the
+    # verdict is bound to. The viewer path and the take-over replace nothing.
+    with:
+      relaunch: false
+    secrets: inherit
+
+  decide:
+    name: Verify or roll back
+    needs: [status, smoke]
+    # It runs whatever the smoke's result, and decides only on what both families reported: a family
+    # that reported no probe summary (setup, credentials, runner, coordinator) decides nothing, and
+    # neither does a placement that changed during the probes (release_gate.py).
+    if: ${{ !cancelled() && needs.status.outputs.ready == 'true' }}
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          mask-aws-account-id: true
+      - env:
+          RELEASE_GATE: ${{ vars.RELEASE_GATE }}
+          BEFORE: ${{ needs.status.outputs.status }}
+          V4: ${{ needs.smoke.outputs.v4 }}
+          V6: ${{ needs.smoke.outputs.v6 }}
+        run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6"

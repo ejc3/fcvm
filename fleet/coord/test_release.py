@@ -600,7 +600,7 @@ class ViewerPathTests(unittest.TestCase):
         return {"id": "t:1", "slot": "mc-1" if mode == "minecraft" else "win-1", "phase": "running",
                 key: url, **extra}
 
-    def probe(self, mode, tile, family="v4", server=None, admit="v1.9.v-1.mac", ports=None, **kw):
+    def probe(self, mode, tile, family="v4", server=None, admit="v1.9.v-1.mac", ports=None, half="fcvm", **kw):
         addr = ipaddress.ip_address(server.host) if server else ipaddress.ip_address("192.0.2.9")
         declared = ports if ports is not None else {server.port} if server else None
         patches = [patch.object(smoke, "lookup", lambda host, fam, r: [addr]),
@@ -611,7 +611,7 @@ class ViewerPathTests(unittest.TestCase):
             for p in patches:
                 stack.enter_context(p)
             stack.enter_context(patch.object(smoke, "PROBE_SECONDS", 3))
-            return smoke.probe_tile(mode, "fcvm", tile, family, admit, "v-1", ["192.0.2.53"], **kw)
+            return smoke.probe_tile(mode, half, tile, family, admit, "v-1", ["192.0.2.53"], **kw)
 
     def test_a_streaming_tile_decodes_to_a_picture_over_each_family(self):
         for family in ("v4", "v6"):
@@ -658,18 +658,55 @@ class ViewerPathTests(unittest.TestCase):
         self.assertFalse(p.ok)
         self.assertEqual(p.step, "connect")
         self.assertEqual(p.error[1], "timed out")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
 
     def test_an_open_socket_that_sends_no_frame_fails(self):
         server = FakeViewerServer(self, "v4", lambda s, srv: None)
         p = self.probe("windows", self.tile("windows", server), "v4", server)
         self.assertFalse(p.ok)
         self.assertEqual(p.step, "stream header")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
 
-    def test_a_flat_picture_is_a_blank_tile(self):
+    def test_an_application_error_without_an_identified_stream_is_inconclusive(self):
+        for message in ("Unauthorized", "Too Many Requests", "Service Unavailable"):
+            with self.subTest(message=message):
+                def deny(connection, server, denied=message):
+                    send_server(connection, {"error": denied})
+
+                server = FakeViewerServer(self, "v4", deny)
+                p = self.probe("wall", self.tile("wall", server), "v4", server)
+                self.assertFalse(p.ok)
+                self.assertEqual((p.step, p.error),
+                                 ("stream header", ("AssertionError", "the stream's header names no H.264 codec")))
+                self.assertEqual(p.attributed()["verdict"], "inconclusive")
+
+    def test_a_flat_picture_is_a_blank_tile_but_does_not_blame_the_image(self):
         server = FakeViewerServer(self, "v4", stream_of("color=c=black"))
         p = self.probe("wall", self.tile("wall", server), "v4", server)
         self.assertFalse(p.ok)
         self.assertEqual(p.error[1], "the tile's first picture is flat: a blank tile")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
+
+    def test_protocol_invalid_data_blames_only_the_identified_direct_stream(self):
+        def malformed(s, server):
+            send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
+            send_server(s, b"not a valid frame", opcode=2)
+
+        host = {"host": "i-0example0host00a"}
+        instance = {"half": "ec2", "vm": "i-0example0tile00a"}
+        for mode, half, attribution, verdict in (
+            ("wall", "fcvm", host, "image_failure"),
+            ("wall", "ec2", instance, "image_failure"),
+            ("wall", "fcvm", {}, "inconclusive"),
+            ("wall", "fcvm", instance, "inconclusive"),
+            ("aggregate", "fcvm", host, "inconclusive"),
+        ):
+            with self.subTest(mode=mode, half=half, attribution=attribution):
+                server = FakeViewerServer(self, "v4", malformed)
+                p = self.probe(mode, self.tile(mode, server, **attribution), "v4", server, half=half)
+                self.assertFalse(p.ok)
+                self.assertEqual(p.error[1], "a frame message without FCVF framing")
+                self.assertEqual(p.attributed()["verdict"], verdict)
 
     def test_a_certificate_the_viewer_does_not_trust_fails(self):
         server = FakeViewerServer(self, "v4", stream_of("testsrc"))
@@ -703,12 +740,19 @@ class ViewerPathTests(unittest.TestCase):
         self.assertEqual(p.detail["mapColumns"], 4)
         self.assertIn("driveAckMs", p.detail, "the take-over waited for an acknowledged drive")
         unread = {**good[1], "cells": base64.b64encode(bytes(8)).decode()}
-        for messages, step in (([{**good[0], "tile": "mc-2"}], "view hello"), (good[:1], "view map"),
-                               ([good[0], unread], "view map")):
+        malformed = {**good[1], "cells": base64.b64encode(bytes([3])).decode()}
+        for messages, step, verdict in (
+            ([{**good[0], "tile": "mc-2"}], "view hello", "inconclusive"),
+            (good[:1], "view map", "inconclusive"),
+            ([good[0], unread], "view map", "inconclusive"),
+            ([good[0], malformed], "view map", "image_failure"),
+        ):
             with self.subTest(step=step):
                 server = FakeViewerServer(self, "v4", self.minecraft(messages))
-                p = self.probe("minecraft", self.tile("minecraft", server), "v4", server)
+                tile = self.tile("minecraft", server, host="i-0example0host00a")
+                p = self.probe("minecraft", tile, "v4", server)
                 self.assertEqual((p.ok, p.step), (False, step))
+                self.assertEqual(p.attributed()["verdict"], verdict)
 
     def test_without_admission_a_view_socket_names_the_viewer(self):
         good = [{"type": "hello", "tile": "mc-1"}, {"type": "map", "region": {"w": 1, "h": 1},
@@ -882,6 +926,94 @@ class PotatoEvidenceTests(unittest.TestCase):
         self.assertNotIn("2001:db8", json.dumps(line), "a drop's free text can name an address")
 
 
+class AttributionTests(unittest.TestCase):
+    """The release gate (fleet/ami/release_gate.py) decides only on probes whose tiles the
+    coordinator said ran on the release's hosts and tile instances, so each family's summary
+    records, per probe, digests of the host and tile instance ids /live reported for the tile.
+    The ids themselves never reach a printed line: this repository's logs are public."""
+
+    STATE = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "running", "host": "i-0example0host00a"},
+                       {"id": "fcvm:2", "half": "fcvm", "phase": "failed", "host": "i-0example0host00a"},
+                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "i-0example0tile00a"}],
+             "windows": {"tiles": [{"id": "win:1", "phase": "running", "host": "i-0example0host00b"}]},
+             "aggregates": [{"id": "agg:ec2", "half": "ec2", "host": None, "tiles": ["ec2:1"],
+                             "frame_url": "wss://agg-ec2-abcdefgh.tiles.fcvm.dev/frames"}]}
+
+    def test_the_digest_is_the_release_gates(self):
+        gate = load("release_gate", "../ami/release_gate.py")
+        for instance in ("i-0example0host00a", ""):
+            self.assertEqual(smoke.attribution_digest(instance), gate.attribution_digest(instance))
+        self.assertEqual(smoke.attribution_digest("i-0example0host00a"),
+                         hashlib.sha256(b"fcvm-release-gate\0i-0example0host00a").hexdigest())
+
+    def test_each_probe_carries_the_host_or_tile_instance_live_reported(self):
+        jobs, failed = smoke.sweep_jobs(self.STATE, ("wall", "windows"), "v4", None, "v-1", [])
+        by_tile = {j[2]["id"]: smoke.tile_attribution(j[2]) for j in jobs}
+        self.assertEqual(by_tile["fcvm:1"], (["i-0example0host00a"], []))
+        self.assertEqual(by_tile["ec2:1"], ([], ["i-0example0tile00a"]))
+        self.assertEqual(by_tile["win:1"], (["i-0example0host00b"], []))
+        # The EC2 half's aggregate has no host of its own: it relays its tiles' frames.
+        self.assertEqual(by_tile["agg:ec2"], ([], ["i-0example0tile00a"]))
+        # A tile the coordinator reports not running is still attributed to where it runs.
+        self.assertEqual([(f.tile, f.hosts, f.instances) for f in failed], [("fcvm:2", ["i-0example0host00a"], [])])
+        # A tile /live names no host for has no attribution, and the gate then decides nothing.
+        self.assertEqual(smoke.tile_attribution({"id": "fcvm:9", "half": "fcvm"}), ([], []))
+
+    def test_every_running_tile_of_a_real_view_is_attributed(self):
+        # The browser views fleet-core's replayed vectors produce (tests/vectors/*.json
+        # final_view, rewritten from the Rust code by FLEET_VECTORS_BLESS=1): what /live really
+        # serializes, not a fixture written to match the smoke.
+        vectors = sorted((HERE.parent / "core" / "tests" / "vectors").glob("*.json"))
+        seen = set()
+        for path in vectors:
+            view = json.loads(path.read_text()).get("final_view") or {}
+            modes = tuple(m for m in ("wall", "phones", "windows", "minecraft") if smoke.tiles_of(view, m))
+            jobs, _ = smoke.sweep_jobs(view, modes, "v4", None, "v-1", [])
+            for job in jobs:
+                mode, tile = job[0], job[2]
+                with self.subTest(vector=path.name, tile=tile.get("id")):
+                    hosts, instances = smoke.tile_attribution(tile)
+                    self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
+                    seen.add((mode, tile.get("half")))
+            # No vector serves an aggregate's URLs, so the sweep skips them; their attribution
+            # is the view's own fields all the same.
+            for aggregate in view.get("aggregates") or []:
+                with self.subTest(vector=path.name, tile=aggregate.get("id")):
+                    self.assertTrue(aggregate.get("host"), "a GPU host's aggregate names no host")
+                    self.assertEqual(smoke.tile_attribution(aggregate), ([aggregate["host"]], []))
+                    seen.add(("aggregate", aggregate.get("half")))
+        # Every kind of probe the smoke attributes from a tile appears in some vector. The potato
+        # game's host is pinned by 33_potato.json's /view/potato/host checks: its final view is
+        # after the host has gone.
+        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("phones", "fcvm"), ("windows", "fcvm"),
+                     ("minecraft", "fcvm"), ("aggregate", "fcvm")):
+            self.assertIn(kind, seen)
+
+    def test_the_summary_line_holds_digests_and_no_line_holds_an_id(self):
+        clock, current = [0.0], [{"potato": {"capacity": 96, "host": "i-0example0host00b",
+                                             "round": {"id": 1, "size": 2, "seq": 0}}}]
+
+        def until(predicate):
+            # Each wait sees one more catch: the settle wait first, then the catch watch.
+            clock[0] += 1
+            current[0]["potato"]["round"]["seq"] += 1
+            predicate(current[0])
+            return current[0]
+
+        out = io.StringIO()
+        with patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            smoke.viewer_path("v4", ("potato",), False, [], until, None, lambda: (current[0], {}, "v-1"))
+        self.assertNotIn("i-0example0host00b", out.getvalue())
+        records = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        summaries = [record for record in records if isinstance(record, dict) and "probes" in record]
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertEqual(summary["probes"], len(summary["attribution"]))
+        self.assertEqual(summary["attribution"], [{"mode": "potato", "tile": None, "ok": True,
+                                                   "verdict": "pass", "hosts": [smoke.attribution_digest("i-0example0host00b")],
+                                                   "instances": []}])
+
+
 class HostLocalTests(unittest.TestCase):
     """The image factory's validator has a builder security group that admits no inbound port and
     lets out only 80, 443 and 53 over IPv4, so a host-image acceptance that went out through the
@@ -929,15 +1061,16 @@ class SmokeWorkflowTests(unittest.TestCase):
 
     def test_every_caller_of_the_smoke_passes_its_secrets(self):
         import re
-        callers = 0
+        callers = []
         for path in sorted((HERE.parent.parent / ".github" / "workflows").glob("*.yml")):
             text = path.read_text()
             for job in re.split(r"(?m)^  (?=[\w-]+:\n)", text.split("\njobs:\n", 1)[-1]):
                 if "uses: ./.github/workflows/fleet-viewer-smoke.yml" not in job:
                     continue
-                callers += 1
+                callers.append(path.name)
                 self.assertRegex(job, r"(?m)^    secrets: inherit$", f"{path.name}: the smoke gets no secrets")
-        self.assertEqual(callers, 2, "the coordinator and web deploys both call the smoke")
+        self.assertEqual(callers, ["fleet-coordinator-deploy.yml", "fleet-release-gate.yml", "fleet-web-deploy.yml"],
+                         "the coordinator and web deploys and the image release gate call the smoke")
 
 
 class ResolveTests(unittest.TestCase):

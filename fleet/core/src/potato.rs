@@ -994,6 +994,10 @@ pub struct PotatoView {
     pub colours: u32,
     /// The players the potato host runs; 0 while none is connected.
     pub capacity: u32,
+    /// The host running the players (its agent's name, as a tile's `host`); null while none is
+    /// connected. The viewer-path smoke attributes its potato probe to it for the image
+    /// release gate (fleet/coord/stage-smoke.py).
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1084,6 +1088,7 @@ impl Potato {
             next_round_at: self.next_round_at,
             colours: self.round.as_ref().map_or(cfg.colours, |r| r.colours),
             capacity: self.capacity,
+            host: self.host.clone(),
         })
     }
 }

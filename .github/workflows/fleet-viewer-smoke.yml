@@ -16,6 +16,20 @@ name: Fleet viewer-path smoke
 
 on:
   workflow_call:
+    inputs:
+      # The IPv4 viewer relaunches a tile in each wall half after its probes. The image release
+      # gate turns that off: an EC2 relaunch replaces the tile's instance, which changes the
+      # placement the gate's verdict is bound to.
+      relaunch:
+        type: boolean
+        default: true
+    # Each family's summary line ({"family", "modes", "probes", "failed"}), empty when the family
+    # never finished its probes. The release gate decides on these, not on the job results.
+    outputs:
+      v4:
+        value: ${{ jobs.ipv4.outputs.summary }}
+      v6:
+        value: ${{ jobs.ipv6.outputs.summary }}
   schedule:
     - cron: '41 15 * * *'
   workflow_dispatch:
@@ -34,6 +48,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
     timeout-minutes: 45
+    outputs:
+      summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
       group: fleet-viewer-smoke
       cancel-in-progress: false
@@ -51,9 +67,16 @@ jobs:
           STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # Empty on the schedule and on a manual run, which relaunch.
+          RELAUNCH: ${{ inputs.relaunch }}
         run: |
           set -o pipefail
-          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family --relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+          relaunch=--relaunch; [ "$RELAUNCH" = false ] && relaunch=
+          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family $relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: The v4 summary for the release gate
+        id: verdict
+        if: ${{ always() }}
+        run: python3 -B fleet/ami/release_gate.py summary "$RUNNER_TEMP/smoke.jsonl"
       - name: Failing tiles to the job summary
         if: ${{ failure() }}
         run: |
@@ -69,6 +92,8 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64]
     environment: fleet-stage-deploy
     timeout-minutes: 45
+    outputs:
+      summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
       group: fleet-viewer-smoke
       cancel-in-progress: false
@@ -93,6 +118,10 @@ jobs:
         run: |
           set -o pipefail
           python3 -B fcvm/fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: The v6 summary for the release gate
+        id: verdict
+        if: ${{ always() }}
+        run: python3 -B fcvm/fleet/ami/release_gate.py summary "$RUNNER_TEMP/smoke.jsonl"
       - name: Failing tiles to the job summary
         if: ${{ failure() }}
         run: |

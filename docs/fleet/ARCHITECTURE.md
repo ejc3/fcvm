@@ -101,6 +101,16 @@ never a URL, host name or token. It runs after every coordinator and web deploy 
 and daily; a failure fails the job on main and opens or updates the `fleet-viewer-smoke`
 issue.
 
+The image release gate uses the same smoke, but a failed smoke does not automatically mean
+the image should be withdrawn. It rechecks that both families probed the same live release
+and placement. A decoder, network, authentication, coordinator or other inconclusive error
+leaves the release pending. Rollback requires positive evidence from a host or tile on an
+image that changed, such as malformed frame data from an identified stream or an invalid map
+sent after a Minecraft server's own hello. Failures confined to unchanged images also leave
+the release pending.
+A blank frame or map still fails the viewer smoke but may be a warm-up symptom, so it does
+not withdraw the image.
+
 A host image is checked the same way before it is published: the image factory's host validator
 runs `fleet/tools/viewer-acceptance.sh` on its cold boot (`viewer_path` in the validation
 record). It makes a throwaway CA and a certificate for a test zone, gives them to the host's

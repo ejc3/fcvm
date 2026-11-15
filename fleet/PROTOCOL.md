@@ -890,7 +890,7 @@ Intents:
 The snapshot's `state.potato` is absent until a host has run players, else:
 
 ```json
-{"size": 4, "colours": 12, "capacity": 96, "next_round_at": null,
+{"size": 4, "colours": 12, "capacity": 96, "host": "<host name>", "next_round_at": null,
  "ladder": [{"size": 2, "record_hold_ms": 1458, "record_at": 1762317000000, "rounds": 3,
              "broke": {"reason": "not_listening", "player": 1, "thrower": 0, "seq": 11, "lap": 5,
                        "hold_ms": 1182, "stage": "waking", "stage_ms": 90.0, "listening_after_ms": 84.0,
@@ -917,6 +917,9 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   next starts). `hold_ms` is the hold the ball carries now; `turnaround_ms` is (size - 1)
   holds, the time a player has between its throw and its next catch to sleep and wake.
   `flight` is the ball in the air (thrown by `from` to `to` at `at`), null once caught.
+- `host`: the potato host, by its agent's name (as a tile's `host`); null while none is
+  connected. The viewer-path smoke attributes its potato probe to it for the image release
+  gate.
 - `players`: each player's colour (an index into `colours`), its catch count, and what the
   agent is doing with it: `awake`, `sleeping` (from its throw until its snapshot is written
   and its VM has exited), `asleep`, `waking` or `failed`.
