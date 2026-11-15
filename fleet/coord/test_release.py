@@ -694,7 +694,7 @@ class ViewerPathTests(unittest.TestCase):
             send_server(s, b"not a valid frame", opcode=2)
 
         host = {"host": "i-0example0host00a"}
-        instance = {"half": "ec2", "vm": "us-east-1/i-0e00000000000000a"}
+        instance = {"half": "ec2", "vm": "us-east-1/i-1234567890abcdef0"}
         for mode, half, attribution, verdict in (
             ("wall", "fcvm", host, "image_failure"),
             ("wall", "ec2", instance, "image_failure"),
@@ -935,7 +935,7 @@ class AttributionTests(unittest.TestCase):
 
     STATE = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "running", "host": "i-0example0host00a"},
                        {"id": "fcvm:2", "half": "fcvm", "phase": "failed", "host": "i-0example0host00a"},
-                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "us-east-1/i-0e00000000000000a"}],
+                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "us-east-1/i-1234567890abcdef0"}],
              "windows": {"tiles": [{"id": "win:1", "phase": "running", "host": "i-0example0host00b"}]},
              "aggregates": [{"id": "agg:ec2", "half": "ec2", "host": None, "tiles": ["ec2:1"],
                              "frame_url": "wss://agg-ec2-abcdefgh.tiles.fcvm.dev/frames"}]}
@@ -992,10 +992,10 @@ class AttributionTests(unittest.TestCase):
         jobs, failed = smoke.sweep_jobs(self.STATE, ("wall", "windows"), "v4", None, "v-1", [])
         by_tile = {j[2]["id"]: smoke.tile_attribution(j[2]) for j in jobs}
         self.assertEqual(by_tile["fcvm:1"], (["i-0example0host00a"], []))
-        self.assertEqual(by_tile["ec2:1"], ([], ["i-0e00000000000000a"]))
+        self.assertEqual(by_tile["ec2:1"], ([], ["i-1234567890abcdef0"]))
         self.assertEqual(by_tile["win:1"], (["i-0example0host00b"], []))
         # The EC2 half's aggregate has no host of its own: it relays its tiles' frames.
-        self.assertEqual(by_tile["agg:ec2"], ([], ["i-0e00000000000000a"]))
+        self.assertEqual(by_tile["agg:ec2"], ([], ["i-1234567890abcdef0"]))
         # A tile the coordinator reports not running is still attributed to where it runs.
         self.assertEqual([(f.tile, f.hosts, f.instances) for f in failed], [("fcvm:2", ["i-0example0host00a"], [])])
         # A tile /live names no host for has no attribution, and the gate then decides nothing.
