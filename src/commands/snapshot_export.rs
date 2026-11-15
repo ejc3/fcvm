@@ -181,6 +181,22 @@ pub(crate) async fn export_to_file(
     let output = parent.join(name);
     // Before anything is written, and again right before the rename.
     ensure_replaceable(&output)?;
+    // The archive must not become one of the snapshot's files, or be renamed over a file the
+    // export reads. That second check is made once the export has opened them.
+    if let Ok(dir) = std::fs::canonicalize(host.snapshots_dir.join(tag)) {
+        ensure!(
+            !parent.starts_with(&dir),
+            "--output {} is inside the directory of snapshot '{tag}', which the export reads",
+            output.display()
+        );
+    }
+    let replaces = match std::fs::metadata(&output) {
+        Ok(existing) => Some(FileId::of(&existing)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading --output {}", output.display()))
+        }
+    };
 
     let owner_dir = crate::reclaim::owner_dir_in(&host.data_dir)?;
     // A killed export's temporary can be as large as the archive, and the export that is
@@ -191,7 +207,7 @@ pub(crate) async fn export_to_file(
     let owner = Owner::begin_in(&owner_dir, &format!("export-{id}"))?;
     owner.record(Resource::Temp { path: temp.clone() })?;
 
-    match write_output_file(host, tag, &temp, &output).await {
+    match write_output_file(host, tag, &temp, &output, replaces).await {
         Ok(entries) => {
             // The temporary has its final name. A record that stays names a path that no
             // longer exists, which the next launch's reclaim finds gone.
@@ -269,6 +285,7 @@ async fn write_output_file(
     tag: &str,
     temp: &Path,
     output: &Path,
+    replaces: Option<FileId>,
 ) -> Result<Vec<EntryRecord>> {
     // A named temporary and a rename, not `O_TMPFILE` and `linkat`: `linkat` refuses a name
     // that exists, and `--output` replaces a file, so the unnamed file would still need a
@@ -282,7 +299,7 @@ async fn write_output_file(
         .mode(0o600)
         .open(temp)
         .with_context(|| format!("creating {}", temp.display()))?;
-    let (file, entries) = export_snapshot(host, tag, file).await?;
+    let (file, entries) = export_snapshot_replacing(host, tag, file, replaces).await?;
     let (temp, output) = (temp.to_path_buf(), output.to_path_buf());
     tokio::task::spawn_blocking(move || -> Result<()> {
         file.sync_all()
@@ -307,6 +324,30 @@ pub(crate) async fn export_snapshot<W>(
     host: &ExportHost,
     tag: &str,
     out: W,
+) -> Result<(W, Vec<EntryRecord>)>
+where
+    W: Write + Send + 'static,
+{
+    export_snapshot_replacing(host, tag, out, None).await
+}
+
+/// The identity of a file: its device and inode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileId(u64, u64);
+
+impl FileId {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self(metadata.dev(), metadata.ino())
+    }
+}
+
+/// [`export_snapshot`], for an archive that will be renamed over the existing file
+/// `replaces`. The export fails before it writes anything when that file is one it reads.
+async fn export_snapshot_replacing<W>(
+    host: &ExportHost,
+    tag: &str,
+    out: W,
+    replaces: Option<FileId>,
 ) -> Result<(W, Vec<EntryRecord>)>
 where
     W: Write + Send + 'static,
@@ -363,7 +404,16 @@ where
     tokio::task::spawn_blocking(move || {
         // Held until the archive is written, or the write has failed.
         let _generation_lock = generation_lock;
-        write_archive(&host, &tag, &dir, &config, &generation, memory, out)
+        write_archive(
+            &host,
+            &tag,
+            &dir,
+            &config,
+            &generation,
+            memory,
+            out,
+            replaces,
+        )
     })
     .await
     .context("the task that writes the archive panicked")?
@@ -430,6 +480,7 @@ impl Drop for MarkedMemory {
 }
 
 /// Write the archive of the snapshot in `dir`, under the tag's shared lock.
+#[allow(clippy::too_many_arguments)]
 fn write_archive<W: Write>(
     host: &ExportHost,
     tag: &str,
@@ -438,6 +489,7 @@ fn write_archive<W: Write>(
     generation: &SnapshotGeneration,
     mut memory: Option<MarkedMemory>,
     out: W,
+    replaces: Option<FileId>,
 ) -> Result<(W, Vec<EntryRecord>)> {
     // The check a restore makes of the pmem entries, before any of them is opened and
     // again once the last one is streamed: an entry is recorded by inode, length and
@@ -456,6 +508,16 @@ fn write_archive<W: Write>(
         &externals,
     )?;
     let files = snapshot_files(dir, memory.is_some())?;
+    if let Some(replaces) = replaces {
+        ensure_not_read(
+            replaces,
+            dir,
+            &files,
+            memory.as_ref(),
+            &externals,
+            &manifest,
+        )?;
+    }
 
     let out = BufWriter::with_capacity(OUTPUT_BUFFER, out);
     let mut writer = ArchiveWriter::new(out, &manifest)?;
@@ -507,6 +569,56 @@ fn write_archive<W: Write>(
         .map_err(|error| error.into_error())
         .context("flushing the archive")?;
     Ok((out, entries))
+}
+
+/// Refuse to export into the file `replaces` when it is one the export reads: a file of the
+/// snapshot's directory, the memory image (which `--memory-dir` keeps outside it), an
+/// external file or the Firecracker binary. The archive would be renamed over it.
+fn ensure_not_read(
+    replaces: FileId,
+    dir: &Path,
+    files: &[PathBuf],
+    memory: Option<&MarkedMemory>,
+    externals: &[External],
+    manifest: &ArchiveManifest,
+) -> Result<()> {
+    let mut read: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
+    for relative in files {
+        let path = dir.join(relative);
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("stat-ing {}", path.display()))?;
+        read.push((path, metadata));
+    }
+    if let Some(memory) = memory {
+        let metadata = memory
+            .file
+            .metadata()
+            .context("stat-ing the memory image")?;
+        read.push((dir.join(SNAPSHOT_MEMORY_FILE), metadata));
+    }
+    for external in externals {
+        let metadata = external
+            .file
+            .metadata()
+            .with_context(|| format!("stat-ing {}", external.manifest.path.display()))?;
+        read.push((external.manifest.path.clone(), metadata));
+    }
+    let firecracker = &manifest.firecracker.path;
+    let metadata = std::fs::metadata(firecracker)
+        .with_context(|| format!("stat-ing {}", firecracker.display()))?;
+    read.push((firecracker.clone(), metadata));
+
+    if let Some((path, _)) = read
+        .iter()
+        .find(|(_, metadata)| FileId::of(metadata) == replaces)
+    {
+        bail!(
+            "--output is {}, a file the export of this snapshot reads; the archive would be \
+             renamed over it",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// A file outside the snapshot's directory that the archive carries, opened once: the
@@ -1858,6 +1970,62 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"an older archive");
         assert_eq!(names_in(&out_dir), ["snapshot.archive"]);
         assert_eq!(fake.export_records(), Vec::<String>::new());
+    }
+
+    /// An `--output` that names a file the export reads would have the archive renamed over
+    /// it: the snapshot's config, its memory image where `--memory-dir` put it, the image
+    /// disk or pmem entry it carries, or the Firecracker binary it records. A new name inside
+    /// the snapshot's directory would make the archive one of the snapshot's files. Each is
+    /// refused before anything is written, and every file keeps its bytes.
+    #[tokio::test]
+    async fn an_output_that_is_a_file_of_the_exported_snapshot_is_refused() {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let memory_dir = fake.root.path().join("memory-dir");
+        std::fs::create_dir(&memory_dir).unwrap();
+        let memory = memory_dir.join("fcvm-memory-example.bin");
+        std::fs::rename(fake.memory(), &memory).unwrap();
+        std::os::unix::fs::symlink(&memory, fake.memory()).unwrap();
+
+        for output in [
+            fake.dir().join(CONFIG_FILE),
+            fake.dir().join("disk").join("disk.raw"),
+            fake.dir().join("snapshot.archive"),
+            memory.clone(),
+            externals.image_disk.clone(),
+            PathBuf::from(&externals.pmem.path),
+            fake.firecracker(),
+        ] {
+            let parent = output.parent().unwrap().to_path_buf();
+            let names = names_in(&parent);
+            let bytes = std::fs::read(&output).ok();
+
+            let error = export_to_file(&fake.host, TAG, &output)
+                .await
+                .expect_err(&format!(
+                    "an export to {} was not refused",
+                    output.display()
+                ));
+
+            assert!(
+                format!("{error:#}").contains("--output"),
+                "{}: {error:#}",
+                output.display()
+            );
+            assert_eq!(
+                std::fs::read(&output).ok(),
+                bytes,
+                "{} was written",
+                output.display()
+            );
+            assert_eq!(names_in(&parent), names, "{}", output.display());
+            assert_eq!(fake.export_records(), Vec::<String>::new());
+        }
+        // Control: the snapshot exports to a file of its own.
+        let out_dir = fake.root.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        export_to_file(&fake.host, TAG, &out_dir.join("snapshot.archive"))
+            .await
+            .unwrap();
     }
 
     /// The rename would replace a directory entry that is not a file: a link stays a link

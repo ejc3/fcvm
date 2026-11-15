@@ -1825,7 +1825,8 @@ directory; a killed import leaves it to the next import or VM launch.
 
 The order after the trailer has verified is the same for every import: the staged directory
 is checked for every file a restore opens, the external files are published, `config.json`
-is written, the directory is synced, and the directory is renamed.
+is written, the working set is written under the staged snapshot's key, the directory is
+synced, and the directory is renamed.
 
 The image disk and the pmem store entries are installed where this host lacks them, and
 kept as they are where it has them (the archived copy is then read and dropped). An image
@@ -1864,8 +1865,36 @@ later step failed stay: each is a whole, verified entry of its store.
 - `config.json` gets a new generation id, no parent snapshot, and each pmem device's
   identity (inode, length and modification time) as its store entry has it on this host.
   Every other field is kept as the export wrote it.
-- The working set recorded beside the memory image is not installed: its key names the
-  exporting host's files. The first restores record a new one.
+- The working set recorded beside the memory image (`memory.bin.working-set`) is installed
+  under the imported snapshot's key, so the first clone restored through a memory server
+  replays the pages the exporting host recorded, in their first-touch tiers. The sidecar's
+  key is a digest of the snapshot's `config.json` and of the memory image's length and
+  modification time, and the import writes both anew. It decodes the archived sidecar under
+  the key the exporting host gave it, which it builds from the archived `config.json` and
+  the manifest's record of the memory image, and writes the set into the staging directory
+  under the key of the staged files. No file of it is written before the trailer has
+  verified, and it is synced and renamed into place with the rest of the directory.
+- A working set is a hint and never fails an import. An archive that carries none installs
+  a snapshot without one, and the import says so at info level. An archive that carries
+  one the import cannot use also installs a snapshot without one, with one warning that
+  gives the reason. The reasons, in the order the import checks them:
+  - the snapshot has no memory image;
+  - the manifest gives the sidecar another format version than this build's;
+  - the sidecar comes ahead of the memory image in the archive (an export writes it after);
+  - the staged memory image is not as long as the manifest says, or its size cannot be
+    read;
+  - the memory image is longer than a working set is recorded for (1 TiB);
+  - the sidecar is longer than the working set of an image of that length can be;
+  - the sidecar does not decode, or its own header gives another format version or another
+    image length;
+  - the sidecar's key is not the one the archive's own facts give;
+  - the set records no pages;
+  - the set cannot be written beside the staged memory image.
+
+  The first six are decided when the sidecar's entry is reached, from the staged memory
+  image's real length, and the import then holds none of the sidecar's bytes. After any of
+  them, the first clones restored through a memory server fault their pages in on demand
+  and record a set.
 - What a restore of the snapshot reads that the archive does not carry (mapped
   directories, NFS shares, firmware) is logged as a warning, one line each.
 
