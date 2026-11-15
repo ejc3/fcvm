@@ -4756,7 +4756,7 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     let dest_str = dest
         .to_str()
         .with_context(|| format!("non-UTF-8 path: {}", dest.display()))?;
-    let result = tokio::process::Command::new("cp")
+    let result = crate::utils::helper_command("cp")
         .args(["--reflink=always", source_str, dest_str])
         .status()
         .await

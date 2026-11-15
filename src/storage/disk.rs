@@ -269,7 +269,7 @@ pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let output = tokio::process::Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args(["subvolume", "create"])
         .arg(path)
         .output()
@@ -344,7 +344,7 @@ fn clear_staging_with(staging: &Path, removed: std::io::Result<()>) -> Result<()
 /// (`btrfs subvolume sync`, bounded): a deleted subvolume's space comes back on the cleaner
 /// thread after the delete returns, so a free-space check right after one can read low.
 pub async fn wait_for_deleted_subvolumes(path: &Path) {
-    let sync = tokio::process::Command::new("btrfs")
+    let sync = crate::utils::helper_command("btrfs")
         .args(["subvolume", "sync"])
         .arg(path)
         .kill_on_drop(true)
@@ -406,7 +406,7 @@ pub async fn snapshot_disk_subvolume(
             dest.display()
         );
     }
-    let output = tokio::process::Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args(["subvolume", "snapshot"])
         .arg(src)
         .arg(dest)
@@ -496,7 +496,7 @@ pub async fn stage_from_parent_subvolume(parent: &Path, staging: &Path) -> Resul
         );
     }
     let started = std::time::Instant::now();
-    let output = tokio::process::Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args(["subvolume", "snapshot"])
         .arg(parent)
         .arg(staging)
@@ -657,7 +657,7 @@ impl DiskManager {
                 "creating instant reflink copy (btrfs CoW)"
             );
 
-            let reflink_output = tokio::process::Command::new("cp")
+            let reflink_output = crate::utils::helper_command("cp")
                 .arg("--reflink=always")
                 .arg(&self.base_rootfs)
                 .arg(&disk_path)
@@ -717,7 +717,7 @@ impl DiskManager {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let output = tokio::process::Command::new("btrfs")
+        let output = crate::utils::helper_command("btrfs")
             .args(["subvolume", "snapshot"])
             .arg(base_dir)
             .arg(&self.vm_dir)
@@ -790,7 +790,7 @@ pub async fn ensure_free_space(
 
 /// Detect filesystem type of an image file using blkid.
 async fn detect_filesystem_type(path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("blkid")
+    let output = crate::utils::helper_command("blkid")
         .args(["-o", "value", "-s", "TYPE", path.to_string_lossy().as_ref()])
         .output()
         .await
@@ -808,7 +808,7 @@ async fn detect_filesystem_type(path: &Path) -> Result<String> {
 /// An e2fsprogs command run in the C locale. e2fsprogs translates dumpe2fs's
 /// group headings and labels, and the parsers here read the English ones.
 fn e2fsprogs(tool: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(tool);
+    let mut cmd = crate::utils::helper_command(tool);
     cmd.env("LC_ALL", "C");
     cmd
 }
@@ -853,7 +853,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     );
 
     // Expand the sparse file
-    let output = tokio::process::Command::new("truncate")
+    let output = crate::utils::helper_command("truncate")
         .args([
             "-s",
             &format!("+{}", expand_by),
@@ -1199,7 +1199,7 @@ async fn mark_added_inode_tables_zeroed(disk_path: &Path, groups_before: u64) ->
 /// The guest resizes the btrfs filesystem at boot via `btrfs filesystem resize max /`.
 async fn ensure_free_space_btrfs(disk_path: &Path, min_free: u64) -> Result<()> {
     // Parse btrfs superblock to get size info (no mount needed)
-    let output = tokio::process::Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args([
             "inspect-internal",
             "dump-super",
@@ -1241,7 +1241,7 @@ async fn ensure_free_space_btrfs(disk_path: &Path, min_free: u64) -> Result<()> 
     );
 
     // Expand sparse file — fc-agent resizes btrfs at boot
-    let output = tokio::process::Command::new("truncate")
+    let output = crate::utils::helper_command("truncate")
         .args([
             "-s",
             &format!("+{}", expand_by),
