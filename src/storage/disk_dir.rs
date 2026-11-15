@@ -258,7 +258,7 @@ fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating --disk-dir staging {}", parent.display()))?;
     }
-    let output = std::process::Command::new("cp")
+    let output = crate::utils::helper_command_std("cp")
         .args(cp_args(nix::unistd::geteuid().is_root()))
         .arg(host)
         .arg(dest)

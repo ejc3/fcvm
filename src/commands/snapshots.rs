@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
-use tokio::process::Command;
 use tracing::info;
 
 use crate::cli::{
@@ -259,7 +258,7 @@ fn format_size_exclusive(bytes: u64) -> String {
 
 /// Calculate exclusive (non-shared) disk usage using btrfs fi du
 async fn calculate_btrfs_exclusive_size(dir: &std::path::Path) -> Result<u64> {
-    let output = Command::new("btrfs")
+    let output = crate::utils::helper_command("btrfs")
         .args(["filesystem", "du", "-s", "--raw"])
         .arg(dir)
         .output()

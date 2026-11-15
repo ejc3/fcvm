@@ -320,22 +320,44 @@ pub fn is_same_process_name(pid: u32) -> bool {
 /// re-exec clears the signal, nor for a helper spawned from a short-lived thread.
 pub fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
-    // SAFETY: getpid() before the fork; in the child only async-signal-safe calls (prctl,
-    // getppid, _exit) run before exec.
-    let parent = unsafe { libc::getpid() };
+    let arm = helper_pre_exec();
+    // SAFETY: the hook runs only async-signal-safe calls (`helper_pre_exec`).
     unsafe {
-        command.pre_exec(move || {
+        command.pre_exec(arm);
+    }
+    command
+}
+
+/// [`helper_command`] for a helper run and waited for synchronously, on a thread that stays
+/// blocked in the wait until the helper exits (a `spawn_blocking` closure, or `main`).
+pub fn helper_command_std(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(program);
+    let arm = helper_pre_exec();
+    // SAFETY: the hook runs only async-signal-safe calls (`helper_pre_exec`).
+    unsafe {
+        command.pre_exec(arm);
+    }
+    command
+}
+
+/// The `pre_exec` hook of a helper: `PR_SET_PDEATHSIG` with SIGKILL, then a check that the
+/// parent did not die between the fork and the prctl, after which no signal would come.
+fn helper_pre_exec() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    // SAFETY: getpid() runs before the fork; in the child only async-signal-safe calls
+    // (prctl, getppid, _exit) run before exec.
+    let parent = unsafe { libc::getpid() };
+    move || {
+        unsafe {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // The parent died between the fork and the prctl: no signal will come.
             if libc::getppid() != parent {
                 libc::_exit(1);
             }
-            Ok(())
-        });
+        }
+        Ok(())
     }
-    command
 }
 
 /// Gracefully kill a process by sending SIGTERM first, then SIGKILL if needed.
