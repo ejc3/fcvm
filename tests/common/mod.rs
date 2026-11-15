@@ -15,6 +15,25 @@ pub const TEST_IMAGE: &str = "ecr-public.aws.com/nginx/nginx:alpine";
 /// Alpine test image - use AWS ECR to avoid Docker Hub rate limits
 pub const ALPINE_IMAGE: &str = "ecr-public.aws.com/docker/library/alpine:latest";
 
+/// The words that start a busybox `wget`, run in a guest or its container, whose request
+/// must reach its target directly. fcvm hands the guest the host's proxy variables
+/// (README, "auto-forwards `http_proxy`/`https_proxy`"), and busybox wget sends every
+/// request to `http_proxy` and ignores `no_proxy`. So on a host that exports a proxy, a
+/// fetch of a test server or of the guest's own loopback goes to that proxy, which cannot
+/// reach it. `-Y off` keeps the request direct. `http_proxy` names a port nothing listens
+/// on, so a fetch that does use a proxy fails on every host, not only on one that exports
+/// a proxy.
+pub const DIRECT_WGET: [&str; 5] = ["env", "http_proxy=http://127.0.0.1:9/", "wget", "-Y", "off"];
+
+/// [`DIRECT_WGET`] followed by `args`.
+pub fn direct_wget<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    DIRECT_WGET
+        .iter()
+        .copied()
+        .chain(args.iter().copied())
+        .collect()
+}
+
 /// Standard log directory for test logs
 const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
 
@@ -1294,14 +1313,13 @@ pub async fn exec_in_container(pid: u32, cmd: &[&str]) -> anyhow::Result<String>
 pub async fn wait_for_nginx(pid: u32, limit: Duration) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + limit;
     loop {
-        let fetch = [
-            "wget",
+        let fetch = direct_wget(&[
             "-q",
             "-O",
             "/dev/null",
             "--timeout=2",
             "http://127.0.0.1:80/",
-        ];
+        ]);
         let error = match exec_in_container(pid, &fetch).await {
             Ok(_) => return Ok(()),
             Err(error) => error,
