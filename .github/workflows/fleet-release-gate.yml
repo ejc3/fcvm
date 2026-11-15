@@ -7,7 +7,10 @@ name: Fleet image release gate
 # (fleet-viewer-smoke.yml). Both pass: the generation is verified and this workflow stops smoking
 # it. Either fails: the gate moves staging back to the live receipt's own previous release
 # (fleet/ami/release_gate.py), and records that rollback as verified, so it is not rolled back in
-# turn. A verified generation is never rolled back by the gate.
+# turn. A verified generation is never rolled back by the gate. Both decisions name the receipt and
+# the placement digest the probes ran against, and the gate refuses either when the live release
+# or its placement has moved since. A run whose smoke could not report (setup, credentials, runner,
+# coordinator) decides nothing.
 
 # A promotion starts it at once: the publisher, or whoever sees the new receipt, sends
 # repository_dispatch `fleet-release-promoted` or runs `gh workflow run fleet-release-gate.yml`.
@@ -38,9 +41,11 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      generation: ${{ steps.gate.outputs.generation }}
-      verified: ${{ steps.gate.outputs.verified }}
-      current: ${{ steps.gate.outputs.current }}
+      # ready: the live generation is unverified and its placement can carry a verdict (every live
+      # host and tile on the release's images, settled, at least one release host). status: the
+      # gate's whole answer, which the decision compares with a second status after the probes.
+      ready: ${{ steps.gate.outputs.ready }}
+      status: ${{ steps.gate.outputs.status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -60,9 +65,10 @@ jobs:
   smoke:
     name: Staging smoke
     needs: status
-    # Only while every live host and tile runs the release: a smoke on a host still on the
-    # previous image says nothing about this one, and the next run tries again.
-    if: needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true'
+    # Only while every live host and tile runs the release and has settled: a smoke on a host
+    # still on the previous image, or still coming up, says nothing about this one, and the next
+    # run tries again.
+    if: needs.status.outputs.ready == 'true'
     # A called workflow cannot raise its caller's permissions; the smoke's report job opens an issue.
     permissions:
       contents: read
@@ -73,7 +79,10 @@ jobs:
   decide:
     name: Verify or roll back
     needs: [status, smoke]
-    if: ${{ !cancelled() && needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true' }}
+    # It runs whatever the smoke's result, and decides only on what both families reported: a family
+    # that reported no probe summary (setup, credentials, runner, coordinator) decides nothing, and
+    # neither does a placement that changed during the probes (release_gate.py).
+    if: ${{ !cancelled() && needs.status.outputs.ready == 'true' }}
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
     timeout-minutes: 20
@@ -91,6 +100,7 @@ jobs:
           mask-aws-account-id: true
       - env:
           RELEASE_GATE: ${{ vars.RELEASE_GATE }}
-          GENERATION: ${{ needs.status.outputs.generation }}
-          SMOKE: ${{ needs.smoke.result }}
-        run: python3 -B fleet/ami/release_gate.py decide --generation "$GENERATION" --smoke "$SMOKE"
+          BEFORE: ${{ needs.status.outputs.status }}
+          V4: ${{ needs.smoke.outputs.v4 }}
+          V6: ${{ needs.smoke.outputs.v6 }}
+        run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6"

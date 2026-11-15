@@ -6,7 +6,9 @@ import pathlib
 import re
 import sys
 import tempfile
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -36,34 +38,111 @@ class GateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_a_smoke_that_failed_on_either_family_rolls_the_generation_back(self):
-        gate = Lambda({"status": "rolled_back", "generation": 16})
-        self.assertEqual(release_gate.main(["decide", "--generation", "15", "--smoke", "failure"], run=gate), 0)
-        self.assertEqual(gate.payloads, [{"action": "rollback", "generation": 15}])
+    # A status as ejc3/aws#862's gate returns it: the live receipt and the placement serving it.
+    def status(self, **changes):
+        placement = {"current": True, "settled": True, "release_hosts": 1, "digest": "d" * 64}
+        placement.update(changes.pop("placement", {}))
+        value = {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build", "source_sha": "a" * 40,
+                 "verified": False, "rollback": False, "placement": placement}
+        value.update(changes)
+        return value
 
-    def test_a_smoke_that_passed_on_both_families_verifies_the_generation(self):
-        gate = Lambda({"status": "verified", "generation": 15})
-        self.assertEqual(release_gate.main(["decide", "--generation", "15", "--smoke", "success"], run=gate), 0)
-        self.assertEqual(gate.payloads, [{"action": "verify", "generation": 15}])
+    SUMMARY = {"family": "v4", "modes": ["wall", "phones", "windows", "minecraft", "potato"], "probes": 26, "failed": 0}
 
-    def test_a_cancelled_or_skipped_smoke_decides_nothing(self):
-        for smoke in ("cancelled", "skipped"):
-            gate = Lambda()
-            self.assertEqual(release_gate.main(["decide", "--generation", "15", "--smoke", smoke], run=gate), 0)
-            self.assertEqual(gate.payloads, [])
+    def family(self, name, failed=0):
+        return json.dumps(dict(self.SUMMARY, family=name, failed=failed))
+
+    def decide(self, gate, before=None, v4=None, v6=None):
+        before = before if before is not None else self.status()
+        argv = ["decide", "--before", json.dumps(before),
+                "--v4", self.family("v4") if v4 is None else v4, "--v6", self.family("v6") if v6 is None else v6]
+        return release_gate.main(argv, run=gate)
+
+    def test_a_pass_on_both_families_verifies_the_exact_receipt(self):
+        gate = Lambda(self.status(), {"status": "verified", "generation": 15})
+        self.assertEqual(self.decide(gate), 0)
+        self.assertEqual(gate.payloads[0], {"action": "status"})
+        self.assertEqual(gate.payloads[1], {"action": "verify",
+                                            "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
+                                            "placement": "d" * 64})
+
+    def test_a_probe_failure_on_a_stable_current_placement_rolls_the_receipt_back(self):
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {"generation": 16}, "hosts": {"withdrawn_running": 1}})
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.decide(gate, v6=self.family("v6", failed=1)), 0)
+        self.assertEqual(gate.payloads[1], {"action": "rollback",
+                                            "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
+                                            "placement": "d" * 64})
+        # The pointer moving back and the hosts already running are reported apart.
+        self.assertIn("release pointer: rolled back", out.getvalue())
+        self.assertIn("running hosts:", out.getvalue())
+
+    def test_a_runner_or_auth_failure_decides_nothing(self):
+        # A family whose job did not run, or did not get as far as its probes (setup, credentials,
+        # runner, an unreachable coordinator), reports no summary.
+        for v4, v6 in (("", self.family("v6")), (self.family("v4"), ""), ("", ""), ("not json", self.family("v6")),
+                       (json.dumps(dict(self.SUMMARY, probes=0)), self.family("v6")),
+                       (json.dumps(dict(self.SUMMARY, modes=["wall"])), self.family("v6"))):
+            with self.subTest(v4=v4, v6=v6):
+                gate = Lambda(self.status())
+                self.assertEqual(self.decide(gate, v4=v4, v6=v6), 0)
+                self.assertNotIn("verify", [p.get("action") for p in gate.payloads])
+                self.assertNotIn("rollback", [p.get("action") for p in gate.payloads])
+
+    def test_a_placement_that_changed_during_the_probe_decides_nothing(self):
+        for after in (self.status(placement={"digest": "e" * 64}), self.status(generation=16),
+                      self.status(build_id="fcvm-fleet-image-factory:other")):
+            with self.subTest(after=after):
+                gate = Lambda(after)
+                self.assertEqual(self.decide(gate, v4=self.family("v4", failed=3)), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_mixed_unsettled_or_unobservable_placement_decides_nothing(self):
+        for placement in ({"current": False}, {"settled": False}, {"release_hosts": 0}, {"digest": None}):
+            for which in ("before", "after"):
+                with self.subTest(placement=placement, which=which):
+                    bad = self.status(placement=placement)
+                    gate = Lambda(bad if which == "after" else self.status())
+                    self.assertEqual(self.decide(gate, before=bad if which == "before" else None,
+                                                 v4=self.family("v4", failed=2)), 0)
+                    self.assertEqual(gate.payloads, [] if which == "before" else [{"action": "status"}])
+        # A status from a gate without the placement fields (before ejc3/aws#862's receipt patch).
+        legacy = {"generation": 15, "source_sha": "a" * 40, "verified": False, "rollback": False, "current": True}
+        gate = Lambda()
+        self.assertEqual(self.decide(gate, before=legacy, v4=self.family("v4", failed=2)), 0)
+        self.assertEqual(gate.payloads, [])
 
     def test_a_refused_rollback_fails_the_job(self):
-        gate = Lambda({"status": "refused", "reason": "the live release has no previous release to roll back to"})
+        gate = Lambda(self.status(), {"status": "refused", "reason": "the live release has no previous release to roll back to"})
         with self.assertRaisesRegex(SystemExit, "no previous release"):
-            release_gate.main(["decide", "--generation", "15", "--smoke", "failure"], run=gate)
+            self.decide(gate, v4=self.family("v4", failed=1))
 
-    def test_status_writes_the_generation_and_whether_it_was_verified(self):
+    def test_status_writes_whether_the_live_release_is_ready_to_smoke(self):
+        for status, ready in ((self.status(), "true"), (self.status(verified=True), "false"),
+                              (self.status(placement={"settled": False}), "false"),
+                              (self.status(placement={"current": False}), "false")):
+            with self.subTest(status=status), tempfile.NamedTemporaryFile("r") as out, \
+                    mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}):
+                self.assertEqual(release_gate.main(["status"], run=Lambda(status)), 0)
+                lines = dict(line.split("=", 1) for line in out.read().splitlines())
+                self.assertEqual(lines["ready"], ready)
+                self.assertEqual(json.loads(lines["status"]), status)
+
+    def test_a_family_summary_is_read_from_the_smoke_lines(self):
+        lines = [json.dumps({"mode": "wall", "tile": "fcvm:1", "ok": True}), json.dumps(dict(self.SUMMARY, failed=2)),
+                 json.dumps({"status": "failed", "step": "viewer path"})]
+        with tempfile.NamedTemporaryFile("w", delete=False) as smoke:
+            smoke.write("\n".join(lines) + "\n")
         with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}):
-            gate = Lambda({"generation": 15, "source_sha": "a" * 40, "verified": False, "rollback": False,
-                           "current": False})
-            self.assertEqual(release_gate.main(["status"], run=gate), 0)
-            self.assertEqual(out.read(), "generation=15\nverified=false\ncurrent=false\n")
-        self.assertEqual(gate.payloads, [{"action": "status"}])
+            self.assertEqual(release_gate.main(["summary", smoke.name]), 0)
+            self.assertEqual(json.loads(out.read().split("=", 1)[1]), dict(self.SUMMARY, failed=2))
+        with open(smoke.name, "w") as handle:
+            handle.write(json.dumps({"status": "failed", "step": "/live"}) + "\n")
+        with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}):
+            self.assertEqual(release_gate.main(["summary", smoke.name]), 0)
+            self.assertEqual(out.read(), "summary=\n")
+        os.unlink(smoke.name)
 
     def test_only_the_gate_function_is_invoked(self):
         with mock.patch.dict(os.environ, {"RELEASE_GATE": "fcvm-fleet-ami-publish"}):
@@ -79,14 +158,24 @@ class GateTests(unittest.TestCase):
         self.assertIn("  workflow_dispatch:", on)
         self.assertIn("    - cron: '*/5 * * * *'", on)
 
-    def test_the_smoke_runs_only_while_the_fleet_runs_the_release(self):
-        # A smoke on a host still running the previous image says nothing about this release, so the
-        # gate smokes (and decides) only while every live machine runs it; the next run tries again.
+    def test_the_smoke_runs_only_while_the_release_is_ready_and_its_verdicts_reach_the_decision(self):
         smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
-        self.assertIn("if: needs.status.outputs.verified == 'false' && needs.status.outputs.current == 'true'", smoke)
+        self.assertIn("if: needs.status.outputs.ready == 'true'", smoke)
         decide = WORKFLOW.split("\n  decide:\n", 1)[1]
-        self.assertIn("if: ${{ !cancelled() && needs.status.outputs.verified == 'false' && "
-                      "needs.status.outputs.current == 'true' }}", decide)
+        self.assertIn("if: ${{ !cancelled() && needs.status.outputs.ready == 'true' }}", decide)
+        for line in ("BEFORE: ${{ needs.status.outputs.status }}", "V4: ${{ needs.smoke.outputs.v4 }}",
+                     "V6: ${{ needs.smoke.outputs.v6 }}",
+                     'release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6"'):
+            self.assertIn(line, decide)
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        call = viewer.split("  workflow_call:\n", 1)[1].split("\n  schedule:", 1)[0]
+        self.assertIn("v4:\n        value: ${{ jobs.ipv4.outputs.summary }}", call)
+        self.assertIn("v6:\n        value: ${{ jobs.ipv6.outputs.summary }}", call)
+        for job in ("ipv4", "ipv6"):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertIn("summary: ${{ steps.verdict.outputs.summary }}", body)
+            self.assertIn("id: verdict", body)
+            self.assertIn("if: ${{ always() }}", body)
 
     def test_the_smoke_call_grants_what_the_smoke_workflow_needs(self):
         # A called workflow cannot raise its caller's permissions: the smoke's report job opens an
@@ -102,17 +191,6 @@ class GateTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 5", status)
         self.assertIn("sparse-checkout: fleet/ami/release_gate.py", status)
         self.assertIn("sparse-checkout-cone-mode: false", status)
-
-    def test_the_workflow_smokes_an_unverified_generation_and_reports_the_result(self):
-        # The smoke runs only for an unverified generation, and its result, whatever it is, reaches
-        # the decision: a failed smoke must not skip the job that rolls the generation back.
-        self.assertRegex(WORKFLOW, r"(?m)^    uses: \./\.github/workflows/fleet-viewer-smoke\.yml\n    secrets: inherit$")
-        decide = WORKFLOW.split("\n  decide:\n", 1)[1]
-        self.assertIn("needs: [status, smoke]", decide)
-        self.assertIn("SMOKE: ${{ needs.smoke.result }}", decide)
-        self.assertIn('release_gate.py decide --generation "$GENERATION" --smoke "$SMOKE"', decide)
-        smoke = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
-        self.assertRegex(smoke, r"(?m)^  workflow_call:$")
 
 
 if __name__ == "__main__":
