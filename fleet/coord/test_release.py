@@ -669,9 +669,14 @@ class ViewerPathTests(unittest.TestCase):
     def test_an_application_error_without_an_identified_stream_is_inconclusive(self):
         for message in ("Unauthorized", "Too Many Requests", "Service Unavailable"):
             with self.subTest(message=message):
-                server = FakeViewerServer(self, "v4", lambda s, srv: send_server(s, {"error": message}))
+                def deny(connection, server, denied=message):
+                    send_server(connection, {"error": denied})
+
+                server = FakeViewerServer(self, "v4", deny)
                 p = self.probe("wall", self.tile("wall", server), "v4", server)
                 self.assertFalse(p.ok)
+                self.assertEqual((p.step, p.error),
+                                 ("stream header", ("AssertionError", "the stream's header names no H.264 codec")))
                 self.assertEqual(p.attributed()["verdict"], "inconclusive")
 
     def test_a_flat_picture_is_a_blank_tile_but_does_not_blame_the_image(self):
@@ -998,7 +1003,10 @@ class AttributionTests(unittest.TestCase):
         with patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
             smoke.viewer_path("v4", ("potato",), False, [], until, None, lambda: (current[0], {}, "v-1"))
         self.assertNotIn("i-0example0host00b", out.getvalue())
-        summary = next(json.loads(l) for l in out.getvalue().splitlines() if '"probes"' in l)
+        records = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        summaries = [record for record in records if isinstance(record, dict) and "probes" in record]
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
         self.assertEqual(summary["probes"], len(summary["attribution"]))
         self.assertEqual(summary["attribution"], [{"mode": "potato", "tile": None, "ok": True,
                                                    "verdict": "pass", "hosts": [smoke.attribution_digest("i-0example0host00b")],
