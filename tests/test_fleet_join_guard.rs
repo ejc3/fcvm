@@ -126,3 +126,91 @@ fn installing_twice_leaves_one_jump_and_one_set_of_rules() {
     assert_eq!(listing.matches("-j FCVM-MC-JOIN").count(), 1, "{listing}");
     assert_eq!(listing.matches("-A FCVM-MC-JOIN").count(), 2, "{listing}");
 }
+
+#[test]
+fn a_jump_inserted_ahead_later_is_moved_behind_the_limits() {
+    // Netavark inserts its jump at position 1 after the agent's (2026-11-15, a staging host).
+    // Its chain there accepts only the bridge network's own traffic; this one accepts joins, so
+    // a join it sees first skips the limits. The keeper's move puts the limits back first.
+    let (bypassed, listing, refused) = in_guarded_namespace(|addr| {
+        let ip6 = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/sbin/ip6tables")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "ip6tables {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        ip6(&["-N", "NETAVARK_FORWARD"]);
+        ip6(&[
+            "-A",
+            "NETAVARK_FORWARD",
+            "-p",
+            "tcp",
+            "--dport",
+            "25565",
+            "-j",
+            "ACCEPT",
+        ]);
+        ip6(&[
+            "-I",
+            "INPUT",
+            "1",
+            "-m",
+            "comment",
+            "--comment",
+            "netavark firewall plugin rules",
+            "-j",
+            "NETAVARK_FORWARD",
+        ]);
+        let l = TcpListener::bind(addr).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..=joinguard::MAX_CONNECTIONS {
+            let c = connect(addr).expect("a join the limits never saw");
+            held.push((c, l.accept().unwrap().0));
+        }
+        let bypassed = held.len();
+        let done = joinguard::ensure_first("INPUT", joinguard::JOIN_PORT).unwrap();
+        assert_eq!(done, joinguard::First::Move { copies: 1 });
+        let listing = ip6(&["-S", "INPUT"]);
+        // connlimit counts the connections it has seen, so the ones that went past it are not in
+        // its count: from the move on, the cap applies afresh.
+        let mut refused = None;
+        for n in 1..=joinguard::MAX_CONNECTIONS + 1 {
+            match connect(addr) {
+                Ok(c) => held.push((c, l.accept().unwrap().0)),
+                Err(e) => {
+                    refused = Some((n, e.kind()));
+                    break;
+                }
+            }
+        }
+        (bypassed, listing, refused)
+    });
+    assert_eq!(
+        bypassed as u32,
+        joinguard::MAX_CONNECTIONS + 1,
+        "the netavark rule did not bypass"
+    );
+    let rules: Vec<&str> = listing
+        .lines()
+        .filter(|l| l.starts_with("-A INPUT "))
+        .collect();
+    assert_eq!(
+        rules[0], "-A INPUT -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN",
+        "{listing}"
+    );
+    assert_eq!(listing.matches("-j FCVM-MC-JOIN").count(), 1, "{listing}");
+    assert_eq!(
+        refused,
+        Some((
+            joinguard::MAX_CONNECTIONS + 1,
+            std::io::ErrorKind::ConnectionRefused
+        )),
+        "the cap does not hold after the move"
+    );
+}

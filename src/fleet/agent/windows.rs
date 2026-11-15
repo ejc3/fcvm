@@ -1225,10 +1225,10 @@ impl Bridge {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let name = format!("{prefix}-{}", &nonce[..8]);
         let argv = bridge_argv(&name, &cfg.bridge_image, rdp, &cfg.password(), mode);
-        Ok(Bridge {
-            client: Vm::spawn_args(&cfg.podman, &argv, &name)?,
-            name,
-        })
+        let client = Vm::spawn_args(&cfg.podman, &argv, &name)?;
+        // Its network setup puts netavark's FORWARD jump first (joinguard.rs).
+        super::joinguard::poke();
+        Ok(Bridge { client, name })
     }
 
     /// `podman stop -t <bridge_stop>` (SIGTERM, then SIGKILL), `podman rm -f`, then the client
