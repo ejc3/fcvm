@@ -39,7 +39,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use super::warmup::{
+use crate::uffd::warmup::{
     host_page_size, request_read, Pacer, Probe, Request, IN_FLIGHT_BYTES, REQUEST_BYTES,
 };
 
@@ -54,16 +54,16 @@ const WORKERS: usize = 4;
 
 /// What one inheritance did, for its log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct InheritStats {
+pub(crate) struct InheritStats {
     /// Pages of the parent's file its page cache held, over the part of it walked.
-    pub(super) parent_resident_pages: u64,
+    pub(crate) parent_resident_pages: u64,
     /// `WILLNEED` requests made on the new file, and their bytes.
-    pub(super) requests: u64,
-    pub(super) requested_bytes: u64,
+    pub(crate) requests: u64,
+    pub(crate) requested_bytes: u64,
     /// Requests the kernel refused.
-    pub(super) failures: u64,
+    pub(crate) failures: u64,
     /// The whole parent was walked before the stop.
-    pub(super) complete: bool,
+    pub(crate) complete: bool,
 }
 
 /// The reads of one inheritance, running until [`Inheritance::finish`] stops them.
@@ -80,7 +80,7 @@ pub fn inherit_page_cache(snapshot: &str, parent: &Path, child: &Path) -> Option
     let stop = Arc::new(AtomicBool::new(false));
     let (parent, child, thread_stop) = (parent.to_path_buf(), child.to_path_buf(), stop.clone());
     let spawned = std::thread::Builder::new()
-        .name("fcvm-cache-inherit".to_string())
+        .name("fcvm-inherit".to_string())
         .spawn(move || inherit_files(&parent, &child, &thread_stop));
     match spawned {
         Ok(thread) => Some(Inheritance {
@@ -186,7 +186,7 @@ fn inherit_files(parent: &Path, child: &Path, stop: &AtomicBool) -> std::io::Res
             let others: Vec<_> = (1..workers)
                 .map(|worker| {
                     std::thread::Builder::new()
-                        .name("fcvm-cache-inherit".to_string())
+                        .name("fcvm-inherit".to_string())
                         .spawn_scoped(scope, move || walk(worker))
                         .map_err(|_| worker)
                 })

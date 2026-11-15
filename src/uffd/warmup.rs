@@ -111,7 +111,7 @@ use super::working_set::{PageSet, Run, GRANULE};
 /// 128 KiB is the kernel default for both limits (`VM_READAHEAD_PAGES`), so a request this
 /// size is only truncated on a host that lowered them, and it is a whole number of 4, 16 or
 /// 64 KiB pages.
-pub(super) const REQUEST_BYTES: u64 = 128 * 1024;
+pub(crate) const REQUEST_BYTES: u64 = 128 * 1024;
 
 /// How many requested bytes may be read ahead and not yet in the page cache.
 ///
@@ -133,7 +133,7 @@ pub(super) const REQUEST_BYTES: u64 = 128 * 1024;
 /// A first restore, with no recorded set, acknowledged in 1.8 to 3.5 s. Paced at 8 MiB the
 /// warm-up read 9.1 to 10.4 M pages in 95 to 98 s, the device's rate, so pacing cost it no
 /// throughput.
-pub(super) const IN_FLIGHT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const IN_FLIGHT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long one request may stay not resident before the pacer stops waiting for it: a page
 /// the kernel read and evicted again would otherwise hold the warm-up for ever. Retiring a
@@ -144,7 +144,7 @@ const RESIDENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Keeps at most [`IN_FLIGHT_BYTES`] of the warm-up's requests outstanding: before the next
 /// request is issued, the oldest outstanding ones are retired once `resident` reports them
 /// in the page cache, or once they have been outstanding [`RESIDENT_WITHIN`].
-pub(super) struct Pacer<R: FnMut(Request) -> bool> {
+pub(crate) struct Pacer<R: FnMut(Request) -> bool> {
     in_flight: std::collections::VecDeque<(Request, Instant)>,
     bytes: u64,
     window: u64,
@@ -152,7 +152,7 @@ pub(super) struct Pacer<R: FnMut(Request) -> bool> {
 }
 
 impl<R: FnMut(Request) -> bool> Pacer<R> {
-    pub(super) fn new(window: u64, resident: R) -> Self {
+    pub(crate) fn new(window: u64, resident: R) -> Self {
         Self {
             in_flight: std::collections::VecDeque::new(),
             bytes: 0,
@@ -162,7 +162,7 @@ impl<R: FnMut(Request) -> bool> Pacer<R> {
     }
 
     /// Wait until `next` fits the window, or `stop` is set. Returns false on a stop.
-    pub(super) fn wait_for_room(&mut self, next: Request, stop: &AtomicBool) -> bool {
+    pub(crate) fn wait_for_room(&mut self, next: Request, stop: &AtomicBool) -> bool {
         while self.bytes + next.len > self.window && !self.in_flight.is_empty() {
             if stop.load(Ordering::Relaxed) {
                 return false;
@@ -178,7 +178,7 @@ impl<R: FnMut(Request) -> bool> Pacer<R> {
         true
     }
 
-    pub(super) fn issued(&mut self, request: Request) {
+    pub(crate) fn issued(&mut self, request: Request) {
         self.in_flight.push_back((request, Instant::now()));
         self.bytes += request.len;
     }
@@ -248,7 +248,7 @@ fn resident(
 /// and on a descriptor without readahead that reads only the probed request's own pages,
 /// which the warm-up has asked for already, and none of their neighbours. The server's
 /// descriptor keeps its readahead, which its fault path's reads use.
-pub(super) struct Probe {
+pub(crate) struct Probe {
     image: Arc<File>,
     file: Option<Option<File>>,
     map: Option<Option<memmap2::Mmap>>,
@@ -259,7 +259,7 @@ pub(super) struct Probe {
 type ResidentProbe = Box<dyn FnMut(Request) -> bool + Send>;
 
 impl Probe {
-    pub(super) fn new(image: Arc<File>) -> Self {
+    pub(crate) fn new(image: Arc<File>) -> Self {
         Self {
             image,
             file: None,
@@ -268,7 +268,7 @@ impl Probe {
         }
     }
 
-    pub(super) fn resident(&mut self, request: Request) -> bool {
+    pub(crate) fn resident(&mut self, request: Request) -> bool {
         use std::os::fd::AsRawFd;
         let image = &self.image;
         let file = self.file.get_or_insert_with(|| {
@@ -311,9 +311,9 @@ fn mapped_resident(map: &memmap2::Mmap, request: Request) -> bool {
 
 /// One `WILLNEED` request: `len` bytes of the memory image at `offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Request {
-    pub(super) offset: u64,
-    pub(super) len: u64,
+pub(crate) struct Request {
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
 }
 
 /// The requests that cover one recorded run, in ascending offset.
@@ -681,7 +681,7 @@ impl Iterator for Pieces {
 }
 
 /// The host's page size, or [`GRANULE`] if `sysconf` has no usable answer.
-pub(super) fn host_page_size() -> u64 {
+pub(crate) fn host_page_size() -> u64 {
     // SAFETY: sysconf(3) has no preconditions.
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(raw)
@@ -695,7 +695,7 @@ pub(super) fn host_page_size() -> u64 {
 /// Returns when the read is queued. `madvise(MADV_WILLNEED)` on the server's mapping reaches
 /// the same kernel code (`vfs_fadvise`), but the descriptor needs no page-aligned address
 /// and no reference to the mapping, so the thread that calls this only has to own the file.
-pub(super) fn request_read(image: &File, request: Request) -> std::io::Result<()> {
+pub(crate) fn request_read(image: &File, request: Request) -> std::io::Result<()> {
     let (Ok(offset), Ok(len)) = (
         libc::off_t::try_from(request.offset),
         libc::off_t::try_from(request.len),

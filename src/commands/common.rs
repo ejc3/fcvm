@@ -6248,9 +6248,9 @@ pub async fn create_snapshot_core(
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     // The new memory file is a new inode that shares the parent's extents and none of its page
     // cache, so its restores would read from disk every page the parent's restores had cached.
-    // The parent's cached pages are read into it beside the rest of the create (uffd::inherit).
+    // The parent's cached pages are read into it beside the rest of the create (storage::inherit).
     let mut inheritance = match base_memory_source.as_ref() {
-        Some(base) if has_base && diff_in_place => crate::uffd::inherit_page_cache(
+        Some(base) if has_base && diff_in_place => crate::storage::inherit::inherit_page_cache(
             &snapshot_config.name,
             base,
             &temp_snapshot_dir.join("memory.bin"),
@@ -6722,8 +6722,11 @@ pub async fn create_snapshot_core(
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("copying base memory to temp for merge");
         }
-        inheritance =
-            crate::uffd::inherit_page_cache(&snapshot_config.name, base_source, &final_memory_path);
+        inheritance = crate::storage::inherit::inherit_page_cache(
+            &snapshot_config.name,
+            base_source,
+            &final_memory_path,
+        );
 
         // Run merge in blocking task since it's CPU/IO bound
         // Merge from memory.diff onto memory.bin
@@ -8451,7 +8454,7 @@ mod tests {
     }
 
     /// A diff snapshot's new memory file shares the parent's extents and none of its page
-    /// cache, so the create reads the parent's cached pages into it (`uffd::inherit`): from
+    /// cache, so the create reads the parent's cached pages into it (`storage::inherit`): from
     /// when the file exists, on the in-place path once it is known to take the diff and on the
     /// merge path once the base is copied, until just before publication, which can remove the
     /// parent. `the_new_file_caches_the_pages_the_parent_cached` is the mechanism's test; no
@@ -8465,18 +8468,20 @@ mod tests {
         let end = source[start..]
             .find("pub async fn create_snapshot_ch(")
             .expect("no Cloud Hypervisor create after the Firecracker one");
-        let body = &source[start..start + end];
+        // Compared without whitespace, so rustfmt's line breaks do not move a step.
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let body = flat(&source[start..start + end]);
         let steps = [
-            "Some(base) if has_base && diff_in_place => crate::uffd::inherit_page_cache(",
+            "Some(base) if has_base && diff_in_place => crate::storage::inherit::inherit_page_cache(",
             "tokio::fs::copy(base_source, &final_memory_path)",
-            "crate::uffd::inherit_page_cache(&snapshot_config.name, base_source, &final_memory_path)",
+            "crate::storage::inherit::inherit_page_cache(&snapshot_config.name, base_source, &final_memory_path",
             "inheritance.finish().await",
             "publish_snapshot_dir(",
         ];
         let offsets: Vec<usize> = steps
             .iter()
             .map(|step| {
-                body.find(step)
+                body.find(&flat(step))
                     .unwrap_or_else(|| panic!("the snapshot create has no `{step}`"))
             })
             .collect();
