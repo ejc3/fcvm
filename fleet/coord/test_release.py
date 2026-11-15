@@ -13,6 +13,7 @@ import socket
 import struct
 import base64
 import hashlib
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -228,7 +229,7 @@ class ProbeTests(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
                 patch.object(smoke, "prove_frame", lambda t, a=None: frames.append((t, a))), \
                 patch.object(smoke, "prove_refused", lambda t: refused.append(t)), \
-                patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke, "prove_resolves", return_value=(0.05, 1)), \
                 patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)):
             smoke.main()
@@ -369,7 +370,7 @@ class ReconnectTests(unittest.TestCase):
         output, error = io.StringIO(), None
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
                 patch.object(smoke, "prove_frame", prove), patch.object(smoke, "prove_refused"), \
-                patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke, "prove_resolves", return_value=(0.05, 1)), \
                 patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)), \
                 contextlib.redirect_stdout(output):
@@ -892,10 +893,10 @@ class HostLocalTests(unittest.TestCase):
 
     def test_the_public_address_is_reached_on_the_private_one(self):
         with patch.dict(os.environ, self.LOCAL), \
-                patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+                patch.object(smoke, "resolve", return_value=([ipaddress.ip_address("1.0.0.1")], 1)):
             self.assertEqual(smoke.lookup("x-v4.tiles.fleet.test", "v4", ["127.0.0.1:2"]),
                              [ipaddress.ip_address("10.0.4.9")])
-        with patch.object(smoke, "resolve", return_value=[ipaddress.ip_address("1.0.0.1")]):
+        with patch.object(smoke, "resolve", return_value=([ipaddress.ip_address("1.0.0.1")], 1)):
             self.assertEqual(smoke.lookup("x-v4.tiles.fcvm.dev", "v4", ["1.1.1.1"]),
                              [ipaddress.ip_address("1.0.0.1")], "staging is untouched")
 
@@ -970,7 +971,7 @@ class ResolveTests(unittest.TestCase):
     def ask(self, answer, qtype=28):
         port = self.resolver(answer)
         with patch.object(smoke, "DNS_PORT", port):
-            return smoke.resolve("127.0.0.1", "slot-1-abcdefgh.tiles.fcvm.dev", qtype, 0.5)
+            return smoke.resolve("127.0.0.1", "slot-1-abcdefgh.tiles.fcvm.dev", qtype, 0.5)[0]
 
     def test_an_answer_is_read(self):
         v6 = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
@@ -1007,19 +1008,21 @@ class ResolveTests(unittest.TestCase):
         asked = []
         def resolve(resolver, name, qtype, timeout):
             asked.append((resolver, name, qtype))
-            return [] if resolver == "9.9.9.9" and qtype == 1 else ["x"]
+            return ([], 1) if resolver == "9.9.9.9" and qtype == 1 else (["x"], 1)
         with patch.object(smoke, "resolve", resolve), self.assertRaises(AssertionError):
             smoke.prove_resolves(tile)
         self.assertEqual(len(asked), 6)
         clock = [0.0]
         def slow(resolver, name, qtype, timeout):
             clock[0] += 2.5
-            return ["x"]
+            return ["x"], 1
         with patch.object(smoke, "resolve", slow), patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 self.assertRaises(AssertionError):
             smoke.prove_resolves(tile)
-        with patch.object(smoke, "resolve", lambda *a: ["x"]):
-            self.assertLess(smoke.prove_resolves(tile), 2.0)
+        with patch.object(smoke, "resolve", lambda *a: (["x"], 1)):
+            slowest, sends = smoke.prove_resolves(tile)
+            self.assertLess(slowest, 2.0)
+            self.assertEqual(sends, 1)
 
 
 class PublishTests(unittest.TestCase):
@@ -1096,6 +1099,75 @@ class ReleaseInvocationTests(unittest.TestCase):
         printed, error, sleeps = self.run_publish([255] * 11)
         self.assertIsInstance(error, publish.CommandFailed)
         self.assertEqual(len(sleeps), 10)
+
+
+class ResolveRetransmitTests(unittest.TestCase):
+    """resolve() retransmits one query within its deadline, as a stub resolver does."""
+
+    def serve(self, drop):
+        """A UDP DNS stub on loopback that ignores the first `drop` datagrams (all of them when
+        None) and answers the rest with 192.0.2.7; returns (address, received list)."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(0.2)
+        received, stop = [], threading.Event()
+
+        def loop():
+            while not stop.is_set():
+                try:
+                    query, peer = sock.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                received.append(query)
+                if drop is None or len(received) <= drop:
+                    continue
+                question = query[12:len(query) - 11]
+                reply = query[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + question
+                kind = struct.unpack(">H", question[-4:-2])[0]
+                rdata = bytes([192, 0, 2, 7]) if kind == 1 else socket.inet_pton(socket.AF_INET6, "2001:db8::7")
+                reply += b"\xc0\x0c" + struct.pack(">HHIH", kind, 1, 60, len(rdata)) + rdata
+                sock.sendto(reply, peer)
+
+        thread = threading.Thread(target=loop)
+        thread.start()
+
+        def close():
+            stop.set()
+            thread.join()
+            sock.close()
+
+        self.addCleanup(close)
+        return "127.0.0.1:%d" % sock.getsockname()[1], received
+
+    def test_a_lost_first_datagram_is_retransmitted_and_answered(self):
+        resolver, received = self.serve(drop=1)
+        found, sends = smoke.resolve(resolver, "tile.example", 1, 2.0)
+        self.assertEqual([str(a) for a in found], ["192.0.2.7"])
+        self.assertEqual(sends, 2)
+        self.assertEqual(len(set(received)), 1, "a retransmit repeats the same query and id")
+
+    def test_a_resolver_that_never_answers_fails_inside_the_deadline_and_says_which(self):
+        resolver, received = self.serve(drop=None)
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError) as caught:
+            smoke.resolve(resolver, "tile.example", 28, 1.2)
+        self.assertLess(time.monotonic() - start, 1.2 + 0.5)
+        message = str(caught.exception)
+        for part in (resolver, "AAAA", "%d datagrams" % len(received)):
+            self.assertIn(part, message)
+        self.assertNotIn("tile.example", message)
+
+    def test_the_failure_names_the_tile_key_and_the_success_reports_sends(self):
+        resolver, _ = self.serve(drop=None)
+        tile = dict(frame_url="wss://a.fcvm.dev/frames", frame_url_v4="wss://b.fcvm.dev:20200/frames")
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6):
+            with self.assertRaises(TimeoutError) as caught:
+                smoke.prove_resolves(tile)
+        self.assertIn("frame_url", str(caught.exception))
+        resolver, _ = self.serve(drop=1)
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)):
+            slowest, sends = smoke.prove_resolves(tile)
+        self.assertEqual(sends, 2)
 
 
 class WorkflowTests(unittest.TestCase):

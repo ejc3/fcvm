@@ -371,40 +371,57 @@ def resolver_address(resolver):
     return family, ip, port
 
 
+RETRANSMIT_EVERY = 0.5
+
+
 def resolve(resolver, name, qtype, timeout):
-    """One query to a resolver; the addresses it answers within timeout seconds."""
+    """One lookup at a resolver: (addresses, datagrams sent). The identical query (same id) is
+    resent every RETRANSMIT_EVERY seconds until the answer or timeout, as a stub resolver does,
+    because UDP does not promise delivery. An empty or NXDOMAIN answer still ends the lookup."""
     ident, query = dns_query(name, qtype)
-    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    deadline = start + timeout
     family, ip, port = resolver_address(resolver)
+    sends = 0
     with socket.socket(family, socket.SOCK_DGRAM) as s:
         s.connect((ip, port))
-        s.send(query)
         while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("a public resolver did not answer in time")
-            s.settimeout(left)
+            now = time.monotonic()
+            if now >= deadline:
+                lost = TimeoutError(
+                    f"resolver {resolver} did not answer a {'AAAA' if qtype == 28 else 'A'} query "
+                    f"within {timeout:g}s after {sends} datagrams")
+                raise lost
+            if now >= start + sends * RETRANSMIT_EVERY:
+                s.send(query)
+                sends += 1
+            s.settimeout(max(min(deadline, start + sends * RETRANSMIT_EVERY) - time.monotonic(), 0.001))
             try:
                 reply = s.recv(4096)
-            except socket.timeout:
+            except (socket.timeout, ConnectionRefusedError):
                 continue
             if reply[:2] == ident:
-                return addresses(reply, ident, query, qtype)
+                return addresses(reply, ident, query, qtype), sends
 
 
 def prove_resolves(tile):
-    """Both of a fresh launch's names answer at every public resolver on the first query; the slowest, in s."""
-    slowest = 0.0
+    """Both of a fresh launch's names answer at every public resolver on the first lookup;
+    returns the slowest answer in s and the most datagrams any lookup needed."""
+    slowest, sends_max = 0.0, 0
     for key, qtype in (("frame_url", 28), ("frame_url_v4", 1)):
         host = frame_host(tile[key])
         for resolver in PUBLIC_RESOLVERS:
             start = time.monotonic()
-            found = resolve(resolver, host, qtype, RESOLVE_WITHIN)
+            try:
+                found, sends = resolve(resolver, host, qtype, RESOLVE_WITHIN)
+            except TimeoutError as error:
+                lost = TimeoutError(f"{key}: {error}")
+                raise lost from None
             took = time.monotonic() - start
             if not found or took > RESOLVE_WITHIN:
                 raise AssertionError("a fresh launch name did not resolve on its first query")
-            slowest = max(slowest, took)
-    return slowest
+            slowest, sends_max = max(slowest, took), max(sends_max, sends)
+    return slowest, sends_max
 
 
 # ---- The viewer path: every mode, every tile, one address family ---------------------------
@@ -545,7 +562,7 @@ def lookup(host, family, resolvers):
     local = host_local()
     for resolver in resolvers:
         try:
-            found = resolve(resolver, host, qtype, 5)
+            found, _ = resolve(resolver, host, qtype, 5)
         except (OSError, ValueError, AssertionError):
             continue
         found = [a for a in found if a.is_global]
@@ -1013,11 +1030,11 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False):
             fresh(old, new)
             # Before anything else looks the names up: each resolver's first query.
             step(f"public resolvers: relaunched {half} tile names")
-            slowest = prove_resolves(new)
+            slowest, sends = prove_resolves(new)
             step(f"renderer socket: relaunched {half} tile frames")
             prove_frame(new, direct())
             print(json.dumps({"half": half, "freshLaunchNames": True, "freshNamesResolved": True,
-                              "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True,
+                              "resolveMsMax": round(slowest * 1000), "resolveSendsMax": sends, "ipv4RendererFrames": True,
                               "directAdmission": direct() is not None}), flush=True)
     finally:
         connection.close()
