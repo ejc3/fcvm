@@ -549,6 +549,99 @@ class PipelineTests(unittest.TestCase):
                 self.assertLess(bake.index(step), pack)
         self.assertIn('app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)', bake)
 
+    def test_windows_env_says_the_bridge_refuses_still_only_when_the_tree_does(self):
+        # The host bootstrap (ejc3/aws modules/fcvm-fleet-region) starts Windows on an image that is
+        # not on its allowlist only when windows.env says the bridge refuses /still on the public
+        # ports (ejc3/fcvm#1839). The build says so only when the tree the bridge image was built
+        # from has both halves of that refusal, and the halves it looks for are the tree's own
+        # lines (CI's bridge and renderer host tests exercise them).
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        image = build.index('make -C fleet/windows bridge-image TAG=fleet')
+        env = build.index("> /etc/fcvm-fleet/windows.env")
+        check = build.index("still=\n", image)
+        self.assertLess(check, env)
+        block = build[check:env]
+        override = 'bool allows_fleet_still() const override { return false; }'
+        refusal = 'if (fleet() && !p_.allows_fleet_still()) return respond(c, 404, "Not Found", "");'
+        self.assertIn(f"grep -qF '{override}' \"$SRC/fleet/windows/bridge/bridge.h\"", block)
+        self.assertIn(f"grep -qF '{refusal}' \"$SRC/fleet/renderer/src/server.cpp\"", block)
+        self.assertIn(override, (HERE.parents[1] / "fleet/windows/bridge/bridge.h").read_text())
+        self.assertIn(refusal, (HERE.parents[1] / "fleet/renderer/src/server.cpp").read_text())
+        self.assertIn("still='WINDOWS_BRIDGE_STILL=refused\\n'", block)
+        self.assertIn("\\n'\"$still\" \"$WIN_IMAGE\"", block)
+
+    def test_minecraft_env_says_the_join_limits_are_enforced_only_when_the_tree_has_them(self):
+        # The host bootstrap's Java guard (ejc3/aws modules/fcvm-fleet-region) opens TCP 25565 on an
+        # image off its list only when the image says its servers carry the join limits: the agent's
+        # per-source FCVM-MC-JOIN chain (#1844, src/fleet/agent/joinguard.rs) and Pumpkin's player cap
+        # and login timeout (fleet/minecraft/src/pumpkin.rs). The build says so only when the tree the
+        # Minecraft image was built from has them, and the lines it looks for are the tree's own.
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        image = build.index("podman image exists localhost/fcvm-minecraft:fleet")
+        env = build.index("> /etc/fcvm-fleet/minecraft.env")
+        check = build.index("limits=\n", image)
+        self.assertLess(check, env)
+        block = build[check:env]
+        root = HERE.parents[1]
+        for path, line in (("src/fleet/agent/joinguard.rs", '"--connlimit-above",'),
+                           ("src/fleet/agent/joinguard.rs", '"--hashlimit-above",'),
+                           ("fleet/minecraft/src/pumpkin.rs", "pub const MAX_PLAYERS: u32"),
+                           ("fleet/minecraft/src/pumpkin.rs", "pub const LOGIN_TIMEOUT_SECS: u64")):
+            with self.subTest(line=line):
+                self.assertIn(f"grep -qF '{line}' \"$SRC/{path}\"", block)
+                self.assertIn(line, (root / path).read_text())
+        self.assertIn("limits='MINECRAFT_JOIN_LIMITS=enforced\\n'", block)
+        self.assertIn("printf \"$limits\" > /etc/fcvm-fleet/minecraft.env", build)
+
+    def test_the_bake_drops_build_only_state_from_the_root(self):
+        # A host hydrates every root block it reads from the image's snapshot, and the image is
+        # what every host boots: the compiler cache (4.1 GB on the cad0ddad image), the Rust
+        # toolchain (2.9 GB) and the build's journal are build-only. The cache goes before the
+        # pack, which needs the room; prep and build install the toolchain again when it is
+        # missing.
+        source = (HERE / "host/build.sh").read_text()
+        phases = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+        bake = phases["bake"]
+        self.assertLess(bake.index('rm -rf "$UH/.cache/sccache"'), bake.index('python3 "$HERE/store-pack.py"'))
+        self.assertIn('rm -rf "$UH/.cargo" "$UH/.rustup"', bake)
+        self.assertIn("journalctl --vacuum-time=1s", bake)
+        self.assertLess(bake.index('rm -rf "$UH/.cargo" "$UH/.rustup"'), bake.index("\n  root_has_room"))
+        for phase in ("prep", "build"):
+            with self.subTest(phase=phase):
+                self.assertIn('[ -x "$UH/.cargo/bin/cargo" ] || as_user', phases[phase])
+
+    def test_the_bake_fails_unless_the_root_keeps_room(self):
+        # The image keeps its packed store on the root, which every host inherits; a gpubox from
+        # the cad0ddad image had 416 MB free there and a 7.3.3 host kernel install failed. The
+        # bake checks the root's free space last, once the store is packed and /tmp emptied, and
+        # fails under ROOT_FREE_MIN_GIB (8).
+        source = (HERE / "host/build.sh").read_text()
+        bake = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["bake"]
+        check = bake.index("\n  root_has_room")
+        self.assertLess(bake.index('python3 "$HERE/store-pack.py"'), check)
+        self.assertLess(bake.index("find /tmp /var/tmp -mindepth 1 -delete"), check)
+        # fleet/ami/check.sh holds the /tmp cleanup right before the final sync; the check is a
+        # read and comes after both.
+        self.assertLess(bake.index("\n  sync\n"), check)
+        fn = re.search(r"^root_has_room\(\) \{\n.*?^\}\n", source, re.S | re.M)
+        self.assertIsNotNone(fn, "build.sh defines no root_has_room")
+        with tempfile.TemporaryDirectory() as tmp:
+            df = Path(tmp) / "df"
+
+            def run(avail_bytes):
+                df.write_text(f"#!/bin/sh\nprintf 'Avail\\n%s\\n' '{avail_bytes}'\n")
+                df.chmod(0o755)
+                return subprocess.run(["bash", "-c", fn.group(0) + "root_has_room"], capture_output=True, text=True,
+                                      env={"PATH": f"{tmp}:/usr/bin:/bin"})
+
+            low = run(416 * 1024 * 1024)
+            self.assertNotEqual(low.returncode, 0)
+            self.assertIn("416 MiB free", low.stdout)
+            self.assertEqual(run(9 * 1024 ** 3).returncode, 0)
+            self.assertNotEqual(run("").returncode, 0, "an unreadable df must fail, not pass")
+
     def test_the_minecraft_image_builds_beside_the_rest_into_roots_store(self):
         # In line it was the build phase's longest step (19 of 44 min on 2026-11-09). It starts
         # after the checkout, as root (a rootful build stays in its unit's cgroup), and the phase

@@ -22,7 +22,6 @@ import subprocess
 import tempfile
 import sys
 import time
-import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import race  # noqa: E402
@@ -58,16 +57,11 @@ def image(cfg, s):
 
 def lambda_code(cfg, s):
     lam = s.client("lambda")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        info = zipfile.ZipInfo("bootstrap")
-        info.external_attr = 0o100755 << 16
-        with open(cfg["workload_bin"], "rb") as f:
-            z.writestr(info, f.read())
+    code = race.workload_zip(cfg["workload_bin"])
     urls = {}
     for k in ("cold", "warm"):
         name = f"boot-race-{k}"
-        lam.update_function_code(FunctionName=name, ZipFile=buf.getvalue())
+        lam.update_function_code(FunctionName=name, ZipFile=code)
         lam.get_waiter("function_updated_v2").wait(FunctionName=name)
         urls[k] = lam.get_function_url_config(FunctionName=name)["FunctionUrl"]
         env = lam.get_function_configuration(FunctionName=name)["Environment"]["Variables"]

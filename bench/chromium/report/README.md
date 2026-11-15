@@ -8,7 +8,7 @@ and the status of historical evidence.
 
 ## Status
 
-- The page quotes one campaign, listed under "The campaign 40657613" below,
+- The page quotes one campaign, listed under "The campaign f3324aa0" below,
   and nothing else: every fcvm figure is from the records of that campaign,
   at one fcvm commit, on three hosts of one instance type, each on one boot.
   Earlier runs stay in `results/` as history and are not quoted; the
@@ -57,12 +57,86 @@ The 348.7 ms direct-CDP figure and the fixture latency/decomposition tables
 remain optimisation evidence only. They do not appear as corpus headlines or
 support CPU, memory or network-mode comparisons against Cloudflare.
 
-That leaves the corpus mix as the publishable headline. The page quotes the campaign 40657613 alone: its headline is the 8 vCPU rung, the median of three runs' request medians, each run on its own golden, indexed by `results/campaign-40657613-summary.json`. The runs of 2026-08-30, 2026-09-02, 2026-10-22 and 2026-11-04 remain records of earlier builds and are not quoted.
+That leaves the corpus mix as the publishable headline. The page quotes the campaign f3324aa0 alone: its headline is the 8 vCPU rung, the median of three runs' request medians, each run on its own golden, indexed by `results/campaign-f3324aa0-summary.json`. The campaign 40657613 and the runs of 2026-08-30, 2026-09-02, 2026-10-22 and 2026-11-04 remain records of earlier builds and are not quoted. The page's live-site section cites one record outside the campaign, `results/live-w3`, and says so.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
 
-## The campaign 40657613
+## The campaign f3324aa0
+
+One campaign of `make bench-chromium-corpus`, `make bench-chromium-corpus-extra` (memory,
+host control and Kitesurf phases) and `MEASURE=scale`, from fcvm `f3324aa0` (main after #1910,
+one queue each way on every veth), on three AWS c8g.metal-48xl hosts, 2026-11-14 to
+2026-11-15, 8.4 hours of recorded runs. fcvm, fc-agent, the Firecracker build, the guest kernel,
+rootfs and initrd, both container images and the Kitesurf build were built once on one host and
+copied to the other two, with matching sha256 checked before the first run
+(`results/campaign-f3324aa0-artifacts.txt`, the same list on the three hosts). Each host ran on
+one boot. The serial runs went in three rounds, one per host, each running every configuration
+once in a seeded order; each A/B/A sequence ran on one host and one golden;
+`results/campaign-f3324aa0-plan.tsv` lists every step with its host. Every serial run is
+DNS-verified clean, with 0 failures in 230 attempts per arm (430 in bridged and routed runs),
+and every scale rate passed. The Kitesurf step's first attempt stopped at start-up because the
+2 vCPU scale run before it, whose host control Chromium ran as root, had created a root-owned
+`$HOME/.config` where wrangler could not create its directory (fixed in #1913); after the
+directory's owner was restored it ran again at the same commit, and `results/corpusextra-f3324aa0-ks`
+is that second attempt. The replay logs are in `ejc3/fcvm-bench-records`, those over 45 MB
+gzipped (`external-logs.json` `encoding`). Index: `results/campaign-f3324aa0-summary.json`.
+
+The live-site run (`results/live-w3`) is not part of this campaign: one run at fcvm `e0ed334e`
+on one c8gd.metal-24xl, fcvm and Browser Run over the live sites; its raw files are in
+`ejc3/fcvm-bench-records` under `bench/chromium/results/live-w3`, listed with their sha256 in
+`results/live-w3/external-records.json`.
+
+| run | configuration | record |
+|---|---|---|
+| r1-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-r4` |
+| r1-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-c2` |
+| r1-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-b4` |
+| r1-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-c8` |
+| r1-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-f3324aa0-r1-h4` |
+| r1-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-w4` |
+| r1-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r1-c4` |
+| cm1-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a1) | `results/reqbench-f3324aa0-cm1-a1` |
+| cm1-b | Chromium, 4 vCPU, rootless, copy, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step b) | `results/reqbench-f3324aa0-cm1-b` |
+| cm1-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a2) | `results/reqbench-f3324aa0-cm1-a2` |
+| pf1-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a1) | `results/reqbench-f3324aa0-pf1-a1` |
+| pf1-b | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch off (prefetch off against on, A/B/A on one golden, step b) | `results/reqbench-f3324aa0-pf1-b` |
+| pf1-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a2) | `results/reqbench-f3324aa0-pf1-a2` |
+| m4 | memory, screenshot, N = 2 to 48, golden cb-r1-c4 | `results/corpusextra-f3324aa0-m4` |
+| s4 | open-loop throughput, 4 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-f3324aa0-s4` |
+| m96 | memory, screenshot, N = 2 and 96, golden cb-r1-c4 | `results/corpusextra-f3324aa0-m96` |
+| r2-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-f3324aa0-r2-h4` |
+| r2-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-r4` |
+| r2-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-c8` |
+| r2-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-c2` |
+| r2-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-c4` |
+| r2-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-b4` |
+| r2-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r2-w4` |
+| cm2-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a1) | `results/reqbench-f3324aa0-cm2-a1` |
+| cm2-b | Chromium, 4 vCPU, rootless, copy, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step b) | `results/reqbench-f3324aa0-cm2-b` |
+| cm2-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a2) | `results/reqbench-f3324aa0-cm2-a2` |
+| pf2-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a1) | `results/reqbench-f3324aa0-pf2-a1` |
+| pf2-b | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch off (prefetch off against on, A/B/A on one golden, step b) | `results/reqbench-f3324aa0-pf2-b` |
+| pf2-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a2) | `results/reqbench-f3324aa0-pf2-a2` |
+| m2 | memory, screenshot, N = 2 to 48, golden cb-r2-c2 | `results/corpusextra-f3324aa0-m2` |
+| s2 | open-loop throughput, 2 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-f3324aa0-s2` |
+| hc | host Chromium without a VM: no CPU limit, 2, 4 and 8 CPUs | `results/corpusextra-f3324aa0-hc` |
+| ks | Kitesurf under wrangler dev on the replay, screenshot and HTML, 202 measured requests each (second attempt; see above) | `results/corpusextra-f3324aa0-ks` |
+| r3-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-b4` |
+| r3-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-c4` |
+| r3-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-f3324aa0-r3-h4` |
+| r3-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-c8` |
+| r3-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-w4` |
+| r3-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-c2` |
+| r3-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-f3324aa0-r3-r4` |
+| m8 | memory, screenshot, N = 2 to 48, golden cb-r3-c8 | `results/corpusextra-f3324aa0-m8` |
+| s8 | open-loop throughput, 8 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-f3324aa0-s8` |
+| m4h | memory, HTML extraction, N = 2 to 48, golden cb-r3-c4 | `results/corpusextra-f3324aa0-m4h` |
+| pw3-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (page target prewired against looked up, A/B/A on one golden, step a1) | `results/reqbench-f3324aa0-pw3-a1` |
+| pw3-b | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on, page target prewired (page target prewired against looked up, A/B/A on one golden, step b) | `results/reqbench-f3324aa0-pw3-b` |
+| pw3-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (page target prewired against looked up, A/B/A on one golden, step a2) | `results/reqbench-f3324aa0-pw3-a2` |
+
+## The campaign 40657613 (history, not quoted)
 
 One campaign of `make bench-chromium-corpus`, `make bench-chromium-corpus-extra` and
 `MEASURE=scale`, from fcvm `40657613` (main after #1511 and #1513), on three AWS

@@ -169,11 +169,9 @@ fcvm's lockfile.
 - **Offline mode** means the servers check no Minecraft account, so anyone with a Java Edition
   client can join under any name. The owner chose open joins in offline mode (2026-11-08), with
   the servers reset from their snapshot: on the schedule above, on Reset, and when a borrow
-  ends. A public player reaches only the Java listener: the fleet security group admits TCP
-  25565 over IPv6 and nothing else of the server's beyond the view socket (on 443 over IPv6,
-  and on its port of the host's IPv4 range over IPv4), and Pumpkin's
-  query, management, proxy, LAN and Bedrock services are off by name. "Public joins" below has the
-  limits on a source and on a server. The page and the coordinator stay behind Cloudflare Access.
+  ends. Virginia's dedicated Java security group admits IPv6 TCP/25565 through approved GPU hosts
+  to the Minecraft guests. Viewer sockets use separate rules. Pumpkin's query, management, proxy,
+  LAN and Bedrock services are disabled. The page and the coordinator stay behind Cloudflare Access.
 - **The density comparison** runs Mojang's vanilla server and Paper beside Pumpkin, on the
   bench box only, with Mojang's EULA accepted there by the owner's decision (2026-11-08,
   "Compare is fine for research"). The jars are downloaded on that box and are never in git, a
@@ -181,10 +179,14 @@ fcvm's lockfile.
 
 ## Public joins (TCP 25565)
 
-The owner chose open joins in offline mode (2026-11-08). The fleet security group admits TCP 25565
-over IPv6 (ejc3/aws, `minecraft_public_join`, on by default), so anyone with a Java Edition 26.3
-client can reach a Minecraft server at its tile's address. This section is the scope of that
-opening: what answers, what limits a source, what a player can reach, and how to close it.
+Virginia's `fcvm-fleet-minecraft-java` security group admits TCP/25565 over IPv6. Clients
+running Java Edition 26.3 can use the tile's current join hostname. The group is separate from
+the shared viewer group and attaches only to the Virginia x86 GPU host template for the AMI
+approved in [AWS Terraform](https://github.com/ejc3/aws/blob/main/fcvm-fleet.tf)
+(`minecraft_java_access.host_ami`). Before each agent start, the host verifies the actual boot
+AMI, delegated IPv6 prefix and guest layout. The host forwards Java traffic only to the Minecraft
+slots, leaving its own address, other guests and the gold VM closed on that port. An unapproved
+boot AMI or missing metadata leaves Java closed.
 
 **What answers.** Pumpkin, at the pinned commit of the ejc3/Pumpkin fork (upstream plus the login
 timeout below), in offline mode, speaking Java Edition 26.3 and nothing else, on the Minecraft VMs
@@ -221,13 +223,18 @@ sees the refusal at once.
   the metadata service), and the only file the host maps in is the fleet's TLS certificate for the
   tile's view socket, read-only.
 
-**Closing it.** `minecraft_public_join = false` in the ejc3/aws fleet module removes the
-security group's 25565 rule in every region with one apply. No new image, agent change or restart
-is needed, and the servers, their tiles and the page keep running for viewers.
+**Closing public joins.** In `ejc3/aws`, restore `minecraft_java_access.source_cidr` in
+Virginia's `fcvm_fleet_east1` configuration from `::/0` to the administration jumpbox's
+IPv6 `/128`. Use the [canary configuration](https://github.com/ejc3/aws/pull/866) to derive
+the address from Terraform. Review and apply that ingress change through the AWS repository.
+New public joins stop without a host restart or a viewer change; [tracked connections can
+remain open](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-connection-tracking.html).
 
-**Checking it.** Once the rule is applied, a port scan from outside the fleet must find only 25565
-and 443 answering on a Minecraft VM's address, and a load test from one source must see its
-fifth open connection and its seventh new connection in a burst reset.
+**Checking it.** Read back the Virginia group's IPv6 rule and the host template's approved AMI.
+From an allowed source, check Java status on a live tile and confirm the fifth open connection
+and seventh new connection in a burst are refused. Verify Java is closed to a serving
+non-Minecraft guest, the host and the gold VM. After narrowing the rule, use a different IPv6
+source to check that the tile's viewer socket still responds and TCP/25565 is closed.
 
 ## Density
 

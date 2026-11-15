@@ -83,6 +83,19 @@ store_settled() {
   fi
   /usr/local/lib/fcvm-fleet/store.sh
 }
+# A host still writes to the root after the image is made: journals, packages, a host kernel
+# install. The image keeps its packed store (about 28 GB) on the root as the S3 restore's
+# fallback, and a gpubox from the cad0ddad image, whose root is 64 GB, had 416 MB free there:
+# installing a 7.3.3 host kernel failed. The bake fails unless ROOT_FREE_MIN_GIB stay free.
+root_has_room() {
+  local avail min=$(( ${ROOT_FREE_MIN_GIB:-8} * 1024 * 1024 * 1024 ))
+  avail=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+  [[ "$avail" =~ ^[0-9]+$ ]] || { echo "could not read the root's free space: '$avail'"; return 1; }
+  [ "$avail" -ge "$min" ] && return 0
+  echo "the root has $(( avail / 1024 / 1024 )) MiB free once the image is baked; ${ROOT_FREE_MIN_GIB:-8} GiB must stay free"
+  df -h /
+  return 1
+}
 # Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
 as_user() {
   local uid; uid=$(id -u "$U")
@@ -267,6 +280,18 @@ build)
   # the checkout. The agent makes its gold snapshot when it starts.
   bg_wait fleet-ami-minecraft-image "$L/minecraft-image.log"
   podman image exists localhost/fcvm-minecraft:fleet || { echo "root's store has no localhost/fcvm-minecraft:fleet"; exit 1; }
+  # minecraft.env says the servers carry the public join limits only when the tree the image was
+  # built from has them: the agent's per-source FCVM-MC-JOIN chain (#1844) and Pumpkin's player cap
+  # and login timeout. The host bootstrap's Java guard (ejc3/aws modules/fcvm-fleet-region) opens
+  # TCP 25565 on an image off its list only with this line. An empty file says nothing.
+  limits=
+  if grep -qF '"--connlimit-above",' "$SRC/src/fleet/agent/joinguard.rs" &&
+    grep -qF '"--hashlimit-above",' "$SRC/src/fleet/agent/joinguard.rs" &&
+    grep -qF 'pub const MAX_PLAYERS: u32' "$SRC/fleet/minecraft/src/pumpkin.rs" &&
+    grep -qF 'pub const LOGIN_TIMEOUT_SECS: u64' "$SRC/fleet/minecraft/src/pumpkin.rs"; then
+    limits='MINECRAFT_JOIN_LIMITS=enforced\n'
+  fi
+  printf "$limits" > /etc/fcvm-fleet/minecraft.env
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
   # system image built from source, and Robot Park, built with the AOSP build's tools.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"
@@ -292,11 +317,21 @@ build)
   WIN_IMAGE=$(grep -E '^/mnt/fcvm-btrfs/windows/image-[0-9a-f]+$' "$L/windows-image.log" | tail -n 1)
   [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory"; exit 1; }
   as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"
+  # windows.env says the bridge refuses /still on the public ports (ejc3/fcvm#1839) only when the
+  # tree the bridge image was built from carries both halves: the bridge's override and the
+  # server's 404 for it (CI's bridge and renderer host tests run them on every main commit the
+  # factory builds). The host bootstrap (ejc3/aws modules/fcvm-fleet-region) starts Windows on an
+  # image off its allowlist only with this line.
+  still=
+  if grep -qF 'bool allows_fleet_still() const override { return false; }' "$SRC/fleet/windows/bridge/bridge.h" &&
+    grep -qF 'if (fleet() && !p_.allows_fleet_still()) return respond(c, 404, "Not Found", "");' "$SRC/fleet/renderer/src/server.cpp"; then
+    still='WINDOWS_BRIDGE_STILL=refused\n'
+  fi
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
   as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar
   rm -f /mnt/fcvm-btrfs/windows-bridge.oci.tar
-  printf 'WINDOWS_AGENT_ARGS="--windows-image %s --windows-bridge-image localhost/fcvm-windows-bridge:fleet"\n' "$WIN_IMAGE" \
+  printf 'WINDOWS_AGENT_ARGS="--windows-image %s --windows-bridge-image localhost/fcvm-windows-bridge:fleet"\n'"$still" "$WIN_IMAGE" \
     > /etc/fcvm-fleet/windows.env
   cat /etc/fcvm-fleet/windows.env
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
@@ -335,6 +370,10 @@ bake)
   # them, and so do the phone app's build image of this checkout's Containerfile; the others go.
   podman image prune -f >/dev/null
   as_user "podman image prune -f >/dev/null"
+  # Build-only state no host reads: the compiler cache (4.1 GB on the cad0ddad image). Every
+  # byte left on the root is hydrated from the snapshot when a host first reads it, and it
+  # leaves the pack less room.
+  rm -rf "$UH/.cache/sccache"
   app=$(sha256sum "$SRC/fleet/phone-app/Containerfile" | cut -c1-16)
   as_user "podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/fcvm-phone-app-build:' | grep -vx 'localhost/fcvm-phone-app-build:$app' | xargs -r podman rmi >/dev/null"
   df -h / | tee "$S/root-before-pack.txt"
@@ -351,7 +390,12 @@ bake)
     [ "$(stat -c %s "$f")" -lt $((5 * 1024 * 1024 * 1024)) ] || { echo "$f is 5 GiB or more: one PUT cannot upload it"; exit 1; }
   done
   # The user's rootless podman storage keeps the renderer image (the store holds its export).
-  rm -rf "$UH/.cargo/registry" "$UH/.cargo/git" "$UH/.rustup/toolchains"/*/share/doc
+  # The Rust toolchain only builds (2.9 GB with ~/.cargo); no host runs cargo, and prep and
+  # build install it again when a builder's base image has none. Nor does a host read the
+  # build's journal.
+  rm -rf "$UH/.cargo" "$UH/.rustup"
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-time=1s >/dev/null 2>&1 || true
   rm -f "$SRC/target"
   $APT clean
   cloud-init clean --logs --seed
@@ -364,6 +408,7 @@ bake)
   # the same pass over the 7f5fb7e6 image's volume. Empty both here, where it costs nothing.
   find /tmp /var/tmp -mindepth 1 -delete
   sync
+  root_has_room
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
 esac

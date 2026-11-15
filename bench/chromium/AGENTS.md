@@ -435,6 +435,14 @@ interval to resolve its ±10 ms margin; the report's runs use `REPS=402`.
   non-trivial, say so in the report or re-run — do not quietly publish.
 - **After a reboot the page cache is cold.** Discard warmup iterations EXPLICITLY
   and say you did; otherwise cold-cache runs inflate p50.
+- **The Kitesurf arm's engine verifies TLS and reuses HTTP/1.0 connections.** workerd
+  refused the replay's default `DNS:*` certificate, and with a CA-signed one it still
+  failed about half its requests ("Network connection lost", 2 of 14 pages completed
+  on the first box run) by reusing connections the replay closes after each reply.
+  `PHASES=kitesurf` therefore runs alone with `corpus_serve.py --tls-ca-out
+  --connection-close` (README, "The Kitesurf arm"); do not fold it into another phase's
+  replay, and do not count a Kitesurf request as a success unless its page completed in
+  `render_check.py`.
 - **`scripts/ci-stray-vm-guard.sh` is DESTRUCTIVE** — it SIGKILLs everything matching,
   with no interlock against a concurrent job. An agent ran it "to exercise it" and
   killed another agent's live test. Use `--dry-run`. Never run it on a shared box.

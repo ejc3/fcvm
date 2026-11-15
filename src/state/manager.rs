@@ -5,6 +5,34 @@ use tokio::fs;
 
 use super::types::VmState;
 
+/// The abstract socket name that leases loopback address `ip` (`allocate_loopback_ip`).
+pub const LOOPBACK_LEASE_PREFIX: &str = "fcvm-loopback-";
+
+/// The loopback addresses this process's VMs lease, by vm_id, each an abstract Unix socket
+/// bound to `LOOPBACK_LEASE_PREFIX` + the address. Released by `delete_state`, and by the
+/// kernel when the process exits however it exits.
+static LOOPBACK_LEASES: std::sync::Mutex<Vec<(String, std::os::unix::net::UnixDatagram)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Lease `ip` on this host: bind its abstract socket, or `None` when another process holds it.
+///
+/// A loopback address belongs to the network namespace: every fcvm process in it, whatever
+/// its data directory and whatever user runs it, publishes ports on the same 127.0.0.0/8.
+/// The abstract socket namespace has the same scope, takes no file permissions, so a root
+/// VM and a user's VM see each other's leases, and is released by the kernel when the
+/// process that bound it dies.
+fn lease_loopback_ip(ip: &str) -> Result<Option<std::os::unix::net::UnixDatagram>> {
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("{LOOPBACK_LEASE_PREFIX}{ip}");
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .with_context(|| format!("naming the lease of loopback address {ip}"))?;
+    match std::os::unix::net::UnixDatagram::bind_addr(&addr) {
+        Ok(socket) => Ok(Some(socket)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("leasing loopback address {ip}")),
+    }
+}
+
 /// Open or create a lock file with world-readable/writable permissions.
 /// Uses fchmod after creation to ensure permissions are set regardless of umask.
 /// This allows both root and non-root processes to coordinate via flock.
@@ -397,6 +425,10 @@ impl StateManager {
     /// afterwards, finds no state file, and becomes a no-op — it can never
     /// resurrect the state file of a deleted VM.
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
+        LOOPBACK_LEASES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(id, _)| id != vm_id);
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", vm_id));
@@ -944,9 +976,10 @@ impl StateManager {
 
     /// Allocate a unique loopback IP for rootless networking and persist it atomically
     ///
-    /// Uses a global lock file to ensure atomic allocation across concurrent VM starts.
-    /// The VM state is saved with the allocated IP WHILE HOLDING THE LOCK, ensuring
-    /// no race conditions - no other process can allocate the same IP.
+    /// A lock file in the state directory serializes allocation within one data directory,
+    /// and the VM state is saved with the allocated IP while holding it. Across data
+    /// directories and users the address is leased host-wide (`lease_loopback_ip`) until
+    /// `delete_state` removes the VM or the process exits.
     ///
     /// Returns an IP in the 127.0.0.2 - 127.255.255.254 range.
     ///
@@ -990,18 +1023,28 @@ impl StateManager {
         // Note: We rely on state file cleanup (cleanup_stale_state) to handle dead processes.
         // We don't check if port 8080 is available because wildcard binds (0.0.0.0:8080)
         // would cause false negatives. Real port conflicts are detected at pasta bind time.
-        let ip = (|| -> Result<String> {
+        // The state files name the addresses of this data directory's VMs. Every other fcvm
+        // process on the host, with another data directory or run by another user, uses the
+        // same 127.0.0.0/8, so an address is also skipped while its lease is held (#1882).
+        let (ip, lease) = (|| -> Result<(String, std::os::unix::net::UnixDatagram)> {
             for b2 in 0..=255u8 {
                 for b3 in 2..=254u8 {
                     // Skip 127.0.0.1 (localhost)
                     let ip = format!("127.0.{}.{}", b2, b3);
-                    if !used_ips.contains(&ip) {
-                        return Ok(ip);
+                    if used_ips.contains(&ip) {
+                        continue;
+                    }
+                    if let Some(lease) = lease_loopback_ip(&ip)? {
+                        return Ok((ip, lease));
                     }
                 }
             }
             anyhow::bail!("all loopback IPs exhausted (65,000+ VMs)")
         })()?;
+        LOOPBACK_LEASES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((vm_state.vm_id.clone(), lease));
 
         // Update VM state with the allocated IP and SAVE WHILE HOLDING THE LOCK
         // This ensures no other process can allocate the same IP
@@ -1190,6 +1233,33 @@ mod tests {
         );
         let mut other = named_state("vm-other", "slot-4");
         manager.claim_name(&mut other).await.unwrap();
+    }
+
+    /// Two data directories on one host share its 127.0.0.0/8: a VM of one must not be
+    /// handed the loopback address a VM of the other holds (#1882). Before the lease each
+    /// manager saw only its own state files, and both returned 127.0.0.2.
+    #[tokio::test]
+    async fn two_data_directories_get_different_loopback_addresses() {
+        let (first_dir, second_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let first_manager = StateManager::new(first_dir.path().to_path_buf());
+        let second_manager = StateManager::new(second_dir.path().to_path_buf());
+        let mut first = named_state("vm-data-dir-a", "dir-a");
+        let mut second = named_state("vm-data-dir-b", "dir-b");
+        let first_ip = first_manager
+            .allocate_loopback_ip(&mut first)
+            .await
+            .unwrap();
+        let second_ip = second_manager
+            .allocate_loopback_ip(&mut second)
+            .await
+            .unwrap();
+        assert_ne!(
+            first_ip, second_ip,
+            "a VM in another data directory was handed the loopback address {first_ip} a \
+             running VM holds"
+        );
+        first_manager.delete_state("vm-data-dir-a").await.unwrap();
+        second_manager.delete_state("vm-data-dir-b").await.unwrap();
     }
 
     /// Several VMs of one process (`fcvm serve`, the library API) share a PID. Claiming

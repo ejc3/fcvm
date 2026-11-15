@@ -1462,6 +1462,10 @@ echo "LOCALVERSION=$LOCALVERSION"
 echo "This takes 15-30 minutes..."
 echo ""
 
+# dpkg-deb compresses each package into a temporary file under TMPDIR: keep it on the build
+# tree's filesystem, which the preflight checked has room, not on a small root disk's /tmp.
+export TMPDIR="$BUILD_DIR/tmp"
+mkdir -p "$TMPDIR"
 make -j"$NPROC" ARCH="$KERNEL_ARCH" LOCALVERSION="$LOCALVERSION" bindeb-pkg
 
 echo ""
@@ -3312,6 +3316,30 @@ mod tests {
             .host_kernel
             .clone()
             .expect("amd64 host_kernel")
+    }
+
+    /// `dpkg-deb` writes each package's compressed archive to a temporary file under `TMPDIR`
+    /// before moving it beside the build tree. The build tree is placed on a filesystem with
+    /// room (scripts/check-host-kernel-build.sh), but `TMPDIR` stayed `/tmp`: on a gpubox, whose
+    /// root disk is 61 GB, the 7.3.3 build failed packaging its debug image with "zstd write
+    /// error: No space left on device" while the build tree's disk had 1.6 TB free. The script
+    /// keeps its temporary files in the build tree before it packages.
+    #[test]
+    fn the_host_kernel_packages_with_temporary_files_in_the_build_tree() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script =
+            generate_host_kernel_build_script(&amd64_host_kernel(), "0123456789ab", repo).unwrap();
+        let export = script
+            .find("export TMPDIR=\"$BUILD_DIR/tmp\"")
+            .expect("the build script does not keep TMPDIR in the build tree");
+        let mkdir = script
+            .find("mkdir -p \"$TMPDIR\"")
+            .expect("TMPDIR is not created");
+        let package = script.find("bindeb-pkg").unwrap();
+        assert!(
+            export < mkdir && mkdir < package,
+            "TMPDIR must be set before packaging"
+        );
     }
 
     /// ejc3/aws#823: a factory builder from Ubuntu built the x86 host kernel from Ubuntu's

@@ -610,6 +610,12 @@ pub(super) fn build_firecracker_config(
             }
             _ => None,
         },
+        // The run resolved this profile for its kernel already, so a lookup error does not
+        // happen here; if it did, the key would match another kernel's snapshot and the
+        // restore's check of the snapshot's recorded host kernel would refuse it.
+        host_kernel: crate::setup::rootfs::guest_kvm_host_kernel(args.kernel_profile.as_deref())
+            .ok()
+            .flatten(),
     }
 }
 

@@ -77,12 +77,41 @@ class Build(unittest.TestCase):
             self.assertTrue(rows["Rounds"].startswith("2,"))
             self.assertEqual(rows["Fargate platform"], "1.4.0")
             self.assertIn("0.12 to 0.31", rows["Campaign host load"])
+            self.assertIn("when each lane attempt began", rows["Campaign host load"])
             self.assertEqual(rows["Region"], "us-east-2")
             self.assertEqual({lid for lid, _ in setup["checks"]}, set(render.LANES))
 
+    def test_a_lane_not_run_is_named_with_its_reason_and_its_setup_row_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_results(d, [sample("fcvm-file", 0, 1793851066938, 200.0), sample("ecs-ec2", 0, 1793851067938, 900.0)])
+            with open(os.path.join(d, "setup.json"), "w") as f:
+                json.dump({"region": "us-east-2", "rows": [["ECS on Fargate", "task 1 vCPU"], ["ECS on EC2", "x"],
+                                                           ["Lambda, cold", "y"]]}, f)
+            data = render.build(d)
+            labels = [r[0] for r in data["setup"]["rows"]]
+            self.assertNotIn("ECS on Fargate", labels)
+            self.assertIn("ECS on EC2", labels)
+            self.assertIn("Lambda, cold start", labels)
+            fargate = next(n for n in data["not_run"] if n["id"] == "ecs-fargate")
+            self.assertIn("ECR interface endpoints", fargate["why"])
+            self.assertEqual({n["id"] for n in data["not_run"]}, set(render.LANES) - {"fcvm-file", "ecs-ec2"})
+            render.check_public(json.dumps(data))
+
+    def test_a_cold_record_without_cold_start_evidence_is_not_a_cold_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            recs = [sample("lambda-cold", 0, 1, 160.0, request_id="r1", generation="g1", init_duration_ms=12.3),
+                    sample("lambda-cold", 1, 2, 60.0, request_id="r2"),
+                    sample("lambda-cold", 2, 3, 61.0, request_id="r3", generation="g3", init_duration_ms=None)]
+            write_results(d, recs)
+            lc = render.build(d)["lanes"][0]
+            self.assertEqual(lc["n"], 1)
+            self.assertEqual(lc["median_ms"], 160.0)
+            self.assertEqual(lc["failures"], 2)
+            self.assertTrue(all("not" in f["error"] for f in lc["failed"]))
+
     def test_init_duration_is_joined_by_request_id(self):
         with tempfile.TemporaryDirectory() as d:
-            recs = [sample("lambda-cold", 0, 1, 120.0, request_id="r1"), sample("lambda-cold", 1, 2, 130.0, request_id="r2")]
+            recs = [sample("lambda-warm", 0, 1, 120.0, request_id="r1"), sample("lambda-warm", 1, 2, 130.0, request_id="r2")]
             write_results(d, recs, {"r1": {"init_duration": "30.12 ms"}, "r2": {"init_duration": None}})
             lc = render.build(d)["lanes"][0]
             self.assertEqual(lc["checks"]["report"], 2)
@@ -123,6 +152,18 @@ class Public(unittest.TestCase):
             self.assertNotIn("10.12.1.7", text)
             self.assertNotIn("i-0123456789abcdef0", text)
             self.assertIn("0b6a2c1e-1111-2222-3333-444455556666", text)
+
+    def test_a_float_with_twelve_fraction_digits_is_not_an_account_id(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            write_results(d, [sample("ec2-start", 0, 1793851066938, 7205.763916015625)])
+            render.public_records(d, out)
+            render.check_public(json.dumps({"ms": 7205.763916015625}))
+            with self.assertRaises(SystemExit):
+                render.check_public(json.dumps({"note": "account 123456789012 here"}))
+            for text in ("Access denied for account 123456789012.", "account 123456789012, then"):
+                with self.assertRaises(SystemExit, msg=text):
+                    render.check_public(json.dumps({"error": text}))
+                self.assertNotIn("123456789012", render.scrub(text))
 
     def test_public_records_refuse_an_unscrubbed_field(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:

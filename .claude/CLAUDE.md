@@ -2656,7 +2656,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
-- Lock-protected with persistence to avoid conflicts
+- Lock-protected with persistence within a data directory, and leased host-wide with an abstract Unix socket (`fcvm-loopback-<address>`) so VMs of other data directories and other users skip it (#1882)
 
 ### btrfs CoW Reflinks
 

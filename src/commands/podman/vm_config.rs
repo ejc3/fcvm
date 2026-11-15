@@ -1561,6 +1561,7 @@ pub(crate) fn build_launch_config(
         hypervisor: args.hypervisor.into(),
         // A launch config without a snapshot key; the key's builder names the binary.
         cloud_hypervisor_bin: None,
+        host_kernel: None,
     }
 }
 

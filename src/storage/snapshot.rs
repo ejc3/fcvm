@@ -316,6 +316,14 @@ pub struct SnapshotMetadata {
     /// disk boots with a kernel that can actually mount it.
     #[serde(default)]
     pub kernel_profile: Option<String>,
+    /// The host kernel release the snapshot was taken under, recorded only when the source's
+    /// kernel profile runs KVM in its guest (`KernelProfile::guest_kvm`). That guest's vCPU
+    /// state holds nested virtualization state the host kernel's KVM wrote, which a restore
+    /// cannot reconcile under another kernel: a phone snapshot taken on a 7.3.3 host and
+    /// restored on a 6.18.60 one lost its emulator (the GPU hook's retake exited 137). A
+    /// restore under another release is refused ([`SnapshotMetadata::check_host_kernel`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_kernel: Option<String>,
     /// Image delivery mode of the source ("overlay" | "btrfs" | "archive");
     /// None for registry-pulled images.
     #[serde(default)]
@@ -414,6 +422,21 @@ pub fn parse_page_reporting_order(text: &str) -> Option<u32> {
 }
 
 impl SnapshotMetadata {
+    /// Refuse a restore under a host kernel other than the one a nested-KVM snapshot was
+    /// taken under (`host_kernel`), before anything starts. A snapshot that records none
+    /// restores anywhere.
+    pub fn check_host_kernel(&self, snapshot: &str, running: &str) -> anyhow::Result<()> {
+        match self.host_kernel.as_deref() {
+            Some(taken) if taken != running => anyhow::bail!(
+                "snapshot {snapshot} was taken under host kernel {taken}, and this host runs \
+                 {running}: its guest runs KVM, and the nested virtualization state in its vCPUs \
+                 restores only under the host kernel that wrote it. Take the snapshot again on \
+                 this host kernel, or boot {taken}"
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// The source VM's `--dns`, or `None` when this snapshot cannot say.
     ///
     /// A snapshot made before `dns_override` was recorded names its resolver only in
@@ -766,6 +789,37 @@ fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotCon
 
 #[cfg(test)]
 mod tests {
+    /// A snapshot recorded under one host kernel and restored under another is refused
+    /// before anything starts, naming both; a phone snapshot taken on 7.3.3 and restored on
+    /// 6.18.60 otherwise lost its emulator (the GPU hook's retake exited 137).
+    #[test]
+    fn a_nested_kvm_snapshot_refuses_another_host_kernel() {
+        let json = r#"{"image":"i","vcpu":2,"memory_mib":1024,"network_config":{"tap_device":"t","guest_mac":"m"},"host_kernel":"example-kernel-a"}"#;
+        let recorded: super::SnapshotMetadata = serde_json::from_str(json).unwrap();
+        let error = recorded
+            .check_host_kernel("phone-warm", "example-kernel-b")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("example-kernel-a") && error.contains("example-kernel-b"),
+            "{error}"
+        );
+        assert!(error.contains("phone-warm"), "{error}");
+        recorded
+            .check_host_kernel("phone-warm", "example-kernel-a")
+            .unwrap();
+        let mut unrecorded = recorded.clone();
+        unrecorded.host_kernel = None;
+        unrecorded
+            .check_host_kernel("phone-warm", "example-kernel-b")
+            .unwrap();
+        // A snapshot without the field (every one taken before this, and every profile
+        // without KVM in its guest) neither carries nor checks it.
+        assert!(!serde_json::to_string(&unrecorded)
+            .unwrap()
+            .contains("host_kernel"));
+    }
+
     /// A name that would be another snapshot's auxiliary file is refused; dotted names that are
     /// not are kept (#1810 review: `base.stage-lock` made every create from `base` fail).
     #[test]
@@ -1064,6 +1118,7 @@ mod tests {
                 guest: Default::default(),
                 health_port: None,
                 firmware: None,
+                host_kernel: None,
             },
         };
 
@@ -1279,6 +1334,7 @@ mod tests {
                 guest: Default::default(),
                 health_port: None,
                 firmware: None,
+                host_kernel: None,
             },
         };
 
@@ -1377,6 +1433,7 @@ mod tests {
                     guest: Default::default(),
                     health_port: None,
                     firmware: None,
+                    host_kernel: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1462,6 +1519,7 @@ mod tests {
                 guest: Default::default(),
                 health_port: None,
                 firmware: None,
+                host_kernel: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1672,6 +1730,7 @@ mod tests {
                 guest: Default::default(),
                 health_port: None,
                 firmware: None,
+                host_kernel: None,
             },
         };
 
@@ -1870,6 +1929,7 @@ mod tests {
             guest: Default::default(),
             health_port: None,
             firmware: None,
+            host_kernel: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

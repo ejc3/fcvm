@@ -112,6 +112,7 @@ percentile and p99 the 99th, which with fewer than 100 samples is the slowest on
 is counted here and left out of the times. So is a sample whose answer came from the wrong process (an identity
 check below).</p>
 <div id="failures" class="muted" style="font-size:15px"></div>
+<div id="notrun" class="muted" style="font-size:15px"></div>
 
 <h2>Where each lane starts the clock</h2>
 <ul id="starts"></ul>
@@ -130,12 +131,14 @@ one lane per round, so no lane always ran first or last.</p>
 <h2>Method</h2>
 <ul id="method">
   <li>t0 is read immediately before the call that asks for compute; t1 when the probe has read a complete
-  <code>200</code> answer. Teardown (terminating, stopping, killing the VM) happens after t1 and is not
-  timed.</li>
+  <code>200</code> answer. For the probed lanes t1 is taken after the answer's JSON is parsed and checked; for
+  Lambda, right after the body is read. Teardown (terminating, stopping, killing the VM) happens after t1 and is
+  not timed.</li>
   <li>The probe runs on the campaign host. For the EC2 and ECS lanes it opens a new connection to the workload's
-  private address every 20 ms (5 ms for ECS on EC2), each attempt with a 1 s timeout, until one answers; for the
-  fcvm lanes every 1 ms to the VM's published port. Lambda is one HTTPS request to the function URL, signed
-  before t0, so its time includes the TLS handshake.</li>
+  private address every 20 ms (5 ms for ECS on EC2), until one answers; the connect, the read of the answer's
+  head and the read of its body each have a 1 s timeout. For the fcvm lanes it does the same every 1 ms to the
+  VM's published port, with 0.5 s timeouts. Lambda is one HTTPS request to the function URL, signed before t0,
+  so its time includes the TLS handshake.</li>
   <li>The workload is one static binary: it counts the primes below 200,000 (about half a millisecond) and
   returns that with a random id drawn at process start and the kernel's boot id. Those two ids are how the page
   tells a new process and a new kernel from a reused one.</li>
@@ -202,6 +205,15 @@ else {
     ul.appendChild(li);
   }
   fl.appendChild(ul);
+}
+
+const nr = document.getElementById("notrun");
+for (const l of D.not_run || []){
+  const p = document.createElement("p");
+  p.innerHTML = "<b></b> ";
+  p.querySelector("b").textContent = `Not run: ${l.name}.`;
+  p.appendChild(document.createTextNode(l.why));
+  nr.appendChild(p);
 }
 
 // ---------------------------------------------------------------- setup table

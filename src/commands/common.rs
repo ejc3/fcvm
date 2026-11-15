@@ -5008,6 +5008,9 @@ pub fn build_snapshot_config(
             tty: vm_state.config.tty,
             interactive: vm_state.config.interactive,
             kernel_profile: vm_state.config.kernel_profile.clone(),
+            host_kernel: crate::setup::rootfs::guest_kvm_host_kernel(
+                vm_state.config.kernel_profile.as_deref(),
+            )?,
             image_mode: vm_state.config.image_mode.clone(),
             image_disk_path: vm_state.config.image_disk_path.clone(),
             image_disk_identity: vm_state.config.image_disk_identity.clone(),
@@ -6243,6 +6246,17 @@ pub async fn create_snapshot_core(
             .context("creating temp snapshot directory")?;
     }
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+    // The new memory file is a new inode that shares the parent's extents and none of its page
+    // cache, so its restores would read from disk every page the parent's restores had cached.
+    // The parent's cached pages are read into it beside the rest of the create (storage::inherit).
+    let mut inheritance = match base_memory_source.as_ref() {
+        Some(base) if has_base && diff_in_place => crate::storage::inherit::inherit_page_cache(
+            &snapshot_config.name,
+            base,
+            &temp_snapshot_dir.join("memory.bin"),
+        ),
+        _ => None,
+    };
     let temp_memory_path = if has_base && !diff_in_place {
         temp_snapshot_dir.join("memory.diff")
     } else {
@@ -6708,6 +6722,11 @@ pub async fn create_snapshot_core(
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("copying base memory to temp for merge");
         }
+        inheritance = crate::storage::inherit::inherit_page_cache(
+            &snapshot_config.name,
+            base_source,
+            &final_memory_path,
+        );
 
         // Run merge in blocking task since it's CPU/IO bound
         // Merge from memory.diff onto memory.bin
@@ -6755,6 +6774,10 @@ pub async fn create_snapshot_core(
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
+    // The reads stop here: publication can remove the parent's generation.
+    if let Some(inheritance) = inheritance.take() {
+        inheritance.finish().await;
+    }
     let publish_started = std::time::Instant::now();
     publish_snapshot_dir(
         &temp_snapshot_dir,
@@ -8427,6 +8450,44 @@ mod tests {
         assert!(
             offsets.windows(2).all(|pair| pair[0] < pair[1]),
             "the Firecracker restore does not run {steps:?} in that order: offsets {offsets:?}"
+        );
+    }
+
+    /// A diff snapshot's new memory file shares the parent's extents and none of its page
+    /// cache, so the create reads the parent's cached pages into it (`storage::inherit`): from
+    /// when the file exists, on the in-place path once it is known to take the diff and on the
+    /// merge path once the base is copied, until just before publication, which can remove the
+    /// parent. `the_new_file_caches_the_pages_the_parent_cached` is the mechanism's test; no
+    /// fake VMM can drive a create, so where the create calls it is pinned by its source.
+    #[test]
+    fn a_diff_snapshot_inherits_the_parents_page_cache_until_it_publishes() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn create_snapshot_core(")
+            .expect("no Firecracker snapshot create");
+        let end = source[start..]
+            .find("pub async fn create_snapshot_ch(")
+            .expect("no Cloud Hypervisor create after the Firecracker one");
+        // Compared without whitespace, so rustfmt's line breaks do not move a step.
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let body = flat(&source[start..start + end]);
+        let steps = [
+            "Some(base) if has_base && diff_in_place => crate::storage::inherit::inherit_page_cache(",
+            "tokio::fs::copy(base_source, &final_memory_path)",
+            "crate::storage::inherit::inherit_page_cache(&snapshot_config.name, base_source, &final_memory_path",
+            "inheritance.finish().await",
+            "publish_snapshot_dir(",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(&flat(step))
+                    .unwrap_or_else(|| panic!("the snapshot create has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "the snapshot create does not run {steps:?} in that order: offsets {offsets:?}"
         );
     }
 
