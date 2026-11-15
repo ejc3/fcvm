@@ -52,7 +52,7 @@ class GateTests(unittest.TestCase):
     # A status as ejc3/aws#862's gate returns it: the live receipt and the placement serving it.
     def status(self, **changes):
         placement = {"current": True, "settled": True, "release_hosts": list(self.HOSTS),
-                     "release_tiles": list(self.TILES), "digest": "d" * 64}
+                     "release_tiles": list(self.TILES), "digest": "d" * 64, "changed_kinds": ["host", "tile"]}
         placement.update(changes.pop("placement", {}))
         value = {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build", "source_sha": "a" * 40,
                  "verified": False, "rollback": False, "placement": placement}
@@ -118,6 +118,49 @@ class GateTests(unittest.TestCase):
         self.assertIn("release pointer: rolled back", out.getvalue())
         self.assertIn("running hosts:", out.getvalue())
 
+    def test_host_only_release_ignores_failure_from_unchanged_ec2_tile(self):
+        prior = self.status(placement={"changed_kinds": ["host"]})
+        summary = self.summary("v6", failed=1)
+        summary["attribution"][-1] = self.attribution(hosts=[], instances=self.TILES, ok=False)
+        gate = Lambda(prior, {"status": "rolled_back"})
+        self.assertEqual(self.decide(gate, before=prior, v6=json.dumps(summary)), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_release_chooses_failure_from_the_changed_image_not_a_prior_unrelated_failure(self):
+        for changed_kind, first, second in (
+            ("host", self.attribution(hosts=[], instances=self.TILES, ok=False), self.attribution(ok=False)),
+            ("tile", self.attribution(ok=False), self.attribution(hosts=[], instances=self.TILES, ok=False)),
+        ):
+            with self.subTest(changed_kind=changed_kind):
+                prior = self.status(placement={"changed_kinds": [changed_kind]})
+                summary = self.summary("v6", failed=2)
+                summary["attribution"][-2:] = [first, second]
+                gate = Lambda(prior, {"status": "rolled_back"})
+                self.assertEqual(self.decide(gate, before=prior, v6=json.dumps(summary)), 0)
+                self.assertEqual(gate.payloads[-1]["action"], "rollback")
+                self.assertEqual(gate.payloads[-1]["evidence"], {
+                    "kind": "image_failure", "family": "v6", "hosts": second["hosts"], "instances": second["instances"],
+                })
+
+    def test_neither_image_changed_does_not_make_a_failure_a_pass_or_a_rollback(self):
+        prior = self.status(placement={"changed_kinds": []})
+        gate = Lambda(prior, {"status": "rolled_back"})
+        self.assertEqual(self.decide(gate, before=prior, v6=self.family("v6", failed=1)), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_no_or_malformed_changed_kinds_cannot_ready_a_release(self):
+        for value in (None, "host", ["no-such-kind"], ["host", "host"], [["host"]]):
+            with self.subTest(value=value):
+                prior = self.status(placement={"changed_kinds": value})
+                gate = Lambda()
+                self.assertEqual(self.decide(gate, before=prior), 0)
+                self.assertEqual(gate.payloads, [])
+        legacy = self.status()
+        del legacy["placement"]["changed_kinds"]
+        gate = Lambda()
+        self.assertEqual(self.decide(gate, before=legacy), 0)
+        self.assertEqual(gate.payloads, [])
+
     def test_an_attributed_transport_failure_does_not_roll_back(self):
         # This now happens after the coordinator supplied a known release host. A socket
         # timeout is still no answer from the application on that image.
@@ -146,6 +189,8 @@ class GateTests(unittest.TestCase):
             lambda s: s["attribution"][-1].update(verdict="pass"),
             lambda s: s["attribution"][-1].update(mode="aggregate"),
             lambda s: s["attribution"][-1].update(mode="potato"),
+            lambda s: s["attribution"][-1].update(instances=[self.digest(self.TILES[0])]),
+            lambda s: s["attribution"][-1].update(hosts=[self.digest(h) for h in self.HOSTS]),
             lambda s: s["attribution"][0].update(ok=1),
             lambda s: [e.update(mode="wall") for e in s["attribution"]],
         )
@@ -171,7 +216,8 @@ class GateTests(unittest.TestCase):
 
     def test_a_placement_that_changed_during_the_probe_decides_nothing(self):
         for after in (self.status(placement={"digest": "e" * 64}), self.status(generation=16),
-                      self.status(build_id="fcvm-fleet-image-factory:other")):
+                      self.status(build_id="fcvm-fleet-image-factory:other"),
+                      self.status(placement={"changed_kinds": ["tile"]})):
             with self.subTest(after=after):
                 gate = Lambda(after)
                 self.assertEqual(self.decide(gate, v4=self.family("v4", failed=3)), 0)
@@ -193,9 +239,11 @@ class GateTests(unittest.TestCase):
         self.assertEqual(gate.payloads, [])
 
     def test_a_refused_rollback_fails_the_job(self):
-        gate = Lambda(self.status(), {"status": "refused", "reason": "the live release has no previous release to roll back to"})
-        with self.assertRaisesRegex(SystemExit, "no previous release"):
-            self.decide(gate, v4=self.family("v4", failed=1))
+        for reason in ("the live release has no previous release to roll back to", "the previous release was not verified"):
+            with self.subTest(reason=reason):
+                gate = Lambda(self.status(), {"status": "refused", "reason": reason})
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.decide(gate, v4=self.family("v4", failed=1))
 
     def test_status_writes_whether_the_live_release_is_ready_to_smoke(self):
         for status, ready in ((self.status(), "true"), (self.status(verified=True), "false"),

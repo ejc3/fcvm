@@ -767,9 +767,11 @@ def probe_tile(mode, half, tile, family, admit, viewer, resolvers, takeover=None
             connection.close()
         probe.ok = True
     except Exception as error:
-        # An aggregate can relay data from another service, so a bad aggregate frame
-        # is not proof the image supplying its tiles caused the failure.
-        probe.image_failure = isinstance(error, InvalidViewerPayload) and mode != "aggregate"
+        # An aggregate may relay another service. Only direct probes with one attributable
+        # source can blame a host or tile image for invalid data.
+        gpu_host = half == "fcvm" and len(probe.hosts) == 1 and not probe.instances
+        ec2_tile = half == "ec2" and mode == "wall" and len(probe.instances) == 1 and not probe.hosts
+        probe.image_failure = isinstance(error, InvalidViewerPayload) and mode != "aggregate" and (gpu_host or ec2_tile)
         probe.error = fixed(error)
     return probe
 

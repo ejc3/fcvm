@@ -1,8 +1,8 @@
 name: Fleet image release gate
 
 # Run the staging viewer smoke on both address families for each new image release. Both pass:
-# verify the generation. A probe receives invalid application data from a release host or tile
-# and neither family has an inconclusive probe: the gate may return to the live receipt's own
+# verify the generation. A probe receives invalid application data from a host or tile on a
+# changed image and neither family has an inconclusive probe: the gate may return to the live receipt's own
 # previous release, and marks the rollback verified so it cannot roll back in turn. Transport,
 # credentials, runner and coordinator failures fail the smoke without writing a release verdict.
 # The release gate (ejc3/aws fcvm-fleet-ami-pipeline.tf) rechecks the exact receipt, placement

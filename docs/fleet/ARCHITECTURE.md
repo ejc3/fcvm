@@ -104,8 +104,10 @@ issue.
 The image release gate uses the same smoke, but a failed smoke does not automatically mean
 the image should be withdrawn. It rechecks that both families probed the same live release
 and placement. A decoder, network, authentication, coordinator or other inconclusive error
-leaves the release pending. Rollback requires positive evidence, such as malformed frame
-data from an identified stream or an invalid map sent after a Minecraft server's own hello.
+leaves the release pending. Rollback requires positive evidence from a host or tile on an
+image that changed, such as malformed frame data from an identified stream or an invalid map
+sent after a Minecraft server's own hello. Failures confined to unchanged images also leave
+the release pending.
 A blank frame or map still fails the viewer smoke but may be a warm-up symptom, so it does
 not withdraw the image.
 

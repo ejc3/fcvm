@@ -599,7 +599,7 @@ class ViewerPathTests(unittest.TestCase):
         return {"id": "t:1", "slot": "mc-1" if mode == "minecraft" else "win-1", "phase": "running",
                 key: url, **extra}
 
-    def probe(self, mode, tile, family="v4", server=None, admit="v1.9.v-1.mac", ports=None, **kw):
+    def probe(self, mode, tile, family="v4", server=None, admit="v1.9.v-1.mac", ports=None, half="fcvm", **kw):
         addr = ipaddress.ip_address(server.host) if server else ipaddress.ip_address("192.0.2.9")
         declared = ports if ports is not None else {server.port} if server else None
         patches = [patch.object(smoke, "lookup", lambda host, fam, r: [addr]),
@@ -610,7 +610,7 @@ class ViewerPathTests(unittest.TestCase):
             for p in patches:
                 stack.enter_context(p)
             stack.enter_context(patch.object(smoke, "PROBE_SECONDS", 3))
-            return smoke.probe_tile(mode, "fcvm", tile, family, admit, "v-1", ["192.0.2.53"], **kw)
+            return smoke.probe_tile(mode, half, tile, family, admit, "v-1", ["192.0.2.53"], **kw)
 
     def test_a_streaming_tile_decodes_to_a_picture_over_each_family(self):
         for family in ("v4", "v6"):
@@ -686,10 +686,18 @@ class ViewerPathTests(unittest.TestCase):
             send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
             send_server(s, b"not a valid frame", opcode=2)
 
-        for mode, verdict in (("wall", "image_failure"), ("aggregate", "inconclusive")):
-            with self.subTest(mode=mode):
+        host = {"host": "i-0example0host00a"}
+        instance = {"half": "ec2", "vm": "i-0example0tile00a"}
+        for mode, half, attribution, verdict in (
+            ("wall", "fcvm", host, "image_failure"),
+            ("wall", "ec2", instance, "image_failure"),
+            ("wall", "fcvm", {}, "inconclusive"),
+            ("wall", "fcvm", instance, "inconclusive"),
+            ("aggregate", "fcvm", host, "inconclusive"),
+        ):
+            with self.subTest(mode=mode, half=half, attribution=attribution):
                 server = FakeViewerServer(self, "v4", malformed)
-                p = self.probe(mode, self.tile(mode, server), "v4", server)
+                p = self.probe(mode, self.tile(mode, server, **attribution), "v4", server, half=half)
                 self.assertFalse(p.ok)
                 self.assertEqual(p.error[1], "a frame message without FCVF framing")
                 self.assertEqual(p.attributed()["verdict"], verdict)
@@ -735,7 +743,8 @@ class ViewerPathTests(unittest.TestCase):
         ):
             with self.subTest(step=step):
                 server = FakeViewerServer(self, "v4", self.minecraft(messages))
-                p = self.probe("minecraft", self.tile("minecraft", server), "v4", server)
+                tile = self.tile("minecraft", server, host="i-0example0host00a")
+                p = self.probe("minecraft", tile, "v4", server)
                 self.assertEqual((p.ok, p.step), (False, step))
                 self.assertEqual(p.attributed()["verdict"], verdict)
 

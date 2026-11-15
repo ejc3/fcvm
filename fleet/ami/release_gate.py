@@ -6,8 +6,8 @@ The gate is a Lambda in the control account (ejc3/aws fcvm-fleet-ami-pipeline.tf
 (`generation`, `build_id`) and the placement serving it: `current` (every live host and tile runs
 the receipt's images), `settled` (every live host has been up long enough to serve),
 `release_hosts` and `release_tiles` (the instance ids of the live hosts on the release's host
-image and of the live EC2 tiles on its tile image), and a `digest` of that placement. `verify`
-and `rollback` take the receipt and the digest and the gate refuses either if the live receipt or
+image and of the live EC2 tiles on its tile image), and a `digest` of that placement.
+`changed_kinds` lists which image kinds differ from the previous release. `verify` and `rollback` take the receipt and the digest and the gate refuses either if the live receipt or
 the placement has moved (ejc3/aws#862). Instance ids are never printed or handed on: `status`
 replaces them by digests (attribution_digest), the form the smoke records them in.
 
@@ -23,7 +23,8 @@ Only a verdict the release caused decides anything:
 - the placement was ready before the probes and is identical after them: the same receipt, the
   same digest, current and settled.
 All passes verify the receipt. An attributed, positive application failure rolls it back
-only when there are no inconclusive probes in either family. A socket, DNS, TLS, authentication,
+only if that probe served a changed image and neither family has an inconclusive probe.
+Failure on an unchanged image alone does not verify or roll back the receipt. A socket, DNS, TLS, authentication,
 setup, decoder, timeout or coordinator failure still fails the smoke, but it does not prove
 the release failed. Missing or ambiguous evidence decides nothing, and a later run retries.
 The rollback includes the failing family's hashed host and tile attribution so the gate can
@@ -112,6 +113,10 @@ def placement_problem(status):
         return "no live host runs the release's host image"
     if not isinstance(p.get("digest"), str) or not p["digest"]:
         return "the placement has no digest"
+    kinds = p.get("changed_kinds")
+    if (not isinstance(kinds, list) or any(kind not in ("host", "tile") for kind in kinds)
+            or len(set(kinds)) != len(kinds)):
+        return "the placement does not identify its changed image kinds"
     return None
 
 
@@ -151,10 +156,11 @@ def unattributed(summary, placement):
         mode, verdict, ok = entry.get("mode"), entry.get("verdict"), entry.get("ok")
         if mode not in (*MODES, "aggregate"):
             return "has a probe for an unknown mode"
-        if (verdict not in ("pass", "image_failure", "inconclusive")
-                or ok is not (verdict == "pass")
-                or (verdict == "image_failure" and mode in ("aggregate", "potato"))):
+        if verdict not in ("pass", "image_failure", "inconclusive") or ok is not (verdict == "pass"):
             return "has a probe without a valid verdict"
+        if verdict == "image_failure" and (mode in ("aggregate", "potato")
+                or len(named[0]) + len(named[1]) != 1 or (named[1] and mode != "wall")):
+            return "has an image failure without one direct host or tile instance"
         modes.add(mode)
         failed += not ok
     if not set(MODES) <= modes:
@@ -177,20 +183,31 @@ def decide(before, v4, v6, run):
     problem = placement_problem(after)
     if problem:
         return None, f"no verdict: after the probes {problem}"
-    if receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]:
+    changed = set(after["placement"]["changed_kinds"])
+    if (receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]
+            or changed != set(before["placement"]["changed_kinds"])):
         return None, "no verdict: the release or its placement changed during the probes"
     for name, summary in summaries.items():
         problem = unattributed(summary, after["placement"])
         if problem:
             return None, f"no verdict: {name} {problem}"
     evidence = None
+    saw_failure = False
     for family, summary in summaries.items():
         for entry in summary["attribution"]:
             if entry["verdict"] == "inconclusive":
                 return None, f"no verdict: {family} has an inconclusive probe"
-            if entry["verdict"] == "image_failure" and evidence is None:
+            if entry["verdict"] != "image_failure":
+                continue
+            saw_failure = True
+            # Each positive failure names one direct instance. An unchanged image does
+            # not prove why this release fails and cannot mask an eligible proof later.
+            kind = "host" if entry["hosts"] else "tile"
+            if evidence is None and kind in changed:
                 evidence = {"kind": "image_failure", "family": family,
                             "hosts": entry["hosts"], "instances": entry["instances"]}
+    if saw_failure and evidence is None:
+        return None, "no verdict: the failed probes served only unchanged images"
     payload = {"action": "rollback" if evidence else "verify", "receipt": receipt(before),
                "placement": before["placement"]["digest"]}
     if evidence:
