@@ -24,8 +24,15 @@
 //!
 //! Recording comes before creating, so a kill between the two leaves a record of something
 //! that does not exist, and undoing it finds nothing. That is safe only for names no other
-//! process can create, which holds for every resource here: a VM's directory is named by
-//! its random vm_id and a temporary by a random UUID.
+//! process can create, which holds for a VM's directory, named by its random vm_id, and a
+//! temporary, named by a random UUID.
+//!
+//! A snapshot create's staging directory (`<tag>.creating`) is the exception: every create
+//! of one tag stages under that name, so a killed create's record names a directory that a
+//! later create of the tag makes again. A create holds the tag's lock exclusively for as
+//! long as it uses the directory, so the undo removes it only under that lock, taken
+//! without waiting, and leaves it while a create holds the lock
+//! ([`Resource::SnapshotStaging`]).
 //!
 //! Network objects follow the same rule with one change, because their names are not
 //! random: a namespace is named from a few characters of the vm_id and settled by
@@ -59,6 +66,12 @@ use tracing::{debug, info, warn};
 pub enum Resource {
     /// A VM's runtime directory. Removed whole.
     RuntimeDir { path: PathBuf },
+    /// A snapshot create's staging directory (`<tag>.creating`), which is renamed into
+    /// place or removed when the create finishes. Every create of the tag uses this name
+    /// while it holds `lock`, the tag's lock, exclusively, so the directory is removed
+    /// only under that lock: with a plain `Temp`, the record of a killed create would
+    /// remove the directory a live create of the same tag is writing.
+    SnapshotStaging { path: PathBuf, lock: PathBuf },
     /// A temporary file or directory that is renamed into place or removed when its
     /// operation finishes.
     Temp { path: PathBuf },
@@ -99,6 +112,7 @@ impl Resource {
         !matches!(
             self,
             Resource::RuntimeDir { .. }
+                | Resource::SnapshotStaging { .. }
                 | Resource::Temp { .. }
                 | Resource::LinkedMemory { .. }
                 | Resource::Unknown
@@ -115,6 +129,9 @@ impl std::fmt::Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
+            Resource::SnapshotStaging { path, .. } => {
+                write!(f, "snapshot staging directory {}", path.display())
+            }
             Resource::Unknown => write!(f, "a resource of a kind this build does not know"),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
             Resource::LinkedMemory { path, .. } => write!(f, "memory file {}", path.display()),
@@ -789,8 +806,8 @@ pub(crate) enum Undo {
     Done,
     /// Still there; a later launch tries again.
     Kept(String),
-    /// Still there because a live process uses it: a lease on it is held. Not a failure;
-    /// the record stays until a launch finds it unused.
+    /// Still there because a live process uses it: a lease or a lock on it is held. Not a
+    /// failure; the record stays until a launch finds it unused.
     InUse(String),
 }
 
@@ -867,6 +884,7 @@ async fn undo_all(
 async fn undo(resource: &Resource) -> Undo {
     match resource {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
+        Resource::SnapshotStaging { path, lock } => undo_snapshot_staging(path, lock).await,
         Resource::Unknown => Undo::Done,
         Resource::Temp { path } => undo_temp(path).await,
         Resource::LinkedMemory { path, link } => undo_linked_memory(path, link),
@@ -1017,6 +1035,108 @@ async fn undo_temp(path: &Path) -> Undo {
         Ok(()) => Undo::Done,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Err(error) => Undo::Kept(error.to_string()),
+    }
+}
+
+/// Remove a snapshot staging directory that no create is using. A create holds the tag's
+/// lock exclusively from before it makes the directory until it has renamed or removed it,
+/// so the lock is taken here without waiting and held across the removal: a create that
+/// holds it keeps its directory, and a create that starts meanwhile waits for the removal
+/// to finish before it stages.
+async fn undo_snapshot_staging(path: &Path, lock: &Path) -> Undo {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {}
+        // Renamed into place, or removed by a later create of the tag. The lock is not
+        // opened: that would make a lock file for a tag that may be gone.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Undo::Done,
+        Err(error) => return Undo::Kept(format!("cannot stat {}: {error}", path.display())),
+    }
+    // Never truncated or unlinked: every holder locks this one inode.
+    let held = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock)
+    {
+        Ok(file) => file,
+        Err(error) => return Undo::Kept(format!("cannot open {}: {error}", lock.display())),
+    };
+    match fs2::FileExt::try_lock_exclusive(&held) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Undo::InUse(format!(
+                "{} is locked by a snapshot command that is running",
+                lock.display()
+            ))
+        }
+        Err(error) => return Undo::Kept(format!("cannot lock {}: {error}", lock.display())),
+    }
+    let removed = crate::storage::disk::remove_snapshot_dir(path).await;
+    drop(held);
+    match removed {
+        Ok(()) => Undo::Done,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
+        Err(error) => Undo::Kept(error.to_string()),
+    }
+}
+
+/// The record of a snapshot staging directory, for the create that makes it
+/// ([`record_snapshot_staging`]).
+///
+/// Dropping it deletes the record when the directory is gone, which is how every create
+/// leaves it: renamed into place, or removed on a failure. The create still holds the tag's
+/// lock then, so no other create can have made the directory again. A directory that is
+/// still there (an early return that removed nothing, a cancelled create) keeps its record,
+/// and the next launch removes both. A SIGKILLed create drops nothing, and the next launch
+/// does the same.
+pub struct SnapshotStagingRecord {
+    path: PathBuf,
+    owner: Option<Owner>,
+}
+
+/// Record the staging directory `path` of a snapshot whose tag lock is `lock`, before
+/// making it. The caller holds `lock` exclusively, and keeps the returned record until it
+/// has renamed `path` into place or removed it.
+pub fn record_snapshot_staging(path: &Path, lock: &Path) -> Result<SnapshotStagingRecord> {
+    record_snapshot_staging_in(&owner_dir()?, path, lock)
+}
+
+/// [`record_snapshot_staging`] with its record in the owner directory `owners`.
+pub fn record_snapshot_staging_in(
+    owners: &Path,
+    path: &Path,
+    lock: &Path,
+) -> Result<SnapshotStagingRecord> {
+    // An owner of its own: `snapshot create` runs in a process that owns no VM.
+    let owner = Owner::begin_in(
+        owners,
+        &format!("snapshot-staging-{}", uuid::Uuid::new_v4().simple()),
+    )?;
+    owner.record(Resource::SnapshotStaging {
+        path: path.to_path_buf(),
+        lock: lock.to_path_buf(),
+    })?;
+    Ok(SnapshotStagingRecord {
+        path: path.to_path_buf(),
+        owner: Some(owner),
+    })
+}
+
+impl Drop for SnapshotStagingRecord {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = owner.discard() {
+                    warn!(path = %self.path.display(), error = %format!("{error:#}"),
+                        "deleting a snapshot staging directory's record");
+                }
+            }
+            // Still there, or unreadable: the record stays for the next launch.
+            _ => drop(owner),
+        }
     }
 }
 
@@ -1274,6 +1394,13 @@ mod tests {
             crate::setup::StoreTemp::new_in(&dir, &root.join("kernels/vmlinux.bin")).unwrap();
         std::fs::create_dir_all(root.join("kernels")).unwrap();
         std::fs::write(store_temp.path(), b"partial kernel").unwrap();
+        // A snapshot create: it holds the tag's lock and has staged the memory image.
+        let (_, staging, lock) = snapshot_paths(root);
+        let tag_lock = std::fs::File::create(&lock).unwrap();
+        fs2::FileExt::lock_exclusive(&tag_lock).unwrap();
+        let _staging = record_snapshot_staging_in(&dir, &staging, &lock).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("memory.bin"), b"partial memory").unwrap();
         println!("{CHILD_READY}");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -1318,12 +1445,14 @@ mod tests {
 
         let dir = owner_dir_in(root.path()).unwrap();
         let (runtime_dir, temp) = child_resources(root.path());
+        let (_, staging, _) = snapshot_paths(root.path());
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed::default(),
             "a pass reclaimed resources of a live owner"
         );
         assert!(runtime_dir.join("disks/rootfs.raw").exists() && temp.exists());
+        assert!(staging.join("memory.bin").exists());
 
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(child.id() as i32),
@@ -1337,17 +1466,22 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(
-            runtime_dir.exists() && temp.exists() && store_temps().len() == 1,
+            runtime_dir.exists() && temp.exists() && store_temps().len() == 1 && staging.exists(),
             "the resources are gone before any pass ran"
         );
 
+        // The kill released the tag's lock, so the staging directory goes too.
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
-                owners: 2,
-                resources: 3,
+                owners: 3,
+                resources: 4,
                 remaining: 0
             }
+        );
+        assert!(
+            !staging.exists(),
+            "the killed create's staging directory is left"
         );
         assert!(
             store_temps().is_empty(),
@@ -1656,6 +1790,156 @@ mod tests {
         assert_eq!(child(65533), second, "the second owner lost its directory");
     }
 
+    /// A snapshot's directory under `root`, with its staging directory and its tag lock as
+    /// `commands::common::snapshot_sibling` names them.
+    fn snapshot_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let snapshot = root.join("snapshots").join("app.v1");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        let sibling = |suffix| crate::commands::common::snapshot_sibling(&snapshot, suffix);
+        (snapshot.clone(), sibling("creating"), sibling("lock"))
+    }
+
+    /// What a create that was killed after it staged leaves: the staging directory with a
+    /// memory file in it, and its record, with no owner alive.
+    fn killed_create(dir: &Path, staging: &Path, lock: &Path) {
+        let record = record_snapshot_staging_in(dir, staging, lock).unwrap();
+        assert_eq!(
+            files_in(dir).len(),
+            2,
+            "the record is not on disk before the staging directory is made"
+        );
+        std::fs::create_dir(staging).unwrap();
+        std::fs::write(staging.join("memory.bin"), b"memory").unwrap();
+        // The directory is still there, so the record stays, as after a SIGKILL.
+        drop(record);
+        assert_eq!(
+            files_in(dir).len(),
+            2,
+            "the record of a left directory is gone"
+        );
+    }
+
+    /// Every create of a tag stages in `<tag>.creating`. The record of a killed create names
+    /// the directory a later create of the tag is writing, and a pass leaves that directory
+    /// while the later create holds the tag's lock.
+    ///
+    /// RED WITHOUT THE LOCK: the pass removed the live create's staging directory, as it
+    /// would with the directory recorded as a `Temp`.
+    #[tokio::test]
+    async fn a_staging_directory_stays_while_a_create_holds_its_tag_lock() {
+        let (root, dir) = test_dir();
+        let (snapshot, staging, lock) = snapshot_paths(root.path());
+        killed_create(&dir, &staging, &lock);
+        // A later create of the tag: it holds the lock and writes the same directory.
+        let live_create = crate::commands::common::acquire_snapshot_dir_lock(&snapshot, true)
+            .await
+            .unwrap();
+        let resource = Resource::SnapshotStaging {
+            path: staging.clone(),
+            lock: lock.clone(),
+        };
+        assert!(
+            matches!(undo(&resource).await, Undo::InUse(_)),
+            "the undo did not report a staging directory whose tag lock is held as in use"
+        );
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 0,
+                resources: 0,
+                remaining: 1
+            },
+            "a pass did not keep the record of a live create's staging directory"
+        );
+        assert!(
+            staging.join("memory.bin").exists(),
+            "a pass removed the staging directory a live create holds the tag lock for"
+        );
+        let names = files_in(&dir);
+        let name = names
+            .iter()
+            .find(|name| name.ends_with(".json"))
+            .unwrap_or_else(|| panic!("the record did not stay: {names:?}"));
+        let record: Record =
+            serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap();
+        assert_eq!(record.resources, [resource]);
+        drop(live_create);
+    }
+
+    /// With nobody holding the tag's lock, the pass removes a killed create's staging
+    /// directory and its record. The lock file stays: its inode is what every holder locks.
+    ///
+    /// RED WITHOUT THE UNDO: the directory stayed, as it does in a build that does not
+    /// know the resource kind.
+    #[tokio::test]
+    async fn a_staging_directory_nobody_holds_the_tag_lock_for_is_removed() {
+        let (root, dir) = test_dir();
+        let (snapshot, staging, lock) = snapshot_paths(root.path());
+        // The killed create held the lock, and its death released it.
+        let killed = crate::commands::common::acquire_snapshot_dir_lock(&snapshot, true)
+            .await
+            .unwrap();
+        killed_create(&dir, &staging, &lock);
+        drop(killed);
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 1,
+                resources: 1,
+                remaining: 0
+            }
+        );
+        assert!(!staging.exists(), "the staging directory is left");
+        assert!(lock.exists(), "the tag's lock file was unlinked");
+        assert!(
+            files_in(&dir).is_empty(),
+            "owner files left: {:?}",
+            files_in(&dir)
+        );
+    }
+
+    /// A create that renamed its staging directory into place, or removed it, leaves no
+    /// record. A record whose directory a later create already cleared is dropped without
+    /// making a lock file for the tag.
+    #[tokio::test]
+    async fn a_staging_record_goes_with_its_directory() {
+        let (root, dir) = test_dir();
+        let (snapshot, staging, lock) = snapshot_paths(root.path());
+        // Renamed into place.
+        let record = record_snapshot_staging_in(&dir, &staging, &lock).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::rename(&staging, &snapshot).unwrap();
+        drop(record);
+        assert!(
+            files_in(&dir).is_empty(),
+            "a published snapshot left its staging record: {:?}",
+            files_in(&dir)
+        );
+        // Removed on a failure.
+        let record = record_snapshot_staging_in(&dir, &staging, &lock).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::remove_dir(&staging).unwrap();
+        drop(record);
+        assert!(
+            files_in(&dir).is_empty(),
+            "a failed create that removed its staging directory left its record: {:?}",
+            files_in(&dir)
+        );
+        // Left by a killed create, then cleared by the next create of the tag.
+        killed_create(&dir, &staging, &lock);
+        std::fs::remove_dir_all(&staging).unwrap();
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 1,
+                resources: 1,
+                remaining: 0
+            }
+        );
+        assert!(files_in(&dir).is_empty());
+        assert!(!lock.exists(), "the pass made a lock file for a tag");
+    }
+
     /// The body of the function whose definition starts with `signature` in `source`.
     fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
@@ -1681,15 +1965,32 @@ mod tests {
     /// #1316: every helper a reclaim pass runs to undo a kernel object dies with the pass. A
     /// pass killed while its `iptables -D` was stopped left the delete to run later, after the
     /// names and addresses could belong to a new VM. Each function `undo` reaches spawns its
-    /// commands with `crate::utils::helper_command`, and `undo` reaches no other.
+    /// commands with `crate::utils::helper_command`, and `undo` reaches no other. The same
+    /// holds for a snapshot staging directory, whose name the next create of the tag takes:
+    /// its removal spawns only `btrfs subvolume delete`, through `delete_subvolume`.
     ///
     /// RED BEFORE THE FIX: every one of them spawned with `Command::new`.
     #[test]
     fn every_undo_helper_dies_with_the_pass_that_runs_it() {
         let reclaim = include_str!("reclaim.rs");
         let undo = body_of(reclaim, "async fn undo(resource: &Resource) -> Undo {");
-        let checked: [(&str, &str, &[&str]); 5] = [
+        let disk = include_str!("storage/disk.rs");
+        assert!(
+            body_of(
+                reclaim,
+                "async fn undo_snapshot_staging(path: &Path, lock: &Path) -> Undo {"
+            )
+            .contains("crate::storage::disk::remove_snapshot_dir(path)"),
+            "a snapshot staging directory is not removed by remove_snapshot_dir"
+        );
+        let remove = body_of(disk, "pub async fn remove_snapshot_dir(");
+        assert!(
+            remove.contains("delete_subvolume(") && !remove.contains("Command"),
+            "remove_snapshot_dir spawns a helper of its own: check it and list it here"
+        );
+        let checked: [(&str, &str, &[&str]); 6] = [
             ("reclaim", reclaim, &["async fn undo_rule("]),
+            ("storage::disk", disk, &["async fn delete_subvolume("]),
             (
                 "network::namespace",
                 include_str!("network/namespace.rs"),
