@@ -754,6 +754,48 @@ pub struct Fleet {
     /// when it cannot say, or the coordinator launches none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hosts: Option<std::collections::BTreeSet<String>>,
+    /// Every host whose agent registered, since this coordinator started or resumed.
+    #[serde(default)]
+    pub registrations: Registrations,
+}
+
+/// The hosts whose agent said hello to this coordinator, by name (the EC2 instance id), since
+/// `since`: when this coordinator started or resumed, the earliest time it vouches for. The
+/// release gate's no-agent verdict reads it (fleet/ami/release_gate.py): a host absent from it
+/// never registered since `since`. A host whose agent is gone stays in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registrations {
+    pub since: u64,
+    pub hosts: BTreeMap<String, Registration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registration {
+    pub first_at: u64,
+    pub last_at: u64,
+}
+
+impl Registrations {
+    /// Hosts kept; past this the one registered longest ago goes. A staging release has a
+    /// handful of hosts, and an EC2 id is never reused.
+    pub const MAX: usize = 256;
+
+    pub fn registered(&mut self, host: &str, at: u64) {
+        let r = self.hosts.entry(host.to_string()).or_insert(Registration {
+            first_at: at,
+            last_at: at,
+        });
+        r.last_at = r.last_at.max(at);
+        while self.hosts.len() > Self::MAX {
+            let oldest = self
+                .hosts
+                .iter()
+                .min_by_key(|(name, r)| (r.last_at, (*name).clone()))
+                .map(|(name, _)| name.clone())
+                .expect("over the bound means not empty");
+            self.hosts.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -836,6 +878,10 @@ impl State {
                 minecraft_to_reset: BTreeMap::new(),
                 potato: Default::default(),
                 expected_hosts: None,
+                registrations: Registrations {
+                    since: now_ms,
+                    hosts: BTreeMap::new(),
+                },
             },
             config,
             receipts: BTreeMap::new(),
@@ -851,6 +897,11 @@ impl State {
         let f = &mut self.fleet;
         // the ladder and the records stay; the round and the players went with the agent
         f.potato.resumed();
+        // Registrations it had not stored are lost, and agents reconnect only once it is back.
+        f.registrations = Registrations {
+            since: now_ms,
+            hosts: BTreeMap::new(),
+        };
         f.hosts.clear();
         f.slots.clear();
         f.phones.clear();
@@ -1002,6 +1053,86 @@ pub fn minecraft_number(id: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hello(host: &str, at: u64) -> crate::Event {
+        serde_json::from_value(serde_json::json!({
+            "at": at, "host": host, "type": "agent",
+            "msg": {"type": "hello", "host": host, "arch": "x86_64", "capacity": 1,
+                    "gpus": [{"name": "Tesla T4", "sbdf": "0000:01:00.0"}]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn every_agent_registration_is_recorded_from_the_coordinators_start() {
+        // The release gate's no-agent verdict (fleet/ami/release_gate.py) needs positive
+        // evidence that a host never registered: the record of every host whose agent did, since
+        // a time the coordinator can vouch for.
+        let mut s = State::new(Config::default(), 1000);
+        s = crate::apply(s, &hello("i-0123456789abcdef0", 2000));
+        s = crate::apply(s, &hello("i-0123456789abcdef0", 3000));
+        s = crate::apply(s, &hello("i-0fedcba9876543210", 2500));
+        assert_eq!(s.fleet.registrations.since, 1000);
+        assert_eq!(
+            s.fleet.registrations.hosts.get("i-0123456789abcdef0"),
+            Some(&Registration {
+                first_at: 2000,
+                last_at: 3000
+            })
+        );
+        let view = serde_json::to_value(crate::view(&s)).unwrap();
+        assert_eq!(
+            view["fleet"]["agents"],
+            serde_json::json!({"since": 1000, "hosts": [
+                {"name": "i-0123456789abcdef0", "first_at": 2000, "last_at": 3000},
+                {"name": "i-0fedcba9876543210", "first_at": 2500, "last_at": 2500}]})
+        );
+        // An agent that is gone stays in the record: it registered.
+        let gone: crate::Event = serde_json::from_value(serde_json::json!(
+            {"at": 4000, "host": "i-0123456789abcdef0", "type": "agent_gone"}))
+        .unwrap();
+        s = crate::apply(s, &gone);
+        assert!(s
+            .fleet
+            .registrations
+            .hosts
+            .contains_key("i-0123456789abcdef0"));
+    }
+
+    #[test]
+    fn a_resumed_coordinator_starts_its_registration_record_again() {
+        // A restart may lose registrations it had not stored, and agents reconnect only after
+        // it is back: what it vouches for starts at the resume.
+        let mut s = State::new(Config::default(), 1000);
+        s = crate::apply(s, &hello("i-0123456789abcdef0", 2000));
+        let resumed = s.resumed(Config::default(), 5000);
+        assert_eq!(
+            resumed.fleet.registrations,
+            Registrations {
+                since: 5000,
+                hosts: Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_registration_record_keeps_the_latest_hosts_within_its_bound() {
+        let mut s = State::new(Config::default(), 1000);
+        for i in 0..(Registrations::MAX as u64 + 20) {
+            s = crate::apply(s, &hello(&format!("i-{i:017x}"), 2000 + i));
+        }
+        assert_eq!(s.fleet.registrations.hosts.len(), Registrations::MAX);
+        assert!(!s
+            .fleet
+            .registrations
+            .hosts
+            .contains_key(&format!("i-{:017x}", 0)));
+        assert!(s
+            .fleet
+            .registrations
+            .hosts
+            .contains_key(&format!("i-{:017x}", Registrations::MAX as u64 + 19)));
+    }
 
     #[test]
     fn a_host_aggregator_is_named_only_when_its_host_name_fits_a_label() {

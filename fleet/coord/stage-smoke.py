@@ -525,70 +525,17 @@ def ec2_instance(vm):
     return m.group(1) if m else None
 
 
-# Matches release_gate.py AGENT_WATCH_MS: the gate decides only on a watch this long.
-AGENT_WATCH_SECONDS = 120
-
-
-def agent_names(state):
-    """The hosts with an agent registered with the coordinator in one /live snapshot
-    (fleet.hosts, named by EC2 instance id); None when the snapshot has no fleet view."""
-    hosts = (state.get("fleet") or {}).get("hosts")
-    if not isinstance(hosts, list):
+def agents_line(state, observed_at):
+    """What the release gate's no-agent verdict reads (fleet/ami/release_gate.py): the
+    coordinator's record of every host whose agent registered (/live fleet.agents, named by EC2
+    instance id) since `since`, its start or resume, by digest, and when it was read. No host id
+    is printed. None when the snapshot carries no record."""
+    agents = (state.get("fleet") or {}).get("agents")
+    if not isinstance(agents, dict) or type(agents.get("since")) is not int or not isinstance(agents.get("hosts"), list):
         return None
-    return {h["name"] for h in hosts if isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"]}
-
-
-# The agent watch pings /live this often, and gives up on an observation that leaves a longer
-# stretch than AGENT_WATCH_GAP_SECONDS without the coordinator answering.
-AGENT_WATCH_PING_SECONDS = 10
-AGENT_WATCH_GAP_SECONDS = 30
-
-
-def watch_agents(read, ping, window, clock=time.monotonic):
-    """Every host seen with an agent in any snapshot over `window` seconds of /live, and how long
-    that was, in ms. A restarted coordinator lists no agent until each reconnects (up to 30 s of
-    backoff, src/fleet/agent/dial.rs), so one snapshot is not enough. `ping()` sends a ping every
-    AGENT_WATCH_PING_SECONDS and the coordinator's `clock` answers confirm it is still serving
-    this connection; `read(deadline)` gives the next message (a dict) or raises TimeoutError at
-    the deadline. None when no snapshot came, or when any stretch of the window, from its start
-    to its end, went longer than AGENT_WATCH_GAP_SECONDS unanswered: a /live that went quiet
-    without closing observed nothing. A closed /live raises."""
-    start = clock()
-    end = start + window
-    names, snapshots = set(), 0
-    alive, next_ping = start, start
-    while True:
-        now = clock()
-        if now >= end:
-            break
-        if now - alive > AGENT_WATCH_GAP_SECONDS:
-            return None
-        if now >= next_ping:
-            ping()
-            next_ping = now + AGENT_WATCH_PING_SECONDS
-        try:
-            message = read(min(end, next_ping))
-        except TimeoutError:
-            continue
-        if not isinstance(message, dict):
-            continue
-        if message.get("type") == "clock":
-            alive = clock()
-        elif message.get("type") == "snapshot":
-            seen = agent_names(message.get("state") or {})
-            if seen is not None:
-                names |= seen
-                snapshots += 1
-    if not snapshots or clock() - alive > AGENT_WATCH_GAP_SECONDS:
-        return None
-    return names, int((clock() - start) * 1000)
-
-
-def agents_line(names, observed_at, watched_ms):
-    """What the release gate's no-agent verdict reads (fleet/ami/release_gate.py): the watched
-    hosts by digest, when the watch ended and how long it was. No host id is printed."""
-    return {"agents": sorted(attribution_digest(n) for n in names), "observed_at": observed_at,
-            "watched_ms": watched_ms}
+    names = [h["name"] for h in agents["hosts"] if isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"]]
+    return {"since": agents["since"], "registered": sorted(attribution_digest(n) for n in names),
+            "observed_at": observed_at}
 
 
 def tile_attribution(tile):
@@ -1125,19 +1072,8 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                     return message.get("outcome") == "committed"
         if agents:
             step("/live: registered agents")
-            def read(deadline):
-                opcode, payload = connection.message(deadline)
-                if opcode != 1:
-                    return None
-                message = json.loads(payload)
-                take(message)
-                return message
-            def ping():
-                connection.send({"type": "ping", "client_unix_ms": time.time() * 1000})
-            watched = watch_agents(read, ping, AGENT_WATCH_SECONDS)
-            if watched is None:
-                raise AssertionError("the coordinator did not answer throughout the agent watch")
-            print(json.dumps(agents_line(watched[0], int(time.time() * 1000), watched[1])), flush=True)
+            until(lambda s: agents_line(s, 0) is not None)
+            print(json.dumps(agents_line(state, int(time.time() * 1000))), flush=True)
             return 0
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
@@ -1251,7 +1187,7 @@ def arguments(argv):
     parser.add_argument("--relaunch", action="store_true", help="relaunch a tile per wall half")
     parser.add_argument("--takeover", action="store_true", help="borrow and drive a Minecraft server")
     parser.add_argument("--agents", action="store_true",
-                        help="print which hosts have an agent registered (digests), and nothing else")
+                        help="print the coordinator's record of registered agents (digests), and nothing else")
     args = parser.parse_args(argv)
     modes = tuple(m for m in args.modes.split(",") if m)
     if any(m not in MODES for m in modes):

@@ -124,6 +124,21 @@ pub struct FleetView {
     /// GPUs starting their VM before they join the wall (slot ids).
     pub warming: Vec<String>,
     pub power: PowerView,
+    /// Every host whose agent registered since `since` (crate::state::Registrations).
+    pub agents: AgentsView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentsView {
+    pub since: u64,
+    pub hosts: Vec<AgentSeenView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSeenView {
+    pub name: String,
+    pub first_at: u64,
+    pub last_at: u64,
 }
 
 /// Totals since the fleet was first started.
@@ -706,6 +721,19 @@ pub fn view(state: &State) -> View {
                 .map(|n| crate::state::slot_name(*n))
                 .collect(),
             power: power_view(&f.power, &state.config),
+            agents: AgentsView {
+                since: f.registrations.since,
+                hosts: f
+                    .registrations
+                    .hosts
+                    .iter()
+                    .map(|(name, r)| AgentSeenView {
+                        name: name.clone(),
+                        first_at: r.first_at,
+                        last_at: r.last_at,
+                    })
+                    .collect(),
+            },
         },
         scene: f.scene.clone(),
         image_aspect: c.image_aspect,

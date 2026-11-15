@@ -170,25 +170,19 @@ def unattributed(summary, placement):
     return None
 
 
-# How long fleet/coord/stage-smoke.py --agents watches the coordinator's registered agents. A
-# restarted coordinator lists none until each agent reconnects, which takes up to 30 s of backoff
-# (src/fleet/agent/dial.rs); every host seen in any snapshot of the window counts.
-AGENT_WATCH_MS = 120_000
-
-
 def agent_snapshot(raw):
-    """The coordinator's registered agents after the probes (fleet/coord/stage-smoke.py --agents):
-    {"agents": [digests], "observed_at": ms, "watched_ms": ms}, or None when there is none to read
-    or it was watched for less than AGENT_WATCH_MS."""
+    """The coordinator's record of registered agents (fleet/coord/stage-smoke.py --agents):
+    {"since": ms, "registered": [digests], "observed_at": ms}, every host whose agent said hello
+    since `since` (the coordinator's start or resume), or None when there is none to read."""
     try:
         value = json.loads(raw) if raw else None
     except ValueError:
         return None
-    if (isinstance(value, dict) and set(value) == {"agents", "observed_at", "watched_ms"}
-            and isinstance(value["agents"], list)
-            and all(isinstance(a, str) and DIGEST.fullmatch(a) for a in value["agents"])
-            and type(value["observed_at"]) is int and value["observed_at"] > 0
-            and type(value["watched_ms"]) is int and value["watched_ms"] >= AGENT_WATCH_MS):
+    if (isinstance(value, dict) and set(value) == {"since", "registered", "observed_at"}
+            and isinstance(value["registered"], list)
+            and all(isinstance(a, str) and DIGEST.fullmatch(a) for a in value["registered"])
+            and type(value["since"]) is int and value["since"] > 0
+            and type(value["observed_at"]) is int and value["observed_at"] >= value["since"]):
         return value
     return None
 
@@ -212,11 +206,11 @@ def decide(before, v4, v6, run, agents=""):
             or changed != set(before["placement"]["changed_kinds"])):
         return None, "no verdict: the release or its placement changed during the probes"
     # Probes that can be laid on the release decide. Only when they cannot (no summary, or probes
-    # /live named no release host for) does the coordinator's agent list: a host image that boots
-    # but never starts its agent leaves the smoke no tile to probe, and the coordinator then lists
-    # none of the release's hosts among its agents. The gate (ejc3/aws publish.py) checks the
-    # hosts are exactly the live release hosts and have been up long enough that an agent would
-    # have registered.
+    # /live named no release host for) does the coordinator's record of registrations: a host
+    # image that boots but never starts its agent leaves the smoke no tile to probe, and the record
+    # then holds none of the release's hosts. The gate (ejc3/aws publish.py) checks the hosts are
+    # exactly the live release hosts, launched after the record began and long enough before the
+    # read that an agent would have registered.
     problem = (f"no verdict: {' and '.join(missing)} reported no probe summary "
                "(setup, credentials, runner or coordinator)") if missing else None
     for name, summary in summaries.items():
@@ -225,13 +219,15 @@ def decide(before, v4, v6, run, agents=""):
             problem = f"no verdict: {name} {reason}" if reason else None
     if problem is not None:
         hosts = after["placement"]["release_hosts"]
-        if snapshot is None or set(hosts) & set(snapshot["agents"]):
+        if snapshot is None or set(hosts) & set(snapshot["registered"]):
             return None, problem
         if "host" not in changed:
-            return None, "no verdict: no release host has an agent, but this release did not change the host image"
+            return None, "no verdict: no release host registered an agent, but this release did not change the host image"
+        # The gate checks the coordinator's record began before every release host launched, so
+        # "not registered since `since`" covers each host's whole life.
         return {"action": "rollback", "receipt": receipt(before), "placement": before["placement"]["digest"],
-                "evidence": {"kind": "no_agent", "hosts": sorted(hosts),
-                             "observed_at": snapshot["observed_at"]}}, None
+                "evidence": {"kind": "no_agent", "hosts": sorted(hosts), "observed_at": snapshot["observed_at"],
+                             "coordinator_since": snapshot["since"]}}, None
     evidence = None
     saw_failure = False
     for family, summary in summaries.items():

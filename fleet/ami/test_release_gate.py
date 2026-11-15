@@ -97,11 +97,11 @@ class GateTests(unittest.TestCase):
             argv += ["--agents", agents]
         return release_gate.main(argv, run=gate)
 
-    def agents(self, instances=None, observed_at=1_794_780_000_000, watched_ms=None):
-        """The coordinator's registered agents, as stage-smoke.py --agents prints them."""
+    def agents(self, instances=None, observed_at=1_794_780_000_000, since=1_794_770_000_000):
+        """The coordinator's record of registered agents, as stage-smoke.py --agents prints it."""
         names = self.HOSTS if instances is None else instances
-        return json.dumps({"agents": sorted(self.digest(i) for i in names), "observed_at": observed_at,
-                           "watched_ms": release_gate.AGENT_WATCH_MS if watched_ms is None else watched_ms})
+        return json.dumps({"since": since, "registered": sorted(self.digest(i) for i in names),
+                           "observed_at": observed_at})
 
     def test_probes_that_decide_are_never_overruled_by_an_empty_agent_list(self):
         # A coordinator restart clears its registered agents until they reconnect (Codex on
@@ -113,12 +113,6 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.decide(gate, v4=self.family("v4", failed=1), agents=self.agents(instances=[])), 0)
         self.assertEqual(gate.payloads[1]["evidence"]["kind"], "image_failure")
 
-    def test_an_agent_list_watched_too_briefly_decides_nothing(self):
-        gate = Lambda(self.status())
-        brief = self.agents(instances=[], watched_ms=release_gate.AGENT_WATCH_MS - 1)
-        self.assertEqual(self.decide(gate, v4="", v6="", agents=brief), 0)
-        self.assertNotIn("rollback", [p.get("action") for p in gate.payloads])
-
     def test_release_hosts_without_an_agent_roll_back(self):
         # A host image that boots but never starts its agent: the smoke reaches no tile, so it
         # reports no probe summary, and the coordinator lists none of the release's hosts.
@@ -129,7 +123,7 @@ class GateTests(unittest.TestCase):
             "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
             "placement": "d" * 64,
             "evidence": {"kind": "no_agent", "hosts": sorted(self.digest(h) for h in self.HOSTS),
-                         "observed_at": 1_794_780_000_000}})
+                         "observed_at": 1_794_780_000_000, "coordinator_since": 1_794_770_000_000}})
         # An agent of a host outside the release does not count for it.
         gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
         self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=["i-0example0other0a"])), 0)
@@ -154,12 +148,11 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(gate.payloads, [{"action": "status"}])
 
     def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
-        w = release_gate.AGENT_WATCH_MS
-        for raw in ("", "not json", json.dumps({"agents": ["x"], "observed_at": 1, "watched_ms": w}),
-                    json.dumps({"agents": [], "observed_at": "now", "watched_ms": w}),
-                    json.dumps({"agents": [], "watched_ms": w}),
-                    json.dumps({"agents": [], "observed_at": 0, "watched_ms": w}),
-                    json.dumps({"agents": [], "observed_at": 1})):
+        good = {"since": 2, "registered": [], "observed_at": 3}
+        for raw in ("", "not json", json.dumps(dict(good, registered=["x"])), json.dumps(dict(good, since="then")),
+                    json.dumps({"registered": [], "observed_at": 3}), json.dumps(dict(good, since=0)),
+                    json.dumps(dict(good, observed_at=1)), json.dumps(dict(good, extra=1)),
+                    json.dumps({"agents": [], "observed_at": 3, "watched_ms": 120000})):
             with self.subTest(raw=raw):
                 gate = Lambda(self.status())
                 self.assertEqual(self.decide(gate, v4="", v6="", agents=raw), 0)
