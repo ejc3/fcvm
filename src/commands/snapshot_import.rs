@@ -161,7 +161,7 @@ use crate::storage::snapshot_archive::{
     ArchiveEntry, ArchiveManifest, ArchiveReader, ContentSha256, EntryName, ExternalRole,
     ManifestExternal, ManifestMemory,
 };
-use crate::storage::{validate_snapshot_name, SnapshotConfig, SnapshotKind};
+use crate::storage::{validate_new_snapshot_name, SnapshotConfig, SnapshotKind};
 
 /// The buffer between the input and the archive reader, for the headers, the maps and the
 /// two JSON entries, which the reader takes 512 bytes or less at a time. It is much smaller
@@ -574,7 +574,7 @@ fn read_and_check<R: Read>(
 /// host has.
 fn check_manifest(host: &ImportHost, manifest: &ArchiveManifest) -> Result<()> {
     // The tag becomes a path under the snapshot directory.
-    validate_snapshot_name(&manifest.tag).context("the archive names its snapshot")?;
+    validate_new_snapshot_name(&manifest.tag).context("the archive names its snapshot")?;
     ensure!(
         manifest.arch == std::env::consts::ARCH,
         "the archive holds a snapshot taken on {} and this host is {}; a snapshot restores \
@@ -1045,6 +1045,19 @@ fn publish_externals(
             StagedExternal::ImageDisk { temp, file } => image_disk = Some((temp, file)),
             StagedExternal::Pmem(entry) => entries.push(entry),
         }
+    }
+    // A pmem entry this host had is kept as it is. Another run links an entry before it
+    // syncs the store directory, so that name need not survive a crash yet: the directory is
+    // synced before the snapshot that names the entry gets a name, as an ingest that finds
+    // an entry makes its name durable.
+    if plans
+        .iter()
+        .any(|plan| plan.described.role == ExternalRole::Pmem && !plan.install)
+    {
+        let store_dir = crate::storage::pmem_store::store_dir_under(&host.data_dir)?;
+        File::open(&store_dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("syncing the pmem image store {}", store_dir.display()))?;
     }
     let mut kept = Vec::new();
     for plan in plans {
@@ -2241,6 +2254,25 @@ mod tests {
         let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
 
         assert!(message.contains("invalid snapshot name"), "{message}");
+    }
+
+    /// A name that ends in the suffix of a file fcvm keeps beside a snapshot's directory
+    /// (`<tag>.lock`, `<tag>.stage-lock`, ...) would put a directory where operations on
+    /// `<tag>` open that file. `snapshot create` refuses such a name, and so does an import.
+    #[tokio::test]
+    async fn a_tag_that_names_another_snapshots_auxiliary_file_is_refused() {
+        for suffix in crate::storage::snapshot::SNAPSHOT_SIBLING_SUFFIXES {
+            let (fake, archive) = exported().await;
+            let mut unpacked = Unpacked::of(&archive);
+            unpacked.manifest.tag = format!("example-tag.{suffix}");
+
+            let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+
+            assert!(
+                message.contains("names another snapshot's auxiliary file"),
+                "{suffix}: {message}"
+            );
+        }
     }
 
     /// The checks made on the manifest count only if the config says the same.
@@ -4215,6 +4247,26 @@ mod tests {
                 "create_dir_or_subvolume(staging)",
                 "create_dir_or_subvolume(&snapshot_disk_dir(staging))",
                 "stage_files(",
+            ],
+        );
+    }
+
+    /// A pmem entry the host had is kept, and another run may have linked it without yet
+    /// syncing the store directory. The import syncs that directory before it publishes the
+    /// entries it staged, and so before the snapshot that names them is written and renamed
+    /// (`the_staged_files_are_synced_before_they_are_published`). A test cannot see a sync
+    /// from outside, so the order is pinned by the source.
+    #[test]
+    fn a_kept_pmem_entry_is_made_durable_before_the_snapshot_names_it() {
+        let source = include_str!("snapshot_import.rs");
+        assert_in_order(
+            "publish_externals",
+            body_of(source, "fn publish_externals("),
+            &[
+                "plan.described.role == ExternalRole::Pmem && !plan.install",
+                "store_dir_under(&host.data_dir)",
+                ".sync_all()",
+                "store.publish_staged(",
             ],
         );
     }
