@@ -538,24 +538,48 @@ def agent_names(state):
     return {h["name"] for h in hosts if isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"]}
 
 
-def watch_agents(read, window, clock=time.monotonic):
-    """Every host seen with an agent in any snapshot `read(deadline)` gives over `window` seconds,
-    and how long that was, in ms. A restarted coordinator lists no agent until each reconnects
-    (up to 30 s of backoff, src/fleet/agent/dial.rs), so one snapshot is not enough. None when no
-    snapshot came; a closed /live raises."""
+# The agent watch pings /live this often, and gives up on an observation that leaves a longer
+# stretch than AGENT_WATCH_GAP_SECONDS without the coordinator answering.
+AGENT_WATCH_PING_SECONDS = 10
+AGENT_WATCH_GAP_SECONDS = 30
+
+
+def watch_agents(read, ping, window, clock=time.monotonic):
+    """Every host seen with an agent in any snapshot over `window` seconds of /live, and how long
+    that was, in ms. A restarted coordinator lists no agent until each reconnects (up to 30 s of
+    backoff, src/fleet/agent/dial.rs), so one snapshot is not enough. `ping()` sends a ping every
+    AGENT_WATCH_PING_SECONDS and the coordinator's `clock` answers confirm it is still serving
+    this connection; `read(deadline)` gives the next message (a dict) or raises TimeoutError at
+    the deadline. None when no snapshot came, or when any stretch of the window, from its start
+    to its end, went longer than AGENT_WATCH_GAP_SECONDS unanswered: a /live that went quiet
+    without closing observed nothing. A closed /live raises."""
     start = clock()
     end = start + window
     names, snapshots = set(), 0
-    while clock() < end:
-        try:
-            state = read(end)
-        except TimeoutError:
+    alive, next_ping = start, start
+    while True:
+        now = clock()
+        if now >= end:
             break
-        seen = agent_names(state) if isinstance(state, dict) else None
-        if seen is not None:
-            names |= seen
-            snapshots += 1
-    if not snapshots:
+        if now - alive > AGENT_WATCH_GAP_SECONDS:
+            return None
+        if now >= next_ping:
+            ping()
+            next_ping = now + AGENT_WATCH_PING_SECONDS
+        try:
+            message = read(min(end, next_ping))
+        except TimeoutError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") == "clock":
+            alive = clock()
+        elif message.get("type") == "snapshot":
+            seen = agent_names(message.get("state") or {})
+            if seen is not None:
+                names |= seen
+                snapshots += 1
+    if not snapshots or clock() - alive > AGENT_WATCH_GAP_SECONDS:
         return None
     return names, int((clock() - start) * 1000)
 
@@ -1107,10 +1131,12 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                     return None
                 message = json.loads(payload)
                 take(message)
-                return message.get("state") if message.get("type") == "snapshot" else None
-            watched = watch_agents(read, AGENT_WATCH_SECONDS)
+                return message
+            def ping():
+                connection.send({"type": "ping", "client_unix_ms": time.time() * 1000})
+            watched = watch_agents(read, ping, AGENT_WATCH_SECONDS)
             if watched is None:
-                raise AssertionError("the coordinator sent no snapshot while the agents were watched")
+                raise AssertionError("the coordinator did not answer throughout the agent watch")
             print(json.dumps(agents_line(watched[0], int(time.time() * 1000), watched[1])), flush=True)
             return 0
         if modes:

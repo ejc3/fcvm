@@ -979,30 +979,62 @@ class AttributionTests(unittest.TestCase):
         gate = load("release_gate", "../ami/release_gate.py")
         self.assertEqual(smoke.AGENT_WATCH_SECONDS * 1000, gate.AGENT_WATCH_MS)
 
+    def watch(self, script, window=120):
+        """Run watch_agents over a scripted /live: each entry is (seconds that pass, message or
+        an exception to raise); a ping is answered only when the script says so."""
+        clock, pings, script = [0.0], [], list(script)
+        def read(deadline):
+            if not script:
+                clock[0] = max(clock[0], deadline)
+                raise TimeoutError("no message")
+            wait, message = script.pop(0)
+            if clock[0] + wait > deadline:
+                script.insert(0, (clock[0] + wait - deadline, message))
+                clock[0] = deadline
+                raise TimeoutError("no message")
+            clock[0] += wait
+            if isinstance(message, Exception):
+                raise message
+            return message
+        result = smoke.watch_agents(read, lambda: pings.append(clock[0]), window, clock=lambda: clock[0])
+        return result, pings
+
+    @staticmethod
+    def live_for(seconds, hosts_at=()):
+        """A coordinator answering every ping (sent every 10 s) for `seconds`, with snapshots: no
+        agent, then the named host from each time in `hosts_at` on."""
+        script = [(0.5, {"type": "snapshot", "state": {"fleet": {"hosts": []}}})]
+        t = 0.5
+        while t < seconds:
+            names = [{"name": "i-0example0host00a"}] if any(t >= at for at in hosts_at) else []
+            script += [(9, {"type": "clock", "server_unix_ms": 1, "client_unix_ms": 1}),
+                       (1, {"type": "snapshot", "state": {"fleet": {"hosts": names}}})]
+            t += 10
+        return script
+
     def test_agents_are_watched_across_a_coordinator_recovery(self):
         # A coordinator that restarted just before the read lists no agents until they reconnect
         # (up to 30 s of backoff): every host seen in any snapshot of the window counts.
-        clock = [0.0]
-        states = [{"fleet": {"hosts": []}}, None, {"fleet": {"hosts": [{"name": "i-0example0host00a"}]}},
-                  {"fleet": {"hosts": []}}]
-        def read(deadline):
-            clock[0] += 40
-            if not states:
-                raise TimeoutError("no message")
-            return states.pop(0)
-        names, watched = smoke.watch_agents(read, 120, clock=lambda: clock[0])
+        (names, watched), pings = self.watch(self.live_for(130, hosts_at=(40,)))
         self.assertEqual(names, {"i-0example0host00a"})
         self.assertGreaterEqual(watched, 120_000)
+        self.assertGreaterEqual(len(pings), 12)
+        (names, watched), _ = self.watch(self.live_for(130))
+        self.assertEqual(names, set())
         # A /live close during the window (the coordinator going away) gives no observation.
-        def closing(deadline):
-            raise smoke.WebSocketClosed("WebSocket closed")
         with self.assertRaises(smoke.WebSocketClosed):
-            smoke.watch_agents(closing, 120, clock=lambda: 0.0)
-        # A window with no snapshot at all observes nothing.
-        def silent(deadline):
-            clock[0] += 200
-            raise TimeoutError("no message")
-        self.assertIsNone(smoke.watch_agents(silent, 120, clock=lambda: clock[0]))
+            self.watch([(1, smoke.WebSocketClosed("WebSocket closed"))])
+
+    def test_an_agent_watch_the_coordinator_stopped_answering_observes_nothing(self):
+        # Codex on #1925: one empty snapshot, then a /live that stalls without closing, must not
+        # read as two minutes with no agents.
+        result, pings = self.watch([(0.5, {"type": "snapshot", "state": {"fleet": {"hosts": []}}})])
+        self.assertIsNone(result)
+        self.assertGreater(len(pings), 1, "the watch kept asking")
+        # Answers that stop partway, leaving more than 30 s unconfirmed, observe nothing either.
+        self.assertIsNone(self.watch(self.live_for(60))[0])
+        # No snapshot at all observes nothing.
+        self.assertIsNone(self.watch([(1, {"type": "clock", "server_unix_ms": 1, "client_unix_ms": 1})] * 20)[0])
 
     def test_the_digest_is_the_release_gates(self):
         gate = load("release_gate", "../ami/release_gate.py")
