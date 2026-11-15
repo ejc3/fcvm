@@ -454,8 +454,11 @@ async fn test_custom_command_bridged() -> Result<()> {
     // Verify nginx is running by checking if we can curl localhost
     // (more reliable than pgrep which may not exist in alpine)
     println!("Checking nginx is serving requests...");
-    let output =
-        common::exec_in_container(fcvm_pid, &["wget", "-q", "-O", "-", "http://localhost/"]).await;
+    let output = common::exec_in_container(
+        fcvm_pid,
+        &common::direct_wget(&["-q", "-O", "-", "http://localhost/"]),
+    )
+    .await;
     assert!(
         output.is_ok(),
         "nginx should be responding to requests: {:?}",

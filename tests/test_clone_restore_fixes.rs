@@ -523,14 +523,7 @@ async fn test_restore_network_cleanup_reestablishes_gateway() -> Result<()> {
     // Verify container networking works — nginx must respond on localhost
     let container_out = common::exec_in_container(
         clone_pid,
-        &[
-            "wget",
-            "-q",
-            "-O",
-            "-",
-            "--timeout=5",
-            "http://127.0.0.1:80/",
-        ],
+        &common::direct_wget(&["-q", "-O", "-", "--timeout=5", "http://127.0.0.1:80/"]),
     )
     .await
     .context("nginx should be reachable after exact restore cleanup")?;

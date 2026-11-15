@@ -7,6 +7,9 @@
 //! 4. Runs 8000 parallel connections from inside the VM to 192.0.2.1
 //! 5. Verifies all connections succeed and measures throughput
 //!
+//! Every wget bypasses any HTTP proxy (`common::DIRECT_WGET`): fcvm forwards the host's
+//! proxy variables, and a wget that used one would skip the egress proxy under test.
+//!
 //! Traffic path: guest wget → iptables REDIRECT → guest proxy → vsock mux →
 //!               host proxy → TcpStream::connect(192.0.2.1) → test server
 //!
@@ -109,20 +112,19 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
 
     // Retry a few times — proxy vsock connection may take a moment
     let mut verify_ok = false;
+    let pid_arg = vm_pid.to_string();
+    let url = format!("http://{}:{}/", TEST_IP, server.port);
+    let mut verify_args = vec!["exec", "--pid", &pid_arg, "--"];
+    verify_args.extend(common::direct_wget(&[
+        "-q",
+        "-O",
+        "/dev/null",
+        "--timeout=10",
+        &url,
+    ]));
     for attempt in 1..=5 {
         let verify = tokio::process::Command::new(&fcvm_path)
-            .args([
-                "exec",
-                "--pid",
-                &vm_pid.to_string(),
-                "--",
-                "wget",
-                "-q",
-                "-O",
-                "/dev/null",
-                "--timeout=10",
-                &format!("http://{}:{}/", TEST_IP, server.port),
-            ])
+            .args(&verify_args)
             .output()
             .await?;
 
@@ -170,7 +172,7 @@ TMPDIR=$(mktemp -d)
 # Spawn all connections in parallel
 for i in $(seq 1 $COUNT); do
     (
-        if wget -q -O /dev/null --timeout=60 "http://$IP:$PORT/" 2>"$TMPDIR/err_$i"; then
+        if {} -q -O /dev/null --timeout=60 "http://$IP:$PORT/" 2>"$TMPDIR/err_$i"; then
             echo ok > "$TMPDIR/$i"
         else
             echo "fail:$(cat $TMPDIR/err_$i)" > "$TMPDIR/$i"
@@ -208,7 +210,10 @@ if [ -n "$FAIL_SAMPLES" ]; then
     echo "ERRORS:$FAIL_SAMPLES"
 fi
 "#,
-        TEST_IP, server.port, NUM_CONNECTIONS
+        TEST_IP,
+        server.port,
+        NUM_CONNECTIONS,
+        common::DIRECT_WGET.join(" ")
     );
 
     // Write script to VM
