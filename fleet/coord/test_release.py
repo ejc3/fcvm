@@ -657,18 +657,42 @@ class ViewerPathTests(unittest.TestCase):
         self.assertFalse(p.ok)
         self.assertEqual(p.step, "connect")
         self.assertEqual(p.error[1], "timed out")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
 
     def test_an_open_socket_that_sends_no_frame_fails(self):
         server = FakeViewerServer(self, "v4", lambda s, srv: None)
         p = self.probe("windows", self.tile("windows", server), "v4", server)
         self.assertFalse(p.ok)
         self.assertEqual(p.step, "stream header")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
 
-    def test_a_flat_picture_is_a_blank_tile(self):
+    def test_an_application_error_without_an_identified_stream_is_inconclusive(self):
+        for message in ("Unauthorized", "Too Many Requests", "Service Unavailable"):
+            with self.subTest(message=message):
+                server = FakeViewerServer(self, "v4", lambda s, srv: send_server(s, {"error": message}))
+                p = self.probe("wall", self.tile("wall", server), "v4", server)
+                self.assertFalse(p.ok)
+                self.assertEqual(p.attributed()["verdict"], "inconclusive")
+
+    def test_a_flat_picture_is_a_blank_tile_but_does_not_blame_the_image(self):
         server = FakeViewerServer(self, "v4", stream_of("color=c=black"))
         p = self.probe("wall", self.tile("wall", server), "v4", server)
         self.assertFalse(p.ok)
         self.assertEqual(p.error[1], "the tile's first picture is flat: a blank tile")
+        self.assertEqual(p.attributed()["verdict"], "inconclusive")
+
+    def test_protocol_invalid_data_blames_only_the_identified_direct_stream(self):
+        def malformed(s, server):
+            send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
+            send_server(s, b"not a valid frame", opcode=2)
+
+        for mode, verdict in (("wall", "image_failure"), ("aggregate", "inconclusive")):
+            with self.subTest(mode=mode):
+                server = FakeViewerServer(self, "v4", malformed)
+                p = self.probe(mode, self.tile(mode, server), "v4", server)
+                self.assertFalse(p.ok)
+                self.assertEqual(p.error[1], "a frame message without FCVF framing")
+                self.assertEqual(p.attributed()["verdict"], verdict)
 
     def test_a_certificate_the_viewer_does_not_trust_fails(self):
         server = FakeViewerServer(self, "v4", stream_of("testsrc"))
@@ -702,12 +726,18 @@ class ViewerPathTests(unittest.TestCase):
         self.assertEqual(p.detail["mapColumns"], 4)
         self.assertIn("driveAckMs", p.detail, "the take-over waited for an acknowledged drive")
         unread = {**good[1], "cells": base64.b64encode(bytes(8)).decode()}
-        for messages, step in (([{**good[0], "tile": "mc-2"}], "view hello"), (good[:1], "view map"),
-                               ([good[0], unread], "view map")):
+        malformed = {**good[1], "cells": base64.b64encode(bytes([3])).decode()}
+        for messages, step, verdict in (
+            ([{**good[0], "tile": "mc-2"}], "view hello", "inconclusive"),
+            (good[:1], "view map", "inconclusive"),
+            ([good[0], unread], "view map", "inconclusive"),
+            ([good[0], malformed], "view map", "image_failure"),
+        ):
             with self.subTest(step=step):
                 server = FakeViewerServer(self, "v4", self.minecraft(messages))
                 p = self.probe("minecraft", self.tile("minecraft", server), "v4", server)
                 self.assertEqual((p.ok, p.step), (False, step))
+                self.assertEqual(p.attributed()["verdict"], verdict)
 
     def test_without_admission_a_view_socket_names_the_viewer(self):
         good = [{"type": "hello", "tile": "mc-1"}, {"type": "map", "region": {"w": 1, "h": 1},
@@ -962,7 +992,7 @@ class AttributionTests(unittest.TestCase):
         summary = next(json.loads(l) for l in out.getvalue().splitlines() if '"probes"' in l)
         self.assertEqual(summary["probes"], len(summary["attribution"]))
         self.assertEqual(summary["attribution"], [{"mode": "potato", "tile": None, "ok": True,
-                                                   "hosts": [smoke.attribution_digest("i-0example0host00b")],
+                                                   "verdict": "pass", "hosts": [smoke.attribution_digest("i-0example0host00b")],
                                                    "instances": []}])
 
 

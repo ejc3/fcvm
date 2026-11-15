@@ -22,10 +22,12 @@ Only a verdict the release caused decides anything:
   one of its release tiles, and
 - the placement was ready before the probes and is identical after them: the same receipt, the
   same digest, current and settled.
-Then a pass on both families verifies the receipt and a failure on either rolls it back.
-Anything else (a family that did not report: setup, credentials, runner, an unreachable
-coordinator; or a placement that is old, mixed, changing or unobservable) decides nothing, and a
-later run smokes the release again.
+All passes verify the receipt. An attributed, positive application failure rolls it back
+only when there are no inconclusive probes in either family. A socket, DNS, TLS, authentication,
+setup, decoder, timeout or coordinator failure still fails the smoke, but it does not prove
+the release failed. Missing or ambiguous evidence decides nothing, and a later run retries.
+The rollback includes the failing family's hashed host and tile attribution so the gate can
+validate it again against the live placement under the publication lock.
 """
 import argparse
 import hashlib
@@ -113,13 +115,14 @@ def placement_problem(status):
     return None
 
 
-def family_summary(raw):
-    """A family's smoke summary, or None when the family did not report one."""
+def family_summary(raw, family):
+    """A family's smoke summary, or None when that family did not report one."""
     try:
         value = json.loads(raw) if raw else None
     except ValueError:
         return None
-    if (isinstance(value, dict) and type(value.get("probes")) is int and value["probes"] > 0
+    if (isinstance(value, dict) and value.get("family") == family
+            and type(value.get("probes")) is int and value["probes"] > 0
             and type(value.get("failed")) is int and 0 <= value["failed"] <= value["probes"]
             and value.get("modes") == MODES):
         return value
@@ -135,6 +138,8 @@ def unattributed(summary, placement):
     if not isinstance(entries, list) or len(entries) != summary["probes"]:
         return "does not attribute every probe"
     hosts, tiles = set(placement["release_hosts"]), set(placement["release_tiles"])
+    modes = set()
+    failed = 0
     for entry in entries:
         named = (entry.get("hosts"), entry.get("instances")) if isinstance(entry, dict) else (None, None)
         if not all(isinstance(n, list) and all(isinstance(i, str) and DIGEST.fullmatch(i) for i in n) for n in named):
@@ -143,6 +148,19 @@ def unattributed(summary, placement):
             return "has a probe /live named no host or tile instance for"
         if not set(named[0]) <= hosts or not set(named[1]) <= tiles:
             return "has a probe served by a host or tile instance not on the release's images"
+        mode, verdict, ok = entry.get("mode"), entry.get("verdict"), entry.get("ok")
+        if mode not in (*MODES, "aggregate"):
+            return "has a probe for an unknown mode"
+        if (verdict not in ("pass", "image_failure", "inconclusive")
+                or ok is not (verdict == "pass")
+                or (verdict == "image_failure" and mode in ("aggregate", "potato"))):
+            return "has a probe without a valid verdict"
+        modes.add(mode)
+        failed += not ok
+    if not set(MODES) <= modes:
+        return "has no probe for at least one required mode"
+    if failed != summary["failed"]:
+        return "has a failure count inconsistent with its probes"
     return None
 
 
@@ -150,7 +168,7 @@ def decide(before, v4, v6, run):
     problem = placement_problem(before)
     if problem:
         return None, f"no verdict: before the probes {problem}"
-    summaries = {"v4": family_summary(v4), "v6": family_summary(v6)}
+    summaries = {"v4": family_summary(v4, "v4"), "v6": family_summary(v6, "v6")}
     missing = [name for name, value in summaries.items() if value is None]
     if missing:
         return None, (f"no verdict: {' and '.join(missing)} reported no probe summary "
@@ -165,9 +183,19 @@ def decide(before, v4, v6, run):
         problem = unattributed(summary, after["placement"])
         if problem:
             return None, f"no verdict: {name} {problem}"
-    failed = summaries["v4"]["failed"] + summaries["v6"]["failed"]
-    action = "rollback" if failed else "verify"
-    return {"action": action, "receipt": receipt(before), "placement": before["placement"]["digest"]}, None
+    evidence = None
+    for family, summary in summaries.items():
+        for entry in summary["attribution"]:
+            if entry["verdict"] == "inconclusive":
+                return None, f"no verdict: {family} has an inconclusive probe"
+            if entry["verdict"] == "image_failure" and evidence is None:
+                evidence = {"kind": "image_failure", "family": family,
+                            "hosts": entry["hosts"], "instances": entry["instances"]}
+    payload = {"action": "rollback" if evidence else "verify", "receipt": receipt(before),
+               "placement": before["placement"]["digest"]}
+    if evidence:
+        payload["evidence"] = evidence
+    return payload, None
 
 
 def main(argv=None, run=subprocess.run):

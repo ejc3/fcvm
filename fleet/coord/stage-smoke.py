@@ -98,6 +98,14 @@ class WebSocketClosed(RuntimeError):
     """The peer closed the connection, distinct from a malformed WebSocket message."""
 
 
+class InvalidViewerPayload(AssertionError):
+    """Invalid data sent after the expected application identified its stream or tile.
+
+    A transient blank frame or map, or a transport, admission, decoder or setup
+    failure, cannot make this claim.
+    """
+
+
 class Socket:
     def __init__(self, url, headers=None, opener=None):
         """A WebSocket over TLS. `opener(host, port)` gives the TLS socket: by default an
@@ -512,6 +520,7 @@ class Probe:
     def __init__(self, mode, tile, family, attribution=([], [])):
         self.mode, self.tile, self.family = mode, tile, family
         self.step, self.ok, self.error, self.detail = "start", False, None, {}
+        self.image_failure = False
         # What a failed check saw that attributes it (numbers and fixed words only).
         self.seen = None
         # The host and tile instance ids /live reported serving it; only digests are printed,
@@ -519,7 +528,8 @@ class Probe:
         self.hosts, self.instances = list(attribution[0]), list(attribution[1])
 
     def attributed(self):
-        return {"mode": self.mode, "tile": self.tile, "ok": self.ok,
+        verdict = "pass" if self.ok else "image_failure" if self.image_failure else "inconclusive"
+        return {"mode": self.mode, "tile": self.tile, "ok": self.ok, "verdict": verdict,
                 "hosts": [attribution_digest(h) for h in self.hosts],
                 "instances": [attribution_digest(i) for i in self.instances]}
 
@@ -642,12 +652,12 @@ def prove_stream(connection, deadline, probe):
         if header is None:
             raise AssertionError("a frame arrived before the stream's header")
         if len(payload) < 26 or payload[:5] != b"FCVF\x01":
-            raise AssertionError("a frame message without FCVF framing")
+            raise InvalidViewerPayload("a frame message without FCVF framing")
         keyframe, (width, height) = payload[5] & 1, struct.unpack("<HH", payload[6:10])
         if not units and not keyframe:
             continue
         if not width or not height:
-            raise AssertionError("a frame of zero size")
+            raise InvalidViewerPayload("a frame of zero size")
         size = size or (width, height)
         units.append(payload[22:])
         probe.step = "decode"
@@ -683,16 +693,18 @@ def prove_view(connection, slot, deadline, probe):
             continue
         if kind != "map":
             continue
-        region = message.get("region") or {}
+        region = message.get("region")
+        if not isinstance(region, dict):
+            raise InvalidViewerPayload("the view's map region is not a grid")
         w, h = region.get("w"), region.get("h")
-        if not (isinstance(w, int) and isinstance(h, int) and 0 < w * h <= 1 << 20):
-            raise AssertionError("the view's map region is not a grid")
+        if not (type(w) is int and type(h) is int and w > 0 and h > 0 and w * h <= 1 << 20):
+            raise InvalidViewerPayload("the view's map region is not a grid")
         try:
             cells = base64.b64decode(message.get("cells") or "", validate=True)
-        except ValueError:
-            raise AssertionError("the view's map cells are not base64")
+        except (TypeError, ValueError):
+            raise InvalidViewerPayload("the view's map cells are not base64")
         if len(cells) != w * h * 2:
-            raise AssertionError("the view's map cells do not fill its region")
+            raise InvalidViewerPayload("the view's map cells do not fill its region")
         # A column the tile has not read is material 0 at height 0: a map of only those is a
         # blank tile.
         if not any(cells):
@@ -755,6 +767,9 @@ def probe_tile(mode, half, tile, family, admit, viewer, resolvers, takeover=None
             connection.close()
         probe.ok = True
     except Exception as error:
+        # An aggregate can relay data from another service, so a bad aggregate frame
+        # is not proof the image supplying its tiles caused the failure.
+        probe.image_failure = isinstance(error, InvalidViewerPayload) and mode != "aggregate"
         probe.error = fixed(error)
     return probe
 
@@ -1085,7 +1100,8 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
     for p in probes:
         print(json.dumps(p.line()), flush=True)
     failed = sum(not p.ok for p in probes)
-    # The release gate decides on this line: how many probes failed, and where /live said each ran.
+    # The smoke still fails for any failed probe. The release gate separately needs a
+    # positive application failure before it can roll back the image serving the probe.
     print(json.dumps({"family": family, "modes": list(modes), "probes": len(probes), "failed": failed,
                       "attribution": [p.attributed() for p in probes]}), flush=True)
     return failed

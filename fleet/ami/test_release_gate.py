@@ -59,17 +59,19 @@ class GateTests(unittest.TestCase):
         value.update(changes)
         return value
 
-    def attribution(self, hosts=None, instances=None, ok=True):
+    def attribution(self, hosts=None, instances=None, ok=True, mode="wall"):
         """What the smoke records of each probe: the digests of the host and tile instances the
         coordinator reported serving it."""
         hosts = self.HOSTS[:1] if hosts is None else hosts
-        return {"mode": "wall", "tile": "fcvm:1", "ok": ok, "hosts": [self.digest(h) for h in hosts],
-                "instances": [self.digest(i) for i in (instances or [])]}
+        return {"mode": mode, "tile": "fcvm:1", "ok": ok,
+                "verdict": "pass" if ok else "image_failure",
+                "hosts": [self.digest(h) for h in hosts], "instances": [self.digest(i) for i in (instances or [])]}
 
     def summary(self, name="v4", failed=0, attribution=None):
         if attribution is None:
             attribution = ([self.attribution(), self.attribution(hosts=self.HOSTS[1:2]),
                             self.attribution(hosts=[], instances=self.TILES)])
+            attribution += [self.attribution(mode=mode) for mode in release_gate.MODES if mode != "wall"]
             attribution += [self.attribution(ok=False) for _ in range(failed)]
         return {"family": name, "modes": ["wall", "phones", "windows", "minecraft", "potato"],
                 "probes": len(attribution), "failed": failed, "attribution": attribution}
@@ -108,10 +110,52 @@ class GateTests(unittest.TestCase):
             self.assertEqual(self.decide(gate, v6=self.family("v6", failed=1)), 0)
         self.assertEqual(gate.payloads[1], {"action": "rollback",
                                             "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
-                                            "placement": "d" * 64})
+                                            "placement": "d" * 64, "evidence": {
+                                                "kind": "image_failure", "family": "v6",
+                                                "hosts": [self.digest(self.HOSTS[0])], "instances": [],
+                                            }})
         # The pointer moving back and the hosts already running are reported apart.
         self.assertIn("release pointer: rolled back", out.getvalue())
         self.assertIn("running hosts:", out.getvalue())
+
+    def test_an_attributed_transport_failure_does_not_roll_back(self):
+        # This now happens after the coordinator supplied a known release host. A socket
+        # timeout is still no answer from the application on that image.
+        summary = self.summary("v6", failed=1)
+        summary["attribution"][-1]["verdict"] = "inconclusive"
+        gate = Lambda(self.status(), {"status": "rolled_back"})
+        self.assertEqual(self.decide(gate, v6=json.dumps(summary)), 0)
+        self.assertNotIn("rollback", [p["action"] for p in gate.payloads])
+        self.assertNotIn("verify", [p["action"] for p in gate.payloads])
+
+    def test_an_inconclusive_probe_blocks_even_with_another_positive_failure(self):
+        summary = self.summary("v6", failed=2)
+        summary["attribution"][-1]["verdict"] = "inconclusive"
+        gate = Lambda(self.status(), {"status": "rolled_back"})
+        self.assertEqual(self.decide(gate, v6=json.dumps(summary)), 0)
+        self.assertNotIn("rollback", [p["action"] for p in gate.payloads])
+
+    def test_missing_or_inconsistent_verdicts_do_not_trigger_gate_actions(self):
+        def omit_verdict(s):
+            del s["attribution"][-1]["verdict"]
+
+        cases = (
+            omit_verdict,
+            lambda s: s.update(family="v4"),
+            lambda s: s.update(failed=0),
+            lambda s: s["attribution"][-1].update(verdict="pass"),
+            lambda s: s["attribution"][-1].update(mode="aggregate"),
+            lambda s: s["attribution"][-1].update(mode="potato"),
+            lambda s: s["attribution"][0].update(ok=1),
+            lambda s: [e.update(mode="wall") for e in s["attribution"]],
+        )
+        for tamper in cases:
+            with self.subTest(tamper=tamper):
+                summary = self.summary("v6", failed=1)
+                tamper(summary)
+                gate = Lambda(self.status(), {"status": "rolled_back"})
+                self.assertEqual(self.decide(gate, v6=json.dumps(summary)), 0)
+                self.assertTrue(all(p["action"] == "status" for p in gate.payloads))
 
     def test_a_runner_or_auth_failure_decides_nothing(self):
         # A family whose job did not run, or did not get as far as its probes (setup, credentials,
