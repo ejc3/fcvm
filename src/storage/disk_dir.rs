@@ -402,6 +402,19 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 
 /// `links` maps a multiply linked file's (device, inode) to the relative path the walk
 /// first met it at.
+/// The permission bits an entry contributes to the hash. A symlink contributes none:
+/// Linux ignores a symlink's own permission bits (symlink(7)), and filesystems report
+/// different ones for the same link. EdenFS reports 0770 where the btrfs staging copy
+/// has 0777, so a tree holding a symlink never hashed the same in place and staged, and
+/// every launch from an EdenFS checkout was refused as changed during the launch.
+fn hashed_mode(kind: u8, mode: u32) -> u32 {
+    if kind == b'l' {
+        0
+    } else {
+        mode & 0o7777
+    }
+}
+
 fn hash_entry(
     path: &Path,
     relative: &Path,
@@ -430,7 +443,7 @@ fn hash_entry(
     };
     hash_bytes(hasher, relative.as_os_str().as_bytes());
     hasher.update([kind]);
-    hasher.update((md.mode() & 0o7777).to_le_bytes());
+    hasher.update(hashed_mode(kind, md.mode()).to_le_bytes());
     if keep_owners {
         hasher.update(md.uid().to_le_bytes());
         hasher.update(md.gid().to_le_bytes());
@@ -506,6 +519,15 @@ mod tests {
         let (staged, resolved) = DiskDirStaging::resolve(staging, &[], &specs).unwrap();
         let key = snapshot_key_extra_disks(&[], &specs, &[], Some(&resolved)).join("\n");
         (key, staged)
+    }
+
+    /// A symlink's permission bits are not content: EdenFS reports 0770 for a link the btrfs
+    /// staging copy holds as 0777, and the two must hash the same. A file's bits still count.
+    #[test]
+    fn a_symlinks_permission_bits_do_not_enter_the_hash() {
+        assert_eq!(hashed_mode(b'l', 0o120770), hashed_mode(b'l', 0o120777));
+        assert_ne!(hashed_mode(b'f', 0o100640), hashed_mode(b'f', 0o100644));
+        assert_eq!(hashed_mode(b'f', 0o104755), 0o4755);
     }
 
     /// Two trees at one path that differ in one file's bytes get different keys, and the
