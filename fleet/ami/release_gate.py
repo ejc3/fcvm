@@ -170,17 +170,25 @@ def unattributed(summary, placement):
     return None
 
 
+# How long fleet/coord/stage-smoke.py --agents watches the coordinator's registered agents. A
+# restarted coordinator lists none until each agent reconnects, which takes up to 30 s of backoff
+# (src/fleet/agent/dial.rs); every host seen in any snapshot of the window counts.
+AGENT_WATCH_MS = 120_000
+
+
 def agent_snapshot(raw):
     """The coordinator's registered agents after the probes (fleet/coord/stage-smoke.py --agents):
-    {"agents": [digests], "observed_at": ms}, or None when there is none to read."""
+    {"agents": [digests], "observed_at": ms, "watched_ms": ms}, or None when there is none to read
+    or it was watched for less than AGENT_WATCH_MS."""
     try:
         value = json.loads(raw) if raw else None
     except ValueError:
         return None
-    if (isinstance(value, dict) and set(value) == {"agents", "observed_at"}
+    if (isinstance(value, dict) and set(value) == {"agents", "observed_at", "watched_ms"}
             and isinstance(value["agents"], list)
             and all(isinstance(a, str) and DIGEST.fullmatch(a) for a in value["agents"])
-            and type(value["observed_at"]) is int and value["observed_at"] > 0):
+            and type(value["observed_at"]) is int and value["observed_at"] > 0
+            and type(value["watched_ms"]) is int and value["watched_ms"] >= AGENT_WATCH_MS):
         return value
     return None
 
@@ -203,25 +211,27 @@ def decide(before, v4, v6, run, agents=""):
     if (receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]
             or changed != set(before["placement"]["changed_kinds"])):
         return None, "no verdict: the release or its placement changed during the probes"
-    # A host image that boots but never starts its agent leaves the smoke no tile to probe. The
-    # coordinator then lists none of the release's hosts among its agents, and that, on a settled
-    # placement that changed the host image, is the release's failure. The gate (ejc3/aws
-    # publish.py) checks the hosts are exactly the live release hosts and have been up long
-    # enough that an agent would have registered.
-    hosts = after["placement"]["release_hosts"]
-    if snapshot is not None and not set(hosts) & set(snapshot["agents"]):
+    # Probes that can be laid on the release decide. Only when they cannot (no summary, or probes
+    # /live named no release host for) does the coordinator's agent list: a host image that boots
+    # but never starts its agent leaves the smoke no tile to probe, and the coordinator then lists
+    # none of the release's hosts among its agents. The gate (ejc3/aws publish.py) checks the
+    # hosts are exactly the live release hosts and have been up long enough that an agent would
+    # have registered.
+    problem = (f"no verdict: {' and '.join(missing)} reported no probe summary "
+               "(setup, credentials, runner or coordinator)") if missing else None
+    for name, summary in summaries.items():
+        if problem is None:
+            reason = unattributed(summary, after["placement"])
+            problem = f"no verdict: {name} {reason}" if reason else None
+    if problem is not None:
+        hosts = after["placement"]["release_hosts"]
+        if snapshot is None or set(hosts) & set(snapshot["agents"]):
+            return None, problem
         if "host" not in changed:
             return None, "no verdict: no release host has an agent, but this release did not change the host image"
         return {"action": "rollback", "receipt": receipt(before), "placement": before["placement"]["digest"],
                 "evidence": {"kind": "no_agent", "hosts": sorted(hosts),
                              "observed_at": snapshot["observed_at"]}}, None
-    if missing:
-        return None, (f"no verdict: {' and '.join(missing)} reported no probe summary "
-                      "(setup, credentials, runner or coordinator)")
-    for name, summary in summaries.items():
-        problem = unattributed(summary, after["placement"])
-        if problem:
-            return None, f"no verdict: {name} {problem}"
     evidence = None
     saw_failure = False
     for family, summary in summaries.items():

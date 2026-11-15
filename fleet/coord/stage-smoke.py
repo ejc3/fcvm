@@ -525,15 +525,46 @@ def ec2_instance(vm):
     return m.group(1) if m else None
 
 
-def agents_line(state, now_ms):
-    """The hosts with an agent registered with the coordinator (/live fleet.hosts, named by EC2
-    instance id), by digest, and when that was read: what the release gate's no-agent verdict
-    reads (fleet/ami/release_gate.py). None when the state has no fleet view."""
+# Matches release_gate.py AGENT_WATCH_MS: the gate decides only on a watch this long.
+AGENT_WATCH_SECONDS = 120
+
+
+def agent_names(state):
+    """The hosts with an agent registered with the coordinator in one /live snapshot
+    (fleet.hosts, named by EC2 instance id); None when the snapshot has no fleet view."""
     hosts = (state.get("fleet") or {}).get("hosts")
     if not isinstance(hosts, list):
         return None
-    names = [h.get("name") for h in hosts if isinstance(h, dict) and isinstance(h.get("name"), str) and h.get("name")]
-    return {"agents": sorted(attribution_digest(n) for n in names), "observed_at": now_ms}
+    return {h["name"] for h in hosts if isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"]}
+
+
+def watch_agents(read, window, clock=time.monotonic):
+    """Every host seen with an agent in any snapshot `read(deadline)` gives over `window` seconds,
+    and how long that was, in ms. A restarted coordinator lists no agent until each reconnects
+    (up to 30 s of backoff, src/fleet/agent/dial.rs), so one snapshot is not enough. None when no
+    snapshot came; a closed /live raises."""
+    start = clock()
+    end = start + window
+    names, snapshots = set(), 0
+    while clock() < end:
+        try:
+            state = read(end)
+        except TimeoutError:
+            break
+        seen = agent_names(state) if isinstance(state, dict) else None
+        if seen is not None:
+            names |= seen
+            snapshots += 1
+    if not snapshots:
+        return None
+    return names, int((clock() - start) * 1000)
+
+
+def agents_line(names, observed_at, watched_ms):
+    """What the release gate's no-agent verdict reads (fleet/ami/release_gate.py): the watched
+    hosts by digest, when the watch ended and how long it was. No host id is printed."""
+    return {"agents": sorted(attribution_digest(n) for n in names), "observed_at": observed_at,
+            "watched_ms": watched_ms}
 
 
 def tile_attribution(tile):
@@ -1070,11 +1101,17 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                     return message.get("outcome") == "committed"
         if agents:
             step("/live: registered agents")
-            until(lambda s: isinstance(s.get("fleet"), dict))
-            line = agents_line(state, int(time.time() * 1000))
-            if line is None:
-                raise AssertionError("the coordinator's state has no fleet view")
-            print(json.dumps(line), flush=True)
+            def read(deadline):
+                opcode, payload = connection.message(deadline)
+                if opcode != 1:
+                    return None
+                message = json.loads(payload)
+                take(message)
+                return message.get("state") if message.get("type") == "snapshot" else None
+            watched = watch_agents(read, AGENT_WATCH_SECONDS)
+            if watched is None:
+                raise AssertionError("the coordinator sent no snapshot while the agents were watched")
+            print(json.dumps(agents_line(watched[0], int(time.time() * 1000), watched[1])), flush=True)
             return 0
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,

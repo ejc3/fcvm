@@ -97,10 +97,27 @@ class GateTests(unittest.TestCase):
             argv += ["--agents", agents]
         return release_gate.main(argv, run=gate)
 
-    def agents(self, instances=None, observed_at=1_794_780_000_000):
+    def agents(self, instances=None, observed_at=1_794_780_000_000, watched_ms=None):
         """The coordinator's registered agents, as stage-smoke.py --agents prints them."""
         names = self.HOSTS if instances is None else instances
-        return json.dumps({"agents": sorted(self.digest(i) for i in names), "observed_at": observed_at})
+        return json.dumps({"agents": sorted(self.digest(i) for i in names), "observed_at": observed_at,
+                           "watched_ms": release_gate.AGENT_WATCH_MS if watched_ms is None else watched_ms})
+
+    def test_probes_that_decide_are_never_overruled_by_an_empty_agent_list(self):
+        # A coordinator restart clears its registered agents until they reconnect (Codex on
+        # #1925): an empty list next to complete, attributed probes is that, not a broken image.
+        gate = Lambda(self.status(), {"status": "verified"})
+        self.assertEqual(self.decide(gate, agents=self.agents(instances=[])), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "verify"])
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4=self.family("v4", failed=1), agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1]["evidence"]["kind"], "image_failure")
+
+    def test_an_agent_list_watched_too_briefly_decides_nothing(self):
+        gate = Lambda(self.status())
+        brief = self.agents(instances=[], watched_ms=release_gate.AGENT_WATCH_MS - 1)
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=brief), 0)
+        self.assertNotIn("rollback", [p.get("action") for p in gate.payloads])
 
     def test_release_hosts_without_an_agent_roll_back(self):
         # A host image that boots but never starts its agent: the smoke reaches no tile, so it
@@ -137,9 +154,12 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(gate.payloads, [{"action": "status"}])
 
     def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
-        for raw in ("", "not json", json.dumps({"agents": ["x"], "observed_at": 1}),
-                    json.dumps({"agents": [], "observed_at": "now"}), json.dumps({"agents": []}),
-                    json.dumps({"agents": [], "observed_at": 0})):
+        w = release_gate.AGENT_WATCH_MS
+        for raw in ("", "not json", json.dumps({"agents": ["x"], "observed_at": 1, "watched_ms": w}),
+                    json.dumps({"agents": [], "observed_at": "now", "watched_ms": w}),
+                    json.dumps({"agents": [], "watched_ms": w}),
+                    json.dumps({"agents": [], "observed_at": 0, "watched_ms": w}),
+                    json.dumps({"agents": [], "observed_at": 1})):
             with self.subTest(raw=raw):
                 gate = Lambda(self.status())
                 self.assertEqual(self.decide(gate, v4="", v6="", agents=raw), 0)

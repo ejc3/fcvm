@@ -966,15 +966,43 @@ class AttributionTests(unittest.TestCase):
         view = json.loads((HERE.parent / "core/tests/vectors/04_retile_join_leave.json").read_text())["final_view"]
         names = [h["name"] for h in view["fleet"]["hosts"]]
         self.assertTrue(names)
-        line = smoke.agents_line(view, 1_794_780_000_000)
+        self.assertEqual(smoke.agent_names(view), set(names))
+        self.assertIsNone(smoke.agent_names({}))
+        line = smoke.agents_line(set(names), 1_794_780_000_000, 120_000)
         self.assertEqual(line, {"agents": sorted(smoke.attribution_digest(n) for n in names),
-                                "observed_at": 1_794_780_000_000})
+                                "observed_at": 1_794_780_000_000, "watched_ms": 120_000})
         for name in names:
             self.assertNotIn(name, json.dumps(line))
-        self.assertEqual(smoke.agents_line({"fleet": {"hosts": []}}, 5), {"agents": [], "observed_at": 5})
-        # Without a fleet view there is no observation to report.
-        self.assertIsNone(smoke.agents_line({}, 5))
         self.assertTrue(smoke.arguments(["--agents"])["agents"])
+
+    def test_the_agent_watch_is_as_long_as_the_gate_requires(self):
+        gate = load("release_gate", "../ami/release_gate.py")
+        self.assertEqual(smoke.AGENT_WATCH_SECONDS * 1000, gate.AGENT_WATCH_MS)
+
+    def test_agents_are_watched_across_a_coordinator_recovery(self):
+        # A coordinator that restarted just before the read lists no agents until they reconnect
+        # (up to 30 s of backoff): every host seen in any snapshot of the window counts.
+        clock = [0.0]
+        states = [{"fleet": {"hosts": []}}, None, {"fleet": {"hosts": [{"name": "i-0example0host00a"}]}},
+                  {"fleet": {"hosts": []}}]
+        def read(deadline):
+            clock[0] += 40
+            if not states:
+                raise TimeoutError("no message")
+            return states.pop(0)
+        names, watched = smoke.watch_agents(read, 120, clock=lambda: clock[0])
+        self.assertEqual(names, {"i-0example0host00a"})
+        self.assertGreaterEqual(watched, 120_000)
+        # A /live close during the window (the coordinator going away) gives no observation.
+        def closing(deadline):
+            raise smoke.WebSocketClosed("WebSocket closed")
+        with self.assertRaises(smoke.WebSocketClosed):
+            smoke.watch_agents(closing, 120, clock=lambda: 0.0)
+        # A window with no snapshot at all observes nothing.
+        def silent(deadline):
+            clock[0] += 200
+            raise TimeoutError("no message")
+        self.assertIsNone(smoke.watch_agents(silent, 120, clock=lambda: clock[0]))
 
     def test_the_digest_is_the_release_gates(self):
         gate = load("release_gate", "../ami/release_gate.py")
