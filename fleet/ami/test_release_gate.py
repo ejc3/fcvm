@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests of fleet/ami/release_gate.py and the workflow that runs it (fleet-release-gate.yml)."""
 import hashlib
+import subprocess
+import importlib.util
 import json
 import os
 import pathlib
@@ -161,9 +163,19 @@ class GateTests(unittest.TestCase):
     def test_the_decision_reads_the_coordinators_agents_after_the_smoke(self):
         decide = WORKFLOW.split("\n  decide:\n", 1)[1]
         self.assertIn("python3 -B fleet/coord/stage-smoke.py --agents", decide)
-        # The snapshot is selected as JSON (jq), not by matching its text.
-        self.assertIn("""jq -cR 'fromjson? | select(type == "object" and has("agents"))'""", decide)
+        # The snapshot is selected as JSON (jq), not by matching its text, and the workflow's own
+        # filter passes what stage-smoke.py --agents prints (Codex on #1925: a filter on a key the
+        # producer no longer writes passed nothing).
         self.assertNotIn("grep", decide)
+        selector = re.search(r"\| (jq -cR '[^']+') \|", decide)
+        self.assertIsNotNone(selector, decide)
+        spec = importlib.util.spec_from_file_location("smoke", ROOT / "fleet/coord/stage-smoke.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        line = smoke.agents_line({"fleet": {"agents": {"since": 1, "hosts": [{"name": self.HOSTS[0]}]}}}, 2)
+        printed = "\n".join(["step text", json.dumps({"status": "failed"}), json.dumps(line)]) + "\n"
+        out = subprocess.run(["bash", "-c", selector.group(1)], input=printed, capture_output=True, text=True, check=True)
+        self.assertEqual(release_gate.agent_snapshot(out.stdout.strip().splitlines()[-1]), line)
         self.assertIn('--agents "$AGENTS"', decide)
         for secret in ("CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}",
                        "CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}",

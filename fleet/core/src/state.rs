@@ -1071,7 +1071,7 @@ mod tests {
         let mut s = State::new(Config::default(), 1000);
         s = crate::apply(s, &hello("i-0123456789abcdef0", 2000));
         s = crate::apply(s, &hello("i-0123456789abcdef0", 3000));
-        s = crate::apply(s, &hello("i-0fedcba9876543210", 2500));
+        s = crate::apply(s, &hello("i-1234567890abcdef0", 2500));
         assert_eq!(s.fleet.registrations.since, 1000);
         assert_eq!(
             s.fleet.registrations.hosts.get("i-0123456789abcdef0"),
@@ -1085,7 +1085,7 @@ mod tests {
             view["fleet"]["agents"],
             serde_json::json!({"since": 1000, "hosts": [
                 {"name": "i-0123456789abcdef0", "first_at": 2000, "last_at": 3000},
-                {"name": "i-0fedcba9876543210", "first_at": 2500, "last_at": 2500}]})
+                {"name": "i-1234567890abcdef0", "first_at": 2500, "last_at": 2500}]})
         );
         // An agent that is gone stays in the record: it registered.
         let gone: crate::Event = serde_json::from_value(serde_json::json!(

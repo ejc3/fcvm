@@ -109,7 +109,7 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          line=$(python3 -B fleet/coord/stage-smoke.py --agents | jq -cR 'fromjson? | select(type == "object" and has("agents"))' | tail -1) || line=
+          line=$(python3 -B fleet/coord/stage-smoke.py --agents | jq -cR 'fromjson? | select(type == "object" and has("since") and has("registered"))' | tail -1) || line=
           echo "agents=$line" >> "$GITHUB_OUTPUT"
       - env:
           RELEASE_GATE: ${{ vars.RELEASE_GATE }}
