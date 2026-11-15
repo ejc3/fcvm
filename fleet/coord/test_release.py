@@ -8,6 +8,7 @@ import copy
 import errno
 import ipaddress
 import json
+import re
 import os
 import socket
 import struct
@@ -693,7 +694,7 @@ class ViewerPathTests(unittest.TestCase):
             send_server(s, b"not a valid frame", opcode=2)
 
         host = {"host": "i-0example0host00a"}
-        instance = {"half": "ec2", "vm": "i-0example0tile00a"}
+        instance = {"half": "ec2", "vm": "us-east-1/i-0e00000000000000a"}
         for mode, half, attribution, verdict in (
             ("wall", "fcvm", host, "image_failure"),
             ("wall", "ec2", instance, "image_failure"),
@@ -934,10 +935,30 @@ class AttributionTests(unittest.TestCase):
 
     STATE = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "running", "host": "i-0example0host00a"},
                        {"id": "fcvm:2", "half": "fcvm", "phase": "failed", "host": "i-0example0host00a"},
-                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "i-0example0tile00a"}],
+                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "us-east-1/i-0e00000000000000a"}],
              "windows": {"tiles": [{"id": "win:1", "phase": "running", "host": "i-0example0host00b"}]},
              "aggregates": [{"id": "agg:ec2", "half": "ec2", "host": None, "tiles": ["ec2:1"],
                              "frame_url": "wss://agg-ec2-abcdefgh.tiles.fcvm.dev/frames"}]}
+
+    def test_an_ec2_tile_is_attributed_to_its_bare_instance_id(self):
+        # The coordinator reports an EC2 tile's `vm` as region/instance (src/fleet/coord/ec2_aws.rs),
+        # and the release gate lists bare instance ids: on 2026-11-15 every EC2 tile probe of a
+        # staging gate run fell outside the release's tiles because of the region prefix.
+        tile = {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "us-east-1/i-0123456789abcdef0"}
+        self.assertEqual(smoke.tile_attribution(tile), ([], ["i-0123456789abcdef0"]))
+        jobs, _ = smoke.sweep_jobs({"tiles": [tile], "aggregates": [
+            {"id": "agg:ec2", "half": "ec2", "host": None, "tiles": ["ec2:1"],
+             "frame_url": "wss://agg-ec2-abcdefgh.tiles.fcvm.dev/frames"}]}, ("wall",), "v4", None, "v-1", [])
+        self.assertEqual([smoke.tile_attribution(j[2]) for j in jobs],
+                         [([], ["i-0123456789abcdef0"]), ([], ["i-0123456789abcdef0"])])
+        # Anything else is not an instance the gate could list: no attribution, so no verdict.
+        for vm in ("i-0123456789abcdef0", "us-east-1/fake-1", "us-east-1/i-0123", "fleet-slot-1", ""):
+            self.assertEqual(smoke.tile_attribution(dict(tile, vm=vm)), ([], []), vm)
+        # The format is the coordinator's: every Launched instance it builds is region/id.
+        source = (HERE.parent.parent / "src/fleet/coord/ec2_aws.rs").read_text()
+        built = re.findall(r"instance: (format!\([^)]*\))", source)
+        self.assertTrue(built, "ec2_aws.rs builds no Launched instance")
+        self.assertTrue(all(f.startswith('format!("{region}/') for f in built), built)
 
     def test_the_digest_is_the_release_gates(self):
         gate = load("release_gate", "../ami/release_gate.py")
@@ -950,10 +971,10 @@ class AttributionTests(unittest.TestCase):
         jobs, failed = smoke.sweep_jobs(self.STATE, ("wall", "windows"), "v4", None, "v-1", [])
         by_tile = {j[2]["id"]: smoke.tile_attribution(j[2]) for j in jobs}
         self.assertEqual(by_tile["fcvm:1"], (["i-0example0host00a"], []))
-        self.assertEqual(by_tile["ec2:1"], ([], ["i-0example0tile00a"]))
+        self.assertEqual(by_tile["ec2:1"], ([], ["i-0e00000000000000a"]))
         self.assertEqual(by_tile["win:1"], (["i-0example0host00b"], []))
         # The EC2 half's aggregate has no host of its own: it relays its tiles' frames.
-        self.assertEqual(by_tile["agg:ec2"], ([], ["i-0example0tile00a"]))
+        self.assertEqual(by_tile["agg:ec2"], ([], ["i-0e00000000000000a"]))
         # A tile the coordinator reports not running is still attributed to where it runs.
         self.assertEqual([(f.tile, f.hosts, f.instances) for f in failed], [("fcvm:2", ["i-0example0host00a"], [])])
         # A tile /live names no host for has no attribution, and the gate then decides nothing.
@@ -972,8 +993,14 @@ class AttributionTests(unittest.TestCase):
             for job in jobs:
                 mode, tile = job[0], job[2]
                 with self.subTest(vector=path.name, tile=tile.get("id")):
-                    hosts, instances = smoke.tile_attribution(tile)
-                    self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
+                    if tile.get("half") == "ec2":
+                        # The vectors' EC2 instances are fleet-core's own names, not the driver's
+                        # region/instance (test_an_ec2_tile_is_attributed_to_its_bare_instance_id
+                        # pins that format): only the field is checked here.
+                        self.assertTrue(isinstance(tile.get("vm"), str) and tile["vm"], "an EC2 tile names no vm")
+                    else:
+                        hosts, instances = smoke.tile_attribution(tile)
+                        self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
                     seen.add((mode, tile.get("half")))
             # No vector serves an aggregate's URLs, so the sweep skips them; their attribution
             # is the view's own fields all the same.

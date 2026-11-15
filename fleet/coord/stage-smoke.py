@@ -518,6 +518,13 @@ def attribution_digest(instance):
     return hashlib.sha256(b"fcvm-release-gate\0" + instance.encode()).hexdigest()
 
 
+def ec2_instance(vm):
+    """The EC2 instance id in an EC2 tile's `vm`, which the coordinator reports as
+    `<region>/<instance id>` (src/fleet/coord/ec2_aws.rs); None for anything else."""
+    m = re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+/(i-[0-9a-f]{17})", vm or "")
+    return m.group(1) if m else None
+
+
 def tile_attribution(tile):
     """The (host instance ids, tile instance ids) /live reports serving a tile: a GPU host's tile,
     phone, sandbox, server or aggregate names its host; an EC2 tile names the instance it runs on
@@ -526,7 +533,8 @@ def tile_attribution(tile):
     if tile.get("_instances") is not None:
         return [], list(tile["_instances"])
     if tile.get("half") == "ec2":
-        return [], [tile["vm"]] if tile.get("vm") else []
+        instance = ec2_instance(tile.get("vm"))
+        return [], [instance] if instance else []
     return [tile["host"]] if tile.get("host") else [], []
 
 
@@ -824,8 +832,9 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
                 continue  # an aggregator that serves no browser: aggregation is off
             if mode == "aggregate" and t.get("half") == "ec2":
                 inside = set(t.get("tiles") or [])
-                t = dict(t, _instances=[w["vm"] for w in state.get("tiles") or []
-                                        if w.get("half") == "ec2" and w.get("id") in inside and w.get("vm")])
+                t = dict(t, _instances=[ec2_instance(w.get("vm")) for w in state.get("tiles") or []
+                                        if w.get("half") == "ec2" and w.get("id") in inside
+                                        and ec2_instance(w.get("vm"))])
             if private(t, viewer):
                 continue
             if t.get("phase", "running") not in ("running", "borrowed"):
