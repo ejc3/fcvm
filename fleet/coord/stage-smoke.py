@@ -486,15 +486,42 @@ def settled(state, modes, viewer=None):
     return True
 
 
+def attribution_digest(instance):
+    """How a probe names the instance that served it in the summary line: a digest, because the
+    ids are not printed in this public repository's logs. fleet/ami/release_gate.py computes the
+    same one over the release gate's instance ids (test_release.py pins the two together)."""
+    return hashlib.sha256(b"fcvm-release-gate\0" + instance.encode()).hexdigest()
+
+
+def tile_attribution(tile):
+    """The (host instance ids, tile instance ids) /live reports serving a tile: a GPU host's tile,
+    phone, sandbox, server or aggregate names its host; an EC2 tile names the instance it runs on
+    (`vm`); the EC2 half's aggregate relays its tiles' frames (`sweep_jobs` lists their instances
+    under `_instances`). Empty when /live names none."""
+    if tile.get("_instances") is not None:
+        return [], list(tile["_instances"])
+    if tile.get("half") == "ec2":
+        return [], [tile["vm"]] if tile.get("vm") else []
+    return [tile["host"]] if tile.get("host") else [], []
+
+
 class Probe:
     """One viewer-path check's outcome: the mode, the tile id, the family, what was proved or the
     step that failed and its fixed text. Printed as one JSON line; no URL, host or token."""
 
-    def __init__(self, mode, tile, family):
+    def __init__(self, mode, tile, family, attribution=([], [])):
         self.mode, self.tile, self.family = mode, tile, family
         self.step, self.ok, self.error, self.detail = "start", False, None, {}
         # What a failed check saw that attributes it (numbers and fixed words only).
         self.seen = None
+        # The host and tile instance ids /live reported serving it; only digests are printed,
+        # and only in the summary line (`attributed`).
+        self.hosts, self.instances = list(attribution[0]), list(attribution[1])
+
+    def attributed(self):
+        return {"mode": self.mode, "tile": self.tile, "ok": self.ok,
+                "hosts": [attribution_digest(h) for h in self.hosts],
+                "instances": [attribution_digest(i) for i in self.instances]}
 
     def line(self):
         out = {"mode": self.mode, "tile": self.tile, "family": self.family, "ok": self.ok}
@@ -702,7 +729,7 @@ def drive_round_trip(connection, deadline, probe):
 def probe_tile(mode, half, tile, family, admit, viewer, resolvers, takeover=None):
     """Prove one tile over one family; the Probe. `takeover` drives a Minecraft server this
     viewer has borrowed."""
-    probe = Probe(mode, tile.get("id"), family)
+    probe = Probe(mode, tile.get("id"), family, tile_attribution(tile))
     try:
         probe.step = "published URL"
         url = tile.get(FAMILIES[family][2])
@@ -761,10 +788,14 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
         for half, t in tiles:
             if mode == "aggregate" and not (t.get("frame_url") or t.get("frame_url_v4")):
                 continue  # an aggregator that serves no browser: aggregation is off
+            if mode == "aggregate" and t.get("half") == "ec2":
+                inside = set(t.get("tiles") or [])
+                t = dict(t, _instances=[w["vm"] for w in state.get("tiles") or []
+                                        if w.get("half") == "ec2" and w.get("id") in inside and w.get("vm")])
             if private(t, viewer):
                 continue
             if t.get("phase", "running") not in ("running", "borrowed"):
-                p = Probe(mode, t.get("id"), family)
+                p = Probe(mode, t.get("id"), family, tile_attribution(t))
                 p.step, p.error = "coordinator state", ("AssertionError", "the tile is not running")
                 failed.append(p)
                 continue
@@ -772,11 +803,11 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
     return jobs, failed
 
 
-def potato_probe(family, caught, seen=None):
+def potato_probe(family, caught, seen=None, host=None):
     """The potato game has no viewer socket: the page draws /live. A verified catch while the
     smoke watched (the round's latest catch moved) is its first real payload. Without one, the
     line carries what the watch saw (PotatoWatch)."""
-    p = Probe("potato", None, family)
+    p = Probe("potato", None, family, ([host] if host else [], []))
     if caught:
         p.ok, p.detail = True, {"verifiedCatch": True}
     else:
@@ -1047,13 +1078,16 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
             seq = ((s.get("potato") or {}).get("round") or {}).get("seq")
             return (seq is not None and seq != catches) or time.monotonic() > watch_by
         until(caught)
-        seq = ((now()[0].get("potato") or {}).get("round") or {}).get("seq")
+        potato = now()[0].get("potato") or {}
+        seq = (potato.get("round") or {}).get("seq")
         probes.append(potato_probe(family, seq is not None and seq != catches,
-                                   watch.evidence(time.monotonic())))
+                                   watch.evidence(time.monotonic()), host=potato.get("host")))
     for p in probes:
         print(json.dumps(p.line()), flush=True)
     failed = sum(not p.ok for p in probes)
-    print(json.dumps({"family": family, "modes": list(modes), "probes": len(probes), "failed": failed}), flush=True)
+    # The release gate decides on this line: how many probes failed, and where /live said each ran.
+    print(json.dumps({"family": family, "modes": list(modes), "probes": len(probes), "failed": failed,
+                      "attribution": [p.attributed() for p in probes]}), flush=True)
     return failed
 
 

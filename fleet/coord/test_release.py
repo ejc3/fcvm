@@ -881,6 +881,61 @@ class PotatoEvidenceTests(unittest.TestCase):
         self.assertNotIn("2001:db8", json.dumps(line), "a drop's free text can name an address")
 
 
+class AttributionTests(unittest.TestCase):
+    """The release gate (fleet/ami/release_gate.py) decides only on probes whose tiles the
+    coordinator said ran on the release's hosts and tile instances, so each family's summary
+    records, per probe, digests of the host and tile instance ids /live reported for the tile.
+    The ids themselves never reach a printed line: this repository's logs are public."""
+
+    STATE = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "running", "host": "i-0example0host00a"},
+                       {"id": "fcvm:2", "half": "fcvm", "phase": "failed", "host": "i-0example0host00a"},
+                       {"id": "ec2:1", "half": "ec2", "phase": "running", "vm": "i-0example0tile00a"}],
+             "windows": {"tiles": [{"id": "win:1", "phase": "running", "host": "i-0example0host00b"}]},
+             "aggregates": [{"id": "agg:ec2", "half": "ec2", "host": None, "tiles": ["ec2:1"],
+                             "frame_url": "wss://agg-ec2-abcdefgh.tiles.fcvm.dev/frames"}]}
+
+    def test_the_digest_is_the_release_gates(self):
+        gate = load("release_gate", "../ami/release_gate.py")
+        for instance in ("i-0example0host00a", ""):
+            self.assertEqual(smoke.attribution_digest(instance), gate.attribution_digest(instance))
+        self.assertEqual(smoke.attribution_digest("i-0example0host00a"),
+                         hashlib.sha256(b"fcvm-release-gate\0i-0example0host00a").hexdigest())
+
+    def test_each_probe_carries_the_host_or_tile_instance_live_reported(self):
+        jobs, failed = smoke.sweep_jobs(self.STATE, ("wall", "windows"), "v4", None, "v-1", [])
+        by_tile = {j[2]["id"]: smoke.tile_attribution(j[2]) for j in jobs}
+        self.assertEqual(by_tile["fcvm:1"], (["i-0example0host00a"], []))
+        self.assertEqual(by_tile["ec2:1"], ([], ["i-0example0tile00a"]))
+        self.assertEqual(by_tile["win:1"], (["i-0example0host00b"], []))
+        # The EC2 half's aggregate has no host of its own: it relays its tiles' frames.
+        self.assertEqual(by_tile["agg:ec2"], ([], ["i-0example0tile00a"]))
+        # A tile the coordinator reports not running is still attributed to where it runs.
+        self.assertEqual([(f.tile, f.hosts, f.instances) for f in failed], [("fcvm:2", ["i-0example0host00a"], [])])
+        # A tile /live names no host for has no attribution, and the gate then decides nothing.
+        self.assertEqual(smoke.tile_attribution({"id": "fcvm:9", "half": "fcvm"}), ([], []))
+
+    def test_the_summary_line_holds_digests_and_no_line_holds_an_id(self):
+        clock, current = [0.0], [{"potato": {"capacity": 96, "host": "i-0example0host00b",
+                                             "round": {"id": 1, "size": 2, "seq": 0}}}]
+
+        def until(predicate):
+            # Each wait sees one more catch: the settle wait first, then the catch watch.
+            clock[0] += 1
+            current[0]["potato"]["round"]["seq"] += 1
+            predicate(current[0])
+            return current[0]
+
+        out = io.StringIO()
+        with patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            smoke.viewer_path("v4", ("potato",), False, [], until, None, lambda: (current[0], {}, "v-1"))
+        self.assertNotIn("i-0example0host00b", out.getvalue())
+        summary = next(json.loads(l) for l in out.getvalue().splitlines() if '"probes"' in l)
+        self.assertEqual(summary["probes"], len(summary["attribution"]))
+        self.assertEqual(summary["attribution"], [{"mode": "potato", "tile": None, "ok": True,
+                                                   "hosts": [smoke.attribution_digest("i-0example0host00b")],
+                                                   "instances": []}])
+
+
 class HostLocalTests(unittest.TestCase):
     """The image factory's validator has a builder security group that admits no inbound port and
     lets out only 80, 443 and 53 over IPv4, so a host-image acceptance that went out through the
@@ -928,15 +983,16 @@ class SmokeWorkflowTests(unittest.TestCase):
 
     def test_every_caller_of_the_smoke_passes_its_secrets(self):
         import re
-        callers = 0
+        callers = []
         for path in sorted((HERE.parent.parent / ".github" / "workflows").glob("*.yml")):
             text = path.read_text()
             for job in re.split(r"(?m)^  (?=[\w-]+:\n)", text.split("\njobs:\n", 1)[-1]):
                 if "uses: ./.github/workflows/fleet-viewer-smoke.yml" not in job:
                     continue
-                callers += 1
+                callers.append(path.name)
                 self.assertRegex(job, r"(?m)^    secrets: inherit$", f"{path.name}: the smoke gets no secrets")
-        self.assertEqual(callers, 2, "the coordinator and web deploys both call the smoke")
+        self.assertEqual(callers, ["fleet-coordinator-deploy.yml", "fleet-release-gate.yml", "fleet-web-deploy.yml"],
+                         "the coordinator and web deploys and the image release gate call the smoke")
 
 
 class ResolveTests(unittest.TestCase):

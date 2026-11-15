@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests of fleet/ami/release_gate.py and the workflow that runs it (fleet-release-gate.yml)."""
+import hashlib
 import json
 import os
 import pathlib
@@ -38,22 +39,56 @@ class GateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    # Placeholder instance ids: the gate's raw answer names the release's hosts and tile instances.
+    HOSTS = ["i-0example0host00a", "i-0example0host00b"]
+    TILES = ["i-0example0tile00a"]
+
+    @staticmethod
+    def digest(instance):
+        # The attribution digest both sides compute (fleet/coord/stage-smoke.py, release_gate.py):
+        # instance ids are not printed in this public repository's logs.
+        return hashlib.sha256(b"fcvm-release-gate\0" + instance.encode()).hexdigest()
+
     # A status as ejc3/aws#862's gate returns it: the live receipt and the placement serving it.
     def status(self, **changes):
-        placement = {"current": True, "settled": True, "release_hosts": 1, "digest": "d" * 64}
+        placement = {"current": True, "settled": True, "release_hosts": list(self.HOSTS),
+                     "release_tiles": list(self.TILES), "digest": "d" * 64}
         placement.update(changes.pop("placement", {}))
         value = {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build", "source_sha": "a" * 40,
                  "verified": False, "rollback": False, "placement": placement}
         value.update(changes)
         return value
 
+    def attribution(self, hosts=None, instances=None, ok=True):
+        """What the smoke records of each probe: the digests of the host and tile instances the
+        coordinator reported serving it."""
+        hosts = self.HOSTS[:1] if hosts is None else hosts
+        return {"mode": "wall", "tile": "fcvm:1", "ok": ok, "hosts": [self.digest(h) for h in hosts],
+                "instances": [self.digest(i) for i in (instances or [])]}
+
+    def summary(self, name="v4", failed=0, attribution=None):
+        if attribution is None:
+            attribution = ([self.attribution(), self.attribution(hosts=self.HOSTS[1:2]),
+                            self.attribution(hosts=[], instances=self.TILES)])
+            attribution += [self.attribution(ok=False) for _ in range(failed)]
+        return {"family": name, "modes": ["wall", "phones", "windows", "minecraft", "potato"],
+                "probes": len(attribution), "failed": failed, "attribution": attribution}
+
     SUMMARY = {"family": "v4", "modes": ["wall", "phones", "windows", "minecraft", "potato"], "probes": 26, "failed": 0}
 
-    def family(self, name, failed=0):
-        return json.dumps(dict(self.SUMMARY, family=name, failed=failed))
+    def family(self, name, failed=0, attribution=None):
+        return json.dumps(self.summary(name, failed, attribution))
+
+    def redacted(self, status):
+        """The status as the status job hands it on: release instance ids replaced by digests."""
+        value = json.loads(json.dumps(status))
+        for key in ("release_hosts", "release_tiles"):
+            if isinstance(value.get("placement"), dict) and isinstance(value["placement"].get(key), list):
+                value["placement"][key] = [self.digest(i) for i in value["placement"][key]]
+        return value
 
     def decide(self, gate, before=None, v4=None, v6=None):
-        before = before if before is not None else self.status()
+        before = self.redacted(before if before is not None else self.status())
         argv = ["decide", "--before", json.dumps(before),
                 "--v4", self.family("v4") if v4 is None else v4, "--v6", self.family("v6") if v6 is None else v6]
         return release_gate.main(argv, run=gate)
@@ -99,7 +134,7 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(gate.payloads, [{"action": "status"}])
 
     def test_a_mixed_unsettled_or_unobservable_placement_decides_nothing(self):
-        for placement in ({"current": False}, {"settled": False}, {"release_hosts": 0}, {"digest": None}):
+        for placement in ({"current": False}, {"settled": False}, {"release_hosts": []}, {"digest": None}):
             for which in ("before", "after"):
                 with self.subTest(placement=placement, which=which):
                     bad = self.status(placement=placement)
@@ -127,7 +162,58 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(release_gate.main(["status"], run=Lambda(status)), 0)
                 lines = dict(line.split("=", 1) for line in out.read().splitlines())
                 self.assertEqual(lines["ready"], ready)
-                self.assertEqual(json.loads(lines["status"]), status)
+                self.assertEqual(json.loads(lines["status"]), self.redacted(status))
+
+    def test_status_never_prints_or_hands_on_a_release_instance_id(self):
+        with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}):
+            printed = io.StringIO()
+            with redirect_stdout(printed):
+                self.assertEqual(release_gate.main(["status"], run=Lambda(self.status())), 0)
+            handed = out.read()
+        for instance in self.HOSTS + self.TILES:
+            self.assertNotIn(instance, printed.getvalue())
+            self.assertNotIn(instance, handed)
+
+    def test_a_probe_on_a_host_outside_the_release_gives_no_verdict(self):
+        # The placement digest stayed the same, but the coordinator said this probe's tile ran on
+        # a host that is not on the release's host image, or on a tile instance not on its tile image.
+        for failed in (0, 1):
+            for stray in (self.attribution(hosts=["i-0example0other0a"]),
+                          self.attribution(hosts=[], instances=["i-0example0other0b"]),
+                          self.attribution(hosts=self.HOSTS + ["i-0example0other0a"])):
+                with self.subTest(failed=failed, stray=stray):
+                    summary = self.summary("v6", failed)
+                    summary["attribution"].append(stray)
+                    summary["probes"] += 1
+                    gate = Lambda(self.status())
+                    self.assertEqual(self.decide(gate, v6=json.dumps(summary)), 0)
+                    self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_probe_without_host_attribution_gives_no_verdict(self):
+        bare = self.summary("v4")
+        del bare["attribution"]
+        empty = self.summary("v4")
+        empty["attribution"].append(self.attribution(hosts=[], instances=[]))
+        empty["probes"] += 1
+        short = self.summary("v4")
+        short["probes"] += 1
+        not_a_digest = self.summary("v4")
+        not_a_digest["attribution"][0]["hosts"] = [self.HOSTS[0]]
+        for summary in (bare, empty, short, not_a_digest):
+            with self.subTest(summary=summary):
+                gate = Lambda(self.status())
+                self.assertEqual(self.decide(gate, v4=json.dumps(summary)), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_every_probe_on_a_release_host_with_a_pass_verifies(self):
+        gate = Lambda(self.status(), {"status": "verified"})
+        self.assertEqual(self.decide(gate, v4=self.family("v4"), v6=self.family("v6")), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "verify"])
+
+    def test_every_probe_on_a_release_host_with_a_fail_rolls_back(self):
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4=self.family("v4", failed=2), v6=self.family("v6")), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "rollback"])
 
     def test_a_family_summary_is_read_from_the_smoke_lines(self):
         lines = [json.dumps({"mode": "wall", "tile": "fcvm:1", "ok": True}), json.dumps(dict(self.SUMMARY, failed=2)),

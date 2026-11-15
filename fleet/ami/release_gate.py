@@ -4,17 +4,22 @@
 The gate is a Lambda in the control account (ejc3/aws fcvm-fleet-ami-pipeline.tf,
 `fcvm_ami_release_gate`; publish.py `gate_handler`). Its status names the live release receipt
 (`generation`, `build_id`) and the placement serving it: `current` (every live host and tile runs
-the receipt's images), `settled` (every live host has been up long enough to serve), the number
-of live hosts on the release's host image, and a `digest` of that placement. `verify` and
-`rollback` take the receipt and the digest and the gate refuses either if the live receipt or the
-placement has moved (ejc3/aws#862).
+the receipt's images), `settled` (every live host has been up long enough to serve),
+`release_hosts` and `release_tiles` (the instance ids of the live hosts on the release's host
+image and of the live EC2 tiles on its tile image), and a `digest` of that placement. `verify`
+and `rollback` take the receipt and the digest and the gate refuses either if the live receipt or
+the placement has moved (ejc3/aws#862). Instance ids are never printed or handed on: `status`
+replaces them by digests (attribution_digest), the form the smoke records them in.
 
     release_gate.py status
     release_gate.py summary SMOKE.jsonl        (in each smoke family's job)
     release_gate.py decide --before STATUS --v4 SUMMARY --v6 SUMMARY
 
 Only a verdict the release caused decides anything:
-- both families ran every mode's probes (each reported its summary line), and
+- both families ran every mode's probes (each reported its summary line),
+- every probe is attributed: the smoke recorded, for each, the hosts or EC2 tile instances /live
+  said served it, every host is one of the after-status's release hosts and every tile instance
+  one of its release tiles, and
 - the placement was ready before the probes and is identical after them: the same receipt, the
   same digest, current and settled.
 Then a pass on both families verifies the receipt and a failure on either rolls it back.
@@ -23,7 +28,9 @@ coordinator; or a placement that is old, mixed, changing or unobservable) decide
 later run smokes the release again.
 """
 import argparse
+import hashlib
 import json
+import re
 import os
 import subprocess
 import sys
@@ -47,6 +54,26 @@ def invoke(payload, run=subprocess.run):
             raise SystemExit(f"release_gate: {FUNCTION} raised {meta['FunctionError']}")
         with open(out) as handle:
             return json.load(handle)
+
+
+DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def attribution_digest(instance):
+    """An instance id as the smoke and the status output name it (fleet/coord/stage-smoke.py
+    computes the same one; fleet/coord/test_release.py pins the two together)."""
+    return hashlib.sha256(b"fcvm-release-gate\0" + instance.encode()).hexdigest()
+
+
+def redact(status):
+    """The status with its release instance ids replaced by their digests."""
+    value = json.loads(json.dumps(status))
+    placement = value.get("placement") if isinstance(value, dict) else None
+    if isinstance(placement, dict):
+        for key in ("release_hosts", "release_tiles"):
+            if isinstance(placement.get(key), list):
+                placement[key] = [attribution_digest(i) if isinstance(i, str) else None for i in placement[key]]
+    return value
 
 
 def outputs(values):
@@ -76,7 +103,10 @@ def placement_problem(status):
         return "a live host or tile runs an image other than the release's"
     if p.get("settled") is not True:
         return "a live host is still coming up"
-    if type(p.get("release_hosts")) is not int or p["release_hosts"] < 1:
+    for key in ("release_hosts", "release_tiles"):
+        if not isinstance(p.get(key), list) or not all(isinstance(i, str) and DIGEST.fullmatch(i) for i in p[key]):
+            return f"the placement does not list its {key}"
+    if not p["release_hosts"]:
         return "no live host runs the release's host image"
     if not isinstance(p.get("digest"), str) or not p["digest"]:
         return "the placement has no digest"
@@ -96,6 +126,26 @@ def family_summary(raw):
     return None
 
 
+def unattributed(summary, placement):
+    """Why a family's probes cannot be laid on the release, or None when each one can: every probe
+    names a host or tile instance, every host is a release host and every tile instance a release
+    tile. A probe that ran on something else, or that /live named nothing for, is no evidence
+    about the release, whatever it found."""
+    entries = summary.get("attribution")
+    if not isinstance(entries, list) or len(entries) != summary["probes"]:
+        return "does not attribute every probe"
+    hosts, tiles = set(placement["release_hosts"]), set(placement["release_tiles"])
+    for entry in entries:
+        named = (entry.get("hosts"), entry.get("instances")) if isinstance(entry, dict) else (None, None)
+        if not all(isinstance(n, list) and all(isinstance(i, str) and DIGEST.fullmatch(i) for i in n) for n in named):
+            return "has a probe without host attribution"
+        if not named[0] and not named[1]:
+            return "has a probe /live named no host or tile instance for"
+        if not set(named[0]) <= hosts or not set(named[1]) <= tiles:
+            return "has a probe served by a host or tile instance not on the release's images"
+    return None
+
+
 def decide(before, v4, v6, run):
     problem = placement_problem(before)
     if problem:
@@ -105,12 +155,16 @@ def decide(before, v4, v6, run):
     if missing:
         return None, (f"no verdict: {' and '.join(missing)} reported no probe summary "
                       "(setup, credentials, runner or coordinator)")
-    after = invoke({"action": "status"}, run)
+    after = redact(invoke({"action": "status"}, run))
     problem = placement_problem(after)
     if problem:
         return None, f"no verdict: after the probes {problem}"
     if receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]:
         return None, "no verdict: the release or its placement changed during the probes"
+    for name, summary in summaries.items():
+        problem = unattributed(summary, after["placement"])
+        if problem:
+            return None, f"no verdict: {name} {problem}"
     failed = summaries["v4"]["failed"] + summaries["v6"]["failed"]
     action = "rollback" if failed else "verify"
     return {"action": action, "receipt": receipt(before), "placement": before["placement"]["digest"]}, None
@@ -128,7 +182,7 @@ def main(argv=None, run=subprocess.run):
     d.add_argument("--v6", default="")
     args = parser.parse_args(argv)
     if args.command == "status":
-        status = invoke({"action": "status"}, run)
+        status = redact(invoke({"action": "status"}, run))
         ready = status.get("verified") is False and placement_problem(status) is None
         print(json.dumps(status))
         outputs({"ready": "true" if ready else "false", "status": json.dumps(status, separators=(",", ":"))})
