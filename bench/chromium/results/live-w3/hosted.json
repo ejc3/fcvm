@@ -1,0 +1,198 @@
+{
+ "batches": 8,
+ "client_load": {
+  "max": 8.69,
+  "median": 1.05
+ },
+ "colos": [
+  "CMH"
+ ],
+ "cpu": 4,
+ "edge_probe": {
+  "median": 10.350000000000001,
+  "n": 112
+ },
+ "fcvm": {
+  "cdp": {
+   "hi": 499.38368850007464,
+   "lo": 386.61640800000896,
+   "median": 407.98140749996037,
+   "n": 202
+  },
+  "html-fast": {
+   "hi": 448.0678104999356,
+   "lo": 330.0499059998856,
+   "median": 355.3291230000468,
+   "n": 202
+  },
+  "noop": {
+   "hi": 36.69521550011723,
+   "lo": 36.53702849987894,
+   "median": 36.56652200015742,
+   "n": 202
+  }
+ },
+ "guest_dns": "1.1.1.1",
+ "host": {
+  "cpu_model": "Neoverse-V2",
+  "instance_type": "c8gd.metal-24xl",
+  "nproc": 96
+ },
+ "hosted": {
+  "chromium/content": {
+   "attempts": 112,
+   "median": 970.1500000000001,
+   "succeeded": 112
+  },
+  "chromium/screenshot": {
+   "attempts": 112,
+   "median": 1097.1,
+   "succeeded": 112
+  },
+  "kitesurf/content": {
+   "attempts": 112,
+   "median": 928.75,
+   "succeeded": 110
+  },
+  "kitesurf/screenshot": {
+   "attempts": 112,
+   "median": 1284.9499999999998,
+   "succeeded": 110
+  }
+ },
+ "kitesurf_incomplete": [
+  [
+   "browserrun-005",
+   "https://www.theguardian.com/international"
+  ],
+  [
+   "browserrun-007",
+   "https://www.elmundo.es/"
+  ]
+ ],
+ "kitesurf_incomplete_text": "the Guardian in browserrun-005 and elmundo in browserrun-007",
+ "n_failed": 0,
+ "per_url": {
+  "https://blog.cloudflare.com/": {
+   "chromium/content": 1474.4,
+   "chromium/screenshot": 1055.55,
+   "fcvm cdp": 403.44931599997835,
+   "fcvm html-fast": 354.1495560000385,
+   "kitesurf/content": 1024.8,
+   "kitesurf/screenshot": 3528.95
+  },
+  "https://developer.mozilla.org/en-US/": {
+   "chromium/content": 1472.5,
+   "chromium/screenshot": 772.6500000000001,
+   "fcvm cdp": 387.42969599979915,
+   "fcvm html-fast": 326.3214290000178,
+   "kitesurf/content": 1571.8,
+   "kitesurf/screenshot": 2609.6000000000004
+  },
+  "https://developers.cloudflare.com/": {
+   "chromium/content": 1155.55,
+   "chromium/screenshot": 1237.2,
+   "fcvm cdp": 542.2433819999242,
+   "fcvm html-fast": 482.8343489998588,
+   "kitesurf/content": 1914.25,
+   "kitesurf/screenshot": 3674.7
+  },
+  "https://en.wikipedia.org/": {
+   "chromium/content": 1003.05,
+   "chromium/screenshot": 1208.8,
+   "fcvm cdp": 505.5852610000784,
+   "fcvm html-fast": 517.2420210001292,
+   "kitesurf/content": 1023.55,
+   "kitesurf/screenshot": 3915.35
+  },
+  "https://example.com/": {
+   "chromium/content": 484.0,
+   "chromium/screenshot": 625.8499999999999,
+   "fcvm cdp": 194.3587899997965,
+   "fcvm html-fast": 142.52116099987688,
+   "kitesurf/content": 634.2,
+   "kitesurf/screenshot": 747.7
+  },
+  "https://news.ycombinator.com/": {
+   "chromium/content": 1066.05,
+   "chromium/screenshot": 1118.45,
+   "fcvm cdp": 643.6701650000032,
+   "fcvm html-fast": 594.8605060000318,
+   "kitesurf/content": 645.6500000000001,
+   "kitesurf/screenshot": 949.5
+  },
+  "https://todomvc.com/examples/angular/dist/browser/": {
+   "chromium/content": 634.5999999999999,
+   "chromium/screenshot": 848.15,
+   "fcvm cdp": 358.48388499994144,
+   "fcvm html-fast": 299.755565499936,
+   "kitesurf/content": 913.1,
+   "kitesurf/screenshot": 754.65
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/": {
+   "chromium/content": 873.8,
+   "chromium/screenshot": 682.1,
+   "fcvm cdp": 359.3797304999953,
+   "fcvm html-fast": 284.3296434999729,
+   "kitesurf/content": 575.85,
+   "kitesurf/screenshot": 758.4000000000001
+  },
+  "https://todomvc.com/examples/preact/dist/": {
+   "chromium/content": 757.5,
+   "chromium/screenshot": 1114.65,
+   "fcvm cdp": 326.4109080000708,
+   "fcvm html-fast": 267.2454039999934,
+   "kitesurf/content": 493.0,
+   "kitesurf/screenshot": 802.75
+  },
+  "https://todomvc.com/examples/react/dist/index.html": {
+   "chromium/content": 646.95,
+   "chromium/screenshot": 921.85,
+   "fcvm cdp": 325.975587500011,
+   "fcvm html-fast": 273.5948999999209,
+   "kitesurf/content": 754.35,
+   "kitesurf/screenshot": 907.4000000000001
+  },
+  "https://todomvc.com/examples/vue/dist/": {
+   "chromium/content": 604.3,
+   "chromium/screenshot": 716.4,
+   "fcvm cdp": 326.6247735000434,
+   "fcvm html-fast": 291.75666850005655,
+   "kitesurf/content": 695.3499999999999,
+   "kitesurf/screenshot": 776.85
+  },
+  "https://www.elmundo.es/": {
+   "chromium/content": 4201.65,
+   "chromium/screenshot": 2926.85,
+   "fcvm cdp": 30636.815000000013,
+   "fcvm html-fast": 31348.256011000103,
+   "kitesurf/content": 2441.0,
+   "kitesurf/screenshot": 15550.6
+  },
+  "https://www.rtp.pt/noticias/": {
+   "chromium/content": 4135.9,
+   "chromium/screenshot": 2754.8500000000004,
+   "fcvm cdp": 2615.537712499986,
+   "fcvm html-fast": 2403.6291129999654,
+   "kitesurf/content": 2124.6,
+   "kitesurf/screenshot": 7014.4
+  },
+  "https://www.theguardian.com/international": {
+   "chromium/content": 1452.95,
+   "chromium/screenshot": 1542.8000000000002,
+   "fcvm cdp": 1439.7166164999362,
+   "fcvm html-fast": 1713.2597365000493,
+   "kitesurf/content": 3331.6,
+   "kitesurf/screenshot": 10458.3
+  }
+ },
+ "publishable": true,
+ "source_revision": "e0ed334ed99ec59805d0bb926a0cacf1f66c4ba7",
+ "uffd_mode": "copy",
+ "window_s": null,
+ "windows": {
+  "fcvm_s": 1848.710351228714,
+  "hosted_end_s": 2099.759011030197,
+  "hosted_start_s": 1.3828821182250977
+ }
+}
