@@ -127,7 +127,7 @@ pub(crate) fn image_identity(metadata: &std::fs::Metadata) -> String {
 /// then finds different. An entry is mode 0400 and never written, so these three are
 /// enough to see one that is missing or was replaced. The length stays the second field,
 /// where `check_pmem_images` reads it.
-fn entry_identity(metadata: &std::fs::Metadata) -> String {
+pub(crate) fn entry_identity(metadata: &std::fs::Metadata) -> String {
     crate::utils::metadata_identity(metadata)
 }
 

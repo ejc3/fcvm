@@ -1280,20 +1280,130 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
 /// v2: host-side cleanup of podman state files before ext4 packaging
 const OVERLAY_CACHE_VERSION: u32 = 2;
 
+/// What follows the image's digest in the name of its image-delivery disk in the image
+/// cache: the overlay storage image of this build's format, or the Docker archive.
+fn image_disk_suffix(mode: crate::firecracker::ImageMode) -> String {
+    match mode {
+        crate::firecracker::ImageMode::Overlay => format!(".storage-v{OVERLAY_CACHE_VERSION}.img"),
+        crate::firecracker::ImageMode::Btrfs | crate::firecracker::ImageMode::Archive => {
+            ".docker.tar".to_string()
+        }
+    }
+}
+
 /// The content-addressed cache path the image-delivery disk for `digest` lands
 /// at once built. Purely computed — existence is the caller's question to ask.
 fn expected_image_disk_path(digest: &str, mode: crate::firecracker::ImageMode) -> PathBuf {
-    let cache_dir = paths::image_cache_dir().join(digest);
-    match mode {
-        crate::firecracker::ImageMode::Overlay => PathBuf::from(format!(
-            "{}.storage-v{}.img",
-            cache_dir.display(),
-            OVERLAY_CACHE_VERSION
-        )),
-        crate::firecracker::ImageMode::Btrfs | crate::firecracker::ImageMode::Archive => {
-            cache_dir.with_extension("docker.tar")
+    paths::image_cache_dir().join(format!("{digest}{}", image_disk_suffix(mode)))
+}
+
+/// The key of the image in `name`, when `name` is one [`expected_image_disk_path`] gives
+/// the disk of an image: the image's key ([`is_image_cache_key`]), then
+/// [`image_disk_suffix`] of a mode. The key also names the image's lock
+/// ([`lock_image_cache_entries`]).
+///
+/// A launch reuses a file of the image cache by this name, so `snapshot import`, whose
+/// archive names the path of an image disk, holds the name against it.
+pub(crate) fn image_disk_name_digest(name: &std::ffi::OsStr) -> Option<&str> {
+    let name = name.to_str()?;
+    [
+        crate::firecracker::ImageMode::Overlay,
+        crate::firecracker::ImageMode::Archive,
+    ]
+    .into_iter()
+    .find_map(|mode| name.strip_suffix(image_disk_suffix(mode).as_str()))
+    .filter(|key| is_image_cache_key(key))
+}
+
+/// Whether `key` is a key the image cache gives an image
+/// (`image::parse_image_cache_ref`): the digest podman prints for the image, or its image
+/// id, with a leading `sha256:` taken off. That is the encoded part of a digest alone
+/// (letters, digits, `=`, `_` and `-`), or an algorithm (lowercase letters and digits, in
+/// parts joined by one of `+`, `.`, `_` and `-`), a colon and the encoded part. No such key
+/// holds a path separator.
+fn is_image_cache_key(key: &str) -> bool {
+    let (algorithm, encoded) = match key.split_once(':') {
+        Some((algorithm, encoded)) => (Some(algorithm), encoded),
+        None => (None, key),
+    };
+    let encoded_is_one = !encoded.is_empty()
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'_' | b'-'));
+    let algorithm_is_one = algorithm.is_none_or(|algorithm| {
+        algorithm.split(['+', '.', '_', '-']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+    });
+    encoded_is_one && algorithm_is_one
+}
+
+/// Take the lock of the image cache's entries for `digest`, and wait for it. A launch
+/// holds it from its look for the image's cached archive and storage image through the
+/// renames that publish the ones it builds, and those renames replace. `snapshot import`
+/// holds it while it publishes or checks an image disk, so it never publishes into a
+/// build in flight on this kernel.
+///
+/// The lock is a flock, which one kernel grants. VMs that share the store through a FUSE
+/// map each get it from their own guest kernel, so a build in another VM is not kept out:
+/// an import there meets what a launch there meets, and a build that replaces the disk an
+/// import linked leaves a snapshot whose restore is refused (image disk build changed).
+///
+/// The lock file is opened without following a link and is not truncated: a sudo import
+/// hands the image cache it makes to its invoker, who can put a link at the lock's name.
+/// A sudo run hands the lock file to its invoker, so the invoker's rootless runs can open
+/// it. A lock file this user cannot write (a run as root without an invoker left it) is
+/// opened for reading: a flock needs no write access.
+pub(crate) fn lock_image_cache_entries(
+    image_cache_dir: &std::path::Path,
+    digest: &str,
+) -> Result<std::fs::File> {
+    lock_image_cache_entries_for(image_cache_dir, digest, crate::setup::sudo_invoker())
+}
+
+/// [`lock_image_cache_entries`] for the sudo invoker `invoker`.
+fn lock_image_cache_entries_for(
+    image_cache_dir: &std::path::Path,
+    digest: &str,
+    invoker: Option<&nix::unistd::User>,
+) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_path = image_cache_dir.join(format!("{digest}.lock"));
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path);
+    let lock_file = match opened {
+        Ok(lock_file) => {
+            // Through the descriptor: the name is in a directory the invoker can write.
+            crate::setup::give_store_fd_to(&lock_file, &lock_path, invoker);
+            lock_file
         }
+        Err(denied) if denied.kind() == std::io::ErrorKind::PermissionDenied => {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)
+            {
+                Ok(lock_file) => lock_file,
+                // No lock file to read either: the first refusal is the one to report.
+                Err(_) => return Err(denied).context("creating image cache lock file"),
+            }
+        }
+        Err(error) => return Err(error).context("creating image cache lock file"),
+    };
+    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+        failpoint::note("lock.wait", lock_path.display());
+        lock_file
+            .lock_exclusive()
+            .context("acquiring image cache lock")?;
     }
+    Ok(lock_file)
 }
 
 /// Export a localhost/ image and build its delivery disk (overlay storage
@@ -1319,21 +1429,12 @@ async fn export_localhost_image_disk(
         .await
         .context("creating image-cache directory")?;
 
-    let cache_dir = image_cache_dir.join(&digest);
-
     // Lock per-digest to prevent concurrent exports of the same image
-    let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
-    let lock_file = std::fs::File::create(&lock_path).context("creating image cache lock file")?;
-    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
-        failpoint::note("lock.wait", lock_path.display());
-        lock_file
-            .lock_exclusive()
-            .context("acquiring image cache lock")?;
-    }
+    let lock_file = lock_image_cache_entries(&image_cache_dir, &digest)?;
 
     // Check if already cached (inside lock to prevent race)
     // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
-    let archive_path = cache_dir.with_extension("docker.tar");
+    let archive_path = expected_image_disk_path(&digest, crate::firecracker::ImageMode::Archive);
     let needs_export = if !archive_path.exists() {
         true
     } else {
@@ -7424,6 +7525,171 @@ mod tests {
         // Error paths can run before any state was persisted — calling the helper
         // again with nothing left to remove must not panic.
         cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
+    }
+
+    /// A launch names an image's disk after the key `podman image inspect` gives the image
+    /// ([`image::parse_image_cache_ref`], [`expected_image_disk_path`]), and `snapshot
+    /// import` takes an image disk only under such a name ([`image_disk_name_digest`]). So
+    /// the name of every mode, for every shape of key, has to read back as that key.
+    #[test]
+    fn every_image_disk_name_a_launch_makes_is_one_an_import_takes() {
+        let hex = "0123456789abcdef".repeat(4);
+        // What `podman image inspect` prints for `{{.Digest}}\t{{.Id}}`, and the key.
+        let inspected = [
+            // A manifest digest.
+            (format!("sha256:{hex}\t{hex}\n"), hex.clone()),
+            // A local build reports no digest: the image id, bare or with its algorithm.
+            (format!("\t{hex}\n"), hex.clone()),
+            (format!("\tsha256:{hex}\n"), hex.clone()),
+            // A digest of another algorithm keeps the algorithm.
+            (
+                format!("sha512:{hex}{hex}\t{hex}\n"),
+                format!("sha512:{hex}{hex}"),
+            ),
+            // The widest algorithm and encoding a digest's grammar allows.
+            (
+                format!("multihash+base58:QmRZxt2b1FVZPNqd8hsiykDL3TdBDeTSPX9Kv46HmX4Gx8\t{hex}\n"),
+                "multihash+base58:QmRZxt2b1FVZPNqd8hsiykDL3TdBDeTSPX9Kv46HmX4Gx8".to_string(),
+            ),
+            (
+                format!("sha256+b64u:LCa0a2j_xo_5m0U8HTBBNBNCLXBkg7-g-YpeiGJm564=\t{hex}\n"),
+                "sha256+b64u:LCa0a2j_xo_5m0U8HTBBNBNCLXBkg7-g-YpeiGJm564=".to_string(),
+            ),
+        ];
+        for (stdout, key) in inspected {
+            let cache_key = image::parse_image_cache_ref("localhost/example", &stdout)
+                .unwrap()
+                .cache_key;
+            assert_eq!(cache_key, key, "the key of {stdout:?}");
+            for mode in [ImageMode::Overlay, ImageMode::Btrfs, ImageMode::Archive] {
+                let disk = expected_image_disk_path(&cache_key, mode);
+                assert_eq!(
+                    disk.parent(),
+                    Some(paths::image_cache_dir().as_path()),
+                    "{} is not directly under the image cache",
+                    disk.display()
+                );
+                assert_eq!(
+                    image_disk_name_digest(disk.file_name().unwrap()),
+                    Some(key.as_str()),
+                    "a launch in {mode} mode names the disk of image {key} {}, and an import \
+                     does not take that name for the image",
+                    disk.display()
+                );
+            }
+        }
+
+        // Not a name of the image cache: no image, a path, or a character no digest has.
+        for name in [
+            ".storage-v2.img",
+            ".docker.tar",
+            "layers.img",
+            "0123456789abcdef.storage-v1.img",
+            "0123456789abcdef.lock",
+            ":0123456789abcdef.docker.tar",
+            "sha512:.docker.tar",
+            "Sha512:0123456789abcdef.docker.tar",
+            "sha512+:0123456789abcdef.docker.tar",
+            "sha512:0123:4567.docker.tar",
+            "0123 4567.docker.tar",
+            "0123/4567.docker.tar",
+            "0123.4567.docker.tar",
+        ] {
+            assert_eq!(
+                image_disk_name_digest(std::ffi::OsStr::new(name)),
+                None,
+                "{name} was taken as the disk of an image"
+            );
+        }
+    }
+
+    /// The lock of an image is a flock, which needs no write access to the lock file. A
+    /// lock file another user made (a launch as root leaves one with mode 0644) still gives
+    /// this user the lock, and it is the lock every other holder takes. As root the open
+    /// for writing succeeds, so this holds there by another path.
+    #[test]
+    fn the_image_lock_is_taken_through_a_lock_file_the_caller_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        let lock_path = cache.path().join("0123456789abcdef.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let lock = lock_image_cache_entries(cache.path(), "0123456789abcdef")
+            .expect("the lock of an image whose lock file cannot be written");
+
+        let other = std::fs::File::open(&lock_path).unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&other).is_err(),
+            "the lock that was returned is not the image's: another holder got it meanwhile"
+        );
+        drop(lock);
+        fs2::FileExt::try_lock_exclusive(&other).expect("the image's lock, once it was dropped");
+    }
+
+    /// The lock file is opened in a directory a sudo run hands to its invoker, so a link at
+    /// its name is refused and not followed, and a file that has the name keeps its bytes.
+    #[test]
+    fn the_image_lock_follows_no_link_and_truncates_nothing() {
+        let cache = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("target");
+        std::fs::write(&target, b"kept").unwrap();
+        let lock_path = cache.path().join("0123456789abcdef.lock");
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+        let through_link = lock_image_cache_entries(cache.path(), "0123456789abcdef");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"kept",
+            "taking the lock truncated the file a link at the lock's name points to"
+        );
+        assert!(
+            through_link.is_err(),
+            "the lock was taken through a link at its name"
+        );
+
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::write(&lock_path, b"held").unwrap();
+        let lock = lock_image_cache_entries(cache.path(), "0123456789abcdef").unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"held");
+        drop(lock);
+    }
+
+    /// A sudo import hands the image cache it makes, and the disk it installs, to its
+    /// invoker. The lock file it makes beside them goes with them, so the invoker's next
+    /// rootless launch or import of the image can open it.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_sudo_run_hands_the_image_lock_to_its_invoker() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "privileged tests run as root"
+        );
+        const INVOKER: u32 = 2000;
+        // Handing a file to it is an fchown, which needs no passwd entry.
+        let invoker = nix::unistd::User {
+            name: "fixture-invoker".to_string(),
+            passwd: std::ffi::CString::new("x").unwrap(),
+            uid: nix::unistd::Uid::from_raw(INVOKER),
+            gid: nix::unistd::Gid::from_raw(INVOKER),
+            gecos: std::ffi::CString::default(),
+            dir: PathBuf::from("/nonexistent"),
+            shell: PathBuf::from("/bin/false"),
+        };
+        let cache = tempfile::tempdir().unwrap();
+
+        let lock =
+            lock_image_cache_entries_for(cache.path(), "0123456789abcdef", Some(&invoker)).unwrap();
+
+        let found = std::fs::symlink_metadata(cache.path().join("0123456789abcdef.lock")).unwrap();
+        assert_eq!(
+            (found.uid(), found.gid()),
+            (INVOKER, INVOKER),
+            "the lock file a sudo run made is not its invoker's"
+        );
+        drop(lock);
     }
 }
 

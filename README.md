@@ -505,8 +505,8 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm snapshot create` | Snapshot a running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Clone from snapshot (`--publish` chooses where its ports listen) |
-| `fcvm snapshot export` | Write a Firecracker snapshot's directory as one archive, to stdout or `--output <FILE>` |
-| `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote, from stdin or `--input <FILE>` |
+| `fcvm snapshot export` | Write a Firecracker snapshot as one archive, with the image disk and the pmem images it reads, to stdout or `--output <FILE>` |
+| `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote, and the image disk and pmem images this host lacks, from stdin or `--input <FILE>` |
 | `fcvm serve` | Start HTTP API server |
 
 **Key `podman run` flags:**

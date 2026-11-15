@@ -2,11 +2,9 @@
 //! carries (`storage::snapshot_archive`), read from a file or from stdin.
 //!
 //! The archive holds the snapshot's directory, and the import installs it under the tag it
-//! was exported from. What a restore reads outside the directory is not carried by this
-//! version. An archive whose manifest lists external files is refused, and a snapshot that
-//! refers to an image disk or to pmem images is refused unless this host already has them
-//! as the snapshot recorded them. For pmem images that is the exporting host only: the
-//! snapshot records each store entry by inode, length and modification time.
+//! was exported from. It also holds the image disk the snapshot attaches and the pmem
+//! store entries it maps (`manifest.externals`), and the import installs each one this host
+//! lacks at the path the snapshot recorded, where a restore opens it.
 //!
 //! # What is refused before anything is written
 //!
@@ -23,15 +21,28 @@
 //! - its kernel profile is configured here, without which a restore is refused;
 //! - `config.json` has the SHA-256 the manifest gives, and the two agree on the tag, the
 //!   kind, the snapshot versions, the hypervisor and the Firecracker binary;
-//! - the image disk the snapshot refers to is a file here, with the digest the snapshot
-//!   recorded if it recorded one, and its pmem images are the store entries it recorded
-//!   (`verify_image_disk_identity` and `check_snapshot_pmem_images`, the checks a restore
-//!   makes);
+//! - the manifest lists the external files the config names: the image disk and each pmem
+//!   store entry, with the digest the config binds each one's bytes to;
+//! - the image disk's recorded path is one this host's image cache gives the disk of an
+//!   image, whether this host has the file or not: directly under the cache, with the name
+//!   a launch gives such a disk. A launch reuses a file of that name by its existence, so
+//!   the name an import installs under decides which image gets the disk. A storage image
+//!   comes with the identity the snapshot recorded, `sha256:` and 64 lowercase hex digits;
+//! - an image disk this host has at that path is a regular file and, where the snapshot
+//!   recorded an identity, the build it recorded (`verify_image_disk_identity`, the check
+//!   a restore makes);
+//! - a pmem entry is named in this host's store. One this host has is an entry this run
+//!   can use; for one it lacks, the entries belong to the uid this import publishes for.
+//!   An entry's name is a digest of that uid and of the bytes, so another uid's entries
+//!   would not get the paths the snapshot recorded, and Firecracker reopens those paths;
 //! - every extra disk is named by one path component;
 //! - the tag does not exist here.
 //!
-//! None of this is trusted yet: the reader verifies nothing until it has read the trailer.
+//! None of this is verified yet: the reader verifies nothing until it has read the trailer.
 //! The checks decide whether to start, and the trailer decides whether to publish.
+//!
+//! The checks do not make an archive from an untrusted source safe: an archive is trusted
+//! as a snapshot made on this host is (DESIGN.md, `fcvm snapshot import`).
 //!
 //! # How it installs
 //!
@@ -48,18 +59,55 @@
 //! the imported snapshot has neither, so a memory server would read it as another
 //! snapshot's and ignore it.
 //!
-//! `config.json` is written last: the archived one with a new generation id and no parent
-//! snapshot, and every other field as it was. Once the reader has verified the trailer, the
-//! staged directory is checked for the files a restore opens (`check_generation_files`, as
-//! `podman prepare` checks a generation), synced, and renamed to `<tag>`. That rename is
+//! Once the reader has verified the trailer, the staged directory is checked for the files
+//! a restore opens (`check_generation_files`, as `podman prepare` checks a generation; the
+//! config is not among them and is not written yet), the external files are published,
+//! `config.json` is written, and the directory is synced and renamed to `<tag>`. The config
+//! is the archived one with a new generation id, no parent snapshot and each pmem device's
+//! identity as its entry has it on this host, and every other field as it was. That rename is
 //! the only step that makes the tag exist, and it replaces nothing: it is made with
 //! `RENAME_NOREPLACE`, which the kernel refuses when anything has the name. A cut stream, a
 //! digest that does not match, or any other failure removes the staging directory. A killed
 //! import leaves it to the next import or the next VM launch, both of which reclaim first.
+//!
+//! # External files
+//!
+//! A file this host has is never written: the archived copy is read, verified with the rest
+//! of the archive, and dropped, because the stream cannot skip it. A file this host lacks
+//! is staged where its store stages its own, and published only after the trailer has
+//! verified and the staged directory has every file a restore opens:
+//!
+//! - The image disk goes into a temporary beside its path in the image cache
+//!   (`setup::StoreTemp`), recorded for reclaim before the file exists. Where the snapshot
+//!   recorded an identity, the SHA-256 computed from the bytes as they are written has to
+//!   be that identity. A Docker archive disk has no recorded identity, and is installed as
+//!   the archive carries it, checked by the archive's trailer only. The disk is synced,
+//!   and then published with a hard link, which fails where a file has the name, under the
+//!   lock of its image in the image cache: a launch holds that lock from its look for the
+//!   image's disk through the rename that publishes the one it builds, so the import waits
+//!   for a build in flight on this kernel and then finds the build's disk under the name
+//!   (the lock is a flock, which a FUSE map does not carry to another VM's kernel). A disk
+//!   this host had all along is checked again under the same lock. The digest computed
+//!   while writing is recorded for the published file (`remember_image_disk_digest`), so
+//!   the first restore does not read the disk to check it.
+//! - A pmem entry goes through the store's stream ingest
+//!   (`PmemStore::begin_stream_ingest`): a temp under the store's `tmp/` with the store's
+//!   lock held, the store's digest computed as the bytes arrive, and the store's own
+//!   publication. The name those bytes get for this run's uid has to be the recorded path.
+//!
+//! A failure before publication removes every temporary and its reclaim record; the
+//! directories the import made (the image cache, the pmem store) and lock files stay. A
+//! killed import leaves no temporary for good: the next import or VM launch removes them
+//! (`reclaim_abandoned`, which also collects the pmem store's temps). A file that another
+//! process published under the same name meanwhile is kept, and has to be what the
+//! snapshot recorded. An external that is published stays if a later step fails or the
+//! import is killed: it is a whole, verified entry of its store, as one a `podman run`
+//! leaves.
 
 use std::fs::File;
 use std::io::{BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,16 +120,21 @@ use super::common::{
     acquire_snapshot_dir_lock, create_memory_file_nodatacow, record_snapshot_staging_in,
     snapshot_sibling,
 };
-use super::snapshot_export::{not_shipped, sha256_hex, CONFIG_FILE};
+use super::snapshot_export::{not_shipped, recorded_externals, sha256_hex, CONFIG_FILE};
 use crate::cli::SnapshotImportArgs;
 use crate::hypervisor::Backend;
 use crate::paths;
+use crate::setup::StoreTemp;
 use crate::storage::disk::{clear_staging, create_dir_or_subvolume, remove_snapshot_dir};
+use crate::storage::pmem_store::{PmemStore, StagedEntry};
 use crate::storage::snapshot::{
     check_extra_disk_names, check_generation_files, parse_snapshot_config, snapshot_disk_dir,
     SNAPSHOT_DISK_FILE, SNAPSHOT_MEMORY_FILE, SNAPSHOT_VMSTATE_FILE,
 };
-use crate::storage::snapshot_archive::{ArchiveEntry, ArchiveManifest, ArchiveReader, EntryName};
+use crate::storage::snapshot_archive::{
+    ArchiveEntry, ArchiveManifest, ArchiveReader, ContentSha256, EntryName, ExternalRole,
+    ManifestExternal,
+};
 use crate::storage::{validate_snapshot_name, SnapshotConfig, SnapshotKind};
 
 /// The buffer between the input and the archive reader, for the headers, the maps and the
@@ -102,6 +155,9 @@ pub(crate) struct ImportHost {
     pub snapshots_dir: PathBuf,
     /// Compared with the manifest's: the VM state embeds paths under it.
     pub data_dir: PathBuf,
+    /// Where this host keeps image disks, and the one directory an import installs an image
+    /// disk into.
+    pub image_cache_dir: PathBuf,
     /// Whether the kernel profile of this name is configured for this architecture.
     pub kernel_profile_configured: fn(&str) -> Result<bool>,
 }
@@ -111,6 +167,7 @@ impl ImportHost {
         Self {
             snapshots_dir: paths::snapshot_dir(),
             data_dir: paths::data_dir(),
+            image_cache_dir: paths::image_cache_dir(),
             kernel_profile_configured: |name| Ok(crate::setup::get_kernel_profile(name)?.is_some()),
         }
     }
@@ -122,9 +179,22 @@ pub(crate) struct Imported {
     pub tag: String,
     /// One per file installed, `config.json` first, as the archive describes it.
     pub files: Vec<ArchiveEntry>,
+    /// One per external file of the archive, in its order.
+    pub externals: Vec<ImportedExternal>,
     /// What a restore of the installed snapshot reads that the archive did not carry, one
     /// sentence each, from the installed config.
     pub not_shipped: Vec<String>,
+}
+
+/// What an import did with one external file of its archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedExternal {
+    pub role: ExternalRole,
+    pub path: PathBuf,
+    pub len: u64,
+    /// Whether this import put the file there. `false` for a file the host already had,
+    /// which is kept as it was.
+    pub installed: bool,
 }
 
 /// Import a snapshot (`fcvm snapshot import`).
@@ -149,6 +219,22 @@ pub async fn cmd_snapshot_import(args: SnapshotImportArgs) -> Result<()> {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "imported snapshot"
     );
+    for external in &imported.externals {
+        if external.installed {
+            info!(
+                path = %external.path.display(),
+                bytes = external.len,
+                "installed the snapshot's {}",
+                external.role
+            );
+        } else {
+            info!(
+                path = %external.path.display(),
+                "this host already had the snapshot's {}; it is kept as it was",
+                external.role
+            );
+        }
+    }
     for sentence in &imported.not_shipped {
         warn!(
             snapshot = %imported.tag,
@@ -177,8 +263,9 @@ fn archive_input(stdin: &(impl IsTerminal + AsFd)) -> Result<File> {
 /// Install the snapshot in the archive read from `input`, under the tag it was exported
 /// from. `input` is read through a buffer of [`INPUT_BUFFER`] bytes.
 ///
-/// On an error this import has installed nothing and its staging directory is removed,
-/// unless the error says the snapshot is installed.
+/// On an error the tag is not installed and the staging directory is removed, unless the
+/// error says the snapshot is installed. External files the import published before the
+/// error stay: each is a whole, verified entry of its store.
 pub(crate) async fn import_snapshot<R>(host: &ImportHost, input: R) -> Result<Imported>
 where
     R: Read + Send + 'static,
@@ -291,12 +378,13 @@ where
 
     let tag = archive.manifest.tag.clone();
     let config = archive.config.clone();
-    let files = {
+    let Staged { files, externals } = {
         let (staging, generation_lock) = (staging.to_path_buf(), generation_lock.clone());
+        let host = host.clone();
         tokio::task::spawn_blocking(move || {
             // Held until the last file is written, or the write has failed.
             let _generation_lock = generation_lock;
-            stage_files(reader, &staging, &archive)
+            stage_files(reader, &staging, &archive, &host)
         })
         .await
         .context("the task that stages the snapshot panicked")??
@@ -320,6 +408,7 @@ where
     Ok(Imported {
         tag,
         files,
+        externals,
         not_shipped: not_shipped(&config),
     })
 }
@@ -377,6 +466,17 @@ struct CheckedArchive {
     config_json: Vec<u8>,
     /// The entry the config was read from.
     config_entry: ArchiveEntry,
+    /// What to do with each external file, in the manifest's order.
+    externals: Vec<ExternalPlan>,
+}
+
+/// What an import does with one external file of its archive.
+struct ExternalPlan {
+    described: ManifestExternal,
+    /// Whether this host lacked the file when the archive was checked, so the archived copy
+    /// is installed. A file the host has is kept as it is, and the archived copy is read and
+    /// not written.
+    install: bool,
 }
 
 /// Read the manifest and the archived `config.json` from `input` and check them against
@@ -394,6 +494,7 @@ fn read_and_check<R: Read>(
     ensure_tag_is_free(&host.snapshots_dir.join(&manifest.tag), &manifest.tag)?;
     let (config_entry, config_json) = read_config_entry(&mut reader)?;
     let config = check_config(host, &manifest, &config_json)?;
+    let externals = plan_externals(host, &manifest, &config)?;
     Ok((
         reader,
         CheckedArchive {
@@ -401,6 +502,7 @@ fn read_and_check<R: Read>(
             config,
             config_json,
             config_entry,
+            externals,
         },
     ))
 }
@@ -423,12 +525,6 @@ fn check_manifest(host: &ImportHost, manifest: &ArchiveManifest) -> Result<()> {
         "the archive holds a snapshot taken with {}; snapshot import installs Firecracker \
          snapshots only",
         manifest.hypervisor
-    );
-    ensure!(
-        manifest.externals.is_empty(),
-        "the archive carries {} files from outside the snapshot's directory (an image disk \
-         or pmem images), which this fcvm does not import",
-        manifest.externals.len()
     );
     ensure!(
         manifest.data_dir == host.data_dir,
@@ -516,6 +612,10 @@ fn check_config(
             "the memory image",
             manifest.memory.is_some() != (config.kind == SnapshotKind::Full),
         ),
+        (
+            "the image disk and the pmem images the archive carries",
+            !manifest_lists_recorded_externals(manifest, &config)?,
+        ),
     ];
     if let Some((what, _)) = disagreements.iter().find(|(_, differs)| *differs) {
         bail!(
@@ -566,55 +666,512 @@ fn check_config(
          restore of the snapshot would be refused for that"
     );
 
-    // Last, because the image disk is read whole. The archive carries neither the image
-    // disk nor the pmem images, and a restore opens both at the paths the snapshot recorded,
-    // so they have to be on this host already. A snapshot records the digest of an overlay
-    // storage image only; where it recorded one, the disk has to have it, which is the
-    // check a restore makes. The file has to be there either way.
-    let metadata = &config.metadata;
-    if let Some(disk) = metadata.image_disk_path.as_deref() {
-        ensure!(
-            std::fs::metadata(disk).is_ok_and(|file| file.is_file()),
-            "the snapshot reads the image disk {}, which the archive does not carry and this \
-             host does not have",
-            disk.display()
-        );
-        if let Some(identity) = metadata.image_disk_identity.as_deref() {
-            crate::utils::verify_image_disk_identity(disk, identity).with_context(|| {
-                format!(
-                    "the snapshot reads the image disk {}, which the archive does not carry \
-                     and this host does not have as the snapshot recorded it",
-                    disk.display()
-                )
-            })?;
-        }
-    }
-    // A snapshot records each pmem store entry by inode, length and modification time, so
-    // this passes on the host that took the snapshot and on no other.
-    crate::storage::pmem::check_snapshot_pmem_images(&host.data_dir, &metadata.pmem_devices)
-        .context(
-            "the snapshot maps pmem images, which the archive does not carry; a restore \
-             reopens the store entries the snapshot recorded, and this host does not have \
-             them",
-        )?;
     Ok(config)
 }
 
-/// Write every file left in the archive into `staging`, read the archive to its verified
-/// end, write the imported `config.json`, check that the directory holds every file a
-/// restore opens, and sync it. One [`ArchiveEntry`] per file written, the config's first.
+/// Whether the manifest lists exactly the external files the config names
+/// ([`recorded_externals`]), in that order, each with the digest the config binds its bytes
+/// to, and a pmem entry with the length the config records for it. The length of an image
+/// disk is recorded nowhere but in the manifest.
+fn manifest_lists_recorded_externals(
+    manifest: &ArchiveManifest,
+    config: &SnapshotConfig,
+) -> Result<bool> {
+    let recorded = recorded_externals(&manifest.tag, config)
+        .context("reading what the archived snapshot names outside its directory")?;
+    if recorded.len() != manifest.externals.len() {
+        return Ok(false);
+    }
+    for (listed, (role, path, sha256)) in manifest.externals.iter().zip(recorded) {
+        if listed.role != role || listed.path != path || listed.sha256 != sha256 {
+            return Ok(false);
+        }
+        if role == ExternalRole::Pmem {
+            // A device's identity is inode:length:mtime (`storage::pmem::entry_identity`).
+            let lengths_agree = config
+                .metadata
+                .pmem_devices
+                .iter()
+                .filter(|device| Path::new(&device.path) == path)
+                .all(|device| {
+                    device.identity.split(':').nth(1) == Some(listed.len.to_string().as_str())
+                });
+            if !lengths_agree {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Decide, for each external file the manifest lists, whether this host has it or the
+/// import installs it, and refuse the archive where neither can be done. The manifest
+/// agrees with the config by now ([`manifest_lists_recorded_externals`]). Nothing is
+/// written here, and the pmem store is not created.
+///
+/// Last of the checks, because an image disk this host has is read whole (once per build of
+/// the file; `image_disk_digest` remembers it).
+fn plan_externals(
+    host: &ImportHost,
+    manifest: &ArchiveManifest,
+    config: &SnapshotConfig,
+) -> Result<Vec<ExternalPlan>> {
+    let mut plans = Vec::with_capacity(manifest.externals.len());
+    for described in &manifest.externals {
+        let install = match described.role {
+            ExternalRole::ImageDisk => plan_image_disk(host, described)?,
+            ExternalRole::Pmem => plan_pmem_entry(host, manifest, config, described)?,
+        };
+        plans.push(ExternalPlan {
+            described: described.clone(),
+            install,
+        });
+    }
+    Ok(plans)
+}
+
+/// The key of the image in the recorded path of an image disk, which names the image's
+/// lock in the image cache. The path comes from the archive, so it is held against this
+/// host's image cache by the rules an export holds it against its own
+/// (`snapshot_export::image_of_disk`): directly under the cache, with the name a launch
+/// gives such a disk, and a storage image with the identity the snapshot recorded.
+fn image_of_disk<'a>(host: &ImportHost, described: &'a ManifestExternal) -> Result<&'a str> {
+    super::snapshot_export::image_of_disk(
+        &host.image_cache_dir,
+        &described.path,
+        described.sha256.is_some(),
+    )
+}
+
+/// Whether the image disk has to be installed. Its path has to be one this host's image
+/// cache gives an image disk ([`image_of_disk`]). One this host has there is kept, and has
+/// to be a regular file and, where the snapshot recorded an identity, the build it
+/// recorded, which is the check a restore makes. One it lacks is installed.
+///
+/// This decides whether to start. The check the installed snapshot relies on is made
+/// again when the disk is published, under the image's lock ([`settle_image_disk`]).
+fn plan_image_disk(host: &ImportHost, described: &ManifestExternal) -> Result<bool> {
+    let disk = &described.path;
+    image_of_disk(host, described)?;
+    match std::fs::symlink_metadata(disk) {
+        Ok(found) => {
+            check_present_image_disk(
+                described,
+                &found,
+                "this host has another build of the image disk than the one the snapshot was \
+                 taken against",
+            )?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error)
+            .with_context(|| format!("reading the snapshot's image disk {}", disk.display())),
+    }
+}
+
+/// An image disk that is at its recorded path, with the metadata `found` (not followed
+/// through a link), has to be a regular file and, where the snapshot recorded an identity,
+/// the build it recorded. `another_build` says how that other build came to be there.
+fn check_present_image_disk(
+    described: &ManifestExternal,
+    found: &std::fs::Metadata,
+    another_build: &str,
+) -> Result<()> {
+    let disk = &described.path;
+    ensure!(
+        found.is_file(),
+        "the snapshot reads the image disk {}, which on this host is not a regular file",
+        disk.display()
+    );
+    if let Some(sha256) = &described.sha256 {
+        crate::utils::verify_image_disk_identity(disk, &format!("sha256:{sha256}")).with_context(
+            || {
+                format!(
+                    "{another_build} ({}), and an import does not replace a file",
+                    disk.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether a pmem store entry has to be installed. The recorded path has to name an entry
+/// of this host's store. One this host has is kept, and has to be an entry this run can use
+/// (`PmemStore::check_entry`). One it lacks is installed, which gives the bytes the name
+/// they have for the uid this import publishes for: unless that is the uid the entries
+/// belong to on the exporting host, the name is not the recorded one.
+fn plan_pmem_entry(
+    host: &ImportHost,
+    manifest: &ArchiveManifest,
+    config: &SnapshotConfig,
+    described: &ManifestExternal,
+) -> Result<bool> {
+    let entry = &described.path;
+    let mapped = config
+        .metadata
+        .pmem_devices
+        .iter()
+        .find(|device| Path::new(&device.path) == entry)
+        .map(|device| {
+            format!(
+                " (a copy of {}, mapped at {})",
+                device.source, device.mount_path
+            )
+        })
+        .unwrap_or_default();
+    let store_dir = crate::storage::pmem_store::store_dir_under(&host.data_dir)?;
+    ensure!(
+        crate::storage::pmem_store::is_entry_of(&store_dir, entry),
+        "the snapshot maps the pmem image {}{mapped}, which is not an entry of this host's \
+         pmem image store {}",
+        entry.display(),
+        store_dir.display()
+    );
+    match std::fs::symlink_metadata(entry) {
+        Ok(_) => {
+            crate::storage::pmem_store::check_existing_entry(&store_dir, entry, described.len)
+                .with_context(|| {
+                    format!(
+                        "the snapshot maps the pmem image {}{mapped}, and what this host has \
+                         at that path is not an entry this import can use",
+                        entry.display()
+                    )
+                })?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let here = crate::storage::pmem_store::run_owner();
+            ensure!(
+                manifest.pmem_owner_uid == Some(here),
+                "the snapshot maps the pmem image {}{mapped}, which this host does not have. \
+                 The snapshot's pmem images belong to {} on the exporting host and this \
+                 import publishes store entries for uid {here}. A store entry's name is a \
+                 digest of the uid it belongs to and of its bytes, so the entry this uid \
+                 publishes would not have the path the snapshot recorded, and Firecracker \
+                 reopens that path. Run the import as the uid the entries belong to",
+                entry.display(),
+                manifest.pmem_owner_uid.map_or_else(
+                    || "no uid the manifest names".to_string(),
+                    |uid| format!("uid {uid}")
+                )
+            );
+            Ok(true)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("reading the snapshot's pmem image {}", entry.display())),
+    }
+}
+
+/// What [`stage_files`] wrote.
+struct Staged {
+    /// One per file written into the staging directory, the config's first.
+    files: Vec<ArchiveEntry>,
+    externals: Vec<ImportedExternal>,
+}
+
+/// An external file in its temporary, whole and not yet published. Dropping it removes the
+/// temporary.
+enum StagedExternal<'a> {
+    ImageDisk { temp: StoreTemp, file: File },
+    Pmem(StagedEntry<'a>),
+}
+
+/// Write the external file `entry`, which is `plan`'s, into a temporary of the store it
+/// belongs to, or read past it when this host has the file.
+fn stage_external<'a, R: Read>(
+    reader: &mut ArchiveReader<R>,
+    entry: &ArchiveEntry,
+    plan: &ExternalPlan,
+    owners: &Path,
+    store: Option<&'a PmemStore>,
+) -> Result<Option<StagedExternal<'a>>> {
+    let described = &plan.described;
+    let (role, path) = (described.role, &described.path);
+    ensure!(
+        entry.len == described.len,
+        "the archive carries {} bytes for the {role} {} and its manifest says {}",
+        entry.len,
+        path.display(),
+        described.len
+    );
+    if !plan.install {
+        // Not written: this host has the file. The reader still reads and verifies the
+        // archived copy, on the way to the next entry.
+        return Ok(None);
+    }
+    match role {
+        ExternalRole::ImageDisk => {
+            // A host that never ran a local image has no image cache yet.
+            if let Some(cache) = path.parent().filter(|cache| !cache.exists()) {
+                std::fs::create_dir_all(cache)
+                    .with_context(|| format!("creating the image cache {}", cache.display()))?;
+                crate::setup::give_store_entry_to_invoker(cache);
+            }
+            // Recorded before the file exists, so a killed import leaves it to the next
+            // import or VM launch.
+            let temp = StoreTemp::new_in(owners, path)?;
+            // Readable too: its digest is recorded from this descriptor once it is published.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(temp.path())
+                .with_context(|| format!("creating {}", temp.path().display()))?;
+            file.set_len(entry.len)
+                .with_context(|| format!("setting the length of {}", temp.path().display()))?;
+            let mut content = described.sha256.as_ref().map(|_| ContentSha256::new());
+            while let Some((offset, bytes)) = reader.next_run()? {
+                file.write_all_at(bytes, offset).with_context(|| {
+                    format!("writing {} at offset {offset}", temp.path().display())
+                })?;
+                if let Some(content) = content.as_mut() {
+                    content.piece(offset, bytes)?;
+                }
+            }
+            if let (Some(recorded), Some(content)) = (&described.sha256, content) {
+                let found = content.finish(entry.len)?;
+                ensure!(
+                    found == *recorded,
+                    "the image disk the archive carries for {} is not the build the snapshot \
+                     was taken against: its SHA-256 is {found} and the snapshot records \
+                     {recorded}",
+                    path.display()
+                );
+            }
+            Ok(Some(StagedExternal::ImageDisk { temp, file }))
+        }
+        ExternalRole::Pmem => {
+            let store =
+                store.context("the pmem image store was not opened for an entry to install")?;
+            let mut ingest = store.begin_stream_ingest(entry.len)?;
+            while let Some((offset, bytes)) = reader.next_run()? {
+                ingest.write_at(offset, bytes)?;
+            }
+            Ok(Some(StagedExternal::Pmem(ingest.finish_as(path)?)))
+        }
+    }
+}
+
+/// Publish the staged external files and settle the image disk, and return the paths of
+/// the files this import staged and did not publish because another process had published
+/// them meanwhile, which are kept. The archive has verified by now.
+///
+/// A pmem entry is published by its store, which keeps an entry another run published
+/// first.
+fn publish_externals(
+    host: &ImportHost,
+    plans: &[ExternalPlan],
+    staged: Vec<StagedExternal<'_>>,
+    store: Option<&PmemStore>,
+) -> Result<Vec<PathBuf>> {
+    let mut image_disk = None;
+    let mut entries = Vec::new();
+    for external in staged {
+        match external {
+            StagedExternal::ImageDisk { temp, file } => image_disk = Some((temp, file)),
+            StagedExternal::Pmem(entry) => entries.push(entry),
+        }
+    }
+    let mut kept = Vec::new();
+    for plan in plans {
+        if plan.described.role == ExternalRole::ImageDisk {
+            let published = settle_image_disk(host, plan, image_disk.take())?;
+            if plan.install && !published {
+                kept.push(plan.described.path.clone());
+            }
+        }
+    }
+    for entry in entries {
+        let store = store.context("the pmem image store was not opened to publish an entry")?;
+        let published = store.publish_staged(entry)?;
+        if !published.linked {
+            kept.push(published.path);
+        }
+    }
+    Ok(kept)
+}
+
+/// Give the image disk its name, or check the one that has it, under the lock of its image
+/// in the image cache. Returns whether the staged copy got the name.
+///
+/// A launch of the image holds that lock from its look for the image's disk through the
+/// rename that publishes the one it builds, and that rename replaces. Under the lock no
+/// build is in flight on this kernel, so the disk this function leaves at the path is the
+/// one a later launch finds and reuses, and a build that finished first is met here as a
+/// file that has the name. The lock is a flock, and VMs that share the store through a
+/// FUSE map each get it from their own kernel: a build in another VM is not kept out, and
+/// one that replaces the linked disk leaves a snapshot whose restore is refused.
+///
+/// The staged copy is private until it is linked, so it is handed to the sudo invoker
+/// through its descriptor and synced before the lock is taken: a launch of the image does
+/// not wait behind the flush of a disk. Under the lock it is linked into place, which
+/// fails where anything has the name. A disk that has the name, from before the import or
+/// since, is kept: it has to be a regular file and, where the snapshot recorded an
+/// identity, the build it recorded. The installed config relies on this check, not on the
+/// one made before the archive was read.
+fn settle_image_disk(
+    host: &ImportHost,
+    plan: &ExternalPlan,
+    staged: Option<(StoreTemp, File)>,
+) -> Result<bool> {
+    let described = &plan.described;
+    let dest = &described.path;
+    ensure!(
+        plan.install == staged.is_some(),
+        "the image disk {} was {} and the archive was read as if it was not",
+        dest.display(),
+        if plan.install {
+            "to be installed"
+        } else {
+            "on this host"
+        }
+    );
+    let digest = image_of_disk(host, described)?;
+    if let Some((temp, file)) = &staged {
+        crate::setup::give_store_fd_to(file, temp.path(), crate::setup::sudo_invoker());
+        file.sync_all()
+            .with_context(|| format!("syncing {}", temp.path().display()))?;
+    }
+    let _lock = crate::commands::podman::lock_image_cache_entries(&host.image_cache_dir, digest)
+        .with_context(|| format!("locking the image of the image disk {}", dest.display()))?;
+    let Some((temp, file)) = staged else {
+        let found = match std::fs::symlink_metadata(dest) {
+            Ok(found) => found,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "the snapshot's image disk {} is gone from this host: it was there when the \
+                 import began, so the archive's copy was not kept",
+                dest.display()
+            ),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading the image disk {}", dest.display()))
+            }
+        };
+        check_present_image_disk(
+            described,
+            &found,
+            "another build of the image disk took its place on this host while the archive \
+             was imported",
+        )?;
+        return Ok(false);
+    };
+
+    let published = match std::fs::hard_link(temp.path(), dest) {
+        Ok(()) => {
+            if let Some(parent) = dest.parent() {
+                File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .with_context(|| format!("syncing {}", parent.display()))?;
+            }
+            // The digest of the bytes as they were written is the recorded identity
+            // (`stage_external`), so the first restore need not read the disk to learn it.
+            if let Some(sha256) = &described.sha256 {
+                if let Err(error) = crate::utils::remember_image_disk_digest(
+                    dest,
+                    &file,
+                    &format!("sha256:{sha256}"),
+                ) {
+                    warn!(
+                        path = %dest.display(),
+                        error = %format!("{error:#}"),
+                        "could not record the installed image disk's digest; the first \
+                         restore reads the disk to compute it"
+                    );
+                }
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            info!(
+                path = %dest.display(),
+                "the image disk appeared on this host while its archive was imported; it is \
+                 kept as it is"
+            );
+            let found = std::fs::symlink_metadata(dest)
+                .with_context(|| format!("reading the image disk {}", dest.display()))?;
+            check_present_image_disk(
+                described,
+                &found,
+                "another build of the image disk appeared on this host while the archive \
+                 was imported",
+            )?;
+            false
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("linking {} to {}", temp.path().display(), dest.display())
+            })
+        }
+    };
+    // Removes the temporary's name, which is a second link when the copy was published,
+    // and its reclaim record.
+    drop(temp);
+    Ok(published)
+}
+
+/// The identity each pmem device of `config` has on this host now, as a snapshot records it
+/// (`storage::pmem::entry_identity`), by the device's path. The devices with these
+/// identities have to pass the check a restore makes of them.
+fn pmem_identities(host: &ImportHost, config: &SnapshotConfig) -> Result<Vec<(String, String)>> {
+    let mut devices = config.metadata.pmem_devices.clone();
+    for device in &mut devices {
+        let found = std::fs::symlink_metadata(&device.path)
+            .with_context(|| format!("reading the installed pmem image {}", device.path))?;
+        device.identity = crate::storage::pmem::entry_identity(&found);
+    }
+    crate::storage::pmem::check_snapshot_pmem_images(&host.data_dir, &devices)
+        .context("checking the imported snapshot's pmem images as a restore checks them")?;
+    Ok(devices
+        .into_iter()
+        .map(|device| (device.path, device.identity))
+        .collect())
+}
+
+/// Write every file left in the archive: the snapshot's into `staging`, and the external
+/// ones this host lacks into temporaries of their stores. Read the archive to its verified
+/// end, check that the directory holds every file a restore opens, publish the external
+/// files, write the imported `config.json`, and sync the directory.
 /// Runs on a blocking thread of the runtime.
 fn stage_files<R: Read>(
     mut reader: ArchiveReader<R>,
     staging: &Path,
     archive: &CheckedArchive,
-) -> Result<Vec<ArchiveEntry>> {
+    host: &ImportHost,
+) -> Result<Staged> {
     let working_set = crate::uffd::WorkingSetStore::path_for(Path::new(SNAPSHOT_MEMORY_FILE));
     let memory = Path::new(SNAPSHOT_MEMORY_FILE);
+    let owners = crate::reclaim::owner_dir_in(&host.data_dir)?;
+    // Opened, and so created where this host has none, only for an entry to install.
+    let store = archive
+        .externals
+        .iter()
+        .any(|plan| plan.install && plan.described.role == ExternalRole::Pmem)
+        .then(|| PmemStore::open(&host.data_dir))
+        .transpose()
+        .context("opening the pmem image store")?;
+    // Dropped with their temporaries if anything below fails before they are published.
+    let mut staged_externals = Vec::new();
     let mut files = vec![archive.config_entry.clone()];
     while let Some(entry) = reader.next_entry()? {
-        let EntryName::Snapshot(relative) = &entry.name else {
-            bail!("the archive carries a file from outside the snapshot's directory");
+        let relative = match &entry.name {
+            EntryName::Snapshot(relative) => relative,
+            EntryName::External(index) => {
+                // The reader gives the external files in the manifest's order and no more
+                // of them than it lists.
+                let plan = archive
+                    .externals
+                    .get(*index)
+                    .with_context(|| format!("the archive's manifest lists no external/{index}"))?;
+                staged_externals.extend(stage_external(
+                    &mut reader,
+                    &entry,
+                    plan,
+                    &owners,
+                    store.as_ref(),
+                )?);
+                continue;
+            }
         };
         if *relative == working_set {
             // Not written: its key is the exporting host's config digest and the memory
@@ -649,17 +1206,6 @@ fn stage_files<R: Read>(
     }
 
     // The reader has verified the trailer: every file above is the one the export wrote.
-    // The config is written last, as a create writes it. `create_new`, so the archive
-    // cannot have supplied it.
-    let config_path = staging.join(CONFIG_FILE);
-    let config_json = imported_config_json(&archive.config_json)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-        .and_then(|mut file| file.write_all(&config_json))
-        .with_context(|| format!("writing {}", config_path.display()))?;
-
     // An archive can verify and still lack a file: the trailer says the files are the ones
     // the export wrote, not that they are all a restore opens.
     tokio::runtime::Handle::current().block_on(check_generation_files(
@@ -668,14 +1214,41 @@ fn stage_files<R: Read>(
         &format!("imported snapshot {}", archive.manifest.tag),
     ))?;
 
+    // Only now does anything of this import get a name outside the staging directory.
+    failpoint::hit("snapshot.import.externals_staged");
+    let kept = publish_externals(host, &archive.externals, staged_externals, store.as_ref())?;
+    let pmem_identities = pmem_identities(host, &archive.config)?;
+
+    // The config is written last, as a create writes it. `create_new`, so the archive
+    // cannot have supplied it.
+    let config_path = staging.join(CONFIG_FILE);
+    let config_json = imported_config_json(&archive.config_json, &pmem_identities)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config_path)
+        .and_then(|mut file| file.write_all(&config_json))
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
     super::podman::sync_generation(staging).context("syncing the staged snapshot")?;
-    Ok(files)
+    let externals = archive
+        .externals
+        .iter()
+        .map(|plan| ImportedExternal {
+            role: plan.described.role,
+            path: plan.described.path.clone(),
+            len: plan.described.len,
+            installed: plan.install && !kept.contains(&plan.described.path),
+        })
+        .collect();
+    Ok(Staged { files, externals })
 }
 
-/// The `config.json` an import writes: the archived one as a generation of its own. Only
-/// the two fields are set, on the parsed JSON, so every other field is installed as the
+/// The `config.json` an import writes: the archived one as a generation of its own, with
+/// each pmem device's identity as `pmem_identities` gives it by the device's path. Only
+/// those fields are set, on the parsed JSON, so every other field is installed as the
 /// export wrote it, also one this build does not know.
-fn imported_config_json(archived: &[u8]) -> Result<Vec<u8>> {
+fn imported_config_json(archived: &[u8], pmem_identities: &[(String, String)]) -> Result<Vec<u8>> {
     let mut config: serde_json::Value =
         serde_json::from_slice(archived).context("parsing the archived snapshot config")?;
     let fields = config
@@ -691,6 +1264,27 @@ fn imported_config_json(archived: &[u8]) -> Result<Vec<u8>> {
     // The parent is a tag on the exporting host. Here it is absent, or names another
     // snapshot. The memory image is whole without it.
     fields.insert("parent_snapshot".to_string(), serde_json::Value::Null);
+    // A snapshot records each pmem store entry by inode, length and modification time, and
+    // a restore refuses an entry that has another identity. An entry this import installed
+    // is a new file, so the exporting host's identity is not its own.
+    if !pmem_identities.is_empty() {
+        let devices = fields
+            .get_mut("metadata")
+            .and_then(|metadata| metadata.get_mut("pmem_devices"))
+            .and_then(serde_json::Value::as_array_mut)
+            .context("the archived snapshot config lists no pmem devices")?;
+        for device in devices {
+            let path = device
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .context("a pmem device of the archived snapshot config has no path")?;
+            let (_, identity) = pmem_identities
+                .iter()
+                .find(|(entry, _)| entry == path)
+                .with_context(|| format!("no identity was read for the pmem image {path}"))?;
+            device["identity"] = serde_json::Value::String(identity.clone());
+        }
+    }
     serde_json::to_vec_pretty(&config).context("serializing snapshot config")
 }
 
@@ -699,11 +1293,13 @@ mod tests {
     use super::*;
     use crate::commands::snapshot_export::export_snapshot;
     use crate::commands::snapshot_export::tests::{
-        data_runs, fake_snapshot, fake_snapshot_with, names_in, pattern, Fake, TAG,
+        data_runs, fake_snapshot, fake_snapshot_with, fake_snapshot_with_externals, names_in,
+        pattern, Externals, Fake, IMAGE_DISK_LEN, MIB, PMEM_LEN, TAG,
     };
-    use crate::storage::snapshot_archive::{ArchiveWriter, ManifestExternal};
+    use crate::storage::snapshot_archive::ArchiveWriter;
     use crate::storage::SnapshotManager;
     use std::io::Cursor;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::Duration;
 
     /// The importing host a fake snapshot was exported on: the same directories, and every
@@ -712,6 +1308,7 @@ mod tests {
         ImportHost {
             snapshots_dir: fake.host.snapshots_dir.clone(),
             data_dir: fake.host.data_dir.clone(),
+            image_cache_dir: fake.image_cache(),
             kernel_profile_configured: |_| Ok(true),
         }
     }
@@ -819,6 +1416,8 @@ mod tests {
     struct Unpacked {
         manifest: ArchiveManifest,
         files: Vec<(PathBuf, Vec<u8>)>,
+        /// The external files, in the archive's order.
+        externals: Vec<Vec<u8>>,
     }
 
     impl Unpacked {
@@ -826,18 +1425,23 @@ mod tests {
             let mut reader = ArchiveReader::new(archive).unwrap();
             let manifest = reader.manifest().clone();
             let mut files = Vec::new();
+            let mut externals = Vec::new();
             while let Some(entry) = reader.next_entry().unwrap() {
-                let EntryName::Snapshot(name) = entry.name else {
-                    panic!("the archive holds an external file");
-                };
                 let mut bytes = vec![0u8; entry.len as usize];
                 while let Some((offset, piece)) = reader.next_run().unwrap() {
                     let start = offset as usize;
                     bytes[start..start + piece.len()].copy_from_slice(piece);
                 }
-                files.push((name, bytes));
+                match entry.name {
+                    EntryName::Snapshot(name) => files.push((name, bytes)),
+                    EntryName::External(_) => externals.push(bytes),
+                }
             }
-            Self { manifest, files }
+            Self {
+                manifest,
+                files,
+                externals,
+            }
         }
 
         /// Change the archived config, and the digest the manifest gives for it.
@@ -869,8 +1473,14 @@ mod tests {
             for (name, bytes) in &self.files {
                 writer.append_snapshot_file(name, &file_of(bytes)).unwrap();
             }
-            for _ in &self.manifest.externals {
-                writer.append_external(&file_of(b"external")).unwrap();
+            // One per external file the manifest lists: the file's bytes, or a few bytes
+            // for one a test added to the manifest.
+            for index in 0..self.manifest.externals.len() {
+                let bytes = self
+                    .externals
+                    .get(index)
+                    .map_or(&b"external"[..], Vec::as_slice);
+                writer.append_external(&file_of(bytes)).unwrap();
             }
             writer.finish().unwrap()
         }
@@ -1208,24 +1818,55 @@ mod tests {
         );
     }
 
-    /// The image disk and the pmem images are a later version's to install.
+    /// The checks made of the external files count only if the manifest lists the ones the
+    /// config names, each with the digest and the length the config records.
     #[tokio::test]
-    async fn an_archive_that_carries_external_files_is_refused() {
+    async fn a_manifest_that_does_not_list_the_configs_external_files_is_refused() {
+        const DISAGREE: &str =
+            "disagree about the image disk and the pmem images the archive carries,";
+        let (fake, _externals, archive) = exported_with_externals().await;
+        type Edit = fn(&mut Unpacked);
+        let cases: [(&str, Edit); 6] = [
+            ("no external files", |unpacked| {
+                unpacked.manifest.externals.clear()
+            }),
+            ("one external file", |unpacked| {
+                unpacked.manifest.externals.truncate(1)
+            }),
+            ("another image disk digest", |unpacked| {
+                unpacked.manifest.externals[0].sha256 = Some("00".repeat(32))
+            }),
+            ("another image disk path", |unpacked| {
+                unpacked.manifest.externals[0].path = PathBuf::from("/example/elsewhere.img")
+            }),
+            ("the roles exchanged", |unpacked| {
+                unpacked.manifest.externals[0].role = ExternalRole::Pmem;
+                unpacked.manifest.externals[1].role = ExternalRole::ImageDisk;
+            }),
+            ("another pmem length", |unpacked| {
+                unpacked.manifest.externals[1].len += PMEM_LEN
+            }),
+        ];
+        for (what, edit) in cases {
+            let mut unpacked = Unpacked::of(&archive);
+            edit(&mut unpacked);
+
+            let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+
+            assert!(message.contains(DISAGREE), "{what}: {message}");
+        }
+
+        // A manifest that lists a file the config does not name.
         let (fake, archive) = exported().await;
         let mut unpacked = Unpacked::of(&archive);
         unpacked.manifest.externals = vec![ManifestExternal {
-            role: "image-disk".to_string(),
-            path: PathBuf::from("/example/image-cache/layers.img"),
+            role: ExternalRole::ImageDisk,
+            path: fake.image_cache().join("layers.img"),
             len: 8,
-            sha256: "00".repeat(32),
+            sha256: None,
         }];
-
         let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
-
-        assert!(
-            message.contains("carries 1 files from outside the snapshot's directory"),
-            "{message}"
-        );
+        assert!(message.contains(DISAGREE), "{message}");
     }
 
     #[tokio::test]
@@ -1630,85 +2271,956 @@ mod tests {
         );
     }
 
-    /// The archive does not carry the image disk a snapshot attaches. The import takes the
-    /// snapshot where the disk is already there, with the digest the snapshot recorded if it
-    /// recorded one (it records one for an overlay storage image only), and refuses it where
-    /// the disk is absent or is another build.
-    #[tokio::test]
-    async fn a_snapshot_with_an_image_disk_imports_only_where_the_disk_is_as_recorded() {
-        let (fake, exported) = exported().await;
-        let disk = fake.root.path().join("image-disk.img");
-        std::fs::write(&disk, pattern(8, 4096)).unwrap();
-        let identity = crate::utils::image_disk_digest(&disk).unwrap();
-        let archive_recording = |identity: Option<String>| {
-            let mut unpacked = Unpacked::of(&exported);
-            unpacked.edit_config(|config| {
-                config.metadata.image_disk_path = Some(disk.clone());
-                config.metadata.image_disk_identity = identity;
-            });
-            unpacked.pack()
-        };
-        let with_digest = archive_recording(Some(identity));
-        let without_digest = archive_recording(None);
+    /// A fake snapshot with an image disk and a pmem entry, exported, and its directory
+    /// deleted. The external files are still on the host.
+    async fn exported_with_externals() -> (Fake, Externals, Vec<u8>) {
+        let (fake, externals) = fake_snapshot_with_externals();
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        (fake, externals, archive)
+    }
 
-        std::fs::write(&disk, pattern(9, 4096)).unwrap();
-        let message = refusal(&fake, &host_of(&fake), with_digest.clone()).await;
-        assert!(
-            message.contains("which the archive does not carry")
-                && message.contains("image disk build changed"),
-            "another build of the disk: {message}"
-        );
+    /// The pmem store directory of the fake host.
+    fn pmem_store_dir(fake: &Fake) -> PathBuf {
+        crate::storage::pmem_store::store_dir_under(&fake.host.data_dir).unwrap()
+    }
 
-        std::fs::remove_file(&disk).unwrap();
-        for (recorded, archive) in [("a digest", &with_digest), ("no digest", &without_digest)] {
-            let message = refusal(&fake, &host_of(&fake), archive.clone()).await;
-            assert!(
-                message.contains("which the archive does not carry and this host does not have")
-                    && message.contains("image-disk.img"),
-                "no disk, {recorded} recorded: {message}"
-            );
-        }
-
-        // Control: with the disk the snapshot recorded, the same archives import.
-        std::fs::write(&disk, pattern(8, 4096)).unwrap();
-        for archive in [with_digest, without_digest] {
-            import_snapshot(&host_of(&fake), Cursor::new(archive))
-                .await
-                .unwrap();
-            remove_snapshot_dir(&fake.dir()).await.unwrap();
+    /// Remove the image disk and the pmem entry from the fake host, and the link a run
+    /// leaves from an image to its entry: a host that never had the files.
+    fn remove_externals(fake: &Fake, externals: &Externals) {
+        std::fs::remove_file(&externals.image_disk).unwrap();
+        std::fs::remove_file(&externals.pmem.path).unwrap();
+        let store = pmem_store_dir(fake);
+        for name in names_in(&store) {
+            if name.ends_with(".source") {
+                std::fs::remove_file(store.join(name)).unwrap();
+            }
         }
     }
 
-    /// The archive does not carry pmem images either, and a restore reopens each at its
-    /// recorded path in this host's store, as the entry the snapshot recorded by inode,
-    /// length and modification time. A snapshot whose entries are not there is refused.
-    #[tokio::test]
-    async fn a_snapshot_whose_pmem_images_are_not_on_this_host_is_refused() {
-        let (fake, archive) = exported().await;
-        let mut unpacked = Unpacked::of(&archive);
-        let entry = fake.host.data_dir.join("pmem/0123456789abcdef.img");
-        unpacked.edit_config(|config| {
-            config.metadata.pmem_devices = vec![crate::state::types::PmemDevice {
-                path: entry.to_string_lossy().into_owned(),
-                source: "/example/models/model.img".to_string(),
-                mount_path: "/models".to_string(),
-                identity: "1:2:3".to_string(),
-            }];
-        });
+    /// What an import in flight keeps outside its staging directory: the temporaries beside
+    /// the image disk, the temps of the pmem store, and the reclaim records of store
+    /// temporaries.
+    fn external_temporaries(fake: &Fake) -> Vec<String> {
+        let mut found = Vec::new();
+        for name in names_in(&fake.image_cache()) {
+            if name.ends_with(".tmp") {
+                found.push(format!("image-cache/{name}"));
+            }
+        }
+        let tmp = pmem_store_dir(fake).join("tmp");
+        if tmp.is_dir() {
+            for name in names_in(&tmp) {
+                found.push(format!("pmem/tmp/{name}"));
+            }
+        }
+        let owners = crate::reclaim::owner_dir_in(&fake.host.data_dir).unwrap();
+        for name in names_in(&owners) {
+            if name.contains("store-temp-") {
+                found.push(format!("reclaim/{name}"));
+            }
+        }
+        found
+    }
 
-        let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+    /// The length, the data runs and the bytes of the file at `path`.
+    fn file_image(path: &Path) -> FileImage {
+        let bytes = std::fs::read(path).unwrap();
+        FileImage {
+            name: path.to_path_buf(),
+            len: bytes.len() as u64,
+            runs: data_runs(path),
+            bytes,
+        }
+    }
+
+    /// The inode and the modification time of the file at `path`.
+    fn inode_and_mtime(path: &Path) -> (u64, i64, i64) {
+        let found = std::fs::metadata(path).unwrap();
+        (found.ino(), found.mtime(), found.mtime_nsec())
+    }
+
+    /// The config of the snapshot the fake host has under the test's tag.
+    async fn installed_config(fake: &Fake) -> SnapshotConfig {
+        SnapshotManager::new(fake.host.snapshots_dir.clone())
+            .load_snapshot(TAG)
+            .await
+            .unwrap()
+    }
+
+    /// A host that has neither the image disk nor the pmem entry gets both at the paths the
+    /// snapshot recorded, with the exported lengths, hole maps and bytes. The image disk is
+    /// the build the config records, the entry is read-only like any the store publishes,
+    /// and the config records the entry as it is on this host, so the checks a restore
+    /// makes pass. Nothing else is left: no temporary, no reclaim record, and no link from
+    /// an image to the entry, which a run records for an image this host does not have.
+    #[tokio::test]
+    async fn an_import_installs_the_external_files_this_host_lacks() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        let (disk_before, entry_before) = (file_image(&externals.image_disk), file_image(&entry));
+        remove_externals(&fake, &externals);
+
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            imported.externals,
+            [
+                ImportedExternal {
+                    role: ExternalRole::ImageDisk,
+                    path: externals.image_disk.clone(),
+                    len: IMAGE_DISK_LEN,
+                    installed: true,
+                },
+                ImportedExternal {
+                    role: ExternalRole::Pmem,
+                    path: entry.clone(),
+                    len: PMEM_LEN,
+                    installed: true,
+                },
+            ]
+        );
+        let (disk_after, entry_after) = (file_image(&externals.image_disk), file_image(&entry));
+        assert!(
+            disk_after.runs.len() > 1 && entry_after.runs.len() > 1,
+            "control: the image disk and the pmem entry have holes to keep"
+        );
+        assert!(
+            disk_after == disk_before,
+            "the installed image disk is not the exported one"
+        );
+        assert!(
+            entry_after == entry_before,
+            "the installed pmem entry is not the exported one"
+        );
+        assert_eq!(
+            std::fs::metadata(&entry).unwrap().permissions().mode() & 0o7777,
+            0o400,
+            "a store entry is read-only for its owner"
+        );
+
+        let config = installed_config(&fake).await;
+        let metadata = &config.metadata;
+        crate::utils::verify_image_disk_identity(
+            &externals.image_disk,
+            metadata.image_disk_identity.as_deref().unwrap(),
+        )
+        .unwrap();
+        let device = &metadata.pmem_devices[0];
+        assert_eq!(
+            device.identity,
+            crate::storage::pmem::entry_identity(&std::fs::metadata(&entry).unwrap()),
+            "the config records the entry as it is on this host"
+        );
+        assert_ne!(
+            device.identity, externals.pmem.identity,
+            "control: the installed entry is another file than the exported one"
+        );
+        assert_eq!(
+            (&device.path, &device.source, &device.mount_path),
+            (
+                &externals.pmem.path,
+                &externals.pmem.source,
+                &externals.pmem.mount_path
+            ),
+            "the import changed more of the device than its identity"
+        );
+        crate::storage::pmem::check_snapshot_pmem_images(
+            &fake.host.data_dir,
+            &metadata.pmem_devices,
+        )
+        .unwrap();
+
+        assert_eq!(
+            names_in(&fake.image_cache()),
+            [
+                "0123456789abcdef.lock",
+                externals.image_disk.file_name().unwrap().to_str().unwrap()
+            ],
+            "the image cache holds the disk and the lock of its image"
+        );
+        assert_eq!(
+            names_in(&pmem_store_dir(&fake)),
+            [".lock", entry.file_name().unwrap().to_str().unwrap(), "tmp"],
+            "the store holds the entry, its lock and its temp directory"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// External files this host has are kept as they are: the same inodes with the same
+    /// modification times, and the config records the pmem entry as it was. The archived
+    /// copies are read and written nowhere.
+    #[tokio::test]
+    async fn external_files_this_host_has_are_kept_and_not_written() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        let before = (
+            inode_and_mtime(&externals.image_disk),
+            inode_and_mtime(&entry),
+        );
+        let store_before = names_in(&pmem_store_dir(&fake));
+
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            imported
+                .externals
+                .iter()
+                .map(|external| (external.role, external.installed))
+                .collect::<Vec<_>>(),
+            [
+                (ExternalRole::ImageDisk, false),
+                (ExternalRole::Pmem, false)
+            ]
+        );
+        assert_eq!(
+            (
+                inode_and_mtime(&externals.image_disk),
+                inode_and_mtime(&entry)
+            ),
+            before,
+            "the import wrote a file this host already had"
+        );
+        assert_eq!(
+            installed_config(&fake).await.metadata.pmem_devices,
+            std::slice::from_ref(&externals.pmem)
+        );
+        assert_eq!(names_in(&pmem_store_dir(&fake)), store_before);
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// This host has another build of the image disk at the recorded path. The import is
+    /// refused before it writes anything and the disk is kept. A Docker archive disk, for
+    /// which a snapshot records no identity, is kept whatever it holds, which is what a
+    /// restore accepts.
+    #[tokio::test]
+    async fn an_image_disk_of_another_build_on_this_host_is_not_replaced() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let mut other = std::fs::read(&externals.image_disk).unwrap();
+        other[MIB as usize + 5] ^= 0x01;
+        std::fs::write(&externals.image_disk, &other).unwrap();
+
+        let message = refusal(&fake, &host_of(&fake), archive).await;
 
         assert!(
-            message.contains("the snapshot maps pmem images, which the archive does not carry")
-                && message.contains("snapshot pmem image changed"),
+            message.contains("this host has another build of the image disk")
+                && message.contains("image disk build changed"),
+            "{message}"
+        );
+        assert!(
+            std::fs::read(&externals.image_disk).unwrap() == other,
+            "the refused import changed the image disk"
+        );
+
+        let (fake, externals) = fake_snapshot_with_externals();
+        let disk = fake.image_cache().join("0123456789abcdef.docker.tar");
+        std::fs::rename(&externals.image_disk, &disk).unwrap();
+        fake.edit_config(|config| {
+            config.metadata.image_disk_path = Some(disk.clone());
+            config.metadata.image_disk_identity = None;
+        });
+        let archive = export_of(&fake).await;
+        std::fs::remove_dir_all(fake.dir()).unwrap();
+        std::fs::write(&disk, &other).unwrap();
+        let before = inode_and_mtime(&disk);
+
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+
+        assert!(!imported.externals[0].installed);
+        assert_eq!(inode_and_mtime(&disk), before);
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// The recorded path of the image disk comes from the archive, and a launch reuses a
+    /// file of the image cache by its name. So the path has to be one this host's image
+    /// cache gives the disk of an image, whether this host has the file or not: directly
+    /// under the cache, with the name a launch gives such a disk. A storage image comes
+    /// with the identity its snapshot recorded.
+    #[tokio::test]
+    async fn an_image_disk_has_a_name_of_this_hosts_image_cache() {
+        let (fake, externals, archive) = exported_with_externals().await;
+
+        // Another image cache than the path's, without and with a file at the path.
+        let mut elsewhere = host_of(&fake);
+        elsewhere.image_cache_dir = fake.root.path().join("another-image-cache");
+        let aside = fake.root.path().join("image-disk-aside");
+        std::fs::rename(&externals.image_disk, &aside).unwrap();
+        let message = refusal(&fake, &elsewhere, archive.clone()).await;
+        assert!(
+            message.contains("is not a file of this host's image cache")
+                && message.contains("another-image-cache"),
+            "a disk this host lacks: {message}"
+        );
+        std::fs::rename(&aside, &externals.image_disk).unwrap();
+        let message = refusal(&fake, &elsewhere, archive.clone()).await;
+        assert!(
+            message.contains("is not a file of this host's image cache")
+                && message.contains("another-image-cache"),
+            "a disk this host has: {message}"
+        );
+
+        // A name the image cache gives no disk, with the recorded build under it.
+        let misnamed = fake.image_cache().join("layers.img");
+        std::fs::copy(&externals.image_disk, &misnamed).unwrap();
+        let mut unpacked = Unpacked::of(&archive);
+        unpacked.manifest.externals[0].path = misnamed.clone();
+        unpacked.edit_config(|config| config.metadata.image_disk_path = Some(misnamed.clone()));
+        let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+        assert!(
+            message.contains("is not a name this host's image cache gives an image disk"),
+            "a file of the cache under another name: {message}"
+        );
+        std::fs::remove_file(&misnamed).unwrap();
+
+        // A storage image the snapshot recorded no identity for.
+        let mut unpacked = Unpacked::of(&archive);
+        unpacked.manifest.externals[0].sha256 = None;
+        unpacked.edit_config(|config| config.metadata.image_disk_identity = None);
+        let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+        assert!(
+            message.contains("records no identity for it"),
+            "a storage image without an identity: {message}"
+        );
+
+        // Control: the archive as it was exported imports on the same host.
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        assert!(!imported.externals[0].installed);
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// A store entry's name is a digest of the uid it belongs to and of its bytes. An entry
+    /// this host lacks would be published for this import's uid, so pmem images that belong
+    /// to another uid on the exporting host are refused before anything is written, with a
+    /// message that names both uids. So is an entry that is not named in this host's store.
+    #[tokio::test]
+    async fn pmem_entries_of_another_uid_or_another_store_are_refused() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        std::fs::remove_file(&externals.pmem.path).unwrap();
+        let here = nix::unistd::getuid().as_raw();
+
+        let mut unpacked = Unpacked::of(&archive);
+        assert_eq!(
+            unpacked.manifest.pmem_owner_uid,
+            Some(here),
+            "control: the export recorded this uid as the entries' owner"
+        );
+        unpacked.manifest.pmem_owner_uid = Some(here + 1);
+        let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+        assert!(
+            message.contains(&format!("belong to uid {} on the exporting host", here + 1))
+                && message.contains(&format!("publishes store entries for uid {here}"))
+                && message.contains("Run the import as the uid the entries belong to"),
+            "{message}"
+        );
+
+        let mut unpacked = Unpacked::of(&archive);
+        let elsewhere = PathBuf::from("/example/another-data/pmem")
+            .join(Path::new(&externals.pmem.path).file_name().unwrap());
+        unpacked.manifest.externals[1].path = elsewhere.clone();
+        unpacked.edit_config(|config| {
+            config.metadata.pmem_devices[0].path = elsewhere.to_string_lossy().into_owned();
+        });
+        let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+        assert!(
+            message.contains("is not an entry of this host's pmem image store"),
             "{message}"
         );
     }
 
-    /// An input that stops before the first read past the start of the archive, which is
-    /// inside the memory image's data, until the test lets it go on.
+    /// The archive verifies, and the bytes it carries for an external file are not the ones
+    /// the snapshot recorded: an image disk of another build, and pmem bytes that are not
+    /// the ones the entry is named for. Each fails the import after the file is staged, and
+    /// nothing is left: no file at the recorded path, no temporary, no tag.
+    #[tokio::test]
+    async fn external_bytes_that_are_not_the_recorded_ones_install_nothing() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        remove_externals(&fake, &externals);
+        let changed = |index: usize| {
+            let mut unpacked = Unpacked::of(&archive);
+            unpacked.externals[index][MIB as usize + 5] ^= 0x01;
+            unpacked.pack()
+        };
+
+        let message = failure_that_leaves_nothing(&fake, changed(0)).await;
+        assert!(
+            message.contains("is not the build the snapshot was taken against"),
+            "another image disk: {message}"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+
+        let message = failure_that_leaves_nothing(&fake, changed(1)).await;
+        assert!(
+            message.contains("the pmem image the archive carries for")
+                && message.contains("belongs to another uid"),
+            "other pmem bytes: {message}"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+
+        assert!(
+            !externals.image_disk.exists() && !entry.exists(),
+            "a failed import published an external file"
+        );
+
+        // Control: the archive as it was exported installs both.
+        import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        assert!(externals.image_disk.is_file() && entry.is_file());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// Nothing is published before the trailer verifies. A stream cut inside an external
+    /// file, and an archive whose memory image has a flipped byte, which is known only
+    /// when the trailer is read after both external files are staged whole, both leave no
+    /// external file, no temporary and no tag.
+    #[tokio::test]
+    async fn a_cut_or_corrupt_archive_publishes_no_external_file() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        remove_externals(&fake, &externals);
+
+        // The pmem entry's second data run, which is the last data of the archive.
+        let cut = position_of(&archive, &pattern(22, 64)) + 100;
+        let message = failure_that_leaves_nothing(&fake, archive[..cut].to_vec()).await;
+        assert!(
+            message.contains("ended inside the data of external/1"),
+            "{message}"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        assert!(!externals.image_disk.exists() && !entry.exists());
+
+        let mut corrupt = archive.clone();
+        let at = position_of(&corrupt, &pattern(2, 64));
+        corrupt[at + 10] ^= 0x01;
+        let message = failure_that_leaves_nothing(&fake, corrupt).await;
+        assert!(
+            message.contains("snapshot/memory.bin is corrupt"),
+            "{message}"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        assert!(
+            !externals.image_disk.exists() && !entry.exists(),
+            "an archive that did not verify published an external file"
+        );
+    }
+
+    /// An import parked once every external file is staged and before the archive has
+    /// verified, with what it has staged by then.
+    struct StagedImport {
+        import: tokio::task::JoinHandle<Result<Imported>>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    /// Start an import of `archive` and wait until it has read past the last external
+    /// file's data: the input stops at the read that looks for the end of the archive.
+    async fn import_parked_with_externals_staged(fake: &Fake, archive: Vec<u8>) -> StagedImport {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let input = Parked {
+            park_after: position_of(&archive, &pattern(22, 64)) as u64,
+            archive: Cursor::new(archive),
+            entered: entered_tx,
+            release: release_rx,
+            parked: false,
+        };
+        let host = host_of(fake);
+        let import = tokio::spawn(async move { import_snapshot(&host, input).await });
+        tokio::time::timeout(Duration::from_secs(60), entered_rx.recv())
+            .await
+            .expect("the import never read past the last external file")
+            .unwrap();
+        StagedImport {
+            import,
+            release: release_tx,
+        }
+    }
+
+    /// While the archive has not verified, an external file this host lacks is in a
+    /// temporary of its store and has no name of its own: the image disk beside its path
+    /// with a reclaim record, the pmem entry under the store's `tmp/` with the store's
+    /// lock held, so that a collection of abandoned temps removes nothing. Once the import
+    /// ends, both are at their paths and no temporary is left.
+    #[tokio::test]
+    async fn external_files_are_staged_in_their_stores_until_the_archive_has_verified() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        remove_externals(&fake, &externals);
+
+        let staged = import_parked_with_externals_staged(&fake, archive).await;
+
+        let temporaries = external_temporaries(&fake);
+        // A reclaim record is a `.json` file and its lock.
+        let count = |prefix: &str| {
+            temporaries
+                .iter()
+                .filter(|name| name.starts_with(prefix) && !name.ends_with(".lock"))
+                .count()
+        };
+        assert_eq!(
+            (count("image-cache/"), count("pmem/tmp/"), count("reclaim/")),
+            (1, 1, 1),
+            "the staged image disk, the staged pmem entry and the image disk's reclaim \
+             record: {temporaries:?}"
+        );
+        assert!(
+            !externals.image_disk.exists() && !entry.exists() && !fake.dir().exists(),
+            "an external file or the tag has its name before the archive has verified"
+        );
+        assert_eq!(
+            crate::storage::pmem_store::collect_abandoned_temps(&fake.host.data_dir).unwrap(),
+            0,
+            "a collection of abandoned temps removed the temp of an import that is running"
+        );
+        assert_eq!(count("pmem/tmp/"), 1);
+
+        staged.release.send(()).unwrap();
+        staged.import.await.unwrap().unwrap();
+
+        assert!(externals.image_disk.is_file() && entry.is_file());
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// The lines of `/proc/locks` that are requests waiting for a `flock` of the file at
+    /// `path`: the kernel lists a blocked request under the lock it waits behind, marked
+    /// `->`, with the file's inode number.
+    fn flock_waiters(path: &Path) -> usize {
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(path).unwrap().ino();
+        std::fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("-> FLOCK") && line.trim_end().ends_with(&format!(":{inode} 0 EOF"))
+            })
+            .count()
+    }
+
+    /// A launch holds the lock of an image's cache entries from its look for the image's
+    /// disk through the rename that publishes the one it built, and that rename replaces. An
+    /// import publishes the disk under the same lock: while a build holds it the import
+    /// waits, with the disk still in its temporary, and it then meets the build's file as
+    /// one that appeared meanwhile, which it keeps and checks.
+    #[tokio::test]
+    async fn the_image_disk_is_published_under_the_lock_of_its_image() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let mut other = std::fs::read(&externals.image_disk).unwrap();
+        other[MIB as usize + 5] ^= 0x01;
+        std::fs::remove_file(&externals.image_disk).unwrap();
+
+        // What a launch of the image holds while it builds the disk.
+        let digest = externals
+            .image_disk
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string();
+        let lock_path = fake.image_cache().join(format!("{digest}.lock"));
+        let build = File::create(&lock_path).unwrap();
+        fs2::FileExt::lock_exclusive(&build).unwrap();
+
+        let host = host_of(&fake);
+        let import =
+            tokio::spawn(async move { import_snapshot(&host, Cursor::new(archive)).await });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while flock_waiters(&lock_path) == 0 {
+            assert!(
+                !import.is_finished(),
+                "the import ended while a build held the lock of the image: it published \
+                 the image disk (present: {}) without the lock",
+                externals.image_disk.exists()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the import neither ended nor asked for the lock of the image"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !externals.image_disk.exists() && !fake.dir().exists(),
+            "the import published before it had the lock of the image"
+        );
+
+        // The build publishes its disk, another build than the snapshot's, and lets go.
+        std::fs::write(&externals.image_disk, &other).unwrap();
+        drop(build);
+        let error = match import.await.unwrap() {
+            Ok(imported) => panic!("the import installed {}", imported.tag),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(
+            error.contains("another build of the image disk")
+                && error.contains("appeared on this host while the archive was imported"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read(&externals.image_disk).unwrap() == other,
+            "the import replaced the disk the build published"
+        );
+        assert!(!fake.dir().exists() && !staging_of(&fake).exists());
+    }
+
+    /// The staged disk is private until it is linked, and the larger the disk, the longer
+    /// its flush. It is synced before the lock of its image is taken, so a launch of the
+    /// image never waits behind that flush, and it is linked under the lock.
+    #[test]
+    fn the_staged_image_disk_is_synced_before_the_lock_of_its_image_is_taken() {
+        let source = include_str!("snapshot_import.rs");
+        let from = source
+            .find("\nfn settle_image_disk(")
+            .expect("no settle_image_disk");
+        let body = &source[from..];
+        let body = &body[..body.find("\n}\n").expect("unterminated fn")];
+        let at = |what: &str| {
+            let found: Vec<usize> = body.match_indices(what).map(|(at, _)| at).collect();
+            assert_eq!(found.len(), 1, "{what:?} in settle_image_disk: {found:?}");
+            found[0]
+        };
+        let (sync, lock, link) = (
+            at("file.sync_all()"),
+            at("lock_image_cache_entries("),
+            at("hard_link("),
+        );
+        assert!(
+            sync < lock,
+            "the staged image disk is synced with the lock of its image held"
+        );
+        assert!(
+            lock < link,
+            "the image disk is linked before the lock of its image is taken"
+        );
+    }
+
+    /// A recorded image disk identity is `sha256:` and 64 lowercase hex digits. An archive
+    /// whose config records anything else is refused before anything is written, also when
+    /// its manifest repeats it.
+    #[tokio::test]
+    async fn an_archive_whose_image_disk_identity_is_not_a_digest_is_refused() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        std::fs::remove_file(&externals.image_disk).unwrap();
+        let upper = "0123456789ABCDEF".repeat(4);
+
+        for digest in ["abc", upper.as_str()] {
+            let mut unpacked = Unpacked::of(&archive);
+            unpacked.manifest.externals[0].sha256 = Some(digest.to_string());
+            unpacked.edit_config(|config| {
+                config.metadata.image_disk_identity = Some(format!("sha256:{digest}"));
+            });
+            let message = refusal(&fake, &host_of(&fake), unpacked.pack()).await;
+            assert!(
+                message.contains("which is not the SHA-256 of its bytes"),
+                "{digest}: {message}"
+            );
+        }
+    }
+
+    /// A Docker archive disk (`<digest>.docker.tar`) has no recorded identity: a launch
+    /// records one for a storage image only. An import installs one this host lacks as the
+    /// archive carries it, with no check of its bytes beyond the archive's own.
+    #[tokio::test]
+    async fn an_image_disk_without_a_recorded_identity_is_installed_as_the_archive_carries_it() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let disk = fake.image_cache().join("0123456789abcdef.docker.tar");
+        let before = std::fs::read(&externals.image_disk).unwrap();
+        std::fs::remove_file(&externals.image_disk).unwrap();
+        let mut unpacked = Unpacked::of(&archive);
+        unpacked.manifest.externals[0].path = disk.clone();
+        unpacked.manifest.externals[0].sha256 = None;
+        unpacked.edit_config(|config| {
+            config.metadata.image_disk_path = Some(disk.clone());
+            config.metadata.image_disk_identity = None;
+        });
+
+        let imported = import_snapshot(&host_of(&fake), Cursor::new(unpacked.pack()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                imported.externals[0].role,
+                &imported.externals[0].path,
+                imported.externals[0].installed
+            ),
+            (ExternalRole::ImageDisk, &disk, true)
+        );
+        assert!(
+            std::fs::read(&disk).unwrap() == before,
+            "the installed image disk does not hold the archived bytes"
+        );
+        assert_eq!(
+            installed_config(&fake).await.metadata.image_disk_identity,
+            None
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// What has the image disk's name on this host has to be a regular file: a directory
+    /// there is refused, and so is a link to the disk, which a launch would follow to a
+    /// file that is not the image cache's.
+    #[tokio::test]
+    async fn an_image_disk_that_is_not_a_regular_file_is_refused() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let aside = fake.root.path().join("image-disk-aside");
+        std::fs::rename(&externals.image_disk, &aside).unwrap();
+
+        std::fs::create_dir(&externals.image_disk).unwrap();
+        let message = refusal(&fake, &host_of(&fake), archive.clone()).await;
+        assert!(
+            message.contains("which on this host is not a regular file"),
+            "a directory: {message}"
+        );
+        std::fs::remove_dir(&externals.image_disk).unwrap();
+
+        std::os::unix::fs::symlink(&aside, &externals.image_disk).unwrap();
+        let message = refusal(&fake, &host_of(&fake), archive.clone()).await;
+        assert!(
+            message.contains("which on this host is not a regular file"),
+            "a link to the recorded build: {message}"
+        );
+        std::fs::remove_file(&externals.image_disk).unwrap();
+
+        // Control: with the file itself at the path, the archive imports.
+        std::fs::rename(&aside, &externals.image_disk).unwrap();
+        import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// A pmem entry this host has at the recorded path has to pass the store's own check of
+    /// an entry: one that is not the read-only file the store publishes is refused before
+    /// anything is written, and is left as it is.
+    #[tokio::test]
+    async fn a_pmem_entry_this_run_cannot_use_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let message = refusal(&fake, &host_of(&fake), archive.clone()).await;
+
+        assert!(
+            message.contains("is not an entry this import can use")
+                && message.contains("is not a mode 0400 regular file"),
+            "{message}"
+        );
+
+        // Control: the entry as the store published it is accepted.
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o400)).unwrap();
+        import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// An image disk this host had when the import began is not written, so the archive's
+    /// copy is gone by the time the import publishes. A disk that was removed meanwhile
+    /// fails the import, which leaves nothing.
+    #[tokio::test]
+    async fn an_image_disk_that_is_gone_when_the_import_publishes_fails_it() {
+        let (fake, externals, archive) = exported_with_externals().await;
+
+        let staged = import_parked_with_externals_staged(&fake, archive).await;
+        assert_eq!(
+            external_temporaries(&fake),
+            Vec::<String>::new(),
+            "control: the import staged a file this host has"
+        );
+        std::fs::remove_file(&externals.image_disk).unwrap();
+        staged.release.send(()).unwrap();
+        let error = match staged.import.await.unwrap() {
+            Ok(imported) => panic!("the import installed {}", imported.tag),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(error.contains("is gone from this host"), "{error}");
+        assert!(!fake.dir().exists() && !staging_of(&fake).exists());
+        assert!(!externals.image_disk.exists());
+    }
+
+    /// The import fails after it has published its external files: the tag's name is taken
+    /// while the import stages, so the rename that publishes the snapshot is refused. The
+    /// external files stay, whole and under their names, as entries of their stores. The
+    /// tag is not installed and the staging directory is removed.
+    #[tokio::test]
+    async fn a_failure_after_the_external_files_are_published_keeps_them_and_no_tag() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        let (disk_before, entry_before) = (file_image(&externals.image_disk), file_image(&entry));
+        remove_externals(&fake, &externals);
+
+        let staged = import_parked_with_externals_staged(&fake, archive).await;
+        std::fs::create_dir(fake.dir()).unwrap();
+        staged.release.send(()).unwrap();
+        let error = match staged.import.await.unwrap() {
+            Ok(imported) => panic!("the import installed {}", imported.tag),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(
+            error.contains("appeared on this host while its archive was imported"),
+            "{error}"
+        );
+        assert!(
+            file_image(&externals.image_disk) == disk_before && file_image(&entry) == entry_before,
+            "the external files the import published are not the exported ones"
+        );
+        assert_eq!(
+            files_under(&fake.dir()),
+            Vec::<PathBuf>::new(),
+            "the import wrote into the directory that took the tag's name"
+        );
+        assert!(
+            !staging_of(&fake).exists(),
+            "the failed import left its staging directory"
+        );
+        assert_eq!(staging_records(&fake), Vec::<String>::new());
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+    }
+
+    /// The import hashed the image disk as it wrote it, and records that digest for the
+    /// published file, so the first check of the disk against the snapshot does not read
+    /// it whole. The test changes a byte the lookup's fingerprint does not sample and puts
+    /// the modification time back: a check that read the disk would find another digest.
+    #[tokio::test]
+    async fn the_digest_of_an_installed_image_disk_is_recorded_for_its_first_check() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        std::fs::remove_file(&externals.image_disk).unwrap();
+        import_snapshot(&host_of(&fake), Cursor::new(archive))
+            .await
+            .unwrap();
+        let recorded = installed_config(&fake)
+            .await
+            .metadata
+            .image_disk_identity
+            .unwrap();
+
+        let disk = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&externals.image_disk)
+            .unwrap();
+        let modified = disk.metadata().unwrap().modified().unwrap();
+        // Past the first MiB and between two of the blocks the fingerprint reads.
+        let at = MIB + 8192;
+        let mut byte = [0u8; 1];
+        disk.read_exact_at(&mut byte, at).unwrap();
+        disk.write_all_at(&[byte[0] ^ 0x01], at).unwrap();
+        disk.set_modified(modified).unwrap();
+
+        crate::utils::verify_image_disk_identity(&externals.image_disk, &recorded)
+            .expect("the installed disk was read to learn its digest");
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// Another process publishes the same external files while the import has them staged:
+    /// a launch that built the image disk, and a `--pmem` run of the same image. The import
+    /// keeps the files that have the names, removes its own copies, and records the pmem
+    /// entry that is there.
+    #[tokio::test]
+    async fn external_files_that_appear_while_the_import_stages_are_kept() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let entry = PathBuf::from(&externals.pmem.path);
+        let disk_bytes = std::fs::read(&externals.image_disk).unwrap();
+        remove_externals(&fake, &externals);
+
+        let staged = import_parked_with_externals_staged(&fake, archive).await;
+        std::fs::write(&externals.image_disk, &disk_bytes).unwrap();
+        let store = PmemStore::open(&fake.host.data_dir).unwrap();
+        assert_eq!(
+            store.ingest(Path::new(&externals.pmem.source)).unwrap(),
+            entry,
+            "control: a run of the same image publishes the recorded entry"
+        );
+        let appeared = (
+            inode_and_mtime(&externals.image_disk),
+            inode_and_mtime(&entry),
+        );
+
+        staged.release.send(()).unwrap();
+        let imported = staged.import.await.unwrap().unwrap();
+
+        assert_eq!(
+            imported
+                .externals
+                .iter()
+                .map(|external| external.installed)
+                .collect::<Vec<_>>(),
+            [false, false],
+            "the import reports a file it did not install"
+        );
+        assert_eq!(
+            (
+                inode_and_mtime(&externals.image_disk),
+                inode_and_mtime(&entry)
+            ),
+            appeared,
+            "the import replaced a file that was published while it staged"
+        );
+        assert_eq!(
+            installed_config(&fake).await.metadata.pmem_devices[0].identity,
+            crate::storage::pmem::entry_identity(&std::fs::metadata(&entry).unwrap()),
+            "the config records the entry that is in the store"
+        );
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+        remove_snapshot_dir(&fake.dir()).await.unwrap();
+    }
+
+    /// Another build of the image disk appears at the recorded path while the import has
+    /// its own staged. The import fails, the file that appeared is kept, and nothing of the
+    /// import is left.
+    #[tokio::test]
+    async fn another_build_that_appears_while_the_import_stages_fails_it_and_is_kept() {
+        let (fake, externals, archive) = exported_with_externals().await;
+        let mut other = std::fs::read(&externals.image_disk).unwrap();
+        other[MIB as usize + 5] ^= 0x01;
+        remove_externals(&fake, &externals);
+
+        let staged = import_parked_with_externals_staged(&fake, archive).await;
+        std::fs::write(&externals.image_disk, &other).unwrap();
+
+        staged.release.send(()).unwrap();
+        let error = match staged.import.await.unwrap() {
+            Ok(imported) => panic!("the import installed {}", imported.tag),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(
+            error.contains("another build of the image disk")
+                && error.contains("appeared on this host while the archive was imported"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read(&externals.image_disk).unwrap() == other,
+            "the import replaced the image disk that appeared"
+        );
+        assert!(!fake.dir().exists() && !staging_of(&fake).exists());
+        assert_eq!(external_temporaries(&fake), Vec::<String>::new());
+    }
+
+    /// An input that stops before the first read past `park_after` bytes of the archive
+    /// until the test lets it go on. Past the start of the archive, that read is inside the
+    /// memory image's data.
     struct Parked {
         archive: Cursor<Vec<u8>>,
+        park_after: u64,
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: std::sync::mpsc::Receiver<()>,
         parked: bool,
@@ -1716,7 +3228,7 @@ mod tests {
 
     impl Read for Parked {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if !self.parked && self.archive.position() > 0 {
+            if !self.parked && self.archive.position() > self.park_after {
                 self.parked = true;
                 self.entered.send(()).unwrap();
                 self.release.recv().unwrap();
@@ -1736,6 +3248,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let input = Parked {
             archive: Cursor::new(archive),
+            park_after: 0,
             entered: entered_tx,
             release: release_rx,
             parked: false,
@@ -1796,6 +3309,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let input = Parked {
                 archive: Cursor::new(archive),
+                park_after: 0,
                 entered: entered_tx,
                 release: release_rx,
                 parked: false,
@@ -1952,9 +3466,10 @@ mod tests {
         );
     }
 
-    /// Once the archive has verified, the staged files are checked, then synced, and only
-    /// then renamed. A test cannot see a sync from outside, so the order is pinned by the
-    /// source.
+    /// Once the archive has verified, the staged files are checked, the external files are
+    /// published and the config is written with what they are on this host, and the
+    /// directory is synced and only then renamed. A test cannot see a sync from outside, so
+    /// the order is pinned by the source.
     #[test]
     fn the_staged_files_are_synced_before_they_are_published() {
         let source = include_str!("snapshot_import.rs");
@@ -1963,8 +3478,11 @@ mod tests {
             body_of(source, "fn stage_files<R: Read>("),
             &[
                 "reader.next_entry()",
-                "imported_config_json(",
                 "check_generation_files(",
+                "\"snapshot.import.externals_staged\"",
+                "publish_externals(",
+                "pmem_identities(",
+                "imported_config_json(",
                 "sync_generation(",
             ],
         );

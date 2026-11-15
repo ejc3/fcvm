@@ -7,7 +7,8 @@
 //! stays out of guest RAM and the memory snapshot). fcvm maps a copy of the image from its
 //! store under `<data_dir>/pmem`; three more check that writes to the image after a run
 //! started reach neither that VM nor a restore of its snapshot, and that two runs of one
-//! image map one copy.
+//! image map one copy. One exports a snapshot, deletes it and the store copy, imports the
+//! archive, and restores a clone that reads the file.
 //!
 //! Another runs a program stored on the image, so a page fault is served from a DAX
 //! mapping.
@@ -887,5 +888,164 @@ async fn test_pmem_restores_the_snapshot_image_after_the_source_is_rewritten() -
     if let Some(log_path) = &baseline_log {
         remove_logged_store_copies(log_path).await;
     }
+    result
+}
+
+/// A snapshot of a VM with a pmem image, exported, comes back on a host that has neither
+/// the snapshot nor the image's store copy: `snapshot import` installs the copy at the path
+/// the snapshot recorded, and a clone restored from the imported snapshot has the image
+/// mounted with DAX and reads the file as the host wrote it.
+#[tokio::test]
+async fn test_pmem_snapshot_export_delete_import_restores() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = image_dir()?;
+    let (image, host_sha) = build_image(dir.path()).await?;
+    let spec = format!("{}:{GUEST_MOUNT}:ro", image.display());
+    let (baseline, clone, snapshot, _) = common::unique_names("pmem-import");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let snapshots = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir());
+    // On the store, not in /tmp: the archive holds the guest's memory image.
+    let archive_dir = tempfile::Builder::new()
+        .prefix("pmem-import-test-")
+        .tempdir_in(fcvm::paths::data_dir())
+        .context("creating a directory for the archive")?;
+    let archive = archive_dir.path().join("snapshot.archive");
+
+    // VM processes still running, killed afterwards whatever the outcome.
+    let mut running: Vec<u32> = Vec::new();
+    let mut baseline_log = None;
+    // The store copies the test knows of, removed afterwards whatever the outcome.
+    let mut copies: Vec<String> = Vec::new();
+    let result = async {
+        let (_baseline_child, baseline_pid, log_path) = common::spawn_fcvm_with_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline,
+                "--no-snapshot",
+                "--pmem",
+                &spec,
+                common::TEST_IMAGE,
+            ],
+            &baseline,
+        )
+        .await
+        .context("spawning the baseline")?;
+        running.push(baseline_pid);
+        baseline_log = Some(log_path);
+        common::poll_health_by_pid(baseline_pid, 300).await?;
+        ensure!(
+            guest_sha(baseline_pid).await? == host_sha,
+            "control: the baseline does not read the file the host wrote"
+        );
+        common::create_snapshot_by_pid(baseline_pid, &snapshot).await?;
+        common::kill_process(baseline_pid).await;
+        running.retain(|pid| *pid != baseline_pid);
+
+        let exported = snapshots.load_snapshot(&snapshot).await?;
+        let devices = &exported.metadata.pmem_devices;
+        ensure!(
+            devices.len() == 1 && is_store_entry(Path::new(&devices[0].path)),
+            "the snapshot does not map one pmem store entry: {devices:?}"
+        );
+        let entry = PathBuf::from(&devices[0].path);
+        copies.push(devices[0].path.clone());
+        let entry_len = std::fs::metadata(&entry)?.len();
+
+        let mut export = tokio::process::Command::new(&fcvm_path);
+        export
+            .args(["snapshot", "export", &snapshot, "--output"])
+            .arg(&archive);
+        // Must not outlive a test that nextest killed: it holds the snapshot's lock.
+        common::set_test_pdeathsig(&mut export);
+        let out = export.output().await.context("running snapshot export")?;
+        ensure!(
+            out.status.success(),
+            "snapshot export failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The importing host: no snapshot, no store copy, and no link from the image to it.
+        common::delete_snapshot(&snapshot).await?;
+        if let Some(log_path) = &baseline_log {
+            remove_logged_store_copies(log_path).await;
+        }
+        std::fs::remove_file(&entry).ok();
+        ensure!(
+            !entry.exists() && !fcvm::paths::snapshot_dir().join(&snapshot).exists(),
+            "the snapshot or its store copy {} survived its delete",
+            entry.display()
+        );
+
+        let mut import = tokio::process::Command::new(&fcvm_path);
+        import.args(["snapshot", "import", "--input"]).arg(&archive);
+        // Must not outlive a test that nextest killed: it holds the tag's lock.
+        common::set_test_pdeathsig(&mut import);
+        let out = import.output().await.context("running snapshot import")?;
+        ensure!(
+            out.status.success(),
+            "snapshot import failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let installed = std::fs::metadata(&entry)
+            .with_context(|| format!("the import did not install {}", entry.display()))?;
+        ensure!(
+            installed.len() == entry_len && installed.permissions().mode() & 0o7777 == 0o400,
+            "the installed store copy is {} bytes with mode {:o}; the exported one was {} \
+             bytes and a store copy is read-only for its owner",
+            installed.len(),
+            installed.permissions().mode() & 0o7777,
+            entry_len
+        );
+        let imported = snapshots.load_snapshot(&snapshot).await?;
+        ensure!(
+            imported.metadata.pmem_devices.len() == 1
+                && imported.metadata.pmem_devices[0].path == devices[0].path
+                && imported.metadata.pmem_devices[0].identity != devices[0].identity,
+            "the imported snapshot does not record the installed store copy: {:?} (exported: \
+             {devices:?})",
+            imported.metadata.pmem_devices
+        );
+
+        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &["snapshot", "run", "--snapshot", &snapshot, "--name", &clone],
+            &clone,
+        )
+        .await
+        .context("spawning a clone of the imported snapshot")?;
+        running.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 120)
+            .await
+            .context("the restore of the imported snapshot did not start a healthy clone")?;
+        let mounts = common::exec_in_vm(clone_pid, &["cat /proc/mounts"]).await?;
+        let line = mounts
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(GUEST_MOUNT))
+            .with_context(|| format!("{GUEST_MOUNT} is not mounted in the clone:\n{mounts}"))?;
+        let options = line.split_whitespace().nth(3).unwrap_or("");
+        ensure!(
+            line.starts_with("/dev/pmem0 ") && options.split(',').any(|o| o == "dax=always"),
+            "the clone's pmem mount is not /dev/pmem0 with dax=always: {line}"
+        );
+        let clone_sha = guest_sha(clone_pid).await?;
+        ensure!(
+            clone_sha == host_sha,
+            "the clone of the imported snapshot read {clone_sha}; the host wrote {host_sha}"
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    if let Err(error) = common::delete_snapshot(&snapshot).await {
+        println!("  could not delete snapshot {snapshot}: {error:#}");
+    }
+    if let Some(log_path) = &baseline_log {
+        remove_logged_store_copies(log_path).await;
+    }
+    remove_store_copies(&copies);
     result
 }
