@@ -571,6 +571,30 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("still='WINDOWS_BRIDGE_STILL=refused\\n'", block)
         self.assertIn("\\n'\"$still\" \"$WIN_IMAGE\"", block)
 
+    def test_minecraft_env_says_the_join_limits_are_enforced_only_when_the_tree_has_them(self):
+        # The host bootstrap's Java guard (ejc3/aws modules/fcvm-fleet-region) opens TCP 25565 on an
+        # image off its list only when the image says its servers carry the join limits: the agent's
+        # per-source FCVM-MC-JOIN chain (#1844, src/fleet/agent/joinguard.rs) and Pumpkin's player cap
+        # and login timeout (fleet/minecraft/src/pumpkin.rs). The build says so only when the tree the
+        # Minecraft image was built from has them, and the lines it looks for are the tree's own.
+        source = (HERE / "host/build.sh").read_text()
+        build = dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))["build"]
+        image = build.index("podman image exists localhost/fcvm-minecraft:fleet")
+        env = build.index("> /etc/fcvm-fleet/minecraft.env")
+        check = build.index("limits=\n", image)
+        self.assertLess(check, env)
+        block = build[check:env]
+        root = HERE.parents[1]
+        for path, line in (("src/fleet/agent/joinguard.rs", '"--connlimit-above",'),
+                           ("src/fleet/agent/joinguard.rs", '"--hashlimit-above",'),
+                           ("fleet/minecraft/src/pumpkin.rs", "pub const MAX_PLAYERS: u32"),
+                           ("fleet/minecraft/src/pumpkin.rs", "pub const LOGIN_TIMEOUT_SECS: u64")):
+            with self.subTest(line=line):
+                self.assertIn(f"grep -qF '{line}' \"$SRC/{path}\"", block)
+                self.assertIn(line, (root / path).read_text())
+        self.assertIn("limits='MINECRAFT_JOIN_LIMITS=enforced\\n'", block)
+        self.assertIn("printf \"$limits\" > /etc/fcvm-fleet/minecraft.env", build)
+
     def test_the_bake_drops_build_only_state_from_the_root(self):
         # A host hydrates every root block it reads from the image's snapshot, and the image is
         # what every host boots: the compiler cache (4.1 GB on the cad0ddad image), the Rust

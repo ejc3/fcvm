@@ -280,6 +280,18 @@ build)
   # the checkout. The agent makes its gold snapshot when it starts.
   bg_wait fleet-ami-minecraft-image "$L/minecraft-image.log"
   podman image exists localhost/fcvm-minecraft:fleet || { echo "root's store has no localhost/fcvm-minecraft:fleet"; exit 1; }
+  # minecraft.env says the servers carry the public join limits only when the tree the image was
+  # built from has them: the agent's per-source FCVM-MC-JOIN chain (#1844) and Pumpkin's player cap
+  # and login timeout. The host bootstrap's Java guard (ejc3/aws modules/fcvm-fleet-region) opens
+  # TCP 25565 on an image off its list only with this line. An empty file says nothing.
+  limits=
+  if grep -qF '"--connlimit-above",' "$SRC/src/fleet/agent/joinguard.rs" &&
+    grep -qF '"--hashlimit-above",' "$SRC/src/fleet/agent/joinguard.rs" &&
+    grep -qF 'pub const MAX_PLAYERS: u32' "$SRC/fleet/minecraft/src/pumpkin.rs" &&
+    grep -qF 'pub const LOGIN_TIMEOUT_SECS: u64' "$SRC/fleet/minecraft/src/pumpkin.rs"; then
+    limits='MINECRAFT_JOIN_LIMITS=enforced\n'
+  fi
+  printf "$limits" > /etc/fcvm-fleet/minecraft.env
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
   # system image built from source, and Robot Park, built with the AOSP build's tools.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"
