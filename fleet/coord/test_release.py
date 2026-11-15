@@ -960,6 +960,22 @@ class AttributionTests(unittest.TestCase):
         self.assertTrue(built, "ec2_aws.rs builds no Launched instance")
         self.assertTrue(all(f.startswith('format!("{region}/') for f in built), built)
 
+    def test_the_agents_line_names_each_registered_host_by_digest(self):
+        # The release gate's no-agent verdict reads which hosts have an agent registered with the
+        # coordinator: /live's fleet.hosts, one per connected agent, named by EC2 instance id.
+        view = json.loads((HERE.parent / "core/tests/vectors/04_retile_join_leave.json").read_text())["final_view"]
+        names = [h["name"] for h in view["fleet"]["hosts"]]
+        self.assertTrue(names)
+        line = smoke.agents_line(view, 1_794_780_000_000)
+        self.assertEqual(line, {"agents": sorted(smoke.attribution_digest(n) for n in names),
+                                "observed_at": 1_794_780_000_000})
+        for name in names:
+            self.assertNotIn(name, json.dumps(line))
+        self.assertEqual(smoke.agents_line({"fleet": {"hosts": []}}, 5), {"agents": [], "observed_at": 5})
+        # Without a fleet view there is no observation to report.
+        self.assertIsNone(smoke.agents_line({}, 5))
+        self.assertTrue(smoke.arguments(["--agents"])["agents"])
+
     def test_the_digest_is_the_release_gates(self):
         gate = load("release_gate", "../ami/release_gate.py")
         for instance in ("i-0example0host00a", ""):

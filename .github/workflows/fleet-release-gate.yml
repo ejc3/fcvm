@@ -98,9 +98,23 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-1
           mask-aws-account-id: true
+      # Which hosts have an agent registered with the coordinator, after the probes (digests
+      # only). A host image whose agent never starts gives the smoke no tile to probe; this is
+      # what lets the gate roll it back. A failure here leaves it empty, which decides nothing.
+      - name: Registered agents
+        id: agents
+        env:
+          STAGING_API_URL: ${{ vars.STAGING_API_URL }}
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          line=$(python3 -B fleet/coord/stage-smoke.py --agents | grep '^{"agents"' | tail -1) || line=
+          echo "agents=$line" >> "$GITHUB_OUTPUT"
       - env:
           RELEASE_GATE: ${{ vars.RELEASE_GATE }}
           BEFORE: ${{ needs.status.outputs.status }}
           V4: ${{ needs.smoke.outputs.v4 }}
           V6: ${{ needs.smoke.outputs.v6 }}
-        run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6"
+          AGENTS: ${{ steps.agents.outputs.agents }}
+        run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6" --agents "$AGENTS"

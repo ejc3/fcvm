@@ -89,11 +89,70 @@ class GateTests(unittest.TestCase):
                 value["placement"][key] = [self.digest(i) for i in value["placement"][key]]
         return value
 
-    def decide(self, gate, before=None, v4=None, v6=None):
+    def decide(self, gate, before=None, v4=None, v6=None, agents=None):
         before = self.redacted(before if before is not None else self.status())
         argv = ["decide", "--before", json.dumps(before),
                 "--v4", self.family("v4") if v4 is None else v4, "--v6", self.family("v6") if v6 is None else v6]
+        if agents is not None:
+            argv += ["--agents", agents]
         return release_gate.main(argv, run=gate)
+
+    def agents(self, instances=None, observed_at=1_794_780_000_000):
+        """The coordinator's registered agents, as stage-smoke.py --agents prints them."""
+        names = self.HOSTS if instances is None else instances
+        return json.dumps({"agents": sorted(self.digest(i) for i in names), "observed_at": observed_at})
+
+    def test_release_hosts_without_an_agent_roll_back(self):
+        # A host image that boots but never starts its agent: the smoke reaches no tile, so it
+        # reports no probe summary, and the coordinator lists none of the release's hosts.
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1], {
+            "action": "rollback",
+            "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
+            "placement": "d" * 64,
+            "evidence": {"kind": "no_agent", "hosts": sorted(self.digest(h) for h in self.HOSTS),
+                         "observed_at": 1_794_780_000_000}})
+        # An agent of a host outside the release does not count for it.
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=["i-0example0other0a"])), 0)
+        self.assertEqual(gate.payloads[1]["evidence"]["kind"], "no_agent")
+
+    def test_an_agent_on_any_release_host_leaves_the_probes_to_decide(self):
+        gate = Lambda(self.status(), {"status": "verified"})
+        self.assertEqual(self.decide(gate, agents=self.agents(instances=self.HOSTS[1:])), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "verify"])
+        gate = Lambda(self.status())
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_held_still(self):
+        none = self.agents(instances=[])
+        for after in (self.status(placement={"changed_kinds": ["tile"]}), self.status(placement={"digest": "e" * 64}),
+                      self.status(placement={"settled": False}), self.status(generation=16)):
+            with self.subTest(after=after["placement"]):
+                gate = Lambda(after)
+                before = self.status(placement={"changed_kinds": after["placement"]["changed_kinds"]})
+                self.assertEqual(self.decide(gate, before=before, v4="", v6="", agents=none), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
+        for raw in ("", "not json", json.dumps({"agents": ["x"], "observed_at": 1}),
+                    json.dumps({"agents": [], "observed_at": "now"}), json.dumps({"agents": []}),
+                    json.dumps({"agents": [], "observed_at": 0})):
+            with self.subTest(raw=raw):
+                gate = Lambda(self.status())
+                self.assertEqual(self.decide(gate, v4="", v6="", agents=raw), 0)
+                self.assertNotIn("rollback", [p.get("action") for p in gate.payloads])
+
+    def test_the_decision_reads_the_coordinators_agents_after_the_smoke(self):
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1]
+        self.assertIn("python3 -B fleet/coord/stage-smoke.py --agents", decide)
+        self.assertIn('--agents "$AGENTS"', decide)
+        for secret in ("CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}",
+                       "CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}",
+                       "STAGING_API_URL: ${{ vars.STAGING_API_URL }}"):
+            self.assertIn(secret, decide)
 
     def test_a_pass_on_both_families_verifies_the_exact_receipt(self):
         gate = Lambda(self.status(), {"status": "verified", "generation": 15})
