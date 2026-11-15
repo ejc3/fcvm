@@ -556,6 +556,8 @@ where
         // starts without the per-source limits in place (joinguard.rs).
         joinguard::install("FORWARD", joinguard::JOIN_PORT)
             .context("installing the public join limits for Minecraft mode")?;
+        // Netavark puts its own FORWARD jump first when the Windows bridge containers start.
+        tokio::spawn(joinguard::keep_first("FORWARD", joinguard::JOIN_PORT));
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
     out.send(AgentMsg::Hello {
