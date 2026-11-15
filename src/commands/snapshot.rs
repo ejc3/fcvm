@@ -252,6 +252,9 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
         SnapshotCommands::Export(export_args) => {
             super::snapshot_export::cmd_snapshot_export(export_args).await
         }
+        SnapshotCommands::Import(import_args) => {
+            super::snapshot_import::cmd_snapshot_import(import_args).await
+        }
     }
 }
 
