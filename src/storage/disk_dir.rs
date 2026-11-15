@@ -530,6 +530,45 @@ mod tests {
         assert_eq!(hashed_mode(b'f', 0o104755), 0o4755);
     }
 
+    /// hash_entry hashes a symlink with no permission bits: its digest equals one built with a
+    /// zero mode, while the link's own lstat mode (0777 here) is not zero, so a hash_entry that
+    /// fed the link's mode in would produce a different digest.
+    #[test]
+    fn hash_entry_hashes_a_symlink_without_its_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink("a.txt", &link).unwrap();
+        let own_mode = std::fs::symlink_metadata(&link).unwrap().mode() & 0o7777;
+        assert_ne!(
+            own_mode, 0,
+            "the link must have mode bits for this test to see them"
+        );
+
+        let mut hashed = Sha256::new();
+        hash_entry(
+            &link,
+            Path::new("link"),
+            false,
+            &mut HashMap::new(),
+            &mut hashed,
+        )
+        .unwrap();
+
+        let mut expected = Sha256::new();
+        hash_bytes(&mut expected, b"link");
+        expected.update([b'l']);
+        expected.update(0u32.to_le_bytes());
+        let mut xattrs = extended_attributes(&link).unwrap();
+        xattrs.retain(|(name, _)| carried_xattr(name, false));
+        expected.update((xattrs.len() as u64).to_le_bytes());
+        for (name, value) in xattrs {
+            hash_bytes(&mut expected, &name);
+            hash_bytes(&mut expected, &value);
+        }
+        hash_bytes(&mut expected, b"a.txt");
+        assert_eq!(hashed.finalize(), expected.finalize());
+    }
+
     /// Two trees at one path that differ in one file's bytes get different keys, and the
     /// same content recreated with new timestamps gets the same key.
     #[test]
