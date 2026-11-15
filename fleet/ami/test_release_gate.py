@@ -168,6 +168,9 @@ class GateTests(unittest.TestCase):
     def test_the_decision_reads_the_coordinators_agents_after_the_smoke(self):
         decide = WORKFLOW.split("\n  decide:\n", 1)[1]
         self.assertIn("python3 -B fleet/coord/stage-smoke.py --agents", decide)
+        # The snapshot is selected as JSON (jq), not by matching its text.
+        self.assertIn("""jq -cR 'fromjson? | select(type == "object" and has("agents"))'""", decide)
+        self.assertNotIn("grep", decide)
         self.assertIn('--agents "$AGENTS"', decide)
         for secret in ("CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}",
                        "CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}",
