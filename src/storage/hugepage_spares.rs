@@ -582,9 +582,8 @@ pub fn fill_from(
     if dest.metadata()?.len() < size {
         bail!("the hugepage file is smaller than {}", source.display());
     }
-    // A run still dirty in this kernel's page cache over FUSE (a nested L1) would read as a
-    // hole and stay zeros in guest memory.
-    crate::uffd::flush_for_hole_walk(&src)?;
+    // The walk flushes a source on FUSE first: a run still dirty in this kernel's page cache
+    // over FUSE (a nested L1) would read as a hole and stay zeros in guest memory.
     let mut extents = Vec::new();
     crate::uffd::for_each_data_run(&src, size, |start, end| extents.push((start, end - start)))?;
     let data: u64 = extents.iter().map(|(_, len)| len).sum();
