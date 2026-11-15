@@ -104,7 +104,7 @@ impl Inheritance {
         match joined {
             Ok(Ok(Ok(stats))) => info!(
                 snapshot = %self.snapshot,
-                parent_resident_mib = stats.parent_resident_pages * host_page_size() >> 20,
+                parent_resident_mib = (stats.parent_resident_pages * host_page_size()) >> 20,
                 requested_mib = stats.requested_bytes >> 20,
                 requests = stats.requests,
                 failures = stats.failures,

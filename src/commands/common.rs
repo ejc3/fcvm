@@ -8469,7 +8469,7 @@ mod tests {
         let steps = [
             "Some(base) if has_base && diff_in_place => crate::uffd::inherit_page_cache(",
             "tokio::fs::copy(base_source, &final_memory_path)",
-            "inheritance = crate::uffd::inherit_page_cache(",
+            "crate::uffd::inherit_page_cache(&snapshot_config.name, base_source, &final_memory_path)",
             "inheritance.finish().await",
             "publish_snapshot_dir(",
         ];
