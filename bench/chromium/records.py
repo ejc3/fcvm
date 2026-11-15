@@ -77,6 +77,10 @@ RAW = (
     "scale-*/schedule.json",
     "scale-*/host-samples.jsonl",
     "scale-*/host-control.jsonl",
+    # A Kitesurf phase's per-request rows, and the screenshots, HTML and
+    # verdicts of its correctness pass.
+    "kitesurf/kitesurf.jsonl",
+    "kitesurf/correctness/*/*",
 )
 # The raw files of a bench/boot-race campaign: every sample with the workload's identities, and the Lambda REPORT
 # lines. render.py writes both with addresses and resource ids scrubbed; the driver's own configuration never

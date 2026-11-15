@@ -547,7 +547,22 @@ replay server. Left open: the per-request Firecracker cgroup probe still fails r
 ("firecracker pid N is outside run cgroup", 62 at 2 vCPUs and 1.4 per path), and `fs.inotify.max_user_instances`
 must be raised for runs above about 4 requests per second per path (AGENTS.md).
 
-## The campaign 40657613: what the report quotes since 2026-11-05
+## The campaign f3324aa0: what the report quotes since 2026-11-15
+
+The page quotes this campaign alone (`report/README.md`, "The campaign f3324aa0";
+`results/campaign-f3324aa0-summary.json`). The campaign 40657613 and every earlier run in this
+ledger stay records of earlier builds and are not quoted.
+
+| item | result |
+|---|---|
+| Harness before the campaign | #1835 (a prewired connect waits for the clone's port; HTTP/1.1 DevTools probes), #1881 (the drift control compares each frame mode with itself; cgroup.procs read as a set; scale requests keep a failure dump), #1894, #1896, #1887 (the Kitesurf phase) and #1910 (one queue each way on every veth). |
+| Attempts not imported | 81d631c4 (stopped at s2 and s8: the drift and PID-set defects #1881 fixed, and three guest Chromium crashes on one golden that 22,050 later renders on three fresh goldens did not reproduce) and 1aa4e767 (stopped by a routed run started under udev load from per-CPU veth queues, #1910). |
+| Serial runs | 36, each DNS-verified clean, 0 failures in 230 attempts per arm (430 in bridged and routed runs), every drift gate passed. |
+| Throughput | 2, 4 and 8 vCPUs pass at every rate offered (1.4, 2.8, 4.2 per path). |
+| Memory | five phases, including a 96-clone cell (N = 2 and 96). |
+| Kitesurf | 202/202 per operation, 14 of 14 pages complete, on its second attempt (#1913). |
+
+## The campaign 40657613 (quoted 2026-11-05 to 2026-11-15)
 
 The page quotes this campaign alone (`report/README.md`, "The campaign 40657613";
 `results/campaign-40657613-summary.json`). Every earlier run in this ledger stays a record of an

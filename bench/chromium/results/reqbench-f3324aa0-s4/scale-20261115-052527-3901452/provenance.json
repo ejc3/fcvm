@@ -1,0 +1,143 @@
+{
+  "argv": [
+    "/home/ubuntu/campaign/src/fcvm/bench/chromium/results/corpus-s4/reqbench/runtime/849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f/reqscale.py",
+    "--snapshot-tag",
+    "cb-s4",
+    "--data-root",
+    "/mnt/fcvm-btrfs",
+    "--state-dir",
+    "/mnt/fcvm-btrfs/state",
+    "--url",
+    "https://example.com/,https://news.ycombinator.com/,https://developers.cloudflare.com/,https://blog.cloudflare.com/,https://en.wikipedia.org/,https://developer.mozilla.org/en-US/,https://www.elmundo.es/,https://www.rtp.pt/noticias/,https://www.theguardian.com/international,https://todomvc.com/examples/javascript-es6/dist/,https://todomvc.com/examples/react/dist/index.html,https://todomvc.com/examples/vue/dist/,https://todomvc.com/examples/angular/dist/browser/,https://todomvc.com/examples/preact/dist/",
+    "--rates",
+    "1.4,2.8,4.2",
+    "--bursts",
+    "5",
+    "--control-chromium",
+    "/home/ubuntu/control-chromium/chrome-linux/chrome",
+    "--max-offered-rps-error-pct",
+    "2",
+    "--min-departure-ratio",
+    "0.95",
+    "--max-score-end-backlog",
+    "128",
+    "--max-p95-launch-lag-ms",
+    "50",
+    "--max-control-median-drift-pct",
+    "15",
+    "--seed",
+    "20261104",
+    "--uffd-mode",
+    "minor",
+    "--uffd-prefetch",
+    "on",
+    "--control-url",
+    "https://example.com/",
+    "--control-resolve-all-to",
+    "127.0.0.1",
+    "--diag-max-load-ms",
+    "15000",
+    "--out-dir",
+    "/home/ubuntu/campaign/src/fcvm/bench/chromium/results/corpus-s4/reqbench/scale-20261115-052527-3901452"
+  ],
+  "created_at": "2026-11-15T05:30:14.613507+00:00",
+  "diag_max_load_ms": 15000,
+  "fault_trace": {
+    "bpftrace_version": null,
+    "enabled": false,
+    "max_median_delta_pct": null,
+    "scope": "Firecracker process endpoint-ready through artifact return; all VMAs, not guest-RAM-filtered and not UFFD events"
+  },
+  "fcvm_path": "/home/ubuntu/campaign/src/fcvm/bench/chromium/results/corpus-s4/reqbench/runtime/849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f/fcvm",
+  "fcvm_sha256": "bc0dc91a1772a55cb53c293e7574708d58ce632534943ca1750338cebfa2ba16",
+  "fcvm_version": "fcvm 0.1.0",
+  "golden_creator": {
+    "creator_fcvm_sha256": "bc0dc91a1772a55cb53c293e7574708d58ce632534943ca1750338cebfa2ba16",
+    "creator_runtime_bundle_sha256": "849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f",
+    "source_revision": "f3324aa09a91a27dc45da73cb39d8a4d61637d25"
+  },
+  "harness_sha256": "2962ce90628628a6b9c26d61519e54b706ea047857bacdb8fca93311770dca2b",
+  "host": {
+    "cpu_count": 192,
+    "cpu_model": "Neoverse-V2",
+    "host_boot_sha256": "235fd7cd427e0f2c9472091e6cb59969ded1e1e29b07971948a6c5c6aded42ff",
+    "instance_type": "c8g.metal-48xl",
+    "kernel": "7.0.0-1013-aws",
+    "machine": "aarch64",
+    "python": "3.12.3",
+    "quiet_gate": {
+      "loadavg1": 0.53,
+      "loadavg1_limit": 2.0,
+      "vm_process_count": 0,
+      "vm_processes": []
+    }
+  },
+  "host_control": {
+    "chromium_path": "/home/ubuntu/control-chromium/chrome-linux/chrome",
+    "chromium_sha256": "f48b8e30d70593004542b4d5c16a8f2f8ec5d540111670ecc5f4715df8210eaa",
+    "chromium_version": "Chromium 151.0.7922.34",
+    "interval_seconds": 10.0,
+    "resolve_all_to": "127.0.0.1",
+    "timeout_seconds": 8.0,
+    "url": "https://example.com/"
+  },
+  "run_id": "c0480d0a5ab54eaa9e9429bce6b558da",
+  "runtime_bundle_sha256": "849831f527f69bb37a0877c58bf6a9fd7563c23a0dbeafab4d2b5d671d2b563f",
+  "schedule_sha256": "feaf5540665737ac0ea857629dc0ab2725698a34e19cc02d1b693f6c23abbaba",
+  "schema": "fcvm.chromium.reqscale.provenance.v2",
+  "snapshot": {
+    "config_sha256": "02f609c11f35b125252b30c2e617e15122d50e9484299bb1ecb2e9912a59e248",
+    "created_at": "2026-11-15T05:25:33.128903867Z",
+    "files": {
+      "config": {
+        "inode": 259,
+        "mtime_ns": 1794720333924094374,
+        "path": "config.json",
+        "size": 2485
+      },
+      "disk_path": {
+        "inode": 257,
+        "mtime_ns": 1794720333923094371,
+        "path": "disk/disk.raw",
+        "size": 12804202496
+      },
+      "memory_path": {
+        "inode": 257,
+        "mtime_ns": 1794720333673093642,
+        "path": "memory.bin",
+        "size": 1073741824
+      },
+      "vmstate_path": {
+        "inode": 258,
+        "mtime_ns": 1794720333161092150,
+        "path": "vmstate.bin",
+        "size": 20439
+      }
+    },
+    "generation_id": "98afd108-2484-4337-9fa4-dbe5de2cdcdd",
+    "shape": {
+      "image": "localhost/chromium-bench-req",
+      "memory_mib": 1024,
+      "network_mode": "rootless",
+      "port_mappings": [
+        {
+          "guest_port": 9222,
+          "host_ip": null,
+          "host_port": 9222,
+          "proto": "tcp"
+        }
+      ],
+      "vcpu": 4
+    },
+    "tag": "cb-s4",
+    "vm_id": "vm-3ff29bbbe9cd41b8bdaac8b07dae43cb"
+  },
+  "snapshot_generation_lease": {
+    "held_from_identity_read_through_terminal_verification": true,
+    "mode": "shared",
+    "path": "/mnt/fcvm-btrfs/snapshots/cb-s4.lock"
+  },
+  "source_dirty": false,
+  "source_revision": "f3324aa09a91a27dc45da73cb39d8a4d61637d25",
+  "source_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

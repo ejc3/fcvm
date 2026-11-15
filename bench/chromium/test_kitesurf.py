@@ -644,3 +644,26 @@ class Wiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KitesurfRunNamesItsBoot(unittest.TestCase):
+    """kitesurf.sh's run.json names the host boot the phase ran in.
+
+    Campaign f3324aa0's Kitesurf record named the commit and the kernel but
+    not the boot, so the one-campaign lint could not tie it to a host the way
+    it ties every serial, memory and scale record. Red before the field:
+    host_boot_sha256 absent from the run.json writer."""
+
+    def test_the_run_json_writer_records_reqbench_boot_identity(self):
+        import re
+        import reqbench
+        source = open(os.path.join(HERE, "kitesurf.sh")).read()
+        block = source[source.index('python3 - "$RESULTS/run.json"'):]
+        block = block[:block.index("\nPY\n")]
+        self.assertIn('"host_boot_sha256": hashlib.sha256(', block)
+        expr = re.search(r'b"fcvm-bench-boot\\0" \+ (open\("/proc/sys/kernel/random/boot_id"\)\.read\(\)\.strip\(\))', block)
+        self.assertIsNotNone(expr, "the boot identity is not reqbench's formula over the boot id")
+        boot_id = "0f0e0d0c-0b0a-0908-0706-050403020100"
+        import hashlib
+        self.assertEqual(hashlib.sha256(b"fcvm-bench-boot\0" + boot_id.encode()).hexdigest(),
+                         reqbench.host_boot_sha256(boot_id))

@@ -1,0 +1,16 @@
+2026-11-15T03:38:59.648709Z  WARN uffd: recorded working set covers more than half the guest, which looks like a lifetime footprint rather than a restore working set (issue #858); replay will populate all of it. To re-record: stop the serve process, delete the sidecar, then restart the serve. Deleting it while a serve is running does not repair that server; the loaded hint stays in its in-memory union and the persistence worker can write the sidecar again. path=/mnt/fcvm-btrfs/snapshots/cb-r3-c4/memory.bin.working-set hint_mib=620 guest_mib=1024
+Serving snapshot: cb-r3-c4
+  Serve PID: 291025
+  Socket: /mnt/fcvm-btrfs/uffd-cb-r3-c4-291025-1910484.sock
+  UFFD mode: minor
+  Memory: 1024 MB
+  Waiting for VMs to connect...
+
+Clone VMs with: fcvm snapshot run --pid 291025
+Press Ctrl-C to stop
+
+{"prefetch":true,"serve_pid":291025,"snapshot":"cb-r3-c4","socket":"/mnt/fcvm-btrfs/uffd-cb-r3-c4-291025-1910484.sock","status":"serving","uffd_mode":"minor","working_set_bytes":650702848,"working_set_pages":158863}
+
+Shutting down memory server...
+2026-11-15T05:09:44.811021Z  WARN fcvm::commands::snapshot: failed to remove socket file /mnt/fcvm-btrfs/uffd-cb-r3-c4-291025-1910484.sock: No such file or directory (os error 2)
+Memory server stopped

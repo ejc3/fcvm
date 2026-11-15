@@ -1,0 +1,2762 @@
+[
+ {
+  "record": "results/corpusextra-f3324aa0-m2/memory",
+  "run_id": "1567fe51c3e94e2399073f7292c92e92",
+  "render_op": "screenshot",
+  "container_render": "render.py in the image: a JPEG screenshot and the DOM",
+  "page_blocks": 14,
+  "ns": [
+   2,
+   8,
+   16,
+   32,
+   48
+  ],
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
+  "uncertainty": {
+   "method": "page-block bootstrap, both sides resampled together",
+   "resamples": 5000,
+   "confidence": 0.95
+  },
+  "bases": {
+   "resident": "cgroup memory.current; clone side adds the memory server's cgroup",
+   "pss": "PSS over the same process sets; clone side adds the memory server's PSS"
+  },
+  "serve_mean_mib": {
+   "resident": {
+    "estimate": 877.0,
+    "ci95": [
+     872.0,
+     881.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 876.9495535714286,
+    "unrounded_ci95": [
+     872.7394642857142,
+     880.8092815290179
+    ]
+   },
+   "pss": {
+    "estimate": 68.0,
+    "ci95": [
+     64.0,
+     72.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 67.99137834821428,
+    "unrounded_ci95": [
+     64.65815359933036,
+     71.02872977120536
+    ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 838.0,
+     "ci95": [
+      832.0,
+      843.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 838.1422312594066,
+     "unrounded_ci95": [
+      832.5539216269664,
+      842.7412183856561
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.8,
+     "ci95": [
+      1.5,
+      2.1
+     ],
+     "rounding": 0.1,
+     "unrounded": 1.8305340713217948,
+     "unrounded_ci95": [
+      1.5956718864403678,
+      2.04430705454386
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 70.0,
+     "ci95": [
+      64.0,
+      75.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 70.09430938631326,
+     "unrounded_ci95": [
+      64.63145577169729,
+      74.44283373081991
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.1,
+     "ci95": [
+      -0.3,
+      0.1
+     ],
+     "rounding": 0.1,
+     "unrounded": -0.09919486028768712,
+     "unrounded_ci95": [
+      -0.27500930125729645,
+      0.07510683138518692
+     ]
+    }
+   }
+  },
+  "resident": {
+   "2": {
+    "clone": {
+     "estimate": 640.0,
+     "ci95": [
+      590.0,
+      700.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 639.1325334821429,
+     "unrounded_ci95": [
+      595.803337751116,
+      695.9636160714285
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 279.7582310267857,
+     "unrounded_ci95": [
+      242.56843610491072,
+      328.8513985770089
+     ]
+    },
+    "delta": {
+     "estimate": 359.0,
+     "ci95": [
+      352.0,
+      369.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 359.37430245535717,
+     "unrounded_ci95": [
+      352.51205705915174,
+      368.75629185267854
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 320.0,
+     "ci95": [
+      280.0,
+      380.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 322.92138671875,
+     "unrounded_ci95": [
+      282.01560930524556,
+      375.09019949776786
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 273.49989536830356,
+     "unrounded_ci95": [
+      236.20943429129466,
+      322.60415649414057
+     ]
+    },
+    "delta": {
+     "estimate": 49.0,
+     "ci95": [
+      44.0,
+      55.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 49.421491350446445,
+     "unrounded_ci95": [
+      44.77572021484376,
+      54.19679129464289
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 270.0,
+     "ci95": [
+      220.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 272.13973563058033,
+     "unrounded_ci95": [
+      229.75119149344306,
+      327.55880693708144
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 270.170654296875,
+     "unrounded_ci95": [
+      234.90016392299108,
+      316.6008056640625
+     ]
+    },
+    "delta": {
+     "estimate": 2.0,
+     "ci95": [
+      -6.0,
+      12.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 1.9690813337053328,
+     "unrounded_ci95": [
+      -5.2326498849051415,
+      11.07973196847101
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      200.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 252.99691336495536,
+     "unrounded_ci95": [
+      202.67689187186107,
+      318.5227883475167
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      230.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 263.1263427734375,
+     "unrounded_ci95": [
+      232.05330439976282,
+      304.0276312691825
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -30.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -10.129429408482139,
+     "unrounded_ci95": [
+      -29.5445072719029,
+      17.248451886858273
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 260.0,
+     "ci95": [
+      200.0,
+      340.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 260.3163364955357,
+     "unrounded_ci95": [
+      201.2170617966425,
+      335.1206027076357
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 257.92542666480654,
+     "unrounded_ci95": [
+      226.70511140369237,
+      298.3145781017485
+     ]
+    },
+    "delta": {
+     "estimate": 0.0,
+     "ci95": [
+      -30.0,
+      40.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 2.3909098307291856,
+     "unrounded_ci95": [
+      -25.69382949102493,
+      37.04088003976006
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 240.0,
+     "ci95": [
+      180.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 242.75445244811158,
+     "unrounded_ci95": [
+      183.05172511608797,
+      318.786644367748
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 256.7121508145542,
+     "unrounded_ci95": [
+      226.45099725645682,
+      295.7988543981222
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -50.0,
+      30.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -13.957698366442628,
+     "unrounded_ci95": [
+      -43.58787282688626,
+      23.133969830240787
+     ]
+    }
+   }
+  },
+  "pss": {
+   "2": {
+    "clone": {
+     "estimate": 430.0,
+     "ci95": [
+      390.0,
+      480.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 431.5890415736607,
+     "unrounded_ci95": [
+      390.0559823172433,
+      475.0011221749442
+     ]
+    },
+    "container": {
+     "estimate": 380.0,
+     "ci95": [
+      340.0,
+      430.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 376.9396275111607,
+     "unrounded_ci95": [
+      340.58433837890624,
+      424.5263898577009
+     ]
+    },
+    "delta": {
+     "estimate": 50.0,
+     "ci95": [
+      20.0,
+      90.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 54.6494140625,
+     "unrounded_ci95": [
+      23.565904889787916,
+      86.52600010463169
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 252.80816650390625,
+     "unrounded_ci95": [
+      217.1457953316825,
+      297.7724081856864
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.4059622628348,
+     "unrounded_ci95": [
+      244.45116162981304,
+      327.69779118129185
+     ]
+    },
+    "delta": {
+     "estimate": -28.0,
+     "ci95": [
+      -36.0,
+      -20.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -27.597795758928555,
+     "unrounded_ci95": [
+      -35.95782623291017,
+      -20.396985517229364
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 210.0,
+     "ci95": [
+      170.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 214.6738019670759,
+     "unrounded_ci95": [
+      174.86269683837892,
+      265.8579646519252
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 263.0186985560826,
+     "unrounded_ci95": [
+      229.14270684378488,
+      307.1222909109933
+     ]
+    },
+    "delta": {
+     "estimate": -48.0,
+     "ci95": [
+      -56.0,
+      -40.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -48.34489658900671,
+     "unrounded_ci95": [
+      -55.304282597133096,
+      -40.763267408098486
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      150.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 199.01733180454798,
+     "unrounded_ci95": [
+      156.3814879826137,
+      253.13452622549872
+     ]
+    },
+    "container": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      290.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 248.37872532435827,
+     "unrounded_ci95": [
+      219.08603793552942,
+      286.69086946759904
+     ]
+    },
+    "delta": {
+     "estimate": -50.0,
+     "ci95": [
+      -70.0,
+      -30.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -49.36139351981029,
+     "unrounded_ci95": [
+      -62.89195224217005,
+      -32.60810105460029
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      150.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 204.5383111862909,
+     "unrounded_ci95": [
+      158.19953943888348,
+      260.64175157092865
+     ]
+    },
+    "container": {
+     "estimate": 240.0,
+     "ci95": [
+      210.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 240.1710176013765,
+     "unrounded_ci95": [
+      211.46158708844868,
+      277.12169596354164
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -35.63270641508558,
+     "unrounded_ci95": [
+      -53.20716265723818,
+      -15.428549521310002
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 190.0,
+     "ci95": [
+      140.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 192.7449113601898,
+     "unrounded_ci95": [
+      145.6806083468168,
+      250.12711689505556
+     ]
+    },
+    "container": {
+     "estimate": 230.0,
+     "ci95": [
+      200.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 234.07401586222872,
+     "unrounded_ci95": [
+      206.30170786466888,
+      269.7346235762502
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -70.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -41.329104502038916,
+     "unrounded_ci95": [
+      -60.647559740766006,
+      -18.80173682260305
+     ]
+    }
+   }
+  },
+  "clone_page_cache_mib_per_clone": {
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
+   "2": {
+    "estimate": 10.0,
+    "ci95": [
+     0.0,
+     30.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 14.617047991071429,
+    "unrounded_ci95": [
+     8.705210658482143,
+     25.137196568080356
+    ]
+   },
+   "8": {
+    "estimate": 11.0,
+    "ci95": [
+     9.0,
+     13.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 10.949811662946429,
+    "unrounded_ci95": [
+     9.551810128348215,
+     12.872256905691964
+    ]
+   },
+   "16": {
+    "estimate": 13.0,
+    "ci95": [
+     10.0,
+     16.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 12.723249162946429,
+    "unrounded_ci95": [
+     10.795565795898437,
+     15.543520682198658
+    ]
+   },
+   "32": {
+    "estimate": 20.0,
+    "ci95": [
+     10.0,
+     40.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 19.510916573660715,
+    "unrounded_ci95": [
+     12.159712437220982,
+     31.894260079520087
+    ]
+   },
+   "48": {
+    "estimate": 30.0,
+    "ci95": [
+     10.0,
+     50.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 26.72561500186012,
+    "unrounded_ci95": [
+     14.148040044875373,
+     44.837839471726184
+    ]
+   }
+  },
+  "break_even_n": {
+   "resident": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 3971,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   },
+   "pss": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4997,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   }
+  }
+ },
+ {
+  "record": "results/corpusextra-f3324aa0-m4/memory",
+  "run_id": "70ba57a7027b4bd085bab6ea0711bd34",
+  "render_op": "screenshot",
+  "container_render": "render.py in the image: a JPEG screenshot and the DOM",
+  "page_blocks": 14,
+  "ns": [
+   2,
+   8,
+   16,
+   32,
+   48
+  ],
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
+  "uncertainty": {
+   "method": "page-block bootstrap, both sides resampled together",
+   "resamples": 5000,
+   "confidence": 0.95
+  },
+  "bases": {
+   "resident": "cgroup memory.current; clone side adds the memory server's cgroup",
+   "pss": "PSS over the same process sets; clone side adds the memory server's PSS"
+  },
+  "serve_mean_mib": {
+   "resident": {
+    "estimate": 895.0,
+    "ci95": [
+     891.0,
+     900.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 895.3354352678572,
+    "unrounded_ci95": [
+     891.4220075334822,
+     899.0803669084821
+    ]
+   },
+   "pss": {
+    "estimate": 67.0,
+    "ci95": [
+     63.0,
+     70.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 66.72169363839286,
+    "unrounded_ci95": [
+     63.60186383928572,
+     69.6444287109375
+    ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 856.0,
+     "ci95": [
+      850.0,
+      861.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 855.736536752817,
+     "unrounded_ci95": [
+      850.8293106153584,
+      860.0665592569736
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.9,
+     "ci95": [
+      1.6,
+      2.1
+     ],
+     "rounding": 0.1,
+     "unrounded": 1.8678725714641637,
+     "unrounded_ci95": [
+      1.6487687284380845,
+      2.066235381355124
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 68.0,
+     "ci95": [
+      63.0,
+      73.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 68.31574668102222,
+     "unrounded_ci95": [
+      63.49286320168383,
+      72.35130934015454
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.1,
+     "ci95": [
+      -0.3,
+      0.1
+     ],
+     "rounding": 0.1,
+     "unrounded": -0.07519118125610154,
+     "unrounded_ci95": [
+      -0.2370139904376004,
+      0.08010800700214042
+     ]
+    }
+   }
+  },
+  "resident": {
+   "2": {
+    "clone": {
+     "estimate": 650.0,
+     "ci95": [
+      600.0,
+      710.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 652.0943080357143,
+     "unrounded_ci95": [
+      609.6765555245536,
+      708.0042898995536
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 278.86439732142856,
+     "unrounded_ci95": [
+      241.14644949776786,
+      328.645849609375
+     ]
+    },
+    "delta": {
+     "estimate": 373.0,
+     "ci95": [
+      367.0,
+      381.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 373.2299107142858,
+     "unrounded_ci95": [
+      367.2134451729911,
+      380.56414969308037
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 330.0,
+     "ci95": [
+      280.0,
+      380.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 325.0724400111607,
+     "unrounded_ci95": [
+      285.7114449637276,
+      375.4340602329799
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 273.617919921875,
+     "unrounded_ci95": [
+      236.041064453125,
+      323.4092354910714
+     ]
+    },
+    "delta": {
+     "estimate": 51.0,
+     "ci95": [
+      47.0,
+      56.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 51.45452008928572,
+     "unrounded_ci95": [
+      47.239998081752205,
+      55.72227957589287
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 280.0,
+     "ci95": [
+      230.0,
+      340.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 276.3670654296875,
+     "unrounded_ci95": [
+      233.3366228376116,
+      333.27894941057474
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 269.76674107142856,
+     "unrounded_ci95": [
+      234.47438049316406,
+      316.36811087472097
+     ]
+    },
+    "delta": {
+     "estimate": 10.0,
+     "ci95": [
+      -10.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 6.600324358258945,
+     "unrounded_ci95": [
+      -1.4644727434430882,
+      16.766732352120496
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      200.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 253.24931989397322,
+     "unrounded_ci95": [
+      208.03608790806362,
+      310.9066765921456
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      230.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 262.8464093889509,
+     "unrounded_ci95": [
+      231.99061955043248,
+      303.65352238246373
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -30.0,
+      10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -9.597089494977695,
+     "unrounded_ci95": [
+      -24.241821725027897,
+      7.790436444963703
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 260.0,
+     "ci95": [
+      200.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 260.8055768694196,
+     "unrounded_ci95": [
+      207.99263392857142,
+      328.3189363025482
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 257.9507533482143,
+     "unrounded_ci95": [
+      226.78258129301526,
+      298.4577991303943
+     ]
+    },
+    "delta": {
+     "estimate": 0.0,
+     "ci95": [
+      -20.0,
+      40.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 2.854823521205333,
+     "unrounded_ci95": [
+      -19.20971258254279,
+      30.256115577334466
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 240.0,
+     "ci95": [
+      180.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 242.49818344438964,
+     "unrounded_ci95": [
+      189.87254287118907,
+      309.947538376475
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 256.70595823884435,
+     "unrounded_ci95": [
+      226.56068018309034,
+      296.1553417738354
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -40.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -14.207774794454707,
+     "unrounded_ci95": [
+      -37.00775129999124,
+      14.132455244725321
+     ]
+    }
+   }
+  },
+  "pss": {
+   "2": {
+    "clone": {
+     "estimate": 430.0,
+     "ci95": [
+      380.0,
+      480.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 429.4187709263393,
+     "unrounded_ci95": [
+      387.690775844029,
+      474.95929739815847
+     ]
+    },
+    "container": {
+     "estimate": 380.0,
+     "ci95": [
+      340.0,
+      430.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 377.002197265625,
+     "unrounded_ci95": [
+      340.11868460518974,
+      425.81269618443076
+     ]
+    },
+    "delta": {
+     "estimate": 50.0,
+     "ci95": [
+      20.0,
+      90.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 52.41657366071428,
+     "unrounded_ci95": [
+      21.19082205636163,
+      85.0254717145647
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 253.88701520647322,
+     "unrounded_ci95": [
+      218.869921875,
+      297.71425127301893
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.4810267857143,
+     "unrounded_ci95": [
+      244.24584197998047,
+      328.56745016915454
+     ]
+    },
+    "delta": {
+     "estimate": -27.0,
+     "ci95": [
+      -36.0,
+      -18.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -26.594011579241055,
+     "unrounded_ci95": [
+      -35.71865125383652,
+      -18.35481894356867
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 220.0,
+     "ci95": [
+      170.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 219.29324776785714,
+     "unrounded_ci95": [
+      179.15390951974052,
+      271.379462650844
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 262.6290980747768,
+     "unrounded_ci95": [
+      228.93057741437642,
+      306.9208492824009
+     ]
+    },
+    "delta": {
+     "estimate": -43.0,
+     "ci95": [
+      -52.0,
+      -34.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -43.33585030691964,
+     "unrounded_ci95": [
+      -51.13864321027483,
+      -34.36344855172292
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      160.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 203.99290248325892,
+     "unrounded_ci95": [
+      162.34313468933107,
+      256.7048754555838
+     ]
+    },
+    "container": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      290.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 247.9075644356864,
+     "unrounded_ci95": [
+      218.92321488516671,
+      286.22132339477537
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -43.91466195242748,
+     "unrounded_ci95": [
+      -56.718804659162224,
+      -28.577674211774585
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 210.0,
+     "ci95": [
+      160.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 210.0920671735491,
+     "unrounded_ci95": [
+      166.05666038876487,
+      264.8606900169736
+     ]
+    },
+    "container": {
+     "estimate": 240.0,
+     "ci95": [
+      210.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 240.0081598191034,
+     "unrounded_ci95": [
+      211.2864012218657,
+      277.42875010172526
+     ]
+    },
+    "delta": {
+     "estimate": -30.0,
+     "ci95": [
+      -50.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -29.9160926455543,
+     "unrounded_ci95": [
+      -46.154198383149634,
+      -11.781693413144124
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      150.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 198.75927853545497,
+     "unrounded_ci95": [
+      153.89194004047664,
+      254.4280754866446
+     ]
+    },
+    "container": {
+     "estimate": 230.0,
+     "ci95": [
+      200.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 233.8246934060898,
+     "unrounded_ci95": [
+      206.13297170483247,
+      269.9946925591847
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -35.06541487063484,
+     "unrounded_ci95": [
+      -52.854434137068125,
+      -14.51366403705709
+     ]
+    }
+   }
+  },
+  "clone_page_cache_mib_per_clone": {
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
+   "2": {
+    "estimate": 14.0,
+    "ci95": [
+     7.0,
+     24.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 13.503487723214286,
+    "unrounded_ci95": [
+     7.7169189453125,
+     23.063811383928574
+    ]
+   },
+   "8": {
+    "estimate": 9.0,
+    "ci95": [
+     7.0,
+     12.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 9.084507533482142,
+    "unrounded_ci95": [
+     7.69354248046875,
+     11.033811732700894
+    ]
+   },
+   "16": {
+    "estimate": 11.0,
+    "ci95": [
+     8.0,
+     14.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 10.653267996651786,
+    "unrounded_ci95": [
+     8.7299800327846,
+     13.272562517438617
+    ]
+   },
+   "32": {
+    "estimate": 13.0,
+    "ci95": [
+     9.0,
+     18.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 13.20880126953125,
+    "unrounded_ci95": [
+     9.940023367745535,
+     17.526794869559144
+    ]
+   },
+   "48": {
+    "estimate": 20.0,
+    "ci95": [
+     10.0,
+     40.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 20.576904296875,
+    "unrounded_ci95": [
+     12.130002848307292,
+     34.16897335960751
+    ]
+   }
+  },
+  "break_even_n": {
+   "resident": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4233,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   },
+   "pss": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4997,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   }
+  }
+ },
+ {
+  "record": "results/corpusextra-f3324aa0-m8/memory",
+  "run_id": "499292390cdc43a093b866ff81515824",
+  "render_op": "screenshot",
+  "container_render": "render.py in the image: a JPEG screenshot and the DOM",
+  "page_blocks": 14,
+  "ns": [
+   2,
+   8,
+   16,
+   32,
+   48
+  ],
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
+  "uncertainty": {
+   "method": "page-block bootstrap, both sides resampled together",
+   "resamples": 5000,
+   "confidence": 0.95
+  },
+  "bases": {
+   "resident": "cgroup memory.current; clone side adds the memory server's cgroup",
+   "pss": "PSS over the same process sets; clone side adds the memory server's PSS"
+  },
+  "serve_mean_mib": {
+   "resident": {
+    "estimate": 917.0,
+    "ci95": [
+     913.0,
+     920.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 916.7311941964285,
+    "unrounded_ci95": [
+     913.5459416852678,
+     919.5601143973214
+    ]
+   },
+   "pss": {
+    "estimate": 65.0,
+    "ci95": [
+     62.0,
+     68.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 65.44663783482143,
+    "unrounded_ci95": [
+     62.82274832589285,
+     67.73641531808036
+    ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 877.0,
+     "ci95": [
+      872.0,
+      881.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 876.5286358759762,
+     "unrounded_ci95": [
+      872.0188838959981,
+      880.2927309810242
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.9,
+     "ci95": [
+      1.7,
+      2.1
+     ],
+     "rounding": 0.1,
+     "unrounded": 1.8963470905873738,
+     "unrounded_ci95": [
+      1.7083309532336832,
+      2.0694419257539205
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 67.0,
+     "ci95": [
+      62.0,
+      71.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 66.88880157222431,
+     "unrounded_ci95": [
+      62.43883530839894,
+      70.42538521565253
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.1,
+     "ci95": [
+      -0.3,
+      0.1
+     ],
+     "rounding": 0.1,
+     "unrounded": -0.06802659138692849,
+     "unrounded_ci95": [
+      -0.22105725055946573,
+      0.08013613918414923
+     ]
+    }
+   }
+  },
+  "resident": {
+   "2": {
+    "clone": {
+     "estimate": 690.0,
+     "ci95": [
+      650.0,
+      750.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 694.8678850446429,
+     "unrounded_ci95": [
+      654.1798095703124,
+      746.9240792410714
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.26395089285717,
+     "unrounded_ci95": [
+      243.34998953683038,
+      328.686083984375
+     ]
+    },
+    "delta": {
+     "estimate": 415.0,
+     "ci95": [
+      410.0,
+      420.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 414.6039341517857,
+     "unrounded_ci95": [
+      410.21618652343756,
+      419.5099748883928
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 360.0,
+     "ci95": [
+      320.0,
+      410.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 360.99961635044644,
+     "unrounded_ci95": [
+      322.4099339076451,
+      409.9007550920758
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 273.578369140625,
+     "unrounded_ci95": [
+      236.54200003487725,
+      322.2983660016741
+     ]
+    },
+    "delta": {
+     "estimate": 87.0,
+     "ci95": [
+      83.0,
+      92.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 87.42124720982144,
+     "unrounded_ci95": [
+      83.24904087611603,
+      91.79818812779018
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 310.0,
+     "ci95": [
+      270.0,
+      380.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 314.59559849330356,
+     "unrounded_ci95": [
+      270.7478781563895,
+      371.49343566894527
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 270.15462820870533,
+     "unrounded_ci95": [
+      235.19129333496093,
+      316.0824968610491
+     ]
+    },
+    "delta": {
+     "estimate": 40.0,
+     "ci95": [
+      30.0,
+      60.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 44.44097028459822,
+     "unrounded_ci95": [
+      35.45220947265623,
+      55.60281110491068
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 290.0,
+     "ci95": [
+      240.0,
+      350.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 290.7228742327009,
+     "unrounded_ci95": [
+      245.05374167306084,
+      348.0035452706473
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      230.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 262.9930855887277,
+     "unrounded_ci95": [
+      232.25659768240794,
+      303.48514971051895
+     ]
+    },
+    "delta": {
+     "estimate": 30.0,
+     "ci95": [
+      10.0,
+      50.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 27.729788643973222,
+     "unrounded_ci95": [
+      12.768946184430796,
+      45.844296046665754
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 300.0,
+     "ci95": [
+      240.0,
+      370.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 297.5987606956845,
+     "unrounded_ci95": [
+      245.83409394763765,
+      363.04270542689716
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 257.7735305059524,
+     "unrounded_ci95": [
+      227.07697419666113,
+      297.81014418829056
+     ]
+    },
+    "delta": {
+     "estimate": 40.0,
+     "ci95": [
+      10.0,
+      70.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 39.82523018973211,
+     "unrounded_ci95": [
+      18.306407383510056,
+      66.46411757696242
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 280.0,
+     "ci95": [
+      220.0,
+      350.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 279.27536377191467,
+     "unrounded_ci95": [
+      227.43482653304108,
+      345.15998530588047
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 256.52150018495263,
+     "unrounded_ci95": [
+      226.72520625831015,
+      295.32806951421645
+     ]
+    },
+    "delta": {
+     "estimate": 20.0,
+     "ci95": [
+      0.0,
+      60.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 22.75386358696204,
+     "unrounded_ci95": [
+      0.2519188833438426,
+      50.99653235105596
+     ]
+    }
+   }
+  },
+  "pss": {
+   "2": {
+    "clone": {
+     "estimate": 470.0,
+     "ci95": [
+      420.0,
+      510.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 465.47450474330356,
+     "unrounded_ci95": [
+      429.46578717912945,
+      504.4506365094866
+     ]
+    },
+    "container": {
+     "estimate": 380.0,
+     "ci95": [
+      340.0,
+      430.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 376.71791294642856,
+     "unrounded_ci95": [
+      340.6817531040736,
+      423.9417689732142
+     ]
+    },
+    "delta": {
+     "estimate": 90.0,
+     "ci95": [
+      60.0,
+      120.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 88.756591796875,
+     "unrounded_ci95": [
+      62.37268153599331,
+      116.87645874023436
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 273.3649640764509,
+     "unrounded_ci95": [
+      239.14350956508093,
+      314.71665431431364
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.337881905692,
+     "unrounded_ci95": [
+      244.69508666992186,
+      327.20767996651784
+     ]
+    },
+    "delta": {
+     "estimate": -7.0,
+     "ci95": [
+      -16.0,
+      1.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -6.972917829241055,
+     "unrounded_ci95": [
+      -15.241679600306913,
+      0.6648461478097087
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 240.0,
+     "ci95": [
+      190.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 239.33348301478796,
+     "unrounded_ci95": [
+      199.03106275285995,
+      290.38773422241206
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 262.9527587890625,
+     "unrounded_ci95": [
+      229.45353469848635,
+      306.6009801592145
+     ]
+    },
+    "delta": {
+     "estimate": -24.0,
+     "ci95": [
+      -32.0,
+      -14.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -23.61927577427454,
+     "unrounded_ci95": [
+      -31.414225115094865,
+      -14.965427725655687
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 220.0,
+     "ci95": [
+      180.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 223.10079738071985,
+     "unrounded_ci95": [
+      181.7643041883196,
+      274.69292553492954
+     ]
+    },
+    "container": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      290.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 248.15240260532923,
+     "unrounded_ci95": [
+      219.40632133483885,
+      285.91768858773366
+     ]
+    },
+    "delta": {
+     "estimate": -30.0,
+     "ci95": [
+      -40.0,
+      0.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -25.051605224609375,
+     "unrounded_ci95": [
+      -37.86770836966379,
+      -9.977016884940017
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 230.0,
+     "ci95": [
+      180.0,
+      290.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 228.4506080264137,
+     "unrounded_ci95": [
+      185.51538223993214,
+      282.04102834065753
+     ]
+    },
+    "container": {
+     "estimate": 240.0,
+     "ci95": [
+      210.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 239.9112301781064,
+     "unrounded_ci95": [
+      211.61318519228982,
+      276.52836968558177
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -30.0,
+      10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -11.46062215169269,
+     "unrounded_ci95": [
+      -27.063791983468164,
+      6.28015322004043
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 220.0,
+     "ci95": [
+      170.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 216.63467451915497,
+     "unrounded_ci95": [
+      172.71240236410827,
+      271.4654411566672
+     ]
+    },
+    "container": {
+     "estimate": 230.0,
+     "ci95": [
+      200.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 233.79552898909733,
+     "unrounded_ci95": [
+      206.48844972381443,
+      269.1873323241313
+     ]
+    },
+    "delta": {
+     "estimate": -20.0,
+     "ci95": [
+      -40.0,
+      10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -17.160854469942365,
+     "unrounded_ci95": [
+      -34.35266390104386,
+      2.910789783203425
+     ]
+    }
+   }
+  },
+  "clone_page_cache_mib_per_clone": {
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
+   "2": {
+    "estimate": 29.0,
+    "ci95": [
+     24.0,
+     37.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 29.107003348214285,
+    "unrounded_ci95": [
+     24.247855050223215,
+     36.52831333705357
+    ]
+   },
+   "8": {
+    "estimate": 26.0,
+    "ci95": [
+     24.0,
+     28.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 25.634626116071427,
+    "unrounded_ci95": [
+     24.010348946707587,
+     27.89153529575893
+    ]
+   },
+   "16": {
+    "estimate": 28.0,
+    "ci95": [
+     25.0,
+     32.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 27.803519112723215,
+    "unrounded_ci95": [
+     25.38657531738281,
+     31.071493530273436
+    ]
+   },
+   "32": {
+    "estimate": 31.0,
+    "ci95": [
+     27.0,
+     36.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 30.81170654296875,
+    "unrounded_ci95": [
+     27.252650233677453,
+     35.49706420898437
+    ]
+   },
+   "48": {
+    "estimate": 40.0,
+    "ci95": [
+     20.0,
+     60.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 37.90516299293155,
+    "unrounded_ci95": [
+     29.509471057710197,
+     51.31277654738648
+    ]
+   }
+  },
+  "break_even_n": {
+   "resident": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 120,
+    "estimate": 38.522189101029284,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   },
+   "pss": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4777,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   }
+  }
+ },
+ {
+  "record": "results/corpusextra-f3324aa0-m4h/memory",
+  "run_id": "3552a29b75af4c0798e14bbbc23b8d05",
+  "render_op": "html",
+  "container_render": "render.py in the image: a JPEG screenshot and the DOM",
+  "page_blocks": 14,
+  "ns": [
+   2,
+   8,
+   16,
+   32,
+   48
+  ],
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
+  "uncertainty": {
+   "method": "page-block bootstrap, both sides resampled together",
+   "resamples": 5000,
+   "confidence": 0.95
+  },
+  "bases": {
+   "resident": "cgroup memory.current; clone side adds the memory server's cgroup",
+   "pss": "PSS over the same process sets; clone side adds the memory server's PSS"
+  },
+  "serve_mean_mib": {
+   "resident": {
+    "estimate": 896.0,
+    "ci95": [
+     892.0,
+     900.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 896.3747209821429,
+    "unrounded_ci95": [
+     892.4934430803571,
+     899.8520354352678
+    ]
+   },
+   "pss": {
+    "estimate": 68.0,
+    "ci95": [
+     64.0,
+     71.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 67.98959263392857,
+    "unrounded_ci95": [
+     64.88740583147322,
+     70.69529506138392
+    ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 857.0,
+     "ci95": [
+      852.0,
+      862.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 857.1766583448584,
+     "unrounded_ci95": [
+      852.2437268332553,
+      861.3328633143
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.8,
+     "ci95": [
+      1.6,
+      2.1
+     ],
+     "rounding": 0.1,
+     "unrounded": 1.8489652187398307,
+     "unrounded_ci95": [
+      1.6328775094923271,
+      2.0410284755519337
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 70.0,
+     "ci95": [
+      65.0,
+      74.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 70.0633418998383,
+     "unrounded_ci95": [
+      65.18131012350194,
+      73.98932842399877
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.1,
+     "ci95": [
+      -0.3,
+      0.1
+     ],
+     "rounding": 0.1,
+     "unrounded": -0.09781836159951594,
+     "unrounded_ci95": [
+      -0.2615908681395928,
+      0.05995362490037344
+     ]
+    }
+   }
+  },
+  "resident": {
+   "2": {
+    "clone": {
+     "estimate": 650.0,
+     "ci95": [
+      600.0,
+      710.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 652.6110491071429,
+     "unrounded_ci95": [
+      609.4994140625,
+      709.5483921595982
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.0376674107143,
+     "unrounded_ci95": [
+      243.299609375,
+      329.93403320312495
+     ]
+    },
+    "delta": {
+     "estimate": 373.0,
+     "ci95": [
+      365.0,
+      382.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 372.5733816964286,
+     "unrounded_ci95": [
+      365.16830008370533,
+      381.2483677455357
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 330.0,
+     "ci95": [
+      280.0,
+      390.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 326.16378348214283,
+     "unrounded_ci95": [
+      284.76704275948657,
+      380.05943167550225
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 273.83238002232144,
+     "unrounded_ci95": [
+      236.49619227818079,
+      324.58989780970984
+     ]
+    },
+    "delta": {
+     "estimate": 52.0,
+     "ci95": [
+      45.0,
+      60.0
+     ],
+     "rounding": 1.0,
+     "unrounded": 52.33140345982139,
+     "unrounded_ci95": [
+      45.93055419921877,
+      59.34200875418529
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 280.0,
+     "ci95": [
+      230.0,
+      340.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 276.88181849888394,
+     "unrounded_ci95": [
+      232.41852373395648,
+      335.71558271135603
+     ]
+    },
+    "container": {
+     "estimate": 270.0,
+     "ci95": [
+      230.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 270.30433872767856,
+     "unrounded_ci95": [
+      234.8778503417969,
+      318.15153808593755
+     ]
+    },
+    "delta": {
+     "estimate": 10.0,
+     "ci95": [
+      -10.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 6.57747977120539,
+     "unrounded_ci95": [
+      -2.8870784214564775,
+      18.34506530761717
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      200.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 253.64753069196428,
+     "unrounded_ci95": [
+      206.6032095772879,
+      314.60134778703963
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      230.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 262.7652587890625,
+     "unrounded_ci95": [
+      231.95628509521484,
+      304.1587777273995
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -30.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -9.117728097098222,
+     "unrounded_ci95": [
+      -25.361120605468734,
+      10.873873029436348
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 260.0,
+     "ci95": [
+      200.0,
+      340.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 261.1898949032738,
+     "unrounded_ci95": [
+      207.9499231247675,
+      330.42331383114765
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 258.07217843191967,
+     "unrounded_ci95": [
+      227.28003104073662,
+      299.44063735235306
+     ]
+    },
+    "delta": {
+     "estimate": 0.0,
+     "ci95": [
+      -30.0,
+      40.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 3.1177164713541288,
+     "unrounded_ci95": [
+      -20.142751493908122,
+      32.52193371000743
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 240.0,
+     "ci95": [
+      180.0,
+      320.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 242.82142674414757,
+     "unrounded_ci95": [
+      189.51342971856377,
+      311.8987533018172
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      300.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 256.71715335368026,
+     "unrounded_ci95": [
+      226.9066567368512,
+      296.67969126578765
+     ]
+    },
+    "delta": {
+     "estimate": -10.0,
+     "ci95": [
+      -40.0,
+      20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -13.895726609532687,
+     "unrounded_ci95": [
+      -38.11915398997126,
+      16.546474581171303
+     ]
+    }
+   }
+  },
+  "pss": {
+   "2": {
+    "clone": {
+     "estimate": 440.0,
+     "ci95": [
+      390.0,
+      490.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 440.091796875,
+     "unrounded_ci95": [
+      398.65503278459823,
+      484.25678536551334
+     ]
+    },
+    "container": {
+     "estimate": 380.0,
+     "ci95": [
+      340.0,
+      430.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 376.63783482142856,
+     "unrounded_ci95": [
+      340.3654244559152,
+      425.6902866908482
+     ]
+    },
+    "delta": {
+     "estimate": 60.0,
+     "ci95": [
+      30.0,
+      100.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 63.453962053571445,
+     "unrounded_ci95": [
+      34.57596871512276,
+      93.55274658203115
+     ]
+    }
+   },
+   "8": {
+    "clone": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 253.76817103794642,
+     "unrounded_ci95": [
+      217.09036625453405,
+      300.1382570539202
+     ]
+    },
+    "container": {
+     "estimate": 280.0,
+     "ci95": [
+      240.0,
+      330.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 280.5578351702009,
+     "unrounded_ci95": [
+      244.53833683558872,
+      329.5325391496931
+     ]
+    },
+    "delta": {
+     "estimate": -27.0,
+     "ci95": [
+      -36.0,
+      -18.0
+     ],
+     "rounding": 1.0,
+     "unrounded": -26.7896641322545,
+     "unrounded_ci95": [
+      -35.11683720179968,
+      -18.223040335518977
+     ]
+    }
+   },
+   "16": {
+    "clone": {
+     "estimate": 220.0,
+     "ci95": [
+      170.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 218.7641339983259,
+     "unrounded_ci95": [
+      177.35718547276088,
+      272.5244745526994
+     ]
+    },
+    "container": {
+     "estimate": 260.0,
+     "ci95": [
+      220.0,
+      310.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 263.1219395228795,
+     "unrounded_ci95": [
+      229.2572920663016,
+      308.7367590767996
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -30.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -44.357805524553584,
+     "unrounded_ci95": [
+      -53.163535417829245,
+      -34.27437744140625
+     ]
+    }
+   },
+   "32": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      160.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 203.0077907017299,
+     "unrounded_ci95": [
+      160.18301266261508,
+      258.5270717075893
+     ]
+    },
+    "container": {
+     "estimate": 250.0,
+     "ci95": [
+      210.0,
+      290.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 247.61134120396204,
+     "unrounded_ci95": [
+      218.5794910430908,
+      286.50516232081816
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -20.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -44.60355050223214,
+     "unrounded_ci95": [
+      -58.81136812482561,
+      -27.432065854753738
+     ]
+    }
+   },
+   "48": {
+    "clone": {
+     "estimate": 210.0,
+     "ci95": [
+      160.0,
+      270.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 208.71176002139137,
+     "unrounded_ci95": [
+      164.16632882981074,
+      264.92135344005766
+     ]
+    },
+    "container": {
+     "estimate": 240.0,
+     "ci95": [
+      210.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 240.05162556966147,
+     "unrounded_ci95": [
+      211.7176506405785,
+      277.90447078886484
+     ]
+    },
+    "delta": {
+     "estimate": -30.0,
+     "ci95": [
+      -50.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -31.339865548270097,
+     "unrounded_ci95": [
+      -48.55471899850027,
+      -12.053349413190595
+     ]
+    }
+   },
+   "limit": {
+    "clone": {
+     "estimate": 200.0,
+     "ci95": [
+      150.0,
+      260.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 197.0014811701081,
+     "unrounded_ci95": [
+      151.72278584642592,
+      254.47074001968932
+     ]
+    },
+    "container": {
+     "estimate": 230.0,
+     "ci95": [
+      200.0,
+      280.0
+     ],
+     "rounding": 10.0,
+     "unrounded": 233.76661804775208,
+     "unrounded_ci95": [
+      206.36933218511896,
+      270.23379142108274
+     ]
+    },
+    "delta": {
+     "estimate": -40.0,
+     "ci95": [
+      -60.0,
+      -10.0
+     ],
+     "rounding": 10.0,
+     "unrounded": -36.76513687764398,
+     "unrounded_ci95": [
+      -55.696377261081416,
+      -15.124559740487967
+     ]
+    }
+   }
+  },
+  "clone_page_cache_mib_per_clone": {
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
+   "2": {
+    "estimate": 15.0,
+    "ci95": [
+     9.0,
+     24.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 14.851143973214286,
+    "unrounded_ci95": [
+     9.623029436383927,
+     23.64371512276786
+    ]
+   },
+   "8": {
+    "estimate": 11.0,
+    "ci95": [
+     9.0,
+     13.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 10.745361328125,
+    "unrounded_ci95": [
+     9.386968122209822,
+     12.752680315290172
+    ]
+   },
+   "16": {
+    "estimate": 13.0,
+    "ci95": [
+     10.0,
+     16.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 12.509608677455358,
+    "unrounded_ci95": [
+     10.531229073660715,
+     15.328070068359372
+    ]
+   },
+   "32": {
+    "estimate": 15.0,
+    "ci95": [
+     11.0,
+     20.0
+    ],
+    "rounding": 1.0,
+    "unrounded": 15.346627371651786,
+    "unrounded_ci95": [
+     11.959044102260044,
+     19.97365526471819
+    ]
+   },
+   "48": {
+    "estimate": 20.0,
+    "ci95": [
+     10.0,
+     40.0
+    ],
+    "rounding": 10.0,
+    "unrounded": 22.545555478050595,
+    "unrounded_ci95": [
+     14.14610857282366,
+     36.627665492466505
+    ]
+   }
+  },
+  "break_even_n": {
+   "resident": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4211,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   },
+   "pss": {
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 4997,
+    "estimate": null,
+    "ci95": null,
+    "note": "the slope gap is not positive in every resample, so no interval"
+   }
+  }
+ }
+]
