@@ -180,18 +180,26 @@ fn inherit_files(parent: &Path, child: &Path, stop: &AtomicBool) -> std::io::Res
         )
     };
     let walk = &walk;
-    let walks: Vec<std::io::Result<InheritStats>> = std::thread::scope(|scope| {
-        let others: Vec<_> = (1..workers)
-            .map(|worker| scope.spawn(move || walk(worker)))
-            .collect();
-        let mut walks = vec![walk(0)];
-        walks.extend(others.into_iter().map(|other| {
-            other
-                .join()
-                .unwrap_or_else(|_| Err(std::io::Error::other("an inheritance worker panicked")))
-        }));
-        walks
-    });
+    let walks: Vec<std::io::Result<InheritStats>> =
+        std::thread::scope(|scope| {
+            // A worker whose thread cannot start walks its windows on this thread, after its own.
+            let others: Vec<_> = (1..workers)
+                .map(|worker| {
+                    std::thread::Builder::new()
+                        .name("fcvm-cache-inherit".to_string())
+                        .spawn_scoped(scope, move || walk(worker))
+                        .map_err(|_| worker)
+                })
+                .collect();
+            let mut walks = vec![walk(0)];
+            walks.extend(others.into_iter().map(|other| match other {
+                Ok(thread) => thread.join().unwrap_or_else(|_| {
+                    Err(std::io::Error::other("an inheritance worker panicked"))
+                }),
+                Err(worker) => walk(worker),
+            }));
+            walks
+        });
     let mut total = InheritStats {
         complete: true,
         ..InheritStats::default()
@@ -304,12 +312,21 @@ fn mincore(map: &memmap2::Mmap, offset: u64, vec: &mut [u8]) -> std::io::Result<
     }
 }
 
-/// Whether `mincore` answers for `path`'s page cache: the process owns the file or may write it.
+/// Whether `mincore` answers for `path`'s page cache (`can_do_mincore`): the process owns the
+/// file, may override its owner (root), or may write it, checked with the effective ids.
 fn may_ask_residency(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let owned =
-        std::fs::metadata(path).is_ok_and(|meta| meta.uid() == nix::unistd::geteuid().as_raw());
-    owned || nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok()
+    let euid = nix::unistd::geteuid();
+    let owned = std::fs::metadata(path).is_ok_and(|meta| meta.uid() == euid.as_raw());
+    euid.is_root()
+        || owned
+        || nix::unistd::faccessat(
+            nix::fcntl::AT_FDCWD,
+            path,
+            nix::unistd::AccessFlags::W_OK,
+            nix::fcntl::AtFlags::AT_EACCESS,
+        )
+        .is_ok()
 }
 
 #[cfg(test)]
