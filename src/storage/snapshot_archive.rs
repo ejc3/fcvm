@@ -155,7 +155,11 @@ pub struct ArchiveManifest {
     /// the entry `external/<n>`.
     pub externals: Vec<ManifestExternal>,
     pub pmem_owner_uid: Option<u32>,
-    /// What a restore needs that the archive does not carry (volumes, NFS shares, firmware).
+    /// What a restore reads that the archive does not carry, as far as the snapshot's
+    /// `config.json` records a path for it: the image disk, pmem images, mapped directories,
+    /// NFS shares and firmware. A read-only `--disk` file outside the VM's directory and a
+    /// kernel profile's NVIDIA driver image are recorded only in Firecracker's VM state, so
+    /// they are not listed.
     pub not_shipped: Vec<String>,
 }
 
@@ -168,7 +172,9 @@ pub struct ManifestMemory {
     pub mtime_nsec: i64,
 }
 
-/// The Firecracker binary the snapshot was taken with.
+/// The Firecracker binary at the path the snapshot recorded, as the exporting host had it
+/// when the export ran. `version_output` and `sha256` are those of the file at export time,
+/// so a binary replaced at that path after the snapshot was taken is the one described.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestFirecracker {
@@ -562,6 +568,8 @@ pub struct ArchiveWriter<W: Write> {
     /// and read from the pax `size` record. Lower only in tests.
     header_size_limit: u64,
     buf: Vec<u8>,
+    /// The bytes of file data read so far, over every file appended.
+    data_read: u64,
     failed: bool,
 }
 
@@ -594,6 +602,7 @@ impl<W: Write> ArchiveWriter<W> {
             created,
             header_size_limit,
             buf: vec![0; CHUNK],
+            data_read: 0,
             failed: false,
         };
         let json = serde_json::to_vec_pretty(manifest).context("serializing manifest.json")?;
@@ -639,6 +648,13 @@ impl<W: Write> ArchiveWriter<W> {
             writer.externals_written += 1;
             Ok(record)
         })
+    }
+
+    /// The bytes of file data read so far, over every file appended, whether or not the
+    /// append went on to succeed. A caller that gives a file's pages back to the kernel
+    /// compares this before and after an append to learn whether the append read any.
+    pub fn data_bytes_read(&self) -> u64 {
+        self.data_read
     }
 
     /// Write the trailer and the end of the archive, flush, and give `out` back.
@@ -813,6 +829,7 @@ impl<W: Write> ArchiveWriter<W> {
                     .with_context(|| {
                         format!("reading {count} bytes of {name} at offset {offset}")
                     })?;
+                self.data_read += count as u64;
                 self.out
                     .write_all(&self.buf[..count])
                     .context("writing the archive")?;
