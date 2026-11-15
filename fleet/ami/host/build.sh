@@ -305,11 +305,21 @@ build)
   WIN_IMAGE=$(grep -E '^/mnt/fcvm-btrfs/windows/image-[0-9a-f]+$' "$L/windows-image.log" | tail -n 1)
   [ -d "$WIN_IMAGE" ] || { echo "the Windows image build named no image directory"; exit 1; }
   as_user "cd $SRC && make -C fleet/windows bridge-image TAG=fleet"
+  # windows.env says the bridge refuses /still on the public ports (ejc3/fcvm#1839) only when the
+  # tree the bridge image was built from carries both halves: the bridge's override and the
+  # server's 404 for it (CI's bridge and renderer host tests run them on every main commit the
+  # factory builds). The host bootstrap (ejc3/aws modules/fcvm-fleet-region) starts Windows on an
+  # image off its allowlist only with this line.
+  still=
+  if grep -qF 'bool allows_fleet_still() const override { return false; }' "$SRC/fleet/windows/bridge/bridge.h" &&
+    grep -qF 'if (fleet() && !p_.allows_fleet_still()) return respond(c, 404, "Not Found", "");' "$SRC/fleet/renderer/src/server.cpp"; then
+    still='WINDOWS_BRIDGE_STILL=refused\n'
+  fi
   jq -r '"windows image \(.id): installed \(.installed_at), evaluation expires \(.eval_expires)"' "$WIN_IMAGE/manifest.json"
   as_user "podman save --format oci-archive localhost/fcvm-windows-bridge:fleet -o /mnt/fcvm-btrfs/windows-bridge.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/windows-bridge.oci.tar
   rm -f /mnt/fcvm-btrfs/windows-bridge.oci.tar
-  printf 'WINDOWS_AGENT_ARGS="--windows-image %s --windows-bridge-image localhost/fcvm-windows-bridge:fleet"\n' "$WIN_IMAGE" \
+  printf 'WINDOWS_AGENT_ARGS="--windows-image %s --windows-bridge-image localhost/fcvm-windows-bridge:fleet"\n'"$still" "$WIN_IMAGE" \
     > /etc/fcvm-fleet/windows.env
   cat /etc/fcvm-fleet/windows.env
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
