@@ -20,7 +20,7 @@
 //! generation starts where the parent was, and costs the page cache no more than the parent
 //! did, which publication then removes.
 //!
-//! The reads run on a thread of their own from the moment the new memory file exists until
+//! The reads run on threads of their own from the moment the new memory file exists until
 //! just before the snapshot is published, beside the pause, the save and the resume, and the
 //! create does not wait for them: at most [`IN_FLIGHT_BYTES`] of them are outstanding, as in
 //! the serve's warm-up, so a running guest's demand faults on the same device never queue
@@ -45,6 +45,12 @@ use super::warmup::{
 
 /// How much of the parent one `mincore` call covers. 64 MiB of 4 KiB pages is a 16 KiB vector.
 const RESIDENCY_WINDOW: u64 = 64 * 1024 * 1024;
+
+/// Threads that issue the requests, each over every `WORKERS`th window. A `WILLNEED` request
+/// returns once its pages are allocated and their reads submitted, which is CPU time in the
+/// caller: on a c5d.metal (btrfs, 256 MiB cold) one thread took 130.6 ms to submit the whole
+/// file, four 56.3 ms and eight 54.4 ms. The pacer's window is shared among them.
+const WORKERS: usize = 4;
 
 /// What one inheritance did, for its log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -151,37 +157,71 @@ fn inherit_files(parent: &Path, child: &Path, stop: &AtomicBool) -> std::io::Res
     // another process truncates cannot fault through it.
     let map = unsafe { memmap2::Mmap::map(&parent) }?;
     let page = host_page_size();
-    let mut probe = Probe::new(child.clone());
-    let mut pacer = Pacer::new(IN_FLIGHT_BYTES, |request| probe.resident(request));
-    inherit(
-        len,
-        page,
-        stop,
-        |offset, vec| mincore(&map, offset, vec),
-        |request| {
-            if !pacer.wait_for_room(request, stop) {
-                return None;
-            }
-            let result = request_read(&child, request);
-            pacer.issued(request);
-            Some(result)
-        },
-    )
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(WORKERS) as u64;
+    let walk = |worker: u64| {
+        let mut probe = Probe::new(child.clone());
+        let mut pacer = Pacer::new(IN_FLIGHT_BYTES / workers, |request| probe.resident(request));
+        inherit(
+            len,
+            page,
+            (worker, workers),
+            stop,
+            |offset, vec| mincore(&map, offset, vec),
+            |request| {
+                if !pacer.wait_for_room(request, stop) {
+                    return None;
+                }
+                let result = request_read(&child, request);
+                pacer.issued(request);
+                Some(result)
+            },
+        )
+    };
+    let walk = &walk;
+    let walks: Vec<std::io::Result<InheritStats>> = std::thread::scope(|scope| {
+        let others: Vec<_> = (1..workers)
+            .map(|worker| scope.spawn(move || walk(worker)))
+            .collect();
+        let mut walks = vec![walk(0)];
+        walks.extend(others.into_iter().map(|other| {
+            other
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("an inheritance worker panicked")))
+        }));
+        walks
+    });
+    let mut total = InheritStats {
+        complete: true,
+        ..InheritStats::default()
+    };
+    for stats in walks {
+        let stats = stats?;
+        total.parent_resident_pages += stats.parent_resident_pages;
+        total.requests += stats.requests;
+        total.requested_bytes += stats.requested_bytes;
+        total.failures += stats.failures;
+        total.complete &= stats.complete;
+    }
+    Ok(total)
 }
 
 /// Walk `len` bytes of the parent in [`RESIDENCY_WINDOW`]s, ask `residency` which of its pages
 /// are cached, and hand each cached run, cut into [`REQUEST_BYTES`] pieces, to `read`. `read`
 /// returns `None` when the stop came while it waited. `stop` is read before every request.
+/// `(worker, workers)` picks this walk's windows: every `workers`th one from the `worker`th.
 fn inherit(
     len: u64,
     page: u64,
+    (worker, workers): (u64, u64),
     stop: &AtomicBool,
     mut residency: impl FnMut(u64, &mut Vec<u8>) -> std::io::Result<()>,
     mut read: impl FnMut(Request) -> Option<std::io::Result<()>>,
 ) -> std::io::Result<InheritStats> {
     let mut stats = InheritStats::default();
     let mut vec = Vec::new();
-    let mut offset = 0;
+    let mut offset = worker * RESIDENCY_WINDOW;
     while offset < len {
         let window = (len - offset).min(RESIDENCY_WINDOW);
         vec.clear();
@@ -214,7 +254,7 @@ fn inherit(
                 at += request.len;
             }
         }
-        offset += window;
+        offset += workers * RESIDENCY_WINDOW;
     }
     stats.complete = true;
     Ok(stats)
@@ -308,7 +348,7 @@ mod tests {
         };
         let stop = AtomicBool::new(false);
         let mut asked = Vec::new();
-        let stats = inherit(len, PAGE, &stop, residency, |request| {
+        let stats = inherit(len, PAGE, (0, 1), &stop, residency, |request| {
             asked.push(request);
             Some(Ok(()))
         })
@@ -334,9 +374,20 @@ mod tests {
         assert_eq!(stats.requested_bytes, 5 * REQUEST_BYTES / 2);
         assert_eq!(stats.parent_resident_pages, 5 * pages_per_request / 2);
 
+        // Two workers take alternate windows and between them ask for the same requests.
+        let mut split = Vec::new();
+        for worker in 0..2 {
+            inherit(len, PAGE, (worker, 2), &stop, residency, |request| {
+                split.push(request);
+                Some(Ok(()))
+            })
+            .unwrap();
+        }
+        assert_eq!(split, asked);
+
         stop.store(true, Ordering::Relaxed);
         let mut asked = 0;
-        let stats = inherit(len, PAGE, &stop, residency, |_| {
+        let stats = inherit(len, PAGE, (0, 1), &stop, residency, |_| {
             asked += 1;
             Some(Ok(()))
         })
