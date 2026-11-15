@@ -16,6 +16,13 @@ name: Fleet viewer-path smoke
 
 on:
   workflow_call:
+    inputs:
+      # The IPv4 viewer relaunches a tile in each wall half after its probes. The image release
+      # gate turns that off: an EC2 relaunch replaces the tile's instance, which changes the
+      # placement the gate's verdict is bound to.
+      relaunch:
+        type: boolean
+        default: true
     # Each family's summary line ({"family", "modes", "probes", "failed"}), empty when the family
     # never finished its probes. The release gate decides on these, not on the job results.
     outputs:
@@ -60,9 +67,12 @@ jobs:
           STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # Empty on the schedule and on a manual run, which relaunch.
+          RELAUNCH: ${{ inputs.relaunch }}
         run: |
           set -o pipefail
-          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family --relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+          relaunch=--relaunch; [ "$RELAUNCH" = false ] && relaunch=
+          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family $relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: The v4 summary for the release gate
         id: verdict
         if: ${{ always() }}

@@ -263,6 +263,27 @@ class GateTests(unittest.TestCase):
             self.assertIn("id: verdict", body)
             self.assertIn("if: ${{ always() }}", body)
 
+    def test_the_gates_smoke_replaces_no_tile(self):
+        # The smoke's relaunch launches a new EC2 instance for a tile and terminates the old one,
+        # after the viewer path ran. That changes the placement captured before the probes, so a
+        # smoke with relaunches could never reach a verdict. The gate's call turns them off, and
+        # only the gate's: a deploy's and the daily smoke still relaunch.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertIn("    with:\n      relaunch: false\n", smoke)
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        call = viewer.split("  workflow_call:\n", 1)[1].split("\n  schedule:", 1)[0]
+        self.assertIn("    inputs:\n", call)
+        self.assertIn("      relaunch:\n        type: boolean\n        default: true\n", call)
+        ipv4 = viewer.split("\n  ipv4:\n", 1)[1].split("\n  ipv6:\n", 1)[0]
+        ipv6 = viewer.split("\n  ipv6:\n", 1)[1].split("\n  report:\n", 1)[0]
+        self.assertIn("RELAUNCH: ${{ inputs.relaunch }}", ipv4)
+        # Unset on the schedule and on a manual run: those relaunch.
+        self.assertIn('relaunch=--relaunch; [ "$RELAUNCH" = false ] && relaunch=', ipv4)
+        self.assertNotIn(" --relaunch ", ipv4)
+        self.assertNotIn("--relaunch", ipv6)
+        for name in ("fleet-coordinator-deploy.yml", "fleet-web-deploy.yml"):
+            self.assertNotIn("relaunch: false", (ROOT / ".github/workflows" / name).read_text(), name)
+
     def test_the_smoke_call_grants_what_the_smoke_workflow_needs(self):
         # A called workflow cannot raise its caller's permissions: the smoke's report job opens an
         # issue, so the calling job grants issues: write, as the deploy workflows that call it do.

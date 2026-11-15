@@ -74,6 +74,10 @@ jobs:
       contents: read
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
+    # No relaunches: an EC2 relaunch replaces the tile's instance and so the placement the
+    # verdict is bound to. The viewer path and the take-over replace nothing.
+    with:
+      relaunch: false
     secrets: inherit
 
   decide:
