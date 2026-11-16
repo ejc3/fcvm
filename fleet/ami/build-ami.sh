@@ -135,7 +135,12 @@ cut -d= -f1 /var/lib/fleet-ami/env"
 start)
   # The phase clears its own markers too, but only once it runs; until then `wait` would
   # read the previous run's (a repeated phase, or a builder from a BASE_AMI).
-  ssm_sh "$2" "rm -f /var/lib/fleet-ami/$4.done /var/lib/fleet-ami/$4.failed; cd /opt/fleet-ami && nohup setsid bash $3 $4 > /dev/null 2>&1 < /dev/null & echo started $4"
+  # One phase at a time: the running phase holds /var/lib/fleet-ami/phase.lock (flock -o: the
+  # lock is the phase's alone, not its children's), and a start while it is held fails and
+  # touches no marker. A phase outlives the run that started it, and on 2026-11-16 a resumed
+  # build started prep again beside the first: both ran update-grub, one removed grub.cfg.new
+  # while the other installed it, grub.cfg was left empty, and the builder never booted again.
+  ssm_sh "$2" "install -d /var/lib/fleet-ami; flock -n /var/lib/fleet-ami/phase.lock true || { echo 'a phase is already running on this builder; wait for it'; exit 1; }; rm -f /var/lib/fleet-ami/$4.done /var/lib/fleet-ami/$4.failed; cd /opt/fleet-ami && nohup setsid flock -n -o /var/lib/fleet-ami/phase.lock bash $3 $4 > /dev/null 2>&1 < /dev/null & echo started $4"
   ;;
 wait)
   id=$2; ph=$3

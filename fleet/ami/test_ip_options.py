@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -167,6 +168,82 @@ else: sys.exit(91)
         for kind, value in zip(("image", "snapshot"), specifications):
             self.assertTrue(value.startswith("ResourceType=" + kind + ","))
             self.assertIn("{Key=GuardHelperSHA256,Value=" + HELPER_SHA + "}", value)
+
+    def start_command(self):
+        """The command build-ami.sh start sends to the builder, captured with an AWS executable that
+        cannot call AWS."""
+        with tempfile.TemporaryDirectory(prefix="fleet-start-test-") as temporary:
+            directory = Path(temporary)
+            log = directory / "calls.jsonl"
+            binary = directory / "bin"
+            binary.mkdir()
+            fake = binary / "aws"
+            fake.write_text('''#!/usr/bin/python3
+import json,os,sys
+args=sys.argv[1:]
+if args[:1]==['--region']: args=args[2:]
+with open(os.environ['START_TEST_LOG'],'a') as output:output.write(json.dumps(args)+'\\n')
+operation=tuple(args[:2])
+if operation==('sts','get-caller-identity'): print('111122223333')
+elif operation==('ssm','send-command'): print('cmd-test')
+elif operation==('ssm','get-command-invocation'):
+ query=args[args.index('--query')+1]
+ print('Success' if query=='Status' else 'started prep')
+else: sys.exit(91)
+''')
+            fake.chmod(0o755)
+            result = subprocess.run(["bash", str(AMI / "build-ami.sh"), "start", "i-0123456789abcdef0", "host/build.sh", "prep"],
+                                    capture_output=True, text=True, timeout=15,
+                                    env={**os.environ, "PATH": str(binary) + ":/usr/bin:/bin", "START_TEST_LOG": str(log)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            send = next(args for args in calls if args[:2] == ["ssm", "send-command"])
+            return json.loads(send[send.index("--parameters") + 1])["commands"][0]
+
+    def test_a_phase_is_never_started_while_another_runs_on_the_builder(self):
+        # 2026-11-16: a resumed drill build started prep again while the first prep, whose caller had
+        # been stopped, still ran. Both ran update-grub; one removed grub.cfg.new while the other
+        # installed it, grub.cfg was left empty, and the builder never came back from its reboot.
+        command = self.start_command()
+        with tempfile.TemporaryDirectory(prefix="fleet-builder-") as temporary:
+            root = Path(temporary)
+            state, recipe = root / "state", root / "opt"
+            (recipe / "host").mkdir(parents=True)
+            state.mkdir()
+            # A phase that runs until told to finish, then marks itself done as build.sh does.
+            (recipe / "host" / "build.sh").write_text(
+                f"while [ ! -e {root}/finish-$1 ]; do sleep 0.05; done\ntouch {state}/$1.done\n")
+            local = command.replace("/var/lib/fleet-ami", str(state)).replace("/opt/fleet-ami", str(recipe))
+            def start():
+                # As SSM does: wait for the shell, not for the background phase that inherits its output.
+                with tempfile.TemporaryFile("w+") as out:
+                    done = subprocess.run(["bash", "-c", local], stdout=out, stderr=subprocess.STDOUT, timeout=10)
+                    out.seek(0)
+                    done.stdout, done.stderr = out.read(), ""
+                    return done
+            first = start()
+            self.assertEqual(first.returncode, 0, first.stderr)
+            # A second start while it runs is refused, and leaves the running phase's state alone.
+            (state / "prep.failed").write_text("")
+            second = start()
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("already running", second.stdout + second.stderr)
+            self.assertTrue((state / "prep.failed").exists(), "a refused start cleared a marker")
+            (state / "prep.failed").unlink()
+            (root / "finish-prep").write_text("")
+            for _ in range(100):
+                if (state / "prep.done").exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue((state / "prep.done").exists())
+            # Once it has finished, the next phase starts.
+            for _ in range(100):
+                third = start()
+                if third.returncode == 0:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(third.returncode, 0, third.stderr)
+            (root / "finish-prep").write_text("")
 
     def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None, unit_change=None, consumer_change=None):
         """Execute the actual transmitted verifier; every subprocess and helper path is fake."""
