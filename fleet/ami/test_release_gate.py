@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests of fleet/ami/release_gate.py and the workflow that runs it (fleet-release-gate.yml)."""
 import hashlib
+import subprocess
+import importlib.util
 import json
 import os
 import pathlib
@@ -89,11 +91,96 @@ class GateTests(unittest.TestCase):
                 value["placement"][key] = [self.digest(i) for i in value["placement"][key]]
         return value
 
-    def decide(self, gate, before=None, v4=None, v6=None):
+    def decide(self, gate, before=None, v4=None, v6=None, agents=None):
         before = self.redacted(before if before is not None else self.status())
         argv = ["decide", "--before", json.dumps(before),
                 "--v4", self.family("v4") if v4 is None else v4, "--v6", self.family("v6") if v6 is None else v6]
+        if agents is not None:
+            argv += ["--agents", agents]
         return release_gate.main(argv, run=gate)
+
+    def agents(self, instances=None, observed_at=1_794_780_000_000, since=1_794_770_000_000):
+        """The coordinator's record of registered agents, as stage-smoke.py --agents prints it."""
+        names = self.HOSTS if instances is None else instances
+        return json.dumps({"since": since, "registered": sorted(self.digest(i) for i in names),
+                           "observed_at": observed_at})
+
+    def test_probes_that_decide_are_never_overruled_by_an_empty_agent_list(self):
+        # A coordinator restart clears its registered agents until they reconnect (Codex on
+        # #1925): an empty list next to complete, attributed probes is that, not a broken image.
+        gate = Lambda(self.status(), {"status": "verified"})
+        self.assertEqual(self.decide(gate, agents=self.agents(instances=[])), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "verify"])
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4=self.family("v4", failed=1), agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1]["evidence"]["kind"], "image_failure")
+
+    def test_release_hosts_without_an_agent_roll_back(self):
+        # A host image that boots but never starts its agent: the smoke reaches no tile, so it
+        # reports no probe summary, and the coordinator lists none of the release's hosts.
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1], {
+            "action": "rollback",
+            "receipt": {"generation": 15, "build_id": "fcvm-fleet-image-factory:example-build"},
+            "placement": "d" * 64,
+            "evidence": {"kind": "no_agent", "hosts": sorted(self.digest(h) for h in self.HOSTS),
+                         "observed_at": 1_794_780_000_000, "coordinator_since": 1_794_770_000_000}})
+        # An agent of a host outside the release does not count for it.
+        gate = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=["i-0example0other0a"])), 0)
+        self.assertEqual(gate.payloads[1]["evidence"]["kind"], "no_agent")
+
+    def test_an_agent_on_any_release_host_leaves_the_probes_to_decide(self):
+        gate = Lambda(self.status(), {"status": "verified"})
+        self.assertEqual(self.decide(gate, agents=self.agents(instances=self.HOSTS[1:])), 0)
+        self.assertEqual([p["action"] for p in gate.payloads], ["status", "verify"])
+        gate = Lambda(self.status())
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_held_still(self):
+        none = self.agents(instances=[])
+        for after in (self.status(placement={"changed_kinds": ["tile"]}), self.status(placement={"digest": "e" * 64}),
+                      self.status(placement={"settled": False}), self.status(generation=16)):
+            with self.subTest(after=after["placement"]):
+                gate = Lambda(after)
+                before = self.status(placement={"changed_kinds": after["placement"]["changed_kinds"]})
+                self.assertEqual(self.decide(gate, before=before, v4="", v6="", agents=none), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
+        good = {"since": 2, "registered": [], "observed_at": 3}
+        for raw in ("", "not json", json.dumps(dict(good, registered=["x"])), json.dumps(dict(good, since="then")),
+                    json.dumps({"registered": [], "observed_at": 3}), json.dumps(dict(good, since=0)),
+                    json.dumps(dict(good, observed_at=1)), json.dumps(dict(good, extra=1)),
+                    json.dumps({"agents": [], "observed_at": 3, "watched_ms": 120000})):
+            with self.subTest(raw=raw):
+                gate = Lambda(self.status())
+                self.assertEqual(self.decide(gate, v4="", v6="", agents=raw), 0)
+                self.assertNotIn("rollback", [p.get("action") for p in gate.payloads])
+
+    def test_the_decision_reads_the_coordinators_agents_after_the_smoke(self):
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1]
+        self.assertIn("python3 -B fleet/coord/stage-smoke.py --agents", decide)
+        # The snapshot is selected as JSON (jq), not by matching its text, and the workflow's own
+        # filter passes what stage-smoke.py --agents prints (Codex on #1925: a filter on a key the
+        # producer no longer writes passed nothing).
+        self.assertNotIn("grep", decide)
+        selector = re.search(r"\| (jq -cR '[^']+') \|", decide)
+        self.assertIsNotNone(selector, decide)
+        spec = importlib.util.spec_from_file_location("smoke", ROOT / "fleet/coord/stage-smoke.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        line = smoke.agents_line({"fleet": {"agents": {"since": 1, "hosts": [{"name": self.HOSTS[0]}]}}}, 2)
+        printed = "\n".join(["step text", json.dumps({"status": "failed"}), json.dumps(line)]) + "\n"
+        out = subprocess.run(["bash", "-c", selector.group(1)], input=printed, capture_output=True, text=True, check=True)
+        self.assertEqual(release_gate.agent_snapshot(out.stdout.strip().splitlines()[-1]), line)
+        self.assertIn('--agents "$AGENTS"', decide)
+        for secret in ("CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}",
+                       "CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}",
+                       "STAGING_API_URL: ${{ vars.STAGING_API_URL }}"):
+            self.assertIn(secret, decide)
 
     def test_a_pass_on_both_families_verifies_the_exact_receipt(self):
         gate = Lambda(self.status(), {"status": "verified", "generation": 15})

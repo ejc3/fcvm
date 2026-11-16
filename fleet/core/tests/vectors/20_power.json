@@ -430,6 +430,16 @@
     },
     "failures": [],
     "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 460000,
+            "name": "h1"
+          }
+        ],
+        "since": 0
+      },
       "ec2_instances": 0,
       "ec2_n": 0,
       "ec2_waiting": 0,

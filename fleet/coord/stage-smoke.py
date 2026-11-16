@@ -525,6 +525,19 @@ def ec2_instance(vm):
     return m.group(1) if m else None
 
 
+def agents_line(state, observed_at):
+    """What the release gate's no-agent verdict reads (fleet/ami/release_gate.py): the
+    coordinator's record of every host whose agent registered (/live fleet.agents, named by EC2
+    instance id) since `since`, its start or resume, by digest, and when it was read. No host id
+    is printed. None when the snapshot carries no record."""
+    agents = (state.get("fleet") or {}).get("agents")
+    if not isinstance(agents, dict) or type(agents.get("since")) is not int or not isinstance(agents.get("hosts"), list):
+        return None
+    names = [h["name"] for h in agents["hosts"] if isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"]]
+    return {"since": agents["since"], "registered": sorted(attribution_digest(n) for n in names),
+            "observed_at": observed_at}
+
+
 def tile_attribution(tile):
     """The (host instance ids, tile instance ids) /live reports serving a tile: a GPU host's tile,
     phone, sandbox, server or aggregate names its host; an EC2 tile names the instance it runs on
@@ -961,7 +974,7 @@ def plain(host, port):
     return socket.create_connection((host, port), timeout=20)
 
 
-def main(family="v4", single=False, modes=(), relaunch=True, takeover=False):
+def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
     if modes and host_local() is None:
@@ -1057,6 +1070,11 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False):
                 take(message)
                 if message.get("type") == "receipt" and message.get("id") == intent:
                     return message.get("outcome") == "committed"
+        if agents:
+            step("/live: registered agents")
+            until(lambda s: agents_line(s, 0) is not None)
+            print(json.dumps(agents_line(state, int(time.time() * 1000))), flush=True)
+            return 0
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
                                    lambda: (state, admission, viewer))
@@ -1168,14 +1186,18 @@ def arguments(argv):
     parser.add_argument("--modes", default="", help="comma separated, of " + ",".join(MODES))
     parser.add_argument("--relaunch", action="store_true", help="relaunch a tile per wall half")
     parser.add_argument("--takeover", action="store_true", help="borrow and drive a Minecraft server")
+    parser.add_argument("--agents", action="store_true",
+                        help="print the coordinator's record of registered agents (digests), and nothing else")
     args = parser.parse_args(argv)
     modes = tuple(m for m in args.modes.split(",") if m)
     if any(m not in MODES for m in modes):
         parser.error("unknown mode")
-    if not modes and not args.relaunch:
-        parser.error("nothing to check: give --modes or --relaunch")
+    if args.agents and (modes or args.relaunch or args.takeover):
+        parser.error("--agents reads the coordinator's agents and nothing else")
+    if not modes and not args.relaunch and not args.agents:
+        parser.error("nothing to check: give --modes, --relaunch or --agents")
     return dict(family=args.family, single=args.single_family, modes=modes,
-                relaunch=args.relaunch, takeover=args.takeover)
+                relaunch=args.relaunch, takeover=args.takeover, agents=args.agents)
 
 
 def run(argv=None):

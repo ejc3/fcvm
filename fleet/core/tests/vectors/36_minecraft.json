@@ -1636,6 +1636,21 @@
       }
     ],
     "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 48000,
+            "name": "h1"
+          },
+          {
+            "first_at": 1100,
+            "last_at": 51000,
+            "name": "h2"
+          }
+        ],
+        "since": 0
+      },
       "ec2_instances": 0,
       "ec2_n": 0,
       "ec2_waiting": 0,

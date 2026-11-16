@@ -960,6 +960,27 @@ class AttributionTests(unittest.TestCase):
         self.assertTrue(built, "ec2_aws.rs builds no Launched instance")
         self.assertTrue(all(f.startswith('format!("{region}/') for f in built), built)
 
+    def test_the_agents_line_is_the_coordinators_registration_record_by_digest(self):
+        # The release gate's no-agent verdict reads the coordinator's record of every host whose
+        # agent registered since its start or resume (/live fleet.agents, fleet-core
+        # Registrations), from a fleet-core vector's real view.
+        view = json.loads((HERE.parent / "core/tests/vectors/04_retile_join_leave.json").read_text())["final_view"]
+        record = view["fleet"]["agents"]
+        names = [h["name"] for h in record["hosts"]]
+        self.assertTrue(names)
+        line = smoke.agents_line(view, 1_794_780_000_000)
+        self.assertEqual(line, {"since": record["since"], "registered": sorted(smoke.attribution_digest(n) for n in names),
+                                "observed_at": 1_794_780_000_000})
+        for name in names:
+            self.assertNotIn(name, json.dumps(line))
+        # A host whose agent has gone is still in the record: it registered.
+        self.assertTrue(set(names) >= {h["name"] for h in view["fleet"]["hosts"]})
+        # A snapshot without the record, or with a malformed one, gives no line.
+        for state in ({}, {"fleet": {"hosts": []}}, {"fleet": {"agents": {"since": "x", "hosts": []}}},
+                      {"fleet": {"agents": {"since": 1}}}):
+            self.assertIsNone(smoke.agents_line(state, 5))
+        self.assertTrue(smoke.arguments(["--agents"])["agents"])
+
     def test_the_digest_is_the_release_gates(self):
         gate = load("release_gate", "../ami/release_gate.py")
         for instance in ("i-0example0host00a", ""):

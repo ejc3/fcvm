@@ -170,13 +170,31 @@ def unattributed(summary, placement):
     return None
 
 
-def decide(before, v4, v6, run):
+def agent_snapshot(raw):
+    """The coordinator's record of registered agents (fleet/coord/stage-smoke.py --agents):
+    {"since": ms, "registered": [digests], "observed_at": ms}, every host whose agent said hello
+    since `since` (the coordinator's start or resume), or None when there is none to read."""
+    try:
+        value = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if (isinstance(value, dict) and set(value) == {"since", "registered", "observed_at"}
+            and isinstance(value["registered"], list)
+            and all(isinstance(a, str) and DIGEST.fullmatch(a) for a in value["registered"])
+            and type(value["since"]) is int and value["since"] > 0
+            and type(value["observed_at"]) is int and value["observed_at"] >= value["since"]):
+        return value
+    return None
+
+
+def decide(before, v4, v6, run, agents=""):
     problem = placement_problem(before)
     if problem:
         return None, f"no verdict: before the probes {problem}"
     summaries = {"v4": family_summary(v4, "v4"), "v6": family_summary(v6, "v6")}
     missing = [name for name, value in summaries.items() if value is None]
-    if missing:
+    snapshot = agent_snapshot(agents)
+    if missing and snapshot is None:
         return None, (f"no verdict: {' and '.join(missing)} reported no probe summary "
                       "(setup, credentials, runner or coordinator)")
     after = redact(invoke({"action": "status"}, run))
@@ -187,10 +205,29 @@ def decide(before, v4, v6, run):
     if (receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]
             or changed != set(before["placement"]["changed_kinds"])):
         return None, "no verdict: the release or its placement changed during the probes"
+    # Probes that can be laid on the release decide. Only when they cannot (no summary, or probes
+    # /live named no release host for) does the coordinator's record of registrations: a host
+    # image that boots but never starts its agent leaves the smoke no tile to probe, and the record
+    # then holds none of the release's hosts. The gate (ejc3/aws publish.py) checks the hosts are
+    # exactly the live release hosts, launched after the record began and long enough before the
+    # read that an agent would have registered.
+    problem = (f"no verdict: {' and '.join(missing)} reported no probe summary "
+               "(setup, credentials, runner or coordinator)") if missing else None
     for name, summary in summaries.items():
-        problem = unattributed(summary, after["placement"])
-        if problem:
-            return None, f"no verdict: {name} {problem}"
+        if problem is None:
+            reason = unattributed(summary, after["placement"])
+            problem = f"no verdict: {name} {reason}" if reason else None
+    if problem is not None:
+        hosts = after["placement"]["release_hosts"]
+        if snapshot is None or set(hosts) & set(snapshot["registered"]):
+            return None, problem
+        if "host" not in changed:
+            return None, "no verdict: no release host registered an agent, but this release did not change the host image"
+        # The gate checks the coordinator's record began before every release host launched, so
+        # "not registered since `since`" covers each host's whole life.
+        return {"action": "rollback", "receipt": receipt(before), "placement": before["placement"]["digest"],
+                "evidence": {"kind": "no_agent", "hosts": sorted(hosts), "observed_at": snapshot["observed_at"],
+                             "coordinator_since": snapshot["since"]}}, None
     evidence = None
     saw_failure = False
     for family, summary in summaries.items():
@@ -225,6 +262,7 @@ def main(argv=None, run=subprocess.run):
     d.add_argument("--before", required=True)
     d.add_argument("--v4", default="")
     d.add_argument("--v6", default="")
+    d.add_argument("--agents", default="")
     args = parser.parse_args(argv)
     if args.command == "status":
         status = redact(invoke({"action": "status"}, run))
@@ -251,7 +289,7 @@ def main(argv=None, run=subprocess.run):
         before = json.loads(args.before)
     except ValueError:
         before = None
-    payload, why = decide(before, args.v4, args.v6, run)
+    payload, why = decide(before, args.v4, args.v6, run, args.agents)
     if payload is None:
         print(f"release_gate: {why}; a later run smokes the release again")
         return 0

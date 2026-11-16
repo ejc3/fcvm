@@ -367,6 +367,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
+                        state.fleet.registrations.registered(host, at);
                         let cfg = state.config.potato.clone();
                         state
                             .fleet
