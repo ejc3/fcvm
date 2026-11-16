@@ -245,6 +245,42 @@ else: sys.exit(91)
             self.assertEqual(third.returncode, 0, third.stderr)
             (root / "finish-prep").write_text("")
 
+    def test_the_phase_lock_is_held_from_the_check_to_the_phase(self):
+        # Codex on #1931: a check that releases the lock at once lets an overlapping start pass it
+        # too, before either phase holds it; one phase then exits on contention and its wait never
+        # ends. A start paused between its check and the phase's launch must still keep others out.
+        command = self.start_command()
+        with tempfile.TemporaryDirectory(prefix="fleet-builder-") as temporary:
+            root = Path(temporary)
+            state, recipe, shims = root / "state", root / "opt", root / "bin"
+            for d in ((recipe / "host"), state, shims):
+                d.mkdir(parents=True)
+            (recipe / "host" / "build.sh").write_text(
+                f"while [ ! -e {root}/finish-$1 ]; do sleep 0.05; done\ntouch {state}/$1.done\n")
+            # nohup that waits for a gate: the first start sits between its check and the launch.
+            (shims / "nohup").write_text(f"#!/bin/bash\nwhile [ ! -e {root}/gate ]; do sleep 0.05; done\nexec /usr/bin/nohup \"$@\"\n")
+            (shims / "nohup").chmod(0o755)
+            local = command.replace("/var/lib/fleet-ami", str(state)).replace("/opt/fleet-ami", str(recipe))
+            env = {**os.environ, "PATH": f"{shims}:/usr/bin:/bin"}
+            def start(phase):
+                with tempfile.TemporaryFile("w+") as out:
+                    done = subprocess.run(["bash", "-c", local.replace(" prep", " " + phase)], stdout=out,
+                                          stderr=subprocess.STDOUT, timeout=10, env=env)
+                    out.seek(0)
+                    return done.returncode, out.read()
+            first = start("prep")
+            self.assertEqual(first[0], 0, first[1])
+            second = start("build")
+            self.assertNotEqual(second[0], 0, "a start passed the check while another was launching")
+            self.assertIn("already running", second[1])
+            (root / "gate").write_text("")
+            (root / "finish-prep").write_text("")
+            for _ in range(100):
+                if (state / "prep.done").exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue((state / "prep.done").exists())
+
     def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None, unit_change=None, consumer_change=None):
         """Execute the actual transmitted verifier; every subprocess and helper path is fake."""
         source = (AMI / "build-ami.sh").read_text()
