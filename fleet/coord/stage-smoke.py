@@ -136,10 +136,16 @@ class Socket:
         if " 101 " not in lines[0] or response.get("sec-websocket-accept") != accepted:
             raise RuntimeError("WebSocket upgrade refused")
 
+    # Bytes read but not yet consumed, and the bytes the current message() call consumed: a
+    # deadline that expires mid-frame puts those back, so the next read starts at a frame header.
+    rx = b""
+    taken = ()
+
     def exact(self, count, deadline):
-        buf = b""
+        buf, self.rx = self.rx, b""
         while len(buf) < count:
             if time.monotonic() >= deadline:
+                self.rx = buf
                 raise TimeoutError("WebSocket response timeout")
             self.s.settimeout(min(20, max(0.1, deadline - time.monotonic())))
             try:
@@ -147,9 +153,12 @@ class Socket:
             except socket.timeout:
                 continue
             if not part:
+                self.rx = buf
                 raise WebSocketClosed("WebSocket closed")
             buf += part
-        return buf
+        self.rx, out = buf[count:], buf[:count]
+        self.taken = (*self.taken, out)
+        return out
 
     def send(self, payload, opcode=1):
         if isinstance(payload, dict):
@@ -160,6 +169,14 @@ class Socket:
         self.s.sendall(bytes([0x80 | opcode]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
     def message(self, deadline):
+        self.taken = ()
+        try:
+            return self._message(deadline)
+        except TimeoutError:
+            self.rx, self.taken = b"".join(self.taken) + self.rx, ()
+            raise
+
+    def _message(self, deadline):
         data, first_opcode = b"", None
         while True:
             a, b = self.exact(2, deadline)
@@ -989,14 +1006,15 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     if stage is not None:
         api, origin = stage
         step("Access check")
-        for url in (api + "/healthz", origin + "/"):
+        for role, url, path in (("api", api + "/healthz", "/healthz"), ("origin", origin + "/", "/")):
             code, response_headers, _ = get(url)
             location = urllib.parse.urlsplit(response_headers.get("Location", ""))
             if code != 302 or location.scheme != "https" or not (location.hostname or "").endswith(".cloudflareaccess.com"):
-                raise AssertionError("staging did not require Access")
+                why = "no Location" if not response_headers.get("Location") else "Location is not an Access host"
+                raise AssertionError(f"staging did not require Access: {role} {path} answered {code} ({why})")
             code, _, _ = get(url, headers)
             if code != 200:
-                raise AssertionError("authenticated staging request failed")
+                raise AssertionError(f"authenticated staging request failed: {role} {path} answered {code}")
         step("agents-only endpoint check")
         code, _, _ = get(api + "/agent", headers)
         if code not in (401, 403, 302):
@@ -1027,15 +1045,23 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 seat = message.get("seat")
             elif message.get("type") == "hello":
                 viewer = message.get("viewer")
-        def until(predicate):
+        def until(predicate, by=None):
+            """Read /live until `predicate(state)`. With `by` (a monotonic time), the wait is
+            bounded: at `by` it returns the state as it is, so the caller states its own
+            failure, even when /live has gone silent. Without it the run's deadline applies."""
             nonlocal connection, state, admission, reconnects
-            while time.monotonic() < deadline:
+            limit = deadline if by is None else min(deadline, by)
+            while time.monotonic() < limit:
                 if admission and predicate(state):
                     return state
                 try:
-                    opcode, payload = connection.message(deadline)
+                    opcode, payload = connection.message(limit)
+                except TimeoutError:
+                    if limit < deadline:
+                        break
+                    raise
                 except WebSocketClosed:
-                    if reconnects >= 3 or time.monotonic() >= deadline:
+                    if reconnects >= 3 or time.monotonic() >= limit:
                         raise
                     # A readiness wait can resume; an intent awaiting its receipt cannot.
                     connection.close()
@@ -1048,6 +1074,8 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 if opcode != 1:
                     continue
                 take(json.loads(payload))
+            if by is not None and limit < deadline:
+                return state
             raise TimeoutError("staging did not reach the required state")
         def direct():
             """The direct token, when the coordinator gates direct streams (else None)."""
@@ -1057,13 +1085,20 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             if not token:
                 raise AssertionError("the smoke connection was given no direct token")
             return token
-        def commit(name, args):
-            """Send an intent and wait for its receipt; whether it committed."""
+        def commit(name, args, by=None):
+            """Send an intent and wait for its receipt; whether it committed. With `by`, a
+            receipt that has not come by then counts as not committed."""
             intent = str(uuid.uuid4())
             connection.send({"type": "intent", "id": intent, "name": name, "args": args})
+            limit = deadline if by is None else min(deadline, by)
             # A refused intent must fail explicitly, rather than wait for an unrelated change.
             while True:
-                opcode, payload = connection.message(deadline)
+                try:
+                    opcode, payload = connection.message(limit)
+                except TimeoutError:
+                    if limit < deadline:
+                        return False
+                    raise
                 if opcode != 1:
                     continue
                 message = json.loads(payload)
@@ -1121,7 +1156,7 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
     tile and returns how many failed. `until`, `commit` and `now` are main's /live helpers."""
     step("/live: wait for every mode's tiles to run")
     settle_by = time.monotonic() + 600
-    until(lambda s: settled(s, modes, now()[2]) or time.monotonic() > settle_by)
+    until(lambda s: settled(s, modes, now()[2]), by=settle_by)
     state, admission, viewer = now()
     token = (admission.get("direct") or {}).get("value")
     catches = ((state.get("potato") or {}).get("round") or {}).get("seq")
@@ -1137,8 +1172,8 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
         def caught(s):
             watch.see(s)
             seq = ((s.get("potato") or {}).get("round") or {}).get("seq")
-            return (seq is not None and seq != catches) or time.monotonic() > watch_by
-        until(caught)
+            return seq is not None and seq != catches
+        until(caught, by=watch_by)
         potato = now()[0].get("potato") or {}
         seq = (potato.get("round") or {}).get("seq")
         probes.append(potato_probe(family, seq is not None and seq != catches,
@@ -1163,8 +1198,8 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
     try:
         held_by = time.monotonic() + 30
         def held(s):
-            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or []) or time.monotonic() > held_by
-        until(held)
+            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or [])
+        until(held, by=held_by)
         tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, viewer)), None)
         if tile is None:
             p.error = ("AssertionError", "the borrowed server never showed as this viewer's")
@@ -1173,7 +1208,10 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
         p.tile = (p.tile or "") + " take-over"
         return p
     finally:
-        commit("release_minecraft", {})
+        # Bounded, so a silent /live cannot replace the probe being returned with a TimeoutError.
+        if not commit("release_minecraft", {}, by=time.monotonic() + 30):
+            p.ok = False
+            p.error = p.error or ("AssertionError", "the borrowed server was not confirmed given back")
 
 
 

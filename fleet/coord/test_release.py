@@ -289,8 +289,15 @@ class FailureTests(unittest.TestCase):
             if (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
                     and getattr(node.exc.func, "id", None) != "SystemExit"):
                 args = node.exc.args
-                self.assertTrue(len(args) == 1 and isinstance(args[0], ast.Constant)
-                                and isinstance(args[0].value, str),
+                # An f-string may interpolate only these names: a probe's role, path, status code
+                # and reason, never a URL or a header value.
+                def literal(arg):
+                    if isinstance(arg, ast.JoinedStr):
+                        return all(isinstance(v, ast.Constant) or
+                                   (isinstance(v.value, ast.Name) and v.value.id in {"role", "path", "code", "why"})
+                                   for v in arg.values)
+                    return isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                self.assertTrue(len(args) == 1 and literal(args[0]),
                                 f"line {node.lineno}: a raise whose message is not a string literal")
 
 
@@ -901,11 +908,11 @@ class PotatoEvidenceTests(unittest.TestCase):
         ]
         clock, current = [0.0], [{"potato": snapshots[0]}]
 
-        def until(predicate):
+        def until(predicate, by=None):
             for potato in snapshots + [snapshots[-1]] * 3:
                 clock[0] += 40
                 current[0] = {"potato": potato}
-                if predicate(current[0]):
+                if predicate(current[0]) or (by is not None and clock[0] > by):
                     return current[0]
             raise AssertionError("the watch did not end")
 
@@ -925,6 +932,147 @@ class PotatoEvidenceTests(unittest.TestCase):
         self.assertGreaterEqual(seen["snapshots"], 3)
         self.assertGreaterEqual(seen["watchedSeconds"], 90)
         self.assertNotIn("2001:db8", json.dumps(line), "a drop's free text can name an address")
+
+
+class SilentLiveTests(unittest.TestCase):
+    """A /live that goes silent after readiness ends a bounded wait at its own limit."""
+
+    def test_a_silent_live_ends_the_potato_watch_in_its_own_failure_line(self):
+        clock = [100.0]
+        state = {"potato": {"capacity": 4, "round": {"seq": 7}}}
+        class Live:
+            def __init__(self, *a, **k):
+                self.queue = [{"type": "hello", "viewer": "v-1"},
+                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                              {"type": "snapshot", "state": copy.deepcopy(state)}]
+            def send(self, m): pass
+            def message(self, deadline):
+                if self.queue:
+                    clock[0] += 1
+                    return 1, json.dumps(self.queue.pop(0)).encode()
+                # Silent: like Socket.exact, nothing arrives until the caller's deadline.
+                clock[0] = max(clock[0], deadline)
+                raise TimeoutError("WebSocket response timeout")
+            def close(self): pass
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        out, start = io.StringIO(), clock[0]
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v6", modes=("potato",), relaunch=False)
+        self.assertEqual(failed, 1)
+        lines = [json.loads(l) for l in out.getvalue().splitlines()]
+        potato = next(l for l in lines if l.get("mode") == "potato")
+        self.assertEqual(potato["error"], "no verified catch while the smoke watched")
+        self.assertLess(clock[0] - start, 200, "the watch ran to the run's global deadline")
+
+
+class PartialFrameTests(unittest.TestCase):
+    def test_a_deadline_inside_a_frame_leaves_the_next_read_at_a_frame_header(self):
+        chunks = [b"\x81\x02{", None, b"}"]
+        class Transport:
+            def recv(self, count):
+                if not chunks:
+                    return b""
+                if chunks[0] is None:
+                    chunks.pop(0)
+                    raise smoke.socket.timeout()
+                chunk, chunks[0] = chunks[0][:count], chunks[0][count:]
+                if not chunks[0]:
+                    chunks.pop(0)
+                return chunk
+            def settimeout(self, timeout): pass
+        clock = [0.0]
+        connection = smoke.Socket.__new__(smoke.Socket)
+        connection.s = Transport()
+        def tick(): clock[0] += 1; return clock[0]
+        with patch.object(smoke.time, "monotonic", tick):
+            with self.assertRaises(TimeoutError):
+                connection.message(4.0)
+            self.assertEqual(connection.message(100.0), (1, b"{}"))
+
+
+class AccessCheckMessageTests(unittest.TestCase):
+    ENV = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+           "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+
+    def failure(self, get):
+        with patch.dict(os.environ, self.ENV), patch.object(smoke, "get", get), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(AssertionError) as caught:
+                smoke.main(family="v4", modes=(), relaunch=False)
+        return str(caught.exception)
+
+    def test_an_unauthenticated_failure_names_the_endpoint_and_code(self):
+        message = self.failure(lambda url, headers=None: (200, {}, b""))
+        self.assertIn("api /healthz", message)
+        self.assertIn("200", message)
+        self.assertIn("no Location", message)
+        self.assertNotIn("example.test", message)
+
+    def test_a_redirect_to_another_host_is_named_without_echoing_it(self):
+        message = self.failure(lambda url, headers=None: (302, {"Location": "https://elsewhere.test/x"}, b""))
+        self.assertIn("api /healthz", message)
+        self.assertIn("302", message)
+        self.assertIn("not an Access host", message)
+        self.assertNotIn("elsewhere", message)
+
+    def test_an_authenticated_failure_names_the_endpoint_and_code(self):
+        def get(url, headers=None):
+            if headers:
+                return (503 if url.endswith("/") and "stage" in url else 200), {}, b""
+            return 302, {"Location": "https://team.cloudflareaccess.com/login"}, b""
+        message = self.failure(get)
+        self.assertIn("origin /", message)
+        self.assertIn("503", message)
+        self.assertNotIn("example.test", message)
+
+
+class SilentReleaseTests(unittest.TestCase):
+    def test_a_silent_live_after_a_claim_still_prints_the_claim_failure_probe(self):
+        clock, sent = [100.0], []
+        tile = {"id": "t:4", "slot": "s-4", "half": "fcvm", "phase": "running",
+                "frame_url": "wss://x.tiles.fcvm.dev/frames", "frame_url_v4": None}
+        state = {"minecraft": {"tiles": [tile]}}
+        class Live:
+            def __init__(self, *a, **k):
+                self.queue = [{"type": "hello", "viewer": "v-1"},
+                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                              {"type": "snapshot", "state": copy.deepcopy(state)}]
+            def send(self, m):
+                if m.get("type") == "intent":
+                    sent.append(m["name"])
+                    if m["name"] == "claim_minecraft":
+                        self.queue.append({"type": "receipt", "id": m["id"], "outcome": "committed"})
+            def message(self, deadline):
+                if self.queue:
+                    clock[0] += 1
+                    return 1, json.dumps(self.queue.pop(0)).encode()
+                clock[0] = max(clock[0], deadline)
+                raise TimeoutError("WebSocket response timeout")
+            def close(self): pass
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        def probe(mode, half, t, family, admit, viewer, resolvers, takeover=None):
+            p = smoke.Probe(mode, t["id"], family)
+            p.ok = True
+            return p
+        out, start = io.StringIO(), clock[0]
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), patch.object(smoke, "probe_tile", probe), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v6", modes=("minecraft",), relaunch=False, takeover=True)
+        self.assertGreaterEqual(failed, 1)
+        self.assertEqual(sent, ["claim_minecraft", "release_minecraft"])
+        errors = {l.get("error") for l in map(json.loads, out.getvalue().splitlines()) if l.get("ok") is False}
+        self.assertIn("the borrowed server never showed as this viewer's", errors)
+        self.assertLess(clock[0] - start, 200, "the release ran to the run's global deadline")
 
 
 class AttributionTests(unittest.TestCase):
@@ -1041,7 +1189,7 @@ class AttributionTests(unittest.TestCase):
         clock, current = [0.0], [{"potato": {"capacity": 96, "host": "i-0example0host00b",
                                              "round": {"id": 1, "size": 2, "seq": 0}}}]
 
-        def until(predicate):
+        def until(predicate, by=None):
             # Each wait sees one more catch: the settle wait first, then the catch watch.
             clock[0] += 1
             current[0]["potato"]["round"]["seq"] += 1
