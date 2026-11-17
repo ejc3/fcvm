@@ -1031,6 +1031,50 @@ class AccessCheckMessageTests(unittest.TestCase):
         self.assertNotIn("example.test", message)
 
 
+class SilentReleaseTests(unittest.TestCase):
+    def test_a_silent_live_after_a_claim_still_prints_the_claim_failure_probe(self):
+        clock, sent = [100.0], []
+        tile = {"id": "t:4", "slot": "s-4", "half": "fcvm", "phase": "running",
+                "frame_url": "wss://x.tiles.fcvm.dev/frames", "frame_url_v4": None}
+        state = {"minecraft": {"tiles": [tile]}}
+        class Live:
+            def __init__(self, *a, **k):
+                self.queue = [{"type": "hello", "viewer": "v-1"},
+                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                              {"type": "snapshot", "state": copy.deepcopy(state)}]
+            def send(self, m):
+                if m.get("type") == "intent":
+                    sent.append(m["name"])
+                    if m["name"] == "claim_minecraft":
+                        self.queue.append({"type": "receipt", "id": m["id"], "outcome": "committed"})
+            def message(self, deadline):
+                if self.queue:
+                    clock[0] += 1
+                    return 1, json.dumps(self.queue.pop(0)).encode()
+                clock[0] = max(clock[0], deadline)
+                raise TimeoutError("WebSocket response timeout")
+            def close(self): pass
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        def probe(mode, half, t, family, admit, viewer, resolvers, takeover=None):
+            p = smoke.Probe(mode, t["id"], family)
+            p.ok = True
+            return p
+        out, start = io.StringIO(), clock[0]
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), patch.object(smoke, "probe_tile", probe), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v6", modes=("minecraft",), relaunch=False, takeover=True)
+        self.assertGreaterEqual(failed, 1)
+        self.assertEqual(sent, ["claim_minecraft", "release_minecraft"])
+        errors = {l.get("error") for l in map(json.loads, out.getvalue().splitlines()) if l.get("ok") is False}
+        self.assertIn("the borrowed server never showed as this viewer's", errors)
+        self.assertLess(clock[0] - start, 200, "the release ran to the run's global deadline")
+
+
 class AttributionTests(unittest.TestCase):
     """The release gate (fleet/ami/release_gate.py) decides only on probes whose tiles the
     coordinator said ran on the release's hosts and tile instances, so each family's summary

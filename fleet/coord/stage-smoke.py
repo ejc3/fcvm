@@ -1085,13 +1085,20 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             if not token:
                 raise AssertionError("the smoke connection was given no direct token")
             return token
-        def commit(name, args):
-            """Send an intent and wait for its receipt; whether it committed."""
+        def commit(name, args, by=None):
+            """Send an intent and wait for its receipt; whether it committed. With `by`, a
+            receipt that has not come by then counts as not committed."""
             intent = str(uuid.uuid4())
             connection.send({"type": "intent", "id": intent, "name": name, "args": args})
+            limit = deadline if by is None else min(deadline, by)
             # A refused intent must fail explicitly, rather than wait for an unrelated change.
             while True:
-                opcode, payload = connection.message(deadline)
+                try:
+                    opcode, payload = connection.message(limit)
+                except TimeoutError:
+                    if limit < deadline:
+                        return False
+                    raise
                 if opcode != 1:
                     continue
                 message = json.loads(payload)
@@ -1201,7 +1208,10 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
         p.tile = (p.tile or "") + " take-over"
         return p
     finally:
-        commit("release_minecraft", {})
+        # Bounded, so a silent /live cannot replace the probe being returned with a TimeoutError.
+        if not commit("release_minecraft", {}, by=time.monotonic() + 30):
+            p.ok = False
+            p.error = p.error or ("AssertionError", "the borrowed server was not confirmed given back")
 
 
 
