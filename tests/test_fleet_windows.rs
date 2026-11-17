@@ -432,11 +432,11 @@ impl Coord {
 }
 
 fn recent() -> (String, String) {
-    let now = chrono::Utc::now();
-    let installed = now - chrono::Duration::days(12);
+    let now = jiff::Timestamp::now();
+    let installed = now - jiff::SignedDuration::from_hours(24 * 12);
     (
-        installed.to_rfc3339(),
-        (installed + chrono::Duration::days(180)).to_rfc3339(),
+        installed.to_string(),
+        (installed + jiff::SignedDuration::from_hours(24 * 180)).to_string(),
     )
 }
 
@@ -786,11 +786,11 @@ async fn a_gold_snapshot_made_before_is_reused() {
 #[tokio::test]
 async fn an_image_170_days_old_starts_no_sandbox() {
     let f = fake(1);
-    let now = chrono::Utc::now();
-    let installed = now - chrono::Duration::days(171);
+    let now = jiff::Timestamp::now();
+    let installed = now - jiff::SignedDuration::from_hours(24 * 171);
     let img = f.image(
-        &installed.to_rfc3339(),
-        &(installed + chrono::Duration::days(180)).to_rfc3339(),
+        &installed.to_string(),
+        &(installed + jiff::SignedDuration::from_hours(24 * 180)).to_string(),
     );
     let w = f.windows(1, img.clone());
     let tag_dir = f
@@ -810,7 +810,10 @@ async fn an_image_170_days_old_starts_no_sandbox() {
     let (failed, images) = c.until(&["win-1"], "failed", 1).await;
     let e = failed["win-1"].error.clone().unwrap();
     assert!(e.contains("171 days old"), "{e}");
-    assert!(e.contains(&installed.format("%Y-%m-%d").to_string()), "{e}");
+    assert!(
+        e.contains(&installed.strftime("%Y-%m-%d").to_string()),
+        "{e}"
+    );
     assert_eq!(failed["win-1"].retry_in_ms, None);
     let image = images.last().unwrap();
     assert!(
@@ -843,11 +846,12 @@ fn with_gold(f: &Fake, w: &WindowsCfg) {
 #[tokio::test]
 async fn a_sandbox_running_when_its_image_reaches_the_cutoff_is_stopped() {
     let f = fake(1);
-    let now = chrono::Utc::now();
-    let expires = now + chrono::Duration::days(7) + chrono::Duration::seconds(4);
+    let now = jiff::Timestamp::now();
+    let expires =
+        now + jiff::SignedDuration::from_hours(24 * 7) + jiff::SignedDuration::from_secs(4);
     let img = f.image(
-        &(now - chrono::Duration::days(20)).to_rfc3339(),
-        &expires.to_rfc3339(),
+        &(now - jiff::SignedDuration::from_hours(24 * 20)).to_string(),
+        &expires.to_string(),
     );
     let w = f.windows(1, img);
     with_gold(&f, &w);
@@ -860,7 +864,7 @@ async fn a_sandbox_running_when_its_image_reaches_the_cutoff_is_stopped() {
         .expect("the sandbox is reported failed once its image is refused");
     let e = failed.error.unwrap();
     assert!(
-        e.contains(&expires.format("%Y-%m-%d").to_string()),
+        e.contains(&expires.strftime("%Y-%m-%d").to_string()),
         "names the expiry: {e}"
     );
     assert_eq!(failed.retry_in_ms, None);
@@ -986,14 +990,16 @@ enum During {
 /// back, because the action is one event among the supervisor's others.
 async fn during_a_slow_action(during: During) {
     let f = fake(1);
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let expires = match during {
-        During::Cutoff => now + chrono::Duration::days(7) + chrono::Duration::seconds(4),
-        _ => now + chrono::Duration::days(160),
+        During::Cutoff => {
+            now + jiff::SignedDuration::from_hours(24 * 7) + jiff::SignedDuration::from_secs(4)
+        }
+        _ => now + jiff::SignedDuration::from_hours(24 * 160),
     };
     let img = f.image(
-        &(now - chrono::Duration::days(20)).to_rfc3339(),
-        &expires.to_rfc3339(),
+        &(now - jiff::SignedDuration::from_hours(24 * 20)).to_string(),
+        &expires.to_string(),
     );
     let w = f.windows(1, img);
     with_gold(&f, &w);

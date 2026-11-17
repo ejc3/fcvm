@@ -1,8 +1,8 @@
-use chrono::Utc;
 use fcvm::health::spawn_health_monitor_with_state_dir;
 use fcvm::network::NetworkConfig;
 use fcvm::paths;
 use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
+use jiff::Timestamp;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::{sleep, Duration};
 
@@ -27,7 +27,7 @@ fn create_unique_test_dir() -> std::path::PathBuf {
 
 /// The state of a running VM with an HTTP health check on `health_check_url`.
 fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &str) -> VmState {
-    let now = Utc::now();
+    let now = Timestamp::now();
     VmState {
         schema_version: 1,
         vm_id: vm_id.to_string(),

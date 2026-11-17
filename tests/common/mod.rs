@@ -67,7 +67,7 @@ impl TestLogger {
         std::fs::create_dir_all(TEST_LOG_DIR).ok();
 
         // Include PID to avoid conflicts between host and container tests
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let timestamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S");
         let pid = std::process::id();
         let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
         let log_path = PathBuf::from(format!(
@@ -109,7 +109,7 @@ impl TestLogger {
         logger.log_raw(&format!(
             "=== Test: {} ===\nStarted: {}\n\n",
             test_name,
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S UTC")
         ));
 
         logger

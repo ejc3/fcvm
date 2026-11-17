@@ -585,7 +585,7 @@ fn update_record(
         ..Default::default()
     });
     change(&mut record);
-    record.updated = Some(chrono::Utc::now().to_rfc3339());
+    record.updated = Some(jiff::Timestamp::now().to_string());
     write_record(state_dir, &record)?;
     Ok(record)
 }
@@ -688,7 +688,7 @@ pub fn scrub_and_record_with(
             record.quarantined = true;
             record.last_error = Some(format!(
                 "a scrub started at {} and has not recorded its outcome",
-                chrono::Utc::now().to_rfc3339()
+                jiff::Timestamp::now()
             ));
         })
         .map(|_| ())

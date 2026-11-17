@@ -42,6 +42,11 @@ pub fn uri_encode(s: &str) -> String {
 /// Sign a request. `path` is the URL path exactly as sent (segments already encoded once);
 /// for every service but S3 the canonical path encodes each segment again. `headers` must
 /// include `host` and `x-amz-date`; names are lowercase. Returns the `Authorization` value.
+/// The `x-amz-date` value for `t`: `YYYYMMDDTHHMMSSZ`, whole seconds, UTC.
+pub fn amz_date(t: jiff::Timestamp) -> String {
+    t.strftime("%Y%m%dT%H%M%SZ").to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn authorization(
     creds: &Credentials,
@@ -97,6 +102,16 @@ pub fn authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signing date format is the one chrono's `%Y%m%dT%H%M%SZ` wrote: fractional seconds
+    /// are dropped, not rounded.
+    #[test]
+    fn amz_date_is_the_sigv4_basic_format_with_whole_seconds() {
+        let t: jiff::Timestamp = "2026-11-18T11:06:40.999999999Z".parse().unwrap();
+        assert_eq!(amz_date(t), "20261118T110640Z");
+        let t: jiff::Timestamp = "2026-01-02T03:04:05+00:00".parse().unwrap();
+        assert_eq!(amz_date(t), "20260102T030405Z");
+    }
 
     #[test]
     fn hmac_matches_rfc_4231_case_2() {

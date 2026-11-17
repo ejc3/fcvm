@@ -1555,7 +1555,7 @@ async fn scenario_body(
     if s.after == After::LateRestore {
         let guest = common::exec_in_vm(clone, &["date +%s"]).await?;
         let guest: i64 = guest.trim().parse().context("guest date")?;
-        let host = chrono::Utc::now().timestamp();
+        let host = jiff::Timestamp::now().as_second();
         ensure!(
             (guest - host).abs() <= 5,
             "the clone's clock is {}s off the host's after a late restore",
@@ -1872,7 +1872,7 @@ async fn gym_full_cross_product() -> Result<()> {
     let seed: u64 = std::env::var("FCVM_GYM_SEED")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp() as u64);
+        .unwrap_or_else(|| jiff::Timestamp::now().as_second() as u64);
     let all = cross_product();
     let mut order: Vec<usize> = (0..all.len()).filter(|i| i % shards == shard).collect();
     let mut state = seed | 1;

@@ -157,8 +157,8 @@ async fn build_snapshot_info(
     use_btrfs_shared: bool,
 ) -> SnapshotInfo {
     // Calculate age
-    let now = chrono::Utc::now();
-    let duration = now.signed_duration_since(config.created_at);
+    let now = jiff::Timestamp::now();
+    let duration = now.duration_since(config.created_at);
     let age = format_duration(duration);
 
     // Calculate size (sum of memory.bin, disk.raw, vmstate.bin)
@@ -188,7 +188,7 @@ async fn build_snapshot_info(
         name: name.to_string(),
         snapshot_type: config.snapshot_type.to_string(),
         image: config.metadata.image.clone(),
-        created_at: config.created_at.to_rfc3339(),
+        created_at: config.created_at.to_string(),
         age,
         size_bytes,
         size_human,
@@ -198,8 +198,8 @@ async fn build_snapshot_info(
 }
 
 /// Format duration as human-readable age
-fn format_duration(duration: chrono::Duration) -> String {
-    let seconds = duration.num_seconds();
+fn format_duration(duration: jiff::SignedDuration) -> String {
+    let seconds = duration.as_secs();
 
     // Handle negative durations (clock skew, future timestamps)
     if seconds < 0 {

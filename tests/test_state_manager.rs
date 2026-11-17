@@ -1,6 +1,6 @@
-use chrono::Utc;
 use fcvm::network::NetworkConfig;
 use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
+use jiff::Timestamp;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn test_state_persistence() {
     // Initialize state directory
     manager.init().await.unwrap();
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Create and save a VM state
     let state = VmState {
@@ -129,7 +129,7 @@ async fn test_list_vms() {
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Save multiple VMs
     for i in 1..=3 {
@@ -217,7 +217,7 @@ async fn test_load_state_by_name_duplicate_detection() {
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Save two VMs with the same name but different vm_ids and PIDs
     for (i, pid) in [(1u32, 5000u32), (2, 5001)] {
@@ -446,8 +446,8 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         lifecycle_ready: false,
         holder_pid: None,
         vsock_epoch: 0,
-        created_at: Utc::now(),
-        last_updated: Utc::now(),
+        created_at: Timestamp::now(),
+        last_updated: Timestamp::now(),
         config: VmConfig {
             image: "test:latest".to_string(),
             vcpu: 1,
@@ -851,4 +851,40 @@ async fn a_loopback_address_another_user_holds_is_not_handed_out() {
         allocated, held_ip,
         "root was handed the loopback address {held_ip} that a process of uid 65534 holds"
     );
+}
+
+/// A state file exactly as the chrono build wrote it: `created_at` with nanoseconds,
+/// `last_updated` with none.
+const CHRONO_STATE_JSON: &str = r#"{"schema_version":1,"vm_id":"v","name":null,"status":"starting","health_status":"unknown","exit_code":null,"pid":null,"pid_start_time":null,"lifecycle_ready":false,"holder_pid":null,"vsock_epoch":0,"created_at":"2026-11-18T11:06:40.123456789Z","last_updated":"2026-11-18T11:08:20Z","config":{"image":"i","vcpu":1,"memory_mib":64,"network":{"tap_device":"","guest_mac":"","guest_ip":null,"host_ip":null,"host_veth":null,"loopback_ip":null,"dns_server":null,"guest_ipv6":null,"host_ipv6":null,"guest_ipv6_local_only":false,"dns_search":null,"namespace_name":null,"http_proxy":null,"https_proxy":null},"volumes":[],"extra_disks":[],"pmem_devices":[],"nfs_shares":[],"health_check_url":null,"health_check_timeout":5,"restore_hook":null,"guest_thp":null,"guest_thp_restore":false,"snapshot_name":null,"process_type":"vm","serve_pid":null,"uffd_mode":null,"original_vsock_vm_id":null,"vsock_socket_path":null,"source_vsock_socket_path":null,"port_mappings":[],"published_guest_ports":null,"forward_localhost":[],"labels":{},"kernel_profile":null,"image_mode":null,"image_disk_path":null,"image_disk_identity":null,"hugepages":false,"portable_volumes":false,"user":null,"network_mode":"rootless","ipv6_prefix":null,"tty":false,"interactive":false,"username":null,"hypervisor":"Firecracker","firecracker_bin":null,"balloon_mib":null,"balloon_free_page_reporting":false,"gpus":[],"container_start_version":1,"guest":"linux"}}"#;
+
+#[test]
+fn state_json_written_by_the_chrono_build_loads_with_the_same_instants() {
+    let state: VmState = serde_json::from_str(CHRONO_STATE_JSON).unwrap();
+    assert_eq!(state.created_at.as_second(), 1_795_000_000);
+    assert_eq!(state.created_at.subsec_nanosecond(), 123_456_789);
+    assert_eq!(state.last_updated.as_second(), 1_795_000_100);
+    assert_eq!(state.last_updated.subsec_nanosecond(), 0);
+}
+
+#[test]
+fn state_serialization_round_trips_and_matches_what_the_chrono_build_wrote() {
+    let state: VmState = serde_json::from_str(CHRONO_STATE_JSON).unwrap();
+    let written = serde_json::to_string(&state).unwrap();
+    assert_eq!(
+        written, CHRONO_STATE_JSON,
+        "byte-identical to the chrono output"
+    );
+    let back: VmState = serde_json::from_str(&written).unwrap();
+    assert_eq!(back.created_at, state.created_at);
+    assert_eq!(back.last_updated, state.last_updated);
+}
+
+/// `fcvm ls --json` of the chrono build printed offsets as `Z`, but a hand-edited or older file
+/// may carry `+00:00`; both name the same instant.
+#[test]
+fn state_json_with_a_numeric_utc_offset_loads_with_the_same_instant() {
+    let edited = CHRONO_STATE_JSON.replace("123456789Z", "123456789+00:00");
+    let state: VmState = serde_json::from_str(&edited).unwrap();
+    assert_eq!(state.created_at.as_second(), 1_795_000_000);
+    assert_eq!(state.created_at.subsec_nanosecond(), 123_456_789);
 }

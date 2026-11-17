@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-log = "0.2"  # Bridge log crate to tracing (for fuse-backend-rs)
 libc = "0.2"
 nix = { version = "0.30", features = ["sched", "net", "fs", "dir", "user", "mount", "signal", "term", "inotify"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", features = ["serde"] }
 tempfile = "3"
 rand = "0.9"
 async-trait = "0.1"

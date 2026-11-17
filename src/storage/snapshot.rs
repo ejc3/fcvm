@@ -181,7 +181,7 @@ pub struct SnapshotConfig {
     pub memory_path: PathBuf,
     pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// Type of snapshot: User (explicit) or System (auto-generated cache)
     pub snapshot_type: SnapshotType,
     /// Full (memory+disk) vs DiskOnly (no memory image — clones cold-boot).
@@ -1151,7 +1151,7 @@ mod tests {
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
             disk_path: PathBuf::from("/path/to/disk.raw"),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             snapshot_type: SnapshotType::User,
             kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
@@ -1367,7 +1367,7 @@ mod tests {
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             snapshot_type: SnapshotType::User,
             kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
@@ -1466,7 +1466,7 @@ mod tests {
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
                 disk_path: PathBuf::from("/disk.raw"),
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
                 snapshot_type: SnapshotType::System,
                 kind: SnapshotKind::Full,
                 metadata: SnapshotMetadata {
@@ -1552,7 +1552,7 @@ mod tests {
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             snapshot_type: SnapshotType::System,
             kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {
@@ -1763,7 +1763,7 @@ mod tests {
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             snapshot_type: SnapshotType::User,
             kind: SnapshotKind::Full,
             metadata: SnapshotMetadata {

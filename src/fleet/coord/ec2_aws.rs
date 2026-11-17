@@ -201,8 +201,8 @@ pub fn parse_instances(xml: &str) -> Vec<Instance> {
                 spot_request: xml_tag(seg, "spotInstanceRequestId").filter(|r| !r.is_empty()),
                 pooled: seg.contains("<key>FleetPool</key>"),
                 launched_at: xml_tag(seg, "launchTime")
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
-                    .map(|t| t.timestamp()),
+                    .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                    .map(|t| t.as_second()),
             })
         })
         .collect()
@@ -650,7 +650,7 @@ impl AwsEc2 {
             return Ok(None);
         }
         let image = self.pool_image().await?;
-        let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+        let oldest = jiff::Timestamp::now().as_second() - POOL_MAX_AGE.as_secs() as i64;
         let (fresh, stale): (Vec<Instance>, Vec<Instance>) = pooled.into_iter().partition(|i| {
             i.image.as_deref() == Some(image.as_str()) && i.launched_at.is_some_and(|t| t >= oldest)
         });
@@ -750,7 +750,7 @@ impl AwsEc2 {
                 .await
                 .map(|v| v.iter().filter(|i| i.pooled && i.id != id).count() < self.pool_max)
                 .unwrap_or(false);
-            let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+            let oldest = jiff::Timestamp::now().as_second() - POOL_MAX_AGE.as_secs() as i64;
             let keep = region == self.pool_region()
                 && room
                 && image.is_some()

@@ -2210,7 +2210,7 @@ struct HeldVm<'a> {
     child: &'a mut tokio::process::Child,
     vm_id: String,
     /// The newest `last_updated` read from the VM's state file.
-    last_updated: chrono::DateTime<chrono::Utc>,
+    last_updated: jiff::Timestamp,
     /// How often `last_updated` has advanced during the hold.
     persisted_checks: u32,
 }
