@@ -136,10 +136,16 @@ class Socket:
         if " 101 " not in lines[0] or response.get("sec-websocket-accept") != accepted:
             raise RuntimeError("WebSocket upgrade refused")
 
+    # Bytes read but not yet consumed, and the bytes the current message() call consumed: a
+    # deadline that expires mid-frame puts those back, so the next read starts at a frame header.
+    rx = b""
+    taken = ()
+
     def exact(self, count, deadline):
-        buf = b""
+        buf, self.rx = self.rx, b""
         while len(buf) < count:
             if time.monotonic() >= deadline:
+                self.rx = buf
                 raise TimeoutError("WebSocket response timeout")
             self.s.settimeout(min(20, max(0.1, deadline - time.monotonic())))
             try:
@@ -147,9 +153,12 @@ class Socket:
             except socket.timeout:
                 continue
             if not part:
+                self.rx = buf
                 raise WebSocketClosed("WebSocket closed")
             buf += part
-        return buf
+        self.rx, out = buf[count:], buf[:count]
+        self.taken = (*self.taken, out)
+        return out
 
     def send(self, payload, opcode=1):
         if isinstance(payload, dict):
@@ -160,6 +169,14 @@ class Socket:
         self.s.sendall(bytes([0x80 | opcode]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
     def message(self, deadline):
+        self.taken = ()
+        try:
+            return self._message(deadline)
+        except TimeoutError:
+            self.rx, self.taken = b"".join(self.taken) + self.rx, ()
+            raise
+
+    def _message(self, deadline):
         data, first_opcode = b"", None
         while True:
             a, b = self.exact(2, deadline)

@@ -964,6 +964,31 @@ class SilentLiveTests(unittest.TestCase):
         self.assertLess(clock[0] - start, 200, "the watch ran to the run's global deadline")
 
 
+class PartialFrameTests(unittest.TestCase):
+    def test_a_deadline_inside_a_frame_leaves_the_next_read_at_a_frame_header(self):
+        chunks = [b"\x81\x02{", None, b"}"]
+        class Transport:
+            def recv(self, count):
+                if not chunks:
+                    return b""
+                if chunks[0] is None:
+                    chunks.pop(0)
+                    raise smoke.socket.timeout()
+                chunk, chunks[0] = chunks[0][:count], chunks[0][count:]
+                if not chunks[0]:
+                    chunks.pop(0)
+                return chunk
+            def settimeout(self, timeout): pass
+        clock = [0.0]
+        connection = smoke.Socket.__new__(smoke.Socket)
+        connection.s = Transport()
+        def tick(): clock[0] += 1; return clock[0]
+        with patch.object(smoke.time, "monotonic", tick):
+            with self.assertRaises(TimeoutError):
+                connection.message(4.0)
+            self.assertEqual(connection.message(100.0), (1, b"{}"))
+
+
 class AttributionTests(unittest.TestCase):
     """The release gate (fleet/ami/release_gate.py) decides only on probes whose tiles the
     coordinator said ran on the release's hosts and tile instances, so each family's summary
