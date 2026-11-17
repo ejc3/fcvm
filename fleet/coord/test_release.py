@@ -901,11 +901,11 @@ class PotatoEvidenceTests(unittest.TestCase):
         ]
         clock, current = [0.0], [{"potato": snapshots[0]}]
 
-        def until(predicate):
+        def until(predicate, by=None):
             for potato in snapshots + [snapshots[-1]] * 3:
                 clock[0] += 40
                 current[0] = {"potato": potato}
-                if predicate(current[0]):
+                if predicate(current[0]) or (by is not None and clock[0] > by):
                     return current[0]
             raise AssertionError("the watch did not end")
 
@@ -925,6 +925,43 @@ class PotatoEvidenceTests(unittest.TestCase):
         self.assertGreaterEqual(seen["snapshots"], 3)
         self.assertGreaterEqual(seen["watchedSeconds"], 90)
         self.assertNotIn("2001:db8", json.dumps(line), "a drop's free text can name an address")
+
+
+class SilentLiveTests(unittest.TestCase):
+    """A /live that goes silent after readiness ends a bounded wait at its own limit."""
+
+    def test_a_silent_live_ends_the_potato_watch_in_its_own_failure_line(self):
+        clock = [100.0]
+        state = {"potato": {"capacity": 4, "round": {"seq": 7}}}
+        class Live:
+            def __init__(self, *a, **k):
+                self.queue = [{"type": "hello", "viewer": "v-1"},
+                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                              {"type": "snapshot", "state": copy.deepcopy(state)}]
+            def send(self, m): pass
+            def message(self, deadline):
+                if self.queue:
+                    clock[0] += 1
+                    return 1, json.dumps(self.queue.pop(0)).encode()
+                # Silent: like Socket.exact, nothing arrives until the caller's deadline.
+                clock[0] = max(clock[0], deadline)
+                raise TimeoutError("WebSocket response timeout")
+            def close(self): pass
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        out, start = io.StringIO(), clock[0]
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v6", modes=("potato",), relaunch=False)
+        self.assertEqual(failed, 1)
+        lines = [json.loads(l) for l in out.getvalue().splitlines()]
+        potato = next(l for l in lines if l.get("mode") == "potato")
+        self.assertEqual(potato["error"], "no verified catch while the smoke watched")
+        self.assertLess(clock[0] - start, 200, "the watch ran to the run's global deadline")
 
 
 class AttributionTests(unittest.TestCase):
@@ -1041,7 +1078,7 @@ class AttributionTests(unittest.TestCase):
         clock, current = [0.0], [{"potato": {"capacity": 96, "host": "i-0example0host00b",
                                              "round": {"id": 1, "size": 2, "seq": 0}}}]
 
-        def until(predicate):
+        def until(predicate, by=None):
             # Each wait sees one more catch: the settle wait first, then the catch watch.
             clock[0] += 1
             current[0]["potato"]["round"]["seq"] += 1

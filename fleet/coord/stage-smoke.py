@@ -1027,15 +1027,23 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 seat = message.get("seat")
             elif message.get("type") == "hello":
                 viewer = message.get("viewer")
-        def until(predicate):
+        def until(predicate, by=None):
+            """Read /live until `predicate(state)`. With `by` (a monotonic time), the wait is
+            bounded: at `by` it returns the state as it is, so the caller states its own
+            failure, even when /live has gone silent. Without it the run's deadline applies."""
             nonlocal connection, state, admission, reconnects
-            while time.monotonic() < deadline:
+            limit = deadline if by is None else min(deadline, by)
+            while time.monotonic() < limit:
                 if admission and predicate(state):
                     return state
                 try:
-                    opcode, payload = connection.message(deadline)
+                    opcode, payload = connection.message(limit)
+                except TimeoutError:
+                    if limit < deadline:
+                        break
+                    raise
                 except WebSocketClosed:
-                    if reconnects >= 3 or time.monotonic() >= deadline:
+                    if reconnects >= 3 or time.monotonic() >= limit:
                         raise
                     # A readiness wait can resume; an intent awaiting its receipt cannot.
                     connection.close()
@@ -1048,6 +1056,8 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 if opcode != 1:
                     continue
                 take(json.loads(payload))
+            if by is not None and limit < deadline:
+                return state
             raise TimeoutError("staging did not reach the required state")
         def direct():
             """The direct token, when the coordinator gates direct streams (else None)."""
@@ -1121,7 +1131,7 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
     tile and returns how many failed. `until`, `commit` and `now` are main's /live helpers."""
     step("/live: wait for every mode's tiles to run")
     settle_by = time.monotonic() + 600
-    until(lambda s: settled(s, modes, now()[2]) or time.monotonic() > settle_by)
+    until(lambda s: settled(s, modes, now()[2]), by=settle_by)
     state, admission, viewer = now()
     token = (admission.get("direct") or {}).get("value")
     catches = ((state.get("potato") or {}).get("round") or {}).get("seq")
@@ -1137,8 +1147,8 @@ def viewer_path(family, modes, takeover, resolvers, until, commit, now):
         def caught(s):
             watch.see(s)
             seq = ((s.get("potato") or {}).get("round") or {}).get("seq")
-            return (seq is not None and seq != catches) or time.monotonic() > watch_by
-        until(caught)
+            return seq is not None and seq != catches
+        until(caught, by=watch_by)
         potato = now()[0].get("potato") or {}
         seq = (potato.get("round") or {}).get("seq")
         probes.append(potato_probe(family, seq is not None and seq != catches,
@@ -1163,8 +1173,8 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
     try:
         held_by = time.monotonic() + 30
         def held(s):
-            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or []) or time.monotonic() > held_by
-        until(held)
+            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or [])
+        until(held, by=held_by)
         tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, viewer)), None)
         if tile is None:
             p.error = ("AssertionError", "the borrowed server never showed as this viewer's")
