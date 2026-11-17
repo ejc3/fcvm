@@ -1403,6 +1403,44 @@ pub enum SnapshotCommands {
     /// installs becomes this host's cached disk for that image. Import only archives whose
     /// exporter you would let create snapshots on this host.
     Import(SnapshotImportArgs),
+    /// Internal: undoes what a memory snapshot create changed on its source VM if the create
+    /// stops before reopening the source (`commands::snapshot_guard`)
+    #[command(hide = true)]
+    SourceGuard(SnapshotSourceGuardArgs),
+}
+
+/// The descriptors and VM a snapshot create hands its source guard
+/// (`commands::snapshot_guard`). Only the create spawns it.
+#[derive(Args, Debug)]
+pub struct SnapshotSourceGuardArgs {
+    /// The guard's end of the create's socket pair, inherited
+    #[arg(long)]
+    pub channel_fd: i32,
+    /// A pidfd of the create process, inherited
+    #[arg(long)]
+    pub pidfd: i32,
+    /// The create's per-VM snapshot lock (the same open file description), inherited
+    #[arg(long)]
+    pub lock_fd: i32,
+    /// The source VM's id
+    #[arg(long)]
+    pub vm_id: String,
+    /// The snapshot being created, for logs
+    #[arg(long)]
+    pub snapshot: String,
+    /// The source VM's VMM
+    #[arg(long, value_enum)]
+    pub hypervisor: Hypervisor,
+    /// The VMM's API socket
+    #[arg(long)]
+    pub api_socket: std::path::PathBuf,
+    /// The guest's exec vsock socket; absent for a guest that runs no fc-agent
+    #[arg(long)]
+    pub vsock_socket: Option<std::path::PathBuf>,
+    /// How long the VMM resume may take: a create killed during the save leaves the save
+    /// running in the VMM, and the resume waits behind it
+    #[arg(long)]
+    pub resume_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]

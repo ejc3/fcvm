@@ -244,6 +244,21 @@ on the present, and the `default` profile keeps the clock running through a paus
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;
 `every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
 
+### A create that dies does not leave its source paused
+
+The create reopens its source on its own return paths, which a killed process never reaches,
+and the source's own fcvm does not know it was paused (#1936: a SIGKILLed create left the
+source paused and `fcvm ls` reporting it healthy). So every create whose source keeps running
+(`SnapshotSourceDisposition::Resume`) spawns a guard process (`src/commands/snapshot_guard.rs`)
+before the prepare. The guard inherits a pidfd of the create, its end of a socket pair, and
+the per-VM snapshot lock's open file description. If the create dies, or drops its handle,
+before saying it reopened the source, the guard resumes the VMM (if the pause was asked for)
+and runs `--resume-snapshot-network` with the host's clock, while the inherited flock keeps
+every other create of that VM waiting. `--stop` and disposable prepare sources get no guard.
+`test_lifecycle_interleave_killed_snapshot_create_resumes_its_source` (and its Cloud
+Hypervisor twin) SIGKILLs a create held at `snapshot.post_save_pre_resume`;
+`a_source_that_keeps_running_is_guarded_from_its_prepare_to_its_reopen` pins the order.
+
 ## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
 
 A fleet mode (wall, phones, Windows, Minecraft, potato) counts as working only when the

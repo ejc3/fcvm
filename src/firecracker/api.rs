@@ -34,6 +34,11 @@ impl FirecrackerClient {
         })
     }
 
+    /// The API socket this client talks to.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     /// Return a clone with a different request timeout.
     /// Use for long-running operations like snapshot create/load.
     pub fn with_timeout(&self, timeout: Duration) -> Self {
