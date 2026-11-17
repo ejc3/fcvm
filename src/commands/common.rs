@@ -6137,8 +6137,8 @@ pub async fn create_snapshot_core(
 
     // A source that keeps running gets a guard before anything changes it: a process that
     // undoes the prepare and the pause if this create stops without reopening the source,
-    // SIGKILL included (#1936, `snapshot_guard`). Spawned here so its exec overlaps the
-    // staging below; it is waited for just before the prepare.
+    // SIGKILL included (#1936, `snapshot_guard`). It holds what it needs from the fork, so
+    // nothing waits for it to start; the stand-down after the reopen checks that it did.
     let mut source_guard = match source_disposition {
         SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
             &super::snapshot_guard::GuardTarget {
@@ -6418,7 +6418,7 @@ pub async fn create_snapshot_core(
         .await
         .context("reopening guest network after Firecracker preparation failure");
         if let Some(guard) = source_guard.take() {
-            guard.disarm().await;
+            let _ = guard.disarm().await;
         }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
@@ -6462,7 +6462,7 @@ pub async fn create_snapshot_core(
                 .await
                 .context("reopening guest network after Firecracker pause failure");
         if let Some(guard) = source_guard.take() {
-            guard.disarm().await;
+            let _ = guard.disarm().await;
         }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
@@ -6669,14 +6669,17 @@ pub async fn create_snapshot_core(
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after snapshot!");
     }
-    if let Some(guard) = source_guard.take() {
-        guard.disarm().await;
-    }
+    // A create whose guard never started was not guarded, and fails.
+    let guard_result = match source_guard.take() {
+        Some(guard) => guard.disarm().await,
+        None => Ok(()),
+    };
 
     let (operation_result, extra_files_reader) = match extra_files_result {
         Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
         Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
     };
+    let operation_result = operation_result.and(guard_result);
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,
@@ -7119,7 +7122,7 @@ pub async fn create_snapshot_ch(
             .await
             .context("reopening guest network after Cloud Hypervisor preparation failure");
         if let Some(guard) = source_guard.take() {
-            guard.disarm().await;
+            let _ = guard.disarm().await;
         }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
@@ -7158,7 +7161,7 @@ pub async fn create_snapshot_ch(
             .await
             .context("reopening guest network after Cloud Hypervisor pause failure");
         if let Some(guard) = source_guard.take() {
-            guard.disarm().await;
+            let _ = guard.disarm().await;
         }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
@@ -7225,14 +7228,17 @@ pub async fn create_snapshot_ch(
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
     }
-    if let Some(guard) = source_guard.take() {
-        guard.disarm().await;
-    }
+    // A create whose guard never started was not guarded, and fails.
+    let guard_result = match source_guard.take() {
+        Some(guard) => guard.disarm().await,
+        None => Ok(()),
+    };
 
     let (operation_result, extra_files_reader) = match extra_files_result {
         Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
         Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
     };
+    let operation_result = operation_result.and(guard_result);
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,

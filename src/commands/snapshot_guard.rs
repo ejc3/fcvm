@@ -26,17 +26,19 @@
 //! signal: it has to outlive the create. It exits on [`DONE`], at once when the create
 //! changed nothing, or after the undo, whose every step has a timeout.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::cli::{Hypervisor, SnapshotSourceGuardArgs};
 
-/// Guard to create: the guard holds its descriptors and watches.
+/// Guard to create: the guard has checked its descriptors and watches.
 const READY: u8 = b'R';
+/// Guard to create, after [`DONE`]: the guard has closed its copy of the per-VM lock.
+const RELEASED: u8 = b'K';
 /// Create to guard: the guest boundary's prepare is about to run.
 pub(crate) const PREPARE: u8 = b'P';
 /// Create to guard: the VMM pause is about to be asked for.
@@ -44,13 +46,10 @@ pub(crate) const PAUSE: u8 = b'V';
 /// Create to guard: the create ran its own reopen of the source; stand down.
 const DONE: u8 = b'D';
 
-/// How long a create waits for its guard to start. It is an exec of this binary, which
-/// loads its config; a guard that is not up by then fails the create before it changes
-/// anything.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a create waits for a guard told [`DONE`] to exit before killing it.
-const STAND_DOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a create waits for a guard told [`DONE`] to answer [`RELEASED`] before killing
+/// it. The guard is an exec of this binary that loads its config before it reads anything,
+/// so a create shorter than that start waits here for it.
+const STAND_DOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the guard waits for the guest's reopen. A healthy guest answers in well under a
 /// second once its vCPUs run. An exec whose command never finishes would otherwise wait for
@@ -203,23 +202,10 @@ impl SourceGuard {
         Ok(Self { channel, child })
     }
 
-    /// Wait until the guard holds its descriptors, then tell it the prepare is next. Fails
-    /// closed: a create whose guard is not up changes nothing.
+    /// Tell the guard the prepare is next. Nothing waits for the guard to start: it holds
+    /// its descriptors from the fork, and what is written here stays in the socket for it to
+    /// read, also after this process is gone. [`SourceGuard::disarm`] checks that it started.
     pub(crate) async fn arm(&mut self) -> Result<()> {
-        let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(READY_TIMEOUT, self.channel.read_exact(&mut byte)).await;
-        match read {
-            Ok(Ok(_)) if byte[0] == READY => {}
-            Ok(Ok(_)) => bail!("the snapshot source guard sent {:?}, not ready", byte[0]),
-            Ok(Err(error)) => {
-                let status = self.child.try_wait().ok().flatten();
-                bail!("the snapshot source guard did not start (exit status {status:?}): {error}")
-            }
-            Err(_) => bail!(
-                "the snapshot source guard was not ready within {}s",
-                READY_TIMEOUT.as_secs()
-            ),
-        }
         self.mark(PREPARE)
             .await
             .context("telling the snapshot source guard the prepare is next")
@@ -234,22 +220,49 @@ impl SourceGuard {
     }
 
     /// The create has run its own reopen of the source (whatever its result): tell the
-    /// guard to stand down and wait for it to exit, so it holds the per-VM lock no longer
-    /// than the create does.
-    pub(crate) async fn disarm(mut self) {
-        if let Err(error) = self.channel.write_all(&[DONE]).await {
-            warn!(error = %error, "the snapshot source guard exited before the create finished");
-        }
-        drop(self.channel);
-        match tokio::time::timeout(STAND_DOWN_TIMEOUT, self.child.wait()).await {
-            Ok(Ok(status)) => debug!(%status, "snapshot source guard stood down"),
-            Ok(Err(error)) => warn!(error = %error, "waiting for the snapshot source guard"),
+    /// guard to stand down and wait until it has closed its copy of the per-VM lock, so it
+    /// holds the lock no longer than the create does. The guard's exit is not waited for.
+    ///
+    /// Fails closed: a guard that never reported ready (it could not start, or rejected its
+    /// descriptors) did not guard this create, and the create fails.
+    pub(crate) async fn disarm(mut self) -> Result<()> {
+        let sent = self.channel.write_all(&[DONE]).await;
+        let mut seen = Vec::new();
+        let answer = tokio::time::timeout(STAND_DOWN_TIMEOUT, async {
+            let mut byte = [0u8; 1];
+            loop {
+                match self.channel.read(&mut byte).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(_) if byte[0] == RELEASED => return true,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+        })
+        .await;
+        let ready = seen.contains(&READY);
+        match answer {
+            Ok(true) if ready => {
+                debug!("snapshot source guard stood down");
+                Ok(())
+            }
+            Ok(_) => {
+                let status = self.child.try_wait().ok().flatten();
+                let error = anyhow::anyhow!(
+                    "the snapshot source guard did not guard this create (ready: {ready}, \
+                     stand-down sent: {}, exit status {status:?})",
+                    sent.is_ok()
+                );
+                error!(error = %error, "snapshot source guard");
+                Err(error)
+            }
             Err(_) => {
-                warn!(
-                    "the snapshot source guard did not stand down within {}s; killing it",
+                let _ = self.child.kill().await;
+                let error = anyhow::anyhow!(
+                    "the snapshot source guard did not stand down within {}s; killed it",
                     STAND_DOWN_TIMEOUT.as_secs()
                 );
-                let _ = self.child.kill().await;
+                error!(error = %error, "snapshot source guard");
+                Err(error)
             }
         }
     }
@@ -303,8 +316,9 @@ pub async fn cmd_snapshot_source_guard(args: SnapshotSourceGuardArgs) -> Result<
     unsafe { libc::prctl(libc::PR_SET_NAME, c"fcvm-src-guard".as_ptr()) };
     let channel = inherited_fd(args.channel_fd, "channel", Some(libc::S_IFSOCK))?;
     let pidfd = inherited_fd(args.pidfd, "pidfd", None)?;
-    // Held, never read, until this process exits: the create's per-VM snapshot lock.
-    let _vm_lock = inherited_fd(args.lock_fd, "lock", Some(libc::S_IFREG))?;
+    // Held, never read, until the create stands this guard down or the undo is finished: the
+    // create's per-VM snapshot lock.
+    let vm_lock = inherited_fd(args.lock_fd, "lock", Some(libc::S_IFREG))?;
     // SAFETY: pidfd_send_signal(2) with signal 0 checks the descriptor is a pidfd.
     let probe = unsafe {
         libc::syscall(
@@ -324,21 +338,30 @@ pub async fn cmd_snapshot_source_guard(args: SnapshotSourceGuardArgs) -> Result<
         );
     }
     let mut channel = std::os::unix::net::UnixStream::from(channel);
+    // A create that is already gone cannot read this, and what it sent before it went is
+    // still in the socket: the watch reads it either way.
     if let Err(error) = std::io::Write::write_all(&mut channel, &[READY]) {
-        // The create is gone before it heard the guard was ready, so it changed nothing:
-        // it sends PREPARE only after reading READY.
         debug!(error = %error, "the snapshot create is gone before its guard was ready");
-        return Ok(());
     }
     channel
         .set_nonblocking(true)
         .context("setting the channel non-blocking")?;
 
-    let verdict = tokio::task::spawn_blocking(move || watch(&mut channel, &pidfd))
-        .await
-        .context("the source guard's watch")??;
-    match verdict {
-        Verdict::StandDown | Verdict::Undo(Phase::Untouched) => Ok(()),
+    let (verdict, mut channel) = tokio::task::spawn_blocking(move || {
+        let verdict = watch(&mut channel, &pidfd);
+        (verdict, channel)
+    })
+    .await
+    .context("the source guard's watch")?;
+    match verdict? {
+        Verdict::StandDown => {
+            // The create waits for this answer, not for this process's exit.
+            drop(vm_lock);
+            let _ = channel.set_nonblocking(false);
+            let _ = std::io::Write::write_all(&mut channel, &[RELEASED]);
+            Ok(())
+        }
+        Verdict::Undo(Phase::Untouched) => Ok(()),
         Verdict::Undo(phase) => {
             undo(&args, phase, GUEST_REOPEN_TIMEOUT).await;
             // An exec abandoned by the timeout keeps a blocking thread, which the runtime's
