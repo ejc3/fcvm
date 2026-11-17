@@ -122,11 +122,15 @@ ssm() { # id, command: print output, return the command's exit status
 
 # The pinned toolchain for the ubuntu user, from the checkout's rust-toolchain.toml. The fleet's
 # host image has none on purpose, so a gpubox gets it here and the fleet's hosts stay without.
-TOOLCHAIN_INSTALL='if sudo -u ubuntu -H test -x /home/ubuntu/.cargo/bin/cargo; then echo "Rust toolchain already installed"; else
+# Only the rustup bootstrap is skipped when cargo exists: the proxy appears before the pinned
+# toolchain is downloaded, so a retry after a failed download must still install it (rustup
+# makes that a no-op when it is there).
+TOOLCHAIN_INSTALL='if sudo -u ubuntu -H test -x /home/ubuntu/.cargo/bin/cargo; then echo "rustup already installed"; else
   sudo -u ubuntu -H bash -c "set -euo pipefail
-    curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-    cd /home/ubuntu/fcvm && /home/ubuntu/.cargo/bin/rustup toolchain install"
-fi'
+    curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none"
+fi
+sudo -u ubuntu -H bash -c "set -euo pipefail
+  cd /home/ubuntu/fcvm && /home/ubuntu/.cargo/bin/rustup toolchain install"'
 
 wait_ready() {
   local t0=$1 id=$2 st

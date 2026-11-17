@@ -787,6 +787,26 @@ class GpuboxToolchain(unittest.TestCase):
         self.assertNotIn("ready after", r.stderr)
 
 
+    def test_the_pinned_toolchain_is_installed_even_when_the_cargo_proxy_exists(self):
+        # rustup creates ~/.cargo/bin/cargo before it downloads the pinned toolchain, so a retry
+        # after a failed download finds the proxy and must still run the toolchain install.
+        import re
+        import tempfile
+        src = open(os.path.join(HERE, "gpubox.sh")).read()
+        script = re.search(r"^TOOLCHAIN_INSTALL='(.*?)'$", src, re.S | re.M).group(1)
+        for have_cargo in (True, False):
+            with self.subTest(have_cargo=have_cargo):
+                log = os.path.join(tempfile.mkdtemp(), "sudo")
+                prelude = ('sudo() { shift 3; if [ "$1" = test ]; then return %d; fi; echo "$*" >> "$LOG"; }\n'
+                           % (0 if have_cargo else 1))
+                r = subprocess.run(["bash", "-c", prelude + script], env=dict(os.environ, LOG=log),
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                ran = open(log).read() if os.path.exists(log) else ""
+                self.assertIn("rustup toolchain install", ran)
+                self.assertEqual("sh.rustup.rs" in ran, not have_cargo, ran)
+
+
 class PathrunLighting(unittest.TestCase):
     def test_a_late_pass_posts_the_latest_time_of_day_not_the_next(self):
         # The director's time of day moves every second while the camera flies; pathrun
