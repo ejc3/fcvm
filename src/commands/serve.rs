@@ -23,7 +23,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ const STOP_GRACE: Duration = Duration::from_secs(30);
 struct SandboxEntry {
     sandbox: SandboxProcess,
     runtime: Option<String>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     timeout_ms: Option<u64>,
 }
 
@@ -663,7 +663,7 @@ async fn create_sandbox(
             vsock_socket_path,
         },
         runtime,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         timeout_ms: req.timeout_ms,
     };
 
@@ -759,7 +759,7 @@ async fn health(State(state): State<SharedState>, Path(id): Path<String>) -> Res
 
     let body = serde_json::json!({
         "status": "ok",
-        "timestamp": Utc::now().to_rfc3339(),
+        "timestamp": Timestamp::now().to_string(),
     });
     Json(body).into_response()
 }
@@ -973,8 +973,8 @@ async fn list_files(
                 let modified_at = parts[3]
                     .parse::<i64>()
                     .ok()
-                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                    .map(|dt| dt.to_rfc3339());
+                    .and_then(|ts| jiff::Timestamp::from_second(ts).ok())
+                    .map(|dt| dt.to_string());
                 Some(FileInfo {
                     name,
                     file_type,
@@ -1562,14 +1562,14 @@ async fn reaper_task(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
         interval.tick().await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut expired = Vec::new();
 
         {
             let sandboxes = state.sandboxes.read().await;
             for (id, entry) in sandboxes.iter() {
                 if let Some(timeout_ms) = entry.timeout_ms {
-                    let elapsed = (now - entry.created_at).num_milliseconds().max(0) as u64;
+                    let elapsed = now.duration_since(entry.created_at).as_millis().max(0) as u64;
                     if elapsed > timeout_ms {
                         expired.push(id.clone());
                     }

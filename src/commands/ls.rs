@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -55,9 +55,9 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
         }
 
         // Check if state is stale (no update in 5 minutes)
-        let now = Utc::now();
-        let elapsed = now.signed_duration_since(vm.last_updated);
-        let stale = elapsed.num_seconds() > STALE_THRESHOLD_SECS;
+        let now = Timestamp::now();
+        let elapsed = now.duration_since(vm.last_updated);
+        let stale = elapsed.as_secs() > STALE_THRESHOLD_SECS;
 
         // Verify PID is actually running by checking /proc/{pid}
         if let Some(pid) = vm.pid {

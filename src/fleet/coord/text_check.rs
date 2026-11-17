@@ -211,7 +211,7 @@ impl TextChecker for Bedrock {
         let host = format!("bedrock-runtime.{}.amazonaws.com", self.region);
         let path = format!("/model/{}/invoke", uri_encode(&self.model));
         let body = serde_json::to_vec(&Self::request_body(sky, text))?;
-        let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let amz_date = super::sigv4::amz_date(jiff::Timestamp::now());
         let mut headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
             ("host".to_string(), host.clone()),

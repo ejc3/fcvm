@@ -4979,7 +4979,7 @@ pub fn build_snapshot_config(
         memory_path: snapshot_dir.join("memory.bin"),
         vmstate_path: snapshot_dir.join("vmstate.bin"),
         disk_path: crate::storage::snapshot::snapshot_disk_dir(snapshot_dir).join("disk.raw"),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         snapshot_type,
         // Prod builder always produces Full snapshots; the disk-only path (P2)
         // sets DiskOnly in create_disk_only_snapshot_core.

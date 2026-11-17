@@ -5912,7 +5912,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                 let at = if old.contains(&id.to_string()) {
                     "2020-01-01T00:00:00.000Z".to_string()
                 } else {
-                    chrono::Utc::now().to_rfc3339()
+                    jiff::Timestamp::now().to_string()
                 };
                 let tags: String = tags
                     .iter()

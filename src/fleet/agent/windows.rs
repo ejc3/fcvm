@@ -19,9 +19,9 @@
 use super::slot::{frame_url, AgentCfg};
 use super::vm::Vm;
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
 use fleet_core::protocol::{AgentMsg, AssignSlot, AssignWindows, SharedScene, SlotReport};
 use fleet_core::windows::{Gold, WindowsAction, WindowsImage};
+use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,19 +72,18 @@ impl Manifest {
         Ok(m)
     }
 
-    pub fn installed(&self) -> Result<DateTime<Utc>> {
+    pub fn installed(&self) -> Result<Timestamp> {
         parse_time(&self.installed_at).context("manifest installed_at")
     }
 
-    pub fn expires(&self) -> Result<DateTime<Utc>> {
+    pub fn expires(&self) -> Result<Timestamp> {
         parse_time(&self.eval_expires).context("manifest eval_expires")
     }
 }
 
-fn parse_time(s: &str) -> Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(s)
-        .with_context(|| format!("{s:?} is not an RFC 3339 time"))?
-        .with_timezone(&Utc))
+fn parse_time(s: &str) -> Result<Timestamp> {
+    s.parse::<Timestamp>()
+        .with_context(|| format!("{s:?} is not an RFC 3339 time"))
 }
 
 /// The image is this old when the agent warns, and when it stops starting sandboxes from it;
@@ -103,11 +102,11 @@ pub struct Verdict {
     pub refused: Option<String>,
 }
 
-pub fn verdict(installed: DateTime<Utc>, expires: DateTime<Utc>, now: DateTime<Utc>) -> Verdict {
-    let age = (now - installed).num_days().max(0);
-    let day = |t: DateTime<Utc>| t.format("%Y-%m-%d").to_string();
-    let refuse_at = (installed + chrono::Duration::days(REFUSE_DAYS))
-        .min(expires - chrono::Duration::days(REFUSE_BEFORE_EXPIRY_DAYS));
+pub fn verdict(installed: Timestamp, expires: Timestamp, now: Timestamp) -> Verdict {
+    let age = (now.duration_since(installed).as_secs() / 86_400).max(0);
+    let day = |t: Timestamp| t.strftime("%Y-%m-%d").to_string();
+    let refuse_at = (installed + jiff::SignedDuration::from_hours(24 * REFUSE_DAYS))
+        .min(expires - jiff::SignedDuration::from_hours(24 * REFUSE_BEFORE_EXPIRY_DAYS));
     let refused = (now >= refuse_at).then(|| {
         format!(
             "the Windows image installed {} is {age} days old and its evaluation expires {}; no sandbox starts from an image {REFUSE_DAYS} days old or within {REFUSE_BEFORE_EXPIRY_DAYS} days of its expiry (from {}): rebuild it from fresh evaluation media",
@@ -702,7 +701,7 @@ impl WindowsCfg {
         self.image_dir.join("sandbox-password")
     }
 
-    fn image(&self, gold: &GoldState, now: DateTime<Utc>) -> WindowsImage {
+    fn image(&self, gold: &GoldState, now: Timestamp) -> WindowsImage {
         let m = &self.manifest;
         let v = match (m.installed(), m.expires()) {
             (Ok(i), Ok(e)) => verdict(i, e, now),
@@ -849,7 +848,7 @@ impl Windows {
                 let mut sent: Option<WindowsImage> = None;
                 let mut tick = tokio::time::interval(Duration::from_secs(60));
                 loop {
-                    let image = cfg.image(&gold.borrow_and_update().clone(), Utc::now());
+                    let image = cfg.image(&gold.borrow_and_update().clone(), Timestamp::now());
                     if sent.as_ref() != Some(&image) {
                         if let Some(w) = &image.warning {
                             tracing::warn!(warning = %w, "the Windows image is old");
@@ -1709,7 +1708,9 @@ async fn supervise(
                 }
             };
             let Some(tag) = tag else { break };
-            let image = ctx.cfg.image(&GoldState::Ready(tag.clone()), Utc::now());
+            let image = ctx
+                .cfg
+                .image(&GoldState::Ready(tag.clone()), Timestamp::now());
             if let Some(why) = image.refused {
                 if let Some(mut r) = running.take() {
                     ctx.stop(&mut r).await;
@@ -1777,7 +1778,7 @@ async fn supervise(
                 None
             }
             _ = image_tick.tick() => {
-                if ctx.cfg.image(&GoldState::Ready(String::new()), Utc::now()).refused.is_some() {
+                if ctx.cfg.image(&GoldState::Ready(String::new()), Timestamp::now()).refused.is_some() {
                     // The next pass stops nothing more and reports the refusal with its date.
                     action = None;
                     let mut r = running.take().unwrap();
@@ -1840,7 +1841,7 @@ async fn supervise(
 mod tests {
     use super::*;
 
-    fn t(s: &str) -> DateTime<Utc> {
+    fn t(s: &str) -> Timestamp {
         parse_time(s).unwrap()
     }
 
@@ -1851,7 +1852,7 @@ mod tests {
         let installed = t("2026-11-07T10:00:00Z");
         // An expiry far enough out that the age rule decides.
         let expires = t("2027-12-31T00:00:00Z");
-        let at = |days: i64| installed + chrono::Duration::days(days);
+        let at = |days: i64| installed + jiff::SignedDuration::from_hours(24 * days);
         let v = verdict(installed, expires, at(149));
         assert_eq!((v.age_days, v.warning, v.refused), (149, None, None));
         let v = verdict(installed, expires, at(150));
@@ -1873,10 +1874,18 @@ mod tests {
         assert!(refused.contains("2026-11-07"), "{refused}");
         // The expiry rule: 180 days, so 7 days before it comes after 170 days only when the
         // expiry is late; one 100 days out is refused at 93.
-        let expires = installed + chrono::Duration::days(100);
-        let v = verdict(installed, expires, expires - chrono::Duration::days(8));
+        let expires = installed + jiff::SignedDuration::from_hours(24 * 100);
+        let v = verdict(
+            installed,
+            expires,
+            expires - jiff::SignedDuration::from_hours(24 * 8),
+        );
         assert_eq!((v.age_days, v.refused), (92, None));
-        let v = verdict(installed, expires, expires - chrono::Duration::days(7));
+        let v = verdict(
+            installed,
+            expires,
+            expires - jiff::SignedDuration::from_hours(24 * 7),
+        );
         let refused = v.refused.unwrap();
         assert!(
             refused.contains("2027-02-15"),
@@ -1890,7 +1899,7 @@ mod tests {
         let v = verdict(
             installed,
             expires,
-            expires - chrono::Duration::days(7) - chrono::Duration::seconds(1),
+            expires - jiff::SignedDuration::from_hours(24 * 7) - jiff::SignedDuration::from_secs(1),
         );
         assert_eq!(v.refused, None);
     }

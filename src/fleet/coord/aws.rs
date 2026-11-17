@@ -12,13 +12,13 @@ struct Cached {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
-    expires: Option<chrono::DateTime<chrono::Utc>>,
+    expires: Option<jiff::Timestamp>,
 }
 
 impl Cached {
     fn fresh(&self) -> bool {
         self.expires
-            .is_none_or(|e| e - chrono::Duration::minutes(5) > chrono::Utc::now())
+            .is_none_or(|e| e - jiff::SignedDuration::from_mins(5) > jiff::Timestamp::now())
     }
     fn creds(&self) -> Credentials {
         Credentials {
@@ -51,8 +51,7 @@ impl RoleCreds {
             session_token: self.token,
             expires: self
                 .expiration
-                .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e).ok())
-                .map(|e| e.with_timezone(&chrono::Utc)),
+                .and_then(|e| e.parse::<jiff::Timestamp>().ok()),
         }
     }
 }
@@ -175,7 +174,7 @@ pub async fn signed(
         .trim_end_matches('/')
         .to_string();
     let creds = chain.get().await?;
-    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let amz_date = super::sigv4::amz_date(jiff::Timestamp::now());
     let mut headers = vec![
         ("host".to_string(), host),
         ("x-amz-date".to_string(), amz_date.clone()),

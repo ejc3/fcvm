@@ -283,7 +283,7 @@ impl StateManager {
         let result = async {
             // Update last_updated timestamp before saving
             let mut state = state.clone();
-            state.last_updated = chrono::Utc::now();
+            state.last_updated = jiff::Timestamp::now();
             // Record the start time of the process at `pid` so later lookups
             // can detect PID reuse by an unrelated process (see pid_identity_matches).
             state.pid_start_time = state.pid.and_then(process_start_time);
@@ -848,7 +848,7 @@ impl StateManager {
 
             // Apply caller's modification
             mutate(&mut state);
-            state.last_updated = chrono::Utc::now();
+            state.last_updated = jiff::Timestamp::now();
 
             // Write to temp file
             let state_json = serde_json::to_string_pretty(&state)?;

@@ -30,7 +30,7 @@ pub struct CertDoc {
 }
 
 /// Renew this long before expiry.
-pub const RENEW_BEFORE: chrono::Duration = chrono::Duration::days(30);
+pub const RENEW_BEFORE: jiff::SignedDuration = jiff::SignedDuration::from_hours(24 * 30);
 
 /// The names the certificate covers: the zone, its wildcard and `extra`.
 pub fn domains(zone: &str, extra: &[String]) -> Vec<String> {
@@ -45,7 +45,7 @@ pub fn needs_renewal(
     secret: Option<&str>,
     zone: &str,
     extra: &[String],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> bool {
     let Some(doc) = secret.and_then(|s| serde_json::from_str::<CertDoc>(s).ok()) else {
         return true;
@@ -56,21 +56,21 @@ pub fn needs_renewal(
     {
         return true;
     }
-    match chrono::DateTime::parse_from_rfc3339(&doc.not_after) {
-        Ok(t) => t.with_timezone(&chrono::Utc) - now <= RENEW_BEFORE,
+    match doc.not_after.parse::<jiff::Timestamp>() {
+        Ok(t) => t.duration_since(now) <= RENEW_BEFORE,
         Err(_) => true,
     }
 }
 
 /// The secret's document for a PEM chain and key: expiry, names and issuer read from the
 /// leaf certificate.
-pub fn doc_from_pem(chain: &str, key: &str, now: chrono::DateTime<chrono::Utc>) -> Result<CertDoc> {
+pub fn doc_from_pem(chain: &str, key: &str, now: jiff::Timestamp) -> Result<CertDoc> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(chain.as_bytes())
         .map_err(|e| anyhow::anyhow!("the chain is not PEM: {e}"))?;
     let leaf = pem
         .parse_x509()
         .map_err(|e| anyhow::anyhow!("the leaf is not X.509: {e}"))?;
-    let not_after = chrono::DateTime::from_timestamp(leaf.validity().not_after.timestamp(), 0)
+    let not_after = jiff::Timestamp::from_second(leaf.validity().not_after.timestamp())
         .context("the leaf's expiry")?;
     let mut domains = Vec::new();
     if let Ok(Some(san)) = leaf.subject_alternative_name() {
@@ -80,7 +80,7 @@ pub fn doc_from_pem(chain: &str, key: &str, now: chrono::DateTime<chrono::Utc>) 
             }
         }
     }
-    let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let fmt = |t: jiff::Timestamp| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
     Ok(CertDoc {
         cert: chain.to_string(),
         key: key.to_string(),
@@ -226,7 +226,7 @@ pub async fn issue(r: &Renewal, cf: &mut Cloudflare) -> Result<CertDoc> {
         }
         let key = order.finalize().await?;
         let chain = order.poll_certificate(&policy).await?;
-        doc_from_pem(&chain, &key, chrono::Utc::now())
+        doc_from_pem(&chain, &key, jiff::Timestamp::now())
     }
     .await;
     for id in records {
@@ -251,7 +251,7 @@ pub async fn run(r: Renewal, secrets: Secrets, mut cf: Cloudflare) {
     loop {
         let current = secrets.get(&r.secret).await;
         let due = match &current {
-            Ok(s) => needs_renewal(Some(s), &r.zone, &r.extra, chrono::Utc::now()),
+            Ok(s) => needs_renewal(Some(s), &r.zone, &r.extra, jiff::Timestamp::now()),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the certificate secret could not be read");
                 false
@@ -361,9 +361,7 @@ mod tests {
 
     #[test]
     fn renewal_is_due_within_thirty_days_or_when_the_secret_is_unusable() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = "2026-10-23T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let both = ["*.fcvm.dev", "fcvm.dev"];
         assert!(!needs_renewal(
             Some(&doc("2026-11-22T00:00:01Z", &both)),
@@ -418,9 +416,7 @@ mod tests {
         params.not_after = rcgen::date_time_ymd(2027, 1, 21);
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = "2026-10-23T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let d = doc_from_pem(&cert.pem(), &key.serialize_pem(), now).unwrap();
         assert_eq!(d.not_after, "2027-01-21T00:00:00Z");
         assert_eq!(d.issued_at, "2026-10-23T00:00:00Z");

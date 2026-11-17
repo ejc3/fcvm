@@ -49,8 +49,8 @@ pub struct VmState {
     /// to 0 so state files written before this field existed still load.
     #[serde(default)]
     pub vsock_epoch: u64,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
+    pub last_updated: jiff::Timestamp,
     pub config: VmConfig,
 }
 
@@ -405,7 +405,7 @@ impl VmConfig {
 
 impl VmState {
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         Self {
             schema_version: 1,
             vm_id,
