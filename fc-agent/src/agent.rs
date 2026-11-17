@@ -816,28 +816,11 @@ async fn start_chronyd(host_servers: Vec<String>) {
         sources.join("\n")
     );
 
-    // Held while this changes which daemon runs, so a restore that lands mid-way
-    // (the pre-start snapshot is taken while this task can still be running)
-    // waits for it instead of interleaving with it. Not held across the
-    // readiness wait, which a restore must never queue behind.
-    let mut lifecycle = CHRONYD_LIFECYCLE.clone().lock_owned().await;
-    let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
-    let _ = tokio::fs::create_dir_all("/var/run/chrony").await;
-    if let Err(e) = tokio::fs::write(CHRONY_CONF, config).await {
-        eprintln!("[fc-agent] ERROR: cannot write {CHRONY_CONF}: {e}; no NTP time sync");
+    // The swap takes the lifecycle; the readiness wait below does not, because
+    // a restore must never queue behind it.
+    if !CHRONYD_LIFECYCLE.boot_swap(&GuestChronyd, &config).await {
         return;
     }
-    *lifecycle = true;
-
-    // The rootfs enables chrony.service, so systemd starts its own chronyd as the
-    // _chrony user — which cannot send UDP in this VM. Replace it, and wait for it
-    // to be GONE, because the replacement binds the same command socket.
-    stop_running_chronyd().await;
-
-    if !spawn_chronyd().await {
-        return;
-    }
-    drop(lifecycle);
 
     // Positive verification. Waiting for chronyc to answer proves the daemon is
     // up; counting its sources proves the config we wrote was actually loaded.
@@ -875,17 +858,182 @@ async fn spawn_chronyd() -> bool {
     }
 }
 
-/// Serializes every change to which chronyd runs: the boot setup replacing
-/// systemd's daemon, and a restore replacing the snapshot's. The value says
-/// whether the boot setup has written [`CHRONY_CONF`]; until it has, a restore
-/// leaves starting the daemon to it.
-static CHRONYD_LIFECYCLE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<bool>>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(false)));
+/// What changing the running chronyd does to the guest. [`GuestChronyd`] does
+/// it; a test stands in for it to hold one step open.
+trait ChronydSystem: Sync {
+    /// Write [`CHRONY_CONF`] and the directories chronyd needs.
+    async fn write_config(&self, config: &str) -> std::io::Result<()>;
+    /// Stop systemd's chrony unit and end every chronyd still running.
+    async fn stop_systemd_chronyd(&self);
+    /// SIGKILL every running chronyd and zero the kernel's frequency correction.
+    async fn kill_chronyds_for_restore(&self);
+    /// Start chronyd on [`CHRONY_CONF`]. Returns whether it was spawned.
+    async fn spawn_chronyd(&self) -> bool;
+}
 
-/// The snapshot's chronyd, gone. Holds [`CHRONYD_LIFECYCLE`] so no daemon can
-/// start between the kill and the restore's clock step;
+/// [`ChronydSystem`] on this guest.
+struct GuestChronyd;
+
+impl ChronydSystem for GuestChronyd {
+    async fn write_config(&self, config: &str) -> std::io::Result<()> {
+        let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
+        let _ = tokio::fs::create_dir_all("/var/run/chrony").await;
+        tokio::fs::write(CHRONY_CONF, config).await
+    }
+
+    async fn stop_systemd_chronyd(&self) {
+        stop_running_chronyd().await;
+    }
+
+    async fn kill_chronyds_for_restore(&self) {
+        kill_chronyds_for_restore().await;
+    }
+
+    async fn spawn_chronyd(&self) -> bool {
+        spawn_chronyd().await
+    }
+}
+
+/// Serializes every change to which chronyd runs: the boot setup replacing
+/// systemd's daemon, and a restore replacing the snapshot's.
+///
+/// The lock is held only across steps that end in milliseconds: writing the
+/// config, killing with SIGKILL, starting chronyd, and from a restore's kill to
+/// its clock step. The boot's stop of systemd's chrony unit runs without it.
+/// That stop waits for systemd's chronyd to exit, and a chronyd waiting on a DNS
+/// lookup (its helper resolving the rootfs's pool name with no nameserver
+/// answering) took 20 s to exit after SIGTERM; with the lock held across it, the
+/// first restore of a snapshot taken during the stop waited the rest of those
+/// 20 s before stepping its clock (#1937). A restore's SIGKILL ends that chronyd,
+/// so the stop then returns at once.
+///
+/// What the lock still guarantees:
+/// - no daemon starts between a restore's kill and its clock step, because the
+///   restore holds the lock across both;
+/// - one daemon at a time: every daemon fc-agent starts, it starts under the lock
+///   after systemd's unit is stopped ([`Self::systemd_gone`]), and the boot's stop
+///   ends daemons only before that, so it never ends one of ours;
+/// - one starter: a restore that lands after the boot wrote its config starts the
+///   daemon, and the boot, which records the restore count when it writes the
+///   config, starts none once that count has moved. A restore's restart that
+///   waited for the unit starts none once a later restore (of a clone of this
+///   clone) has moved the count again.
+struct ChronydLifecycle {
+    state: std::sync::Arc<tokio::sync::Mutex<LifecycleState>>,
+    /// Set once the boot setup has stopped systemd's chrony unit and ended every
+    /// chronyd it left running.
+    systemd_gone: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    /// The boot setup has written [`CHRONY_CONF`]; until it has, a restore
+    /// leaves starting the daemon to it.
+    config_written: bool,
+    /// Restores this guest has gone through.
+    restores: u64,
+}
+
+static CHRONYD_LIFECYCLE: std::sync::LazyLock<ChronydLifecycle> =
+    std::sync::LazyLock::new(ChronydLifecycle::new);
+
+/// The snapshot's chronyd, gone. Holds the lifecycle so no daemon can start
+/// between the kill and the restore's clock step;
 /// [`restart_chronyd_after_restore`] consumes it once the step is done.
-pub(crate) struct RetiredChronyd(tokio::sync::OwnedMutexGuard<bool>);
+pub(crate) struct RetiredChronyd {
+    state: tokio::sync::OwnedMutexGuard<LifecycleState>,
+    /// This restore's number in [`LifecycleState::restores`].
+    restore: u64,
+}
+
+impl ChronydLifecycle {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(LifecycleState::default())),
+            systemd_gone: tokio::sync::watch::Sender::new(false),
+        }
+    }
+
+    /// The boot's half: write the config, replace systemd's chronyd with ours.
+    /// Returns whether it started the daemon.
+    async fn boot_swap(&self, system: &impl ChronydSystem, config: &str) -> bool {
+        let restores = {
+            let mut state = self.state.lock().await;
+            if let Err(e) = system.write_config(config).await {
+                eprintln!("[fc-agent] ERROR: cannot write {CHRONY_CONF}: {e}; no NTP time sync");
+                return false;
+            }
+            state.config_written = true;
+            state.restores
+        };
+
+        // The rootfs enables chrony.service, so systemd starts its own chronyd as the
+        // _chrony user, which cannot send UDP in this VM. Replace it, and wait for it
+        // to be GONE, because the replacement binds the same command socket.
+        system.stop_systemd_chronyd().await;
+        self.systemd_gone.send_replace(true);
+
+        let state = self.state.lock().await;
+        if state.restores != restores {
+            eprintln!(
+                "[fc-agent] chronyd: a restore landed while systemd's chronyd was being \
+                 stopped; the restore starts the daemon"
+            );
+            return false;
+        }
+        let spawned = system.spawn_chronyd().await;
+        drop(state);
+        spawned
+    }
+
+    /// The restore's first half: end every chronyd before the clock step.
+    async fn retire_for_restore(&self, system: &impl ChronydSystem) -> RetiredChronyd {
+        let mut state = self.state.clone().lock_owned().await;
+        state.restores += 1;
+        let restore = state.restores;
+        system.kill_chronyds_for_restore().await;
+        RetiredChronyd { state, restore }
+    }
+
+    /// The restore's second half, after the clock step. Returns whether it
+    /// started the daemon.
+    async fn restart_after_restore(
+        &self,
+        system: &impl ChronydSystem,
+        retired: RetiredChronyd,
+        epoch: &str,
+    ) -> bool {
+        let RetiredChronyd { mut state, restore } = retired;
+        if !state.config_written {
+            eprintln!(
+                "[fc-agent] chronyd: the boot setup has not run yet in this clone; it starts the daemon"
+            );
+            return false;
+        }
+        if !*self.systemd_gone.borrow() {
+            // The boot is still stopping systemd's unit. The restore's kill ended
+            // its chronyd, so the stop returns now, but a daemon started before it
+            // has returned could meet systemd's on the command socket.
+            drop(state);
+            eprintln!(
+                "[fc-agent] chronyd: waiting for the boot setup to stop systemd's chrony \
+                 unit (epoch={epoch})"
+            );
+            let mut gone = self.systemd_gone.subscribe();
+            if gone.wait_for(|gone| *gone).await.is_err() {
+                return false;
+            }
+            state = self.state.clone().lock_owned().await;
+            if state.restores != restore {
+                eprintln!("[fc-agent] chronyd: a later restore starts the daemon (epoch={epoch})");
+                return false;
+            }
+        }
+        let spawned = system.spawn_chronyd().await;
+        drop(state);
+        spawned
+    }
+}
 
 /// Kill the chronyd a restored clone inherited from its snapshot, before the
 /// restore steps the clock.
@@ -907,7 +1055,12 @@ pub(crate) struct RetiredChronyd(tokio::sync::OwnedMutexGuard<bool>);
 /// frequency correction where its slew put it, so this zeroes it: the next
 /// daemon takes the drift file's frequency, or the kernel's when there is none.
 pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
-    let lifecycle = CHRONYD_LIFECYCLE.clone().lock_owned().await;
+    CHRONYD_LIFECYCLE.retire_for_restore(&GuestChronyd).await
+}
+
+/// SIGKILL every running chronyd and zero the kernel's frequency correction
+/// ([`retire_chronyd_for_restore`]).
+async fn kill_chronyds_for_restore() {
     let survivors = end_chronyds(
         running_chronyd_pids(),
         &[libc::SIGKILL],
@@ -921,7 +1074,6 @@ pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
         );
     }
     reset_kernel_frequency();
-    RetiredChronyd(lifecycle)
 }
 
 /// Start a fresh chronyd once the restore has stepped the clock. Its first
@@ -931,17 +1083,12 @@ pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
 /// waits for sources carries the task into every clone, where it finishes and logs for the
 /// restore that started it, not for the clone's own.
 pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd, epoch: String) {
-    let RetiredChronyd(lifecycle) = retired;
-    if !*lifecycle {
-        eprintln!(
-            "[fc-agent] chronyd: the boot setup has not run yet in this clone; it starts the daemon"
-        );
+    if !CHRONYD_LIFECYCLE
+        .restart_after_restore(&GuestChronyd, retired, &epoch)
+        .await
+    {
         return;
     }
-    if !spawn_chronyd().await {
-        return;
-    }
-    drop(lifecycle);
     match wait_for_chrony_sources().await {
         Ok(count) => eprintln!(
             "[fc-agent] chronyd restarted after restore (epoch={epoch}) with {count} NTP source(s)"
@@ -1008,10 +1155,15 @@ async fn rootfs_ntp_sources() -> Vec<String> {
 /// `pidfd_send_signal` so a PID recycled between the /proc scan and the signal
 /// can never be hit: the pidfd pins the process it was opened for.
 async fn stop_running_chronyd() {
+    let started = std::time::Instant::now();
     let _ = tokio::process::Command::new("systemctl")
         .args(["stop", "chrony"])
         .output()
         .await;
+    eprintln!(
+        "[fc-agent] chronyd: systemctl stop chrony returned after {} ms",
+        started.elapsed().as_millis()
+    );
 
     // SIGKILL cannot be caught; a process that has not exited after it is wedged
     // in the kernel (uninterruptible), and the new daemon reports the conflict.
@@ -1594,8 +1746,8 @@ mod tests {
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("agent.rs has no test module")];
         for caller in [
-            "pub(crate) async fn retire_chronyd_for_restore(",
-            "async fn stop_running_chronyd(",
+            "\nasync fn kill_chronyds_for_restore(",
+            "\nasync fn stop_running_chronyd(",
         ] {
             let start = body.find(caller).expect(caller);
             let end = body[start..].find("\n}\n").unwrap() + start;
@@ -1639,6 +1791,170 @@ mod tests {
         assert!(
             pidfile.exists(),
             "removed the pid file of a process it did not end"
+        );
+    }
+
+    /// One step of [`super::ChronydSystem`], as [`FakeChronyd`] records it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        WriteConfig,
+        StopBegan,
+        StopEnded,
+        KillForRestore,
+        Spawn,
+    }
+
+    /// A [`super::ChronydSystem`] that records its steps, and whose stop of
+    /// systemd's unit is held open until the test releases it: the boot's
+    /// `systemctl stop chrony` took 20 s in a guest whose systemd chronyd was
+    /// waiting on a DNS lookup (#1937).
+    #[derive(Default)]
+    struct FakeChronyd {
+        steps: std::sync::Mutex<Vec<Step>>,
+        stop_entered: tokio::sync::Notify,
+        stop_released: tokio::sync::Notify,
+    }
+
+    impl FakeChronyd {
+        fn record(&self, step: Step) {
+            self.steps.lock().unwrap().push(step);
+        }
+
+        fn steps(&self) -> Vec<Step> {
+            self.steps.lock().unwrap().clone()
+        }
+    }
+
+    impl super::ChronydSystem for FakeChronyd {
+        async fn write_config(&self, _config: &str) -> std::io::Result<()> {
+            self.record(Step::WriteConfig);
+            Ok(())
+        }
+
+        async fn stop_systemd_chronyd(&self) {
+            self.record(Step::StopBegan);
+            self.stop_entered.notify_one();
+            self.stop_released.notified().await;
+            self.record(Step::StopEnded);
+        }
+
+        async fn kill_chronyds_for_restore(&self) {
+            self.record(Step::KillForRestore);
+        }
+
+        async fn spawn_chronyd(&self) -> bool {
+            self.record(Step::Spawn);
+            true
+        }
+    }
+
+    /// A restore that lands while the boot is stopping systemd's chronyd retires
+    /// the daemons at once instead of waiting for the stop, and the clone still
+    /// ends with one daemon: the restore's, started after systemd's unit is
+    /// stopped, and none from the boot. On main the restore waited for the whole
+    /// stop, 17 to 19.6 s of every first restore's clock phase (#1937).
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_does_not_wait_for_the_boot_to_stop_systemds_chronyd() {
+        let system = std::sync::Arc::new(FakeChronyd::default());
+        let lifecycle = std::sync::Arc::new(super::ChronydLifecycle::new());
+        let boot = tokio::spawn({
+            let (system, lifecycle) = (system.clone(), lifecycle.clone());
+            async move { lifecycle.boot_swap(&*system, "config").await }
+        });
+        system.stop_entered.notified().await;
+
+        let retired = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lifecycle.retire_for_restore(&*system),
+        )
+        .await
+        .expect("the restore waited for the boot's stop of systemd's chronyd");
+        // The restore steps the clock here.
+        let restart = tokio::spawn({
+            let (system, lifecycle) = (system.clone(), lifecycle.clone());
+            async move {
+                lifecycle
+                    .restart_after_restore(&*system, retired, "test")
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            system.steps(),
+            [Step::WriteConfig, Step::StopBegan, Step::KillForRestore],
+            "a daemon was started while systemd's unit was still being stopped"
+        );
+
+        system.stop_released.notify_one();
+        assert!(
+            !boot.await.unwrap(),
+            "the boot started a daemon after a restore took the swap over"
+        );
+        assert!(restart.await.unwrap(), "the restore started no daemon");
+        assert_eq!(
+            system.steps(),
+            [
+                Step::WriteConfig,
+                Step::StopBegan,
+                Step::KillForRestore,
+                Step::StopEnded,
+                Step::Spawn
+            ]
+        );
+    }
+
+    /// A clone of a clone taken while the first restore's restart waited for the
+    /// boot's stop: both restarts wait, and only the later restore starts a
+    /// daemon, so the clone ends with one.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_latest_restore_starts_chronyd_after_the_boot_stops_systemds() {
+        let system = std::sync::Arc::new(FakeChronyd::default());
+        let lifecycle = std::sync::Arc::new(super::ChronydLifecycle::new());
+        let boot = tokio::spawn({
+            let (system, lifecycle) = (system.clone(), lifecycle.clone());
+            async move { lifecycle.boot_swap(&*system, "config").await }
+        });
+        system.stop_entered.notified().await;
+
+        let mut restarts = Vec::new();
+        for _ in 0..2 {
+            let retired = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                lifecycle.retire_for_restore(&*system),
+            )
+            .await
+            .expect("the restore waited for the boot's stop of systemd's chronyd");
+            restarts.push(tokio::spawn({
+                let (system, lifecycle) = (system.clone(), lifecycle.clone());
+                async move {
+                    lifecycle
+                        .restart_after_restore(&*system, retired, "test")
+                        .await
+                }
+            }));
+        }
+
+        system.stop_released.notify_one();
+        assert!(!boot.await.unwrap(), "the boot started a daemon");
+        let mut started = Vec::new();
+        for restart in restarts {
+            started.push(restart.await.unwrap());
+        }
+        assert_eq!(
+            started,
+            [false, true],
+            "the earlier restore started a daemon"
+        );
+        assert_eq!(
+            system.steps(),
+            [
+                Step::WriteConfig,
+                Step::StopBegan,
+                Step::KillForRestore,
+                Step::KillForRestore,
+                Step::StopEnded,
+                Step::Spawn
+            ]
         );
     }
 }
