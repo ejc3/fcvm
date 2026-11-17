@@ -289,8 +289,15 @@ class FailureTests(unittest.TestCase):
             if (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
                     and getattr(node.exc.func, "id", None) != "SystemExit"):
                 args = node.exc.args
-                self.assertTrue(len(args) == 1 and isinstance(args[0], ast.Constant)
-                                and isinstance(args[0].value, str),
+                # An f-string may interpolate only these names: a probe's role, path, status code
+                # and reason, never a URL or a header value.
+                def literal(arg):
+                    if isinstance(arg, ast.JoinedStr):
+                        return all(isinstance(v, ast.Constant) or
+                                   (isinstance(v.value, ast.Name) and v.value.id in {"role", "path", "code", "why"})
+                                   for v in arg.values)
+                    return isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                self.assertTrue(len(args) == 1 and literal(args[0]),
                                 f"line {node.lineno}: a raise whose message is not a string literal")
 
 
@@ -987,6 +994,41 @@ class PartialFrameTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 connection.message(4.0)
             self.assertEqual(connection.message(100.0), (1, b"{}"))
+
+
+class AccessCheckMessageTests(unittest.TestCase):
+    ENV = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+           "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+
+    def failure(self, get):
+        with patch.dict(os.environ, self.ENV), patch.object(smoke, "get", get), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(AssertionError) as caught:
+                smoke.main(family="v4", modes=(), relaunch=False)
+        return str(caught.exception)
+
+    def test_an_unauthenticated_failure_names_the_endpoint_and_code(self):
+        message = self.failure(lambda url, headers=None: (200, {}, b""))
+        self.assertIn("api /healthz", message)
+        self.assertIn("200", message)
+        self.assertIn("no Location", message)
+        self.assertNotIn("example.test", message)
+
+    def test_a_redirect_to_another_host_is_named_without_echoing_it(self):
+        message = self.failure(lambda url, headers=None: (302, {"Location": "https://elsewhere.test/x"}, b""))
+        self.assertIn("api /healthz", message)
+        self.assertIn("302", message)
+        self.assertIn("not an Access host", message)
+        self.assertNotIn("elsewhere", message)
+
+    def test_an_authenticated_failure_names_the_endpoint_and_code(self):
+        def get(url, headers=None):
+            if headers:
+                return (503 if url.endswith("/") and "stage" in url else 200), {}, b""
+            return 302, {"Location": "https://team.cloudflareaccess.com/login"}, b""
+        message = self.failure(get)
+        self.assertIn("origin /", message)
+        self.assertIn("503", message)
+        self.assertNotIn("example.test", message)
 
 
 class AttributionTests(unittest.TestCase):

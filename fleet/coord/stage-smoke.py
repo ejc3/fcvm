@@ -1006,14 +1006,15 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     if stage is not None:
         api, origin = stage
         step("Access check")
-        for url in (api + "/healthz", origin + "/"):
+        for role, url, path in (("api", api + "/healthz", "/healthz"), ("origin", origin + "/", "/")):
             code, response_headers, _ = get(url)
             location = urllib.parse.urlsplit(response_headers.get("Location", ""))
             if code != 302 or location.scheme != "https" or not (location.hostname or "").endswith(".cloudflareaccess.com"):
-                raise AssertionError("staging did not require Access")
+                why = "no Location" if not response_headers.get("Location") else "Location is not an Access host"
+                raise AssertionError(f"staging did not require Access: {role} {path} answered {code} ({why})")
             code, _, _ = get(url, headers)
             if code != 200:
-                raise AssertionError("authenticated staging request failed")
+                raise AssertionError(f"authenticated staging request failed: {role} {path} answered {code}")
         step("agents-only endpoint check")
         code, _, _ = get(api + "/agent", headers)
         if code not in (401, 403, 302):
