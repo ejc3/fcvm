@@ -76,13 +76,27 @@ BUCKET=fcvm-fleet-assets-$ACCOUNT
 # the release's ids in every region (SSM /fcvm-fleet/ami-release-copies), else the release itself
 # (/fcvm-fleet/ami-release, which names us-east-1), both in us-east-1. Nothing else: a validated
 # image is not necessarily released (a publication can fail after tagging it), and a factory
-# candidate never is. Prints nothing when neither names an available image there.
+# candidate never is. A release-gate drill is restricted to staging: its ordinary predecessor
+# is used instead, and a drill copy record is ignored. Only one predecessor is inspected.
+# Prints nothing when neither names an available image there.
 host_ami() {
-  local id q
+  local id q selection drill_filter
   [ -n "${GPUBOX_AMI:-}" ] && { echo "$GPUBOX_AMI"; return; }
+  # These immutable identities match the two reviewed staging drills in the image publisher.
+  drill_filter='def drill:
+    ((.build_id // "") | startswith("reviewed-release-gate-drill:") or startswith("reviewed-no-agent-drill:"))
+    or .source_sha == "7457a0ff977a3471f4e8a2502b8248417576f737"
+    or .source_sha == "c3831f6c43313e36db9ef461df87d6620755c6b4";'
   for q in "/fcvm-fleet/ami-release-copies .images[\$r].host" "/fcvm-fleet/ami-release .host_amis[\$r].x86_64"; do
+    selection='select(drill | not)'
+    if [ "${q%% *}" = /fcvm-fleet/ami-release ]; then
+      selection='if drill then
+        select((.generation | type) == "number") | . as $active | .previous |
+        select(type == "object" and (.generation | type) == "number" and .generation < $active.generation)
+        else . end | select(drill | not)'
+    fi
     id=$(aws --region us-east-1 ssm get-parameter --name "${q%% *}" --query Parameter.Value --output text 2>/dev/null \
-      | jq -r --arg r "$REGION" "${q#* } // empty" 2>/dev/null || true)
+      | jq -r --arg r "$REGION" "$drill_filter $selection | ${q#* } // empty" 2>/dev/null || true)
     if [[ "$id" =~ ^ami-[0-9a-f]{17}$ ]] && [ "$(A ec2 describe-images --image-ids "$id" --query 'Images[0].State' --output text 2>/dev/null || true)" = available ]; then
       echo "$id"; return
     fi
