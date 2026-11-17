@@ -6428,10 +6428,24 @@ pub async fn create_snapshot_core(
         );
     }
     boundary.prepare_ms = boundary.lap(boundary_started);
+    // A guard that cannot be told about the pause cannot undo it: fail closed, before the
+    // pause, reopening the guest as a failed prepare does.
     if let Some(guard) = source_guard.as_mut() {
         if let Err(error) = guard.mark(super::snapshot_guard::PAUSE).await {
-            error!(snapshot = %snapshot_config.name, error = %error,
-                "the snapshot source guard is gone; a create killed during this pause would leave the source paused");
+            drop(source_guard.take());
+            let guest_network_resume_result = run_snapshot_network_command(
+                vsock_socket_path,
+                &snapshot_config.vm_id,
+                "--resume-snapshot-network",
+            )
+            .await
+            .context("reopening guest network after the snapshot source guard was lost");
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return combine_snapshot_boundary_results(
+                Err(error.context("the snapshot source guard is gone; not pausing the VM")),
+                Ok(()),
+                guest_network_resume_result,
+            );
         }
     }
     let pause_result = pause_client
@@ -7131,10 +7145,20 @@ pub async fn create_snapshot_ch(
             guest_network_resume_result,
         );
     }
+    // As on Firecracker: a guard that cannot be told about the pause fails the create first.
     if let Some(guard) = source_guard.as_mut() {
         if let Err(error) = guard.mark(super::snapshot_guard::PAUSE).await {
-            error!(snapshot = %snapshot_config.name, error = %error,
-                "the snapshot source guard is gone; a create killed during this pause would leave the source paused");
+            drop(source_guard.take());
+            let guest_network_resume_result = guest
+                .reopen_after_failed_prepare(&snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after the snapshot source guard was lost");
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return combine_snapshot_boundary_results(
+                Err(error.context("the snapshot source guard is gone; not pausing the VM")),
+                Ok(()),
+                guest_network_resume_result,
+            );
         }
     }
     let pause_result = client
@@ -8977,8 +9001,8 @@ mod tests {
             );
             assert_eq!(
                 before.matches(failed_prepare_reopen).count(),
-                1,
-                "{name}: the reopen after a failed prepare changed"
+                2,
+                "{name}: the reopens after a failed prepare and a lost guard changed"
             );
             assert!(
                 !after.contains("\"--resume-snapshot-network\"")
@@ -9058,6 +9082,16 @@ mod tests {
                 "{name} hands the guard its lock"
             );
             assert_eq!(body.matches("guard.disarm().await").count(), 3, "{name}");
+            // A failed PAUSE mark reopens the guest and returns before the pause.
+            let marked = body
+                .find("guard.mark(super::snapshot_guard::PAUSE)")
+                .unwrap();
+            let between = &body[marked..body.find(pause).unwrap()];
+            assert!(
+                between.contains(reopens[0])
+                    && between.contains("return combine_snapshot_boundary_results("),
+                "{name} pauses the VM after its guard could not be told about the pause"
+            );
             let mut from = 0;
             for reopen in reopens {
                 let at = from

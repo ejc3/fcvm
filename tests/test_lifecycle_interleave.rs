@@ -3496,6 +3496,9 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
         common::TEST_IMAGE,
     ])
     .await?;
+    // Outside the case, so every way out of it kills and reaps the create: one left held at
+    // its failpoint keeps the snapshot's generation lock, which the cleanup's delete waits on.
+    let mut held_create: Option<tokio::process::Child> = None;
 
     let result = async {
         common::poll_health_by_pid(vm_pid, 300).await?;
@@ -3512,7 +3515,7 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
             "snapshot.post_save_pre_resume:block_until_file:{}",
             scratch.path().join("never").display()
         );
-        let (mut create, create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
+        let (create, create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
             &[
                 "snapshot",
                 "create",
@@ -3524,6 +3527,7 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
             &[("FCVM_FAILPOINT", &hold)],
         )
         .await?;
+        let create = held_create.insert(create);
         wait_for_marker(
             &create_log,
             "FAILPOINT snapshot.post_save_pre_resume reached",
@@ -3539,20 +3543,30 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
             "the published port answered while the create held the source paused"
         );
 
+        let deadline = Duration::from_secs(15);
+        let in_time = |what: &str, at: Duration| {
+            if at <= deadline {
+                Ok(at)
+            } else {
+                Err(format!(
+                    "{what} answered {at:?} after the SIGKILL, past {deadline:?}"
+                ))
+            }
+        };
+        let killed_at = Instant::now();
         // SAFETY: kill(2) on the create's pid, which this test spawned and has not reaped.
         anyhow::ensure!(
             unsafe { libc::kill(create_pid as libc::pid_t, libc::SIGKILL) } == 0,
             "SIGKILL of the create: {}",
             std::io::Error::last_os_error()
         );
-        let status = wait_exit(&mut create, Duration::from_secs(10)).await?;
-        let killed_at = Instant::now();
+        let status = wait_exit(create, Duration::from_secs(10)).await?;
         anyhow::ensure!(
             !status.success(),
             "the held create exited on its own: {status}"
         );
 
-        let deadline = killed_at + Duration::from_secs(15);
+        let give_up = killed_at + deadline;
         let exec = loop {
             let attempt = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -3560,18 +3574,18 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
             )
             .await;
             match attempt {
-                Ok(Ok(_)) => break Ok(killed_at.elapsed()),
-                Ok(Err(error)) if Instant::now() >= deadline => break Err(format!("{error:#}")),
-                Err(_) if Instant::now() >= deadline => break Err("exec timed out".to_string()),
+                Ok(Ok(_)) => break in_time("exec", killed_at.elapsed()),
+                Ok(Err(error)) if Instant::now() >= give_up => break Err(format!("{error:#}")),
+                Err(_) if Instant::now() >= give_up => break Err("exec timed out".to_string()),
                 _ => tokio::time::sleep(Duration::from_millis(100)).await,
             }
         };
         let port = loop {
             let attempt = common::curl_check(&ip, host_port, 2).await;
             if attempt.success {
-                break Ok(killed_at.elapsed());
+                break in_time("port", killed_at.elapsed());
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= give_up {
                 break Err(attempt.error);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3595,6 +3609,10 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
     }
     .await;
 
+    if let Some(mut create) = held_create.take() {
+        let _ = create.start_kill();
+        let _ = wait_exit(&mut create, Duration::from_secs(10)).await;
+    }
     sigterm(vm_pid).await;
     let _ = wait_exit(&mut vm, Duration::from_secs(60)).await;
     common::delete_snapshot(&snapshot).await.ok();

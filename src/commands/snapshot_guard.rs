@@ -363,7 +363,8 @@ pub async fn cmd_snapshot_source_guard(args: SnapshotSourceGuardArgs) -> Result<
         }
         Verdict::Undo(Phase::Untouched) => Ok(()),
         Verdict::Undo(phase) => {
-            undo(&args, phase, GUEST_REOPEN_TIMEOUT).await;
+            let total = Duration::from_secs(args.resume_timeout_secs) + 2 * GUEST_REOPEN_TIMEOUT;
+            bounded_undo(&args, phase, GUEST_REOPEN_TIMEOUT, total).await;
             // An exec abandoned by the timeout keeps a blocking thread, which the runtime's
             // shutdown would wait for. Exit now: that also releases the per-VM lock.
             std::process::exit(0);
@@ -420,6 +421,23 @@ fn watch(channel: &mut std::os::unix::net::UnixStream, pidfd: &OwnedFd) -> Resul
             return Err(error).context("polling the create");
         }
         creator_gone = fds[1].revents != 0;
+    }
+}
+
+/// [`undo`] with a deadline over all of it: a client timeout bounds a response's head and
+/// not its body, and the guard holds the per-VM lock until it exits.
+async fn bounded_undo(
+    args: &SnapshotSourceGuardArgs,
+    phase: Phase,
+    guest_timeout: Duration,
+    total: Duration,
+) {
+    if tokio::time::timeout(total, undo(args, phase, guest_timeout))
+        .await
+        .is_err()
+    {
+        warn!(vm_id = %args.vm_id, snapshot = %args.snapshot, ?phase,
+            "gave up undoing a dead snapshot create's changes after {}s", total.as_secs());
     }
 }
 
@@ -594,6 +612,103 @@ mod tests {
         assert!(
             finished.is_ok(),
             "the guard waited 10 s on a guest reopen that never finishes"
+        );
+    }
+
+    /// A VMM that answers the resume's head and never sends its body does not keep the guard,
+    /// and the per-VM lock it holds, for ever: the client's timeout covers only the head.
+    #[test]
+    fn a_vmm_resume_that_never_finishes_does_not_hold_the_guard() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("api.sock");
+        let vmm = std::os::unix::net::UnixListener::bind(&api).unwrap();
+        std::thread::spawn(move || {
+            for stream in vmm.incoming() {
+                let stream = stream.unwrap();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    // The request's head; a connection that closes is the guard's check.
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    writer
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 64\r\n\r\n",
+                        )
+                        .unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                });
+            }
+        });
+        let args = SnapshotSourceGuardArgs {
+            channel_fd: -1,
+            pidfd: -1,
+            lock_fd: -1,
+            vm_id: "vm-guard-test-no-state".to_string(),
+            snapshot: "guard-test".to_string(),
+            hypervisor: Hypervisor::CloudHypervisor,
+            api_socket: api,
+            vsock_socket: None,
+            resume_timeout_secs: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let finished = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                bounded_undo(
+                    &args,
+                    Phase::Paused,
+                    Duration::from_millis(500),
+                    Duration::from_secs(2),
+                ),
+            )
+            .await
+        });
+        runtime.shutdown_background();
+        assert!(
+            finished.is_ok(),
+            "the guard waited 10 s on a VMM resume whose body never came"
+        );
+    }
+
+    /// The SIGKILL case in tests/test_lifecycle_interleave.rs kills and reaps its create on
+    /// every way out (a create left held at its failpoint keeps the generation lock that the
+    /// cleanup's delete waits on), and takes the time of the kill before the kill and
+    /// rejects an answer that arrives after the deadline.
+    #[test]
+    fn the_sigkill_case_reaps_its_create_and_rejects_a_late_recovery() {
+        let source = include_str!("../../tests/test_lifecycle_interleave.rs");
+        let start = source
+            .find("async fn killed_snapshot_create_resumes_its_source(")
+            .unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let killed_at = body.find("let killed_at = Instant::now();").unwrap();
+        let kill = body.find("libc::SIGKILL").unwrap();
+        assert!(killed_at < kill, "the kill's time is taken after the kill");
+        assert!(body.contains("break in_time(\"exec\""));
+        assert!(body.contains("break in_time(\"port\""));
+        let after_block = &body[body.rfind("}\n    .await;").unwrap()..];
+        let reaped = after_block
+            .find("start_kill()")
+            .expect("no kill of the create after the case");
+        let stopped = after_block.find("sigterm(vm_pid)").unwrap();
+        assert!(
+            reaped < stopped,
+            "the create is reaped after the VM is stopped"
         );
     }
 
