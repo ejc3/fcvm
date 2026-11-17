@@ -7,6 +7,10 @@ ignore = [
     # bincode is unmaintained but v1.3.3 is considered complete
     # Not a security issue - maintainers ceased development
     "RUSTSEC-2025-0141",
+    # chrono is unmaintained (advisory dated 2026-09-14, no fixed version). Not a
+    # vulnerability. fcvm is its only user; replacing it with a maintained date
+    # crate removes this entry.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
