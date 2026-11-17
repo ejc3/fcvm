@@ -675,6 +675,67 @@ class GpuboxWallReserve(unittest.TestCase):
                 self.assertEqual(launches, [], r.stderr)
                 self.assertIn("names no available host image", r.stderr)
                 self.assertFalse(any(" describe-images " in c and "--image-ids" not in c for c in r.calls), r.calls)
+
+    def test_a_staging_drill_falls_back_to_its_ordinary_predecessor(self):
+        safe, broken = "ami-" + "1" * 17, "ami-" + "2" * 17
+        identities = [
+            {"build_id": "reviewed-release-gate-drill:example"},
+            {"build_id": "reviewed-no-agent-drill:example"},
+            {"source_sha": "7457a0ff977a3471f4e8a2502b8248417576f737"},
+            {"source_sha": "c3831f6c43313e36db9ef461df87d6620755c6b4"},
+        ]
+        for identity in identities:
+            with self.subTest(identity=identity):
+                previous = {"generation": 17, "host_amis": {"us-east-1": {"x86_64": safe}}}
+                release = dict(identity, generation=18, host_amis={"us-east-1": {"x86_64": broken}}, previous=previous)
+                r, launches, _ = self.up(FAKE_RELEASE_RECORD=None, FAKE_RELEASE=json.dumps(release))
+                self.assertEqual(len(launches), 1, r.stderr)
+                self.assertIn(f"--image-id {safe} ", launches[0])
+                self.assertFalse(any(broken in call for call in r.calls), "never even consider the drill image")
+
+    def test_a_drill_copy_record_does_not_offer_an_image_to_gpubox(self):
+        safe, broken = "ami-" + "1" * 17, "ami-" + "2" * 17
+        for identity in ({"build_id": "reviewed-release-gate-drill:example"},
+                         {"source_sha": "c3831f6c43313e36db9ef461df87d6620755c6b4"}):
+            with self.subTest(identity=identity):
+                record = dict(identity, images={"us-west-2": {"host": broken}})
+                release = {"host_amis": {"us-west-2": {"x86_64": safe}}}
+                r, launches, _ = self.up(GPUBOX_REGION="us-west-2", FAKE_RELEASE_RECORD=json.dumps(record),
+                                        FAKE_RELEASE=json.dumps(release))
+                self.assertEqual(len(launches), 1, r.stderr)
+                self.assertIn(f"--image-id {safe} ", launches[0])
+                self.assertFalse(any(broken in call for call in r.calls))
+
+    def test_normal_copy_remains_usable_during_a_staging_drill(self):
+        safe, broken = "ami-" + "1" * 17, "ami-" + "2" * 17
+        release = {"build_id": "reviewed-no-agent-drill:example", "generation": 18,
+                   "host_amis": {"us-west-2": {"x86_64": broken}}}
+        record = {"build_id": "factory:example", "images": {"us-west-2": {"host": safe}}}
+        r, launches, _ = self.up(GPUBOX_REGION="us-west-2", FAKE_RELEASE_RECORD=json.dumps(record),
+                                FAKE_RELEASE=json.dumps(release))
+        self.assertEqual(len(launches), 1, r.stderr)
+        self.assertIn(f"--image-id {safe} ", launches[0])
+
+    def test_a_drill_with_no_older_ordinary_predecessor_cannot_launch(self):
+        broken = "ami-" + "2" * 17
+        previous = {"generation": 17, "build_id": "reviewed-release-gate-drill:example",
+                    "host_amis": {"us-east-1": {"x86_64": broken}},
+                    "previous": {"generation": 16, "host_amis": {"us-east-1": {"x86_64": "ami-" + "1" * 17}}}}
+        for invalid in (None, previous, dict(previous, build_id="factory:example", generation=18)):
+            with self.subTest(previous=invalid):
+                release = {"build_id": "reviewed-no-agent-drill:example", "generation": 18,
+                           "host_amis": {"us-east-1": {"x86_64": broken}}, "previous": invalid}
+                r, launches, _ = self.up(FAKE_RELEASE_RECORD=None, FAKE_RELEASE=json.dumps(release))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(launches, [], r.stderr)
+                self.assertIn("names no available host image", r.stderr)
+        release = {"build_id": "reviewed-no-agent-drill:example", "generation": "18",
+                   "host_amis": {"us-east-1": {"x86_64": broken}},
+                   "previous": {"generation": 17, "host_amis": {"us-east-1": {"x86_64": broken}}}}
+        r, launches, _ = self.up(FAKE_RELEASE_RECORD=None, FAKE_RELEASE=json.dumps(release))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(launches, [], r.stderr)
+
     def test_the_ledger_holds_four_field_lines_only(self):
         # A recent line of another shape (an admission whose vCPUs are unknown) refuses the launch;
         # an expired line is dropped whatever its shape, and the rewritten ledger is four-field.
