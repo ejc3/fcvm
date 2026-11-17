@@ -52,6 +52,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a create waits for a guard told [`DONE`] to exit before killing it.
 const STAND_DOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the guard waits for the guest's reopen. A healthy guest answers in well under a
+/// second once its vCPUs run. An exec whose command never finishes would otherwise wait for
+/// ever, and the guard holds the per-VM snapshot lock until it exits.
+const GUEST_REOPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How far a create got with its source, as the guard knows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Phase {
@@ -335,8 +340,10 @@ pub async fn cmd_snapshot_source_guard(args: SnapshotSourceGuardArgs) -> Result<
     match verdict {
         Verdict::StandDown | Verdict::Undo(Phase::Untouched) => Ok(()),
         Verdict::Undo(phase) => {
-            undo(&args, phase).await;
-            Ok(())
+            undo(&args, phase, GUEST_REOPEN_TIMEOUT).await;
+            // An exec abandoned by the timeout keeps a blocking thread, which the runtime's
+            // shutdown would wait for. Exit now: that also releases the per-VM lock.
+            std::process::exit(0);
         }
     }
 }
@@ -395,7 +402,7 @@ fn watch(channel: &mut std::os::unix::net::UnixStream, pidfd: &OwnedFd) -> Resul
 
 /// Reopen the source the way a create that finishes does: the vsock epoch and the VMM
 /// resume if the create asked for a pause, then the guest's reopen with the host's clock.
-async fn undo(args: &SnapshotSourceGuardArgs, phase: Phase) {
+async fn undo(args: &SnapshotSourceGuardArgs, phase: Phase, guest_timeout: Duration) {
     let vm_id = args.vm_id.as_str();
     let snapshot = args.snapshot.as_str();
     // An owner process that died took its VMM with it: nothing is left to reopen.
@@ -433,7 +440,15 @@ async fn undo(args: &SnapshotSourceGuardArgs, phase: Phase) {
         "not paused".to_string()
     };
     let guest = match &args.vsock_socket {
-        Some(vsock) => outcome(super::common::resume_paused_source(vsock, vm_id).await),
+        Some(vsock) => match tokio::time::timeout(
+            guest_timeout,
+            super::common::resume_paused_source(vsock, vm_id),
+        )
+        .await
+        {
+            Ok(result) => outcome(result),
+            Err(_) => format!("no answer within {}s", guest_timeout.as_secs_f64()),
+        },
         None => "no fc-agent".to_string(),
     };
     warn!(vm_id, snapshot, ?phase, vmm_resume = %vmm, guest_reopen = %guest,
@@ -499,6 +514,64 @@ mod tests {
             assert_eq!(watch(&mut guard, &pidfd).unwrap(), expected);
             drop(create);
         }
+    }
+
+    /// A guest whose reopen is acknowledged and then never finishes does not keep the guard,
+    /// and the per-VM lock it holds, for ever. The fake agent completes the exec handshake
+    /// (CONNECT, request, ACK, GO) and then says nothing.
+    #[test]
+    fn a_guest_reopen_that_never_finishes_does_not_hold_the_guard() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("api.sock");
+        let vsock = dir.path().join("vsock.sock");
+        // Listening, never accepting: the guard's check that the VMM is still there connects.
+        let _api = std::os::unix::net::UnixListener::bind(&api).unwrap();
+        let agent = std::os::unix::net::UnixListener::bind(&vsock).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = agent.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap(); // CONNECT <port>
+            writer.write_all(b"OK 1\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // the request
+            writeln!(writer, "{}", exec_proto::HANDSHAKE_ACK).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // GO
+            loop {
+                std::thread::park();
+            }
+        });
+        let args = SnapshotSourceGuardArgs {
+            channel_fd: -1,
+            pidfd: -1,
+            lock_fd: -1,
+            vm_id: "vm-guard-test-no-state".to_string(),
+            snapshot: "guard-test".to_string(),
+            hypervisor: Hypervisor::Firecracker,
+            api_socket: api,
+            vsock_socket: Some(vsock),
+            resume_timeout_secs: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let finished = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                undo(&args, Phase::Prepared, Duration::from_millis(500)),
+            )
+            .await
+        });
+        // The abandoned exec's blocking thread is still reading; do not wait for it.
+        runtime.shutdown_background();
+        assert!(
+            finished.is_ok(),
+            "the guard waited 10 s on a guest reopen that never finishes"
+        );
     }
 
     /// Creates the guard's socket pair and pidfd with close-on-exec, so no other child of
