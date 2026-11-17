@@ -973,6 +973,7 @@ pub(super) fn build_boot_plan_json(
         host_clock: crate::utils::host_clock_now(),
         ntp_servers: host_ntp_servers(),
         transparent_hugepage: vm_state.config.guest_thp.clone(),
+        guest_mtu: network_config.guest_mtu,
     };
 
     launch_config.to_mmds_json(runtime)

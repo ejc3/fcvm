@@ -5278,6 +5278,25 @@ mod tests {
         );
     }
 
+    /// The restoring namespace's MTU is on eth0 before the boundary opens egress:
+    /// every daemon that reconnects then opens its connection with the MSS that
+    /// MTU allows. Set after, the reconnects that bring a restored web-server clone about
+    /// 1 GB from host services in its first 30 s arrive in 1514-byte frames, and
+    /// the clone's TAP dropped 75 to 86 percent of them (2026-11-16).
+    #[test]
+    fn the_guest_mtu_is_set_before_the_boundary_opens_egress() {
+        let body = crate::restore::handle_clone_restore_source();
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        assert!(
+            at("network::apply_guest_mtu(mtu)")
+                < at("crate::snapshot_network::restore_snapshot_network("),
+            "the guest MTU is set after the boundary opens egress"
+        );
+    }
+
     /// A routed clone's IPv6 gateway is pinned after the neighbour flush and
     /// before the IPv6 swap (#1160). A resolution of the gateway in flight
     /// across the swap is sourced from the snapshot-time address the swap

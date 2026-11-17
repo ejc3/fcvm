@@ -818,6 +818,7 @@ impl NetworkManager for BridgedNetwork {
             http_proxy: proxies.http_url,
             https_proxy: proxies.https_url,
             namespace_name: None,
+            guest_mtu: None,
         })
     }
 

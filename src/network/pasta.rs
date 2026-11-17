@@ -39,6 +39,21 @@ const GUEST_IPV6_GATEWAY: &str = "fd00::2";
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
+/// MTU of every link between the guest and pasta: the guest's eth0, the VM's TAP,
+/// `br0` and pasta's TAP. pasta ends the guest's TCP connections and opens its own
+/// on the host, so nothing past pasta sees these frames, and 65520 is pasta's own
+/// default. At 1500 each frame pasta writes carries 1460 bytes, and a restored
+/// guest receiving a bulk transfer is bound by frames per second: a web-server clone
+/// whose daemons pulled about 1 GB from host services right after a restore took
+/// 45,000 to 80,000 frames a second on one vCPU, and its TAP dropped 75 to 86
+/// percent of the frames pasta sent (2026-11-16). At 65520 the first 2 GiB
+/// download into a freshly restored guest took 3.2 s with no drop, against
+/// 69.5 s and 9.7 million drops at 1500. The guest takes this value from the
+/// boot plan and from each restore document (`NetworkConfig::guest_mtu`); the
+/// host's links are set to it whatever the guest does, so a guest that keeps
+/// 1500 (a snapshot made before this) only sends and receives smaller frames.
+pub const GUEST_MTU: u32 = 65520;
+
 /// TAP device name for pasta
 const PASTA_DEVICE_NAME: &str = "pasta0";
 
@@ -1077,6 +1092,14 @@ impl PastaNetwork {
         self.isolated
     }
 
+    /// The MTU of this namespace's links and of the guest's eth0: [`GUEST_MTU`] behind
+    /// pasta, none (1500) in an isolated namespace, which has no pasta behind its bridge.
+    /// The TAP, the guest (`setup`'s `guest_mtu`) and the bridge script's early return
+    /// for an isolated namespace all follow this one decision.
+    fn links_mtu(&self) -> Option<u32> {
+        (!self.isolated).then_some(GUEST_MTU)
+    }
+
     /// Set a unique loopback IP for port forwarding (127.x.y.z)
     ///
     /// Each VM gets a unique loopback IP so multiple VMs can forward the same
@@ -1145,30 +1168,34 @@ impl PastaNetwork {
     ///
     /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<script()>'
     pub fn build_setup_script(&self) -> IpBatchScript {
-        IpBatchScript::new(
-            vec![
-                (
-                    format!("create TAP device {} for Firecracker", self.tap_device),
-                    format!("tuntap add {} mode tap", self.tap_device),
-                ),
-                (
-                    format!("bring TAP device {} up", self.tap_device),
-                    format!("link set {} up", self.tap_device),
-                ),
-                (
-                    "bring loopback up".to_string(),
-                    "link set lo up".to_string(),
-                ),
-                // Verification is the last batch step rather than a second
-                // nsenter+ip process: `ip -batch` already stops at the first
-                // failure, so reaching this line means every step above applied.
-                (
-                    format!("verify TAP device {} exists", self.tap_device),
-                    format!("link show {}", self.tap_device),
-                ),
-            ],
-            &[&self.restore_udp_gate_script()],
-        )
+        let mut steps = vec![(
+            format!("create TAP device {} for Firecracker", self.tap_device),
+            format!("tuntap add {} mode tap", self.tap_device),
+        )];
+        if let Some(mtu) = self.links_mtu() {
+            steps.push((
+                format!("set TAP device {} MTU to {}", self.tap_device, mtu),
+                format!("link set {} mtu {}", self.tap_device, mtu),
+            ));
+        }
+        steps.extend([
+            (
+                format!("bring TAP device {} up", self.tap_device),
+                format!("link set {} up", self.tap_device),
+            ),
+            (
+                "bring loopback up".to_string(),
+                "link set lo up".to_string(),
+            ),
+            // Verification is the last batch step rather than a second
+            // nsenter+ip process: `ip -batch` already stops at the first
+            // failure, so reaching this line means every step above applied.
+            (
+                format!("verify TAP device {} exists", self.tap_device),
+                format!("link show {}", self.tap_device),
+            ),
+        ]);
+        IpBatchScript::new(steps, &[&self.restore_udp_gate_script()])
     }
 
     /// In restore mode, the `tc` lines that drop datagrams to the published UDP guest
@@ -1206,6 +1233,10 @@ impl PastaNetwork {
         IpBatchScript::new(
             vec![
                 (
+                    format!("set pasta TAP {} MTU to {}", self.pasta_device, GUEST_MTU),
+                    format!("link set {} mtu {}", self.pasta_device, GUEST_MTU),
+                ),
+                (
                     format!(
                         "bring {} up (pasta creates it but leaves it down without --config-net)",
                         self.pasta_device
@@ -1234,6 +1265,13 @@ impl PastaNetwork {
                         self.tap_device, bridge
                     ),
                     format!("link set {} master {}", self.tap_device, bridge),
+                ),
+                // Explicit, though the bridge would take its ports' smallest MTU: a
+                // bridge whose MTU was set no longer follows its ports, so this is
+                // the value whatever joins it later.
+                (
+                    format!("set bridge {} MTU to {}", bridge, GUEST_MTU),
+                    format!("link set {} mtu {}", bridge, GUEST_MTU),
                 ),
                 (
                     format!(
@@ -1439,6 +1477,11 @@ impl PastaNetwork {
         push("-g");
         push(GUEST_GATEWAY); // Gateway — pasta responds to ARP for this
         push("--no-dhcp");
+        // The MTU pasta advertises over DHCP and NDP. fcvm addresses the guest itself,
+        // but this is pinned to the links' MTU rather than left to pasta's default (the
+        // same value today), so nothing pasta advertises disagrees with the links.
+        push("-m");
+        push(&GUEST_MTU.to_string());
 
         // If host has global IPv6, configure pasta for IPv6 outbound
         if let Some(ipv6) = host_ipv6 {
@@ -2220,6 +2263,7 @@ impl NetworkManager for PastaNetwork {
             http_proxy,
             https_proxy,
             namespace_name: None,
+            guest_mtu: self.links_mtu(),
         })
     }
 
@@ -2550,6 +2594,10 @@ mod tests {
         assert!(contains_run(&args, &["-g", "10.0.2.2"]), "{args:?}");
         assert!(contains_run(&args, &["-n", "255.255.255.0"]), "{args:?}");
         assert!(contains_run(&args, &["--no-dhcp"]), "{args:?}");
+        assert!(
+            contains_run(&args, &["-m", &GUEST_MTU.to_string()]),
+            "{args:?}"
+        );
         // No host IPv6: IPv6 in local mode, the gateway mapped to the host's ::1, and no
         // outbound address (#1026).
         assert!(contains_run(&args, &["-a", "fd00::100"]), "{args:?}");
@@ -4250,6 +4298,7 @@ mod tests {
             batch_lines(script.script()),
             vec![
                 "tuntap add tap-fc mode tap",
+                "link set tap-fc mtu 65520",
                 "link set tap-fc up",
                 "link set lo up",
                 "link show tap-fc",
@@ -4267,6 +4316,7 @@ mod tests {
         assert_eq!(
             batch_lines(script.script()),
             vec![
+                "link set pasta0 mtu 65520",
                 "link set pasta0 up",
                 "link add br0 type bridge",
                 // Pinned so the guest can hold an authoritative neighbour entry
@@ -4275,6 +4325,7 @@ mod tests {
                 "link set br0 up",
                 "link set pasta0 master br0",
                 "link set tap-fc master br0",
+                "link set br0 mtu 65520",
                 "addr add 10.0.2.1/24 dev br0",
             ]
         );
@@ -4313,7 +4364,9 @@ mod tests {
             );
         }
         assert!(!net.build_setup_script().script().contains("route"));
+        assert!(!net.build_setup_script().script().contains("mtu"));
         let config = net.setup().await.unwrap();
+        assert_eq!(config.guest_mtu, None, "an isolated guest keeps 1500");
         assert_eq!(config.guest_ip.as_deref(), Some("10.0.2.100/24"));
         assert_eq!(config.host_ip, None, "an isolated guest has no gateway");
         assert_eq!(config.dns_server, None);
@@ -4332,14 +4385,34 @@ mod tests {
         assert!(body[isolated..pasta].contains("return self.run_bridge_script(holder_pid).await;"));
     }
 
+    /// The guest is told to take the namespace links' MTU, the one the setup and
+    /// bridge scripts give the TAP, pasta0 and br0.
+    #[tokio::test]
+    async fn a_rootless_guest_takes_the_namespace_link_mtu() {
+        let mut net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        assert_eq!(net.setup().await.unwrap().guest_mtu, Some(GUEST_MTU));
+        let mtu_line = format!("mtu {GUEST_MTU}");
+        assert!(net
+            .build_setup_script()
+            .script()
+            .contains(&format!("link set tap-fc {mtu_line}")));
+        let bridge = net.build_bridge_script();
+        assert!(bridge
+            .script()
+            .contains(&format!("link set pasta0 {mtu_line}")));
+        assert!(bridge
+            .script()
+            .contains(&format!("link set br0 {mtu_line}")));
+    }
+
     #[test]
     fn batch_failure_names_the_failing_step() {
         let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
         let script = net.build_bridge_script();
 
         // `ip -batch` aborts at the first failing line and reports `-:<line>`.
-        let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:2\n");
-        assert!(msg.contains("step 2/7"), "missing step index: {msg}");
+        let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:3\n");
+        assert!(msg.contains("step 3/9"), "missing step index: {msg}");
         assert!(
             msg.contains("create L2 bridge br0"),
             "missing step name: {msg}"
