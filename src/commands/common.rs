@@ -7111,6 +7111,8 @@ pub async fn create_snapshot_ch(
         .record_pause(&snapshot_config.vm_id, &snapshot_config.name)
         .await;
 
+    // failpoint: hold after the save (VM still paused) and before the resume, as on Firecracker.
+    failpoint::hit_async("snapshot.post_save_pre_resume").await;
     // Resume a normal source even if the snapshot or disk copy failed. A `--stop` source
     // never runs again: its fcvm is stopped next, so it stays paused and its guest gate shut.
     let hypervisor_resume_result = match source_disposition {
