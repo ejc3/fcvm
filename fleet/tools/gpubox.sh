@@ -1,6 +1,10 @@
 #!/bin/bash
 # gpubox: a leased g4dn.metal (8 T4 on vfio-pci, fcvm built, gpu profile set up, renderer
 # warmed) from the fleet's GPU host AMI, in the fcvm-fleet account, for one agent's GPU work.
+# The image carries no Rust toolchain (the fleet's hosts run no cargo), so once a box is ready
+# `up` and `wait` install the checkout's pinned one for the ubuntu user (rustup, then
+# `rustup toolchain install` in /home/ubuntu/fcvm, which reads rust-toolchain.toml), skipped
+# when ~/.cargo/bin/cargo exists. A failed install fails `up` and `wait`.
 #
 #   gpubox.sh up [--hours N] [--owner NAME] [--no-wait]
 #                                  launch (spot, then on demand), wait until ready, print
@@ -116,6 +120,18 @@ ssm() { # id, command: print output, return the command's exit status
   return "$([ "$code" -ge 0 ] 2>/dev/null && echo "$code" || echo 1)"
 }
 
+# The pinned toolchain for the ubuntu user, from the checkout's rust-toolchain.toml. The fleet's
+# host image has none on purpose, so a gpubox gets it here and the fleet's hosts stay without.
+# Only the rustup bootstrap is skipped when cargo exists: the proxy appears before the pinned
+# toolchain is downloaded, so a retry after a failed download must still install it (rustup
+# makes that a no-op when it is there).
+TOOLCHAIN_INSTALL='if sudo -u ubuntu -H test -x /home/ubuntu/.cargo/bin/cargo; then echo "rustup already installed"; else
+  sudo -u ubuntu -H bash -c "set -euo pipefail
+    curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none"
+fi
+sudo -u ubuntu -H bash -c "set -euo pipefail
+  cd /home/ubuntu/fcvm && /home/ubuntu/.cargo/bin/rustup toolchain install"'
+
 wait_ready() {
   local t0=$1 id=$2 st
   until [ "$(A ssm describe-instance-information --filters Key=InstanceIds,Values="$id" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)" = Online ]; do
@@ -133,7 +149,12 @@ wait_ready() {
     esac
     sleep 10
   done
-  say "ready after $(( $(now) - t0 )) s: $(ssm "$id" "wc -l < /run/fcvm-fleet/gpus") GPUs on vfio-pci, store restored"
+  local gpus tc0
+  gpus=$(ssm "$id" "wc -l < /run/fcvm-fleet/gpus")
+  tc0=$(now)
+  ssm "$id" "$TOOLCHAIN_INSTALL" >&2 \
+    || die "$id: installing the Rust toolchain failed (output above); the box is up but make targets that build will not work. Retry with: gpubox.sh wait $id"
+  say "ready after $(( $(now) - t0 )) s: $gpus GPUs on vfio-pci, store restored, Rust toolchain in $(( $(now) - tc0 )) s"
 }
 
 lease_userdata() { # lease end, "YYYY-MM-DD HH:MM:SS"

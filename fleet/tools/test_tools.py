@@ -713,6 +713,100 @@ if __name__ == "__main__":
     unittest.main()
 
 
+FAKE_WAIT_AWS = r"""#!/bin/bash
+# A stand-in for the AWS CLI for `gpubox.sh wait`: one running gpubox whose units are active.
+# Every SSM command is saved in order as $FAKE_LOG.cmd.N; the Rust toolchain install (the command
+# that mentions rustup) exits with FAKE_INSTALL_STATUS.
+args=" $* "
+case "$args" in
+  *" sts get-caller-identity "*) echo 123456789012 ;;
+  *" ec2 describe-instances "*"--instance-ids "*"Purpose"*) echo fcvm-fleet-gpubox ;;
+  *" ec2 describe-instances "*) echo running ;;
+  *" ssm describe-instance-information "*) echo Online ;;
+  *" ssm send-command "*)
+    n=$(( $(cat "$FAKE_LOG.n" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG.n"
+    sed -n 's/.*--parameters \(.*\) --timeout-seconds.*/\1/p' <<<"$*" | jq -r '.commands[0]' > "$FAKE_LOG.cmd.$n"
+    echo $n ;;
+  *" ssm get-command-invocation "*)
+    id=$(sed -n 's/.*--command-id \([0-9]*\).*/\1/p' <<<"$args"); cmd=$(cat "$FAKE_LOG.cmd.$id")
+    code=0; out=""
+    case "$cmd" in
+      *is-active*) out="active active" ;;
+      *"wc -l"*) out=8 ;;
+      *rustup*) code=${FAKE_INSTALL_STATUS:-0}; out="installing" ;;
+    esac
+    case "$args" in
+      *"--query Status"*) [ "$code" = 0 ] && echo Success || echo Failed ;;
+      *"--query ResponseCode"*) echo $code ;;
+      *) jq -nc --arg o "$out" '{StandardOutputContent:$o, StandardErrorContent:""}' ;;
+    esac ;;
+  *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class GpuboxToolchain(unittest.TestCase):
+    """A gpubox is ready only once the pinned Rust toolchain is installed (#1934): the host image has none."""
+
+    def wait(self, **extra):
+        import tempfile
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(FAKE_WAIT_AWS)
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        log = os.path.join(d, "calls")
+        env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
+                   GPUBOX_REGIONS="us-west-2", **extra)
+        r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "wait", "i-0123456789abcdef0"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        cmds = []
+        k = 1
+        while os.path.exists(f"{log}.cmd.{k}"):
+            with open(f"{log}.cmd.{k}") as f:
+                cmds.append(f.read())
+            k += 1
+        return r, cmds
+
+    def test_wait_installs_the_pinned_toolchain_after_the_units_are_active(self):
+        r, cmds = self.wait()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        install = [i for i, c in enumerate(cmds) if "rustup" in c]
+        self.assertEqual(len(install), 1, cmds)
+        self.assertTrue(any("is-active" in c for c in cmds[:install[0]]), cmds)
+        c = cmds[install[0]]
+        self.assertIn("--default-toolchain none", c)
+        self.assertIn("cd /home/ubuntu/fcvm", c)
+        self.assertIn("rustup toolchain install", c)
+        self.assertIn("test -x /home/ubuntu/.cargo/bin/cargo", c)
+        self.assertRegex(r.stderr, r"ready after \d+ s: 8 GPUs on vfio-pci, store restored, Rust toolchain in \d+ s")
+
+    def test_a_failed_toolchain_install_fails_wait(self):
+        r, cmds = self.wait(FAKE_INSTALL_STATUS="7")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("installing the Rust toolchain failed", r.stderr)
+        self.assertNotIn("ready after", r.stderr)
+
+
+    def test_the_pinned_toolchain_is_installed_even_when_the_cargo_proxy_exists(self):
+        # rustup creates ~/.cargo/bin/cargo before it downloads the pinned toolchain, so a retry
+        # after a failed download finds the proxy and must still run the toolchain install.
+        import re
+        import tempfile
+        src = open(os.path.join(HERE, "gpubox.sh")).read()
+        script = re.search(r"^TOOLCHAIN_INSTALL='(.*?)'$", src, re.S | re.M).group(1)
+        for have_cargo in (True, False):
+            with self.subTest(have_cargo=have_cargo):
+                log = os.path.join(tempfile.mkdtemp(), "sudo")
+                prelude = ('sudo() { shift 3; if [ "$1" = test ]; then return %d; fi; echo "$*" >> "$LOG"; }\n'
+                           % (0 if have_cargo else 1))
+                r = subprocess.run(["bash", "-c", prelude + script], env=dict(os.environ, LOG=log),
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                ran = open(log).read() if os.path.exists(log) else ""
+                self.assertIn("rustup toolchain install", ran)
+                self.assertEqual("sh.rustup.rs" in ran, not have_cargo, ran)
+
+
 class PathrunLighting(unittest.TestCase):
     def test_a_late_pass_posts_the_latest_time_of_day_not_the_next(self):
         # The director's time of day moves every second while the camera flies; pathrun
