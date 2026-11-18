@@ -27,6 +27,27 @@ pub const PLAYBACK_TOKEN_SECS: u64 = 3600;
 /// The direct token's query parameter on a frame URL.
 pub const ADMIT_PARAM: &str = "admit";
 
+/// The frame streams one tile (a renderer, `MAX_FLEET_STREAMS` in fleet/renderer/src/access.h)
+/// or an aggregator's public listener serves at once (fleet/PROTOCOL.md, "Stream limits").
+pub const STREAMS_PER_TILE: usize = 512;
+/// The streams of a tile that are not a seated viewer's: the aggregators that read it (the EC2
+/// aggregator, a host's, the broadcast's, each twice while a new layout takes over).
+pub const STREAM_RESERVE: usize = 12;
+/// The most seats `--direct-capacity` may hold: every seated viewer streams once from each
+/// tile, and the tile serves [`STREAMS_PER_TILE`] in all.
+pub const MAX_SEATS: usize = STREAMS_PER_TILE - STREAM_RESERVE;
+
+/// Refuses a seat count the tiles cannot all stream to.
+pub fn check_direct_capacity(capacity: usize) -> Result<()> {
+    if capacity > MAX_SEATS {
+        bail!(
+            "--direct-capacity {capacity} is more than the {MAX_SEATS} seats a tile streams to \
+             ({STREAMS_PER_TILE} streams, {STREAM_RESERVE} kept for aggregators)"
+        );
+    }
+    Ok(())
+}
+
 /// Base64url without padding (RFC 4648 section 5).
 pub fn b64url(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -102,6 +123,17 @@ pub fn direct_token_valid(keys: &[AdmitKey], token: &str, now: u64) -> bool {
         };
         ring::hmac::verify(&key, signed.as_bytes(), &mac).is_ok()
     })
+}
+
+/// The viewer a direct token names, without checking its mac or expiry: call it on a token
+/// [`direct_token_valid`] accepted.
+pub fn direct_token_viewer(token: &str) -> Option<&str> {
+    let (signed, _) = token.rsplit_once('.')?;
+    let mut parts = signed.splitn(3, '.');
+    let (Some("v1"), Some(_), Some(viewer)) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    (!viewer.is_empty()).then_some(viewer)
 }
 
 pub(super) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -600,6 +632,25 @@ mod tests {
         assert!(with.broadcast.is_some());
         let without = gate.message(&seat, "v-1", None, 1_000_000, now);
         assert!(without.broadcast.is_none(), "an unbound playback token");
+    }
+
+    /// Every seated viewer streams once from each tile, so the seats fit in what a tile streams
+    /// to, and the renderer's cap is the one this file names.
+    #[test]
+    fn the_tile_stream_cap_covers_every_seat() {
+        assert!(check_direct_capacity(500).is_ok(), "the default seats");
+        assert!(check_direct_capacity(MAX_SEATS).is_ok());
+        assert!(check_direct_capacity(MAX_SEATS + 1).is_err());
+        let access_h = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fleet/renderer/src/access.h"
+        ))
+        .expect("reading fleet/renderer/src/access.h");
+        let want = format!("constexpr size_t MAX_FLEET_STREAMS = {STREAMS_PER_TILE};");
+        assert!(
+            access_h.lines().any(|l| l.trim() == want),
+            "fleet/renderer/src/access.h does not say `{want}`"
+        );
     }
 
     #[test]

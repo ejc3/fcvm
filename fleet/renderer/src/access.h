@@ -7,8 +7,11 @@
 // /budget need `Authorization: Bearer <token>`, and GET /frames is refused until the first
 // scene has said whether streams need a direct token.
 #pragma once
+#include <stdint.h>
 #include <sys/stat.h>
 
+#include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -53,3 +56,47 @@ constexpr int ADMIT_WAIT_MS = 5000;
 // The direct token in a client's first message, `{"admit":"<token>"}`; false when the text
 // is not such a message.
 bool admit_message(const std::string& text, std::string* token);
+
+// What a fleet server streams (fleet/PROTOCOL.md, "Access", "Stream limits").
+//
+// At most this many frame streams at once: the coordinator's seats (--direct-capacity, at most
+// MAX_SEATS in src/fleet/coord/admission.rs) and STREAM_RESERVE there for the aggregators that
+// read a tile. The test `the_tile_stream_cap_covers_every_seat` holds the two files together.
+constexpr size_t MAX_FLEET_STREAMS = 512;
+// The tallest stream: the largest height the page asks for (STREAM_HEIGHTS in
+// fleet/web/core/layout.ts, already scaled by the device pixel ratio).
+constexpr int FLEET_MAX_STREAM_H = 1080;
+// The quality a stream may ask for (quality_from_name: 0 lo, 1 std, 2 hi). The page asks std or
+// lo; q=hi (up to 8 times std's bit rate) is for an aggregator, whose own tokens name a viewer
+// `aggregator-<id>`. With admission off no token names anyone, and any quality is served.
+int fleet_max_quality(bool admission, const std::string& viewer);
+
+// The frame streams open on one server. A stream admitted for a viewer (the one its direct
+// token names) replaces any stream already open for the same viewer, so a reloaded page gets its
+// stream at once and one token never holds two; past `cap` streams a new one is refused.
+class StreamTable {
+ public:
+  explicit StreamTable(size_t cap) : cap_(cap) {}
+  // Takes a place for a stream of `viewer` (empty: admission is off and no viewer is named).
+  // A stream already open for the same viewer is stopped: its `stop` is called once, under the
+  // table's lock, so it runs while that stream's connection is still open (its close() waits for
+  // the lock). The new stream takes the place whatever the count. Otherwise returns false when
+  // `cap` streams are open. On true, *id is what close() takes.
+  bool open(const std::string& viewer, std::function<void()> stop, uint64_t* id);
+  // The stream has ended (its connection is about to close): frees its place.
+  void close(uint64_t id);
+  size_t size();
+  // Tests: a smaller cap.
+  void set_cap(size_t cap);
+
+ private:
+  struct Entry {
+    std::string viewer;
+    std::function<void()> stop;
+  };
+  std::mutex mu_;
+  size_t cap_;
+  uint64_t next_ = 1;
+  std::map<uint64_t, Entry> open_;
+  std::map<std::string, uint64_t> by_viewer_;  // the newest stream of each viewer
+};

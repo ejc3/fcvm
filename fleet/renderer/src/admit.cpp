@@ -57,6 +57,14 @@ bool admit_token_valid(const std::vector<std::string>& keys, const std::string& 
   return false;
 }
 
+std::string admit_token_viewer(const std::string& token) {
+  size_t last = token.rfind('.');
+  if (last == std::string::npos || token.compare(0, 3, "v1.") != 0) return "";
+  size_t dot = token.find('.', 3);
+  if (dot == std::string::npos || dot >= last) return "";
+  return token.substr(dot + 1, last - dot - 1);
+}
+
 std::vector<std::string> admit_keys_after(const std::vector<std::string>& held, const std::vector<std::string>& fresh) {
   std::vector<std::string> out = fresh;
   for (const std::string& k : held)

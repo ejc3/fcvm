@@ -1238,6 +1238,23 @@ async fn each_tile_reconnect_carries_a_token_made_for_it() {
         distinct.len() >= 2,
         "every reconnect reused the first token"
     );
+    // One viewer for the reader's every reconnect (a reconnect replaces its own stale stream),
+    // named as an aggregator, which a renderer serves q=hi, and unique to this reader (another
+    // aggregator reading the tile must not replace it).
+    let viewers: std::collections::BTreeSet<&str> = seen
+        .iter()
+        .filter_map(|t| fcvm::fleet::coord::admission::direct_token_viewer(t))
+        .collect();
+    assert_eq!(viewers.len(), 1, "{viewers:?}");
+    let name = viewers.into_iter().next().unwrap();
+    assert!(
+        name.len() > "aggregator-".len() && name.starts_with("aggregator-"),
+        "{name}"
+    );
+    assert_ne!(
+        fcvm::fleet::aggregate::subscriber_name(),
+        fcvm::fleet::aggregate::subscriber_name()
+    );
 }
 
 /// Before its first layout an aggregator does not know whether streams need a token, so its
@@ -1280,4 +1297,118 @@ async fn the_public_listener_serves_nothing_before_the_first_layout() {
             .await
             .is_ok()
     );
+}
+
+/// The public listener streams once per viewer: a newer stream with a token naming the same
+/// viewer (a reload, or the page's refreshed token) closes the older with 1008, and other
+/// viewers keep theirs. Past its cap a new viewer is closed with 1013; a viewer that already
+/// streams still replaces its own. Without admission keys streams are counted, never replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_public_listener_streams_once_per_viewer_and_up_to_its_cap() {
+    use fcvm::fleet::aggregate::{admit_first_message, public_router};
+    use fcvm::fleet::coord::admission::AdmitKey;
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+    let key = AdmitKey([9; 32]);
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let layout = |admit_keys: Vec<String>| Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![],
+        generation: 0,
+        from_frame: 0,
+        admit_keys,
+    };
+    let serve = |shared: Arc<Shared>| async move {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, public_router(shared)).await.unwrap() });
+        addr
+    };
+    async fn open(addr: std::net::SocketAddr, token: Option<String>) -> Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+            .await
+            .unwrap();
+        if let Some(t) = token {
+            ws.send(Message::Text(admit_first_message(&t).into()))
+                .await
+                .unwrap();
+        }
+        ws
+    }
+    async fn closed_with(ws: &mut Ws) -> Option<u16> {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Close(Some(f))))) => Some(u16::from(f.code)),
+            _ => None,
+        }
+    }
+    async fn still_open(ws: &mut Ws) -> bool {
+        tokio::time::timeout(Duration::from_millis(300), ws.next())
+            .await
+            .is_err()
+    }
+    async fn until(shared: &Shared, n: usize) {
+        for _ in 0..500 {
+            if shared.open_streams() == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} streams open, not {n}", shared.open_streams());
+    }
+    let token = |viewer: &str, exp_delta: u64| {
+        Some(key.direct_token(viewer, now_ms() / 1000 + 600 + exp_delta))
+    };
+
+    let shared = Shared::new();
+    shared.set_layout(layout(vec![key.hex()]));
+    shared.set_stream_cap(2);
+    let addr = serve(shared.clone()).await;
+    let mut a = open(addr, token("v-1", 0)).await;
+    until(&shared, 1).await;
+    // The page's refreshed token: the same viewer, a later expiry.
+    let mut a2 = open(addr, token("v-1", 300)).await;
+    assert_eq!(
+        closed_with(&mut a).await,
+        Some(1008),
+        "the older stream of v-1"
+    );
+    until(&shared, 1).await;
+    assert!(still_open(&mut a2).await, "the newer stream of v-1");
+    let mut b = open(addr, token("v-2", 0)).await;
+    until(&shared, 2).await;
+    let mut c = open(addr, token("v-3", 0)).await;
+    assert_eq!(closed_with(&mut c).await, Some(1013), "past the cap");
+    assert_eq!(shared.open_streams(), 2);
+    let mut a3 = open(addr, token("v-1", 0)).await;
+    assert_eq!(
+        closed_with(&mut a2).await,
+        Some(1008),
+        "at the cap a viewer still replaces its own stream"
+    );
+    assert!(still_open(&mut b).await && still_open(&mut a3).await);
+    drop((a3, b));
+    until(&shared, 0).await;
+
+    let open_shared = Shared::new();
+    open_shared.set_layout(layout(Vec::new()));
+    open_shared.set_stream_cap(2);
+    let addr = serve(open_shared.clone()).await;
+    let mut x = open(addr, None).await;
+    let mut y = open(addr, None).await;
+    until(&open_shared, 2).await;
+    let mut z = open(addr, None).await;
+    assert_eq!(
+        closed_with(&mut z).await,
+        Some(1013),
+        "a third anonymous stream"
+    );
+    assert!(still_open(&mut x).await && still_open(&mut y).await);
 }

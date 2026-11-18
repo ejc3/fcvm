@@ -12,6 +12,9 @@ std::string admit_key_from_hex(const std::string& hex);
 std::string b64url(const unsigned char* p, size_t n);
 // Whether `token` was made with one of `keys` (raw) and has not expired at `now_s`.
 bool admit_token_valid(const std::vector<std::string>& keys, const std::string& token, int64_t now_s);
+// The viewer a direct token names (`v1.<expiry>.<viewer>.<mac>`), without checking its mac or
+// expiry; empty when the text is not shaped like a token. Call it on a token already admitted.
+std::string admit_token_viewer(const std::string& token);
 // The keys to hold after a scene brings `fresh` (raw, newest first): the fresh ones, then
 // the ones held before that are not among them, at most 4, so a token made just before a new
 // key still opens a stream.

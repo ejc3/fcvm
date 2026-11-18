@@ -27,6 +27,7 @@ mod tile;
 pub mod tls;
 
 use crate::cli::{FleetAggregateArgs, FleetAggregateCodec};
+use crate::fleet::coord::admission::direct_token_viewer;
 use crate::fleet::now_ms;
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
@@ -157,6 +158,40 @@ pub struct Shared {
     layout: watch::Sender<Option<Layout>>,
     /// The bearer token `POST /layout` needs; without one only this host may post.
     layout_token: std::sync::OnceLock<String>,
+    /// The public listener's open streams.
+    streams: Mutex<Streams>,
+}
+
+/// The public listener's open streams (fleet/PROTOCOL.md, "Stream limits"): one per viewer a
+/// direct token names (a newer stream replaces the older, so a reloaded page streams at once and
+/// one token never holds two), at most `cap` in all.
+struct Streams {
+    cap: usize,
+    next: u64,
+    /// Each open stream's stop, cancelled when a newer stream of its viewer replaces it.
+    open: HashMap<u64, CancellationToken>,
+    /// The newest stream of each viewer.
+    by_viewer: HashMap<String, u64>,
+}
+
+/// A stream's place among the open ones, given back when it is dropped.
+struct StreamPlace {
+    app: Arc<Shared>,
+    id: u64,
+    viewer: Option<String>,
+    stop: CancellationToken,
+}
+
+impl Drop for StreamPlace {
+    fn drop(&mut self) {
+        let mut s = self.app.streams.lock().unwrap();
+        s.open.remove(&self.id);
+        if let Some(v) = &self.viewer {
+            if s.by_viewer.get(v) == Some(&self.id) {
+                s.by_viewer.remove(v);
+            }
+        }
+    }
 }
 
 impl Shared {
@@ -167,6 +202,52 @@ impl Shared {
             stats: Mutex::default(),
             layout: watch::channel(None).0,
             layout_token: std::sync::OnceLock::new(),
+            streams: Mutex::new(Streams {
+                cap: crate::fleet::coord::admission::STREAMS_PER_TILE,
+                next: 0,
+                open: HashMap::new(),
+                by_viewer: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Tests: a smaller cap on the public listener's streams.
+    pub fn set_stream_cap(&self, cap: usize) {
+        self.streams.lock().unwrap().cap = cap;
+    }
+
+    /// How many streams the public listener has open.
+    pub fn open_streams(&self) -> usize {
+        self.streams.lock().unwrap().open.len()
+    }
+
+    /// A place for a stream of `viewer` (`None`: admission is off and no token names one). A
+    /// stream already open for the same viewer is stopped, and the new one takes the place
+    /// whatever the count; otherwise `None` when `cap` streams are open.
+    fn open_stream(self: &Arc<Self>, viewer: Option<String>) -> Option<StreamPlace> {
+        let mut s = self.streams.lock().unwrap();
+        let held = viewer.as_ref().and_then(|v| s.by_viewer.get(v).copied());
+        match held {
+            Some(old) => {
+                if let Some(stop) = s.open.get(&old) {
+                    stop.cancel();
+                }
+            }
+            None if s.open.len() >= s.cap => return None,
+            None => {}
+        }
+        s.next += 1;
+        let id = s.next;
+        let stop = CancellationToken::new();
+        s.open.insert(id, stop.clone());
+        if let Some(v) = &viewer {
+            s.by_viewer.insert(v.clone(), id);
+        }
+        Some(StreamPlace {
+            app: self.clone(),
+            id,
+            viewer,
+            stop,
         })
     }
 
@@ -856,7 +937,7 @@ async fn layout_route(
 }
 
 async fn frames_route(ws: WebSocketUpgrade, State(app): State<Arc<Shared>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| viewer(socket, app))
+    ws.on_upgrade(move |socket| viewer(socket, app, CancellationToken::new()))
 }
 
 /// The public listener's `/frames`: with admission keys in the layout, only a client whose
@@ -876,6 +957,7 @@ async fn admitted_frames_route(
     // make it buffer more than this.
     ws.max_message_size(MAX_VIEWER_MESSAGE)
         .on_upgrade(move |mut socket| async move {
+            let mut named = None;
             if !keys.is_empty() {
                 let first = tokio::time::timeout(ADMIT_WAIT, socket.recv()).await;
                 let token = match first {
@@ -883,18 +965,32 @@ async fn admitted_frames_route(
                     _ => None,
                 };
                 if !admitted(&keys, token.as_deref()) {
-                    let _ = socket
-                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                            code: 1008,
-                            reason: "a direct token is required".into(),
-                        })))
-                        .await;
+                    let _ = socket.send(close(1008, "a direct token is required")).await;
                     return;
                 }
+                named = token
+                    .as_deref()
+                    .and_then(direct_token_viewer)
+                    .map(str::to_string);
             }
-            viewer(socket, app).await
+            // One stream per viewer, STREAMS_PER_TILE in all (fleet/PROTOCOL.md, "Stream limits").
+            let Some(place) = app.open_stream(named) else {
+                let _ = socket
+                    .send(close(1013, "this aggregator serves no more streams"))
+                    .await;
+                return;
+            };
+            viewer(socket, app, place.stop.clone()).await;
+            drop(place);
         })
         .into_response()
+}
+
+fn close(code: u16, reason: &'static str) -> Message {
+    Message::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
 }
 
 /// How long a stream that needs a direct token waits for the client's first message.
@@ -930,19 +1026,38 @@ pub fn admitted(keys_hex: &[String], token: Option<&str>) -> bool {
     token.is_some_and(|t| direct_token_valid(&keys, t, now_ms() / 1000))
 }
 
-/// A direct token for this aggregator's own tile subscriptions, made with the newest key.
-pub(crate) fn own_token(keys_hex: &[String]) -> Option<String> {
+/// A direct token for one of this aggregator's tile subscriptions, made with the newest key.
+/// `viewer` is the subscription's own (`aggregator-<id>`, [`subscriber_name`]): a renderer serves
+/// one stream per viewer, and q=hi only to a viewer named so (fleet/PROTOCOL.md, "Stream
+/// limits").
+pub(crate) fn own_token(keys_hex: &[String], viewer: &str) -> Option<String> {
     use crate::fleet::coord::admission::{AdmitKey, DIRECT_TOKEN_SECS};
     let key = AdmitKey::from_hex(keys_hex.first()?)?;
-    Some(key.direct_token("aggregator", now_ms() / 1000 + DIRECT_TOKEN_SECS))
+    Some(key.direct_token(viewer, now_ms() / 1000 + DIRECT_TOKEN_SECS))
 }
 
-async fn viewer(socket: WebSocket, app: Arc<Shared>) {
-    let (sink, mut stream) = socket.split();
-    // Read and ignore what the viewer sends (a height request), so pings get answered.
-    let reader = tokio::spawn(async move { while let Some(Ok(_)) = stream.next().await {} });
-    feed(sink, &app).await;
-    reader.abort();
+/// A tile subscription's viewer name, unique to it: two aggregators reading one tile, or one
+/// aggregator's old and new layouts while a re-tile takes over, must not replace each other's
+/// streams.
+pub fn subscriber_name() -> String {
+    format!("aggregator-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Feeds a viewer until it goes, or until `stop` (a newer stream of the same viewer took its
+/// place), which closes it with 1008.
+async fn viewer(socket: WebSocket, app: Arc<Shared>, stop: CancellationToken) {
+    let (mut sink, mut stream) = socket.split();
+    // Read and ignore what the viewer sends (a height request), so pings get answered. When
+    // the viewer goes the stream ends with it, frames or none: a stream that waited for a
+    // frame to fail on would keep its place under the cap while nothing is published.
+    let reader = async move { while let Some(Ok(_)) = stream.next().await {} };
+    tokio::select! {
+        _ = feed(&mut sink, &app) => {}
+        _ = reader => {}
+        _ = stop.cancelled() => {
+            let _ = sink.send(close(1008, "a newer stream holds this viewer's token")).await;
+        }
+    }
 }
 
 /// Send a viewer the header and the frames since the last keyframe, then what follows. A

@@ -88,3 +88,48 @@ bool admit_message(const std::string& text, std::string* token) {
     return false;
   }
 }
+
+int fleet_max_quality(bool admission, const std::string& viewer) {
+  if (!admission) return 2;
+  static const std::string kAggregator = "aggregator-";
+  return viewer.size() > kAggregator.size() && viewer.compare(0, kAggregator.size(), kAggregator) == 0 ? 2 : 1;
+}
+
+bool StreamTable::open(const std::string& viewer, std::function<void()> stop, uint64_t* id) {
+  std::lock_guard<std::mutex> l(mu_);
+  auto held = viewer.empty() ? by_viewer_.end() : by_viewer_.find(viewer);
+  if (held != by_viewer_.end()) {
+    auto old = open_.find(held->second);
+    if (old != open_.end() && old->second.stop) {
+      old->second.stop();
+      old->second.stop = nullptr;  // stopped once; it stays counted until it closes
+    }
+  } else if (open_.size() >= cap_) {
+    return false;
+  }
+  *id = next_++;
+  open_[*id] = Entry{viewer, std::move(stop)};
+  if (!viewer.empty()) by_viewer_[viewer] = *id;
+  return true;
+}
+
+void StreamTable::close(uint64_t id) {
+  std::lock_guard<std::mutex> l(mu_);
+  auto e = open_.find(id);
+  if (e == open_.end()) return;
+  if (!e->second.viewer.empty()) {
+    auto v = by_viewer_.find(e->second.viewer);
+    if (v != by_viewer_.end() && v->second == id) by_viewer_.erase(v);
+  }
+  open_.erase(e);
+}
+
+size_t StreamTable::size() {
+  std::lock_guard<std::mutex> l(mu_);
+  return open_.size();
+}
+
+void StreamTable::set_cap(size_t cap) {
+  std::lock_guard<std::mutex> l(mu_);
+  cap_ = cap;
+}

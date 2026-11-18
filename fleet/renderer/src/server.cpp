@@ -15,6 +15,7 @@
 #include <map>
 #include <thread>
 
+#include "admit.h"
 #include "json.h"
 #include "h264.h"
 #include "jpeg.h"
@@ -35,6 +36,7 @@ const char* status_reason(int code) {
   switch (code) {
     case 200: return "OK";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 409: return "Conflict";
     case 503: return "Service Unavailable";
@@ -181,6 +183,13 @@ void Server::accept_loop(int lfd, bool tls) {
   }
 }
 
+int Server::refuse_without_scene_token(Conn& c, std::map<std::string, std::string>& hdr) {
+  int denied = scene_access(fleet(), fleet() ? token_->current() : std::string(), hdr["authorization"]);
+  if (denied == 503) respond(c, 503, "Service Unavailable", "{\"error\":\"no scene token loaded\"}");
+  else if (denied) respond(c, 401, "Unauthorized", "{\"error\":\"the scene token is required\"}");
+  return denied;
+}
+
 void Server::handle(Conn& c) {
   // Each phase has one deadline for all its reads: a per-read timeout lets a client that
   // sends a byte every few seconds hold this thread for as long as it likes.
@@ -228,9 +237,7 @@ void Server::handle(Conn& c) {
   if (path == "/scene" || path == "/budget" || (path == "/action" && p_.serves_action())) {
     if (method != "POST") return respond(c, 405, "Method Not Allowed", "{\"error\":\"POST only\"}");
     // A fleet renderer takes a scene or a budget only from a holder of the scene token.
-    int denied = scene_access(fleet(), fleet() ? token_->current() : std::string(), hdr["authorization"]);
-    if (denied == 503) return respond(c, 503, "Service Unavailable", "{\"error\":\"no scene token loaded\"}");
-    if (denied) return respond(c, 401, "Unauthorized", "{\"error\":\"the scene token is required\"}");
+    if (refuse_without_scene_token(c, hdr)) return;
     // A JSON content type forces a CORS preflight, which this server never
     // grants, so a page in a browser cannot change the scene or the budget.
     if (lower(hdr["content-type"]).find("application/json") != 0)
@@ -255,6 +262,7 @@ void Server::handle(Conn& c) {
     return respond(c, 200, "OK", "{\"ok\":true}");
   }
   if (path == "/raw" && method == "GET") {  // debug: one unencoded frame, see PROTOCOL.md
+    if (refuse_without_scene_token(c, hdr)) return;
     size_t tp = query.find("t=");
     if (tp == std::string::npos) return respond(c, 400, "Bad Request", "{\"error\":\"t required\"}");
     double t = atof(query.c_str() + tp + 2);
@@ -270,6 +278,7 @@ void Server::handle(Conn& c) {
   }
   if (path == "/still" && (method == "GET" || method == "HEAD")) {
     if (fleet() && !p_.allows_fleet_still()) return respond(c, 404, "Not Found", "");
+    if (refuse_without_scene_token(c, hdr)) return;
     // the next frame drawn, as JPEG: at the height being streamed, or with no
     // stream at tile height h (the renderer keeps drawing that way for
     // STILL_HOLD_S, so in a hold repeated requests return a converging image)
@@ -320,7 +329,9 @@ void Server::handle(Conn& c) {
     if (frames_access(fleet(), p_.has_scene()))
       return respond(c, 503, "Service Unavailable", "{\"error\":\"no scene yet\"}");
     int h = query_int(query, "h", 0);
-    if (h < 16 || h > 2160) return respond(c, 400, "Bad Request", "{\"error\":\"h must be 16..2160\"}");
+    // A fleet server streams no taller than the page asks (FLEET_MAX_STREAM_H).
+    if (h < 16 || h > (fleet() ? FLEET_MAX_STREAM_H : 2160))
+      return respond(c, 400, "Bad Request", fleet() ? "{\"error\":\"h must be 16..1080\"}" : "{\"error\":\"h must be 16..2160\"}");
     std::string qs = query_str(query, "q", "std");
     int q = quality_from_name(qs);
     if (q < 0) return respond(c, 400, "Bad Request", "{\"error\":\"q must be hi, std or lo\"}");
@@ -333,19 +344,46 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
                      ws_accept(key) + "\r\n\r\n";
   if (!c.write_all(resp.data(), resp.size())) return;
+  auto refuse = [&c](const char* reason, size_t n) {
+    std::string close = ws_frame(8, reason, n);
+    c.write_all(close.data(), close.size());
+  };
   // With the coordinator's admission keys, only a client whose first message carries a seated
   // viewer's direct token gets the stream (the URL carries none, so no log holds one).
-  if (p_.requires_admit()) {
+  const bool admission = p_.requires_admit();
+  std::string viewer;
+  if (admission) {
     c.set_read_deadline_ms(ADMIT_WAIT_MS);
     int op = 0;
     std::string first, token;
     if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.admits(token)) {
       static const char kReason[] = "\x03\xf0" "a direct token is required";  // 1008, policy violation
-      std::string close = ws_frame(8, kReason, sizeof kReason - 1);
-      c.write_all(close.data(), close.size());
-      return;
+      return refuse(kReason, sizeof kReason - 1);
     }
+    viewer = admit_token_viewer(token);
   }
+  // A fleet server's limits (fleet/PROTOCOL.md, "Stream limits"): q=hi for an aggregator only,
+  // one stream per viewer (a newer one replaces it), MAX_FLEET_STREAMS in all.
+  const int max_h = fleet() ? FLEET_MAX_STREAM_H : 2160;
+  const int max_q = fleet() ? fleet_max_quality(admission, viewer) : 2;
+  if (q > max_q) {
+    static const char kReason[] = "\x03\xf0" "q=hi is for aggregators";  // 1008
+    return refuse(kReason, sizeof kReason - 1);
+  }
+  uint64_t place = 0;
+  if (fleet() && !streams_.open(viewer, [&c] { c.shutdown_both(); }, &place)) {
+    static const char kReason[] = "\x03\xf5" "this tile serves no more streams";  // 1013, try again later
+    return refuse(kReason, sizeof kReason - 1);
+  }
+  // Its place is freed when this function returns: after the writer has stopped, while the
+  // connection is still open (a newer stream of the same viewer may shut it down until then).
+  struct Place {
+    StreamTable* table;
+    uint64_t id;
+    ~Place() {
+      if (table) table->close(id);
+    }
+  } held{fleet() ? &streams_ : nullptr, place};
   c.set_read_deadline_ms(0);  // the stream's reader waits for as long as the stream lasts
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   // Keep at most 64 KiB written and not yet sent in the kernel (about 26 ms at 20
@@ -387,11 +425,11 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
         Json j = Json::parse(pl);
         if (j.has("h")) {
           int nh = (int)j.at("h").number("h");
-          if (nh >= 16 && nh <= 2160) sub->want_h = nh;
+          if (nh >= 16 && nh <= max_h) sub->want_h = nh;
         }
         if (j.has("q")) {
           int nq = quality_from_name(j.at("q").string("q"));
-          if (nq >= 0) sub->want_q = nq;
+          if (nq >= 0 && nq <= max_q) sub->want_q = nq;
         }
         p_.wake();
       } catch (const std::exception&) {
