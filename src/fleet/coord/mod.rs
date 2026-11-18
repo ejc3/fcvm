@@ -1089,7 +1089,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             let region = args
                 .text_check_region
                 .context("--text-check bedrock needs --text-check-region")?;
-            Arc::new(text_check::Bedrock::new(region, model)?)
+            Arc::new(text_check::Guarded::new(Arc::new(
+                text_check::Bedrock::new(region, model)?,
+            )))
         }
     };
     let (state, store_tx) = match &args.state_file {

@@ -266,7 +266,13 @@ Only an explicit allow commits the word; a refusal, an error, a timeout (5 s) or
 coordinator started without a text check (`--text-check none`) refuses it. An error's
 reason, in the receipt, its `check` and `actions`, is one of two fixed sentences, "words are
 turned off right now" (`--text-check none`) or "couldn't check that word, try again"
-(anything else); what went wrong is in the coordinator's log. A word checked
+(anything else); what went wrong is in the coordinator's log. Across every viewer the
+coordinator sends at most 10 checks at once and one a second after that (a token bucket:
+about 400 input and 64 output tokens a check bound a flood's cost to about $2.60 an hour at
+Claude Haiku 4.5's list price); a word past it is refused with the error "too many words are
+being checked right now, try again in a few seconds", which does not mark the coordinator
+degraded. An allow or refuse verdict is kept for 10 minutes (at most 1024) by the sky and the
+text, so the same text against the same sky is answered from it without a check. A word checked
 against a sky that changed meanwhile is refused (send it again). A check that cannot run
 marks the coordinator degraded (`failures`) until one runs again. The scene keeps the
 latest 16 words. A refused word's text appears nowhere: not in the scene, not in

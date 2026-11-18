@@ -8,6 +8,8 @@ use super::sigv4::{authorization, uri_encode};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::state::TextCheck;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long a word may wait for its check.
@@ -20,6 +22,123 @@ pub const WORDS_OFF: &str = "words are turned off right now";
 /// reason itself goes to the coordinator log only: it can name the model, the region or
 /// an AWS error, and the receipt and the actions list are public.
 pub const CHECK_FAILED: &str = "couldn't check that word, try again";
+
+/// What a viewer reads when the coordinator is already running as many checks as it allows
+/// ([`Guarded`]). Not a failure of the check: it does not mark the coordinator degraded.
+pub const CHECK_BUSY: &str =
+    "too many words are being checked right now, try again in a few seconds";
+
+/// Checks [`Guarded`] lets through at once, before the rate applies.
+pub const CHECK_BURST: f64 = 10.0;
+/// Checks per second [`Guarded`] lets through after the burst, across every viewer. Each
+/// check sends the instructions, the sky (at most 16 words) and the text: about 400 input
+/// tokens and at most 64 output tokens (`max_tokens`). At Claude Haiku 4.5's list price ($1
+/// and $5 per million input and output tokens) that is at most $0.00072 a check, so one a
+/// second bounds a flood to about $2.60 an hour. It also holds the coordinator to 60
+/// requests a minute against the account's Bedrock quota, so a flood's excess is answered
+/// [`CHECK_BUSY`] here at once instead of being throttled there, where every viewer's check
+/// would fail with it and mark the coordinator degraded. One a second is the per-client limit
+/// (one word per 5 s) of five viewers sending without pause.
+pub const CHECKS_PER_SECOND: f64 = 1.0;
+/// Verdicts kept for an identical sky and text, and for how long. Repeating one text costs no
+/// check and no part of the budget; 1024 entries of at most 17 words of 28 characters is
+/// under 1 MB.
+pub const VERDICT_CACHE: usize = 1024;
+pub const VERDICT_TTL: Duration = Duration::from_secs(600);
+
+/// The error [`Guarded`] answers with past its rate.
+#[derive(Debug)]
+pub struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the text check's global rate is spent")
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// A checker behind a global token bucket ([`CHECK_BURST`], [`CHECKS_PER_SECOND`]) and a cache
+/// of verdicts by sky and text ([`VERDICT_CACHE`], [`VERDICT_TTL`]). The per-client limits
+/// bound each client; this bounds them all together, for many clients or one with many
+/// addresses. Only allow and refuse verdicts are cached; an error is asked again.
+pub struct Guarded {
+    inner: Arc<dyn TextChecker>,
+    bucket: Mutex<(f64, tokio::time::Instant)>,
+    cache: Mutex<VerdictCache>,
+}
+
+type VerdictKey = (Vec<String>, String);
+
+#[derive(Default)]
+struct VerdictCache {
+    entries: HashMap<VerdictKey, (Verdict, tokio::time::Instant)>,
+    /// Keys in insertion order, for eviction.
+    order: VecDeque<VerdictKey>,
+}
+
+impl Guarded {
+    pub fn new(inner: Arc<dyn TextChecker>) -> Self {
+        Guarded {
+            inner,
+            bucket: Mutex::new((CHECK_BURST, tokio::time::Instant::now())),
+            cache: Mutex::default(),
+        }
+    }
+
+    fn take(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut b = self.bucket.lock().unwrap();
+        let (tokens, at) = &mut *b;
+        *tokens =
+            (*tokens + now.duration_since(*at).as_secs_f64() * CHECKS_PER_SECOND).min(CHECK_BURST);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cached(&self, key: &VerdictKey) -> Option<Verdict> {
+        let c = self.cache.lock().unwrap();
+        c.entries
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < VERDICT_TTL)
+            .map(|(v, _)| v.clone())
+    }
+
+    fn remember(&self, key: VerdictKey, v: Verdict) {
+        let mut c = self.cache.lock().unwrap();
+        let now = tokio::time::Instant::now();
+        if c.entries.insert(key.clone(), (v, now)).is_none() {
+            c.order.push_back(key);
+        }
+        while c.entries.len() > VERDICT_CACHE {
+            let Some(old) = c.order.pop_front() else {
+                break;
+            };
+            c.entries.remove(&old);
+        }
+    }
+}
+
+#[async_trait]
+impl TextChecker for Guarded {
+    async fn check(&self, sky: &[String], text: &str) -> Result<Verdict> {
+        let key = (sky.to_vec(), text.to_string());
+        if let Some(v) = self.cached(&key) {
+            return Ok(v);
+        }
+        if !self.take() {
+            return Err(Busy.into());
+        }
+        let v = self.inner.check(sky, text).await?;
+        self.remember(key, v.clone());
+        Ok(v)
+    }
+}
 
 /// The error `NoCheck` answers with, so the verdict can tell "turned off" from "failed".
 #[derive(Debug)]
@@ -69,6 +188,11 @@ async fn check_inner(checker: &dyn TextChecker, sky: &[String], text: &str) -> T
         Ok(Err(e)) if e.downcast_ref::<Disabled>().is_some() => TextCheck {
             verdict: "error".into(),
             reason: WORDS_OFF.into(),
+            sky: vec![],
+        },
+        Ok(Err(e)) if e.downcast_ref::<Busy>().is_some() => TextCheck {
+            verdict: "error".into(),
+            reason: CHECK_BUSY.into(),
             sky: vec![],
         },
         Ok(Err(e)) => {
@@ -309,6 +433,54 @@ mod tests {
             vec!["kill".to_string()],
             "the verdict names the sky it was checked with"
         );
+    }
+
+    /// Counts the checks that reach it, and allows everything.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl TextChecker for Counting {
+        async fn check(&self, _sky: &[String], _text: &str) -> Result<Verdict> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Verdict::Allow)
+        }
+    }
+
+    /// A flood reaches the checker at the global rate only, the rest answered busy; a text
+    /// already judged against the same sky is answered from the cache and costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_reaches_the_checker_at_the_global_rate_and_repeats_cost_nothing() {
+        let inner = Arc::new(Counting::default());
+        let g = Guarded::new(inner.clone());
+        let calls = || inner.0.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..100 {
+            assert_eq!(check_text(&g, &[], "hello").await.verdict, "allow");
+        }
+        assert_eq!(calls(), 1, "one text, one check");
+        // Against another sky it is another question.
+        assert_eq!(
+            check_text(&g, &["kill".to_string()], "hello").await.verdict,
+            "allow"
+        );
+        assert_eq!(calls(), 2);
+        let mut busy = 0;
+        for i in 0..100 {
+            let v = check_text(&g, &[], &format!("w{i}")).await;
+            if v.verdict == "error" {
+                assert_eq!(v.reason, CHECK_BUSY);
+                busy += 1;
+            }
+        }
+        let burst = CHECK_BURST as usize;
+        assert_eq!(calls(), burst, "the burst, and nothing past it");
+        assert_eq!(busy, 100 - (burst - 2));
+        // The rate refills with time.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        for i in 0..10 {
+            check_text(&g, &[], &format!("later{i}")).await;
+        }
+        assert_eq!(calls(), burst + 3);
     }
 
     #[tokio::test(start_paused = true)]

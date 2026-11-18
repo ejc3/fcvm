@@ -826,14 +826,17 @@ async fn word(
             let sky = app.handle.sky().await;
             let verdict = check_text(app.cfg.checker.as_ref(), &sky, &normalised).await;
             *checking.lock().unwrap() = None;
-            // A check that cannot run degrades the coordinator until one runs again.
-            app.handle
-                .send(Event::Degraded {
-                    at: 0,
-                    component: "text_check".into(),
-                    reason: (verdict.verdict == "error").then(|| verdict.reason.clone()),
-                })
-                .await;
+            // A check that cannot run degrades the coordinator until one runs again. One held
+            // back by the global rate ran nothing and says nothing about the checker.
+            if verdict.reason != super::text_check::CHECK_BUSY {
+                app.handle
+                    .send(Event::Degraded {
+                        at: 0,
+                        component: "text_check".into(),
+                        reason: (verdict.verdict == "error").then(|| verdict.reason.clone()),
+                    })
+                    .await;
+            }
             Some(verdict)
         }
     };
