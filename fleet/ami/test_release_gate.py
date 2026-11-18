@@ -139,15 +139,84 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
         self.assertEqual(gate.payloads, [{"action": "status"}])
 
-    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_held_still(self):
+    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_its_hosts_held_still(self):
         none = self.agents(instances=[])
-        for after in (self.status(placement={"changed_kinds": ["tile"]}), self.status(placement={"digest": "e" * 64}),
+        for after in (self.status(placement={"changed_kinds": ["tile"]}),
+                      self.status(placement={"digest": "e" * 64, "release_hosts": self.HOSTS[:1]}),
+                      self.status(placement={"digest": "e" * 64, "release_hosts": self.HOSTS + ["i-0example0host00c"]}),
                       self.status(placement={"settled": False}), self.status(generation=16)):
             with self.subTest(after=after["placement"]):
                 gate = Lambda(after)
                 before = self.status(placement={"changed_kinds": after["placement"]["changed_kinds"]})
                 self.assertEqual(self.decide(gate, before=before, v4="", v6="", agents=none), 0)
                 self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_no_agent_rolls_back_when_only_tiles_moved_during_the_probes(self):
+        # Staging, 2026-11-18 (generation 21): the release host never registered, and AWS
+        # interrupted one Spot tile during the 27-minute smoke. The placement digest moved, so the
+        # run decided nothing and the rollback waited for an operator. The no-agent evidence names
+        # only the release's hosts and their registrations, so a tile replacement does not touch
+        # it: the claim is bound to the placement the agents were read against, which the gate
+        # checks again under its lock.
+        moved = self.status(placement={"digest": "e" * 64, "release_tiles": ["i-0example0tile00b"]})
+        gate = Lambda(moved, {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1]["action"], "rollback")
+        self.assertEqual(gate.payloads[1]["placement"], "e" * 64)
+        self.assertEqual(gate.payloads[1]["evidence"]["hosts"], sorted(self.digest(h) for h in self.HOSTS))
+        # Probes still decide only on a placement that held still: a pass or a failure measured
+        # on tiles that have since moved is not laid on the new placement.
+        for v4 in (self.family("v4"), self.family("v4", failed=2)):
+            with self.subTest(v4=v4):
+                gate = Lambda(moved)
+                self.assertEqual(self.decide(gate, v4=v4, agents=self.agents(instances=[])), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+        # An agent on a release host still leaves the moved placement undecided.
+        gate = Lambda(moved)
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_gate_call_the_cli_could_not_complete_is_repeated(self):
+        # Staging, 2026-11-18 (generation 19): both families reported six attributed image
+        # failures and no inconclusive probe, and `aws lambda invoke` exited 254. The verdict was
+        # lost with no retry and no reason; the rollback came two runs and 6.5 minutes later.
+        # Every gate action is safe to repeat: status reads, verify records the same receipt, and
+        # the gate answers a repeated rollback of a committed receipt with the committed answer.
+        throttled = ("\nAn error occurred (TooManyRequestsException) when calling the Invoke operation "
+                     "(reached max retries: 4): Rate Exceeded.\n")
+        for failures in (1, len(release_gate.INVOKE_WAITS)):
+            with self.subTest(failures=failures):
+                inner = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+                calls = []
+
+                def gate(argv, **kw):
+                    calls.append(json.loads(argv[argv.index("--payload") + 1])["action"])
+                    if calls.count("rollback") and calls.count("rollback") <= failures:
+                        return mock.Mock(returncode=254, stdout="", stderr=throttled)
+                    return inner(argv, **kw)
+                err = io.StringIO()
+                with mock.patch.object(release_gate.time, "sleep") as sleep, \
+                        mock.patch.object(sys, "stderr", err), redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.decide(gate, v4=self.family("v4", failed=1)), 0)
+                self.assertEqual(calls, ["status"] + ["rollback"] * (failures + 1))
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], list(release_gate.INVOKE_WAITS[:failures]))
+                self.assertIn("TooManyRequestsException", err.getvalue())
+                self.assertNotIn("Rate Exceeded", err.getvalue())
+        # A call that never completes stops after the last wait and fails the job.
+        failing = mock.Mock(return_value=mock.Mock(returncode=254, stdout="", stderr=throttled))
+        with mock.patch.object(release_gate.time, "sleep"), mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, r"exit 254, TooManyRequestsException"):
+                release_gate.invoke({"action": "status"}, failing)
+        self.assertEqual(failing.call_count, len(release_gate.INVOKE_WAITS) + 1)
+
+    def test_a_gate_call_waits_for_the_function_rather_than_invoking_it_again(self):
+        # The gate function runs up to 900 s with one reserved execution (ejc3/aws
+        # fcvm-fleet-ami-pipeline.tf). The CLI's default 60 s read timeout makes the CLI invoke it
+        # again while a rollback is still running, which the reserved execution refuses.
+        gate = Lambda(self.status())
+        argv = []
+        release_gate.invoke({"action": "status"}, lambda a, **kw: (argv.extend(a), gate(a, **kw))[1])
+        self.assertGreater(int(argv[argv.index("--cli-read-timeout") + 1]), 900)
 
     def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
         good = {"since": 2, "registered": [], "observed_at": 3}
@@ -468,6 +537,177 @@ class GateTests(unittest.TestCase):
         # issue, so the calling job grants issues: write, as the deploy workflows that call it do.
         smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
         self.assertIn("    permissions:\n      contents: read\n      issues: write\n", smoke)
+
+    def outputs_of(self, argv, gate):
+        with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(release_gate.main(argv, run=gate), 0)
+            return dict(line.split("=", 1) for line in out.read().splitlines())
+
+    def test_status_says_whether_an_unverified_release_is_still_settling(self):
+        # Staging, 2026-11-18: generation 21 was current at 09:00:23 and settled at 09:05:23,
+        # but nothing looks before the schedule's next run, which came 8 to 37 minutes apart
+        # (median 9.3) over 2026-11-15 to 2026-11-18. `waiting` lets the workflow look again soon.
+        for status, unverified, waiting in (
+                (self.status(), "true", "false"),
+                (self.status(placement={"settled": False}), "true", "true"),
+                (self.status(placement={"current": False}), "true", "true"),
+                (self.status(placement={"release_hosts": []}), "true", "false"),
+                (self.status(verified=True), "false", "false"),
+                (self.status(verified=True, placement={"settled": False}), "false", "false")):
+            with self.subTest(status=status):
+                lines = self.outputs_of(["status"], Lambda(status))
+                self.assertEqual((lines["unverified"], lines["waiting"]), (unverified, waiting))
+                self.assertEqual(lines["generation"], "15" if unverified == "true" else "")
+
+    def test_decide_says_whether_it_reached_a_verdict(self):
+        for gate, v4, verdict in ((Lambda(self.status(), {"status": "verified"}), self.family("v4"), "verified"),
+                                  (Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}}),
+                                   self.family("v4", failed=1), "rolled_back"),
+                                  (Lambda(self.status(placement={"digest": "e" * 64})), self.family("v4"), "none")):
+            with self.subTest(verdict=verdict):
+                argv = ["decide", "--before", json.dumps(self.redacted(self.status())), "--v4", v4,
+                        "--v6", self.family("v6")]
+                self.assertEqual(self.outputs_of(argv, gate)["verdict"], verdict)
+
+    class Gh:
+        """`gh` that lists the gate's dispatched runs from `titles` and records each dispatch."""
+
+        def __init__(self, titles=(), list_status=0):
+            self.titles, self.list_status, self.calls = list(titles), list_status, []
+
+        def __call__(self, argv, **_):
+            self.calls.append(argv)
+            if argv[:3] == ["gh", "run", "list"]:
+                return mock.Mock(returncode=self.list_status, stderr="",
+                                 stdout=json.dumps([{"displayTitle": t} for t in self.titles]))
+            assert argv[:3] == ["gh", "workflow", "run"], argv
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def again(self, gh, generation="21", since="", now=10_000_000):
+        with mock.patch.object(release_gate.time, "time", return_value=now), \
+                mock.patch.object(release_gate.time, "sleep") as sleep, redirect_stdout(io.StringIO()):
+            self.assertEqual(release_gate.main(["again", "--generation", generation, "--since", since], run=gh), 0)
+        return sleep, [c for c in gh.calls if c[:3] == ["gh", "workflow", "run"]]
+
+    def test_an_unsettled_or_undecided_release_is_looked_at_again_for_two_hours(self):
+        now = 10_000_000
+        title = "Fleet image release gate: generation {} since {}".format
+        # The first look starts the clock; a later run carries it, and so does any earlier run of
+        # the same generation in the history, so the schedule's own runs cannot restart it.
+        for titles, since, first in (([], "", now), ([], str(now - 600), now - 600),
+                                     ([title(21, now - 3000), title(20, now - 9000), "Fleet image release gate"],
+                                      str(now - 600), now - 3000),
+                                     ([title(21, now + 50)], "", now), ([], "not a time", now)):
+            with self.subTest(titles=titles, since=since):
+                sleep, dispatched = self.again(self.Gh(titles), since=since)
+                self.assertEqual(dispatched, [["gh", "workflow", "run", "fleet-release-gate.yml", "--ref", "main",
+                                               "-f", "generation=21", "-f", f"since={first}"]])
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [release_gate.AGAIN_DELAY])
+        # Two hours after the gate first saw the generation, only the schedule looks.
+        for titles, since in (([title(21, now - 7200)], ""), ([], str(now - 7201))):
+            with self.subTest(titles=titles, since=since):
+                sleep, dispatched = self.again(self.Gh(titles), since=since)
+                self.assertEqual(dispatched, [])
+                sleep.assert_not_called()
+        # No generation, or a history it cannot read: no dispatch (the bound cannot be checked).
+        self.assertEqual(self.again(self.Gh(), generation="")[1], [])
+        with self.assertRaisesRegex(SystemExit, "listing"):
+            self.again(self.Gh(list_status=1))
+
+    def test_the_workflow_looks_again_only_at_an_unverified_release_and_only_that_job_may_dispatch(self):
+        on = WORKFLOW.split("\non:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("  workflow_dispatch:\n    inputs:\n", on)
+        self.assertIn("      generation:\n        type: string\n", on)
+        self.assertIn("      since:\n        type: string\n", on)
+        # The title is the history the bound reads (release_gate.py TITLE).
+        name = re.search(r"^run-name: \"\$\{\{ inputs\.generation && format\('([^']+)', inputs\.generation, "
+                         r"inputs\.since\) \|\| '([^']+)' \}\}\"$", WORKFLOW, re.M)
+        self.assertIsNotNone(name)
+        self.assertRegex(name.group(1).format(21, 1234), release_gate.TITLE)
+        self.assertEqual(name.group(2), "Fleet image release gate")
+        again = WORKFLOW.split("\n  again:\n", 1)[1]
+        self.assertIn("needs: [status, smoke, decide]", again)
+        for condition in ("!cancelled()", "needs.status.outputs.unverified == 'true'",
+                          "needs.status.outputs.waiting == 'true'", "needs.decide.outputs.verdict == 'none'"):
+            self.assertIn(condition, again)
+        self.assertIn("    permissions:\n      actions: write\n", again)
+        self.assertEqual(WORKFLOW.count("actions: write"), 1)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", again)
+        self.assertIn('release_gate.py again --generation "$GENERATION" --since "$SINCE"', again)
+        status = WORKFLOW.split("\n  status:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        for key in ("generation", "unverified", "waiting"):
+            self.assertIn(f"{key}: ${{{{ steps.gate.outputs.{key} }}}}", status)
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1].split("\n  again:\n", 1)[0]
+        self.assertIn("verdict: ${{ steps.decide.outputs.verdict }}", decide)
+        self.assertIn("id: decide", decide)
+
+    def test_the_smoke_installs_a_pinned_ffmpeg_not_from_apt(self):
+        # Staging, 2026-11-18: apt on the hosted runner fetched ffmpeg at 75.7 kB/s for 13m50s
+        # in the gate's first smoke of generation 19, between a ready release and its verdict.
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        for job, script in (("ipv4", "fleet/coord/install-ffmpeg.sh"), ("ipv6", "./fcvm/fleet/coord/install-ffmpeg.sh")):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertNotIn("apt-get", body)
+            install = f'run: {script} "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"'
+            self.assertIn(install, body)
+            self.assertLess(body.index(install), body.index("stage-smoke.py --family"))
+
+    def test_install_ffmpeg_refuses_a_download_that_does_not_match_its_checksum(self):
+        script = ROOT / "fleet/coord/install-ffmpeg.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            # A download that is a working ffmpeg with an H.264 decoder, but not the pinned one.
+            fake = tmp / "fake-ffmpeg"
+            fake.write_text("#!/bin/sh\necho ' V....D h264                 H.264'\n")
+            bin_ = tmp / "bin"
+            bin_.mkdir()
+            (bin_ / "curl").write_text('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+                                       f'gzip -c {fake} > "$2"\n')
+            (bin_ / "uname").write_text("#!/bin/sh\necho \"$FAKE_ARCH\"\n")
+            for name in ("curl", "uname"):
+                (bin_ / name).chmod(0o755)
+            for arch in ("x86_64", "aarch64", "riscv64"):
+                with self.subTest(arch=arch):
+                    out = tmp / arch
+                    env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", FAKE_ARCH=arch)
+                    result = subprocess.run(["bash", str(script), str(out)], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result)
+                    self.assertIn("pinned", result.stderr)
+                    self.assertFalse((out / "ffmpeg").exists())
+                    self.assertEqual(result.stdout, "")
+
+    def test_the_gates_smoke_shares_the_smokes_concurrency_group(self):
+        # Codex on #1949: a smoke in its own group runs beside a deploy, daily or manual smoke,
+        # whose tile relaunches move the placement the verdict is bound to and whose returned
+        # Minecraft borrows reset servers under the gate's probes.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertNotRegex(smoke, r"\n      group:")
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        for job in ("ipv4", "ipv6"):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertIn("    concurrency:\n      group: fleet-viewer-smoke\n", body)
+
+    def test_a_dispatched_run_hands_its_first_sighting_only_to_the_same_generation(self):
+        # Codex on #1949: a run dispatched for generation N that finds N+1 live must not give N+1
+        # generation N's first sighting, or N+1 starts with N's spent two hours.
+        again = WORKFLOW.split("\n  again:\n", 1)[1]
+        self.assertIn("SINCE: ${{ inputs.generation == needs.status.outputs.generation && inputs.since || '' }}", again)
+        self.assertNotIn("SINCE: ${{ inputs.since }}", again)
+
+    def test_the_gates_smoke_waits_at_most_five_minutes_for_tiles(self):
+        # Generation 21 (2026-11-18): no agent, so no tile ever ran and each family waited the
+        # smoke's full 600 s, 20 of the 27 minutes of smoke. In 120 healthy family runs from
+        # 2026-11-13 to 2026-11-18 the whole smoke, the wait included, took at most 290.3 s.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertIn("\n      settle_seconds: 300\n", smoke)
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        call = viewer.split("  workflow_call:\n", 1)[1].split("\n  schedule:", 1)[0]
+        self.assertIn("      settle_seconds:\n        type: number\n        default: 600\n", call)
+        for job in ("ipv4", "ipv6"):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertIn("SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}", body)
+            self.assertIn('--settle-seconds "$SETTLE_SECONDS"', body)
 
     def test_the_status_run_is_cheap(self):
         # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted

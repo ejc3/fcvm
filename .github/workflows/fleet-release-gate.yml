@@ -11,11 +11,24 @@ name: Fleet image release gate
 # A promotion starts it at once: the publisher, or whoever sees the new receipt, sends
 # repository_dispatch `fleet-release-promoted` or runs `gh workflow run fleet-release-gate.yml`.
 # The schedule is the fallback for a promotion nobody announced; when the live generation is
-# already verified a run ends after the status job.
+# already verified a run ends after the status job. A run that finds the live generation
+# unverified and still settling, or that decides nothing, starts the next run a minute later
+# (the again job), for two hours after the gate first saw that generation.
+# The title of a run the again job started records that first sighting (release_gate.py TITLE).
+run-name: "${{ inputs.generation && format('Fleet image release gate: generation {0} since {1}', inputs.generation, inputs.since) || 'Fleet image release gate' }}"
+
 on:
   repository_dispatch:
     types: [fleet-release-promoted]
   workflow_dispatch:
+    inputs:
+      # Set by the again job: the generation it looks at again, and when the gate first saw it.
+      generation:
+        type: string
+        required: false
+      since:
+        type: string
+        required: false
   schedule:
     - cron: '*/5 * * * *'
 
@@ -42,6 +55,11 @@ jobs:
       # gate's whole answer, which the decision compares with a second status after the probes.
       ready: ${{ steps.gate.outputs.ready }}
       status: ${{ steps.gate.outputs.status }}
+      # unverified: the live generation (generation) is not verified. waiting: it is not ready
+      # only because its placement is not yet current or settled.
+      generation: ${{ steps.gate.outputs.generation }}
+      unverified: ${{ steps.gate.outputs.unverified }}
+      waiting: ${{ steps.gate.outputs.waiting }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -71,9 +89,16 @@ jobs:
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
     # No relaunches: an EC2 relaunch replaces the tile's instance and so the placement the
-    # verdict is bound to. The viewer path and the take-over replace nothing.
+    # verdict is bound to. The viewer path and the take-over replace nothing. It shares the
+    # smokes' concurrency group: another smoke relaunches tiles and returns borrowed Minecraft
+    # servers, which would move the placement or reset a server under this one's probes.
     with:
       relaunch: false
+      # The status job found every live host up 300 s and every tile instance running, so the
+      # tiles' wait is short: in 120 healthy family runs (2026-11-13 to 2026-11-18) the whole
+      # smoke, wait included, took at most 290.3 s. A tile still not running after it is an
+      # unattributed probe: no verdict, and the again job looks again in a minute.
+      settle_seconds: 300
     secrets: inherit
 
   decide:
@@ -89,6 +114,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      # none, verified or rolled_back; empty when the job failed (a refusal is not retried).
+      verdict: ${{ steps.decide.outputs.verdict }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -111,10 +139,38 @@ jobs:
         run: |
           line=$(python3 -B fleet/coord/stage-smoke.py --agents | jq -cR 'fromjson? | select(type == "object" and has("since") and has("registered"))' | tail -1) || line=
           echo "agents=$line" >> "$GITHUB_OUTPUT"
-      - env:
+      - id: decide
+        env:
           RELEASE_GATE: ${{ vars.RELEASE_GATE }}
           BEFORE: ${{ needs.status.outputs.status }}
           V4: ${{ needs.smoke.outputs.v4 }}
           V6: ${{ needs.smoke.outputs.v6 }}
           AGENTS: ${{ steps.agents.outputs.agents }}
         run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6" --agents "$AGENTS"
+
+  again:
+    name: Look again soon
+    needs: [status, smoke, decide]
+    # The live generation is unverified and either still settling or this run decided nothing.
+    if: >-
+      ${{ !cancelled() && needs.status.result == 'success' && needs.status.outputs.unverified == 'true'
+      && (needs.status.outputs.waiting == 'true' || needs.decide.outputs.verdict == 'none') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Only this job may start a run: workflow_dispatch from the job token starts one.
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/ami/release_gate.py
+          sparse-checkout-cone-mode: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GENERATION: ${{ needs.status.outputs.generation }}
+          # A run dispatched for an older generation must not hand its first sighting to a newer
+          # release, which would start with that generation's spent two hours.
+          SINCE: ${{ inputs.generation == needs.status.outputs.generation && inputs.since || '' }}
+        run: python3 -B fleet/ami/release_gate.py again --generation "$GENERATION" --since "$SINCE"
