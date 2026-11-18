@@ -302,7 +302,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "phase": "running",
       "slot": "slot-1",
       "frame_url": "wss://slot-1-k3x7q2ab.<zone>/frames",
-      "frame_url_v4": "wss://slot-1-k3x7q2ab-v4.<zone>:20200/frames",
+      "frame_url_v4": "wss://slot-1-k3x7q2ab-v4.<zone>/frames",
       "gpu": {"sbdf": "0000:01:00.0", "name": "Tesla T4"},
       "host": "<host name>",
       "place": "EC2 in us-east-1",
@@ -547,7 +547,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   runs its aggregator. `frame_url` is null until the host's aggregator is serving. With
   the coordinator's subzone (`--dns-subzone`) a host aggregator's `frame_url` and
   `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<subzone>/frames`,
-  `wss://agg-<host>-<token>-v4.<subzone>:<port>/frames`), and both stay null for an
+  `wss://agg-<host>-<token>-v4.<subzone>/frames`, port 443 through the host's IPv4 front;
+  a URL names another port only for an agent that reports one, see "The IPv4 front"), and
+  both stay null for an
   aggregator that serves no browser (no `--aggregate-tls-port`).
 - `actions` holds the latest 50 intents, committed and refused, oldest first: the
   `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
@@ -673,8 +675,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   60. A launch's names answer until its slot has a newer launch or leaves the fleet. A
   host aggregator that reports public addresses is named the same way under
   `agg-<host>-<token>` (a host name of lowercase letters, digits and inner hyphens, at most
-  40 characters): AAAA its own IPv6 address, A the host's IPv4 address, with its port in
-  `frame_url_v4`; the EC2 half's aggregator is `agg-ec2-<token>` (see
+  40 characters): AAAA its own IPv6 address, A the host's IPv4 address, with the reported
+  `v4_port` in `frame_url_v4` when it is not 443; the EC2 half's aggregator is `agg-ec2-<token>` (see
   `--ec2-aggregate-tls`). An aggregator's names answer while it reports the same
   addresses; new addresses get a new label. Minting a label and publishing its names are
   one step of the coordinator's state, and the server answers from that state, so a name
@@ -1074,8 +1076,9 @@ to four, then rows of equal length, each tile square (the map is 128 x 128 colum
 `image_aspect` is that image's. `frame_url` is the tile's view socket ("Minecraft tile",
 below): the agent's URL, or with published names the launch's name under the subzone with the
 path `/view` (`mc-<n>-<token>`, as `slot-<n>-<token>` names a slot's frames). `frame_url_v4` is
-the same view socket over the host's IPv4 address at the server's published port
-(`mc-<n>-<token>-v4`), null when the agent reports no IPv4 path; the page picks the family as it
+the same view socket over the host's IPv4 address on 443, through the host's IPv4 front
+(`mc-<n>-<token>-v4`, "The IPv4 front"), null when the agent reports no IPv4 path. The Java
+Edition game port (25565, IPv6 only) is not part of the front; the page picks the family as it
 does for every stream (IPv6 first, IPv4 when IPv6 does not connect). A lent server
 keeps its `frame_url`: everyone watches it, and only its driver drives it. `join` is the host
 name Java Edition players connect to (port 25565): the frame URL's host when the URL is
@@ -1222,7 +1225,7 @@ host's slots stay, and the old connection's later messages are ignored.
 
 ```json
 {"type": "slot", "id": "slot-3", "phase": "running", "generation": 4, "vm": "fleet-slot-3",
- "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": "192.0.2.10", "v4_port": 20202,
+ "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": "192.0.2.10", "v4_port": 443,
  "place": "EC2 in us-east-1",
  "timings": {"teardown_ms": 310, "restore_ms": 4300, "ack_ms": 4300, "gpu_ms": 3100, "container_ms": 600, "first_frame_ms": 250, "total_ms": 5200},
  "error": null, "retry_in_ms": null}
@@ -1615,11 +1618,47 @@ The IPv4 path: a GPU host has one public IPv4 address, shared by its slots.
 `--tls-publish-base <port>` forwards each slot's TLS port on the host (`--publish-ip`, port
 `<port> + GPU index`, fcvm's `--publish`, which relays into a routed VM and goes away with its
 fcvm), and `--public-ipv4-from-imds` reports the host's address (IMDS `public-ipv4`, assigned
-by EC2 at launch) as `ipv4`, with the slot's port as `v4_port`. Every place's TLS port is in its
-mode's range of `fleet/published-ports.json`: `<port>` plus the range's offset plus the place's
-index in its mode (GPU slots by GPU index, then Windows sandboxes, Minecraft servers and the
-aggregator in ranges of their own). The agent refuses to start with more places of a mode than
-its range holds, and an `--aggregate-tls-port` other than the declared one. The host
+by EC2 at launch) as `ipv4`, with `v4_port` 443, the IPv4 front's port (below). Every place's
+TLS port is in its mode's range of `fleet/published-ports.json`: `<port>` plus the range's
+offset plus the place's index in its mode (GPU slots by GPU index, then Windows sandboxes,
+Minecraft servers and the aggregator in ranges of their own). The agent refuses to start with
+more places of a mode than its range holds, and an `--aggregate-tls-port` other than the
+declared one.
+
+#### The IPv4 front
+
+With both `--tls-publish-base` and `--public-ipv4-from-imds`, the agent listens on port
+`gpu_host_ipv4.sni_port` of `fleet/published-ports.json` (443) of `--publish-ip`, which must
+then be an IPv4 address (`0.0.0.0` on the fleet's hosts), and refuses to start when it cannot.
+It reads each connection's TLS ClientHello, takes the server name, and relays the connection,
+the ClientHello included and every byte unchanged, to the TLS port of the place the name is
+for, on the address the connection arrived at (the host's private address behind its public
+one). TLS still ends in the place, with the certificate it already holds; the agent holds no
+key for it. A name routes when it is a `-v4` launch name, `<id>-<token>-v4.<zone>` (the token
+is 8 base32 characters), and a place of this host reports `<id>`: a GPU slot or phone
+(`slot-<n>`, `phone-<n>`), a Windows sandbox (`win-<n>`), a Minecraft server's view socket
+(`mc-<n>`) or the host's aggregator (`agg-<host>`). Every other connection is closed without a
+byte sent: bytes that are not a ClientHello, a hello with no server name, any other name, a
+hello not complete within 10 s or over 16 KiB, and connections past 8192 at once.
+
+The front learns where each place listens from the place's own reports. Every slot and
+aggregate message passes it on its way to the coordinator: a report whose IPv4 path names the
+place's own port records that port under the report's id (or the aggregator's), and goes on
+with `v4_port` 443, so the coordinator names every IPv4 path `wss://<label>-v4.<subzone>/...`
+with no port. A port belongs to the id that reported it last. Every mode's IPv4 path takes
+this one route (`src/fleet/agent/sni.rs`). Minecraft's Java Edition game port (25565, over
+IPv6) is not TLS and not part of it.
+
+Rollout: the places' own ports still listen, as the front's backends, and the security group
+admits them as before, so a page that holds a URL an agent without the front published
+(`...-v4.<subzone>:<port>/...`) keeps working until that launch ends. The front takes effect
+on a host started from a host image built with it (the agent binary is in the image). The
+security group's rule for 443 from any IPv4 address already covers the hosts (it is the
+fleet's one group, shared with the EC2 tiles). The per-place range can leave the security
+group once no host runs an older image: then no published name carries a port other than 443
+(check the coordinator's state for a `frame_url_v4` with a port), and the places' ports are
+only the front's backends. The viewer-path smoke accepts both 443 and a place's own port
+until then. The host
 AMI's unit (`fcvm-fleet-agent.service`, `ExecStart=/usr/local/bin/fcvm fleet agent
 $FLEET_AGENT_ARGS`) takes, in `/etc/fcvm-fleet/agent.env`:
 
@@ -1720,9 +1759,10 @@ and with an IPv6 prefix on port 443 of `<prefix>::1`, the host's side of the pre
 never gives it to a VM), which the agent puts on the host's default IPv6 interface
 (`ip -6 addr replace <addr>/128 dev <iface> nodad`) before it starts. The message then
 carries what the coordinator names (`agg-<host>-<token>`, see `--dns-subzone`):
-`ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and the port as
-`v4_port`. The aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the
-host's security group does not admit.
+`ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and `v4_port` 443, the
+IPv4 front's, which routes `agg-<host>-<token>-v4` to the aggregator's TLS port. The
+aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the host's security
+group does not admit.
 
 ## Aggregator
 

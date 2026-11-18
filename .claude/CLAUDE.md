@@ -256,7 +256,10 @@ evidence. Never report a mode "up", "deployed" or "working" on anything less.
 - Every port a viewer connects to is declared once, in `fleet/published-ports.json`. The agent
   allocates from it and refuses a place outside it; the smoke refuses a published URL outside
   it; ejc3/aws derives the GPU hosts' security group range from it. A new mode or a new place
-  count changes that file first.
+  count changes that file first. A GPU host publishes every place's IPv4 path on 443
+  (`gpu_host_ipv4.sni_port`): the agent's IPv4 front routes by TLS server name to the place's
+  own port (`src/fleet/agent/sni.rs`). A new mode's places report their IPv4 path in
+  `SlotReport` like every other, and the front routes them with no change of its own.
 - 2026-11-13: Windows and Minecraft reported every sandbox and server up on staging while
   every tile was black. The security group dropped their IPv4 ports, Windows over IPv6 never
   answered the TLS handshake, and Minecraft published no IPv4 path. The deploy smoke checked

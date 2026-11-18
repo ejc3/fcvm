@@ -236,9 +236,11 @@ def declared_ports(mode, family, half="fcvm"):
     if half == "ec2":
         return {ports["ec2_tile_ipv4_port"]}
     host = ports["gpu_host_ipv4"]
+    # The front's port, routed by server name, and while hosts on images from before the front
+    # remain (fleet/PROTOCOL.md, "The IPv4 front"), the place's own port in its mode's range.
     r = {x["mode"]: x for x in host["ranges"]}[RANGE_OF[mode]]
     first = host["base"] + r["offset"]
-    return set(range(first, first + r["count"]))
+    return {host["sni_port"]} | set(range(first, first + r["count"]))
 
 
 def checked(url, path, ports):

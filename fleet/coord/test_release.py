@@ -653,7 +653,10 @@ class ViewerPathTests(unittest.TestCase):
     def test_the_declared_ports_are_the_agents(self):
         ports = json.loads((HERE.parent / "published-ports.json").read_text())
         base = ports["gpu_host_ipv4"]["base"]
-        self.assertEqual(smoke.declared_ports("windows", "v4"), set(range(base + 8, base + 12)))
+        self.assertEqual(smoke.declared_ports("windows", "v4"), {443} | set(range(base + 8, base + 12)))
+        # Every mode's IPv4 path is on 443 through the host's front.
+        for mode in ("wall", "phones", "windows", "minecraft", "aggregate"):
+            self.assertIn(443, smoke.declared_ports(mode, "v4"), mode)
         self.assertEqual(smoke.declared_ports("phones", "v4"), smoke.declared_ports("wall", "v4"))
         self.assertEqual(smoke.declared_ports("wall", "v4", "ec2"), {443})
         self.assertEqual(smoke.declared_ports("minecraft", "v6"), {443})

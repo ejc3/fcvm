@@ -1,8 +1,9 @@
-//! The host ports a GPU host publishes its places' TLS on, for viewers with no IPv6: one public
-//! IPv4 address per host, a port per place. `fleet/published-ports.json` declares them once, by
-//! mode; the agent allocates only from it, the viewer-path smoke checks every published URL
-//! against it, and ejc3/aws derives the security group's range from it. A port outside the
-//! declaration would be one the security group drops, so the agent refuses to start instead.
+//! The host ports a GPU host serves its places' TLS on, for viewers with no IPv6: one public
+//! IPv4 address per host, a port per place, and the front on `sni_port` (443) that routes every
+//! place's launch name to its port (`sni.rs`). `fleet/published-ports.json` declares them once,
+//! by mode; the agent allocates only from it, the viewer-path smoke checks every published URL
+//! against it, and ejc3/aws derives the security group from it. A port outside the declaration
+//! would be one the security group drops, so the agent refuses to start instead.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -20,6 +21,8 @@ pub struct Declared {
 
 #[derive(Debug, Deserialize)]
 pub struct HostIpv4 {
+    /// The port viewers reach every place on: the IPv4 front, routed by server name.
+    pub sni_port: u16,
     /// The production `--tls-publish-base`. Offsets are relative to the base the agent is given.
     pub base: u16,
     pub ranges: Vec<Range>,
@@ -137,6 +140,14 @@ mod tests {
     fn the_declaration_parses_and_its_ranges_tile_one_span() {
         let d = declared();
         assert_eq!(d.ipv6_port, 443);
+        // Every IPv4 path of a GPU host is on 443, as an EC2 tile's is: a viewer whose network
+        // lets out only 80 and 443 reaches every mode.
+        assert_eq!(d.gpu_host_ipv4.sni_port, 443);
+        assert_eq!(d.gpu_host_ipv4.sni_port, d.ec2_tile_ipv4_port);
+        assert!(
+            (d.gpu_host_ipv4.sni_port as u32) < d.gpu_host_ipv4.base as u32,
+            "the front's port is not a place's"
+        );
         let mut ranges: Vec<_> = d.gpu_host_ipv4.ranges.iter().collect();
         ranges.sort_by_key(|r| r.offset);
         let mut next = 0u32;

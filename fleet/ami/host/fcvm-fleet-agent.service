@@ -14,6 +14,7 @@ ConditionPathExists=/etc/fcvm-fleet/agent.env
 #
 # It runs as root: each slot's VM gets its own public IPv6 address in fcvm's routed mode
 # (--ipv6-prefix-from-imds), which needs root, and the agent refuses a prefix otherwise.
+# Root also binds the IPv4 front on port 443 (fleet/PROTOCOL.md, "The IPv4 front").
 # The renderer image is in root's podman store and fcvm's config in /root/.config/fcvm
 # (build.sh puts both there).
 #

@@ -283,7 +283,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-system-image phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	bench-container-import bench-sni-front bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-kitesurf-build bench-live-campaign bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -359,6 +359,7 @@ help:
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
+	@echo "  bench-sni-front    GPU host IPv4 front: first-frame latency direct vs through it"
 	@echo "  bench-computesdk   ComputeSDK Burst TTI against fcvm serve (CONCURRENCY=, ITERATIONS=, BURSTS=)"
 	@echo "  bench-gpu-restore  Cache-hit GPU VM restore latency, N runs (needs vfio-pci bound GPUs)"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
@@ -1697,6 +1698,11 @@ bench-hugepages-test: build setup-default
 bench-container-import: build setup-default
 	@echo "==> Running container import benchmark..."
 	$(CARGO) bench --bench container_import
+
+# The GPU host's IPv4 front: connect + TLS + upgrade + first frame, direct and through it.
+#   make bench-sni-front [SNI_BENCH_N=2000] [SNI_BENCH_EXTERNAL=<ip:port> SNI_BENCH_PLACE_PORT=<port>]
+bench-sni-front: cargo-target-link
+	$(CARGO) bench --bench sni_front
 
 # Clone hot-path latency: `fcvm snapshot run` spawn -> exec-server-ready, N times.
 # Event-driven readiness (waits on the debug log's marker), plus a stage breakdown

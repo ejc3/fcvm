@@ -304,9 +304,13 @@ each renderer read-only. Every VM holds the wildcard key, which is acceptable be
 viewer can only send scene parameters, never code; per-slot certificates are the follow-up
 if that changes.
 
-A viewer with no IPv6 cannot reach a VM directly. For them each slot also has a proxied
-name, `slot-<n>-v4.<zone>`, through Cloudflare (which reaches the VM over IPv6 and checks its
-certificate); the page uses it only when the direct address fails.
+A viewer with no IPv6 cannot reach a VM directly. For them each launch also has a `-v4`
+name, `<label>-v4.<zone>`, the A record of the GPU host's one public IPv4 address (an EC2
+tile's own address for the EC2 half). A GPU host serves every place's `-v4` name on 443: the
+agent's IPv4 front reads the TLS server name and relays the connection unchanged to that
+place's own TLS port on the host (fleet/PROTOCOL.md, "The IPv4 front"), so TLS still ends in
+the VM and a network that lets out only 80 and 443 reaches every mode. The page uses the
+`-v4` name only when IPv6 does not connect.
 
 Locally there is no Cloudflare: the page connects to the slot's address directly.
 

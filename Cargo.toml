@@ -137,3 +137,7 @@ harness = false
 [[bench]]
 name = "container_import"
 harness = false
+
+[[bench]]
+name = "sni_front"
+harness = false
