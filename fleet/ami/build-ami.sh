@@ -45,10 +45,25 @@ ssm_send() { # id, command[, delivery timeout s] -> command id
     --timeout-seconds "${3:-600}" --query Command.CommandId --output text
 }
 ssm_sh() { # id, command: wait and print stdout and stderr; exit with its status
-  local cid st; cid=$(ssm_send "$1" "$2")
+  # A status read that fails is not "Pending". On 2026-11-18 every read of a part upload that had
+  # already succeeded failed, and a loop that took each failure for Pending waited two hours. The
+  # call is bounded by the command's own lifetime (delivery 600 s plus execution 7200 s), and
+  # SSM_STATUS_FAILURES reads that fail in a row end it with the last error (the first few seconds
+  # after send-command can answer InvocationDoesNotExist).
+  local cid st out failed=0 end
+  cid=$(ssm_send "$1" "$2") || return 1
+  end=$(($(now) + 7860))
   while :; do
-    st=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>/dev/null || echo Pending)
-    case "$st" in Pending|InProgress|Delayed) sleep 3 ;; *) break ;; esac
+    if out=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>&1); then
+      failed=0; st=$out
+      case "$st" in Pending|InProgress|Delayed) ;; *) break ;; esac
+    else
+      failed=$((failed + 1))
+      [ "$failed" -lt "${SSM_STATUS_FAILURES:-20}" ] || {
+        echo "ssm_sh: $failed status reads of $cid failed in a row: $(tail -n 1 <<<"$out")" >&2; return 1; }
+    fi
+    [ "$(now)" -lt "$end" ] || { echo "ssm_sh: $cid is still ${st:-unread} after its lifetime" >&2; return 1; }
+    sleep "${SSM_POLL:-3}"
   done
   A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query '[StandardOutputContent,StandardErrorContent]' --output text
   [ "$st" = Success ]
