@@ -37,6 +37,8 @@ struct Opts {
     dns: Option<fcvm::fleet::coord::Names>,
     /// Seats and tokens; everyone seated when absent.
     gate: Option<Arc<admission::Gate>>,
+    /// Caps on open `/live` sockets.
+    sockets: live::SocketCaps,
 }
 
 impl Default for Opts {
@@ -54,6 +56,7 @@ impl Default for Opts {
             dns: None,
             site_key: None,
             gate: None,
+            sockets: live::SocketCaps::default(),
         }
     }
 }
@@ -83,6 +86,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
+        sockets: o.sockets,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -648,6 +652,71 @@ async fn ipv6_limits_are_keyed_by_the_slash_64() {
     );
     b.intent("w3", "word", json!({"text": "three"})).await;
     assert_eq!(b.receipt("w3").await["outcome"], "committed");
+}
+
+/// Open a `/live` socket as a client at `ip`, or the HTTP status it was refused with.
+async fn try_live(url: &str, ip: &str) -> Result<Ws, (u16, Option<String>)> {
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("cf-connecting-ip", ip.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err((
+            r.status().as_u16(),
+            r.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        )),
+        Err(e) => panic!("connecting to {url}: {e}"),
+    }
+}
+
+/// One client holds at most `per_client` `/live` sockets and the coordinator `total`; a
+/// socket past either is refused with 503 and a `Retry-After`, and a closed socket gives its
+/// place back.
+#[tokio::test]
+async fn live_sockets_are_capped_per_client_and_in_all() {
+    let c = coordinator_with(Opts {
+        sockets: live::SocketCaps {
+            per_client: 2,
+            total: 3,
+        },
+        ..Opts::default()
+    })
+    .await;
+    let a1 = try_live(&c.url, "198.51.100.1")
+        .await
+        .expect("first socket");
+    let _a2 = try_live(&c.url, "198.51.100.1")
+        .await
+        .expect("second socket");
+    let refused = try_live(&c.url, "198.51.100.1").await.err();
+    assert_eq!(
+        refused,
+        Some((503, Some(live::FULL_RETRY_AFTER_SECS.to_string()))),
+        "a third socket from one client"
+    );
+    let _b1 = try_live(&c.url, "198.51.100.2")
+        .await
+        .expect("another client");
+    assert_eq!(
+        try_live(&c.url, "198.51.100.3").await.err().map(|e| e.0),
+        Some(503),
+        "past the total"
+    );
+    // A closed socket frees its place.
+    drop(a1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match try_live(&c.url, "198.51.100.3").await {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(e) => panic!("a closed socket's place was never given back: {e:?}"),
+        }
+    }
 }
 
 /// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
@@ -1546,6 +1615,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
+        sockets: live::SocketCaps::default(),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -3339,6 +3409,7 @@ async fn page_url(handle: &Handle) -> String {
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),
+        sockets: live::SocketCaps::default(),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });

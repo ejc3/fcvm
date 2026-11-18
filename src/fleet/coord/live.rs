@@ -39,6 +39,89 @@ const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
 
+/// `/live` sockets one client key may hold open at once. A page holds one (fleet/web
+/// wall-client.ts opens the next only after the last has closed); eight lets a household or
+/// small office behind one IPv4 address watch on several devices, while one client holds at
+/// most 0.16% of [`MAX_SOCKETS`].
+pub const SOCKETS_PER_CLIENT: usize = 8;
+/// `/live` sockets the coordinator holds in all. The coordinator holds about 5,000 of them,
+/// bound by memory at about 160 KB each (docs/fleet/ARCHITECTURE.md, "Past about 5,000
+/// viewers the coordinator needs more"); past that a flood of sockets would take the task's
+/// memory from the viewers already connected.
+pub const MAX_SOCKETS: usize = 5_000;
+/// How long a refused `/live` request is told to wait (`Retry-After`). The page does not read
+/// it: a refused handshake is a failed connect to it, retried with its own backoff.
+pub const FULL_RETRY_AFTER_SECS: u64 = 30;
+
+/// The caps on open `/live` sockets.
+#[derive(Debug, Clone, Copy)]
+pub struct SocketCaps {
+    pub per_client: usize,
+    pub total: usize,
+}
+
+impl Default for SocketCaps {
+    fn default() -> Self {
+        SocketCaps {
+            per_client: SOCKETS_PER_CLIENT,
+            total: MAX_SOCKETS,
+        }
+    }
+}
+
+/// The open `/live` sockets: in all and per client key.
+struct Sockets {
+    caps: SocketCaps,
+    open: Mutex<(usize, std::collections::HashMap<String, usize>)>,
+}
+
+/// One open socket's place under the caps, given back when it drops (the socket closed, or the
+/// upgrade never happened).
+struct SocketPermit {
+    sockets: Arc<Sockets>,
+    key: String,
+}
+
+/// Why a socket was refused.
+enum SocketsFull {
+    Client,
+    Total,
+}
+
+impl Sockets {
+    fn take(self: &Arc<Self>, key: &str) -> Result<SocketPermit, SocketsFull> {
+        let mut open = self.open.lock().unwrap();
+        let (total, per) = &mut *open;
+        if *total >= self.caps.total {
+            return Err(SocketsFull::Total);
+        }
+        let n = per.entry(key.to_string()).or_default();
+        if *n >= self.caps.per_client {
+            return Err(SocketsFull::Client);
+        }
+        *n += 1;
+        *total += 1;
+        Ok(SocketPermit {
+            sockets: self.clone(),
+            key: key.to_string(),
+        })
+    }
+}
+
+impl Drop for SocketPermit {
+    fn drop(&mut self) {
+        let mut open = self.sockets.open.lock().unwrap();
+        let (total, per) = &mut *open;
+        *total = total.saturating_sub(1);
+        if let Some(n) = per.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub struct LiveConfig {
     pub checker: Arc<dyn TextChecker>,
     /// Browser origins allowed besides the coordinator's own.
@@ -54,6 +137,8 @@ pub struct LiveConfig {
     pub poster: Arc<Poster>,
     /// Who gets direct streams and who the broadcast, and their tokens.
     pub gate: Arc<Gate>,
+    /// How many `/live` sockets may be open.
+    pub sockets: SocketCaps,
 }
 
 #[derive(Clone)]
@@ -61,9 +146,14 @@ pub struct App {
     pub handle: Handle,
     pub cfg: Arc<LiveConfig>,
     next_viewer: Arc<AtomicU64>,
+    sockets: Arc<Sockets>,
 }
 
 pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
+    let sockets = Arc::new(Sockets {
+        caps: cfg.sockets,
+        open: Mutex::default(),
+    });
     Router::new()
         .route("/live", get(live))
         .route("/agent", get(agent_socket))
@@ -72,6 +162,7 @@ pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
         .with_state(App {
             handle,
             cfg: Arc::new(cfg),
+            sockets,
             next_viewer: Arc::new(AtomicU64::new(1)),
         })
 }
@@ -268,11 +359,34 @@ async fn live(
         key: client_key(&address),
         address,
     };
+    let permit = match app.sockets.take(&client.key) {
+        Ok(p) => p,
+        Err(full) => {
+            let why = match full {
+                SocketsFull::Client => "too many connections from this network",
+                SocketsFull::Total => "the coordinator is full",
+            };
+            tracing::info!(client = %client.key, why, "refusing /live");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, FULL_RETRY_AFTER_SECS.to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                why,
+            )
+                .into_response();
+        }
+    };
     let page = Page {
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
-        .on_upgrade(move |socket| viewer(socket, app, client, page))
+        .on_upgrade(move |socket| async move {
+            // Held for the socket's life; an upgrade that never happens drops it unused.
+            let _permit = permit;
+            viewer(socket, app, client, page).await
+        })
         .into_response()
 }
 

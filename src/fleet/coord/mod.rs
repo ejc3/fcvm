@@ -1403,6 +1403,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         turnstile_site_key: args.turnstile_site_key,
         poster,
         gate: Arc::new(gate),
+        sockets: live::SocketCaps::default(),
     };
     tokio::select! {
         r = live::serve(listener, handle.clone(), cfg) => r?,
