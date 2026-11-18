@@ -139,15 +139,84 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
         self.assertEqual(gate.payloads, [{"action": "status"}])
 
-    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_held_still(self):
+    def test_no_agent_decides_nothing_unless_the_release_changed_the_host_image_and_its_hosts_held_still(self):
         none = self.agents(instances=[])
-        for after in (self.status(placement={"changed_kinds": ["tile"]}), self.status(placement={"digest": "e" * 64}),
+        for after in (self.status(placement={"changed_kinds": ["tile"]}),
+                      self.status(placement={"digest": "e" * 64, "release_hosts": self.HOSTS[:1]}),
+                      self.status(placement={"digest": "e" * 64, "release_hosts": self.HOSTS + ["i-0example0host00c"]}),
                       self.status(placement={"settled": False}), self.status(generation=16)):
             with self.subTest(after=after["placement"]):
                 gate = Lambda(after)
                 before = self.status(placement={"changed_kinds": after["placement"]["changed_kinds"]})
                 self.assertEqual(self.decide(gate, before=before, v4="", v6="", agents=none), 0)
                 self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_no_agent_rolls_back_when_only_tiles_moved_during_the_probes(self):
+        # Staging, 2026-11-18 (generation 21): the release host never registered, and AWS
+        # interrupted one Spot tile during the 27-minute smoke. The placement digest moved, so the
+        # run decided nothing and the rollback waited for an operator. The no-agent evidence names
+        # only the release's hosts and their registrations, so a tile replacement does not touch
+        # it: the claim is bound to the placement the agents were read against, which the gate
+        # checks again under its lock.
+        moved = self.status(placement={"digest": "e" * 64, "release_tiles": ["i-0example0tile00b"]})
+        gate = Lambda(moved, {"status": "rolled_back", "pointer": {}, "hosts": {}})
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents(instances=[])), 0)
+        self.assertEqual(gate.payloads[1]["action"], "rollback")
+        self.assertEqual(gate.payloads[1]["placement"], "e" * 64)
+        self.assertEqual(gate.payloads[1]["evidence"]["hosts"], sorted(self.digest(h) for h in self.HOSTS))
+        # Probes still decide only on a placement that held still: a pass or a failure measured
+        # on tiles that have since moved is not laid on the new placement.
+        for v4 in (self.family("v4"), self.family("v4", failed=2)):
+            with self.subTest(v4=v4):
+                gate = Lambda(moved)
+                self.assertEqual(self.decide(gate, v4=v4, agents=self.agents(instances=[])), 0)
+                self.assertEqual(gate.payloads, [{"action": "status"}])
+        # An agent on a release host still leaves the moved placement undecided.
+        gate = Lambda(moved)
+        self.assertEqual(self.decide(gate, v4="", v6="", agents=self.agents()), 0)
+        self.assertEqual(gate.payloads, [{"action": "status"}])
+
+    def test_a_gate_call_the_cli_could_not_complete_is_repeated(self):
+        # Staging, 2026-11-18 (generation 19): both families reported six attributed image
+        # failures and no inconclusive probe, and `aws lambda invoke` exited 254. The verdict was
+        # lost with no retry and no reason; the rollback came two runs and 6.5 minutes later.
+        # Every gate action is safe to repeat: status reads, verify records the same receipt, and
+        # the gate answers a repeated rollback of a committed receipt with the committed answer.
+        throttled = ("\nAn error occurred (TooManyRequestsException) when calling the Invoke operation "
+                     "(reached max retries: 4): Rate Exceeded.\n")
+        for failures in (1, len(release_gate.INVOKE_WAITS)):
+            with self.subTest(failures=failures):
+                inner = Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}})
+                calls = []
+
+                def gate(argv, **kw):
+                    calls.append(json.loads(argv[argv.index("--payload") + 1])["action"])
+                    if calls.count("rollback") and calls.count("rollback") <= failures:
+                        return mock.Mock(returncode=254, stdout="", stderr=throttled)
+                    return inner(argv, **kw)
+                err = io.StringIO()
+                with mock.patch.object(release_gate.time, "sleep") as sleep, \
+                        mock.patch.object(sys, "stderr", err), redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.decide(gate, v4=self.family("v4", failed=1)), 0)
+                self.assertEqual(calls, ["status"] + ["rollback"] * (failures + 1))
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], list(release_gate.INVOKE_WAITS[:failures]))
+                self.assertIn("TooManyRequestsException", err.getvalue())
+                self.assertNotIn("Rate Exceeded", err.getvalue())
+        # A call that never completes stops after the last wait and fails the job.
+        failing = mock.Mock(return_value=mock.Mock(returncode=254, stdout="", stderr=throttled))
+        with mock.patch.object(release_gate.time, "sleep"), mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, r"exit 254, TooManyRequestsException"):
+                release_gate.invoke({"action": "status"}, failing)
+        self.assertEqual(failing.call_count, len(release_gate.INVOKE_WAITS) + 1)
+
+    def test_a_gate_call_waits_for_the_function_rather_than_invoking_it_again(self):
+        # The gate function runs up to 900 s with one reserved execution (ejc3/aws
+        # fcvm-fleet-ami-pipeline.tf). The CLI's default 60 s read timeout makes the CLI invoke it
+        # again while a rollback is still running, which the reserved execution refuses.
+        gate = Lambda(self.status())
+        argv = []
+        release_gate.invoke({"action": "status"}, lambda a, **kw: (argv.extend(a), gate(a, **kw))[1])
+        self.assertGreater(int(argv[argv.index("--cli-read-timeout") + 1]), 900)
 
     def test_a_missing_or_malformed_agent_snapshot_decides_nothing_without_probes(self):
         good = {"since": 2, "registered": [], "observed_at": 3}

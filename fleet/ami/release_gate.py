@@ -21,7 +21,8 @@ Only a verdict the release caused decides anything:
   said served it, every host is one of the after-status's release hosts and every tile instance
   one of its release tiles, and
 - the placement was ready before the probes and is identical after them: the same receipt, the
-  same digest, current and settled.
+  same digest, current and settled. A no-agent rollback (no release host registered, and no probe
+  names one) needs only the same receipt and release hosts: tiles may have moved meanwhile.
 All passes verify the receipt. An attributed, positive application failure rolls it back
 only if that probe served a changed image and neither family has an inconclusive probe.
 Failure on an unchanged image alone does not verify or roll back the receipt. A socket, DNS, TLS, authentication,
@@ -38,9 +39,22 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 FUNCTION = "fcvm-fleet-ami-release-gate"
 MODES = ["wall", "phones", "windows", "minecraft", "potato"]
+
+
+# Seconds between attempts at a gate call the CLI could not complete (a throttle from the
+# function's one reserved execution, a network error). Every gate action is safe to repeat:
+# status reads, verify records the same receipt, and the gate answers a repeated rollback of a
+# committed receipt with the committed answer (ejc3/aws publish.py `gate`).
+INVOKE_WAITS = (5, 15, 30, 60)
+# Longer than the gate function's own 900 s timeout, so the CLI waits for a long rollback
+# instead of invoking the function again while it runs.
+READ_TIMEOUT = 905
+# Only the error code of a failed call is printed: the CLI's message can name resources.
+ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z]+)\)")
 
 
 def invoke(payload, run=subprocess.run):
@@ -48,10 +62,18 @@ def invoke(payload, run=subprocess.run):
         raise SystemExit(f"release_gate: RELEASE_GATE must name {FUNCTION}")
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "response.json")
-        result = run(["aws", "lambda", "invoke", "--function-name", FUNCTION, "--cli-binary-format", "raw-in-base64-out",
-                      "--payload", json.dumps(payload, separators=(",", ":")), out], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise SystemExit(f"release_gate: invoking {FUNCTION} failed (exit {result.returncode})")
+        for attempt, wait in enumerate((*INVOKE_WAITS, None), 1):
+            result = run(["aws", "lambda", "invoke", "--function-name", FUNCTION, "--cli-binary-format", "raw-in-base64-out",
+                          "--cli-read-timeout", str(READ_TIMEOUT),
+                          "--payload", json.dumps(payload, separators=(",", ":")), out], capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            code = ERROR_CODE.search(result.stderr or "")
+            why = f"invoking {FUNCTION} failed (exit {result.returncode}, {code.group(1) if code else 'no error code'})"
+            if wait is None:
+                raise SystemExit(f"release_gate: {why} after {attempt} attempts")
+            print(f"release_gate: {why}; attempt {attempt}, trying again in {wait} s", file=sys.stderr, flush=True)
+            time.sleep(wait)
         meta = json.loads(result.stdout or "{}")
         if meta.get("FunctionError"):
             raise SystemExit(f"release_gate: {FUNCTION} raised {meta['FunctionError']}")
@@ -187,6 +209,17 @@ def agent_snapshot(raw):
     return None
 
 
+def served(summaries, hosts):
+    """Whether a reported probe names one of `hosts`: a host that served a probe ran its agent,
+    whatever the coordinator's record says."""
+    for summary in summaries.values():
+        for entry in (summary or {}).get("attribution") or []:
+            named = entry.get("hosts") if isinstance(entry, dict) else None
+            if isinstance(named, list) and set(hosts) & {h for h in named if isinstance(h, str)}:
+                return True
+    return False
+
+
 def decide(before, v4, v6, run, agents=""):
     problem = placement_problem(before)
     if problem:
@@ -202,9 +235,14 @@ def decide(before, v4, v6, run, agents=""):
     if problem:
         return None, f"no verdict: after the probes {problem}"
     changed = set(after["placement"]["changed_kinds"])
-    if (receipt(after) != receipt(before) or after["placement"]["digest"] != before["placement"]["digest"]
-            or changed != set(before["placement"]["changed_kinds"])):
+    if receipt(after) != receipt(before) or changed != set(before["placement"]["changed_kinds"]):
         return None, "no verdict: the release or its placement changed during the probes"
+    # Probes decide only on the placement they ran on. A no-agent claim names only the release's
+    # hosts, so a tile replaced meanwhile (a Spot interruption) does not touch it as long as the
+    # release hosts held still; it is bound to the placement after the probes, the one the
+    # agents were read against.
+    held = after["placement"]["digest"] == before["placement"]["digest"]
+    hosts_held = set(after["placement"]["release_hosts"]) == set(before["placement"]["release_hosts"])
     # Probes that can be laid on the release decide. Only when they cannot (no summary, or probes
     # /live named no release host for) does the coordinator's record of registrations: a host
     # image that boots but never starts its agent leaves the smoke no tile to probe, and the record
@@ -217,15 +255,21 @@ def decide(before, v4, v6, run, agents=""):
         if problem is None:
             reason = unattributed(summary, after["placement"])
             problem = f"no verdict: {name} {reason}" if reason else None
+    if problem is None and not held:
+        # Probes that all name release instances say the release's hosts served; they decide on
+        # the placement they ran on or not at all, and are never read as a missing agent.
+        return None, "no verdict: the release or its placement changed during the probes"
     if problem is not None:
         hosts = after["placement"]["release_hosts"]
-        if snapshot is None or set(hosts) & set(snapshot["registered"]):
+        if snapshot is None or set(hosts) & set(snapshot["registered"]) or served(summaries, hosts):
             return None, problem
+        if not hosts_held:
+            return None, "no verdict: no release host registered an agent, but the release hosts changed during the probes"
         if "host" not in changed:
             return None, "no verdict: no release host registered an agent, but this release did not change the host image"
         # The gate checks the coordinator's record began before every release host launched, so
         # "not registered since `since`" covers each host's whole life.
-        return {"action": "rollback", "receipt": receipt(before), "placement": before["placement"]["digest"],
+        return {"action": "rollback", "receipt": receipt(before), "placement": after["placement"]["digest"],
                 "evidence": {"kind": "no_agent", "hosts": sorted(hosts), "observed_at": snapshot["observed_at"],
                              "coordinator_since": snapshot["since"]}}, None
     evidence = None
