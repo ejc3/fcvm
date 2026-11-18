@@ -683,6 +683,8 @@ class GpuboxWallReserve(unittest.TestCase):
             {"build_id": "reviewed-no-agent-drill:example"},
             {"source_sha": "7457a0ff977a3471f4e8a2502b8248417576f737"},
             {"source_sha": "c3831f6c43313e36db9ef461df87d6620755c6b4"},
+            {"source_sha": "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff"},
+            {"source_sha": "df10f45d90593abdb70b564f1fb44042ce2144fc"},
         ]
         for identity in identities:
             with self.subTest(identity=identity):
@@ -696,7 +698,9 @@ class GpuboxWallReserve(unittest.TestCase):
     def test_a_drill_copy_record_does_not_offer_an_image_to_gpubox(self):
         safe, broken = "ami-" + "1" * 17, "ami-" + "2" * 17
         for identity in ({"build_id": "reviewed-release-gate-drill:example"},
-                         {"source_sha": "c3831f6c43313e36db9ef461df87d6620755c6b4"}):
+                         {"source_sha": "c3831f6c43313e36db9ef461df87d6620755c6b4"},
+                         {"source_sha": "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff"},
+                         {"source_sha": "df10f45d90593abdb70b564f1fb44042ce2144fc"}):
             with self.subTest(identity=identity):
                 record = dict(identity, images={"us-west-2": {"host": broken}})
                 release = {"host_amis": {"us-west-2": {"x86_64": safe}}}
