@@ -4,7 +4,8 @@
 //! - [`Seats`]: at most `--direct-capacity` viewers hold a seat (direct and aggregated
 //!   streams). A seat is kept while its connection is open and for [`SEAT_GRACE`] after it
 //!   closes, for a page that reconnects with its ticket. A viewer that arrives with every
-//!   seat held is late: broadcast only, for the whole connection.
+//!   seat held, or whose client already holds [`SEATS_PER_CLIENT`], is late: broadcast
+//!   only, for the whole connection.
 //! - Direct tokens: `v1.<expiry unix s>.<viewer>.<mac>`, the mac an HMAC-SHA256 of the first
 //!   three fields with the admission key, base64url without padding. Renderers and
 //!   aggregators that hold the key refuse `GET /frames` without a valid one.
@@ -19,6 +20,13 @@ use std::time::{Duration, Instant};
 
 /// How long a closed connection's seat waits for the page to come back with its ticket.
 pub const SEAT_GRACE: Duration = Duration::from_secs(60);
+/// Seats one client key (`live::client_key`) may hold when seats are limited. Without it one
+/// client could take all `--direct-capacity` seats (500, the wall's measured capacity) by
+/// opening that many connections and leave every later viewer on the broadcast. A page holds
+/// one seat; two lets a second device or tab of the same household or office be seated, and
+/// a reconnect with its ticket takes its own seat back without counting again. A client past
+/// it watches the broadcast, which shows the same picture.
+pub const SEATS_PER_CLIENT: usize = 2;
 /// How long a direct token lasts, and how often a seated connection gets a new one.
 pub const DIRECT_TOKEN_SECS: u64 = 600;
 pub const DIRECT_REFRESH: Duration = Duration::from_secs(300);
@@ -166,11 +174,23 @@ pub enum Admitted {
     Seat { ticket: String },
     /// Every seat was held when it arrived: the broadcast only.
     Late,
+    /// Its client already held [`SEATS_PER_CLIENT`] seats when it arrived: the broadcast only,
+    /// like a late viewer, but a free seat elsewhere is no reason to reload.
+    ClientFull,
+}
+
+impl Admitted {
+    /// Whether the connection watches the broadcast only.
+    pub fn late(&self) -> bool {
+        !matches!(self, Admitted::Seat { .. })
+    }
 }
 
 struct Seat {
     /// Open connections holding it (a page has one; two with the same ticket share it).
     open: usize,
+    /// The client key it was given to.
+    client: String,
     /// When the last connection closed.
     closed_at: Option<Instant>,
 }
@@ -204,9 +224,11 @@ impl Seats {
         });
     }
 
-    /// Admit a new connection. A ticket the page kept from a seat it still holds (open, or
-    /// closed within the grace) gets that seat back; otherwise a free seat, else late.
-    pub fn admit(&self, ticket: Option<&str>, now: Instant) -> Admitted {
+    /// Admit a new connection from `client` (its client key). A ticket the page kept from a
+    /// seat it still holds (open, or closed within the grace) gets that seat back; otherwise a
+    /// free seat, unless seats are limited and `client` already holds [`SEATS_PER_CLIENT`];
+    /// else late.
+    pub fn admit(&self, ticket: Option<&str>, client: &str, now: Instant) -> Admitted {
         let mut held = self.held.lock().unwrap();
         self.expire(&mut held, now);
         if let Some(t) = ticket {
@@ -221,11 +243,18 @@ impl Seats {
         if self.capacity.is_some_and(|c| held.len() >= c) {
             return Admitted::Late;
         }
+        // Only where a late viewer has a broadcast to watch: unlimited seats mean no broadcast.
+        if self.capacity.is_some()
+            && held.values().filter(|s| s.client == client).count() >= SEATS_PER_CLIENT
+        {
+            return Admitted::ClientFull;
+        }
         let ticket = uuid::Uuid::new_v4().simple().to_string();
         held.insert(
             ticket.clone(),
             Seat {
                 open: 1,
+                client: client.to_string(),
                 closed_at: None,
             },
         );
@@ -326,6 +355,9 @@ pub enum Playback {
 
 /// What a late viewer is told beside its disabled toggle.
 pub const LATE_REASON: &str = "Direct streams are full, so you are watching the broadcast.";
+/// What a viewer whose client already holds its direct seats is told.
+pub const CLIENT_FULL_REASON: &str =
+    "Your network already has 2 direct streams open, so this page watches the broadcast.";
 
 /// The admission policy of one coordinator: its seats, the key direct tokens are made with,
 /// and the broadcast's playback.
@@ -409,6 +441,15 @@ impl Gate {
                 seat_free: self.seats.free(now),
                 capacity: self.seats.capacity(),
             },
+            Admitted::ClientFull => Admission {
+                seat: None,
+                locked: true,
+                reason: Some(CLIENT_FULL_REASON.into()),
+                direct: None,
+                broadcast,
+                seat_free: false,
+                capacity: self.seats.capacity(),
+            },
         }
     }
 }
@@ -487,30 +528,30 @@ mod tests {
     fn seats_admit_up_to_capacity_then_viewers_are_late() {
         let s = Seats::new(Some(2));
         let now = Instant::now();
-        let a = s.admit(None, now);
-        let b = s.admit(None, now);
+        let a = s.admit(None, "c", now);
+        let b = s.admit(None, "c", now);
         assert!(matches!(a, Admitted::Seat { .. }));
         assert!(matches!(b, Admitted::Seat { .. }));
-        assert_eq!(s.admit(None, now), Admitted::Late);
+        assert_eq!(s.admit(None, "c", now), Admitted::Late);
         assert!(!s.free(now));
         // A forged or stale ticket is not a seat.
-        assert_eq!(s.admit(Some("not-a-ticket"), now), Admitted::Late);
+        assert_eq!(s.admit(Some("not-a-ticket"), "c", now), Admitted::Late);
     }
 
     #[test]
     fn a_closed_seat_waits_for_its_ticket_then_frees() {
         let s = Seats::new(Some(1)).with_grace(Duration::from_secs(60));
         let t0 = Instant::now();
-        let Admitted::Seat { ticket } = s.admit(None, t0) else {
+        let Admitted::Seat { ticket } = s.admit(None, "c", t0) else {
             panic!("no seat")
         };
         s.release(&ticket, t0);
         // Within the grace: held for the ticket, not free for anyone else.
         let t1 = t0 + Duration::from_secs(30);
         assert!(!s.free(t1));
-        assert_eq!(s.admit(None, t1), Admitted::Late);
+        assert_eq!(s.admit(None, "c", t1), Admitted::Late);
         assert_eq!(
-            s.admit(Some(&ticket), t1),
+            s.admit(Some(&ticket), "c", t1),
             Admitted::Seat {
                 ticket: ticket.clone()
             }
@@ -519,7 +560,9 @@ mod tests {
         // Past the grace: free, and the old ticket is just another arrival.
         let t2 = t1 + Duration::from_secs(61);
         assert!(s.free(t2));
-        assert!(matches!(s.admit(Some(&ticket), t2), Admitted::Seat { ticket: n } if n != ticket));
+        assert!(
+            matches!(s.admit(Some(&ticket), "c", t2), Admitted::Seat { ticket: n } if n != ticket)
+        );
     }
 
     #[test]
@@ -527,9 +570,38 @@ mod tests {
         let s = Seats::new(None);
         let now = Instant::now();
         for _ in 0..1000 {
-            assert!(matches!(s.admit(None, now), Admitted::Seat { .. }));
+            assert!(matches!(s.admit(None, "c", now), Admitted::Seat { .. }));
         }
         assert!(s.free(now));
+    }
+
+    /// One client cannot take every seat: past `SEATS_PER_CLIENT` its connections watch the
+    /// broadcast while other clients are still seated, and its own ticket still brings a page
+    /// back to its seat.
+    #[test]
+    fn one_client_holds_at_most_its_share_of_seats() {
+        let s = Seats::new(Some(10));
+        let now = Instant::now();
+        let mut tickets = Vec::new();
+        for _ in 0..SEATS_PER_CLIENT {
+            let Admitted::Seat { ticket } = s.admit(None, "a", now) else {
+                panic!("no seat")
+            };
+            tickets.push(ticket);
+        }
+        assert_eq!(s.admit(None, "a", now), Admitted::ClientFull);
+        assert!(s.admit(None, "a", now).late());
+        assert!(matches!(s.admit(None, "b", now), Admitted::Seat { .. }));
+        assert_eq!(s.held(now), SEATS_PER_CLIENT + 1);
+        // A page reconnecting with its ticket takes its own seat back.
+        s.release(&tickets[0], now);
+        assert_eq!(
+            s.admit(Some(&tickets[0]), "a", now),
+            Admitted::Seat {
+                ticket: tickets[0].clone()
+            }
+        );
+        assert!(CLIENT_FULL_REASON.contains(&SEATS_PER_CLIENT.to_string()));
     }
 
     fn test_key_pem() -> String {

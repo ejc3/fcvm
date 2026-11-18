@@ -54,7 +54,11 @@ connection admitted while fewer than `capacity` seats are held gets a `seat` tic
 (`{"admit": "<value>"}`, renderer `GET /frames`); one admitted
 with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
-reload; a late connection is never promoted). A page sends `{"type": "seat", "ticket":
+reload; a late connection is never promoted). One client (as counted for the limits below)
+holds at most 2 seats: its further connections are admitted like late ones, with `reason`
+"Your network already has 2 direct streams open, so this page watches the broadcast." and
+`seat_free` always false, since a reload would not seat them while its seats are held. This
+applies only while `capacity` is set (there is a broadcast to watch). A page sends `{"type": "seat", "ticket":
 "<ticket>", "returning": false}` (`null` without one) as its first message, so one that reconnects keeps its seat
 if the ticket's connection closed less than 60 s before. `returning` is true when the page
 had a connection open before (a reconnect, also of a late page, which keeps no ticket). A

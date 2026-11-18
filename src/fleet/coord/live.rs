@@ -400,8 +400,10 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         .await;
     // A seat is held from here until the connection ends.
     let gate = app.cfg.gate.clone();
-    let admitted = gate.seats.admit(seat.as_deref(), std::time::Instant::now());
-    let late = admitted == Admitted::Late;
+    let admitted = gate
+        .seats
+        .admit(seat.as_deref(), &client, std::time::Instant::now());
+    let late = admitted.late();
     let admission = gate.message(
         &admitted,
         &viewer,
@@ -444,7 +446,10 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
             loop {
                 tokio::time::sleep(gate.tick).await;
                 let now = std::time::Instant::now();
-                let free_changed = late && gate.seats.free(now) != last.seat_free;
+                // Only a viewer late for the capacity is told of a free seat: one whose client
+                // holds its seats would be late again after a reload.
+                let free_changed =
+                    admitted == Admitted::Late && gate.seats.free(now) != last.seat_free;
                 if !free_changed && now.duration_since(sent_at) < super::admission::DIRECT_REFRESH {
                     continue;
                 }
