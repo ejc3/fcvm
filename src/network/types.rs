@@ -52,7 +52,9 @@ pub struct NetworkConfig {
     /// The MTU the guest sets on eth0, at boot (boot plan) and on every restore
     /// (restore document). None leaves the guest's own, 1500. Rootless mode sets
     /// `pasta::GUEST_MTU`; the other modes reach the host's network at its MTU.
-    #[serde(default)]
+    /// Left out of the JSON when None, so a state or snapshot file of a VM without
+    /// one is byte-identical to what fcvm wrote before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_mtu: Option<u32>,
 }
 
