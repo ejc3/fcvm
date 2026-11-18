@@ -11,6 +11,7 @@ import {
   HISTORY_MS,
   SHOWN_ADVANCE_MAX_MS,
   snapshotAt,
+  tokenUsed,
   watchesBroadcast,
   type HistoryEntry,
 } from "../broadcast.ts";
@@ -410,5 +411,18 @@ describe("the stream mode beside Wall / Phones", () => {
     const s = base();
     s.frames = null;
     expect(streamModeView(s, false, "direct").label).toBe("Direct streams");
+  });
+});
+
+describe("tokenUsed", () => {
+  const signed = "https://p.example/x.m3u8?token=aaa.bbb.ccc";
+  it("is true only for the signed URL the player last loaded", () => {
+    expect(tokenUsed(signed, null)).toBe(false);
+    expect(tokenUsed(signed, signed)).toBe(true);
+    expect(tokenUsed("https://p.example/x.m3u8?token=ddd.eee.fff", signed)).toBe(false);
+  });
+  it("lets an open channel's URL load again", () => {
+    const open = "https://p.example/x.m3u8";
+    expect(tokenUsed(open, open)).toBe(false);
   });
 });

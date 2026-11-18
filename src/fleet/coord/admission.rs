@@ -30,8 +30,19 @@ pub const SEATS_PER_CLIENT: usize = 2;
 /// How long a direct token lasts, and how often a seated connection gets a new one.
 pub const DIRECT_TOKEN_SECS: u64 = 600;
 pub const DIRECT_REFRESH: Duration = Duration::from_secs(300);
-/// How long a playback token lasts (renewed with the direct token).
-pub const PLAYBACK_TOKEN_SECS: u64 = 3600;
+/// How long a playback token lasts. IVS checks it only when a player starts playback (its
+/// `exp` "does not indicate the length of time that the stream can be viewed"), and a token
+/// carrying `aws:viewer-id` or `aws:single-use-uuid` may expire at most 10 minutes ahead
+/// (Amazon IVS Low-Latency User Guide, "Generate and Sign IVS Playback Tokens"). The page loads
+/// its player with the newest token, which is renewed every [`DIRECT_REFRESH`] (300 s, looked
+/// at every `Gate::tick`), or asks for one (`playback`); 360 s covers that with a minute to
+/// spare.
+pub const PLAYBACK_TOKEN_SECS: u64 = 360;
+/// The longest `aws:viewer-id` IVS accepts.
+pub const IVS_VIEWER_ID_MAX: usize = 40;
+/// How often one connection may ask for a fresh playback token (`playback`). The page's player
+/// retries a failed load every 3 s (fleet/web Broadcast.tsx `RETRY_MS`).
+pub const PLAYBACK_REQUEST_EVERY: Duration = Duration::from_secs(2);
 /// The direct token's query parameter on a frame URL.
 pub const ADMIT_PARAM: &str = "admit";
 
@@ -105,6 +116,14 @@ impl AdmitKey {
         let signed = format!("v1.{exp}.{viewer}");
         let mac = self.mac(&signed);
         format!("{signed}.{mac}")
+    }
+
+    /// The `aws:viewer-id` of a client key: a keyed hash, so IVS (whose guide says the field
+    /// must not hold personally identifying information) never sees the address, while one
+    /// client's sessions share an id the operator can revoke together. 32 characters, under
+    /// [`IVS_VIEWER_ID_MAX`]; a domain prefix keeps it apart from direct tokens' macs.
+    pub fn viewer_id(&self, client: &str) -> String {
+        self.mac(&format!("ivs-viewer.{client}"))[..32].to_string()
     }
 }
 
@@ -316,10 +335,21 @@ impl PlaybackSigner {
         })
     }
 
-    /// A token for pages served from `origin`, valid until `exp` (unix seconds).
-    pub fn token(&self, origin: Option<&str>, exp: u64) -> Result<String> {
+    /// A token for pages served from `origin`, for the viewer `viewer_id` (at most
+    /// [`IVS_VIEWER_ID_MAX`] characters), valid until `exp` (unix seconds, at most 10 minutes
+    /// ahead) and for one playback: `aws:single-use-uuid` makes IVS invalidate it once it has
+    /// fetched the multivariant playlist, so a URL copied from a page plays nowhere else.
+    pub fn token(&self, origin: Option<&str>, viewer_id: &str, exp: u64) -> Result<String> {
+        if viewer_id.is_empty() || viewer_id.len() > IVS_VIEWER_ID_MAX {
+            bail!("an IVS viewer id is 1 to {IVS_VIEWER_ID_MAX} characters");
+        }
         let header = b64url(br#"{"alg":"ES384","typ":"JWT"}"#);
-        let mut claims = serde_json::json!({"aws:channel-arn": self.channel_arn, "exp": exp});
+        let mut claims = serde_json::json!({
+            "aws:channel-arn": self.channel_arn,
+            "aws:viewer-id": viewer_id,
+            "aws:single-use-uuid": uuid::Uuid::new_v4().to_string(),
+            "exp": exp,
+        });
         if let Some(o) = origin {
             claims["aws:access-control-allow-origin"] = o.into();
         }
@@ -333,7 +363,7 @@ impl PlaybackSigner {
     }
 
     /// The playback URL with a token.
-    pub fn url(&self, origin: Option<&str>, exp: u64) -> Result<String> {
+    pub fn url(&self, origin: Option<&str>, viewer_id: &str, exp: u64) -> Result<String> {
         let sep = if self.playback_url.contains('?') {
             '&'
         } else {
@@ -342,7 +372,7 @@ impl PlaybackSigner {
         Ok(format!(
             "{}{sep}token={}",
             self.playback_url,
-            self.token(origin, exp)?
+            self.token(origin, viewer_id, exp)?
         ))
     }
 }
@@ -382,11 +412,12 @@ impl Gate {
     }
 
     /// The admission message for a connection admitted as `admitted`, acting as `viewer`
-    /// from a page at `origin`, at `now_ms` (unix ms).
+    /// for the client key `client` from a page at `origin`, at `now_ms` (unix ms).
     pub fn message(
         &self,
         admitted: &Admitted,
         viewer: &str,
+        client: &str,
         origin: Option<&str>,
         now_ms: u64,
         now: Instant,
@@ -404,7 +435,7 @@ impl Gate {
             Some(Playback::Signed(_)) if origin.is_none() => None,
             Some(Playback::Signed(s)) => {
                 let exp = now_s + PLAYBACK_TOKEN_SECS;
-                match s.url(origin, exp) {
+                match s.url(origin, &self.key.viewer_id(client), exp) {
                     Ok(value) => Some(Token {
                         value,
                         expires_at: exp * 1000,
@@ -643,7 +674,9 @@ mod tests {
             &pem,
         )
         .unwrap();
-        let url = s.url(Some("https://stage.example"), 2_000_000_000).unwrap();
+        let url = s
+            .url(Some("https://stage.example"), "viewer-1", 2_000_000_000)
+            .unwrap();
         let token = url.split_once("?token=").unwrap().1;
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -700,9 +733,16 @@ mod tests {
         };
         let seat = Admitted::Seat { ticket: "t".into() };
         let now = Instant::now();
-        let with = gate.message(&seat, "v-1", Some("https://stage.example"), 1_000_000, now);
+        let with = gate.message(
+            &seat,
+            "v-1",
+            "c",
+            Some("https://stage.example"),
+            1_000_000,
+            now,
+        );
         assert!(with.broadcast.is_some());
-        let without = gate.message(&seat, "v-1", None, 1_000_000, now);
+        let without = gate.message(&seat, "v-1", "c", None, 1_000_000, now);
         assert!(without.broadcast.is_none(), "an unbound playback token");
     }
 
@@ -723,6 +763,68 @@ mod tests {
             access_h.lines().any(|l| l.trim() == want),
             "fleet/renderer/src/access.h does not say `{want}`"
         );
+    }
+
+    fn claims_of(url: &str) -> serde_json::Value {
+        let token = url.split_once("?token=").unwrap().1;
+        let payload = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&b64url_decode(payload).unwrap()).unwrap()
+    }
+
+    /// A playback token plays once (`aws:single-use-uuid`, new in every token), names its
+    /// client by a keyed hash (`aws:viewer-id`, never the address, at most 40 characters) and
+    /// expires within IVS's 10-minute limit for such tokens, not an hour later.
+    #[test]
+    fn a_playback_token_is_single_use_names_its_client_and_expires_within_ten_minutes() {
+        let gate = Gate {
+            seats: Seats::new(Some(1)),
+            key: AdmitKey([1; 32]),
+            playback: Some(Playback::Signed(Box::new(
+                PlaybackSigner::new(
+                    "arn:aws:ivs:us-east-1:000000000000:channel/example".into(),
+                    "https://playback.example/x.m3u8".into(),
+                    &test_key_pem(),
+                )
+                .unwrap(),
+            ))),
+            tick: Duration::from_secs(10),
+        };
+        let seat = Admitted::Seat { ticket: "t".into() };
+        let now = Instant::now();
+        let origin = Some("https://stage.example");
+        let token = |client: &str| {
+            let a = gate.message(&seat, "v-1", client, origin, 1_000_000_000, now);
+            let b = a.broadcast.unwrap();
+            (claims_of(&b.value), b.expires_at)
+        };
+        let (a, a_expires) = token("198.51.100.1");
+        let (a2, _) = token("198.51.100.1");
+        let (b, _) = token("2001:db8:1:2::/64");
+        let id = a["aws:viewer-id"].as_str().unwrap();
+        assert!(!id.is_empty() && id.len() <= IVS_VIEWER_ID_MAX, "{id}");
+        assert!(!id.contains("198.51.100"), "the address is not sent to IVS");
+        assert_eq!(
+            a2["aws:viewer-id"], a["aws:viewer-id"],
+            "one client, one id"
+        );
+        assert_ne!(b["aws:viewer-id"], a["aws:viewer-id"]);
+        let uuid = a["aws:single-use-uuid"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(uuid).is_ok(), "{uuid}");
+        assert_ne!(a2["aws:single-use-uuid"], a["aws:single-use-uuid"]);
+        let exp = a["exp"].as_u64().unwrap();
+        assert!(exp > 1_000_000 && exp <= 1_000_000 + 600, "exp {exp}");
+        assert_eq!(a_expires, exp * 1000);
+        // A viewer id IVS would refuse is not signed.
+        let s = PlaybackSigner::new(
+            "a".into(),
+            "https://p.example/x.m3u8".into(),
+            &test_key_pem(),
+        )
+        .unwrap();
+        assert!(s.token(None, "", 1).is_err());
+        assert!(s
+            .token(None, &"x".repeat(IVS_VIEWER_ID_MAX + 1), 1)
+            .is_err());
     }
 
     #[test]

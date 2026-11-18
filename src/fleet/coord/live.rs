@@ -521,6 +521,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     let admission = gate.message(
         &admitted,
         &viewer,
+        &client,
         page.origin.as_deref(),
         now_ms(),
         std::time::Instant::now(),
@@ -552,6 +553,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         let gate = gate.clone();
         let admitted = admitted.clone();
         let viewer = viewer.clone();
+        let client = client.clone();
         let origin = page.origin.clone();
         let direct = direct.clone();
         tokio::spawn(async move {
@@ -567,7 +569,14 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 if !free_changed && now.duration_since(sent_at) < super::admission::DIRECT_REFRESH {
                     continue;
                 }
-                last = gate.message(&admitted, &viewer, origin.as_deref(), now_ms(), now);
+                last = gate.message(
+                    &admitted,
+                    &viewer,
+                    &client,
+                    origin.as_deref(),
+                    now_ms(),
+                    now,
+                );
                 sent_at = now;
                 if direct
                     .send(ServerMsg::Admission(last.clone()))
@@ -617,6 +626,8 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // When this connection last asked for a fresh playback token.
+    let mut last_playback: Option<std::time::Instant> = None;
     loop {
         let msg = match pending.take() {
             Some(m) => m,
@@ -651,6 +662,30 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
             }),
             // Only a first message carries a seat ticket.
             Ok(ClientMsg::Seat { .. }) => None,
+            // A playback token plays once, so a player that loads again asks for a fresh one.
+            Ok(ClientMsg::Playback {}) => {
+                let now = std::time::Instant::now();
+                if last_playback.is_some_and(|t| {
+                    now.duration_since(t) < super::admission::PLAYBACK_REQUEST_EVERY
+                }) {
+                    Some(ServerMsg::Error {
+                        reason: format!(
+                            "a fresh playback token at most every {} s",
+                            super::admission::PLAYBACK_REQUEST_EVERY.as_secs()
+                        ),
+                    })
+                } else {
+                    last_playback = Some(now);
+                    Some(ServerMsg::Admission(gate.message(
+                        &admitted,
+                        &viewer,
+                        &client,
+                        page.origin.as_deref(),
+                        now_ms(),
+                        now,
+                    )))
+                }
+            }
             Ok(ClientMsg::Visibility { visible }) => {
                 app.handle
                     .send(Event::Visibility {

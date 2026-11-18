@@ -43,7 +43,7 @@ key when intents need a `verify` first (`null` when they do not).
 ```json
 {"type": "admission", "seat": "<ticket>", "locked": false, "reason": null,
  "direct": {"value": "v1.1761135000.v-17.<mac>", "expires_at": 1761135000000},
- "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761138000000},
+ "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761134760000},
  "seat_free": false, "capacity": 500}
 ```
 
@@ -67,8 +67,15 @@ first message with a ticket or `returning` true is a reconnect, not an arrival
 (`fleet.power`); the viewer joins once the first message is read. The coordinator waits up to 2 s for
 that first message; any other first message is admitted without a ticket and handled as
 usual. A ticket is never read from the URL, which proxies and access logs keep. `broadcast` is the playback URL (signed for a private channel, bound to the page's
-`Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
-connection that sent no `Origin`; `capacity` is null when every viewer is seated (no broadcast).
+`Origin`), null without a broadcast or, on a private channel, for a
+connection that sent no `Origin`. A private channel's token starts one playback: it carries
+`aws:single-use-uuid` (a new UUID in every token, so IVS refuses it once it has fetched the
+playlist), `aws:viewer-id` (a 32-character HMAC of the client key with the coordinator's
+admission key, never the address, so one client's sessions can be revoked together), and an
+`exp` 6 minutes ahead (IVS allows at most 10 with either claim; IVS checks it only when playback
+starts, and the page always holds a token under 5 minutes old). A page whose player must load
+again with a token it has used sends `{"type": "playback"}` and gets a fresh `admission` (at
+most one every 2 s per connection; sooner is answered with an `error`); `capacity` is null when every viewer is seated (no broadcast).
 `claim_gpu` from a late connection is refused unrecorded (`version: 0`).
 
 ```json
@@ -142,7 +149,10 @@ A message the coordinator could not read; nothing was applied.
 {"type": "visibility", "visible": false}
 {"type": "intent", "id": "<client uuid>", "name": "nudge", "args": {"target": "coast"}}
 {"type": "ping", "client_unix_ms": 1761134400100.5}
+{"type": "playback"}
 ```
+
+`playback` asks for a fresh `admission` (a new single-use playback token, see `admission`).
 
 `visibility` says whether the page is visible. A connection counts as an active viewer
 until it reports `visible: false` (the page sends that when its tab has been hidden long

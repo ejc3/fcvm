@@ -22,6 +22,7 @@ import {
   needsVerify,
   nextPingDelay,
   NOTICE_MS,
+  playbackMessage,
   reconnectDelayMs,
   reduce,
   seatMessage,
@@ -291,6 +292,11 @@ export class WallClient {
 
   /** Whether the tab is visible: hidden tabs do not count as viewers. */
   private visible = true;
+
+  /** Ask for a fresh admission: the broadcast player is about to load and its token is used. */
+  requestPlayback(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(playbackMessage());
+  }
 
   /** Tell the coordinator whether this tab is visible (also sent on every connect). */
   setVisible(visible: boolean): void {

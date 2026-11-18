@@ -205,3 +205,12 @@ export function broadcastToggle(s: ClientState): BroadcastToggle | null {
       : "Switch to one video of the whole wall from the CDN instead of a stream per VM.",
   };
 }
+
+/**
+ * Whether loading the broadcast player with `url` would reuse a single-use playback token: it
+ * is the URL the player last loaded (`last`) and it carries a token (a private channel's; an
+ * open channel's URL has none and plays again as it is).
+ */
+export function tokenUsed(url: string, last: string | null): boolean {
+  return url === last && /[?&]token=/.test(url);
+}

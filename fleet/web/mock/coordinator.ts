@@ -601,6 +601,9 @@ export class MockCoordinator {
           this.lastArrivalAt = this.now();
           this.markDirty();
         }
+      } else if (m["type"] === "playback") {
+        // A fresh admission, as the coordinator answers a player whose token is used.
+        if (this.broadcast || this.minecraft) this.sendTo(client, this.admissionFor(client));
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
         if (ok) client.verified = true;
