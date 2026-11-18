@@ -100,7 +100,7 @@ async fn main() {
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
-            Some(match boundary_token::from_args(&args) {
+            let resumed = match boundary_token::from_args(&args) {
                 Ok(token) => {
                     snapshot_network::resume_source_network(
                         snapshot_network::resume_host_time(&args),
@@ -109,7 +109,14 @@ async fn main() {
                     .await
                 }
                 Err(error) => Err(error),
-            })
+            };
+            // A reopen that failed before its fenced step (no token, or the lock could not
+            // be taken) still leaves nothing frozen. Thawing is idempotent, and nothing can
+            // freeze in between: the host starts no prepare before this one-shot returns.
+            if resumed.is_err() {
+                payload_freeze::thaw();
+            }
+            Some(resumed)
         }
         _ => None,
     };
