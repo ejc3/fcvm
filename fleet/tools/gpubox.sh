@@ -82,11 +82,14 @@ BUCKET=fcvm-fleet-assets-$ACCOUNT
 host_ami() {
   local id q selection drill_filter
   [ -n "${GPUBOX_AMI:-}" ] && { echo "$GPUBOX_AMI"; return; }
-  # These immutable identities match the two reviewed staging drills in the image publisher.
+  # An older release or copy record can identify a drill by source alone. Retain earlier
+  # sources when the image publisher rebuilds the two drills on a new release.
   drill_filter='def drill:
     ((.build_id // "") | startswith("reviewed-release-gate-drill:") or startswith("reviewed-no-agent-drill:"))
     or .source_sha == "7457a0ff977a3471f4e8a2502b8248417576f737"
-    or .source_sha == "c3831f6c43313e36db9ef461df87d6620755c6b4";'
+    or .source_sha == "c3831f6c43313e36db9ef461df87d6620755c6b4"
+    or .source_sha == "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff"
+    or .source_sha == "df10f45d90593abdb70b564f1fb44042ce2144fc";'
   for q in "/fcvm-fleet/ami-release-copies .images[\$r].host" "/fcvm-fleet/ami-release .host_amis[\$r].x86_64"; do
     selection='select(drill | not)'
     if [ "${q%% *}" = /fcvm-fleet/ami-release ]; then
