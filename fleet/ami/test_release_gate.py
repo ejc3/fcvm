@@ -677,24 +677,23 @@ class GateTests(unittest.TestCase):
                     self.assertFalse((out / "ffmpeg").exists())
                     self.assertEqual(result.stdout, "")
 
-    def test_the_gates_smoke_never_queues_behind_another_smoke(self):
-        # Staging, 2026-11-18: generation 19's first gate smoke was ready at 07:59:36 and its v4
-        # job waited 2m11s for an operator's standalone smoke holding the shared job group.
+    def test_the_gates_smoke_shares_the_smokes_concurrency_group(self):
+        # Codex on #1949: a smoke in its own group runs beside a deploy, daily or manual smoke,
+        # whose tile relaunches move the placement the verdict is bound to and whose returned
+        # Minecraft borrows reset servers under the gate's probes.
         smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
-        self.assertIn("    with:\n      relaunch: false\n      group: fleet-release-gate-smoke\n", smoke)
+        self.assertNotRegex(smoke, r"\n      group:")
         viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
-        call = viewer.split("  workflow_call:\n", 1)[1].split("\n  schedule:", 1)[0]
-        self.assertIn("      group:\n        type: string\n        default: fleet-viewer-smoke\n", call)
         for job in ("ipv4", "ipv6"):
             body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
-            self.assertIn("    concurrency:\n      group: ${{ inputs.group || 'fleet-viewer-smoke' }}\n", body)
-        # Every other caller, the schedule and a manual run keep sharing one group.
-        for name in ("fleet-coordinator-deploy.yml", "fleet-web-deploy.yml"):
-            call = (ROOT / ".github/workflows" / name).read_text().split(
-                "uses: ./.github/workflows/fleet-viewer-smoke.yml", 1)[1]
-            call = re.split(r"\n  \S", call, maxsplit=1)[0]
-            self.assertIn("secrets: inherit", call)
-            self.assertNotIn("group:", call, name)
+            self.assertIn("    concurrency:\n      group: fleet-viewer-smoke\n", body)
+
+    def test_a_dispatched_run_hands_its_first_sighting_only_to_the_same_generation(self):
+        # Codex on #1949: a run dispatched for generation N that finds N+1 live must not give N+1
+        # generation N's first sighting, or N+1 starts with N's spent two hours.
+        again = WORKFLOW.split("\n  again:\n", 1)[1]
+        self.assertIn("SINCE: ${{ inputs.generation == needs.status.outputs.generation && inputs.since || '' }}", again)
+        self.assertNotIn("SINCE: ${{ inputs.since }}", again)
 
     def test_the_gates_smoke_waits_at_most_five_minutes_for_tiles(self):
         # Generation 21 (2026-11-18): no agent, so no tile ever ran and each family waited the

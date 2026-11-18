@@ -23,11 +23,6 @@ on:
       relaunch:
         type: boolean
         default: true
-      # The jobs' concurrency group. The release gate passes its own, so its smoke never waits
-      # behind a deploy's, the daily or a manual smoke; those keep sharing this one.
-      group:
-        type: string
-        default: fleet-viewer-smoke
       # How long each viewer waits for every mode's tiles to run (stage-smoke.py --settle-seconds).
       # The release gate passes less: it smokes only a placement that has already settled.
       settle_seconds:
@@ -61,7 +56,7 @@ jobs:
     outputs:
       summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
-      group: ${{ inputs.group || 'fleet-viewer-smoke' }}
+      group: fleet-viewer-smoke
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -107,7 +102,7 @@ jobs:
     outputs:
       summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
-      group: ${{ inputs.group || 'fleet-viewer-smoke' }}
+      group: fleet-viewer-smoke
       cancel-in-progress: false
     steps:
       # As ci.yml's self-hosted jobs: a privileged run can leave root-owned files in the workspace.

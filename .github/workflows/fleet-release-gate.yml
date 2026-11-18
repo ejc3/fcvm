@@ -89,12 +89,11 @@ jobs:
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
     # No relaunches: an EC2 relaunch replaces the tile's instance and so the placement the
-    # verdict is bound to. The viewer path and the take-over replace nothing. Its own
-    # concurrency group: gate runs are already one at a time (the workflow's group), and a
-    # release waiting for its verdict does not wait for other smokes.
+    # verdict is bound to. The viewer path and the take-over replace nothing. It shares the
+    # smokes' concurrency group: another smoke relaunches tiles and returns borrowed Minecraft
+    # servers, which would move the placement or reset a server under this one's probes.
     with:
       relaunch: false
-      group: fleet-release-gate-smoke
       # The status job found every live host up 300 s and every tile instance running, so the
       # tiles' wait is short: in 120 healthy family runs (2026-11-13 to 2026-11-18) the whole
       # smoke, wait included, took at most 290.3 s. A tile still not running after it is an
@@ -171,5 +170,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           GENERATION: ${{ needs.status.outputs.generation }}
-          SINCE: ${{ inputs.since }}
+          # A run dispatched for an older generation must not hand its first sighting to a newer
+          # release, which would start with that generation's spent two hours.
+          SINCE: ${{ inputs.generation == needs.status.outputs.generation && inputs.since || '' }}
         run: python3 -B fleet/ami/release_gate.py again --generation "$GENERATION" --since "$SINCE"
