@@ -538,6 +538,110 @@ class GateTests(unittest.TestCase):
         smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
         self.assertIn("    permissions:\n      contents: read\n      issues: write\n", smoke)
 
+    def outputs_of(self, argv, gate):
+        with tempfile.NamedTemporaryFile("r") as out, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(release_gate.main(argv, run=gate), 0)
+            return dict(line.split("=", 1) for line in out.read().splitlines())
+
+    def test_status_says_whether_an_unverified_release_is_still_settling(self):
+        # Staging, 2026-11-18: generation 21 was current at 09:00:23 and settled at 09:05:23,
+        # but nothing looks before the schedule's next run, which came 8 to 37 minutes apart
+        # (median 9.3) over 2026-11-15 to 2026-11-18. `waiting` lets the workflow look again soon.
+        for status, unverified, waiting in (
+                (self.status(), "true", "false"),
+                (self.status(placement={"settled": False}), "true", "true"),
+                (self.status(placement={"current": False}), "true", "true"),
+                (self.status(placement={"release_hosts": []}), "true", "false"),
+                (self.status(verified=True), "false", "false"),
+                (self.status(verified=True, placement={"settled": False}), "false", "false")):
+            with self.subTest(status=status):
+                lines = self.outputs_of(["status"], Lambda(status))
+                self.assertEqual((lines["unverified"], lines["waiting"]), (unverified, waiting))
+                self.assertEqual(lines["generation"], "15" if unverified == "true" else "")
+
+    def test_decide_says_whether_it_reached_a_verdict(self):
+        for gate, v4, verdict in ((Lambda(self.status(), {"status": "verified"}), self.family("v4"), "verified"),
+                                  (Lambda(self.status(), {"status": "rolled_back", "pointer": {}, "hosts": {}}),
+                                   self.family("v4", failed=1), "rolled_back"),
+                                  (Lambda(self.status(placement={"digest": "e" * 64})), self.family("v4"), "none")):
+            with self.subTest(verdict=verdict):
+                argv = ["decide", "--before", json.dumps(self.redacted(self.status())), "--v4", v4,
+                        "--v6", self.family("v6")]
+                self.assertEqual(self.outputs_of(argv, gate)["verdict"], verdict)
+
+    class Gh:
+        """`gh` that lists the gate's dispatched runs from `titles` and records each dispatch."""
+
+        def __init__(self, titles=(), list_status=0):
+            self.titles, self.list_status, self.calls = list(titles), list_status, []
+
+        def __call__(self, argv, **_):
+            self.calls.append(argv)
+            if argv[:3] == ["gh", "run", "list"]:
+                return mock.Mock(returncode=self.list_status, stderr="",
+                                 stdout=json.dumps([{"displayTitle": t} for t in self.titles]))
+            assert argv[:3] == ["gh", "workflow", "run"], argv
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def again(self, gh, generation="21", since="", now=10_000_000):
+        with mock.patch.object(release_gate.time, "time", return_value=now), \
+                mock.patch.object(release_gate.time, "sleep") as sleep, redirect_stdout(io.StringIO()):
+            self.assertEqual(release_gate.main(["again", "--generation", generation, "--since", since], run=gh), 0)
+        return sleep, [c for c in gh.calls if c[:3] == ["gh", "workflow", "run"]]
+
+    def test_an_unsettled_or_undecided_release_is_looked_at_again_for_two_hours(self):
+        now = 10_000_000
+        title = "Fleet image release gate: generation {} since {}".format
+        # The first look starts the clock; a later run carries it, and so does any earlier run of
+        # the same generation in the history, so the schedule's own runs cannot restart it.
+        for titles, since, first in (([], "", now), ([], str(now - 600), now - 600),
+                                     ([title(21, now - 3000), title(20, now - 9000), "Fleet image release gate"],
+                                      str(now - 600), now - 3000),
+                                     ([title(21, now + 50)], "", now), ([], "not a time", now)):
+            with self.subTest(titles=titles, since=since):
+                sleep, dispatched = self.again(self.Gh(titles), since=since)
+                self.assertEqual(dispatched, [["gh", "workflow", "run", "fleet-release-gate.yml", "--ref", "main",
+                                               "-f", "generation=21", "-f", f"since={first}"]])
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [release_gate.AGAIN_DELAY])
+        # Two hours after the gate first saw the generation, only the schedule looks.
+        for titles, since in (([title(21, now - 7200)], ""), ([], str(now - 7201))):
+            with self.subTest(titles=titles, since=since):
+                sleep, dispatched = self.again(self.Gh(titles), since=since)
+                self.assertEqual(dispatched, [])
+                sleep.assert_not_called()
+        # No generation, or a history it cannot read: no dispatch (the bound cannot be checked).
+        self.assertEqual(self.again(self.Gh(), generation="")[1], [])
+        with self.assertRaisesRegex(SystemExit, "listing"):
+            self.again(self.Gh(list_status=1))
+
+    def test_the_workflow_looks_again_only_at_an_unverified_release_and_only_that_job_may_dispatch(self):
+        on = WORKFLOW.split("\non:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("  workflow_dispatch:\n    inputs:\n", on)
+        self.assertIn("      generation:\n        type: string\n", on)
+        self.assertIn("      since:\n        type: string\n", on)
+        # The title is the history the bound reads (release_gate.py TITLE).
+        name = re.search(r"^run-name: \"\$\{\{ inputs\.generation && format\('([^']+)', inputs\.generation, "
+                         r"inputs\.since\) \|\| '([^']+)' \}\}\"$", WORKFLOW, re.M)
+        self.assertIsNotNone(name)
+        self.assertRegex(name.group(1).format(21, 1234), release_gate.TITLE)
+        self.assertEqual(name.group(2), "Fleet image release gate")
+        again = WORKFLOW.split("\n  again:\n", 1)[1]
+        self.assertIn("needs: [status, smoke, decide]", again)
+        for condition in ("!cancelled()", "needs.status.outputs.unverified == 'true'",
+                          "needs.status.outputs.waiting == 'true'", "needs.decide.outputs.verdict == 'none'"):
+            self.assertIn(condition, again)
+        self.assertIn("    permissions:\n      actions: write\n", again)
+        self.assertEqual(WORKFLOW.count("actions: write"), 1)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", again)
+        self.assertIn('release_gate.py again --generation "$GENERATION" --since "$SINCE"', again)
+        status = WORKFLOW.split("\n  status:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        for key in ("generation", "unverified", "waiting"):
+            self.assertIn(f"{key}: ${{{{ steps.gate.outputs.{key} }}}}", status)
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1].split("\n  again:\n", 1)[0]
+        self.assertIn("verdict: ${{ steps.decide.outputs.verdict }}", decide)
+        self.assertIn("id: decide", decide)
+
     def test_the_status_run_is_cheap(self):
         # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted
         # runner, a short limit, and a checkout of the one file it runs.
