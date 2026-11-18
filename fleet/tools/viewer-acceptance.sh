@@ -8,8 +8,8 @@
 # It makes a throwaway CA and a certificate for the launch names of a test zone, starts a
 # coordinator on loopback that names every launch in that zone and serves the zone's DNS itself,
 # with this host's agent as its agent: the image's renderer, phones, Windows sandboxes, Minecraft
-# servers and potato players, the TLS ports published on the host's public IPv4 address from
-# fleet/published-ports.json (--tls-publish-base) and each place's own IPv6 address on 443. Then
+# servers and potato players, the TLS ports published on the host from fleet/published-ports.json
+# (--tls-publish-base) behind its IPv4 front on 443, and each place's own IPv6 address on 443. Then
 # fleet/coord/stage-smoke.py checks every tile through the coordinator's names, once per family,
 # trusting only the throwaway CA. The viewer is this host, and it reaches the host's public IPv4
 # address on its private one (SMOKE_HOST_LOCAL): what leaves the instance crosses its security

@@ -1,8 +1,9 @@
 {
-  "about": "Every port a viewer's browser connects to, by address family and mode. The only declaration: the host agent allocates from it (src/fleet/agent/ports.rs), the viewer-path smoke checks each published URL against it (fleet/coord/stage-smoke.py), and ejc3/aws derives the GPU hosts' security group range from it. A GPU host publishes on its one public IPv4 address at gpu_host_ipv4.base (the agent's --tls-publish-base) plus the place's offset in its mode's range plus its index there.",
+  "about": "Every port a viewer's browser connects to, by address family and mode. The only declaration: the host agent allocates from it (src/fleet/agent/ports.rs), the viewer-path smoke checks each published URL against it (fleet/coord/stage-smoke.py), and ejc3/aws derives the GPU hosts' security group from it. A GPU host publishes every place on its one public IPv4 address at gpu_host_ipv4.sni_port, routed by TLS server name (src/fleet/agent/sni.rs) to the place's own listener at gpu_host_ipv4.base (the agent's --tls-publish-base) plus the place's offset in its mode's range plus its index there. Those per-place ports were published to viewers before sni_port and stay open to them until every host runs an image with the front (fleet/PROTOCOL.md, \"The IPv4 front\").",
   "ipv6_port": 443,
   "ec2_tile_ipv4_port": 443,
   "gpu_host_ipv4": {
+    "sni_port": 443,
     "base": 20200,
     "ranges": [
       {"mode": "slot", "offset": 0, "count": 8, "what": "a GPU slot: a wall renderer or a phone, by its GPU's index in the host's inventory"},

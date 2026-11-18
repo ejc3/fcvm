@@ -9,6 +9,7 @@ pub mod minecraft;
 pub mod ports;
 pub mod potato;
 pub mod slot;
+pub mod sni;
 pub mod spot;
 pub mod tls;
 pub mod vm;
@@ -53,6 +54,8 @@ pub struct Agent {
     pub windows: Option<windows::WindowsCfg>,
     /// Minecraft mode: the host's Minecraft servers.
     pub minecraft: Option<minecraft::MinecraftCfg>,
+    /// The IPv4 front on 443 (`sni.rs`): every place's IPv4 path is reported on its port.
+    pub ipv4_front: Option<Arc<sni::Front>>,
 }
 
 /// The host's aggregator.
@@ -272,6 +275,27 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     } else {
         None
     };
+    // A host that publishes an IPv4 path publishes it on the front's port, by server name.
+    let ipv4_front = match (&public_ipv4, args.tls_publish_base) {
+        (Some(_), Some(_)) => {
+            let ip: std::net::Ipv4Addr = args.publish_ip.parse().with_context(|| {
+                format!(
+                    "the IPv4 front listens on --publish-ip, which must be an IPv4 address, not {}",
+                    args.publish_ip
+                )
+            })?;
+            let port = ports::declared().gpu_host_ipv4.sni_port;
+            Some(
+                sni::Front::bind(
+                    (ip, port).into(),
+                    port,
+                    fleet_core::state::aggregate_id(&host),
+                )
+                .await?,
+            )
+        }
+        _ => None,
+    };
     let fcvm = match args.fcvm {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,
@@ -365,6 +389,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         None
     };
     let agent = Agent {
+        ipv4_front,
         minecraft,
         windows,
         potato,
@@ -560,6 +585,11 @@ where
         tokio::spawn(joinguard::keep_first("FORWARD", joinguard::JOIN_PORT));
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
+    // Every report passes the front, which reports each place's IPv4 path on its own port.
+    let out = match &agent.ipv4_front {
+        Some(front) => front.forward(out),
+        None => out,
+    };
     out.send(AgentMsg::Hello {
         host: agent.host.clone(),
         arch: std::env::consts::ARCH.to_string(),

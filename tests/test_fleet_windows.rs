@@ -317,6 +317,7 @@ impl Coord {
             aggregate: None,
             store_ready_file: None,
             boot: Default::default(),
+            ipv4_front: None,
             potato: None,
             windows: Some(windows),
             minecraft: None,

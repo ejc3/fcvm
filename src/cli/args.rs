@@ -652,9 +652,10 @@ pub struct FleetAgentArgs {
     pub tls_publish_base: Option<u16>,
 
     /// The host's public IPv4 address, reported for every slot whose TLS port is published
-    /// (--tls-publish-base) so the coordinator names it `<label>-v4.<zone>` with the slot's
-    /// port: one address per host, each slot on its own port. Read from IMDS (`public-ipv4`,
-    /// the address EC2 assigns at launch).
+    /// (--tls-publish-base) so the coordinator names it `<label>-v4.<zone>`: one address per
+    /// host, on 443, where the agent's IPv4 front (on --publish-ip, which must be IPv4) routes
+    /// each name to its place's own port. Read from IMDS (`public-ipv4`, the address EC2
+    /// assigns at launch).
     #[arg(long, requires = "tls_publish_base")]
     pub public_ipv4_from_imds: bool,
 

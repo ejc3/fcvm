@@ -103,11 +103,11 @@ impl Coord {
     }
 
     fn start_with(f: &Fake, n: usize, cfg: AgentCfg, spot_notice_url: Option<String>) -> Coord {
-        let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
-        let (agent_in, agent_out): (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>) =
-            tokio::io::split(agent_side);
-        let (coord_in, coord_out) = tokio::io::split(coord_side);
-        let agent = Agent {
+        Self::run(Self::agent(f, n, cfg, spot_notice_url))
+    }
+
+    fn agent(f: &Fake, n: usize, cfg: AgentCfg, spot_notice_url: Option<String>) -> Agent {
+        Agent {
             host: "gpu-host".into(),
             gpus: gpus(n),
             phones: vec![],
@@ -119,10 +119,18 @@ impl Coord {
             aggregate: None,
             store_ready_file: None,
             boot: Default::default(),
+            ipv4_front: None,
             potato: None,
             windows: None,
             minecraft: None,
-        };
+        }
+    }
+
+    fn run(agent: Agent) -> Coord {
+        let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
+        let (agent_in, agent_out): (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>) =
+            tokio::io::split(agent_side);
+        let (coord_in, coord_out) = tokio::io::split(coord_side);
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
         Coord {
@@ -1030,6 +1038,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
         boot: Default::default(),
+        ipv4_front: None,
         potato: None,
         windows: None,
         aggregate: Some(AggregateCfg {
@@ -1403,6 +1412,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         aggregate: None,
         store_ready_file: Some(marker),
         boot: Default::default(),
+        ipv4_front: None,
         potato: None,
         windows: None,
         minecraft: None,
@@ -1482,6 +1492,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         aggregate: None,
         store_ready_file: None,
         boot: Default::default(),
+        ipv4_front: None,
         potato: None,
         windows: None,
         minecraft: None,
@@ -2070,6 +2081,98 @@ async fn a_routed_slot_reports_the_hosts_ipv4_and_its_port() {
     c.close().await;
 }
 
+/// A GPU host's IPv4 path is on 443: with the front, every routed slot reports the host's
+/// address on the front's port, the coordinator's names for it carry no other port, and the
+/// front routes each slot's `-v4` launch name to the slot's own forwarded port.
+#[tokio::test]
+async fn a_routed_slot_publishes_its_ipv4_path_on_443_through_the_front() {
+    use fcvm::fleet::agent::sni::Front;
+    let f = fake(2, &[]);
+    let mut cfg = cfg(&f.fcvm);
+    cfg.ipv6_prefix = Some(fcvm::fleet::agent::addr::Prefix::parse("2001:db8:1:2:3::/80").unwrap());
+    cfg.frame_zone = Some("fleet.example".into());
+    // Two free consecutive ports for the slots' own TLS listeners, which the test plays.
+    let (base, listeners) = consecutive_listeners(2);
+    cfg.tls_publish_base = Some(base);
+    cfg.public_ipv4 = Some("192.0.2.44".into());
+    // The production front listens on 443 and reports it; the test's listens where it can.
+    let front = Front::bind("127.0.0.1:0".parse().unwrap(), 443, None)
+        .await
+        .unwrap();
+    let mut agent = Coord::agent(&f, 2, cfg, None);
+    agent.ipv4_front = Some(front.clone());
+    let mut c = Coord::run(agent);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0)), ("slot-2", 1, 1, rect(0.25))]);
+    let got = c.until(&["slot-1", "slot-2"], "running", 1).await;
+    for (i, (id, l)) in ["slot-1", "slot-2"].into_iter().zip(listeners).enumerate() {
+        let r = &got[id];
+        assert_eq!(r.ipv4.as_deref(), Some("192.0.2.44"), "{id}");
+        assert_eq!(r.v4_port, Some(443), "{id}");
+        let label = fcvm::fleet::coord::dns::mint(id);
+        let names = fcvm::fleet::coord::dns::names(
+            "tiles.fleet.example",
+            &label,
+            1,
+            r.ipv6.as_deref(),
+            r.ipv4.as_deref(),
+            r.v4_port,
+        );
+        assert_eq!(
+            names.frame_url_v4.as_deref(),
+            Some(format!("wss://{label}-v4.tiles.fleet.example/frames").as_str())
+        );
+        // The front sends the slot's name to the slot's own port, the ClientHello first.
+        let args = std::fs::read_to_string(f.dir.path().join(format!("args-fleet-{id}"))).unwrap();
+        let own = base + i as u16;
+        assert!(
+            args.contains(&format!("--publish\n127.0.0.1:{own}:443\n")),
+            "{args}"
+        );
+        let mut viewer = tokio::net::TcpStream::connect(front.local_addr())
+            .await
+            .unwrap();
+        let hello = client_hello(&format!("{label}-v4.tiles.fleet.example"));
+        tokio::io::AsyncWriteExt::write_all(&mut viewer, &hello)
+            .await
+            .unwrap();
+        l.set_nonblocking(true).unwrap();
+        let l = tokio::net::TcpListener::from_std(l).unwrap();
+        let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), l.accept())
+            .await
+            .expect("the front reaches the slot's port")
+            .unwrap();
+        let mut arrived = vec![0; hello.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut s, &mut arrived)
+            .await
+            .unwrap();
+        assert!(arrived == hello, "{id}: the ClientHello arrives unchanged");
+    }
+    c.close().await;
+}
+
+/// The first bytes a TLS client sends for `name`.
+fn client_hello(name: &str) -> Vec<u8> {
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let mut c = rustls::ClientConnection::new(
+        std::sync::Arc::new(config),
+        rustls::pki_types::ServerName::try_from(name.to_string()).unwrap(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    while c.wants_write() {
+        c.write_tls(&mut out).unwrap();
+    }
+    out
+}
+
 /// A warming slot runs its VM and draws the whole image (it is not on the wall yet); placed
 /// at the same generation, it takes its rectangle without a relaunch.
 #[tokio::test]
@@ -2188,6 +2291,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         aggregate: None,
         store_ready_file: None,
         boot: Default::default(),
+        ipv4_front: None,
         potato: None,
         windows: None,
         minecraft: None,
@@ -2377,6 +2481,7 @@ fn dial_agent(f: &Fake) -> Agent {
         aggregate: None,
         store_ready_file: None,
         boot: Default::default(),
+        ipv4_front: None,
         potato: None,
         windows: None,
         minecraft: None,
