@@ -157,8 +157,8 @@ Intents:
 
 | name | args | effect |
 |------|------|--------|
-| `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`) |
-| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s |
+| `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`), and when its EC2 launches (one per EC2 tile) would pass the viewers' EC2 launch budget (below) |
+| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s; for an EC2 tile also within 90 s of that tile's last launch (anyone's relaunch, a race, or its launch at a wake) and past the viewers' EC2 launch budget (below) |
 | `nudge` | `{"target": "<viewpoint>"}` | a vote in the open vote (below), among `nudges.targets`; one vote per client, the latest counts; a pick of the hold just decided (`nudges.next`) is accepted and changes nothing; refused only for a target not offered |
 | `word` | `{"text": "hello", "text_style": "skywriting"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below). `text_style` is how the renderer draws it (#1178): `lockup` (when absent or null), `skywriting` or `landmark`; anything else is refused before the text check |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
@@ -208,6 +208,19 @@ says when the next one starts. Any race starts a global cooldown (`--restart-coo
 default 60 s) during which `restart_now` is refused for everyone; `restart_now` then
 starts one at once and the schedule restarts from it. Tiles on a draining host and GPUs
 lent to a visitor sit the race out.
+
+**EC2 launches.** Every relaunch of an EC2 tile launches an instance, so viewers' relaunches
+of EC2 tiles are bounded. An EC2 tile is not relaunched by a viewer within 90 s of its last
+launch (a relaunch, a race, or its launch at a wake): a launch takes 81 to 84 s to its first
+frame (`--ec2-pool` below), and a relaunch while it comes up throws away an instance that is
+billed its 60 s minimum and drew nothing.
+The receipt says `ec2-1 relaunched 1 s ago; it can be relaunched again in 89 s`. Across the
+fleet, viewers may cause 40 EC2 launches in any 10 minutes, a `relaunch` of an EC2 tile counting
+one and a `restart_now` race one per EC2 tile (five races of 8 EC2 tiles, or 40 relaunches).
+Past it both are refused with `viewers have used this fleet's EC2 launches for now (40 in 10
+minutes); try again in <n> s`. At the g4dn.xlarge on-demand price ($0.526 an hour, us-east-1)
+a launch that serves nothing costs at least $0.0088, so the budget bounds that waste to about
+$2.10 an hour. The owner's scheduled races (`--race-every`) are not counted.
 
 **The directed camera.** The coordinator flies the wall's camera along a program generated
 from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
