@@ -255,6 +255,13 @@ the per-VM snapshot lock's open file description. If the create dies, or drops i
 before saying it reopened the source, the guard resumes the VMM (if the pause was asked for)
 and runs `--resume-snapshot-network` with the host's clock, while the inherited flock keeps
 every other create of that VM waiting. `--stop` and disposable prepare sources get no guard.
+A reopen can overtake the prepare it undoes: a create killed after it dispatched the prepare,
+and before that one-shot took the guest's boundary lock, leaves a prepare the guard's reopen
+can beat to the lock. So each create passes one token (`--boundary-token`) to its prepare and
+to every reopen. Under the lock the prepare records that its token began and refuses,
+without freezing or thawing, when a reopen of that token already ran; a reopen that finds its
+prepare not begun records the token as cancelled (`fc-agent/src/boundary_token.rs`,
+`a_prepare_overtaken_by_its_reopen_refuses_and_changes_nothing`).
 `test_lifecycle_interleave_killed_snapshot_create_resumes_its_source` (and its Cloud
 Hypervisor twin) SIGKILLs a create held at `snapshot.post_save_pre_resume`;
 `a_source_that_keeps_running_is_guarded_from_its_prepare_to_its_reopen` pins the order.

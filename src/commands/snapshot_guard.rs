@@ -20,8 +20,11 @@
 //!
 //! When the create stops without [`DONE`] (its process died, or its future was dropped and
 //! closed the socket), the guard resumes the VMM if the create had asked to pause it, then
-//! runs the guest's `--resume-snapshot-network` with the host's clock, the same steps a
-//! create that finishes takes, and logs one line. The guard runs in its own session so a
+//! runs the guest's `--resume-snapshot-network` with the host's clock and the create's
+//! boundary token, the same steps a create that finishes takes, and logs one line. The
+//! token makes the guest refuse a prepare of this create that arrives after that reopen,
+//! which a create killed after it dispatched the prepare can leave behind (fc-agent's
+//! `boundary_token`). The guard runs in its own session so a
 //! signal to the create's process group does not reach it, and it has no parent-death
 //! signal: it has to outlive the create. It exits on [`DONE`], at once when the create
 //! changed nothing, or after the undo, whose every step has a timeout.
@@ -125,6 +128,8 @@ pub(crate) struct GuardTarget<'a> {
     pub vm_id: &'a str,
     pub snapshot: &'a str,
     pub resume_timeout: Duration,
+    /// The create's boundary token, which its guest reopen passes like the create's own.
+    pub boundary_token: &'a str,
 }
 
 /// The create's handle on its guard. Dropping it without [`SourceGuard::disarm`] closes
@@ -160,7 +165,8 @@ impl SourceGuard {
             .arg("--api-socket")
             .arg(target.api_socket)
             .arg("--resume-timeout-secs")
-            .arg(target.resume_timeout.as_secs().max(1).to_string());
+            .arg(target.resume_timeout.as_secs().max(1).to_string())
+            .args(["--boundary-token", target.boundary_token]);
         if let Some(vsock) = target.vsock_socket {
             command.arg("--vsock-socket").arg(vsock);
         }
@@ -483,7 +489,7 @@ async fn undo(args: &SnapshotSourceGuardArgs, phase: Phase, guest_timeout: Durat
     let guest = match &args.vsock_socket {
         Some(vsock) => match tokio::time::timeout(
             guest_timeout,
-            super::common::resume_paused_source(vsock, vm_id),
+            super::common::resume_paused_source(vsock, vm_id, &args.boundary_token),
         )
         .await
         {
@@ -595,6 +601,7 @@ mod tests {
             api_socket: api,
             vsock_socket: Some(vsock),
             resume_timeout_secs: 1,
+            boundary_token: "guard-test-token".to_string(),
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -661,6 +668,7 @@ mod tests {
             api_socket: api,
             vsock_socket: None,
             resume_timeout_secs: 1,
+            boundary_token: "guard-test-token".to_string(),
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

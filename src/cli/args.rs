@@ -1441,6 +1441,10 @@ pub struct SnapshotSourceGuardArgs {
     /// running in the VMM, and the resume waits behind it
     #[arg(long)]
     pub resume_timeout_secs: u64,
+    /// The create's guest boundary token: the guard's reopen passes it as the create's own
+    /// do, so a prepare the reopen overtook in the guest changes nothing
+    #[arg(long)]
+    pub boundary_token: String,
 }
 
 #[derive(Args, Debug)]

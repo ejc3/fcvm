@@ -274,7 +274,7 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
         |marker: String| move |line: &str| is_console_line(line) && line.contains(&marker);
     let outcome = async {
         common::poll_health_by_pid(pid, 300).await?;
-        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --prepare-snapshot-network"])
+        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --prepare-snapshot-network --boundary-token serial-console-test"])
             .await
             .context("preparing the snapshot boundary")?;
         let written = common::exec_in_vm(
@@ -290,12 +290,12 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
             }
             Err(e) => {
                 let _ =
-                    common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network"])
+                    common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network --boundary-token serial-console-test"])
                         .await;
                 return Err(e.context("writing into the agent's stderr"));
             }
         };
-        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network"])
+        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network --boundary-token serial-console-test"])
             .await
             .context("resuming the snapshot boundary")?;
         let released =

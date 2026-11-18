@@ -5821,8 +5821,24 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// The caller supplies the exact socket recorded in the running VM's state.
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
-async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
-    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+///
+/// `token` is the create's boundary token: the prepare and every reopen of one create pass
+/// the same one, so a prepare that a reopen of its create overtook in the guest changes
+/// nothing (fc-agent's `boundary_token`).
+async fn run_snapshot_network_command(
+    vsock_socket: &Path,
+    vm_id: &str,
+    flag: &str,
+    token: &str,
+) -> Result<()> {
+    run_fc_agent_command(vsock_socket, vm_id, &[flag, "--boundary-token", token])
+        .await
+        .map(|_| ())
+}
+
+/// A new token for one snapshot create's guest boundary (`run_snapshot_network_command`).
+pub(crate) fn new_boundary_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Reopen the source's network once a pause has been invoked, and set the source's
@@ -5839,12 +5855,22 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
 /// (`bootplan::advance_system_clock`), so a source whose clock kept running through
 /// the pause (the arm64 `default` profile: 0 ms behind after the same pause) is left
 /// alone.
-pub(crate) async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+pub(crate) async fn resume_paused_source(
+    vsock_socket: &Path,
+    vm_id: &str,
+    boundary_token: &str,
+) -> Result<()> {
     let host_time = crate::utils::host_clock_now().as_nanos().to_string();
     let output = run_fc_agent_command(
         vsock_socket,
         vm_id,
-        &["--resume-snapshot-network", "--host-time-ns", &host_time],
+        &[
+            "--resume-snapshot-network",
+            "--host-time-ns",
+            &host_time,
+            "--boundary-token",
+            boundary_token,
+        ],
     )
     .await?;
     // The one-shot's own report, including the size of the clock step, reaches no
@@ -6139,6 +6165,7 @@ pub async fn create_snapshot_core(
     // undoes the prepare and the pause if this create stops without reopening the source,
     // SIGKILL included (#1936, `snapshot_guard`). It holds what it needs from the fork, so
     // nothing waits for it to start; the stand-down after the reopen checks that it did.
+    let boundary_token = new_boundary_token();
     let mut source_guard = match source_disposition {
         SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
             &super::snapshot_guard::GuardTarget {
@@ -6148,6 +6175,7 @@ pub async fn create_snapshot_core(
                 vm_id: &snapshot_config.vm_id,
                 snapshot: &snapshot_config.name,
                 resume_timeout: std::time::Duration::from_secs(snapshot_timeout_secs),
+                boundary_token: &boundary_token,
             },
             vm_lock,
         )?),
@@ -6399,21 +6427,23 @@ pub async fn create_snapshot_core(
         vsock_socket_path,
         &snapshot_config.vm_id,
         "--prepare-snapshot-network",
+        &boundary_token,
     )
     .await
     {
         // The exec transport can lose the reply after fc-agent has already
-        // closed the gate and brought eth0 down.  Recovery is safe to issue
-        // after every invoked prepare: the guest serializes both commands on
-        // one flock, so this blocks behind an in-flight prepare and then
-        // reopens the exact transaction it completed.  No hypervisor pause was
-        // invoked yet.
+        // closed the gate. Recovery is safe to issue after every invoked
+        // prepare: the guest runs both commands under one flock and the same
+        // boundary token, so this reopen either follows the prepare or makes a
+        // prepare that has not taken the lock yet refuse. No hypervisor pause
+        // was invoked yet.
         let operation_error =
             error.context("preparing guest network boundary for Firecracker snapshot");
         let guest_network_resume_result = run_snapshot_network_command(
             vsock_socket_path,
             &snapshot_config.vm_id,
             "--resume-snapshot-network",
+            &boundary_token,
         )
         .await
         .context("reopening guest network after Firecracker preparation failure");
@@ -6437,6 +6467,7 @@ pub async fn create_snapshot_core(
                 vsock_socket_path,
                 &snapshot_config.vm_id,
                 "--resume-snapshot-network",
+                &boundary_token,
             )
             .await
             .context("reopening guest network after the snapshot source guard was lost");
@@ -6472,7 +6503,7 @@ pub async fn create_snapshot_core(
                 "CRITICAL: failed to resume VM after pause error — VM may be paused!");
         }
         let guest_network_resume_result =
-            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id, &boundary_token)
                 .await
                 .context("reopening guest network after Firecracker pause failure");
         if let Some(guard) = source_guard.take() {
@@ -6673,7 +6704,7 @@ pub async fn create_snapshot_core(
     // the socket-generation boundary its restored clones consume.
     let guest_network_resume_result = match source_disposition {
         SnapshotSourceDisposition::Resume => {
-            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id, &boundary_token)
                 .await
                 .context("reopening guest network after Firecracker snapshot")
         }
@@ -6974,23 +7005,34 @@ impl<'a> ChSnapshotGuest<'a> {
     }
 
     /// Close the guest network boundary before the pause.
-    async fn prepare(&self, vm_id: &str) -> Result<()> {
+    async fn prepare(&self, vm_id: &str, token: &str) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                run_snapshot_network_command(vsock_socket_path, vm_id, "--prepare-snapshot-network")
-                    .await
+                run_snapshot_network_command(
+                    vsock_socket_path,
+                    vm_id,
+                    "--prepare-snapshot-network",
+                    token,
+                )
+                .await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
     }
 
     /// Reopen the boundary after a failed `prepare`, whose failure does not prove it did
-    /// not run. Guest-side flock serialization makes the unconditional reopen exact.
-    async fn reopen_after_failed_prepare(&self, vm_id: &str) -> Result<()> {
+    /// not run. The guest's flock and the create's boundary token make the unconditional
+    /// reopen exact: it follows the prepare, or the prepare refuses when it comes later.
+    async fn reopen_after_failed_prepare(&self, vm_id: &str, token: &str) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                run_snapshot_network_command(vsock_socket_path, vm_id, "--resume-snapshot-network")
-                    .await
+                run_snapshot_network_command(
+                    vsock_socket_path,
+                    vm_id,
+                    "--resume-snapshot-network",
+                    token,
+                )
+                .await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
@@ -7007,10 +7049,10 @@ impl<'a> ChSnapshotGuest<'a> {
     }
 
     /// Reopen the guest network after the resume, and set the guest's clock.
-    async fn resume(&self, vm_id: &str) -> Result<()> {
+    async fn resume(&self, vm_id: &str, token: &str) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                resume_paused_source(vsock_socket_path, vm_id).await
+                resume_paused_source(vsock_socket_path, vm_id, token).await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
@@ -7052,6 +7094,7 @@ pub async fn create_snapshot_ch(
 
     // As on Firecracker: a source that keeps running is guarded before anything changes it
     // (#1936, `snapshot_guard`).
+    let boundary_token = new_boundary_token();
     let mut source_guard = match source_disposition {
         SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
             &super::snapshot_guard::GuardTarget {
@@ -7061,6 +7104,7 @@ pub async fn create_snapshot_ch(
                 vm_id: &snapshot_config.vm_id,
                 snapshot: &snapshot_config.name,
                 resume_timeout: snapshot_timeout,
+                boundary_token: &boundary_token,
             },
             vm_lock,
         )?),
@@ -7124,15 +7168,15 @@ pub async fn create_snapshot_ch(
         }
     }
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing Cloud Hypervisor VM for snapshot");
-    if let Err(error) = guest.prepare(&snapshot_config.vm_id).await {
+    if let Err(error) = guest.prepare(&snapshot_config.vm_id, &boundary_token).await {
         // A failed exec response does not prove that preparation did not run.
-        // Guest-side flock serialization makes an unconditional resume the
-        // exact recovery operation even if the prepare command is still
-        // finishing when this second exec arrives.
+        // The guest's flock and the boundary token make an unconditional
+        // resume the exact recovery operation: it waits for a prepare that
+        // holds the lock, and a prepare that comes after it refuses.
         let operation_error =
             error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
         let guest_network_resume_result = guest
-            .reopen_after_failed_prepare(&snapshot_config.vm_id)
+            .reopen_after_failed_prepare(&snapshot_config.vm_id, &boundary_token)
             .await
             .context("reopening guest network after Cloud Hypervisor preparation failure");
         if let Some(guard) = source_guard.take() {
@@ -7150,7 +7194,7 @@ pub async fn create_snapshot_ch(
         if let Err(error) = guard.mark(super::snapshot_guard::PAUSE).await {
             drop(source_guard.take());
             let guest_network_resume_result = guest
-                .reopen_after_failed_prepare(&snapshot_config.vm_id)
+                .reopen_after_failed_prepare(&snapshot_config.vm_id, &boundary_token)
                 .await
                 .context("reopening guest network after the snapshot source guard was lost");
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
@@ -7181,7 +7225,7 @@ pub async fn create_snapshot_ch(
                 "CRITICAL: failed to resume Cloud Hypervisor VM after pause error — VM may be paused!");
         }
         let guest_network_resume_result = guest
-            .resume(&snapshot_config.vm_id)
+            .resume(&snapshot_config.vm_id, &boundary_token)
             .await
             .context("reopening guest network after Cloud Hypervisor pause failure");
         if let Some(guard) = source_guard.take() {
@@ -7243,7 +7287,7 @@ pub async fn create_snapshot_ch(
 
     let guest_network_resume_result = match source_disposition {
         SnapshotSourceDisposition::Resume => guest
-            .resume(&snapshot_config.vm_id)
+            .resume(&snapshot_config.vm_id, &boundary_token)
             .await
             .context("reopening guest network after Cloud Hypervisor snapshot"),
         SnapshotSourceDisposition::LeavePaused => Ok(()),
@@ -8932,7 +8976,10 @@ mod tests {
         let after_save = &ch[ch.find(".snapshot_vm(").expect("the save")..];
         for (step, what) in [
             (".resume_vm()", "the VM resume"),
-            (".resume(&snapshot_config.vm_id)", "the guest reopen"),
+            (
+                ".resume(&snapshot_config.vm_id, &boundary_token)",
+                "the guest reopen",
+            ),
         ] {
             let at = after_save
                 .find(step)
@@ -8991,7 +9038,7 @@ mod tests {
                 "create_snapshot_ch",
                 ".pause_vm()",
                 ".reopen_after_failed_prepare(",
-                ".resume(&snapshot_config.vm_id)",
+                ".resume(&snapshot_config.vm_id, &boundary_token)",
             ),
         ] {
             let body = body_of(source, &format!("pub async fn {name}("));
@@ -9057,8 +9104,8 @@ mod tests {
                 ".pause_vm()",
                 [
                     ".reopen_after_failed_prepare(",
-                    ".resume(&snapshot_config.vm_id)",
-                    ".resume(&snapshot_config.vm_id)",
+                    ".resume(&snapshot_config.vm_id, &boundary_token)",
+                    ".resume(&snapshot_config.vm_id, &boundary_token)",
                 ],
             ),
         ] {
@@ -9080,6 +9127,18 @@ mod tests {
             assert!(
                 spawn.contains("vm_lock,"),
                 "{name} hands the guard its lock"
+            );
+            // One token per create, given to the guard and to every guest boundary call,
+            // so the guard's reopen fences the create's own prepare (fc-agent's
+            // boundary_token).
+            assert_eq!(
+                body.matches("new_boundary_token()").count(),
+                1,
+                "{name} makes one boundary token"
+            );
+            assert!(
+                spawn.contains("boundary_token: &boundary_token,"),
+                "{name} does not hand the guard its boundary token"
             );
             assert_eq!(body.matches("guard.disarm().await").count(), 3, "{name}");
             // A failed PAUSE mark reopens the guest and returns before the pause.
@@ -9397,9 +9456,11 @@ mod tests {
         let raw = ChSnapshotGuest::of(&state, Some(vsock)).unwrap();
         assert!(matches!(raw, ChSnapshotGuest::Raw));
         // Nothing to reach: every step succeeds without a socket.
-        raw.prepare("vm-raw").await.unwrap();
-        raw.reopen_after_failed_prepare("vm-raw").await.unwrap();
-        raw.resume("vm-raw").await.unwrap();
+        raw.prepare("vm-raw", "token").await.unwrap();
+        raw.reopen_after_failed_prepare("vm-raw", "token")
+            .await
+            .unwrap();
+        raw.resume("vm-raw", "token").await.unwrap();
 
         // `snapshot create` reads the fc-agent socket only for a guest that runs fc-agent.
         let create_cmd = body_of(include_str!("snapshot.rs"), "async fn cmd_snapshot_create(");
