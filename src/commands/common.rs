@@ -5670,6 +5670,7 @@ pub async fn create_disk_only_snapshot_core(
             snapshot: &snapshot_config.name,
             resume_timeout: std::time::Duration::from_secs(30),
             boundary_token: &boundary_token,
+            gpus: &[],
         },
         vm_lock,
     )?;
@@ -5930,6 +5931,13 @@ async fn run_snapshot_network_command(
     run_fc_agent_command(vsock_socket, vm_id, &[flag, "--boundary-token", token])
         .await
         .map(|_| ())
+}
+
+/// How long a memory snapshot's save may take: max(300 s, 10 s per GiB of guest memory).
+/// 64 GiB at ~500 MB/s is about 128 s for a full save, and dirty page tracking can cost 2 to
+/// 3 times that.
+pub(crate) fn snapshot_save_timeout_secs(memory_mib: u32) -> u64 {
+    std::cmp::max(300, u64::from(memory_mib / 1024) * 10)
 }
 
 /// A new token for one snapshot create's guest boundary (`run_snapshot_network_command`).
@@ -6240,6 +6248,7 @@ pub async fn create_snapshot_core(
     source_disposition: SnapshotSourceDisposition,
     memory_dir: Option<&Path>,
     vm_lock: &std::fs::File,
+    outer_guard: Option<&mut super::snapshot_guard::SourceGuard>,
 ) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -6254,28 +6263,36 @@ pub async fn create_snapshot_core(
     // Snapshot timeout: scales with memory size for large VMs.
     // 64GB at ~500MB/s ≈ 128s for full, but with dirty page tracking overhead can be 2-3x.
     // Formula: max(300, mem_gib * 10) seconds: 300s minimum, 64GB=640s, 128GB=1280s.
-    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
-    let snapshot_timeout_secs = std::cmp::max(300, (mem_gib as u64) * 10);
+    let snapshot_timeout_secs = snapshot_save_timeout_secs(snapshot_config.metadata.memory_mib);
 
     // A source that keeps running gets a guard before anything changes it: a process that
     // undoes the prepare and the pause if this create stops without reopening the source,
     // SIGKILL included (#1936, `snapshot_guard`). It holds what it needs from the fork, so
-    // nothing waits for it to start; the stand-down after the reopen checks that it did.
-    let boundary_token = new_boundary_token();
-    let mut source_guard = match source_disposition {
-        SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
-            &super::snapshot_guard::GuardTarget {
-                hypervisor: crate::cli::Hypervisor::Firecracker,
-                api_socket: client.socket_path(),
-                vsock_socket: Some(vsock_socket_path),
-                vm_id: &snapshot_config.vm_id,
-                snapshot: &snapshot_config.name,
-                resume_timeout: std::time::Duration::from_secs(snapshot_timeout_secs),
-                boundary_token: &boundary_token,
-            },
-            vm_lock,
-        )?),
-        SnapshotSourceDisposition::LeavePaused => None,
+    // nothing waits for it to start; the stand-down after the reopen checks that it did. A
+    // warm GPU create hands in the guard it spawned before its park (#1939), whose token
+    // the boundary calls then pass.
+    let boundary_token = match &outer_guard {
+        Some(guard) => guard.boundary_token().to_string(),
+        None => new_boundary_token(),
+    };
+    let mut source_guard = match (outer_guard, source_disposition) {
+        (Some(guard), _) => Some(super::snapshot_guard::CreateGuard::Outer(guard)),
+        (None, SnapshotSourceDisposition::Resume) => Some(super::snapshot_guard::CreateGuard::Own(
+            super::snapshot_guard::SourceGuard::spawn(
+                &super::snapshot_guard::GuardTarget {
+                    hypervisor: crate::cli::Hypervisor::Firecracker,
+                    api_socket: client.socket_path(),
+                    vsock_socket: Some(vsock_socket_path),
+                    vm_id: &snapshot_config.vm_id,
+                    snapshot: &snapshot_config.name,
+                    resume_timeout: std::time::Duration::from_secs(snapshot_timeout_secs),
+                    boundary_token: &boundary_token,
+                    gpus: &[],
+                },
+                vm_lock,
+            )?,
+        )),
+        (None, SnapshotSourceDisposition::LeavePaused) => None,
     };
 
     // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
@@ -7201,6 +7218,7 @@ pub async fn create_snapshot_ch(
                 snapshot: &snapshot_config.name,
                 resume_timeout: snapshot_timeout,
                 boundary_token: &boundary_token,
+                gpus: &[],
             },
             vm_lock,
         )?),
@@ -9210,8 +9228,10 @@ mod tests {
                 name,
                 body,
                 &[
-                    "SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(",
-                    "SnapshotSourceDisposition::LeavePaused => None,",
+                    // Core spawns its own guard only when no warm GPU create handed it one.
+                    "SnapshotSourceDisposition::Resume",
+                    "SourceGuard::spawn(",
+                    "SnapshotSourceDisposition::LeavePaused",
                     "guard.arm().await",
                     prepare,
                     "guard.mark(super::snapshot_guard::PAUSE)",
@@ -9219,7 +9239,7 @@ mod tests {
                 ],
             );
             let spawn = &body[body.find("SourceGuard::spawn(").unwrap()..];
-            let spawn = &spawn[..spawn.find("LeavePaused => None").unwrap()];
+            let spawn = &spawn[..spawn.find("LeavePaused").unwrap()];
             assert!(
                 spawn.contains("vm_lock,"),
                 "{name} hands the guard its lock"
@@ -9265,9 +9285,13 @@ mod tests {
                 from = disarm;
             }
         }
-        // `snapshot create` passes it to the disk-only capture too.
+        // `snapshot create` passes it to the disk-only capture and the warm GPU guard too.
         for (file, caller, callees) in [
-            (include_str!("snapshot.rs"), "async fn cmd_snapshot_create(", 3),
+            (
+                include_str!("snapshot.rs"),
+                "async fn cmd_snapshot_create(",
+                4,
+            ),
             (
                 include_str!("podman/snapshot.rs"),
                 "async fn create_podman_snapshot(",

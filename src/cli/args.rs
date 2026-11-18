@@ -1445,6 +1445,9 @@ pub struct SnapshotSourceGuardArgs {
     /// do, so a prepare the reopen overtook in the guest changes nothing
     #[arg(long)]
     pub boundary_token: String,
+    /// A warm GPU create's GPUs, in the VM's order: the ones the guard attaches again
+    #[arg(long)]
+    pub gpu: Vec<String>,
 }
 
 #[derive(Args, Debug)]

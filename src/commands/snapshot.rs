@@ -1835,7 +1835,34 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 use crate::firecracker::FirecrackerClient;
                 let vsock_socket_path = fc_agent_vsock(&vsock_socket_path)?;
                 let client = FirecrackerClient::new(socket_path.clone())?;
-                let core = || {
+                // A warm GPU create that keeps its source running is guarded from before its
+                // park until its GPUs are back (#1939). The memory snapshot reports to the
+                // same guard, so one undo resumes the VMM and reopens the guest before it
+                // attaches the GPUs again and unparks them, the order the create itself takes.
+                let warm_guard = tokio::sync::Mutex::new(if args.gpu_warm && !args.stop {
+                    let boundary_token = super::common::new_boundary_token();
+                    Some(super::snapshot_guard::SourceGuard::spawn(
+                        &super::snapshot_guard::GuardTarget {
+                            hypervisor: crate::cli::Hypervisor::Firecracker,
+                            api_socket: client.socket_path(),
+                            vsock_socket: Some(vsock_socket_path),
+                            vm_id: &vm_state.vm_id,
+                            snapshot: &snapshot_name,
+                            resume_timeout: std::time::Duration::from_secs(
+                                super::common::snapshot_save_timeout_secs(
+                                    snapshot_config.metadata.memory_mib,
+                                ),
+                            ),
+                            boundary_token: &boundary_token,
+                            gpus: &vm_state.config.gpus,
+                        },
+                        &_vm_lock,
+                    )?)
+                } else {
+                    None
+                });
+                let core = || async {
+                    let mut outer_guard = warm_guard.lock().await;
                     super::common::create_snapshot_core(
                         &client,
                         snapshot_config.clone(),
@@ -1852,7 +1879,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         },
                         args.memory_dir.as_deref(),
                         &_vm_lock,
+                        outer_guard.as_mut(),
                     )
+                    .await
                 };
                 if args.gpu_warm {
                     let devices =
@@ -1863,9 +1892,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         vsock_socket: vsock_socket_path,
                         vm_id: &vm_state.vm_id,
                         core: Some(core),
+                        guard: &warm_guard,
                         timings: Vec::new(),
                     };
                     let warm = crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;
+                    // The GPU steps are over, whatever they did: stand the guard down. A guard
+                    // that never started did not guard this create, which then fails.
+                    let guard_result = match warm_guard.lock().await.take() {
+                        Some(guard) => guard.disarm().await,
+                        None => Ok(()),
+                    };
                     info!(
                         snapshot = %snapshot_name,
                         gpus = devices.len(),
@@ -1875,7 +1911,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     );
                     let warm = warm?;
                     // Published: record it as the VM's diff parent below, then report.
-                    gpu_recovery_failure = warm.recovery;
+                    gpu_recovery_failure = match (warm.recovery, guard_result) {
+                        (Some(recovery), _) => Some(recovery),
+                        (None, Err(error)) => Some(error),
+                        (None, Ok(())) => None,
+                    };
                     Some(warm.snapshot)
                 } else {
                     Some(core().await?)
@@ -2271,6 +2311,9 @@ struct FirecrackerWarmGpu<'a, F> {
     vsock_socket: &'a Path,
     vm_id: &'a str,
     core: Option<F>,
+    /// The create's guard, told before the park and before each detach (#1939); None for
+    /// a `--stop` create.
+    guard: &'a tokio::sync::Mutex<Option<super::snapshot_guard::SourceGuard>>,
     /// `step=ms` for each step taken, for the log line.
     timings: Vec<String>,
 }
@@ -2283,6 +2326,12 @@ where
     type Snapshot = super::common::PublishedMemoryFile;
 
     async fn park(&mut self) -> Result<()> {
+        if let Some(guard) = self.guard.lock().await.as_mut() {
+            guard
+                .mark(super::snapshot_guard::PARK)
+                .await
+                .context("telling the snapshot source guard the park is next")?;
+        }
         let started = std::time::Instant::now();
         let result =
             super::common::run_fc_agent_one_shot(self.vsock_socket, self.vm_id, "--gpu-park").await;
@@ -2292,6 +2341,12 @@ where
     }
 
     async fn detach(&mut self, id: &str) -> Result<()> {
+        if let Some(guard) = self.guard.lock().await.as_mut() {
+            guard
+                .mark(super::snapshot_guard::DETACH)
+                .await
+                .context("telling the snapshot source guard a detach is next")?;
+        }
         let started = std::time::Instant::now();
         let result = self.client.detach_passthrough(id).await;
         self.timings
@@ -6465,6 +6520,50 @@ async fn record_diff_parent(
 
 #[cfg(test)]
 mod tests {
+    /// #1939: a warm GPU create that keeps its source running spawns one guard before its
+    /// park, tells it before the park and before each detach, hands it to the memory
+    /// snapshot, and stands it down only after the GPU steps.
+    #[test]
+    fn a_warm_gpu_create_is_guarded_from_its_park_to_its_unpark() {
+        let source = include_str!("snapshot.rs");
+        let source = &source[..source.rfind("#[cfg(test)]").unwrap()];
+        let at = |needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("snapshot.rs has no `{needle}`"))
+        };
+        let spawn = at("Mutex::new(if args.gpu_warm && !args.stop {");
+        assert!(
+            source[spawn..]
+                .find("gpus: &vm_state.config.gpus,")
+                .unwrap()
+                < 2000
+        );
+        let handed = at("outer_guard.as_mut(),");
+        let warm = at("crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;");
+        let disarm = at("Some(guard) => guard.disarm().await,");
+        assert!(spawn < handed && handed < warm && warm < disarm);
+        let steps = &source[at("impl<F, Fut> crate::gpu::WarmGpuSteps for FirecrackerWarmGpu")..];
+        for (step, mark, call) in [
+            (
+                "async fn park(",
+                "super::snapshot_guard::PARK",
+                "\"--gpu-park\"",
+            ),
+            (
+                "async fn detach(",
+                "super::snapshot_guard::DETACH",
+                ".detach_passthrough(id)",
+            ),
+        ] {
+            let body = &steps[steps.find(step).unwrap()..];
+            assert!(
+                body.find(mark).unwrap() < body.find(call).unwrap(),
+                "{step} does not tell the guard before {call}"
+            );
+        }
+    }
+
     /// `--stop` pins one VM: the wrapper hands the create the VM id it pinned before the
     /// pidfd, and the create refuses any other right after it loads the selector's VM, before
     /// it can pause anything. Without the check, a VM that took the selector's name or PID
