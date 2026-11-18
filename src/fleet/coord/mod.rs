@@ -167,17 +167,14 @@ pub struct Actor {
     clock: Box<dyn Fn() -> u64 + Send>,
 }
 
-/// The keys the coordinator hands out at start: the direct-stream keys (only with a broadcast,
-/// whose seats they enforce) and the GPU mirror's (always: the mirror is the holder's alone).
-pub fn admission_keys(broadcast: bool, key_hex: String) -> (Vec<String>, Vec<String>) {
-    (
-        if broadcast {
-            vec![key_hex.clone()]
-        } else {
-            Vec::new()
-        },
-        vec![key_hex],
-    )
+/// The keys the coordinator hands out at start: the direct-stream keys and the GPU mirror's.
+/// Both always, with or without a broadcast: every viewer the coordinator admits gets a direct
+/// token, so a renderer, aggregator, phone or server that checks one turns away only a client
+/// that never came through `/live` (and its per-client limits). Without a broadcast every
+/// connection is seated, so checking costs no viewer its picture.
+pub fn admission_keys(gate: &admission::Gate) -> (Vec<String>, Vec<String>) {
+    let key = gate.key.hex();
+    (vec![key.clone()], vec![key])
 }
 
 pub fn snapshot_of(state: &State) -> Arc<Snapshot> {
@@ -1388,10 +1385,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         decoder,
         encoder,
     ));
-    // With a broadcast, direct streams are for seated viewers only: renderers and aggregators
-    // check the direct token made with this key. Without one, nothing is checked. The GPU
-    // mirror is checked either way: only a phone's holder receives it.
-    let (admit, mirror) = admission_keys(gate.seats.capacity().is_some(), gate.key.hex());
+    // Direct streams are for viewers the coordinator admitted: renderers and aggregators check
+    // the direct token made with this key, with or without a broadcast. The GPU mirror is
+    // checked too: only a phone's holder receives it.
+    let (admit, mirror) = admission_keys(&gate);
     handle.set_admit_keys(admit).await;
     handle.set_mirror_keys(mirror).await;
     let cfg = live::LiveConfig {
@@ -1504,5 +1501,25 @@ mod zone_order_tests {
             zone < first_send,
             "dispatch_agents sends an output before it updates the zone"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_key_tests {
+    use super::{admission, admission_keys};
+
+    /// Every coordinator hands its key to the renderers and aggregators, so a direct stream
+    /// needs a token from `/live` also without a broadcast; before, a fleet without one checked
+    /// nothing and any client could open frame streams past every `/live` limit.
+    #[test]
+    fn direct_streams_are_checked_with_or_without_a_broadcast() {
+        let open = admission::Gate::open();
+        assert_eq!(open.seats.capacity(), None, "no broadcast");
+        let (admit, mirror) = admission_keys(&open);
+        assert_eq!(admit, vec![open.key.hex()]);
+        assert_eq!(mirror, vec![open.key.hex()]);
+        let mut broadcast = admission::Gate::open();
+        broadcast.seats = admission::Seats::new(Some(500));
+        assert_eq!(admission_keys(&broadcast).0, vec![broadcast.key.hex()]);
     }
 }

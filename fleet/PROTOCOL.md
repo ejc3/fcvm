@@ -51,7 +51,8 @@ Second on every connection, then again every 5 minutes with fresh tokens, and to
 viewer whenever `seat_free` changes (docs/fleet/ARCHITECTURE.md, "Broadcast mode"). A
 connection admitted while fewer than `capacity` seats are held gets a `seat` ticket and a
 `direct` token, which every frame socket it opens sends as its first message
-(`{"admit": "<value>"}`, renderer `GET /frames`); one admitted
+(`{"admit": "<value>"}`, renderer `GET /frames`); the renderers and aggregators require it
+with or without a broadcast (without one every connection is seated); one admitted
 with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
 reload; a late connection is never promoted). One client (as counted for the limits below)
@@ -2041,7 +2042,7 @@ grants. The body is at most 1 MiB.
 
 `Authorization: Bearer <scene token>` is required on a fleet renderer ("Access").
 `admit_keys` (optional): the coordinator's admission keys, hex, newest first, at
-most 4 (see `GET /frames`). The coordinator sends them only when it runs a
+most 4 (see `GET /frames`). The coordinator always sends them, with or without a
 broadcast; they never appear in a browser's snapshot.
 
 | field | meaning | accepted |

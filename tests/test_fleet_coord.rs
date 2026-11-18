@@ -6884,19 +6884,23 @@ async fn the_broadcast_never_streams_a_borrowed_tile() {
     }
 }
 
-/// The GPU mirror's key is handed out with or without a broadcast, and reaches the agents'
-/// scenes (which give it to phones only) but no browser; direct streams stay unchecked
-/// without a broadcast.
+/// The GPU mirror's key and the direct-stream key are handed out with or without a
+/// broadcast, and reach the agents' scenes (which give the mirror's to phones only) but no
+/// browser.
 #[tokio::test]
 async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
     use fcvm::fleet::coord::admission_keys;
     let key = "cd".repeat(32);
+    let mut gate = admission::Gate::open();
+    gate.key = admission::AdmitKey::from_hex(&key).unwrap();
+    assert_eq!(gate.seats.capacity(), None, "no broadcast");
     assert_eq!(
-        admission_keys(false, key.clone()),
-        (vec![], vec![key.clone()])
+        admission_keys(&gate),
+        (vec![key.clone()], vec![key.clone()])
     );
+    gate.seats = admission::Seats::new(Some(500));
     assert_eq!(
-        admission_keys(true, key.clone()),
+        admission_keys(&gate),
         (vec![key.clone()], vec![key.clone()])
     );
     let config = Config {
@@ -6905,7 +6909,10 @@ async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
         ..Config::default()
     };
     let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
-    let (admit, mirror) = admission_keys(false, key.clone());
+    let (admit, mirror) = admission_keys(&admission::Gate {
+        seats: admission::Seats::new(None),
+        ..gate
+    });
     handle.set_admit_keys(admit).await;
     handle.set_mirror_keys(mirror).await;
     let mut a = FakeAgent::connect(&handle, "gpu-a", 1);
@@ -6917,9 +6924,10 @@ async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
         }
     };
     assert_eq!(scene.mirror_keys, vec![key.clone()]);
-    assert!(
-        scene.admit_keys.is_empty(),
-        "no broadcast: direct streams stay open"
+    assert_eq!(
+        scene.admit_keys,
+        vec![key.clone()],
+        "no broadcast: direct streams are checked too"
     );
     let body = scene.for_renderer(fleet_core::tiling::Rect {
         x: 0.0,

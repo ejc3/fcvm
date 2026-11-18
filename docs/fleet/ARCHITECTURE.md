@@ -468,7 +468,8 @@ browser: IVS web player; the overlay drawn from the state in effect at the shown
 token as the socket's first message once it holds an admission key (never in the URL, which
 proxies and access logs keep): `v1.<expiry, unix s>.<viewer>.<mac>`, the mac an
 HMAC-SHA256 of the first three fields with a 32-byte key the coordinator makes at start (it sends
-keys only when it runs a broadcast, so a fleet without one checks nothing). The
+the key with or without a broadcast; without one every `/live` connection is seated and gets a
+token, so the check turns away only a client that never came through `/live`). The
 key reaches renderers in the scene the agent posts (the coordinator posts the EC2 tiles'
 scenes) and aggregators in their layout, and never appears in a snapshot. A renderer
 accepts the current key and the one before it, so a new key does not cut off a viewer between
@@ -1427,9 +1428,8 @@ gzipped, 92 MB inflated). The mirror's last frame against the phone's screenshot
 same listeners. The first message is `{"admit": "<direct token>"}`, as for `/frames`, and the
 URL carries none. It opens only when the coordinator's keys made the token and the token
 names the viewer holding the phone: the coordinator puts the holder in the phone's scene
-(`mirror_viewer`) and its key in `mirror_keys`, which it sends with or without a broadcast
-(without one, `admit_keys` is empty and direct streams stay open, but the mirror is still the
-holder's alone); the agent passes both to the phone's streamer, and the streamer ends an open
+(`mirror_viewer`) and its key in `mirror_keys`, which it sends with or without a broadcast,
+as it does `admit_keys` (the mirror is the holder's alone); the agent passes both to the phone's streamer, and the streamer ends an open
 mirror, its writer included, when the holder changes. No keys, no holder or another viewer's token: closed with 1008. One
 mirror per phone at a time (the tap has one consumer).
 

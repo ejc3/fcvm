@@ -1161,10 +1161,10 @@ pub async fn inspect_image(podman: &Path, image: &str) -> Result<(String, Option
 }
 
 /// The keys a server checks its view sockets' direct tokens with. A fleet tile admits only a
-/// direct token (it names the viewer a take-over drives for), so it needs keys even when the
-/// coordinator checks no direct stream: without a broadcast `admit_keys` is empty, and the
-/// coordinator's own key, which every seated viewer's direct token is made with, comes as
-/// `mirror_keys`. With an empty list the tile would admit nobody.
+/// direct token (it names the viewer a take-over drives for), so it needs keys even from a
+/// scene whose `admit_keys` is empty (a coordinator from before it sent them without a
+/// broadcast): the coordinator's own key, which every seated viewer's direct token is made
+/// with, also comes as `mirror_keys`. With an empty list the tile would admit nobody.
 pub fn tile_admit_keys(scene: &SharedScene) -> Vec<String> {
     if scene.admit_keys.is_empty() {
         scene.mirror_keys.clone()
