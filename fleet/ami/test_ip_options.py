@@ -200,6 +200,62 @@ else: sys.exit(91)
             send = next(args for args in calls if args[:2] == ["ssm", "send-command"])
             return json.loads(send[send.index("--parameters") + 1])["commands"][0]
 
+    def run_sh_with_status(self, failures_before_success, warn=False):
+        """build-ami.sh sh against an AWS executable whose status reads fail
+        `failures_before_success` times (None: always) before reporting Success."""
+        with tempfile.TemporaryDirectory(prefix="fleet-sh-test-") as temporary:
+            directory = Path(temporary)
+            binary = directory / "bin"
+            binary.mkdir()
+            fake = binary / "aws"
+            fake.write_text('''#!/usr/bin/python3
+import os,sys
+args=sys.argv[1:]
+if args[:1]==['--region']: args=args[2:]
+operation=tuple(args[:2])
+count=os.path.join(os.environ['SH_TEST_DIR'],'reads')
+if operation==('sts','get-caller-identity'): print('111122223333')
+elif operation==('ssm','send-command'): print('cmd-test')
+elif operation==('ssm','get-command-invocation'):
+ query=args[args.index('--query')+1]
+ if query!='Status': print('ok'); sys.exit(0)
+ n=int(open(count).read()) if os.path.exists(count) else 0
+ open(count,'w').write(str(n+1))
+ limit=os.environ['SH_TEST_FAILURES']
+ if limit=='always' or n<int(limit):
+  print('An error occurred (ExpiredTokenException) when calling the GetCommandInvocation operation',file=sys.stderr); sys.exit(254)
+ if os.environ.get('SH_TEST_WARN'): print('a warning the CLI wrote on a successful call',file=sys.stderr)
+ print('Success')
+else: sys.exit(91)
+''')
+            fake.chmod(0o755)
+            env = {**os.environ, "PATH": str(binary) + ":/usr/bin:/bin", "SH_TEST_DIR": temporary, "SSM_POLL": "0",
+                   "SH_TEST_FAILURES": "always" if failures_before_success is None else str(failures_before_success),
+                   "SH_TEST_WARN": "1" if warn else ""}
+            result = subprocess.run(["bash", str(AMI / "build-ami.sh"), "sh", "i-0123456789abcdef0", "true"],
+                                    capture_output=True, text=True, timeout=30, env=env)
+            reads = int((directory / "reads").read_text())
+            return result, reads
+
+    def test_a_status_read_that_keeps_failing_ends_the_call(self):
+        # 2026-11-18: every status read of a drill build's part upload failed, and ssm_sh took each
+        # failure for Pending, so the build waited two hours on an upload that had already succeeded.
+        result, reads = self.run_sh_with_status(None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(reads, 20)
+        self.assertIn("20 status reads of cmd-test failed in a row", result.stderr)
+        self.assertIn("ExpiredTokenException", result.stderr)
+
+    def test_a_status_read_that_fails_briefly_is_retried(self):
+        result, reads = self.run_sh_with_status(3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(reads, 4)
+
+    def test_a_warning_on_a_successful_status_read_is_not_the_status(self):
+        result, reads = self.run_sh_with_status(0, warn=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(reads, 1)
+
     def test_a_phase_is_never_started_while_another_runs_on_the_builder(self):
         # 2026-11-16: a resumed drill build started prep again while the first prep, whose caller had
         # been stopped, still ran. Both ran update-grub; one removed grub.cfg.new while the other
