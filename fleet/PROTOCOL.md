@@ -192,7 +192,10 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 with one service token, and its subrequests all arrive with the Worker's own
 `CF-Connecting-IP`. The coordinator does not verify that JWT itself, so the switch belongs
 only behind a tunnel connector that requires Access (`access.required`), which does.
-Reconnecting does not reset a limit.
+An IPv6 address counts as its /64: every address of `2001:db8:1:2::/64` is one client, since one
+subscriber or instance is usually given a whole /64. An IPv4 address counts on its own, and an
+IPv4-mapped IPv6 address as its IPv4 address. Turnstile's siteverify still gets the full
+address. Reconnecting does not reset a limit.
 
 **Races.** A race relaunches every tile at once and times both halves by the
 coordinator's clock. The owner sets the cadence (`--race-every <secs>`); `race.next_race_at`

@@ -630,6 +630,26 @@ async fn limits_are_keyed_by_the_client_address() {
     );
 }
 
+/// An IPv6 client is counted by its /64: a second address in the same /64 shares the first
+/// one's limits, an address in another /64 does not.
+#[tokio::test]
+async fn ipv6_limits_are_keyed_by_the_slash_64() {
+    let c = coordinator_with(Opts::default()).await;
+    let mut a = Viewer::connect_from(&c.url, Some("2001:db8:1:2::1")).await;
+    let mut a2 = Viewer::connect_from(&c.url, Some("2001:db8:1:2:abcd::7")).await;
+    let mut b = Viewer::connect_from(&c.url, Some("2001:db8:1:3::1")).await;
+    a.intent("w1", "word", json!({"text": "one"})).await;
+    assert_eq!(a.receipt("w1").await["outcome"], "committed");
+    a2.intent("w2", "word", json!({"text": "two"})).await;
+    assert_eq!(
+        a2.receipt("w2").await["reason"],
+        "one word per 5 s per client",
+        "another address in the same /64 is the same client"
+    );
+    b.intent("w3", "word", json!({"text": "three"})).await;
+    assert_eq!(b.receipt("w3").await["outcome"], "committed");
+}
+
 /// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
 /// a placeholder.
 fn access_jwt(claims: Value) -> String {

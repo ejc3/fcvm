@@ -6,8 +6,9 @@
 //! reach it through a bounded channel. A client that stops reading until that channel is
 //! full is disconnected.
 //!
-//! Every intent carries the connection's client address (`CF-Connecting-IP` when trusted,
-//! else the peer address), which the per-client limits are keyed by. With a Turnstile
+//! Every intent carries the connection's client key, which the per-client limits count by:
+//! the client address (`CF-Connecting-IP` when trusted, else the peer address), an IPv6
+//! address cut to its /64 ([`client_key`]). With a Turnstile
 //! secret configured, a connection's intents are refused until it has passed `verify`.
 
 use super::admission::{Admitted, Gate};
@@ -194,6 +195,28 @@ pub fn client_address(
     peer.ip().to_string()
 }
 
+/// The key every per-client limit counts by: an IPv4 address as it is, an IPv6 address as its
+/// /64 (`2001:db8:1:2::/64`). One subscriber or one cloud instance is commonly given a whole
+/// /64 (RFC 6177 recommends at least a /64 per end site, and an EC2 interface takes its IPv6
+/// addresses from its subnet's /64), so keying by the full address let one client rotate
+/// through 2^64 keys and pass every limit. The Minecraft join guard counts sources the same way
+/// (`agent::joinguard::SOURCE_MASK`). An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, a peer on a
+/// dual-stack listener) is its IPv4 address. Anything that is not an address is kept as given.
+pub fn client_key(address: &str) -> String {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let mut o = v6.octets();
+                o[8..].fill(0);
+                format!("{}/64", std::net::Ipv6Addr::from(o))
+            }
+        },
+        Err(_) => address.to_string(),
+    }
+}
+
 /// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
 /// it forwards names one (`common_name`, the token's client id) and no person (`email`).
 /// The signature is not checked here, so this is trusted only with `--access-viewer-address`:
@@ -235,12 +258,16 @@ async fn live(
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    let client = client_address(
+    let address = client_address(
         &headers,
         peer,
         app.cfg.trust_cf_connecting_ip,
         app.cfg.access_viewer_address,
     );
+    let client = Client {
+        key: client_key(&address),
+        address,
+    };
     let page = Page {
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
     };
@@ -282,6 +309,13 @@ fn unrecorded_refusal(id: String, reason: &str) -> ServerMsg {
     }
 }
 
+/// Who a connection is: its address, which Turnstile's siteverify is given, and the key every
+/// per-client limit counts by.
+struct Client {
+    address: String,
+    key: String,
+}
+
 /// What the page said about itself when it connected.
 struct Page {
     /// Its origin, which a playback token is bound to.
@@ -307,7 +341,11 @@ pub const LATE_REFUSED: [&str; 4] = [
     "claim_minecraft",
 ];
 
-async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
+async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
+    let Client {
+        address,
+        key: client,
+    } = who;
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
     let (mut sink, mut stream) = socket.split();
     // Tell the viewer who it is before anything else, so it can find its own actions.
@@ -505,7 +543,7 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
                 None
             }
             Ok(ClientMsg::Verify { token }) => {
-                let r = app.cfg.verifier.verify(&token, &client).await;
+                let r = app.cfg.verifier.verify(&token, &address).await;
                 let (ok, reason) = match r {
                     Ok(None) => (true, None),
                     Ok(Some(why)) => (false, Some(why)),
@@ -697,7 +735,22 @@ async fn word(
 
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{client_key, origin_allowed};
+
+    /// One subscriber holds a whole /64, so every address in it shares one key; IPv4 stays
+    /// per address.
+    #[test]
+    fn ipv6_clients_are_keyed_by_their_slash_64() {
+        let a = client_key("2001:db8:1:2::1");
+        assert_eq!(a, "2001:db8:1:2::/64");
+        assert_eq!(client_key("2001:db8:1:2:ffff:ffff:ffff:fffe"), a);
+        assert_eq!(client_key("2001:db8:1:2:abcd::9"), a);
+        assert_ne!(client_key("2001:db8:1:3::1"), a);
+        assert_eq!(client_key("198.51.100.1"), "198.51.100.1");
+        assert_ne!(client_key("198.51.100.2"), client_key("198.51.100.1"));
+        assert_eq!(client_key("::ffff:198.51.100.1"), "198.51.100.1");
+        assert_eq!(client_key("v-3"), "v-3");
+    }
 
     #[test]
     fn only_listed_or_own_origins_pass() {
