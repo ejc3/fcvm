@@ -400,8 +400,6 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-/// `links` maps a multiply linked file's (device, inode) to the relative path the walk
-/// first met it at.
 /// The permission bits an entry contributes to the hash. A symlink contributes none:
 /// Linux ignores a symlink's own permission bits (symlink(7)), and filesystems report
 /// different ones for the same link. EdenFS reports 0770 where the btrfs staging copy
@@ -415,6 +413,8 @@ fn hashed_mode(kind: u8, mode: u32) -> u32 {
     }
 }
 
+/// `links` maps a multiply linked file's (device, inode) to the relative path the walk
+/// first met it at.
 fn hash_entry(
     path: &Path,
     relative: &Path,
