@@ -50,21 +50,24 @@ ssm_sh() { # id, command: wait and print stdout and stderr; exit with its status
   # call is bounded by the command's own lifetime (delivery 600 s plus execution 7200 s), and
   # SSM_STATUS_FAILURES reads that fail in a row end it with the last error (the first few seconds
   # after send-command can answer InvocationDoesNotExist).
-  local cid st out failed=0 end
+  # Only stdout is the status: the CLI can write a warning to stderr on a successful call.
+  local cid st err failed=0 end
   cid=$(ssm_send "$1" "$2") || return 1
   end=$(($(now) + 7860))
+  err=$(mktemp)
   while :; do
-    if out=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>&1); then
-      failed=0; st=$out
+    if st=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query Status --output text 2>"$err"); then
+      failed=0
       case "$st" in Pending|InProgress|Delayed) ;; *) break ;; esac
     else
       failed=$((failed + 1))
       [ "$failed" -lt "${SSM_STATUS_FAILURES:-20}" ] || {
-        echo "ssm_sh: $failed status reads of $cid failed in a row: $(tail -n 1 <<<"$out")" >&2; return 1; }
+        echo "ssm_sh: $failed status reads of $cid failed in a row: $(tail -n 1 "$err")" >&2; rm -f "$err"; return 1; }
     fi
-    [ "$(now)" -lt "$end" ] || { echo "ssm_sh: $cid is still ${st:-unread} after its lifetime" >&2; return 1; }
+    [ "$(now)" -lt "$end" ] || { echo "ssm_sh: $cid is still ${st:-unread} after its lifetime" >&2; rm -f "$err"; return 1; }
     sleep "${SSM_POLL:-3}"
   done
+  rm -f "$err"
   A ssm get-command-invocation --command-id "$cid" --instance-id "$1" --query '[StandardOutputContent,StandardErrorContent]' --output text
   [ "$st" = Success ]
 }

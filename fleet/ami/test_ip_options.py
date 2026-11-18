@@ -200,7 +200,7 @@ else: sys.exit(91)
             send = next(args for args in calls if args[:2] == ["ssm", "send-command"])
             return json.loads(send[send.index("--parameters") + 1])["commands"][0]
 
-    def run_sh_with_status(self, failures_before_success):
+    def run_sh_with_status(self, failures_before_success, warn=False):
         """build-ami.sh sh against an AWS executable whose status reads fail
         `failures_before_success` times (None: always) before reporting Success."""
         with tempfile.TemporaryDirectory(prefix="fleet-sh-test-") as temporary:
@@ -224,12 +224,14 @@ elif operation==('ssm','get-command-invocation'):
  limit=os.environ['SH_TEST_FAILURES']
  if limit=='always' or n<int(limit):
   print('An error occurred (ExpiredTokenException) when calling the GetCommandInvocation operation',file=sys.stderr); sys.exit(254)
+ if os.environ.get('SH_TEST_WARN'): print('a warning the CLI wrote on a successful call',file=sys.stderr)
  print('Success')
 else: sys.exit(91)
 ''')
             fake.chmod(0o755)
             env = {**os.environ, "PATH": str(binary) + ":/usr/bin:/bin", "SH_TEST_DIR": temporary, "SSM_POLL": "0",
-                   "SH_TEST_FAILURES": "always" if failures_before_success is None else str(failures_before_success)}
+                   "SH_TEST_FAILURES": "always" if failures_before_success is None else str(failures_before_success),
+                   "SH_TEST_WARN": "1" if warn else ""}
             result = subprocess.run(["bash", str(AMI / "build-ami.sh"), "sh", "i-0123456789abcdef0", "true"],
                                     capture_output=True, text=True, timeout=30, env=env)
             reads = int((directory / "reads").read_text())
@@ -248,6 +250,11 @@ else: sys.exit(91)
         result, reads = self.run_sh_with_status(3)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(reads, 4)
+
+    def test_a_warning_on_a_successful_status_read_is_not_the_status(self):
+        result, reads = self.run_sh_with_status(0, warn=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(reads, 1)
 
     def test_a_phase_is_never_started_while_another_runs_on_the_builder(self):
         # 2026-11-16: a resumed drill build started prep again while the first prep, whose caller had
