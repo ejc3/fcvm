@@ -5542,6 +5542,99 @@ pub enum SnapshotSourceDisposition {
     LeavePaused,
 }
 
+/// The source VM of a disk-only capture, for its guard.
+pub struct DiskOnlySource<'a> {
+    pub hypervisor: crate::cli::Hypervisor,
+    pub api_socket: &'a Path,
+}
+
+/// The container store, its own filesystem in the guest: a btrfs loopback mounted at
+/// /var/lib/containers/storage, backed by a file on the rootfs.
+const STORAGE_MOUNT: &str = "/var/lib/containers/storage";
+
+/// Where the disk-only freeze keeps its lock and its token record in the guest: tmpfs, so
+/// writing there works while the guest's disks are frozen.
+const GUEST_RUN_DIR: &str = "/run/fcvm";
+
+fn sh_command(script: String) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), script]
+}
+
+/// The guest's freeze for a disk-only capture whose token is `token`, fenced like the memory
+/// snapshot's prepare (fc-agent's `boundary_token`): under one flock in `run_dir`, it refuses
+/// to freeze, with exit status 3, when a thaw of the same token already ran, and otherwise
+/// records the token as begun. A create killed after it sent the freeze, and before the
+/// guest ran it, leaves a freeze its guard's thaw can beat to the lock; without the check that
+/// freeze would leave the guest frozen with nothing coming to thaw it.
+///
+/// The container store is frozen FIRST, then the rootfs: freezing it flushes its data
+/// through the loop device into the backing file while the rootfs is still writable.
+/// (Freezing the rootfs first would deadlock that flush.)
+pub(crate) fn disk_freeze_script(run_dir: &str, token: &str) -> String {
+    format!(
+        "d='{run_dir}'; t='{token}'; \
+         mkdir -p \"$d\" && exec 9>\"$d/disk-freeze.lock\" && flock 9 || exit 1; \
+         if grep -qxF \"$t\" \"$d/disk-freeze-cancelled\" 2>/dev/null; then \
+         echo \"a thaw of disk freeze token $t already ran; not freezing\" >&2; exit 3; fi; \
+         echo \"$t\" > \"$d/disk-freeze-begun\" || exit 1; \
+         if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --freeze {m} || exit 1; fi; \
+         fsfreeze --freeze /",
+        m = STORAGE_MOUNT
+    )
+}
+
+/// The thaw that ends a disk-only capture whose token is `token`, in reverse order (rootfs
+/// first so the loop device can write again, then the container store). Under the freeze's
+/// flock it records the token as cancelled unless its freeze began, so that freeze, if it
+/// comes later, does nothing. `strict` fails when either unfreeze fails; otherwise only a
+/// failure to take the lock or to write the record fails it (the guard's and the error
+/// paths' thaw, which also run when nothing is frozen).
+pub(crate) fn disk_thaw_script(run_dir: &str, token: &str, strict: bool) -> String {
+    let unfreeze = if strict {
+        format!(
+            "fsfreeze --unfreeze /; rc=$?; \
+             if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --unfreeze {m} || rc=1; fi; \
+             exit $rc",
+            m = STORAGE_MOUNT
+        )
+    } else {
+        format!(
+            "fsfreeze --unfreeze / 2>/dev/null; fsfreeze --unfreeze {m} 2>/dev/null; exit 0",
+            m = STORAGE_MOUNT
+        )
+    };
+    format!(
+        "d='{run_dir}'; t='{token}'; \
+         mkdir -p \"$d\" && exec 9>\"$d/disk-freeze.lock\" && flock 9 || exit 1; \
+         if [ \"$(cat \"$d/disk-freeze-begun\" 2>/dev/null)\" != \"$t\" ]; then \
+         {{ cat \"$d/disk-freeze-cancelled\" 2>/dev/null; echo \"$t\"; }} | tail -n 1024 \
+         > \"$d/disk-freeze-cancelled.tmp\" && \
+         mv \"$d/disk-freeze-cancelled.tmp\" \"$d/disk-freeze-cancelled\" || exit 1; fi; \
+         {unfreeze}"
+    )
+}
+
+/// Thaw the guest's filesystems after a disk-only capture's freeze, best effort: the
+/// guard's undo and the capture's own error paths, which may run when nothing is frozen.
+pub(crate) async fn thaw_guest_filesystems(
+    vsock_socket: &Path,
+    vm_id: &str,
+    boundary_token: &str,
+) -> Result<()> {
+    let command = sh_command(disk_thaw_script(GUEST_RUN_DIR, boundary_token, false));
+    let output =
+        crate::commands::exec::run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
+            .await
+            .context("thawing the guest's filesystems")?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "thawing the guest's filesystems exited {}: {}",
+        output.exit_code,
+        output.stderr.trim()
+    );
+    Ok(())
+}
+
 /// Disk-only capture: quiesce the guest, reflink only the disk (no memory dump,
 /// no vCPU pause — `fsfreeze` provides consistency), unfreeze, and finalize a
 /// `DiskOnly` snapshot. Clones cold-boot from this disk. See
@@ -5552,13 +5645,34 @@ pub enum SnapshotSourceDisposition {
 /// commands in the guest.
 ///
 /// # Locking
-/// Caller holds the per-snapshot-dir + per-VM locks (same as `create_snapshot_core`).
+/// Caller holds the per-snapshot-dir + per-VM locks (same as `create_snapshot_core`), and
+/// passes the per-VM one as `vm_lock`: the source guard (`snapshot_guard`) holds it while
+/// it thaws the guest of a create that stopped while it was frozen (#1939).
 pub async fn create_disk_only_snapshot_core(
     snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     vsock_socket: &Path,
+    source: DiskOnlySource<'_>,
+    vm_lock: &std::fs::File,
 ) -> Result<()> {
     use crate::commands::exec::run_exec_in_vm_captured;
+
+    // The freeze and the thaw share one token, so a freeze the guard's thaw overtook in the
+    // guest does nothing (`disk_freeze_script`). The guard is spawned before anything changes
+    // the guest, as for a memory snapshot.
+    let boundary_token = new_boundary_token();
+    let mut source_guard = super::snapshot_guard::SourceGuard::spawn(
+        &super::snapshot_guard::GuardTarget {
+            hypervisor: source.hypervisor,
+            api_socket: source.api_socket,
+            vsock_socket: Some(vsock_socket),
+            vm_id: &snapshot_config.vm_id,
+            snapshot: &snapshot_config.name,
+            resume_timeout: std::time::Duration::from_secs(30),
+            boundary_token: &boundary_token,
+        },
+        vm_lock,
+    )?;
 
     // memory_path's parent is the snapshot dir (the disk sits one level down, in `disk/`).
     let snapshot_dir = snapshot_config
@@ -5596,12 +5710,8 @@ pub async fn create_disk_only_snapshot_core(
     }
 
     // Quiesce so the reflink captures a crash-consistent filesystem. No vCPU pause.
-    // `sync` flushes dirty pages, then fsfreeze blocks new writes across the reflink.
-    // The podman container store is its own filesystem (btrfs loopback mounted at
-    // /var/lib/containers/storage, backed by a file on the rootfs) — it must be
-    // frozen FIRST, then the rootfs: freezing it flushes its data through the loop
-    // device into the backing file while the rootfs is still writable. (Freezing the
-    // rootfs first would deadlock that flush.) Unfreeze happens in reverse order.
+    // `sync` flushes dirty pages, then fsfreeze blocks new writes across the reflink
+    // (`disk_freeze_script`). Unfreeze happens in reverse order.
     let sync_cmd = vec!["sync".to_string()];
     let sync_out = run_exec_in_vm_captured(vsock_socket, &sync_cmd, false, &snapshot_config.vm_id)
         .await
@@ -5615,13 +5725,11 @@ pub async fn create_disk_only_snapshot_core(
         );
     }
 
-    const STORAGE_MOUNT: &str = "/var/lib/containers/storage";
-    let freeze_script = format!(
-        "if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --freeze {m} || exit 1; fi; \
-         fsfreeze --freeze /",
-        m = STORAGE_MOUNT
-    );
-    let freeze_cmd = vec!["sh".to_string(), "-c".to_string(), freeze_script];
+    if let Err(error) = source_guard.arm_freeze().await {
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+        return Err(error);
+    }
+    let freeze_cmd = sh_command(disk_freeze_script(GUEST_RUN_DIR, &boundary_token));
     // An exec-level error (vsock reset after the request was written) can leave the
     // guest frozen with no response — always attempt a best-effort thaw of BOTH
     // mounts before bailing, never leave the source wedged.
@@ -5631,32 +5739,18 @@ pub async fn create_disk_only_snapshot_core(
         {
             Ok(out) => out,
             Err(e) => {
-                let thaw = vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "fsfreeze --unfreeze / 2>/dev/null; \
-                     fsfreeze --unfreeze {m} 2>/dev/null; true",
-                        m = STORAGE_MOUNT
-                    ),
-                ];
-                let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id)
-                    .await;
+                let _ =
+                    thaw_guest_filesystems(vsock_socket, &snapshot_config.vm_id, &boundary_token)
+                        .await;
+                let _ = source_guard.disarm().await;
                 let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
                 return Err(e).context("freezing guest filesystems");
             }
         };
     if freeze_out.exit_code != 0 {
         // Best-effort thaw in case the storage mount froze but the rootfs didn't.
-        let thaw = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!(
-                "fsfreeze --unfreeze {m} 2>/dev/null; true",
-                m = STORAGE_MOUNT
-            ),
-        ];
-        let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id).await;
+        let _ = thaw_guest_filesystems(vsock_socket, &snapshot_config.vm_id, &boundary_token).await;
+        let _ = source_guard.disarm().await;
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         anyhow::bail!(
             "fsfreeze failed (exit {}): {}",
@@ -5665,6 +5759,7 @@ pub async fn create_disk_only_snapshot_core(
         );
     }
     info!(snapshot = %snapshot_config.name, "guest frozen; reflinking disk");
+    failpoint::hit_async("snapshot.disk_only.frozen").await;
 
     // Reflink the disk (+ any disk-dir images) while frozen.
     let copy_result: Result<()> = async {
@@ -5688,15 +5783,12 @@ pub async fn create_disk_only_snapshot_core(
     // Unfreeze ALWAYS, in reverse order (rootfs first so the loop device can write
     // again, then the storage mount). A failed unfreeze wedges the source VM — that
     // is a hard error even when the reflink succeeded, so the caller knows.
-    let unfreeze_script = format!(
-        "fsfreeze --unfreeze /; rc=$?; \
-         if findmnt -n {m} >/dev/null 2>&1; then fsfreeze --unfreeze {m} || rc=1; fi; \
-         exit $rc",
-        m = STORAGE_MOUNT
-    );
-    let unfreeze_cmd = vec!["sh".to_string(), "-c".to_string(), unfreeze_script];
+    let unfreeze_cmd = sh_command(disk_thaw_script(GUEST_RUN_DIR, &boundary_token, true));
     let unfreeze_result =
         run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false, &snapshot_config.vm_id).await;
+    // The guard stands down only after the thaw ran; a guard that never started fails the
+    // create, as for a memory snapshot.
+    let guard_result = source_guard.disarm().await;
 
     if let Err(e) = copy_result {
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
@@ -5717,6 +5809,10 @@ pub async fn create_disk_only_snapshot_core(
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("unfreezing guest — source VM may be wedged");
         }
+    }
+    if let Err(e) = guard_result {
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+        return Err(e);
     }
 
     // Write config.json (kind = DiskOnly; no memory.bin / vmstate.bin).
@@ -9169,17 +9265,19 @@ mod tests {
                 from = disarm;
             }
         }
-        for (file, caller) in [
-            (include_str!("snapshot.rs"), "async fn cmd_snapshot_create("),
+        // `snapshot create` passes it to the disk-only capture too.
+        for (file, caller, callees) in [
+            (include_str!("snapshot.rs"), "async fn cmd_snapshot_create(", 3),
             (
                 include_str!("podman/snapshot.rs"),
                 "async fn create_podman_snapshot(",
+                2,
             ),
         ] {
             let body = body_of(file, caller);
             assert_eq!(
                 body.matches("&_vm_lock,").count(),
-                2,
+                callees,
                 "{caller} passes its per-VM lock"
             );
         }
@@ -9416,6 +9514,121 @@ mod tests {
     /// `ChSnapshotGuest`, and a raw guest's asks nothing: no network boundary over fc-agent
     /// before the pause, no vsock reset bookkeeping, no reopen after the resume. A Windows
     /// guest is raw even with a vsock path at hand, and a Linux guest without one is refused.
+    /// Runs a disk-only freeze or thaw script with `fsfreeze` and `findmnt` replaced by
+    /// stubs that log their arguments, and returns its exit status and the stub calls.
+    fn run_disk_script(dir: &Path, script: &str) -> (i32, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("calls");
+        for tool in ["fsfreeze", "findmnt"] {
+            let stub = bin.join(tool);
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_file(&log);
+        let status = std::process::Command::new("sh")
+            .args(["-c", script])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .status()
+            .unwrap();
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("fsfreeze"))
+            .map(str::to_string)
+            .collect();
+        (status.code().unwrap(), calls)
+    }
+
+    /// #1939: a disk-only create killed after it sent the freeze, and before the guest ran
+    /// it, leaves its guard's thaw free to run first. The freeze that comes after it must
+    /// freeze nothing, or the guest stays frozen with nothing coming to thaw it.
+    #[test]
+    fn a_disk_freeze_overtaken_by_its_thaw_freezes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        let run = run.to_str().unwrap();
+
+        let (status, calls) = run_disk_script(temp.path(), &disk_thaw_script(run, "tok-a", false));
+        assert_eq!(status, 0);
+        assert_eq!(
+            calls,
+            [
+                "fsfreeze --unfreeze /",
+                "fsfreeze --unfreeze /var/lib/containers/storage"
+            ]
+        );
+
+        let (status, calls) = run_disk_script(temp.path(), &disk_freeze_script(run, "tok-a"));
+        assert_eq!(status, 3, "the overtaken freeze did not refuse");
+        assert!(calls.is_empty(), "the overtaken freeze ran {calls:?}");
+
+        // The usual order for the next capture: freeze, then its thaw, which cancels nothing.
+        let (status, calls) = run_disk_script(temp.path(), &disk_freeze_script(run, "tok-b"));
+        assert_eq!(status, 0);
+        assert_eq!(
+            calls,
+            [
+                "fsfreeze --freeze /var/lib/containers/storage",
+                "fsfreeze --freeze /"
+            ]
+        );
+        let (status, calls) = run_disk_script(temp.path(), &disk_thaw_script(run, "tok-b", true));
+        assert_eq!(status, 0);
+        assert_eq!(
+            calls,
+            [
+                "fsfreeze --unfreeze /",
+                "fsfreeze --unfreeze /var/lib/containers/storage"
+            ]
+        );
+        let cancelled =
+            std::fs::read_to_string(Path::new(run).join("disk-freeze-cancelled")).unwrap();
+        assert_eq!(cancelled, "tok-a\n");
+    }
+
+    /// A disk-only capture is guarded from before its freeze to after its thaw, on every
+    /// path, and both scripts carry the capture's one token.
+    #[test]
+    fn a_disk_only_capture_is_guarded_from_its_freeze_to_its_thaw() {
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn create_disk_only_snapshot_core(",
+        );
+        assert_eq!(body.matches("new_boundary_token()").count(), 1);
+        let spawn = body.find("SourceGuard::spawn(").expect("no guard");
+        let arm = body
+            .find("source_guard.arm_freeze().await")
+            .expect("never armed");
+        let freeze = body
+            .find("disk_freeze_script(GUEST_RUN_DIR, &boundary_token)")
+            .expect("no freeze");
+        let thaw = body
+            .find("disk_thaw_script(GUEST_RUN_DIR, &boundary_token, true)")
+            .expect("no thaw");
+        assert!(spawn < arm && arm < freeze && freeze < thaw);
+        assert!(
+            body[spawn..arm].contains("vm_lock,"),
+            "the guard is not handed the lock"
+        );
+        // The two error paths after the freeze and the thaw each stand the guard down.
+        assert_eq!(body.matches("source_guard.disarm().await").count(), 3);
+        assert!(
+            body[freeze..].find("source_guard.disarm()").unwrap()
+                > body[freeze..].find("thaw_guest_filesystems(").unwrap()
+        );
+        let after_thaw = &body[thaw..];
+        assert!(after_thaw.find("source_guard.disarm().await").is_some());
+    }
+
     #[tokio::test]
     async fn a_raw_guests_snapshot_asks_nothing_of_the_guest() {
         let source = include_str!("common.rs");

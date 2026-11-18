@@ -1786,6 +1786,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             snapshot_config.clone(),
             &vm_disk_path,
             fc_agent_vsock(&vsock_socket_path)?,
+            super::common::DiskOnlySource {
+                hypervisor: match vm_state.config.hypervisor {
+                    crate::hypervisor::Backend::Firecracker => crate::cli::Hypervisor::Firecracker,
+                    crate::hypervisor::Backend::CloudHypervisor => {
+                        crate::cli::Hypervisor::CloudHypervisor
+                    }
+                },
+                api_socket: &socket_path,
+            },
+            &_vm_lock,
         )
         .await?;
         None

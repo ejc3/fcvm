@@ -262,6 +262,11 @@ to every reopen. Under the lock the prepare records that its token began and ref
 without freezing or thawing, when a reopen of that token already ran; a reopen that finds its
 prepare not begun records the token as cancelled (`fc-agent/src/boundary_token.rs`,
 `a_prepare_overtaken_by_its_reopen_refuses_and_changes_nothing`).
+A `--disk-only` create is guarded the same way from before its guest `fsfreeze` to after its
+thaw (#1939): its freeze and thaw scripts carry one token under a flock in the guest's `/run/fcvm`
+(`disk_freeze_script`), so a freeze its guard's thaw overtook freezes nothing.
+`test_lifecycle_interleave_killed_disk_only_create_thaws_its_source` SIGKILLs a create held at
+`snapshot.disk_only.frozen`; `a_disk_freeze_overtaken_by_its_thaw_freezes_nothing` runs the scripts.
 `test_lifecycle_interleave_killed_snapshot_create_resumes_its_source` (and its Cloud
 Hypervisor twin) SIGKILLs a create held at `snapshot.post_save_pre_resume`;
 `a_source_that_keeps_running_is_guarded_from_its_prepare_to_its_reopen` pins the order.

@@ -1,4 +1,4 @@
-//! The source guard of a memory snapshot create (#1936).
+//! The source guard of a snapshot create (#1936, #1939).
 //!
 //! A create changes its source VM: `--prepare-snapshot-network` closes the guest's gate,
 //! freezes the payload cgroup and holds the console, and then the VMM is paused. The create
@@ -28,6 +28,11 @@
 //! signal to the create's process group does not reach it, and it has no parent-death
 //! signal: it has to outlive the create. It exits on [`DONE`], at once when the create
 //! changed nothing, or after the undo, whose every step has a timeout.
+//!
+//! A disk-only create (`snapshot create --disk-only`) is guarded the same way from before its
+//! guest `fsfreeze` to after its thaw (#1939): it sends [`FREEZE`] instead of the prepare and
+//! pause marks, and the undo is the capture's thaw, fenced by the same kind of token
+//! (`common::disk_freeze_script`).
 
 use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -46,6 +51,8 @@ const RELEASED: u8 = b'K';
 pub(crate) const PREPARE: u8 = b'P';
 /// Create to guard: the VMM pause is about to be asked for.
 pub(crate) const PAUSE: u8 = b'V';
+/// Create to guard: a disk-only create is about to freeze the guest's filesystems.
+pub(crate) const FREEZE: u8 = b'F';
 /// Create to guard: the create ran its own reopen of the source; stand down.
 const DONE: u8 = b'D';
 
@@ -68,6 +75,8 @@ pub(crate) enum Phase {
     Prepared,
     /// The VMM may be paused as well.
     Paused,
+    /// A disk-only create's freeze may have frozen the guest's filesystems.
+    Frozen,
 }
 
 /// What the guard does once it knows the create's fate.
@@ -100,7 +109,9 @@ impl Progress {
             DONE => self.done = true,
             PREPARE if !self.done => self.phase = self.phase.max(Phase::Prepared),
             PAUSE if !self.done => self.phase = self.phase.max(Phase::Paused),
-            PREPARE | PAUSE => {}
+            // A disk-only create sends nothing else: it neither prepares nor pauses.
+            FREEZE if !self.done => self.phase = Phase::Frozen,
+            PREPARE | PAUSE | FREEZE => {}
             other => warn!(
                 byte = other,
                 "source guard ignored an unknown byte from its create"
@@ -215,6 +226,13 @@ impl SourceGuard {
         self.mark(PREPARE)
             .await
             .context("telling the snapshot source guard the prepare is next")
+    }
+
+    /// Tell the guard a disk-only create's freeze is next, the same way as [`Self::arm`].
+    pub(crate) async fn arm_freeze(&mut self) -> Result<()> {
+        self.mark(FREEZE)
+            .await
+            .context("telling the snapshot source guard the freeze is next")
     }
 
     /// Tell the guard how far the create has got.
@@ -458,6 +476,23 @@ async fn undo(args: &SnapshotSourceGuardArgs, phase: Phase, guest_timeout: Durat
             "a snapshot create stopped before reopening its source, whose VMM is gone; nothing to undo");
         return;
     }
+    if phase == Phase::Frozen {
+        let thawed = match &args.vsock_socket {
+            Some(vsock) => match tokio::time::timeout(
+                guest_timeout,
+                super::common::thaw_guest_filesystems(vsock, vm_id, &args.boundary_token),
+            )
+            .await
+            {
+                Ok(result) => outcome(result),
+                Err(_) => format!("no answer within {}s", guest_timeout.as_secs_f64()),
+            },
+            None => "no fc-agent".to_string(),
+        };
+        warn!(vm_id, snapshot, ?phase, guest_thaw = %thawed,
+            "undid the freeze of a disk-only snapshot create that stopped before thawing its source");
+        return;
+    }
     let vmm = if phase == Phase::Paused {
         super::common::record_vsock_reset_for_snapshot(vm_id, snapshot).await;
         let timeout = Duration::from_secs(args.resume_timeout_secs);
@@ -529,6 +564,8 @@ mod tests {
         assert_eq!(verdict(b""), Verdict::Undo(Phase::Untouched));
         assert_eq!(verdict(&[PREPARE]), Verdict::Undo(Phase::Prepared));
         assert_eq!(verdict(&[PREPARE, PAUSE]), Verdict::Undo(Phase::Paused));
+        assert_eq!(verdict(&[FREEZE]), Verdict::Undo(Phase::Frozen));
+        assert_eq!(verdict(&[FREEZE, DONE]), Verdict::StandDown);
         assert_eq!(verdict(&[PREPARE, PAUSE, DONE]), Verdict::StandDown);
         assert_eq!(verdict(&[PREPARE, DONE]), Verdict::StandDown);
         assert_eq!(verdict(&[DONE]), Verdict::StandDown);
