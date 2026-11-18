@@ -174,6 +174,10 @@ export class WallClient {
       this.send("release_gpu", { claim: release });
       this.dispatch({ type: "own-released", claim: release });
     }
+    // A new connection while the page held a claim: present its token (held until the
+    // Turnstile check passes when the coordinator asks for one).
+    const resume = next.own.resume;
+    if (resume !== null && before.own.resume !== resume) this.act("resume_claim", { token: resume });
   }
 
   // ---- coordinator socket -----------------------------------------------------

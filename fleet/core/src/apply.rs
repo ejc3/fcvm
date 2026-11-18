@@ -219,7 +219,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             // is the reason only. Args that are not an object (refused, `args must be an
             // object`) are shown as `{}` too: an intent's args are an object on the wire, and
             // a page keeps nothing else.
-            let shown_args = if (name == "word" && outcome == Outcome::Refused) || !args.is_object()
+            // A resume's args are the claim's token, which only its viewer may hold.
+            let shown_args = if (name == "word" && outcome == Outcome::Refused)
+                || name == "resume_claim"
+                || !args.is_object()
             {
                 serde_json::json!({})
             } else {
@@ -354,6 +357,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             for n in mine {
                 release(&mut state.fleet, n, at);
             }
+            release_held(&mut state.fleet, |c| c.viewer == *viewer, at);
             let phones: Vec<u32> = state
                 .fleet
                 .phones
@@ -642,6 +646,7 @@ fn power_step(state: &mut State, at: u64) {
         f.power.idle_since.get_or_insert(at);
     }
     let claims = f.slots.values().any(|s| s.claim.is_some())
+        || !f.held_claims.is_empty()
         || f.phones.values().any(|s| phone_claim(s).is_some())
         || f.windows.values().any(|s| windows_claim(s).is_some())
         || f.minecraft.values().any(|s| minecraft_claim(s).is_some());
@@ -1022,7 +1027,23 @@ fn intent_effect(
                 crate::potato::PotatoIntent::Refused(r) => Err(r),
             }
         }
+        Intent::ResumeClaim { token } => resume_claim(&mut state.fleet, c, token),
         Intent::ReleaseGpu { claim } => {
+            if let Some(h) = state
+                .fleet
+                .held_claims
+                .iter()
+                .find(|h| h.claim.viewer == c.viewer)
+            {
+                if claim.as_ref().is_some_and(|k| *k != h.claim.session) {
+                    return Err(format!(
+                        "{:?} is not this viewer's claim",
+                        claim.as_deref().unwrap()
+                    ));
+                }
+                release_held(&mut state.fleet, |k| k.viewer == c.viewer, at);
+                return Ok("release".into());
+            }
             let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
             let session = &state.fleet.slots[&n].claim.as_ref().unwrap().session;
             if claim.as_ref().is_some_and(|k| k != session) {
@@ -1126,7 +1147,9 @@ fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
         .ok_or("a claim needs a session token from the coordinator")?;
     if f.slots
         .values()
-        .any(|s| s.claim.as_ref().is_some_and(|k| k.client == c.client))
+        .filter_map(|s| s.claim.as_ref())
+        .chain(f.held_claims.iter().map(|h| &h.claim))
+        .any(|k| k.client == c.client)
     {
         return Err("one GPU per client at a time".into());
     }
@@ -1219,6 +1242,7 @@ fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
         autopilot: true,
         flight_t0: None,
         borrowed,
+        resume_by: None,
     });
     Ok(format!("{session} on {}", slot.id))
 }
@@ -1234,6 +1258,39 @@ fn release(f: &mut Fleet, n: u32, at: u64) {
     // The VM restores back into the wall (or to standby), timed like any relaunch.
     bump(slot, &format!("return:{}", claim.session), at);
     f.last_claim_end.insert(claim.client, at);
+}
+
+/// End the held claims (carried over by a restart, their GPU's host not back yet) that
+/// `which` picks. No VM is relaunched: their slot does not exist until the host says hello.
+fn release_held(f: &mut Fleet, which: impl Fn(&Claim) -> bool, at: u64) {
+    let ends = &mut f.last_claim_end;
+    f.held_claims.retain(|h| {
+        if which(&h.claim) {
+            ends.insert(h.claim.client.clone(), at);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// `resume_claim`: a page that reconnected after a coordinator restart takes back the claim
+/// whose token it holds. Only a claim the restart carried over and no page has taken yet.
+fn resume_claim(f: &mut Fleet, c: &Ctx, token: &str) -> Result<String, String> {
+    if own_claim(f, c.viewer).is_some() || f.held_claims.iter().any(|h| h.claim.viewer == c.viewer)
+    {
+        return Err("this viewer already holds a GPU".into());
+    }
+    let claim = f
+        .slots
+        .values_mut()
+        .filter_map(|s| s.claim.as_mut())
+        .chain(f.held_claims.iter_mut().map(|h| &mut h.claim))
+        .find(|k| k.token == token && k.resume_by.is_some() && k.viewer.is_empty())
+        .ok_or("no claim waits for that token: it ended, or the coordinator did not restart")?;
+    claim.viewer = c.viewer.to_string();
+    claim.resume_by = None;
+    Ok(format!("resume {}", claim.session))
 }
 
 fn host_draining(hosts: &BTreeMap<String, Host>, slot: &Slot) -> bool {
@@ -1395,16 +1452,19 @@ fn tick(state: &mut State, at: u64) {
             crate::autopilot::extend(c, now_t);
         }
     }
-    // Claims expire.
+    // Claims expire, and so does a claim a restart carried over that no page took back in
+    // time.
+    let unclaimed = |c: &Claim| at >= c.expires_at || c.resume_by.is_some_and(|t| at >= t);
     let expired: Vec<u32> = f
         .slots
         .iter()
-        .filter(|(_, s)| s.claim.as_ref().is_some_and(|c| at >= c.expires_at))
+        .filter(|(_, s)| s.claim.as_ref().is_some_and(unclaimed))
         .map(|(n, _)| *n)
         .collect();
     for n in expired {
         release(f, n, at);
     }
+    release_held(f, unclaimed, at);
     // Borrowed phones come back; actions the agents have had time to carry out are dropped.
     let expired: Vec<u32> = f
         .phones
@@ -1563,6 +1623,28 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
         },
     );
     f.reclaimed.remove(host);
+    // A claim a restart carried over goes back on its GPU's slot. The host kept the claim's VM
+    // running at the claim's generation, so the slot asks for that generation and no
+    // relaunch.
+    let (back, held): (Vec<HeldClaim>, Vec<HeldClaim>) = std::mem::take(&mut f.held_claims)
+        .into_iter()
+        .partition(|h| {
+            h.host == host
+                && f.slots.values().any(|s| {
+                    s.host.as_deref() == Some(host)
+                        && s.gpu.as_ref().is_some_and(|g| g.sbdf == h.sbdf)
+                        && s.claim.is_none()
+                })
+        });
+    f.held_claims = held;
+    for h in back {
+        if let Some(s) = f.slots.values_mut().find(|s| {
+            s.host.as_deref() == Some(host) && s.gpu.as_ref().is_some_and(|g| g.sbdf == h.sbdf)
+        }) {
+            s.generation = s.generation.max(h.claim.generation);
+            s.claim = Some(h.claim);
+        }
+    }
     drop_missing_from_races(f, at);
 }
 

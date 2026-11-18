@@ -1,0 +1,281 @@
+//! What a coordinator restart keeps (`State::resumed`): a GPU claim waits for its page to
+//! present the claim's token, and the open stop vote keeps the votes it answered.
+
+use fleet_core::state::CLAIM_RESUME_MS;
+use fleet_core::view::host_assignments;
+use fleet_core::{apply, Config, Event, Outcome, State};
+use serde_json::json;
+
+fn config() -> Config {
+    let mut base = serde_json::to_value(Config::default()).unwrap();
+    base["max_tiles"] = json!(2);
+    base["claim_secs"] = json!(600);
+    serde_json::from_value(base).unwrap()
+}
+
+fn ev(v: serde_json::Value) -> Event {
+    serde_json::from_value(v).unwrap()
+}
+
+fn hello(at: u64) -> Event {
+    ev(
+        json!({"at": at, "type": "agent", "host": "h1", "msg": {"type": "hello", "host": "h1",
+        "arch": "x86_64", "capacity": 8, "gpus": [
+            {"name": "Tesla T4", "sbdf": "0000:01:00.0"},
+            {"name": "Tesla T4", "sbdf": "0000:02:00.0"},
+            {"name": "Tesla T4", "sbdf": "0000:03:00.0"}]}}),
+    )
+}
+
+fn running(at: u64, slot: &str, generation: u64) -> Event {
+    ev(
+        json!({"at": at, "type": "agent", "host": "h1", "msg": {"type": "slot", "id": slot,
+        "phase": "running", "generation": generation, "frame_url": "ws://h1:20003/frames",
+        "vm": "fleet-slot", "timings": {}}}),
+    )
+}
+
+fn joined(at: u64, viewer: &str) -> Event {
+    ev(json!({"at": at, "type": "viewer_joined", "viewer": viewer, "client": "198.51.100.20"}))
+}
+
+fn intent(at: u64, viewer: &str, id: &str, name: &str, args: serde_json::Value) -> Event {
+    ev(
+        json!({"at": at, "type": "intent", "viewer": viewer, "client": "198.51.100.20",
+        "id": id, "name": name, "args": args, "secret": "token-a"}),
+    )
+}
+
+fn tick(at: u64) -> Event {
+    ev(json!({"at": at, "type": "tick"}))
+}
+
+fn run(s: State, events: Vec<Event>) -> State {
+    events.iter().fold(s, apply)
+}
+
+/// Viewer v1 holds slot-3 (the standby GPU), its private VM running; the state as stored and
+/// read back by a coordinator that restarted at `restart_at`.
+fn claimed_then_restarted(restart_at: u64) -> (State, u64) {
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            hello(1000),
+            running(1500, "slot-1", 1),
+            running(1500, "slot-2", 1),
+            joined(2000, "v1"),
+            intent(3000, "v1", "c1", "claim_gpu", json!({})),
+        ],
+    );
+    assert_eq!(s.receipts["c1"].outcome, Outcome::Committed);
+    let generation = s.fleet.slots[&3].claim.as_ref().unwrap().generation;
+    let s = run(s, vec![running(4000, "slot-3", generation)]);
+    let stored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    (stored.resumed(config(), restart_at), generation)
+}
+
+#[test]
+fn a_claim_survives_a_restart_for_the_page_that_presents_its_token() {
+    let (s, generation) = claimed_then_restarted(5000);
+    assert_eq!(s.fleet.held_claims.len(), 1, "the claim is kept");
+    let held = &s.fleet.held_claims[0];
+    assert_eq!(
+        (held.host.as_str(), held.sbdf.as_str()),
+        ("h1", "0000:03:00.0")
+    );
+    assert_eq!(held.claim.viewer, "", "the old viewer id names nobody now");
+    assert_eq!(held.claim.resume_by, Some(5000 + CLAIM_RESUME_MS));
+    // The host says hello again: the claim goes back on its GPU's slot, at the generation
+    // the host still runs, so nothing is relaunched.
+    let s = run(s, vec![hello(6000), running(6500, "slot-3", generation)]);
+    let slot = s
+        .fleet
+        .slots
+        .values()
+        .find(|x| x.gpu.as_ref().unwrap().sbdf == "0000:03:00.0")
+        .unwrap();
+    assert!(slot.claim.is_some());
+    assert_eq!(slot.generation, generation);
+    let a = host_assignments(&s)["h1"]
+        .iter()
+        .find(|a| a.id == slot.id)
+        .unwrap()
+        .clone();
+    assert_eq!(a.generation, generation);
+    assert!(
+        a.private_camera.is_some(),
+        "the private scene still goes to the VM"
+    );
+    // The page reconnects under a new viewer id and presents the token.
+    let s = run(
+        s,
+        vec![
+            joined(7000, "v-1"),
+            intent(
+                7100,
+                "v-1",
+                "r0",
+                "resume_claim",
+                json!({"token": "token-b"}),
+            ),
+            intent(
+                7200,
+                "v-1",
+                "r1",
+                "resume_claim",
+                json!({"token": "token-a"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["r0"].outcome, Outcome::Refused, "a wrong token");
+    assert_eq!(s.receipts["r1"].outcome, Outcome::Committed);
+    let c = s
+        .fleet
+        .slots
+        .values()
+        .find_map(|x| x.claim.as_ref())
+        .unwrap();
+    assert_eq!((c.viewer.as_str(), c.resume_by), ("v-1", None));
+    // The token never reaches the shared action list.
+    let shown = s.fleet.actions.iter().find(|a| a.id == "r1").unwrap();
+    assert_eq!(shown.args, json!({}));
+    // Taken back, it lasts past the resume window, and its viewer drives it.
+    let s = run(
+        s,
+        vec![
+            tick(5000 + CLAIM_RESUME_MS + 1000),
+            intent(
+                5000 + CLAIM_RESUME_MS + 1100,
+                "v-1",
+                "cam",
+                "claim_camera",
+                json!({"drag": {"yaw_deg": 5.0, "pitch_deg": 0.0}}),
+            ),
+        ],
+    );
+    assert!(s.fleet.slots.values().any(|x| x.claim.is_some()));
+    assert_eq!(s.receipts["cam"].outcome, Outcome::Committed);
+}
+
+#[test]
+fn a_claim_no_page_takes_back_ends_when_the_resume_window_closes() {
+    // On its slot once the host is back.
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(s, vec![hello(6000), tick(5000 + CLAIM_RESUME_MS - 1)]);
+    assert!(s.fleet.slots.values().any(|x| x.claim.is_some()));
+    let s = run(s, vec![tick(5000 + CLAIM_RESUME_MS)]);
+    assert!(s.fleet.slots.values().all(|x| x.claim.is_none()));
+    assert_eq!(
+        s.fleet.last_claim_end.get("198.51.100.20"),
+        Some(&(5000 + CLAIM_RESUME_MS))
+    );
+    // Still held, its host not back.
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(s, vec![tick(5000 + CLAIM_RESUME_MS)]);
+    assert!(s.fleet.held_claims.is_empty());
+    assert_eq!(
+        s.fleet.last_claim_end.get("198.51.100.20"),
+        Some(&(5000 + CLAIM_RESUME_MS))
+    );
+}
+
+#[test]
+fn a_restarted_coordinator_gives_no_claim_to_a_new_viewer_with_the_old_id() {
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(
+        s,
+        vec![
+            hello(6000),
+            joined(7000, "v1"),
+            intent(
+                7100,
+                "v1",
+                "cam",
+                "claim_camera",
+                json!({"drag": {"yaw_deg": 5.0, "pitch_deg": 0.0}}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["cam"].outcome, Outcome::Refused);
+}
+
+#[test]
+fn a_claim_taken_back_before_its_host_returns_goes_on_its_slot_with_its_viewer() {
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(
+        s,
+        vec![
+            joined(5500, "v-2"),
+            intent(
+                5600,
+                "v-2",
+                "r1",
+                "resume_claim",
+                json!({"token": "token-a"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["r1"].outcome, Outcome::Committed);
+    assert_eq!(s.fleet.held_claims[0].claim.viewer, "v-2");
+    let s = run(s, vec![hello(6000)]);
+    assert!(s.fleet.held_claims.is_empty());
+    let c = s
+        .fleet
+        .slots
+        .values()
+        .find_map(|x| x.claim.as_ref())
+        .unwrap();
+    assert_eq!(c.viewer, "v-2");
+    // Its viewer leaving gives it back, as before the restart.
+    let s = run(
+        s,
+        vec![ev(
+            json!({"at": 7000, "type": "viewer_left", "viewer": "v-2"}),
+        )],
+    );
+    assert!(s.fleet.slots.values().all(|x| x.claim.is_none()));
+}
+
+#[test]
+fn a_claim_whose_time_ran_out_while_the_coordinator_was_down_ends() {
+    // claim_secs is 600: the claim from 3000 runs out at 603_000.
+    let (s, _) = claimed_then_restarted(700_000);
+    assert!(s.fleet.held_claims.is_empty());
+    assert_eq!(s.fleet.last_claim_end.get("198.51.100.20"), Some(&603_000));
+}
+
+#[test]
+fn a_restart_keeps_the_votes_of_the_open_round() {
+    let s = State::new(Config::default(), 0);
+    let target = fleet_core::director::viewpoints()[s.fleet.director.offer[0]].name;
+    let s = run(
+        s,
+        vec![
+            joined(500, "v1"),
+            intent(1000, "v1", "n1", "nudge", json!({"target": target})),
+        ],
+    );
+    assert_eq!(s.receipts["n1"].outcome, Outcome::Committed);
+    let before = s.fleet.director.clone();
+    assert_eq!(before.votes.len(), 1);
+    let stored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    let s = stored.resumed(Config::default(), 2000);
+    assert_eq!(
+        s.fleet.director.votes, before.votes,
+        "the answered vote is kept"
+    );
+    assert_eq!(s.fleet.director.offer, before.offer);
+    // The round closes on that vote.
+    let decide = s.fleet.director.decide_at();
+    let s = apply(
+        s,
+        &Event::Tick {
+            at: (decide * 1000.0) as u64 + 1,
+        },
+    );
+    assert_eq!(
+        s.fleet.director.next,
+        Some(before.offer[0]),
+        "the voted stop is next"
+    );
+}

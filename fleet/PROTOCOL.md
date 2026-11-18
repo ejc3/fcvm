@@ -99,8 +99,16 @@ the latest.
 ```
 
 One per intent. `version` is the state version that first holds the intent's effect (or
-its refusal in `actions`). An intent id the coordinator has seen before, from any viewer,
-returns that id's first receipt again and changes nothing. `check` is present on `word`
+its refusal in `actions`). A `committed` receipt is sent only once a stored state
+(`--state-file` or `--state-bucket`) holds that version, so a coordinator that dies, even by
+SIGKILL, has acknowledged nothing it would forget; one write each store tick (1 s) answers
+every intent applied before it, so a committed receipt arrives within about a second plus
+the write. A receipt the store never holds is never sent: the page sends the intent again
+after it reconnects. A refusal changes nothing and is sent at once. Snapshots are not
+held back: a snapshot can show a change whose receipt has not come yet, and a coordinator
+that dies before storing it comes back without it. An intent id the coordinator has seen
+before, from any viewer, returns that id's first receipt again (also once stored) and
+changes nothing. `check` is present on `word`
 intents that reached the text check: `verdict` is `allow`, `refuse` or `error`, and `sky`
 the words the new one was judged together with. A refusal with `version: 0` was not
 recorded (`"verify first"`: the connection has not passed Turnstile yet); the same id may
@@ -128,7 +136,12 @@ first frame, `phases` the agent's timings of the restore), again whenever its ca
 keyframes change (`claim_camera`, `claim_autopilot`, and the autopilot's next keyframes
 about every 8 s while it flies), and a last time with `phase: "ended"` and `ended` saying why
 (`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
-fleet). The frame URL and the token appear in no snapshot. `tile` is the wall tile it
+fleet). The frame URL and the token appear in no snapshot. A page whose connection drops
+while it holds a claim presents the token on its new connection (`resume_claim`). A
+coordinator that restarted carried the claim over and gives it back to that connection,
+which is told about it from then on as above (`restoring` until the claim's host is back
+and its VM reports running). Otherwise the claim ended when the old connection closed, the
+resume is refused, and the page shows the claim ended. `tile` is the wall tile it
 borrowed, null for a standby GPU. `autopilot` is true while the camera flies the
 autopilot's loop (below) and false once the viewer has paused it or taken the camera.
 
@@ -176,6 +189,7 @@ Intents:
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
+| `resume_claim` | `{"token": "<the claim's token>"}` | takes back, on a new connection, a claim a coordinator restart carried over (below, "What a restart keeps"); refused for any other claim, or when this connection already holds one. Its args are never in `actions` |
 | `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50. On a camera flying its autopilot it also stops the autopilot: the camera eases to rest along its path over 0.5 s while it turns by the drag |
 | `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
 | `claim_phone` | `{"phone": "phone-2"}` (or `{}`: any free phone) | borrows a phone for 120 s (`phone_claim_secs`); see "Phones mode" below |
@@ -652,7 +666,17 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
   keeps versions) at most once a second while it changes and at shutdown. A missing object
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
-  without `s3:ListBucket`) stops the coordinator rather than start it empty.
+  without `s3:ListBucket`) stops the coordinator rather than start it empty. Every PUT is
+  conditional on the object this coordinator last read or wrote (`If-Match` on its ETag, or
+  `If-None-Match: *` when there was none). A PUT answered 412 means another coordinator
+  writes the object now: the coordinator logs `FLEET_STATE_WRITE_LOST` at error level, writes
+  nothing more, and exits without its shutdown write or EC2 sweep, both of which would undo
+  the other coordinator's work. An object that does not parse does not stop the coordinator:
+  it logs `FLEET_STATE_UNREADABLE` at error level and resumes from the newest earlier
+  version that parses (the changes stored after it are lost); with no such version among
+  the 20 before it, it does not start. Its first write then replaces the unreadable object.
+  The task's role needs `s3:ListBucketVersions` and `s3:GetObjectVersion` for this. Alarms
+  match those two strings.
 - `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
   live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. GPUs
   that connected hosts run phones on, and quarantined GPUs of connected hosts, come off it. It and
@@ -805,8 +829,32 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   30 s.
 - `--state-file` keeps the state as JSON, rewritten atomically (temporary file, fsync,
   rename) at most once a second while it changes, and once more on shutdown; a restarted
-  coordinator resumes its version, scene, director, races, receipts and action log from
-  it. Hosts, slots, claims and viewers are rebuilt as agents and browsers connect.
+  coordinator resumes from it (below). A file that does not parse stops the coordinator.
+
+#### What a restart keeps
+
+A coordinator that starts from a stored state (`State::resumed` in `fleet/core/src/state.rs`)
+restores what it can and releases what was bound to the old process:
+
+- Kept: the version, the scene (words, lights), the director, finished races, receipts, the
+  action log, the per-address limits and cooldowns, quarantines and their reports, counters
+  and potato mode's ladder and records.
+- The open stop vote: kept with its votes when the stored offer is the open round's (every
+  stored vote was answered); otherwise the vote starts again.
+- A GPU claim: kept until it expires. Its VM keeps running on its host, and a page proves it
+  holds the claim with the claim's token. The claim waits for its host's agent to say
+  hello (then it is back on that GPU's slot, at the generation the host runs, so nothing
+  relaunches) and for its page to present the token with `resume_claim`, which it must do
+  within 30 s of the restart or the claim ends and the GPU returns to the pool. A claim whose
+  time ran out while the coordinator was down ends then.
+- Released: a borrowed phone, Windows sandbox or Minecraft server. These carry no token, so
+  no page that reconnects can show it held one; each ends as it would when its viewer left
+  (a sandbox or server is reset when its host is back, and the cooldown runs from the
+  restart). The page sees the borrow gone from the snapshot.
+- Released: a race the restart interrupted. Its times are the coordinator's sightings of each
+  tile's first frame, and those during the restart were not seen, so it cannot finish with a
+  true time. It leaves the race list; its tiles keep running.
+- Rebuilt: hosts, slots, viewers and the layout, as agents say hello and pages reconnect.
 - `--race-every` (also `FLEET_RACE_EVERY`) is the owner's race cadence; without it races
   run only on `restart_now`.
 - `--turnstile-secret` and `--turnstile-site-key` (also `FLEET_TURNSTILE_SECRET`,

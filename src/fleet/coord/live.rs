@@ -15,7 +15,7 @@ use super::admission::{Admitted, Gate};
 use super::poster::Poster;
 use super::text_check::{check_text, TextChecker};
 use super::turnstile::Verifier;
-use super::Handle;
+use super::{Handle, Submitted};
 use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The largest message a browser may send.
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
@@ -641,6 +641,32 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         }
     });
 
+    // Receipts in the order their intents arrived, each sent once a stored state holds its
+    // change (a committed one; a refused one at once), so a coordinator that crashes has
+    // acknowledged nothing it did not store. Waiting here keeps the reader reading. A receipt
+    // that no stored state ever holds is never sent. A claim's messages start after its
+    // receipt.
+    let (receipts, mut receipts_rx) =
+        mpsc::channel::<(ServerMsg, oneshot::Receiver<bool>, bool)>(DIRECT_QUEUE);
+    let forward = {
+        let direct = direct.clone();
+        let handle = app.handle.clone();
+        let viewer = viewer.clone();
+        tokio::spawn(async move {
+            let mut claims = tokio::task::JoinSet::new();
+            while let Some((msg, stored, claim)) = receipts_rx.recv().await {
+                if stored.await != Ok(true) {
+                    continue;
+                }
+                if direct.send(msg).await.is_err() {
+                    return;
+                }
+                if claim {
+                    claims.spawn(tell_claim(handle.clone(), viewer.clone(), direct.clone()));
+                }
+            }
+        })
+    };
     let verified = Arc::new(AtomicBool::new(!app.cfg.verifier.required()));
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -750,9 +776,12 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     None
                 } else {
                     let claim = name == "claim_gpu";
+                    // A page taking back its claim after a restart is told about it as a new
+                    // claim is.
+                    let tells = claim || name == "resume_claim";
                     let r = app
                         .handle
-                        .apply(Event::Intent {
+                        .submit(Event::Intent {
                             at: 0,
                             viewer: viewer.clone(),
                             client: Some(client.clone()),
@@ -763,14 +792,21 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             secret: claim.then(|| uuid::Uuid::new_v4().simple().to_string()),
                         })
                         .await;
-                    if claim && r.as_ref().is_some_and(|r| r.outcome == Outcome::Committed) {
-                        tasks.push(tokio::spawn(tell_claim(
-                            app.handle.clone(),
-                            viewer.clone(),
-                            direct.clone(),
-                        )));
+                    if let Some(Submitted {
+                        receipt: Some(r),
+                        stored,
+                    }) = r
+                    {
+                        let tell = tells && r.outcome == Outcome::Committed;
+                        if receipts
+                            .try_send((ServerMsg::receipt(&r), stored, tell))
+                            .is_err()
+                        {
+                            tracing::info!(%viewer, "viewer is not reading its receipts; closing");
+                            break;
+                        }
                     }
-                    r.map(|r| ServerMsg::receipt(&r))
+                    None
                 }
             }
         };
@@ -784,6 +820,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     for t in tasks {
         t.abort();
     }
+    forward.abort();
     renew.abort();
     writer.abort();
     release(&gate);

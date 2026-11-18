@@ -41,7 +41,7 @@ use fleet_core::protocol::{
 use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,12 +61,20 @@ pub enum Cmd {
     /// The keys phone streamers check GPU mirror tokens with (hex, newest first).
     MirrorKeys(Vec<String>),
     /// Apply an event; its `at` is replaced with the actor's clock. Replies with the
-    /// receipt for an intent.
+    /// receipt for an intent: a committed one only once a stored state holds it (the reply
+    /// is dropped if none ever does), a refused one at once.
     Apply {
         event: Event,
         reply: Option<oneshot::Sender<Option<Receipt>>>,
     },
-    /// The receipt already held for an intent id.
+    /// Apply an event as `Apply` does, and reply at once with the receipt and a receiver
+    /// that says whether a stored state holds the receipt's change. The caller sends a
+    /// committed receipt only after that receiver says true.
+    Submit {
+        event: Event,
+        reply: oneshot::Sender<Submitted>,
+    },
+    /// The receipt already held for an intent id, when a stored state holds it.
     Receipt {
         id: String,
         reply: oneshot::Sender<Option<Receipt>>,
@@ -109,6 +117,14 @@ pub enum Cmd {
     Shutdown {
         ack: oneshot::Sender<bool>,
     },
+}
+
+/// An applied intent's receipt, and whether a stored state holds its change: true once a
+/// write that holds it is stored, false (or the sender dropped) when the coordinator stops
+/// without storing it. A refused receipt changes nothing and is resolved at once.
+pub struct Submitted {
+    pub receipt: Option<Receipt>,
+    pub stored: oneshot::Receiver<bool>,
 }
 
 struct AgentConn {
@@ -161,7 +177,13 @@ pub struct Actor {
     agents: HashMap<u64, AgentConn>,
     last_at: u64,
     published: u64,
+    /// The newest state version queued for the writer.
     stored: u64,
+    /// The newest state version a write the store acknowledged holds.
+    durable: u64,
+    /// Answers waiting for a stored state that holds their version (receipts, see
+    /// `Cmd::Apply`), oldest first.
+    waiting: Vec<(u64, oneshot::Sender<bool>)>,
     /// Quarantines agents reported and have not been told are stored: host, GPU address,
     /// the report's id, and the state version that holds the report.
     unacked: Vec<(String, String, Option<String>, u64)>,
@@ -196,6 +218,8 @@ impl Actor {
             admit_keys: Vec::new(),
             mirror_keys: Vec::new(),
             stored: state.version,
+            durable: state.version,
+            waiting: Vec::new(),
             published: state.version,
             state,
             out,
@@ -472,20 +496,81 @@ impl Actor {
         done
     }
 
+    /// Resolves true once a write the store acknowledged holds state `version` (at once when
+    /// one already does, or there is no store), false when the actor stops first.
+    fn when_stored(&mut self, version: u64) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        if self.out.store.is_none() || version <= self.durable {
+            let _ = tx.send(true);
+        } else {
+            self.waiting.push((version, tx));
+        }
+        rx
+    }
+
+    /// Whether a stored state holds `receipt`: a committed receipt waits for one, since the
+    /// viewer is told its change is made; a refused one changed nothing and is answered now.
+    fn receipt_stored(&mut self, receipt: Option<&Receipt>) -> oneshot::Receiver<bool> {
+        match receipt {
+            Some(r) if r.outcome == fleet_core::Outcome::Committed => self.when_stored(r.version),
+            _ => self.when_stored(0),
+        }
+    }
+
+    /// Send `receipt` on `reply` once a stored state holds it; drop `reply` if none does.
+    fn reply_stored(&mut self, reply: oneshot::Sender<Option<Receipt>>, receipt: Option<Receipt>) {
+        let mut stored = self.receipt_stored(receipt.as_ref());
+        if let Ok(true) = stored.try_recv() {
+            let _ = reply.send(receipt);
+            return;
+        }
+        tokio::spawn(async move {
+            if stored.await == Ok(true) {
+                let _ = reply.send(receipt);
+            }
+        });
+    }
+
+    /// A write the store acknowledged holds every version up to `version`: answer what waited
+    /// for it.
+    fn stored_through(&mut self, version: u64) {
+        self.durable = self.durable.max(version);
+        let durable = self.durable;
+        let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|(v, _)| *v <= durable);
+        self.waiting = rest;
+        for (_, tx) in done {
+            let _ = tx.send(true);
+        }
+        self.quarantines_stored(version);
+    }
+
+    fn intent_receipt(&mut self, event: Event) -> Option<Receipt> {
+        let id = match &event {
+            Event::Intent { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        self.apply(event);
+        id.and_then(|id| self.state.receipt(&id).cloned())
+    }
+
     pub fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Apply { event, reply } => {
-                let id = match &event {
-                    Event::Intent { id, .. } => Some(id.clone()),
-                    _ => None,
-                };
-                self.apply(event);
+                let receipt = self.intent_receipt(event);
                 if let Some(reply) = reply {
-                    let _ = reply.send(id.and_then(|id| self.state.receipt(&id).cloned()));
+                    self.reply_stored(reply, receipt);
                 }
             }
+            Cmd::Submit { event, reply } => {
+                let receipt = self.intent_receipt(event);
+                let stored = self.receipt_stored(receipt.as_ref());
+                let _ = reply.send(Submitted { receipt, stored });
+            }
             Cmd::Receipt { id, reply } => {
-                let _ = reply.send(self.state.receipt(&id).cloned());
+                let receipt = self.state.receipt(&id).cloned();
+                self.reply_stored(reply, receipt);
             }
             Cmd::PrecheckWord {
                 client,
@@ -590,6 +675,32 @@ impl Actor {
                         } else {
                             Default::default()
                         },
+                        camera: c.camera.clone(),
+                        autopilot: c.autopilot,
+                        ended: None,
+                    })
+                });
+                // A claim a restart carried over whose GPU's host is not back yet: restoring.
+                let info = info.or_else(|| {
+                    let c = self
+                        .state
+                        .fleet
+                        .held_claims
+                        .iter()
+                        .map(|h| &h.claim)
+                        .find(|c| c.viewer == viewer)?;
+                    Some(ClaimMsg {
+                        id: c.session.clone(),
+                        tile: c.borrowed.clone(),
+                        phase: "restoring".into(),
+                        frame_url: None,
+                        frame_url_v4: None,
+                        token: c.token.clone(),
+                        clicked_at: c.claimed_at,
+                        first_frame_at: c.first_frame_at,
+                        expires_at: c.expires_at,
+                        gpu: None,
+                        phases: Default::default(),
                         camera: c.camera.clone(),
                         autopilot: c.autopilot,
                         ended: None,
@@ -732,9 +843,10 @@ impl Actor {
         snap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut store_tick = tokio::time::interval(STORE_INTERVAL);
         store_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // A write whose outcome acknowledges quarantines: the state version it holds, and
-        // whether it was stored.
-        let mut quarantine_write: Option<(u64, oneshot::Receiver<bool>)> = None;
+        // Writes whose answers acknowledge receipts and quarantines, oldest first: the state
+        // version each holds, and its answer. One write per tick answers every receipt and
+        // report applied before it; the writer answers in the order it was asked.
+        let mut inflight: VecDeque<(u64, oneshot::Receiver<bool>)> = VecDeque::new();
         let ack = loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -744,19 +856,20 @@ impl Actor {
                 },
                 _ = snap_tick.tick() => self.publish(),
                 _ = store_tick.tick() => {
-                    if quarantine_write.is_none() && !self.unacked.is_empty() {
-                        // The barrier's answer says whether the newest state, which holds
-                        // every report so far, is stored (also when it was written before).
+                    let waiting = !self.unacked.is_empty() || !self.waiting.is_empty();
+                    if self.state.version != self.stored || (waiting && inflight.is_empty()) {
+                        // A changed state, or an unchanged one something waits on: the
+                        // answer says whether the newest state is stored (also when it was
+                        // written before, or a failed write of it is retried now).
                         let version = self.state.version;
-                        quarantine_write = Some((version, self.store(true)));
+                        inflight.push_back((version, self.store(true)));
                     } else {
                         drop(self.store(false));
                     }
                 }
-                (version, stored) = written(&mut quarantine_write) => {
-                    quarantine_write = None;
+                (version, stored) = written(&mut inflight) => {
                     if stored {
-                        self.quarantines_stored(version);
+                        self.stored_through(version);
                     }
                 }
             }
@@ -765,8 +878,10 @@ impl Actor {
         let mut stored = false;
         for attempt in 1..=SHUTDOWN_WRITE_ATTEMPTS {
             // A writer that is gone cannot store anything.
+            let version = self.state.version;
             stored = self.store(true).await.unwrap_or(false);
             if stored {
+                self.stored_through(version);
                 break;
             }
             tracing::warn!(attempt, "the last state is not stored yet");
@@ -780,16 +895,25 @@ impl Actor {
                 "the last state was not stored"
             );
         }
+        // What no stored state holds is never acknowledged.
+        for (_, tx) in self.waiting.drain(..) {
+            let _ = tx.send(false);
+        }
         if let Some(ack) = ack {
             let _ = ack.send(stored);
         }
     }
 }
 
-/// The outcome of the write in `w` (pending forever without one).
-async fn written(w: &mut Option<(u64, oneshot::Receiver<bool>)>) -> (u64, bool) {
-    match w {
-        Some((version, rx)) => (*version, rx.await.unwrap_or(false)),
+/// The answer to the oldest write in `w`, which leaves it (pending forever without one).
+async fn written(w: &mut VecDeque<(u64, oneshot::Receiver<bool>)>) -> (u64, bool) {
+    match w.front_mut() {
+        Some((version, rx)) => {
+            let version = *version;
+            let stored = rx.await.unwrap_or(false);
+            w.pop_front();
+            (version, stored)
+        }
         None => std::future::pending().await,
     }
 }
@@ -833,6 +957,17 @@ impl Handle {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Apply an intent and return its receipt at once, with whether a stored state holds it
+    /// (`Cmd::Submit`).
+    pub async fn submit(&self, event: Event) -> Option<Submitted> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Submit { event, reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
 
     /// Stop the actor; returns once the last state is stored, or its writes have failed,
@@ -1001,6 +1136,16 @@ pub fn start(
     (handle, task)
 }
 
+/// Resolves once `lost` turns true (pending forever without one, or once its writer is gone).
+async fn lost_the_store(lost: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = lost else {
+        return std::future::pending().await;
+    };
+    if rx.wait_for(|l| *l).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// The operator's endpoint: `POST /quarantine/release {"host", "sbdf"}` returns a
 /// quarantined GPU to rotation.
 pub fn admin_router(handle: Handle) -> axum::Router {
@@ -1121,6 +1266,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             )))
         }
     };
+    // Turns true once another coordinator wrote the state object (`store::LostWrite`).
+    let mut lost: Option<watch::Receiver<bool>> = None;
     let (state, store_tx) = match &args.state_file {
         Some(path) => {
             let state = match store::load(path)? {
@@ -1147,7 +1294,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                     }
                     None => State::new(config, now_ms()),
                 };
-                (state, Some(store::spawn_s3_writer(obj)))
+                let (tx, lost_rx) = store::spawn_s3_writer(obj);
+                lost = Some(lost_rx);
+                (state, Some(tx))
             }
             None => (State::new(config, now_ms()), None),
         },
@@ -1436,6 +1585,15 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         r = live::serve(listener, handle.clone(), cfg) => r?,
         _ = term.recv() => tracing::info!("SIGTERM"),
         _ = int.recv() => tracing::info!("SIGINT"),
+        _ = lost_the_store(&mut lost) => {
+            // Another coordinator holds the state now. Writing ours over it would undo what
+            // it acknowledged, and the EC2 sweep below would terminate its tiles: stop here.
+            tracing::error!(
+                marker = store::LOST_WRITE_MARKER,
+                "another coordinator writes the state object; stopping without writing or sweeping"
+            );
+            bail!("another coordinator writes the state object ({})", store::LOST_WRITE_MARKER);
+        }
     }
     // The state file holds the last state before the process exits; the agents' commands
     // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).

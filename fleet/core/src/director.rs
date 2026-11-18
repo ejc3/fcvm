@@ -893,6 +893,16 @@ impl Director {
         self.vote_opened_t = now_t;
     }
 
+    /// What a coordinator does with a stored open vote when it resumes: the votes stay when
+    /// the offer is the one the open round makes, since every stored vote was answered;
+    /// otherwise they describe a round already decided, and the vote starts again.
+    pub fn resume_vote(&mut self, now_t: f64) {
+        let (from, step, _) = self.vote_from();
+        if self.offer != self.make_offer(step, from) {
+            self.restart_vote(now_t);
+        }
+    }
+
     /// When the open vote closes.
     pub fn vote_closes_at(&self) -> f64 {
         self.vote_from().2 - DECIDE_LEAD_SECS
