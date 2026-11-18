@@ -642,6 +642,41 @@ class GateTests(unittest.TestCase):
         self.assertIn("verdict: ${{ steps.decide.outputs.verdict }}", decide)
         self.assertIn("id: decide", decide)
 
+    def test_the_smoke_installs_a_pinned_ffmpeg_not_from_apt(self):
+        # Staging, 2026-11-18: apt on the hosted runner fetched ffmpeg at 75.7 kB/s for 13m50s
+        # in the gate's first smoke of generation 19, between a ready release and its verdict.
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        for job, script in (("ipv4", "fleet/coord/install-ffmpeg.sh"), ("ipv6", "./fcvm/fleet/coord/install-ffmpeg.sh")):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertNotIn("apt-get", body)
+            install = f'run: {script} "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"'
+            self.assertIn(install, body)
+            self.assertLess(body.index(install), body.index("stage-smoke.py --family"))
+
+    def test_install_ffmpeg_refuses_a_download_that_does_not_match_its_checksum(self):
+        script = ROOT / "fleet/coord/install-ffmpeg.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            # A download that is a working ffmpeg with an H.264 decoder, but not the pinned one.
+            fake = tmp / "fake-ffmpeg"
+            fake.write_text("#!/bin/sh\necho ' V....D h264                 H.264'\n")
+            bin_ = tmp / "bin"
+            bin_.mkdir()
+            (bin_ / "curl").write_text('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+                                       f'gzip -c {fake} > "$2"\n')
+            (bin_ / "uname").write_text("#!/bin/sh\necho \"$FAKE_ARCH\"\n")
+            for name in ("curl", "uname"):
+                (bin_ / name).chmod(0o755)
+            for arch in ("x86_64", "aarch64", "riscv64"):
+                with self.subTest(arch=arch):
+                    out = tmp / arch
+                    env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", FAKE_ARCH=arch)
+                    result = subprocess.run(["bash", str(script), str(out)], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result)
+                    self.assertIn("pinned", result.stderr)
+                    self.assertFalse((out / "ffmpeg").exists())
+                    self.assertEqual(result.stdout, "")
+
     def test_the_status_run_is_cheap(self):
         # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted
         # runner, a short limit, and a checkout of the one file it runs.

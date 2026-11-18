@@ -57,8 +57,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # A static ffmpeg pinned by SHA-256, not apt (fleet/coord/install-ffmpeg.sh says why).
       - name: Install ffmpeg (the smoke decodes each tile's first picture)
-        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg
+        run: fleet/coord/install-ffmpeg.sh "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"
       # It relaunches one tile in each wall half (fresh launch names) and borrows and drives one
       # Minecraft server; a capacity drought fails it, never counts as a pass.
       - name: Every mode over IPv4, relaunch and fresh names, take-over
@@ -106,9 +107,7 @@ jobs:
           path: fcvm
           persist-credentials: false
       - name: Install ffmpeg (the smoke decodes each tile's first picture)
-        run: |
-          ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y -q --no-install-recommends ffmpeg
+        run: ./fcvm/fleet/coord/install-ffmpeg.sh "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"
       - name: Every mode over IPv6, take-over
         env:
           STAGING_API_URL: ${{ vars.STAGING_API_URL }}
