@@ -168,8 +168,9 @@ pub struct Shared {
 struct Streams {
     cap: usize,
     next: u64,
-    /// Each open stream's stop, cancelled when a newer stream of its viewer replaces it.
-    open: HashMap<u64, CancellationToken>,
+    /// Each open stream's stop, cancelled when a newer stream of its viewer replaces it, and
+    /// its gone, cancelled when it has given its place back.
+    open: HashMap<u64, (CancellationToken, CancellationToken)>,
     /// The newest stream of each viewer.
     by_viewer: HashMap<String, u64>,
 }
@@ -180,6 +181,7 @@ struct StreamPlace {
     id: u64,
     viewer: Option<String>,
     stop: CancellationToken,
+    gone: CancellationToken,
 }
 
 impl Drop for StreamPlace {
@@ -191,7 +193,18 @@ impl Drop for StreamPlace {
                 s.by_viewer.remove(v);
             }
         }
+        self.gone.cancel();
     }
+}
+
+/// What a new stream gets from [`Shared::open_stream`].
+enum Opened {
+    Place(StreamPlace),
+    /// `cap` streams are open.
+    Full,
+    /// Its viewer's older stream was told to stop; this is cancelled once that stream has given
+    /// its place back (within [`REPLACED_CLOSE_WAIT`]), and then the new one asks again.
+    Replacing(CancellationToken),
 }
 
 impl Shared {
@@ -222,32 +235,33 @@ impl Shared {
     }
 
     /// A place for a stream of `viewer` (`None`: admission is off and no token names one). A
-    /// stream already open for the same viewer is stopped, and the new one takes the place
-    /// whatever the count; otherwise `None` when `cap` streams are open.
-    fn open_stream(self: &Arc<Self>, viewer: Option<String>) -> Option<StreamPlace> {
+    /// stream already open for the same viewer is told to stop, and the new one waits for its
+    /// place (`Replacing`), so the count never passes `cap`; otherwise `Full` at `cap`.
+    fn open_stream(self: &Arc<Self>, viewer: Option<&str>) -> Opened {
         let mut s = self.streams.lock().unwrap();
-        let held = viewer.as_ref().and_then(|v| s.by_viewer.get(v).copied());
-        match held {
-            Some(old) => {
-                if let Some(stop) = s.open.get(&old) {
-                    stop.cancel();
-                }
-            }
-            None if s.open.len() >= s.cap => return None,
-            None => {}
+        if let Some((stop, gone)) = viewer
+            .and_then(|v| s.by_viewer.get(v))
+            .and_then(|old| s.open.get(old))
+        {
+            stop.cancel();
+            return Opened::Replacing(gone.clone());
+        }
+        if s.open.len() >= s.cap {
+            return Opened::Full;
         }
         s.next += 1;
         let id = s.next;
-        let stop = CancellationToken::new();
-        s.open.insert(id, stop.clone());
-        if let Some(v) = &viewer {
-            s.by_viewer.insert(v.clone(), id);
+        let (stop, gone) = (CancellationToken::new(), CancellationToken::new());
+        s.open.insert(id, (stop.clone(), gone.clone()));
+        if let Some(v) = viewer {
+            s.by_viewer.insert(v.to_string(), id);
         }
-        Some(StreamPlace {
+        Opened::Place(StreamPlace {
             app: self.clone(),
             id,
-            viewer,
+            viewer: viewer.map(str::to_string),
             stop,
+            gone,
         })
     }
 
@@ -974,11 +988,28 @@ async fn admitted_frames_route(
                     .map(str::to_string);
             }
             // One stream per viewer, STREAMS_PER_TILE in all (fleet/PROTOCOL.md, "Stream limits").
-            let Some(place) = app.open_stream(named) else {
-                let _ = socket
-                    .send(close(1013, "this aggregator serves no more streams"))
-                    .await;
-                return;
+            // A replaced stream ends within REPLACED_CLOSE_WAIT; past twice that, give up.
+            let place = loop {
+                match app.open_stream(named.as_deref()) {
+                    Opened::Place(p) => break p,
+                    Opened::Replacing(gone) => {
+                        if tokio::time::timeout(2 * REPLACED_CLOSE_WAIT, gone.cancelled())
+                            .await
+                            .is_err()
+                        {
+                            let _ = socket
+                                .send(close(1013, "the older stream of this viewer did not end"))
+                                .await;
+                            return;
+                        }
+                    }
+                    Opened::Full => {
+                        let _ = socket
+                            .send(close(1013, "this aggregator serves no more streams"))
+                            .await;
+                        return;
+                    }
+                }
             };
             viewer(socket, app, place.stop.clone()).await;
             drop(place);
@@ -995,6 +1026,11 @@ fn close(code: u16, reason: &'static str) -> Message {
 
 /// How long a stream that needs a direct token waits for the client's first message.
 pub const ADMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a replaced stream's close may take to send before its socket is dropped unsent: a
+/// client that stopped reading would otherwise hold the send, and the stream its place, for
+/// as long as it likes.
+pub const REPLACED_CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 /// The largest message the public listener takes from a viewer.
 pub const MAX_VIEWER_MESSAGE: usize = 4096;
@@ -1043,8 +1079,8 @@ pub fn subscriber_name() -> String {
     format!("aggregator-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Feeds a viewer until it goes, or until `stop` (a newer stream of the same viewer took its
-/// place), which closes it with 1008.
+/// Feeds a viewer until it goes, or until `stop` (a newer stream of the same viewer waits for
+/// its place), which closes it with 1008, or drops it unclosed after [`REPLACED_CLOSE_WAIT`].
 async fn viewer(socket: WebSocket, app: Arc<Shared>, stop: CancellationToken) {
     let (mut sink, mut stream) = socket.split();
     // Read and ignore what the viewer sends (a height request), so pings get answered. When
@@ -1055,7 +1091,14 @@ async fn viewer(socket: WebSocket, app: Arc<Shared>, stop: CancellationToken) {
         _ = feed(&mut sink, &app) => {}
         _ = reader => {}
         _ = stop.cancelled() => {
-            let _ = sink.send(close(1008, "a newer stream holds this viewer's token")).await;
+            // Best effort: a client that stopped reading would hold this send (and the place
+            // the newer stream waits for) for as long as it likes; past the bound the socket is
+            // dropped unsent.
+            let _ = tokio::time::timeout(
+                REPLACED_CLOSE_WAIT,
+                sink.send(close(1008, "a newer stream holds this viewer's token")),
+            )
+            .await;
         }
     }
 }
@@ -1576,5 +1619,93 @@ mod tests {
             Some("Bearer t"),
             at("203.0.113.5:5000")
         ));
+    }
+
+    /// A replaced stream whose client stopped reading gives its place back within
+    /// REPLACED_CLOSE_WAIT, and the replacement takes it only then: one token reconnecting over
+    /// stalled links never holds more than the cap. Each client here never reads, with 64 MiB
+    /// to send it (more than the socket buffers hold), so its feed is blocked in a send when
+    /// the next client replaces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_stream_that_stopped_reading_frees_its_place_within_the_bound() {
+        use crate::fleet::coord::admission::AdmitKey;
+        use tokio_tungstenite::tungstenite::Message as Client;
+        let key = AdmitKey([3; 32]);
+        let shared = Shared::new();
+        shared.set_layout(Layout {
+            epoch_unix_ms: now_ms(),
+            image_aspect: 16.0 / 9.0,
+            region: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+            tiles: vec![],
+            generation: 0,
+            from_frame: 0,
+            admit_keys: vec![key.hex()],
+        });
+        shared.set_stream_cap(1);
+        shared.publish(Out::Header("header".into()));
+        shared.publish(Out::Frame {
+            key: true,
+            bytes: vec![0; 1 << 20],
+        });
+        for _ in 0..63 {
+            shared.publish(Out::Frame {
+                key: false,
+                bytes: vec![1; 1 << 20],
+            });
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let app = shared.clone();
+        tokio::spawn(async move { axum::serve(l, public_router(app)).await.unwrap() });
+        // The most streams ever open, sampled every millisecond for the whole test.
+        let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampling = CancellationToken::new();
+        let sampler = {
+            let (shared, most, sampling) = (shared.clone(), most.clone(), sampling.clone());
+            tokio::spawn(async move {
+                while !sampling.is_cancelled() {
+                    most.fetch_max(shared.open_streams(), std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+        let newest = |shared: &Shared| shared.streams.lock().unwrap().by_viewer.get("v-1").copied();
+        let mut held = Vec::new(); // every client, none of them ever read
+        for i in 0..4u64 {
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+                .await
+                .unwrap();
+            let token = key.direct_token("v-1", now_ms() / 1000 + 600 + i);
+            ws.send(Client::Text(admit_first_message(&token).into()))
+                .await
+                .unwrap();
+            held.push(ws);
+            let deadline = Instant::now() + REPLACED_CLOSE_WAIT + Duration::from_secs(1);
+            while !(newest(&shared) == Some(i + 1) && shared.open_streams() == 1) {
+                assert!(
+                    Instant::now() < deadline,
+                    "client {i}: {} streams open, the newest {:?}, {:?} after it connected",
+                    shared.open_streams(),
+                    newest(&shared),
+                    REPLACED_CLOSE_WAIT + Duration::from_secs(1)
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Let its feed fill the socket and block before the next client replaces it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        sampling.cancel();
+        sampler.await.unwrap();
+        let most = most.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            most <= 1,
+            "{most} streams were open at once under a cap of 1"
+        );
+        drop(held);
     }
 }

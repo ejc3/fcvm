@@ -1774,7 +1774,10 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   serves one stream per viewer, and `q=hi` only to an aggregator: "Stream limits").
 - The public listener serves one stream per viewer and at most 512 at once, as a renderer
   does ("Stream limits"): a stream whose token names a viewer that already streams closes
-  the older one with 1008, and a new viewer past 512 is closed with 1013. Without
+  the older one with 1008 and takes its place once it has ended, so the count never passes
+  the cap. The close waits at most 0.5 s (`REPLACED_CLOSE_WAIT`) to be sent; an older stream
+  whose client stopped reading is dropped without it. A new viewer past 512 is closed with
+  1013. Without
   `admit_keys` streams are counted, never replaced.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`

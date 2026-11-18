@@ -277,6 +277,29 @@ struct ServerTest {
     CHECK(within(2000, [&] { return local_source.subscribed() == 1; }), "outside the fleet h=2160 q=hi streams");
   }
 
+  // A replaced stream whose client stopped reading ends at once: the replacement shuts its
+  // socket down (StreamTable's stop), which fails the writer's blocked write, so it never waits
+  // to send anything first and its place is free before the next replacement.
+  static void a_replaced_stream_that_stopped_reading_ends_at_once() {
+    TokenFile tf;
+    FakeSource src(true);
+    Server fleet(src);
+    fleet.set_scene_token(&tf.token);
+    fleet.streams_.set_cap(1);
+    std::vector<std::unique_ptr<Stream>> held;  // every client, none of them ever read
+    for (int i = 0; i < 4; i++) {
+      held.push_back(stream(fleet, "h=270", "{\"admit\":\"v1.400000000" + std::to_string(i) + ".v-1.mac\"}"));
+      CHECK(within(2000, [&] { return src.subscribed() == (size_t)i + 1; }), "client %d streams", i);
+      if (src.subscribed() != (size_t)i + 1) return;
+      // 64 MiB the client never reads: its writer blocks in a write.
+      auto sub = src.subs[i];
+      for (int k = 0; k < 64; k++) sub->push(std::make_shared<const std::string>(std::string(1 << 20, 'x')));
+      CHECK(within(1000, [&] { return fleet.streams_.size() == 1; }) && (i == 0 || held[i - 1]->done->load()),
+            "client %d replaced its predecessor's stream within 1 s (%zu open)", i, fleet.streams_.size());
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
   // One stream per viewer on a fleet server: a newer one with the same viewer's token ends the
   // older; other viewers' streams stay. At most the cap in all; a refusal is close 1013.
   static void a_fleet_server_streams_once_per_viewer_and_up_to_its_cap() {
@@ -483,6 +506,7 @@ int main() {
   ServerTest::still_and_raw_need_the_scene_token_on_a_fleet_server();
   ServerTest::fleet_streams_ask_no_more_than_the_page();
   ServerTest::a_fleet_server_streams_once_per_viewer_and_up_to_its_cap();
+  ServerTest::a_replaced_stream_that_stopped_reading_ends_at_once();
   // --- stream limits (access.h): the viewer a token names, who may ask q=hi, the table
   {
     CHECK(admit_token_viewer("v1.1000.v-3.77RQ") == "v-3" && admit_token_viewer("v1.1000.aggregator-ab.x") == "aggregator-ab" &&
