@@ -142,6 +142,85 @@ fn interface_ipv4(interface: &str) -> Option<Ipv4Addr> {
     None
 }
 
+/// Read an interface's MTU from sysfs.
+fn interface_mtu(interface: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("{SYSFS_NET_PATH}/{interface}/mtu"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Set an interface's MTU with SIOCSIFMTU on a datagram socket.
+fn set_interface_mtu(interface: &str, mtu: u32) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name = interface.as_bytes();
+    if name.is_empty() || name.len() >= request.ifr_name.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("interface name {interface:?} does not fit in ifr_name"),
+        ));
+    }
+    for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
+        *slot = *byte as _;
+    }
+    request.ifr_ifru.ifru_mtu = i32::try_from(mtu).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("MTU {mtu} out of range"),
+        )
+    })? as _;
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // The request argument's type is the libc's choice (i32 on musl, c_ulong on glibc).
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFMTU as _, &mut request) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set eth0's MTU to the one the host's links run at (`Plan::guest_mtu` at boot,
+/// `LatestMetadata::guest_mtu` on a restore). The host's links are at that MTU whether
+/// or not this succeeds, so a failure leaves the guest working at its old MTU and is
+/// logged, not fatal. Returns the MTU eth0 has afterwards.
+pub fn apply_guest_mtu(mtu: u32) -> Option<u32> {
+    apply_guest_mtu_on("eth0", mtu, interface_mtu, set_interface_mtu)
+}
+
+fn apply_guest_mtu_on(
+    interface: &str,
+    mtu: u32,
+    read: impl Fn(&str) -> Option<u32>,
+    write: impl Fn(&str, u32) -> std::io::Result<()>,
+) -> Option<u32> {
+    let before = read(interface);
+    if before == Some(mtu) {
+        return before;
+    }
+    match write(interface, mtu) {
+        Ok(()) => {
+            let after = read(interface);
+            eprintln!(
+                "[fc-agent] {interface} MTU {} -> {}",
+                before.map_or("unknown".to_string(), |m| m.to_string()),
+                after.map_or("unknown".to_string(), |m| m.to_string())
+            );
+            after
+        }
+        Err(error) => {
+            eprintln!(
+                "[fc-agent] WARNING: could not set {interface} MTU to {mtu}: {error}; it stays {}",
+                before.map_or("unknown".to_string(), |m| m.to_string())
+            );
+            before
+        }
+    }
+}
+
 /// Send `frame` on `interface` through `packet_sender`, as `protocol`,
 /// addressed to `destination`.
 fn send_ethernet_frame(
@@ -3643,5 +3722,38 @@ mod runtime_worker_tests {
         assert_stall_leaves_the_worker_free(|channel| {
             pin_namespace_neighbour_over(move || Ok((channel, 2)))
         });
+    }
+}
+
+#[cfg(test)]
+mod guest_mtu_tests {
+    use super::apply_guest_mtu_on;
+    use std::cell::{Cell, RefCell};
+
+    /// eth0 is set when its MTU differs, left alone when it already matches, and a
+    /// refused set reports the MTU it kept.
+    #[test]
+    fn eth0_takes_the_mtu_once_and_keeps_its_own_when_refused() {
+        let mtu = Cell::new(1500u32);
+        let writes = RefCell::new(Vec::new());
+        let read = |_: &str| Some(mtu.get());
+        let write = |name: &str, value: u32| {
+            writes.borrow_mut().push((name.to_string(), value));
+            mtu.set(value);
+            Ok(())
+        };
+        assert_eq!(apply_guest_mtu_on("eth0", 65520, read, write), Some(65520));
+        assert_eq!(apply_guest_mtu_on("eth0", 65520, read, write), Some(65520));
+        assert_eq!(
+            *writes.borrow(),
+            [("eth0".to_string(), 65520)],
+            "one write, then none"
+        );
+
+        let refused = |_: &str, _: u32| Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!(
+            apply_guest_mtu_on("eth0", 9000, |_: &str| Some(1500), refused),
+            Some(1500)
+        );
     }
 }

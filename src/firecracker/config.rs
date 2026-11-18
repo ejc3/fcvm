@@ -668,6 +668,7 @@ impl FirecrackerConfig {
                     "no_proxy": runtime.no_proxy,
                     "ntp_servers": runtime.ntp_servers,
                     "transparent_hugepage": runtime.transparent_hugepage,
+                    "guest_mtu": runtime.guest_mtu,
                 },
             }
         });
@@ -725,6 +726,9 @@ pub struct MmdsRuntime {
     /// The guest's transparent huge page mode (`--guest-thp`), or none for the
     /// kernel's own. Not keyed: every restore sends its own (fc-agent `thp`).
     pub transparent_hugepage: Option<String>,
+    /// The MTU fc-agent sets on eth0 before the container starts
+    /// (`NetworkConfig::guest_mtu`), or none to keep the guest's own.
+    pub guest_mtu: Option<u32>,
 }
 
 #[cfg(test)]
@@ -790,6 +794,7 @@ mod tests {
             subgid_count: None,
             host_clock: std::time::Duration::ZERO,
             transparent_hugepage: None,
+            guest_mtu: None,
             ntp_servers: vec![],
         }
     }
@@ -1459,6 +1464,7 @@ mod tests {
             host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
             transparent_hugepage: None,
+            guest_mtu: None,
         });
 
         assert_eq!(
@@ -1469,6 +1475,26 @@ mod tests {
         assert_eq!(
             plan.pointer("/latest/container-plan/published_guest_ports"),
             Some(&serde_json::json!(["80", "81"]))
+        );
+    }
+
+    /// fc-agent reads `container-plan.guest_mtu` (fc-agent `Plan.guest_mtu`) and sets
+    /// eth0 to it; none is a null the agent reads as "keep 1500".
+    #[test]
+    fn mmds_carries_the_guest_mtu() {
+        let plan = |guest_mtu| {
+            test_config().to_mmds_json(MmdsRuntime {
+                guest_mtu,
+                ..test_mmds_runtime()
+            })
+        };
+        assert_eq!(
+            plan(Some(65520)).pointer("/latest/container-plan/guest_mtu"),
+            Some(&serde_json::json!(65520))
+        );
+        assert_eq!(
+            plan(None).pointer("/latest/container-plan/guest_mtu"),
+            Some(&serde_json::Value::Null)
         );
     }
 
@@ -1493,6 +1519,7 @@ mod tests {
             host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
             transparent_hugepage: None,
+            guest_mtu: None,
         };
         let plan = test_config().to_mmds_json(runtime(Some("/dev/vdc")));
         assert_eq!(

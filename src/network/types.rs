@@ -49,6 +49,11 @@ pub struct NetworkConfig {
     /// separate ports). A state file from before this field loads as None.
     #[serde(default)]
     pub https_proxy: Option<String>,
+    /// The MTU the guest sets on eth0, at boot (boot plan) and on every restore
+    /// (restore document). None leaves the guest's own, 1500. Rootless mode sets
+    /// `pasta::GUEST_MTU`; the other modes reach the host's network at its MTU.
+    #[serde(default)]
+    pub guest_mtu: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

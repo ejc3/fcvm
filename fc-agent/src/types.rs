@@ -54,6 +54,11 @@ pub struct Plan {
     /// (`--guest-thp`), or none to keep the kernel's.
     #[serde(default)]
     pub transparent_hugepage: Option<String>,
+    /// The MTU to set on eth0 before anything connects (`network::apply_guest_mtu`), or
+    /// none to keep the kernel's 1500. The host sends it for rootless networking, whose
+    /// namespace links run at that MTU.
+    #[serde(default)]
+    pub guest_mtu: Option<u32>,
     #[serde(default)]
     pub subuid_start: Option<u64>,
     #[serde(default)]
@@ -170,6 +175,10 @@ pub struct LatestMetadata {
     /// the restore is acknowledged; `default` is the kernel's boot-time mode.
     #[serde(rename = "transparent-hugepage", default)]
     pub transparent_hugepage: Option<String>,
+    /// The MTU to set on eth0 before egress opens, the restoring namespace's
+    /// (`Plan::guest_mtu`); none keeps what the snapshot's guest had.
+    #[serde(rename = "guest-mtu", default)]
+    pub guest_mtu: Option<u32>,
     /// The restoring host's identity, which replaces the preparing host's.
     #[serde(flatten)]
     pub identity: RestoreIdentity,
@@ -217,6 +226,23 @@ pub struct RestoreDns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest MTU in both documents fcvm writes: the boot plan's `guest_mtu`
+    /// (fcvm `MmdsRuntime::guest_mtu`, a null when unset) and the restore document's
+    /// `guest-mtu` (absent when unset).
+    #[test]
+    fn the_boot_plan_and_the_restore_document_name_the_guest_mtu() {
+        let plan: Plan = serde_json::from_str(r#"{"image": "i", "guest_mtu": 65520}"#).unwrap();
+        assert_eq!(plan.guest_mtu, Some(65520));
+        let plan: Plan = serde_json::from_str(r#"{"image": "i", "guest_mtu": null}"#).unwrap();
+        assert_eq!(plan.guest_mtu, None);
+
+        let metadata: LatestMetadata =
+            serde_json::from_str(r#"{"host-time-ns": "1", "guest-mtu": 65520}"#).unwrap();
+        assert_eq!(metadata.guest_mtu, Some(65520));
+        let metadata: LatestMetadata = serde_json::from_str(r#"{"host-time-ns": "1"}"#).unwrap();
+        assert_eq!(metadata.guest_mtu, None);
+    }
 
     /// The restore document's identity fields, in the shape fcvm's
     /// `RestoreIdentity::write_into` writes them.

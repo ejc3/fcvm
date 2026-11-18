@@ -126,6 +126,7 @@ async fn test_health_monitor_behaviors() {
             http_proxy: None,
             https_proxy: None,
             namespace_name: None,
+            guest_mtu: None,
         },
         "http://localhost/health",
     );

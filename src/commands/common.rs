@@ -4290,6 +4290,10 @@ pub async fn restore_from_snapshot(
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
         }
+        // The same eth0 MTU the restore-only vsock document carries.
+        if let Some(mtu) = network_config.guest_mtu {
+            mmds_latest["guest-mtu"] = serde_json::json!(mtu);
+        }
         // The command the guest runs in the container before the restored VM is
         // published (`--on-restore`). The guest skips it when its container has not
         // started yet, which is every restore of a pre-start snapshot.

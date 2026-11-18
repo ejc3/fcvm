@@ -1417,6 +1417,7 @@ impl NetworkManager for RoutedNetwork {
             http_proxy: proxies.http_url,
             https_proxy: proxies.https_url,
             namespace_name: self.namespace_id.clone(),
+            guest_mtu: None,
         })
     }
 

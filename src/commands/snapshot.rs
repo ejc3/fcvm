@@ -4243,6 +4243,12 @@ async fn cmd_snapshot_run_inner(
     if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
         restore_latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
     }
+    // The MTU the guest sets on eth0 before egress opens: this namespace's. Sent on
+    // every restore, so a clone takes its own namespace's value whatever eth0 had in
+    // the snapshot. An fc-agent from before this field ignores it and keeps 1500.
+    if let Some(mtu) = network_config.guest_mtu {
+        restore_latest["guest-mtu"] = serde_json::json!(mtu);
+    }
     // The command the guest runs in the container before this clone is published
     // (`--on-restore`, recorded in the snapshot's metadata). Carried here, per
     // restore, so it is no part of the snapshot's cache key.
@@ -8344,6 +8350,31 @@ mod tests {
             put,
             "the MMDS mirror must be put after the identity is written"
         );
+    }
+
+    /// Both restore transports carry the guest MTU, under the key fc-agent's
+    /// `LatestMetadata` reads, before the vsock document is served and before the
+    /// MMDS mirror is put.
+    #[test]
+    fn both_restore_documents_carry_the_guest_mtu_under_the_agents_key() {
+        let agent = include_str!("../../fc-agent/src/types.rs");
+        assert!(agent.contains("#[serde(rename = \"guest-mtu\", default)]"));
+
+        let snapshot = include_str!("snapshot.rs");
+        let written = snapshot
+            .find("restore_latest[\"guest-mtu\"] = serde_json::json!(mtu);")
+            .expect("the vsock restore document no longer carries the guest MTU");
+        let served = snapshot
+            .find("super::podman::spawn_bootplan_listener(\n        &bootplan_socket,\n        &restore_latest")
+            .expect("the restore boot-plan listener is no longer spawned");
+        assert!(written < served, "written={written} served={served}");
+
+        let common = include_str!("common.rs");
+        let mirrored = common
+            .find("mmds_latest[\"guest-mtu\"] = serde_json::json!(mtu);")
+            .expect("the MMDS mirror no longer carries the guest MTU");
+        assert!(common[mirrored..]
+            .contains(".put_mmds(serde_json::json!({ \"latest\": mmds_latest }))"));
     }
 
     fn host_inputs(groups: &[(&[&str], &[&str])]) -> crate::commands::podman::GuestBootInputs {

@@ -467,6 +467,14 @@ pub async fn handle_clone_restore(
     }
     phases.neighbour_pin_ms = elapsed_ms(neighbour_pin_started);
 
+    // The restoring namespace's link MTU, set before the boundary opens egress so the
+    // clone's eth0 matches the namespace it runs in, whatever its source booted with.
+    // The daemons that reconnect when egress opens take their MSS from it
+    // (`network::apply_guest_mtu`).
+    if let Some(mtu) = metadata.guest_mtu {
+        network::apply_guest_mtu(mtu);
+    }
+
     // Take the restoring host's identity: its host identity address on lo, and
     // its resolvers. The guest booted with the preparing host's, and on another
     // host both are wrong. Done here, before the boundary opens the gate's egress

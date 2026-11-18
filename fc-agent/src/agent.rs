@@ -87,6 +87,12 @@ pub async fn run() -> Result<()> {
 
     system::save_proxy_settings(&plan);
 
+    // Before the container and its services start: every connection's MSS follows
+    // from the MTU eth0 has when it opens.
+    if let Some(mtu) = plan.guest_mtu {
+        network::apply_guest_mtu(mtu);
+    }
+
     // The kernel's own mode first, so a later restore can ask for it back.
     thp::record_boot_default();
     if let Some(mode) = plan.transparent_hugepage.as_deref() {
