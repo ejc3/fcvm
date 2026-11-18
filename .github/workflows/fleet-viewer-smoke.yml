@@ -23,6 +23,11 @@ on:
       relaunch:
         type: boolean
         default: true
+      # The jobs' concurrency group. The release gate passes its own, so its smoke never waits
+      # behind a deploy's, the daily or a manual smoke; those keep sharing this one.
+      group:
+        type: string
+        default: fleet-viewer-smoke
     # Each family's summary line ({"family", "modes", "probes", "failed"}), empty when the family
     # never finished its probes. The release gate decides on these, not on the job results.
     outputs:
@@ -51,7 +56,7 @@ jobs:
     outputs:
       summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
-      group: fleet-viewer-smoke
+      group: ${{ inputs.group || 'fleet-viewer-smoke' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -96,7 +101,7 @@ jobs:
     outputs:
       summary: ${{ steps.verdict.outputs.summary }}
     concurrency:
-      group: fleet-viewer-smoke
+      group: ${{ inputs.group || 'fleet-viewer-smoke' }}
       cancel-in-progress: false
     steps:
       # As ci.yml's self-hosted jobs: a privileged run can leave root-owned files in the workspace.

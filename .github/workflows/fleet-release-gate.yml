@@ -89,9 +89,12 @@ jobs:
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
     # No relaunches: an EC2 relaunch replaces the tile's instance and so the placement the
-    # verdict is bound to. The viewer path and the take-over replace nothing.
+    # verdict is bound to. The viewer path and the take-over replace nothing. Its own
+    # concurrency group: gate runs are already one at a time (the workflow's group), and a
+    # release waiting for its verdict does not wait for other smokes.
     with:
       relaunch: false
+      group: fleet-release-gate-smoke
     secrets: inherit
 
   decide:
