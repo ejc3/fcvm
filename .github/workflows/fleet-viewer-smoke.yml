@@ -28,6 +28,11 @@ on:
       group:
         type: string
         default: fleet-viewer-smoke
+      # How long each viewer waits for every mode's tiles to run (stage-smoke.py --settle-seconds).
+      # The release gate passes less: it smokes only a placement that has already settled.
+      settle_seconds:
+        type: number
+        default: 600
     # Each family's summary line ({"family", "modes", "probes", "failed"}), empty when the family
     # never finished its probes. The release gate decides on these, not on the job results.
     outputs:
@@ -75,10 +80,11 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           # Empty on the schedule and on a manual run, which relaunch.
           RELAUNCH: ${{ inputs.relaunch }}
+          SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}
         run: |
           set -o pipefail
           relaunch=--relaunch; [ "$RELAUNCH" = false ] && relaunch=
-          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family $relaunch --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+          python3 -B fleet/coord/stage-smoke.py --family v4 --single-family $relaunch --takeover --modes "$MODES" --settle-seconds "$SETTLE_SECONDS" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: The v4 summary for the release gate
         id: verdict
         if: ${{ always() }}
@@ -119,9 +125,10 @@ jobs:
           STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}
         run: |
           set -o pipefail
-          python3 -B fcvm/fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" | tee "$RUNNER_TEMP/smoke.jsonl"
+          python3 -B fcvm/fleet/coord/stage-smoke.py --family v6 --takeover --modes "$MODES" --settle-seconds "$SETTLE_SECONDS" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: The v6 summary for the release gate
         id: verdict
         if: ${{ always() }}

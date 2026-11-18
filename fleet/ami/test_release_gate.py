@@ -696,6 +696,20 @@ class GateTests(unittest.TestCase):
             self.assertIn("secrets: inherit", call)
             self.assertNotIn("group:", call, name)
 
+    def test_the_gates_smoke_waits_at_most_five_minutes_for_tiles(self):
+        # Generation 21 (2026-11-18): no agent, so no tile ever ran and each family waited the
+        # smoke's full 600 s, 20 of the 27 minutes of smoke. In 120 healthy family runs from
+        # 2026-11-13 to 2026-11-18 the whole smoke, the wait included, took at most 290.3 s.
+        smoke = WORKFLOW.split("\n  smoke:\n", 1)[1].split("\n  decide:\n", 1)[0]
+        self.assertIn("\n      settle_seconds: 300\n", smoke)
+        viewer = (ROOT / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        call = viewer.split("  workflow_call:\n", 1)[1].split("\n  schedule:", 1)[0]
+        self.assertIn("      settle_seconds:\n        type: number\n        default: 600\n", call)
+        for job in ("ipv4", "ipv6"):
+            body = viewer.split(f"\n  {job}:\n", 1)[1].split("\n  ipv6:\n" if job == "ipv4" else "\n  report:\n", 1)[0]
+            self.assertIn("SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}", body)
+            self.assertIn('--settle-seconds "$SETTLE_SECONDS"', body)
+
     def test_the_status_run_is_cheap(self):
         # It runs every 5 minutes and mostly finds the live generation verified: a GitHub-hosted
         # runner, a short limit, and a checkout of the one file it runs.

@@ -1499,6 +1499,37 @@ class ResolveRetransmitTests(unittest.TestCase):
         self.assertEqual(sends, 2)
 
 
+class SettleBoundTests(unittest.TestCase):
+    """How long the viewer path waits for every mode's tiles to run. Generation 21 (2026-11-18)
+    never registered an agent, so its tiles never came and each family waited the whole 600 s;
+    the release gate passes a shorter bound."""
+
+    def wait_bound(self, **kw):
+        clock, bounds = [1000.0], []
+
+        def until(predicate, by=None):
+            bounds.append(by)
+            return {}
+        with patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(io.StringIO()):
+            smoke.viewer_path("v4", ("wall",), False, [], until, None, lambda: ({}, {}, "v-1"), **kw)
+        return bounds[0] - clock[0]
+
+    def test_the_wait_for_tiles_is_bounded_by_the_settle_seconds(self):
+        self.assertEqual(self.wait_bound(), 600)
+        self.assertEqual(self.wait_bound(settle_seconds=300), 300)
+
+    def test_the_settle_seconds_argument_reaches_the_viewer_path(self):
+        self.assertEqual(smoke.arguments(["--modes", "wall"])["settle_seconds"], 600)
+        self.assertEqual(smoke.arguments(["--modes", "wall", "--settle-seconds", "300"])["settle_seconds"], 300)
+        for bad in ("0", "-5", "601", "soon"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                smoke.arguments(["--modes", "wall", "--settle-seconds", bad])
+        seen = {}
+        with patch.object(smoke, "main", lambda **kw: seen.update(kw) or 0):
+            smoke.run(["--modes", "wall", "--settle-seconds", "300"])
+        self.assertEqual(seen["settle_seconds"], 300)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_changes_to_the_actual_cli_files_trigger_a_release(self):
         workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()

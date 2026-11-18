@@ -95,6 +95,11 @@ jobs:
     with:
       relaunch: false
       group: fleet-release-gate-smoke
+      # The status job found every live host up 300 s and every tile instance running, so the
+      # tiles' wait is short: in 120 healthy family runs (2026-11-13 to 2026-11-18) the whole
+      # smoke, wait included, took at most 290.3 s. A tile still not running after it is an
+      # unattributed probe: no verdict, and the again job looks again in a minute.
+      settle_seconds: 300
     secrets: inherit
 
   decide:

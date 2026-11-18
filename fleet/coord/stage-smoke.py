@@ -458,6 +458,9 @@ MODES = ("wall", "phones", "windows", "minecraft", "potato")
 FLAT_SPREAD = 16
 # How long one tile may take to give its first payload, and to accept TCP and finish TLS.
 PROBE_SECONDS = 40
+# How long the viewer path waits for every mode's tiles to run before it probes what it has. A
+# tile still not running then fails its probe as "the tile is not running".
+SETTLE_SECONDS = 600
 CONNECT_SECONDS = 10
 # Control endpoints that say whether this viewer has a family at all: Cloudflare's resolver,
 # on 443, in each family.
@@ -991,7 +994,8 @@ def plain(host, port):
     return socket.create_connection((host, port), timeout=20)
 
 
-def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False):
+def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False,
+         settle_seconds=SETTLE_SECONDS):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
     if modes and host_local() is None:
@@ -1112,7 +1116,7 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             return 0
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
-                                   lambda: (state, admission, viewer))
+                                   lambda: (state, admission, viewer), settle_seconds)
         if not relaunch:
             return failures
         for half in ("fcvm", "ec2"):
@@ -1151,11 +1155,11 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     return failures
 
 
-def viewer_path(family, modes, takeover, resolvers, until, commit, now):
+def viewer_path(family, modes, takeover, resolvers, until, commit, now, settle_seconds=SETTLE_SECONDS):
     """Every tile of every mode over `family`, as a viewer's browser reaches it; prints a line per
     tile and returns how many failed. `until`, `commit` and `now` are main's /live helpers."""
     step("/live: wait for every mode's tiles to run")
-    settle_by = time.monotonic() + 600
+    settle_by = time.monotonic() + settle_seconds
     until(lambda s: settled(s, modes, now()[2]), by=settle_by)
     state, admission, viewer = now()
     token = (admission.get("direct") or {}).get("value")
@@ -1226,7 +1230,11 @@ def arguments(argv):
     parser.add_argument("--takeover", action="store_true", help="borrow and drive a Minecraft server")
     parser.add_argument("--agents", action="store_true",
                         help="print the coordinator's record of registered agents (digests), and nothing else")
+    parser.add_argument("--settle-seconds", type=int, default=SETTLE_SECONDS,
+                        help=f"how long to wait for every mode's tiles to run (1 to {SETTLE_SECONDS})")
     args = parser.parse_args(argv)
+    if not 0 < args.settle_seconds <= SETTLE_SECONDS:
+        parser.error(f"--settle-seconds is 1 to {SETTLE_SECONDS}")
     modes = tuple(m for m in args.modes.split(",") if m)
     if any(m not in MODES for m in modes):
         parser.error("unknown mode")
@@ -1235,7 +1243,8 @@ def arguments(argv):
     if not modes and not args.relaunch and not args.agents:
         parser.error("nothing to check: give --modes, --relaunch or --agents")
     return dict(family=args.family, single=args.single_family, modes=modes,
-                relaunch=args.relaunch, takeover=args.takeover, agents=args.agents)
+                relaunch=args.relaunch, takeover=args.takeover, agents=args.agents,
+                settle_seconds=args.settle_seconds)
 
 
 def run(argv=None):
