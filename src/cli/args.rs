@@ -472,8 +472,8 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]
     pub history_idle: u64,
 
-    /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
-    /// or a private network. Off without it.
+    /// Operator endpoint (POST /quarantine/release) on this address, which must be loopback
+    /// (127.0.0.0/8 or ::1): it has no authentication. Off without it.
     #[arg(long)]
     pub admin_listen: Option<String>,
 

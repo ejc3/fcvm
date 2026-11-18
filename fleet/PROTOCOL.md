@@ -791,7 +791,9 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
-  rotation. It has no authentication: keep it on loopback or a private network.
+  rotation. It has no authentication, so the coordinator refuses to start when the address
+  (or any address a name resolves to) is not loopback (127.0.0.0/8 or `::1`); reach it from
+  elsewhere through an SSH tunnel or `ecs execute-command`.
 
 - `--agent-cmd` starts an agent as a child process and talks to it over its stdin and
   stdout: `fcvm fleet agent --stdio ...` locally, `ssh <host> fcvm fleet agent --stdio ...`

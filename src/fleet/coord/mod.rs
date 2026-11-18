@@ -42,6 +42,7 @@ use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1034,7 +1035,33 @@ pub fn power_managed(args: &FleetCoordArgs) -> bool {
     !args.host_templates.is_empty() || args.sleep_when_idle
 }
 
+/// The addresses `--admin-listen` binds: every address it names must be loopback. The endpoint
+/// has no authentication (`POST /quarantine/release` returns a GPU to rotation), so on any
+/// other address, a private network included, anyone who reaches it could undo a quarantine.
+/// A name is resolved, and refused when any of its addresses is not loopback.
+pub async fn admin_addresses(addr: &str) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("--admin-listen {addr} is not an address and port"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("--admin-listen {addr} names no address");
+    }
+    if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
+        bail!(
+            "--admin-listen {addr} reaches {a}, which is not loopback: the admin endpoint has \
+             no authentication, so it binds only 127.0.0.0/8 or ::1"
+        );
+    }
+    Ok(addrs)
+}
+
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    // Before anything starts: a refused admin address stops the coordinator at once.
+    let admin_addrs = match &args.admin_listen {
+        Some(a) => Some(admin_addresses(a).await?),
+        None => None,
+    };
     if args.ec2_aggregate_listen.is_some()
         && args.ec2_aggregate_url.is_none()
         && !args.ec2_aggregate_tls
@@ -1353,10 +1380,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    if let Some(addr) = &args.admin_listen {
-        let admin = tokio::net::TcpListener::bind(addr)
+    if let Some(addrs) = &admin_addrs {
+        // The checked addresses, not the name again: a second lookup could answer otherwise.
+        let admin = tokio::net::TcpListener::bind(&addrs[..])
             .await
-            .with_context(|| format!("listening on {addr}"))?;
+            .with_context(|| format!("listening on {addrs:?}"))?;
         eprintln!("fleet coordinator admin on {}", admin.local_addr()?);
         let h = handle.clone();
         tokio::spawn(async move {
@@ -1523,5 +1551,37 @@ mod admission_key_tests {
         let mut broadcast = admission::Gate::open();
         broadcast.seats = admission::Seats::new(Some(500));
         assert_eq!(admission_keys(&broadcast).0, vec![broadcast.key.hex()]);
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::admin_addresses;
+
+    /// The admin endpoint has no authentication, so it binds loopback only; any other address
+    /// stops the coordinator before it starts.
+    #[tokio::test]
+    async fn the_admin_endpoint_binds_only_loopback() {
+        for ok in ["127.0.0.1:9000", "[::1]:9000", "127.0.0.2:0"] {
+            let a = admin_addresses(ok)
+                .await
+                .unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+            assert!(a.iter().all(|a| a.ip().is_loopback()), "{ok}: {a:?}");
+        }
+        for refused in [
+            "0.0.0.0:9000",
+            "[::]:9000",
+            "10.0.0.5:9000",
+            "192.0.2.1:9000",
+            "[2001:db8::1]:9000",
+            "[::ffff:127.0.0.1]:9000",
+        ] {
+            let e = admin_addresses(refused)
+                .await
+                .expect_err(refused)
+                .to_string();
+            assert!(e.contains("not loopback"), "{refused}: {e}");
+        }
+        assert!(admin_addresses("no-port").await.is_err());
     }
 }
