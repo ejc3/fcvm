@@ -3620,6 +3620,159 @@ async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &st
     result
 }
 
+// ---------------------------------------------------------------------------
+// CASE: killed_disk_only_create_thaws_its_source
+// ---------------------------------------------------------------------------
+
+/// Pins #1939: a `snapshot create --disk-only` killed while the guest's filesystems are
+/// frozen leaves nothing frozen.
+///
+/// Interleaving: the create is held at `snapshot.disk_only.frozen`, after the guest's
+/// `fsfreeze` and before the reflink, and is SIGKILLed there. Oracle: within 15 s a write to
+/// the guest's root filesystem completes, and a following disk-only create of the same VM
+/// succeeds.
+///
+/// RED BEFORE THE FIX: nothing thawed the guest; the write stayed blocked.
+#[tokio::test]
+async fn test_lifecycle_interleave_killed_disk_only_create_thaws_its_source() -> Result<()> {
+    let (vm_name, _, snapshot, second_snapshot) = common::unique_names("ilv-killed-disk-only");
+    let (mut vm, vm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    let mut held_create: Option<tokio::process::Child> = None;
+    // A write to the guest's root filesystem, which a freeze blocks.
+    let write = |n: u32| {
+        let script =
+            format!("echo {n} > /root/ilv-disk-only-probe && sync /root/ilv-disk-only-probe");
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                common::exec_in_vm(vm_pid, &[&script]),
+            )
+            .await
+        }
+    };
+
+    let result = async {
+        common::poll_health_by_pid(vm_pid, 300).await?;
+        anyhow::ensure!(
+            matches!(write(0).await, Ok(Ok(_))),
+            "the guest's root filesystem took no write before the snapshot"
+        );
+
+        let scratch = tempfile::tempdir().context("creating the hold directory")?;
+        let hold = format!(
+            "snapshot.disk_only.frozen:block_until_file:{}",
+            scratch.path().join("never").display()
+        );
+        let (create, create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &vm_pid.to_string(),
+                "--tag",
+                &snapshot,
+                "--disk-only",
+            ],
+            &[("FCVM_FAILPOINT", &hold)],
+        )
+        .await?;
+        let create = held_create.insert(create);
+        wait_for_marker(
+            &create_log,
+            "FAILPOINT snapshot.disk_only.frozen reached",
+            0,
+            Duration::from_secs(180),
+        )
+        .await?;
+
+        // Non-vacuity: the guest is frozen while the create is held.
+        anyhow::ensure!(
+            write(1).await.is_err(),
+            "the guest's root filesystem took a write while the create held it frozen"
+        );
+
+        let deadline = Duration::from_secs(15);
+        let killed_at = Instant::now();
+        // SAFETY: kill(2) on the create's pid, which this test spawned and has not reaped.
+        anyhow::ensure!(
+            unsafe { libc::kill(create_pid as libc::pid_t, libc::SIGKILL) } == 0,
+            "SIGKILL of the create: {}",
+            std::io::Error::last_os_error()
+        );
+        let status = wait_exit(create, Duration::from_secs(10)).await?;
+        anyhow::ensure!(
+            !status.success(),
+            "the held create exited on its own: {status}"
+        );
+
+        let mut attempt = 2;
+        let written = loop {
+            let outcome = write(attempt).await;
+            attempt += 1;
+            let at = killed_at.elapsed();
+            match outcome {
+                Ok(Ok(_)) if at <= deadline => break Ok(at),
+                Ok(Ok(_)) => break Err(format!("the write completed {at:?} after the SIGKILL")),
+                Ok(Err(error)) if at > deadline => break Err(format!("{error:#}")),
+                Err(_) if at > deadline => break Err("the write timed out".to_string()),
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        };
+        println!("after the SIGKILL: guest write {written:?}");
+        anyhow::ensure!(
+            written.is_ok(),
+            "the guest's root filesystem took no write within 15 s of the create's SIGKILL: \
+             {written:?}; create log tail:\n{}",
+            log_tail(&create_log, 40)
+        );
+
+        let fcvm = common::find_fcvm_binary()?;
+        let second = tokio::time::timeout(
+            Duration::from_secs(300),
+            tokio::process::Command::new(&fcvm)
+                .args([
+                    "snapshot",
+                    "create",
+                    "--pid",
+                    &vm_pid.to_string(),
+                    "--tag",
+                    &second_snapshot,
+                    "--disk-only",
+                ])
+                .output(),
+        )
+        .await
+        .context("the following create did not finish within 300 s")??;
+        anyhow::ensure!(
+            second.status.success(),
+            "the following disk-only create of the same VM failed: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        Ok(())
+    }
+    .await;
+
+    if let Some(mut create) = held_create.take() {
+        let _ = create.start_kill();
+        let _ = wait_exit(&mut create, Duration::from_secs(10)).await;
+    }
+    sigterm(vm_pid).await;
+    let _ = wait_exit(&mut vm, Duration::from_secs(60)).await;
+    common::delete_snapshot(&snapshot).await.ok();
+    common::delete_snapshot(&second_snapshot).await.ok();
+    result
+}
+
 #[tokio::test]
 async fn test_lifecycle_interleave_killed_snapshot_create_resumes_its_source() -> Result<()> {
     killed_snapshot_create_resumes_its_source("ilv-killed-create", "firecracker").await

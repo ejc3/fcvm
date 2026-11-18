@@ -5665,6 +5665,7 @@ pub async fn create_disk_only_snapshot_core(
         );
     }
     info!(snapshot = %snapshot_config.name, "guest frozen; reflinking disk");
+    failpoint::hit_async("snapshot.disk_only.frozen").await;
 
     // Reflink the disk (+ any disk-dir images) while frozen.
     let copy_result: Result<()> = async {
