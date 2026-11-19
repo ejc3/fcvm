@@ -56,7 +56,10 @@ struct Key {
 #[derive(Default)]
 struct Keys {
     by_kid: HashMap<String, Key>,
+    /// The last read that succeeded.
     fetched_at: Option<Instant>,
+    /// The last read asked for, whether or not it succeeded: reads are this far apart.
+    attempted_at: Option<Instant>,
 }
 
 /// Verifies Access tokens for one team.
@@ -189,8 +192,11 @@ impl AccessJwt {
                 return Ok(k.clone());
             }
         }
-        let may_fetch = keys.fetched_at.is_none_or(|t| t.elapsed() >= REFETCH_EVERY);
+        let may_fetch = keys
+            .attempted_at
+            .is_none_or(|t| t.elapsed() >= REFETCH_EVERY);
         if may_fetch {
+            keys.attempted_at = Some(Instant::now());
             match self.fetch().await {
                 Ok(by_kid) => {
                     keys.by_kid = by_kid;
@@ -300,7 +306,7 @@ pub mod testing;
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{b64url, serve_keys, TestSigner};
+    use super::testing::{b64url, serve_failing_keys, serve_keys, TestSigner};
     use super::*;
 
     pub const ISS: &str = "https://team.example.cloudflareaccess.com";
@@ -454,6 +460,22 @@ mod tests {
             1,
             "within REFETCH_EVERY"
         );
+    }
+
+    /// A keys endpoint that fails is asked at most once per REFETCH_EVERY too, so a failing
+    /// endpoint does not make every handshake wait for another read.
+    #[tokio::test]
+    async fn a_failing_keys_endpoint_is_not_asked_again_on_every_token() {
+        let s = TestSigner::new(false, "kid-1");
+        let (url, reads) = serve_failing_keys().await;
+        let v = AccessJwt::with_certs_url(ISS, &url).unwrap();
+        for _ in 0..3 {
+            assert!(v
+                .verify(&s.token(&claims(serde_json::json!({}))), &[AUD.into()], NOW)
+                .await
+                .is_err());
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

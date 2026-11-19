@@ -4,9 +4,12 @@
 //!
 //! A dialed agent names its host in its hello, and the coordinator checks that name
 //! ([`AgentIdentity`]): with host templates configured, it must be an EC2 instance of this
-//! fleet's hosts (`Purpose=fcvm-fleet-host`, `Fleet=<--fleet-name>`, pending or running), so
-//! a host of another fleet, or a machine holding a stolen agent token, cannot join. A refusal
-//! is logged at warn with `marker=fleet-agent-refused`.
+//! fleet's hosts (`Purpose=fcvm-fleet-host`, `Fleet=<--fleet-name>`, pending or running), and
+//! the connection must come from that instance (its public IPv4 address, or one of its IPv6
+//! addresses or delegated prefixes, as `CF-Connecting-IP` names it). A host of another fleet
+//! cannot join, and a machine holding a stolen agent token cannot pass for a host by naming
+//! its instance id, which snapshots show. A refusal is logged at warn with
+//! `marker=fleet-agent-refused`.
 
 use super::hosts::HostDriver;
 use super::{Cmd, Handle};
@@ -14,6 +17,7 @@ use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::protocol::{AgentMsg, CoordMsg};
+use std::net::IpAddr;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,8 +34,8 @@ pub const AGENT_REFUSED_MARKER: &str = "fleet-agent-refused";
 /// Whether the host an agent's hello names may join this fleet.
 #[async_trait]
 pub trait AgentIdentity: Send + Sync {
-    /// `Err` says why `host` may not join.
-    async fn check(&self, host: &str) -> std::result::Result<(), String>;
+    /// `Err` says why `host` may not join over a connection from `source` (`None`: unknown).
+    async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String>;
 }
 
 /// An agent's host must be one of this fleet's GPU hosts: an EC2 instance, pending or running,
@@ -46,7 +50,8 @@ pub struct FleetHosts {
 
 #[async_trait]
 impl AgentIdentity for FleetHosts {
-    async fn check(&self, host: &str) -> std::result::Result<(), String> {
+    async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String> {
+        let source = source.ok_or("the connection's source address is unknown")?;
         for region in &self.regions {
             let hosts = self
                 .driver
@@ -54,10 +59,15 @@ impl AgentIdentity for FleetHosts {
                 .await
                 .map_err(|e| format!("listing this fleet's hosts in {region}: {e:#}"))?;
             if let Some(h) = hosts.iter().find(|h| h.id == host) {
-                return if h.live() {
+                if !h.live() {
+                    return Err(format!("instance {host} is {}", h.state));
+                }
+                return if h.sources.iter().any(|s| owns(s, source)) {
                     Ok(())
                 } else {
-                    Err(format!("instance {host} is {}", h.state))
+                    Err(format!(
+                        "the connection comes from {source}, not from instance {host}"
+                    ))
                 };
             }
         }
@@ -69,6 +79,29 @@ impl AgentIdentity for FleetHosts {
     }
 }
 
+/// Whether `source` is `address` or inside the prefix `address/length`.
+fn owns(address: &str, source: IpAddr) -> bool {
+    let (addr, len) = match address.split_once('/') {
+        Some((a, l)) => (a, l.parse::<u32>().ok()),
+        None => (address, None),
+    };
+    let Ok(addr) = addr.parse::<IpAddr>() else {
+        return false;
+    };
+    match (addr.to_canonical(), source.to_canonical(), len) {
+        (a, s, None) => a == s,
+        (IpAddr::V6(a), IpAddr::V6(s), Some(l)) if l <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - l).unwrap_or(0);
+            u128::from(a) & mask == u128::from(s) & mask
+        }
+        (IpAddr::V4(a), IpAddr::V4(s), Some(l)) if l <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - l).unwrap_or(0);
+            u32::from(a) & mask == u32::from(s) & mask
+        }
+        _ => false,
+    }
+}
+
 /// Serve one agent connection until it closes. The first message must be a hello, and the
 /// actor must accept the host it names.
 pub async fn serve_connection<R, W>(input: R, output: W, handle: &Handle) -> Result<()>
@@ -76,15 +109,17 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_checked(input, output, handle, None).await
+    serve_checked(input, output, handle, None, None).await
 }
 
-/// [`serve_connection`], with the hello's host checked by `identity` first.
+/// [`serve_connection`], with the hello's host checked by `identity` first against the
+/// connection's `source` address.
 pub async fn serve_checked<R, W>(
     input: R,
     output: W,
     handle: &Handle,
     identity: Option<&dyn AgentIdentity>,
+    source: Option<IpAddr>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -98,7 +133,7 @@ where
         None => bail!("agent closed before its hello"),
     };
     if let (Some(identity), AgentMsg::Hello { host, .. }) = (identity, &hello) {
-        if let Err(why) = identity.check(host).await {
+        if let Err(why) = identity.check(host, source).await {
             tracing::warn!(
                 marker = AGENT_REFUSED_MARKER,
                 host = %host,

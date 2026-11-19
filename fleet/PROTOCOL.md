@@ -1390,9 +1390,14 @@ verifies that token itself (`Cf-Access-Jwt-Assertion`: the team's RS256 signatur
 one of those audiences, expiry, and a service token rather than a person) and answers `403`
 without it. With host templates (`--host-template`), the host a dialed agent's hello names
 must be one of this fleet's GPU hosts: an EC2 instance, pending or running, tagged
-`Purpose=fcvm-fleet-host` and `Fleet=<--fleet-name>` in a host region. Any other name
-(another fleet's instance, a terminated one, no instance), or a listing that fails, closes
-the connection before the hello is applied, and the agent dials again. Both refusals are
+`Purpose=fcvm-fleet-host` and `Fleet=<--fleet-name>` in a host region, and the connection
+must come from that instance: its public IPv4 address, one of its IPv6 addresses, or an
+address in one of its delegated IPv6 prefixes (the source is `CF-Connecting-IP` with
+`--trust-cf-connecting-ip`, which a coordinator behind Cloudflare needs for this, else the
+peer address). Instance ids appear in snapshots, so the name alone proves nothing. Any other
+name (another fleet's instance, a terminated one, no instance), a connection from elsewhere,
+or a listing that fails, closes the connection before the hello is applied, and the agent
+dials again. Both refusals are
 logged at warn with `marker=fleet-agent-refused`. Agents started with `--agent-cmd` are not
 checked.
 

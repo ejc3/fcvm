@@ -252,8 +252,15 @@ async fn poster(State(app): State<App>) -> Response {
 async fn agent_socket(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(app): State<App>,
 ) -> Response {
+    // Where the agent's connection comes from (CF-Connecting-IP behind Cloudflare): the host
+    // its hello names must own it.
+    let source = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip, false)
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical());
     if let Some(access) = app.cfg.access.as_ref().filter(|a| !a.agent.is_empty()) {
         if let Err(e) = access.agent_claims(&headers).await {
             tracing::warn!(
@@ -299,6 +306,7 @@ async fn agent_socket(
                 serve_out,
                 &app.handle,
                 app.cfg.agent_identity.as_deref(),
+                source,
             )
             .await
             {
@@ -767,6 +775,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // When this connection last asked for a fresh playback token.
     let mut last_playback: Option<std::time::Instant> = None;
+    // The visibility an unverified page reported last, applied when it joins: a background tab
+    // whose check passes on its own sends nothing more until it is shown.
+    let mut visible_before_join: Option<bool> = None;
     loop {
         let msg = match pending.take() {
             Some(m) => m,
@@ -828,7 +839,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
             }
             // An unverified connection is not a viewer, so it is neither active nor hidden.
             Ok(ClientMsg::Visibility { visible }) => {
-                if verified.load(Ordering::SeqCst) {
+                if !verified.load(Ordering::SeqCst) {
+                    visible_before_join = Some(visible);
+                } else {
                     app.handle
                         .send(Event::Visibility {
                             at: 0,
@@ -871,6 +884,15 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             returning,
                         })
                         .await;
+                    if visible_before_join == Some(false) {
+                        app.handle
+                            .send(Event::Visibility {
+                                at: 0,
+                                viewer: viewer.clone(),
+                                visible: false,
+                            })
+                            .await;
+                    }
                     verified.store(true, Ordering::SeqCst);
                     let now = std::time::Instant::now();
                     let a = gate.seats.admit(None, &client, now);

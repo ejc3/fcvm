@@ -104,3 +104,23 @@ pub async fn serve_keys(
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     (url, reads)
 }
+
+/// A keys endpoint that always answers 500; returns its URL and how many times it was asked.
+pub async fn serve_failing_keys() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = reads.clone();
+    let app = axum::Router::new().route(
+        "/cdn-cgi/access/certs",
+        axum::routing::get(move || {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down")
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/cdn-cgi/access/certs", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (url, reads)
+}

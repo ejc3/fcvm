@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
+// Shared with access_jwt's unit tests, which use parts of it this file does not.
+#[allow(dead_code)]
 #[path = "../src/fleet/coord/access_jwt_testing.rs"]
 mod access_testing;
 
@@ -924,6 +926,36 @@ async fn an_unverified_connection_neither_joins_nor_takes_a_seat_until_it_verifi
     b.until(|s| s["viewers"]["active"] == 2).await;
 }
 
+/// A page hidden before it verifies (a background tab whose check passes on its own) is
+/// hidden once it joins: the `visibility: false` it sent while unverified is kept, not lost,
+/// so it does not count as active and hold the fleet awake.
+#[tokio::test]
+async fn a_page_hidden_before_it_verifies_joins_hidden() {
+    let c = coordinator_with(Opts {
+        verifier: turnstile_fake(),
+        site_key: Some("site-key-for-tests".into()),
+        ..Opts::default()
+    })
+    .await;
+    let mut v = Viewer::connect(&c.url).await;
+    assert_eq!(v.message("admission").await["verify"], true);
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.send(json!({"type": "verify", "token": "good"})).await;
+    assert_eq!(v.message("verified").await["ok"], true);
+    let s = v.until(|s| s["viewers"]["count"] == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = if s["viewers"]["active"] == 0 {
+        s
+    } else {
+        published(&c.handle)
+    };
+    assert_eq!(s["viewers"]["active"], 0, "{}", s["viewers"]);
+    // And it turns active when it becomes visible.
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+}
+
 /// An unverified connection is no arrival: it does not wake a sleeping fleet, and its Wake
 /// button is refused until it verifies. Verifying is its arrival, and the fleet wakes.
 #[tokio::test]
@@ -1323,10 +1355,13 @@ async fn the_agent_socket_needs_a_verified_agent_service_token() {
 async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
     let fake = Arc::new(FakeHosts::default());
+    // Reached through Cloudflare: the source is CF-Connecting-IP (here the peer, 127.0.0.1,
+    // for the hosts that dial without the header).
     let host = |id: &str, state: &str| Host {
         id: id.into(),
         state: state.into(),
         market: Market::Spot,
+        sources: vec!["127.0.0.1".into(), "2001:db8:7:7::/80".into()],
     };
     fake.hosts.lock().unwrap().insert(
         "us-east-1".into(),
@@ -1373,9 +1408,36 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     };
     closes(dial("i-0bbbbbbbbbbbbbbb1").await).await;
     closes(dial("i-0aaaaaaaaaaaaaaa2").await).await;
+    // A listed, running instance named from somewhere else: an agent token is not a host, so
+    // naming another fleet host (whose id any snapshot shows) does not make the caller it.
+    for elsewhere in ["198.51.100.9", "2001:db8:7:8::1"] {
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut()
+            .insert("cf-connecting-ip", elsewhere.parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::to_string(&bare_hello("i-0aaaaaaaaaaaaaaa1"))
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        closes(ws).await;
+    }
     *fake.fail_lists.lock().unwrap() = [("us-east-1".to_string(), 1)].into_iter().collect();
     closes(dial("i-0aaaaaaaaaaaaaaa1").await).await;
-    // This fleet's running host registers.
+    // This fleet's running host registers, over IPv4 or from its IPv6 prefix.
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("cf-connecting-ip", "2001:db8:7:7::42".parse().unwrap());
+    let (mut ok6, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ok6.send(Message::Text(
+        serde_json::to_string(&bare_hello("i-0aaaaaaaaaaaaaaa1"))
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
     let _ok = dial("i-0aaaaaaaaaaaaaaa1").await;
     let mut v = Viewer::connect(&c.url).await;
     let s = v
@@ -4705,6 +4767,7 @@ async fn a_restart_keeps_the_hosts_it_finds() {
             id: "i-0123456789abcdef0".into(),
             state: "running".into(),
             market: Market::OnDemand,
+            sources: Vec::new(),
         }],
     );
     let (_handle, _actor) = start(
