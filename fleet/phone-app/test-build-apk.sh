@@ -5,7 +5,9 @@
 #   fleet/phone-app/test-build-apk.sh
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-dir=$(mktemp -d)
+# The directory name always holds "D8", so the stand-in java below is checked against a path
+# that names it, as a random mktemp name sometimes does.
+dir=$(mktemp -d -t D8-test-build-apk.XXXXXX)
 trap 'rm -rf "$dir"' EXIT
 mkdir -p "$dir/src/app/src/main/res" "$dir/src/app/src/main/assets" "$dir/tools/bin" "$dir/tools/framework" "$dir/bin" "$dir/home"
 cp "$here/build-apk.sh" "$dir/src/"
@@ -20,9 +22,11 @@ cat > "$dir/bin/java" <<'S'
 #!/bin/bash
 out=""; prev=""
 for a in "$@"; do [ "$prev" = --output ] || [ "$prev" = --out ] && out=$a; prev=$a; done
-case "$*" in
-  *D8*) echo "$RUN" > "$out/classes.dex" ;;
-  *ApkSignerTool*) sleep 0.5; echo "$RUN" > "$out" ;;
+# by the main class build-apk.sh names: the arguments also carry this test's mktemp paths,
+# which can contain "D8" (/tmp/tmp.xD8yzAbcde, say)
+case " $* " in
+  *" com.android.tools.r8.D8 "*) echo "$RUN" > "$out/classes.dex" ;;
+  *" com.android.apksigner.ApkSignerTool "*) sleep 0.5; echo "$RUN" > "$out" ;;
 esac
 S
 cat > "$dir/tools/bin/aapt2" <<'S'

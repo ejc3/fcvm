@@ -5,8 +5,26 @@
 # Maven Central and the Gradle plugin portal, checked against gradle/verification-metadata.xml.
 # `make -C fleet/phone-app` builds it.
 FROM docker.io/library/ubuntu:24.04
-RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-      openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools \
+# apt's Acquire::http::Timeout counts only time without data, so a connection that keeps
+# trickling never trips it: in run 44504825691 one archive.ubuntu.com address served the JDK at
+# 65 kB/s for 11 minutes while other runs fetched the same 133 MB in 2 to 49 s. So the index
+# update and the package downloads each get a wall-clock bound per attempt and up to three
+# attempts, each on a new connection. The downloads retry without another update: the image's
+# docker-clean hook deletes downloaded and partial .debs after every update, and without it a
+# retry fetches only what the previous attempt did not. Installing reads only the downloaded files.
+RUN apt="apt-get -q -o Acquire::http::Timeout=30 -o Acquire::Retries=3" \
+    pkgs="openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools"; \
+    retry() { \
+      limit=$1 what=$2; shift 2; \
+      for attempt in 1 2 3; do \
+        timeout "$limit" "$@" && return 0; \
+        echo "apt: $what attempt $attempt of 3 failed or ran out of its $limit s" >&2; \
+      done; \
+      return 1; \
+    }; \
+    retry 60 update $apt update \
+    && retry 120 download $apt install -y --no-install-recommends --download-only $pkgs \
+    && DEBIAN_FRONTEND=noninteractive $apt install -y --no-install-recommends $pkgs \
     && rm -rf /var/lib/apt/lists/*
 ARG GRADLE_VERSION=8.10.2
 ARG GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26
