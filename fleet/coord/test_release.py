@@ -31,6 +31,7 @@ def load(name, filename):
 
 
 smoke, publish = load("smoke", "stage-smoke.py"), load("publish", "publish.py")
+prod = load("prod_release", "prod_release.py")
 
 
 class ProbeTests(unittest.TestCase):
@@ -1279,7 +1280,7 @@ class HostLocalTests(unittest.TestCase):
         # builder group's egress refuses over IPv6 and the smoke then blocks on.
         class Stop(Exception):
             pass
-        def live_target():
+        def live_target(target):
             raise Stop()
         with patch.dict(os.environ, self.LOCAL), \
                 patch.object(smoke, "prove_viewer", side_effect=AssertionError("asked the host")), \
@@ -1528,14 +1529,30 @@ class ResolveRetransmitTests(unittest.TestCase):
     def test_the_failure_names_the_tile_key_and_the_success_reports_sends(self):
         resolver, _ = self.serve(drop=None)
         tile = dict(frame_url="wss://a.fcvm.dev/frames", frame_url_v4="wss://b.fcvm.dev:20200/frames")
-        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6):
-            with self.assertRaises(TimeoutError) as caught:
+        out = io.StringIO()
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(TimeoutError):
                 smoke.prove_resolves(tile)
-        self.assertIn("frame_url", str(caught.exception))
+        self.assertEqual(json.loads(out.getvalue())["record"], "frame_url")
         resolver, _ = self.serve(drop=1)
         with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)):
             slowest, sends = smoke.prove_resolves(tile)
         self.assertEqual(sends, 2)
+
+    def test_the_failure_line_names_the_resolver_record_and_datagrams(self):
+        # 2026-11-19: the scheduled smoke printed {"errorType": "TimeoutError", "error": null}.
+        resolver, received = self.serve(drop=None)
+        tile = dict(frame_url="wss://a.fcvm.dev/frames", frame_url_v4="wss://b.fcvm.dev:20200/frames")
+        out = io.StringIO()
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6), \
+                contextlib.redirect_stdout(out), self.assertRaises(TimeoutError) as caught:
+            smoke.prove_resolves(tile)
+        self.assertIsNotNone(smoke.describe(caught.exception), "the failure line would print no error text")
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(lines, [{"resolve": "no answer", "record": "frame_url", "type": "AAAA",
+                                  "resolver": resolver, "sends": len(received), "within_s": 0.6}])
+        self.assertNotIn("fcvm.dev", out.getvalue() + str(caught.exception))
 
 
 class SettleBoundTests(unittest.TestCase):
@@ -1594,6 +1611,478 @@ class WorkflowTests(unittest.TestCase):
         job = deploy.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
         self.assertIn("python3 -B fleet/coord/publish.py", job, "this is the job that replaces the task")
         self.assertEqual(re.findall(block, job), ["fleet-viewer-smoke"])
+
+
+def ts(seconds):
+    """A GitHub timestamp `seconds` after a fixed instant."""
+    import datetime
+    base = datetime.datetime(2026, 11, 19, tzinfo=datetime.timezone.utc)
+    return (base + datetime.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+T0 = ts(0)
+
+
+def at(seconds):
+    return prod.when(ts(seconds))
+
+
+class FakeGitHub:
+    """Workflow runs and their jobs, as the REST API lists them."""
+
+    def __init__(self):
+        self.runs = {wf: [] for wf in prod.WORKFLOWS.values()}
+        self.jobs = {}
+        self.next = 100
+
+    def run(self, workflow, sha, jobs, updated=10_000, status="completed"):
+        self.next += 1
+        self.runs[workflow].insert(0, {"id": self.next, "head_sha": sha, "head_branch": "main", "event": "push",
+            "status": status, "updated_at": ts(updated), "head_repository": {"full_name": "ejc3/fcvm"}})
+        self.jobs[self.next] = jobs
+        return self.next
+
+    def api(self, path):
+        if path.startswith("actions/workflows/"):
+            return {"workflow_runs": self.runs[path.split("/")[2]]}
+        return {"jobs": self.jobs[int(path.split("/")[2])]}
+
+
+def release_job(name, step, start, end, conclusion="success", status="completed"):
+    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None,
+            "steps": [{"name": step, "conclusion": conclusion if status == "completed" else None, "completed_at": ts(end)}],
+            "started_at": ts(start), "completed_at": ts(end)}
+
+
+def viewers(start, end, prefix="smoke / ", conclusion="success"):
+    return [{"name": prefix + "IPv4-only viewer", "conclusion": conclusion, "started_at": ts(start), "completed_at": ts(start + 200)},
+            {"name": prefix + "IPv6 viewer", "conclusion": conclusion, "started_at": ts(start + 210), "completed_at": ts(end)}]
+
+
+class ProdDecideTests(unittest.TestCase):
+    """The staging set prod takes: what staging runs, and a smoke that ran against exactly that."""
+
+    C, W, D = "c" * 40, "e" * 40, "sha256:" + "d" * 64
+    RECEIPT = {"generation": 12, "build_id": "factory:new"}
+
+    def setUp(self):
+        self.gh = FakeGitHub()
+        coordinator = self.gh.run("fleet-coordinator-deploy.yml", self.C,
+            [release_job("deploy", "Publish and release the staging coordinator", 900, 1000)] + viewers(1100, 1500))
+        self.coordinator_run = coordinator
+        self.gh.run("fleet-web-deploy.yml", self.W, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1010, 1050)])
+        self.candidate = {"status": "ok", "stage": {"digest": self.D, "commits": [self.C]},
+                          "prod": {"digest": "sha256:" + "a" * 64, "commits": ["a" * 40]}, "release": None}
+        self.status = {"status": "ok", "stage": self.RECEIPT, "verified": self.RECEIPT, "stage_verified": True,
+                       "verified_at": int(at(500)), "prod": {"generation": 11, "build_id": "factory:old"},
+                       "asleep": True, "reason": None}
+        env = patch.dict(os.environ, {"GITHUB_REPOSITORY": "ejc3/fcvm", "GH_TOKEN": "t",
+                                      "COORDINATOR_RELEASE": "fcvm-coordinator-release-prod",
+                                      "IMAGE_RELEASE": "fcvm-fleet-ami-prod-release"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.calls = []
+        def invoke(function, payload):
+            self.calls.append(payload)
+            if function == "fcvm-coordinator-release-prod":
+                return copy.deepcopy(self.candidate)
+            return copy.deepcopy(self.status)
+        patches = [patch.object(prod, "api", self.gh.api), patch.object(prod.publish, "invoke", invoke)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_smoke_after_both_releases_and_the_verification_promotes_the_set(self):
+        target, prior, changes = prod.decide()
+        self.assertEqual(target, {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+                                  "generation": 12, "build_id": "factory:new", "smoke_run": self.coordinator_run})
+        self.assertEqual(changes, {"image": True, "coordinator": True, "web": True})
+        self.assertEqual(prior["coordinator"], {"commit": "a" * 40, "digest": "sha256:" + "a" * 64})
+        self.assertEqual((prior["generation"], prior["worker_version"]), (11, None))
+
+    def skips(self, why):
+        with self.assertRaisesRegex(prod.Skip, why):
+            prod.decide()
+
+    def test_a_smoke_that_started_before_the_web_release_finished_does_not_count(self):
+        self.gh.run("fleet-web-deploy.yml", "f" * 40, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1050, 1200)])
+        self.skips("no staging smoke")
+
+    def test_a_smoke_before_the_generation_was_verified_does_not_count_unless_it_is_the_verifying_one(self):
+        self.status["verified_at"] = int(at(1600))
+        self.skips("no staging smoke")
+        jobs = viewers(1300, 1550, prefix="Staging smoke / ") + [
+            {"name": "Verify or roll back", "conclusion": "success", "started_at": ts(1560), "completed_at": ts(1620)}]
+        gate = self.gh.run("fleet-release-gate.yml", "0" * 40, jobs)
+        self.assertEqual(prod.decide()[0]["smoke_run"], gate)
+
+    def test_a_failed_viewer_is_no_smoke(self):
+        self.gh.jobs[self.coordinator_run][-1]["conclusion"] = "failure"
+        self.skips("no staging smoke")
+
+    def test_the_release_that_finished_last_is_staging_even_from_an_older_run(self):
+        # An older run rerun after a newer one deployed: its deploy finished last, so staging serves it.
+        older = self.gh.runs["fleet-web-deploy.yml"][-1]
+        self.gh.run("fleet-web-deploy.yml", "f" * 40, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1020, 1040)])
+        self.assertEqual(prod.released("web")[0], self.W)
+        self.gh.jobs[older["id"]] = [release_job("Deploy fcvm-fleet-stage", "Deploy", 1600, 1700, status="in_progress")]
+        with self.assertRaisesRegex(prod.Skip, "in progress"):
+            prod.released("web")
+
+    def test_staging_running_an_unverified_generation_promotes_nothing(self):
+        self.status["stage_verified"] = False
+        self.skips("not verified")
+
+    def test_a_release_in_progress_promotes_nothing(self):
+        self.gh.run("fleet-coordinator-deploy.yml", "1" * 40,
+            [release_job("deploy", "Publish and release the staging coordinator", 2000, 2100, status="in_progress")])
+        self.skips("in progress")
+
+    def test_a_failed_newer_release_falls_back_and_staging_pointer_must_agree(self):
+        self.gh.run("fleet-coordinator-deploy.yml", "1" * 40,
+            [release_job("deploy", "Publish and release the staging coordinator", 2000, 2100, conclusion="failure")])
+        self.assertEqual(prod.decide()[0]["coordinator"]["commit"], self.C)
+        self.candidate["stage"]["commits"] = ["1" * 40]
+        self.skips("not its last successful staging release")
+
+    def test_prod_already_running_the_set_promotes_nothing(self):
+        self.candidate["prod"] = {"digest": self.D, "commits": [self.C]}
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+            "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12, **self.RECEIPT, "smoke_run": 1, "previous": None}
+        self.skips("already runs")
+
+    def test_a_record_that_does_not_describe_prod_stops_the_promotion(self):
+        self.candidate["release"] = {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+            "worker_version": None, "generation": 11, "build_id": "factory:old", "smoke_run": 1, "previous": None}
+        self.skips("outside a promotion")
+
+    def test_runs_from_another_repository_or_branch_are_ignored(self):
+        for run in self.gh.runs["fleet-coordinator-deploy.yml"]:
+            run["head_repository"] = {"full_name": "someone/fork"}
+        self.skips("no staging coordinator release")
+
+
+class ProdStepTests(unittest.TestCase):
+    """hold, the image steps and the exit codes: a held step changes nothing and exits 3."""
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod",
+                                      "IMAGE_RELEASE": "fcvm-fleet-ami-prod-release"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.answers, self.calls = {}, []
+        def invoke(function, payload):
+            self.calls.append(payload.get("action", "release"))
+            answer = self.answers[payload.get("action")]
+            return answer.pop(0) if isinstance(answer, list) else answer
+        p = patch.object(prod.publish, "invoke", invoke)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_an_image_change_waits_for_prod_to_sleep_and_a_coordinator_change_for_no_viewer(self):
+        self.answers["prod-status"] = [{"asleep": False, "reason": "awake"}, {"asleep": True}]
+        clock, sleeps = iter([0, 60, 120]), []
+        self.assertTrue(prod.hold(True, deadline=1000, clock=lambda: next(clock), sleep=sleeps.append))
+        self.assertEqual((self.calls, sleeps), (["prod-status", "prod-status"], [60]))
+        self.calls.clear()
+        self.answers["quiet"] = [{"status": "held", "reason": "viewers"}] * 3
+        clock = iter([0, 500, 1000, 1500])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(prod.hold(False, deadline=1000, clock=lambda: next(clock), sleep=lambda _: None))
+        self.assertEqual(set(self.calls), {"quiet"})
+
+    def test_a_held_promotion_exits_3_and_a_refused_one_fails(self):
+        receipt = '{"generation": 12, "build_id": "factory:new"}'
+        for answer, code in (({"status": "held", "reason": "awake"}, prod.HELD),
+                             ({"status": "refused", "reason": "x"}, 1),
+                             ({"status": "promoted", "generation": 12, "build_id": "factory:new"}, 0)):
+            with self.subTest(answer=answer["status"]):
+                self.answers["promote-prod"] = answer
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(prod.main(["image-promote", receipt]), code)
+
+    def test_an_image_rollback_returns_only_to_the_previous_release(self):
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": old}
+        self.assertEqual(prod.image_rollback(new, old), "unchanged")
+        self.assertNotIn("rollback-prod", self.calls)
+        self.answers["prod-status"] = {"prod": {"generation": 9, "build_id": "x"}}
+        with self.assertRaisesRegex(RuntimeError, "neither"):
+            prod.image_rollback(new, old)
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "held"}, {"status": "rolled_back", **old}]
+        sleeps = []
+        self.assertEqual(prod.image_rollback(new, old, deadline=time.time() + 1000, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60])
+
+    def test_the_record_drops_a_previous_without_a_commit(self):
+        self.answers["record"] = {"status": "recorded"}
+        target = {"coordinator": {"commit": "c" * 40, "digest": "sha256:" + "d" * 64}, "web_commit": "e" * 40,
+                  "generation": 12, "build_id": "n", "smoke_run": 5}
+        sent = []
+        with patch.object(prod.publish, "invoke", lambda f, payload: sent.append(payload) or {"status": "recorded"}):
+            prod.record(target, "", {"coordinator": {"commit": None, "digest": "sha256:" + "a" * 64}})
+        self.assertEqual(sent[0]["release"], {**target, "worker_version": None, "previous": None})
+
+
+class ProdEnabledTests(unittest.TestCase):
+    def test_off_while_the_prod_stack_is_off_with_a_message(self):
+        for value, expected in (("", False), ("false", False), ("true", True)):
+            out = io.StringIO()
+            with patch.dict(os.environ, {"ENABLED": value}), contextlib.redirect_stdout(out):
+                self.assertEqual(prod.enabled(), expected)
+            self.assertEqual("the prod stack is off" in out.getvalue(), not expected)
+
+
+class PublishProdTests(unittest.TestCase):
+    """publish.py --stack prod: no push, the prod function only, held is exit 3, force for rollback."""
+
+    DIGEST = "sha256:" + "c" * 64
+
+    def run_prod(self, results, extra=(), function="fcvm-coordinator-release-prod"):
+        sent = []
+        def invoke(name, payload):
+            sent.append((name, payload))
+            return results.pop(0)
+        with patch.dict(os.environ, {"COORDINATOR_RELEASE": function}), patch.object(publish, "invoke", invoke), \
+                patch.object(publish, "command", side_effect=AssertionError("prod pushes nothing")), \
+                patch.object(publish.time, "sleep", lambda _: None), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit) as exit:
+            publish.run(["--stack", "prod", "--commit", "a" * 40, "--digest", self.DIGEST, *extra])
+            raise SystemExit(0)
+        return exit.exception.code, sent
+
+    def test_held_exits_3_and_busy_is_asked_again(self):
+        code, sent = self.run_prod([{"status": "busy"}, {"status": "held", "reason": "viewers"}])
+        self.assertEqual(code, publish.HELD)
+        self.assertEqual(sent, [("fcvm-coordinator-release-prod", {"commit": "a" * 40, "digest": self.DIGEST})] * 2)
+
+    def test_force_is_sent_only_when_asked(self):
+        code, sent = self.run_prod([{"status": "deployed", "digest": self.DIGEST}], extra=["--force"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sent[0][1]["force"], True)
+
+    def test_the_staging_function_is_refused_for_prod(self):
+        code, sent = self.run_prod([], function="fcvm-coordinator-release")
+        self.assertEqual((code, sent), (1, []))
+
+    def test_staging_takes_no_commit_or_force(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            publish.arguments(["--force"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            publish.arguments(["--stack", "prod", "--commit", "a" * 40])
+
+
+class FakeLive:
+    """A coordinator /live socket that answers from a script."""
+
+    def __init__(self, hello, admission, power, receipt, wakes=False):
+        self.out = [{"type": "hello", **hello}, {"type": "admission", **admission},
+                    {"type": "snapshot", "state": {"fleet": {"power": {"state": power}}}}]
+        self.receipt, self.wakes, self.sent = receipt, wakes, []
+
+    def __call__(self, url, headers=None, opener=None):
+        self.url, self.headers = url, headers
+        return self
+
+    def send(self, payload, opcode=1):
+        self.sent.append(payload)
+        if payload.get("type") == "intent":
+            self.out.append({"type": "receipt", "id": payload["id"], **self.receipt})
+            if self.wakes:
+                self.out.append({"type": "snapshot", "state": {"fleet": {"power": {"state": "waking"}}}})
+
+    def message(self, deadline):
+        if not self.out:
+            raise TimeoutError("no message")
+        return 1, json.dumps(self.out.pop(0)).encode()
+
+    def close(self):
+        pass
+
+
+class UnverifiedProbeTests(unittest.TestCase):
+    ENV = {"PROD_PUBLIC_URL": "https://fleet-api.example", "PROD_ORIGIN": "https://site.example"}
+    VERIFY = {"verify": True, "seat": None, "direct": None, "locked": True}
+    REFUSED = {"outcome": "refused", "reason": "verify first", "version": 0}
+
+    def probe(self, live):
+        with patch.dict(os.environ, self.ENV), patch.object(smoke, "Socket", live), contextlib.redirect_stdout(io.StringIO()) as out:
+            smoke.unverified_probe("v4", watch_seconds=0.2)
+        return out.getvalue()
+
+    def test_an_unverified_visitor_is_asked_to_verify_refused_and_wakes_nothing(self):
+        live = FakeLive({"turnstile": "site-key"}, self.VERIFY, "asleep", self.REFUSED)
+        line = json.loads(self.probe(live).splitlines()[-1])
+        self.assertEqual(line, {"unverified": True, "family": "v4", "seated": False, "wakeRefused": True, "power": "asleep"})
+        self.assertEqual(live.url, "wss://fleet-api.example/live")
+        self.assertEqual(live.headers, {"Origin": "https://site.example"})
+        self.assertNotIn("CF-Access-Client-Id", json.dumps(live.headers))
+
+    def test_each_way_an_unverified_visitor_gets_in_fails(self):
+        cases = {"no turnstile asked": FakeLive({"turnstile": None}, self.VERIFY, "asleep", self.REFUSED),
+                 "seated": FakeLive({"turnstile": "k"}, {**self.VERIFY, "seat": "ticket"}, "asleep", self.REFUSED),
+                 "direct token": FakeLive({"turnstile": "k"}, {**self.VERIFY, "direct": {"value": "v"}}, "asleep", self.REFUSED),
+                 "wake taken": FakeLive({"turnstile": "k"}, self.VERIFY, "asleep", {"outcome": "committed", "version": 9}),
+                 "fleet woke": FakeLive({"turnstile": "k"}, self.VERIFY, "asleep", self.REFUSED, wakes=True)}
+        for name, live in cases.items():
+            with self.subTest(case=name), self.assertRaises(AssertionError):
+                self.probe(live)
+
+
+class BroadcastProbeTests(unittest.TestCase):
+    def test_the_playlist_a_stream_and_a_segment_load_over_the_family(self):
+        bodies = {"https://play.example/m.m3u8?token=t": (200, b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/720.m3u8?x=1\n"),
+                  "https://play.example/v/720.m3u8?x=1": (200, b"#EXTM3U\n#EXTINF:2,\ns1.ts\n#EXTINF:2,\ns2.ts\n"),
+                  "https://play.example/v/s2.ts": (200, b"\x47" * 188)}
+        seen = []
+        def get(url, family):
+            seen.append((url, family))
+            return bodies[url]
+        with patch.object(smoke, "https_get", get):
+            smoke.prove_broadcast("https://play.example/m.m3u8?token=t", "v6")
+        self.assertEqual([u for u, _ in seen], list(bodies))
+        self.assertEqual({f for _, f in seen}, {"v6"})
+        self.assertEqual(sum(u.endswith("token=t") for u, _ in seen), 1, "the single-use token is fetched once")
+
+    def test_a_playlist_with_no_segment_or_a_failed_segment_fails(self):
+        for bodies in ({"p": (200, b"#EXTM3U\n#EXT-X-STREAM-INF:B=1\nv.m3u8\n"), "v.m3u8": (200, b"#EXTM3U\n")},
+                       {"p": (200, b"#EXTM3U\n#EXTINF:2,\ns.ts\n"), "s.ts": (403, b"<html>forbidden</html>")},
+                       {"p": (200, b"<html>")}):
+            with self.subTest(bodies=list(bodies)), \
+                    patch.object(smoke, "https_get", lambda url, family: bodies[url.rsplit("/", 1)[-1]]), \
+                    self.assertRaises(AssertionError):
+                smoke.prove_broadcast("https://play.example/p", "v4")
+
+
+class ProdWorkflowTests(unittest.TestCase):
+    """The prod workflows: triggers, what may run where, and the security rules (CLAUDE.md)."""
+
+    WORKFLOWS = HERE.parent.parent / ".github" / "workflows"
+
+    def text(self, name):
+        return (self.WORKFLOWS / name).read_text()
+
+    def jobs(self, name):
+        body = self.text(name).split("\njobs:\n", 1)[1]
+        return dict((m.group(1), m.group(2)) for m in re.finditer(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", body))
+
+    @staticmethod
+    def run_blocks(body):
+        """Every `run:` value of a job: the line, or a block scalar's indented lines."""
+        lines, blocks = body.split("\n"), []
+        for i, line in enumerate(lines):
+            m = re.match(r"( +)(- )?run: ?(.*)$", line)
+            # A step's run (job outputs and `defaults: run:` sit at six spaces).
+            if not m or (len(m.group(1)) < 8 and not m.group(2)):
+                continue
+            m = re.match(r"( +(?:- )?)run: ?(.*)$", line)
+            if m.group(2).strip() not in ("|", ">", "|-", ">-"):
+                blocks.append(m.group(2))
+                continue
+            indent, block = len(m.group(1)), []
+            for follow in lines[i + 1:]:
+                if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                    break
+                block.append(follow)
+            blocks.append("\n".join(block))
+        return blocks
+
+    def test_promotion_follows_both_staging_deploys_by_name_and_the_gates_verdict(self):
+        promote = self.text("fleet-prod-promote.yml")
+        names = re.search(r"workflows: \[(.*)\]", promote).group(1)
+        triggers = [n.strip().strip('"') for n in names.split(",")]
+        actual = [re.search(r"(?m)^name: (.+)$", self.text(f)).group(1)
+                  for f in ("fleet-coordinator-deploy.yml", "fleet-web-deploy.yml")]
+        self.assertEqual(triggers, actual)
+        self.assertIn("  workflow_dispatch:", promote)
+        # The gate is scheduled, so it dispatches the promotion when it verifies, and only while prod exists.
+        gate = self.jobs("fleet-release-gate.yml")["promote"]
+        self.assertIn("needs.decide.outputs.verdict == 'verified'", gate)
+        self.assertIn("vars.FLEET_PROD_ENABLED == 'true'", gate)
+        self.assertIn("gh workflow run fleet-prod-promote.yml --ref main", gate)
+
+    def test_a_workflow_run_is_taken_only_from_this_repositorys_main(self):
+        gate = self.jobs("fleet-prod-promote.yml")["enabled"]
+        for clause in ("github.event.workflow_run.head_repository.full_name == github.repository",
+                       "github.event.workflow_run.head_branch == 'main'",
+                       "github.event.workflow_run.conclusion == 'success'",
+                       "github.event.workflow_run.event != 'pull_request'"):
+            self.assertIn(clause, gate)
+        self.assertIn("vars.FLEET_PROD_ENABLED", gate)
+        self.assertNotIn("environment:", gate, "the off check runs without the prod environment")
+
+    def test_no_event_value_reaches_a_shell_and_every_credential_is_in_the_prod_environment(self):
+        for name in ("fleet-prod-promote.yml", "fleet-prod-rollback.yml", "fleet-prod-smoke.yml"):
+            for job, body in self.jobs(name).items():
+                with self.subTest(workflow=name, job=job):
+                    for run in self.run_blocks(body):
+                        self.assertNotIn("${{ github.event", run)
+                        self.assertNotRegex(run, r"\$\{\{ *(needs|steps|inputs|vars|secrets)\.")
+                    if "secrets." in body:
+                        self.assertIn("environment: fleet-prod-deploy", body)
+                    self.assertNotIn("fleet-stage-deploy", body)
+                    self.assertNotIn("cloudflare-deploy", body)
+
+    def test_the_run_block_reader_sees_single_lines_and_blocks(self):
+        body = "    steps:\n      - run: one ${{ x }}\n      - name: n\n        run: |\n          two\n          three\n        env:\n          A: b\n"
+        self.assertEqual(self.run_blocks(body), ["one ${{ x }}", "          two\n          three"])
+        self.assertGreater(sum(len(self.run_blocks(b)) for b in self.jobs("fleet-prod-promote.yml").values()), 8)
+
+    def test_the_prod_role_never_pushes_and_the_staging_release_is_never_called(self):
+        for name in ("fleet-prod-promote.yml", "fleet-prod-rollback.yml"):
+            text = self.text(name)
+            self.assertNotIn("docker push", text)
+            self.assertNotRegex(text, r"publish\.py(?! --stack prod)")
+            self.assertNotIn("RELEASE_GATE", text)
+
+    def test_the_rollback_job_runs_on_a_failed_release_smoke_or_record_and_force_is_only_in_rollbacks(self):
+        jobs = self.jobs("fleet-prod-promote.yml")
+        self.assertIn("needs.release.result == 'failure'", jobs["rollback"])
+        self.assertIn("needs.smoke.result != 'success'", jobs["rollback"])
+        # A record that was not written would leave prod on a set its record does not describe.
+        self.assertIn("needs.record.result != 'success'", jobs["rollback"])
+        self.assertIn("needs: [candidate, release, smoke, record]", jobs["rollback"])
+        self.assertIn("--force", jobs["rollback"])
+        for job, body in jobs.items():
+            if job != "rollback":
+                self.assertNotIn("--force", body, job)
+        self.assertIn("needs.smoke.result == 'success'", jobs["record"])
+
+    def test_every_component_rollback_is_attempted_whatever_failed_before_it(self):
+        steps = {"fleet-prod-promote.yml": self.jobs("fleet-prod-promote.yml")["rollback"],
+                 "fleet-prod-rollback.yml": self.jobs("fleet-prod-rollback.yml")["rollback"]}
+        for name, body in steps.items():
+            for step in ("Worker", "Coordinator", "Host and tile images"):
+                with self.subTest(workflow=name, step=step):
+                    block = body.split(f"      - name: {step}\n", 1)[1].split("\n      - ", 1)[0]
+                    self.assertRegex(block, r"(?m)^        if: \$\{\{ !cancelled\(\)", "a failed rollback step skips this one")
+        final = steps["fleet-prod-promote.yml"].split("      - name: The promotion failed\n", 1)[1]
+        self.assertIn("if: ${{ always() }}", final)
+
+    def test_the_prod_smoke_is_both_families_with_the_unverified_probe_and_its_callers_pass_secrets(self):
+        jobs = self.jobs("fleet-prod-smoke.yml")
+        for job, family in (("ipv4", "v4"), ("ipv6", "v6")):
+            self.assertIn(f"--target prod --unverified --family {family}", jobs[job])
+            self.assertIn(f"--target prod --family {family}", jobs[job])
+            self.assertIn("--broadcast", jobs[job])
+            self.assertIn("vars.FLEET_PROD_ENABLED", jobs["ipv4"])
+        self.assertIn("--single-family", jobs["ipv4"])
+        for name in ("fleet-prod-promote.yml", "fleet-prod-rollback.yml"):
+            callers = [b for b in self.jobs(name).values() if "fleet-prod-smoke.yml" in b]
+            self.assertTrue(callers, name)
+            for body in callers:
+                self.assertRegex(body, r"(?m)^    secrets: inherit$")
+
+    def test_the_test_files_the_coordinator_build_compiles_trigger_its_deploy(self):
+        makefile = (HERE.parent.parent / "Makefile").read_text()
+        target = makefile.split("\ntest-fleet-coordinator: cargo-target-link", 1)[1].split("\n\n", 1)[0]
+        tests = re.findall(r"--test (\w+)", target)
+        self.assertTrue(tests)
+        patterns = re.findall(r"^      - '([^']+)'", self.text("fleet-coordinator-deploy.yml"), re.M)
+        for test in tests:
+            self.assertTrue(any(fnmatch.fnmatchcase(f"tests/{test}.rs", p) for p in patterns), test)
 
 
 if __name__ == "__main__":

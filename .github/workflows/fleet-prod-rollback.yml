@@ -1,0 +1,134 @@
+name: Fleet prod rollback
+
+# Returns the production fleet to the set before its current one, as /fcvm-fleet/prod/release records
+# it (`previous`): the Worker version, the coordinator image (the release function's `force`, which
+# skips the viewer hold and is accepted only for an image prod ran before) and the host and tile
+# images (only while prod is asleep: this waits up to 350 minutes for it). Then the prod smoke, and
+# the record names the restored set with the rolled-back one as its previous. Run by hand from main;
+# a failed promotion rolls itself back (fleet-prod-promote.yml).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-prod-release
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Return prod to its previous set
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 360
+    concurrency:
+      group: fleet-prod-viewer-smoke
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      current: ${{ steps.current.outputs.current }}
+      previous: ${{ steps.current.outputs.previous }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12.15.0
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-rollback-${{ github.run_id }}
+          role-duration-seconds: 21600
+          mask-aws-account-id: true
+      - id: current
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+        run: python3 -B fleet/coord/prod_release.py current
+      # Each component is returned whatever the one before it did; any failure still fails the job.
+      - name: Worker
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
+        working-directory: fleet/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CURRENT: ${{ steps.current.outputs.current }}
+          PREVIOUS: ${{ steps.current.outputs.previous }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r '.worker_version // empty' <<<"$PREVIOUS")
+          if [ -z "$version" ] || [ "$version" = "$(jq -r '.worker_version // empty' <<<"$CURRENT")" ]; then
+            echo "the Worker version does not change"
+            exit 0
+          fi
+          [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          pnpm install --frozen-lockfile
+          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm rollback"
+      - name: Coordinator
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          PREVIOUS: ${{ steps.current.outputs.previous }}
+        run: |
+          python3 -B fleet/coord/publish.py --stack prod --force \
+            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"
+      - name: Host and tile images
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
+        env:
+          IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          CURRENT: ${{ steps.current.outputs.current }}
+          PREVIOUS: ${{ steps.current.outputs.previous }}
+        run: |
+          if [ "$(jq -c '[.generation, .build_id]' <<<"$CURRENT")" = "$(jq -c '[.generation, .build_id]' <<<"$PREVIOUS")" ]; then
+            echo "the host and tile images do not change"
+            exit 0
+          fi
+          python3 -B fleet/coord/prod_release.py image-rollback "$CURRENT" "$PREVIOUS"
+
+  smoke:
+    needs: rollback
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-prod-smoke.yml
+    secrets: inherit
+
+  record:
+    name: Record the rollback
+    needs: [rollback, smoke]
+    if: ${{ always() && needs.rollback.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/coord
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-record-${{ github.run_id }}
+          mask-aws-account-id: true
+      # Prod runs the previous set whatever the smoke said: the record says so, and a failed smoke fails the run.
+      - env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          CURRENT: ${{ needs.rollback.outputs.current }}
+          PREVIOUS: ${{ needs.rollback.outputs.previous }}
+        run: python3 -B fleet/coord/prod_release.py record "$PREVIOUS" "$(jq -r '.worker_version // empty' <<<"$PREVIOUS")" "$CURRENT"

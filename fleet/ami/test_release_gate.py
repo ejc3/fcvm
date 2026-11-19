@@ -632,13 +632,20 @@ class GateTests(unittest.TestCase):
                           "needs.status.outputs.waiting == 'true'", "needs.decide.outputs.verdict == 'none'"):
             self.assertIn(condition, again)
         self.assertIn("    permissions:\n      actions: write\n", again)
-        self.assertEqual(WORKFLOW.count("actions: write"), 1)
+        # The other job that may dispatch starts the prod promotion after a verdict, and nothing else:
+        # no checkout, no inputs, one fixed workflow.
+        promote = WORKFLOW.split("\n  promote:\n", 1)[1].split("\n  again:\n", 1)[0]
+        self.assertIn("    permissions:\n      actions: write\n", promote)
+        self.assertIn("needs.decide.outputs.verdict == 'verified'", promote)
+        self.assertNotIn("uses:", promote)
+        self.assertEqual(re.findall(r"(?m)^ +run: (.*)$", promote), ["gh workflow run fleet-prod-promote.yml --ref main"])
+        self.assertEqual(WORKFLOW.count("actions: write"), 2)
         self.assertIn("GH_TOKEN: ${{ github.token }}", again)
         self.assertIn('release_gate.py again --generation "$GENERATION" --since "$SINCE"', again)
         status = WORKFLOW.split("\n  status:\n", 1)[1].split("\n  smoke:\n", 1)[0]
         for key in ("generation", "unverified", "waiting"):
             self.assertIn(f"{key}: ${{{{ steps.gate.outputs.{key} }}}}", status)
-        decide = WORKFLOW.split("\n  decide:\n", 1)[1].split("\n  again:\n", 1)[0]
+        decide = WORKFLOW.split("\n  decide:\n", 1)[1].split("\n  promote:\n", 1)[0]
         self.assertIn("verdict: ${{ steps.decide.outputs.verdict }}", decide)
         self.assertIn("id: decide", decide)
 

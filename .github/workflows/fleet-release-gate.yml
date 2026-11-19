@@ -148,6 +148,22 @@ jobs:
           AGENTS: ${{ steps.agents.outputs.agents }}
         run: python3 -B fleet/ami/release_gate.py decide --before "$BEFORE" --v4 "$V4" --v6 "$V6" --agents "$AGENTS"
 
+  # A verified generation is a new candidate for production (fleet-prod-promote.yml), which decides
+  # whether staging's whole set is ready. Only while the prod stack exists.
+  promote:
+    name: Offer the verified release to prod
+    needs: decide
+    if: ${{ !cancelled() && needs.decide.outputs.verdict == 'verified' && vars.FLEET_PROD_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run fleet-prod-promote.yml --ref main
+
   again:
     name: Look again soon
     needs: [status, smoke, decide]
