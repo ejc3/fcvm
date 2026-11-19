@@ -465,15 +465,16 @@ struct Page {
 /// nothing waits this long.
 pub const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Why a late viewer's `claim_gpu`, `claim_phone`, `claim_windows` or `claim_minecraft` is
-/// refused: a private GPU is a direct stream too, a borrowed phone or sandbox is shown from its
-/// direct stream, and a borrowed server is driven over its tile's view socket, which needs a
-/// direct token.
+/// Why a late viewer's `claim_gpu`, `resume_claim`, `claim_phone`, `claim_windows` or
+/// `claim_minecraft` is refused: a private GPU is a direct stream too (a resumed one as much
+/// as a new one), a borrowed phone or sandbox is shown from its direct stream, and a borrowed
+/// server is driven over its tile's view socket, which needs a direct token.
 pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the broadcast";
 
 /// The intents a late viewer is refused with [`LATE_CLAIM`].
-pub const LATE_REFUSED: [&str; 4] = [
+pub const LATE_REFUSED: [&str; 5] = [
     "claim_gpu",
+    "resume_claim",
     "claim_phone",
     "claim_windows",
     "claim_minecraft",
@@ -665,6 +666,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         tokio::spawn(async move {
             let mut claims = tokio::task::JoinSet::new();
             while let Some((msg, stored, claim)) = receipts_rx.recv().await {
+                // A watcher whose claim ended has returned: its slot goes now, not with the
+                // connection.
+                while claims.try_join_next().is_some() {}
                 if stored.await != Ok(true) {
                     continue;
                 }
@@ -817,6 +821,25 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     }
                 } else {
                     let claim = name == "claim_gpu";
+                    // A page taking back its claim after a restart is told about it as a new
+                    // claim is.
+                    let tells = claim || name == "resume_claim";
+                    // The claim's token is the page's own, so a page that reconnects before it
+                    // heard about its claim can still take it back (`resume_claim`); a claim
+                    // without one is refused, unrecorded.
+                    let secret = if claim {
+                        match claim_token(&args) {
+                            Ok(t) => Some(t),
+                            Err(why) => {
+                                if direct.try_send(unrecorded_refusal(id, why)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let r = app
                         .handle
                         .submit(Event::Intent {
@@ -827,12 +850,13 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             name,
                             args,
                             check: None,
-                            secret: claim.then(|| uuid::Uuid::new_v4().simple().to_string()),
+                            secret,
                         })
                         .await;
                     if let Some(Submitted {
                         receipt: Some(r),
                         stored,
+                        claim: seen,
                     }) = r
                     {
                         if r.outcome != Outcome::Committed {
@@ -846,12 +870,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             .try_send((
                                 ServerMsg::receipt(&r),
                                 stored,
-                                // The claim now, before the receipt waits for the store.
-                                if claim {
-                                    app.handle.claim_for(&viewer).await
-                                } else {
-                                    None
-                                },
+                                // The claim as the intent left it, before the receipt
+                                // waits for the store.
+                                seen.filter(|_| tells),
                             ))
                             .is_err()
                         {
@@ -885,6 +906,25 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         .await;
 }
 
+/// Why a `claim_gpu` without a well-formed token is refused (unrecorded).
+pub const CLAIM_TOKEN_REFUSAL: &str =
+    "claim_gpu needs args.token: 32 to 128 letters, digits, - or _, made by the page";
+
+/// The token of a `claim_gpu`: the page's own (`args.token`, 32 to 128 letters, digits, `-`
+/// or `_`), which the page needs to take the claim back after a reconnect.
+pub fn claim_token(args: &serde_json::Value) -> Result<String, &'static str> {
+    match args.get("token") {
+        Some(serde_json::Value::String(t))
+            if (32..=128).contains(&t.len())
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            Ok(t.clone())
+        }
+        _ => Err(CLAIM_TOKEN_REFUSAL),
+    }
+}
+
 /// Keep the claiming viewer, and only it, told about its GPU: a `claim` message whenever
 /// the claim changes (restoring, then running with its frame URL, a new camera), and a
 /// last one when it ends. `seen` is the claim as it was before its receipt waited for the
@@ -900,6 +940,25 @@ async fn tell_claim(
     let mut known = seen;
     loop {
         match handle.claim_for(&viewer).await {
+            // Another claim of this viewer (its earlier one ended while the receipt
+            // waited, and it claimed again): this watcher's claim is over, and the other one
+            // has a watcher of its own.
+            Some(c) if known.as_ref().is_some_and(|k| k.id != c.id) => {
+                let Some(mut k) = known else { return };
+                k.ended = Some(
+                    if now_ms() >= k.expires_at {
+                        "expired"
+                    } else {
+                        "released"
+                    }
+                    .into(),
+                );
+                k.phase = "ended".into();
+                k.frame_url = None;
+                k.frame_url_v4 = None;
+                let _ = direct.send(ServerMsg::Claim { claim: k }).await;
+                return;
+            }
             Some(c) => {
                 if last.as_ref() != Some(&c) {
                     if direct
@@ -1025,6 +1084,25 @@ mod tests {
         assert_ne!(client_key("198.51.100.2"), client_key("198.51.100.1"));
         assert_eq!(client_key("::ffff:198.51.100.1"), "198.51.100.1");
         assert_eq!(client_key("v-3"), "v-3");
+    }
+
+    /// A claim watcher that returned (its claim ended) leaves the connection's set at the next
+    /// receipt, not when the connection closes: a long-lived page claims again and again.
+    #[test]
+    fn finished_claim_watchers_are_reaped_while_the_connection_lasts() {
+        let src = include_str!("live.rs");
+        let body = src
+            .split("let mut claims = tokio::task::JoinSet::new();")
+            .nth(1)
+            .expect("the forwarding task");
+        let lp = body
+            .find("while let Some((msg, stored, claim)) = receipts_rx.recv().await {")
+            .expect("its loop");
+        let reap = body
+            .find("while claims.try_join_next().is_some() {}")
+            .expect("finished watchers are reaped");
+        let spawn = body.find("claims.spawn(").expect("a watcher is spawned");
+        assert!(lp < reap && reap < spawn, "the reaping is not in the loop");
     }
 
     #[test]

@@ -1936,7 +1936,7 @@ export interface NoticeContext {
  */
 export function noticeText(n: Notice, ctx: NoticeContext | null = null): string | null {
   if (n.intent === "nudge" && ctx?.nudges) return stopChoiceText(n, ctx.nudges, ctx.srvNow, ctx.srvAt);
-  if (n.kind !== "refused" || n.intent === "word" || n.intent === "claim_gpu" || n.intent === "claim_camera" || n.intent === "release_gpu") return null;
+  if (n.kind !== "refused" || n.intent === "word" || n.intent === "claim_gpu" || n.intent === "claim_camera" || n.intent === "release_gpu" || n.intent === "resume_claim") return null;
   const what = INTENT_LABEL[n.intent] ?? n.intent;
   return `${what} was not applied${n.reason ? `: ${n.reason}` : ""}`;
 }

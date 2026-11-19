@@ -9,7 +9,7 @@ to OUT as they are taken (jsonl and images), so a box that dies keeps what it ha
 The coordinator must run with a short --restart-cooldown. Needs the renderer's tools
 (fleet/renderer/tools) for the frame client, Pillow and the ffmpeg CLI.
 """
-import json, os, sys, time, urllib.error, urllib.request
+import json, os, sys, time, urllib.error, urllib.request, uuid
 sys.path.insert(0, os.environ.get("FLEETCLIENT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "renderer", "tools")))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fleetclient as fc  # noqa: E402
@@ -126,7 +126,8 @@ except Exception as e:
 # A visitor's own GPU.
 a = Live(client_ip=None)
 clicked = now_ms()
-r = a.intent("claim_gpu", {})
+# The page makes the claim's token (it takes the claim back after a reconnect with it).
+r = a.intent("claim_gpu", {"token": uuid.uuid4().hex})
 log("claim_gpu", r["outcome"], r.get("reason"))
 append("claim.jsonl", {"event": "receipt", "receipt": r, "clicked_local": clicked})
 if r["outcome"] == "committed":

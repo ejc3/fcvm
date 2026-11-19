@@ -666,6 +666,9 @@ export interface Claim {
   autopilot: boolean;
   /** Why it ended, once it has. */
   ended: string | null;
+  /** The session token, sent to the claiming page alone: the page presents it after a
+   * reconnect (`resume_claim`) to take the claim back from a coordinator that restarted. */
+  token: string | null;
 }
 
 export interface ClaimMsg {
@@ -728,7 +731,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart", "windows_reset", "claim_windows", "release_windows", "windows_action", "minecraft_reset", "minecraft_fork", "claim_minecraft", "release_minecraft"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "resume_claim", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart", "windows_reset", "claim_windows", "release_windows", "windows_action", "minecraft_reset", "minecraft_fork", "claim_minecraft", "release_minecraft"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -1402,6 +1405,7 @@ function parseClaim(v: Obj): Claim {
     camera: parseCamera(v, "claim"),
     autopilot: bool(v, "autopilot", w),
     ended: strOrNull(v, "ended", w),
+    token: strOrNull(v, "token", w),
   };
 }
 

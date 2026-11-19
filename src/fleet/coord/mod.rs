@@ -126,6 +126,10 @@ pub enum Cmd {
 pub struct Submitted {
     pub receipt: Option<Receipt>,
     pub stored: oneshot::Receiver<bool>,
+    /// For a committed `claim_gpu` or `resume_claim`: the claim as it is in the same actor
+    /// turn that applied the intent, so a claim that ends before its receipt goes is still
+    /// known to end.
+    pub claim: Option<ClaimMsg>,
 }
 
 struct AgentConn {
@@ -577,6 +581,69 @@ impl Actor {
         id.and_then(|id| self.state.receipt(&id).cloned())
     }
 
+    /// The claim `viewer` holds, as its page is told about it (`Cmd::ClaimFor`).
+    fn claim_msg(&self, viewer: &str) -> Option<ClaimMsg> {
+        let info = self.state.fleet.slots.values().find_map(|s| {
+            let c = s.claim.as_ref().filter(|c| c.viewer == viewer)?;
+            let ready = s.observed.phase == "running" && s.observed.generation >= c.generation;
+            Some(ClaimMsg {
+                id: c.session.clone(),
+                tile: c.borrowed.clone(),
+                phase: if ready { "running" } else { "restoring" }.into(),
+                frame_url: if ready {
+                    fleet_core::view::frame_urls(&self.state, s).0
+                } else {
+                    None
+                },
+                frame_url_v4: if ready {
+                    fleet_core::view::frame_urls(&self.state, s).1
+                } else {
+                    None
+                },
+                token: c.token.clone(),
+                clicked_at: c.claimed_at,
+                first_frame_at: c.first_frame_at,
+                expires_at: c.expires_at,
+                gpu: s.gpu.as_ref().map(|g| g.name.clone()),
+                phases: if ready {
+                    s.observed.timings.clone()
+                } else {
+                    Default::default()
+                },
+                camera: c.camera.clone(),
+                autopilot: c.autopilot,
+                ended: None,
+            })
+        });
+        // A claim a restart carried over whose GPU's host is not back yet: restoring.
+        let info = info.or_else(|| {
+            let c = self
+                .state
+                .fleet
+                .held_claims
+                .iter()
+                .map(|h| &h.claim)
+                .find(|c| c.viewer == viewer)?;
+            Some(ClaimMsg {
+                id: c.session.clone(),
+                tile: c.borrowed.clone(),
+                phase: "restoring".into(),
+                frame_url: None,
+                frame_url_v4: None,
+                token: c.token.clone(),
+                clicked_at: c.claimed_at,
+                first_frame_at: c.first_frame_at,
+                expires_at: c.expires_at,
+                gpu: None,
+                phases: Default::default(),
+                camera: c.camera.clone(),
+                autopilot: c.autopilot,
+                ended: None,
+            })
+        });
+        info
+    }
+
     pub fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Apply { event, reply } => {
@@ -586,9 +653,28 @@ impl Actor {
                 }
             }
             Cmd::Submit { event, reply } => {
+                let claims = match &event {
+                    Event::Intent { viewer, name, .. }
+                        if name == "claim_gpu" || name == "resume_claim" =>
+                    {
+                        Some(viewer.clone())
+                    }
+                    _ => None,
+                };
                 let receipt = self.intent_receipt(event);
                 let stored = self.receipt_stored(receipt.as_ref());
-                let _ = reply.send(Submitted { receipt, stored });
+                let claim = claims
+                    .filter(|_| {
+                        receipt
+                            .as_ref()
+                            .is_some_and(|r| r.outcome == fleet_core::Outcome::Committed)
+                    })
+                    .and_then(|viewer| self.claim_msg(&viewer));
+                let _ = reply.send(Submitted {
+                    receipt,
+                    stored,
+                    claim,
+                });
             }
             Cmd::Receipt { id, reply } => {
                 let receipt = self.state.receipt(&id).cloned();
@@ -669,40 +755,7 @@ impl Actor {
                 let _ = reply.send(Some(plan));
             }
             Cmd::ClaimFor { viewer, reply } => {
-                let info = self.state.fleet.slots.values().find_map(|s| {
-                    let c = s.claim.as_ref().filter(|c| c.viewer == viewer)?;
-                    let ready =
-                        s.observed.phase == "running" && s.observed.generation >= c.generation;
-                    Some(ClaimMsg {
-                        id: c.session.clone(),
-                        tile: c.borrowed.clone(),
-                        phase: if ready { "running" } else { "restoring" }.into(),
-                        frame_url: if ready {
-                            fleet_core::view::frame_urls(&self.state, s).0
-                        } else {
-                            None
-                        },
-                        frame_url_v4: if ready {
-                            fleet_core::view::frame_urls(&self.state, s).1
-                        } else {
-                            None
-                        },
-                        token: c.token.clone(),
-                        clicked_at: c.claimed_at,
-                        first_frame_at: c.first_frame_at,
-                        expires_at: c.expires_at,
-                        gpu: s.gpu.as_ref().map(|g| g.name.clone()),
-                        phases: if ready {
-                            s.observed.timings.clone()
-                        } else {
-                            Default::default()
-                        },
-                        camera: c.camera.clone(),
-                        autopilot: c.autopilot,
-                        ended: None,
-                    })
-                });
-                let _ = reply.send(info);
+                let _ = reply.send(self.claim_msg(&viewer));
             }
             Cmd::AgentHello {
                 conn,
@@ -1783,6 +1836,60 @@ mod store_tests {
         tx.send(true).unwrap();
         assert!(store_lost(&lost));
         assert!(!owns_the_state(true, &lost), "another writer took it");
+    }
+
+    /// A committed claim comes back with its receipt, read in the turn that applied it: a
+    /// second actor command (`ClaimFor`) could find it already ended, and leave the page with
+    /// a receipt and no claim to be told ended.
+    #[tokio::test]
+    async fn a_submitted_claim_comes_back_with_its_receipt() {
+        let out = Outputs {
+            snapshot: watch::channel(snapshot_of(&State::new(Config::default(), 0))).0,
+            ec2: watch::channel(Vec::new()).0,
+            ec2_layout: watch::channel(None).0,
+            broadcast_layout: watch::channel(None).0,
+            power: watch::channel(String::new()).0,
+            scene: watch::channel(None).0,
+            budget: watch::channel(None).0,
+            zone: None,
+            store: None,
+            owned: watch::channel(true).0,
+        };
+        let cfg = Config {
+            max_tiles: 1,
+            ..Config::default()
+        };
+        let mut actor = Actor::new(State::new(cfg, 0), out, Box::new(|| 1_000));
+        let hello: Event = serde_json::from_value(serde_json::json!({"at": 0, "type": "agent",
+            "host": "h1", "msg": {"type": "hello", "host": "h1", "arch": "x86_64",
+            "capacity": 2, "gpus": [{"name": "Tesla T4", "sbdf": "0000:01:00.0"},
+                                    {"name": "Tesla T4", "sbdf": "0000:02:00.0"}]}}))
+        .unwrap();
+        actor.handle(Cmd::Apply {
+            event: hello,
+            reply: None,
+        });
+        let (reply, rx) = oneshot::channel();
+        actor.handle(Cmd::Submit {
+            event: Event::Intent {
+                at: 0,
+                viewer: "v-1".into(),
+                client: Some("198.51.100.9".into()),
+                id: "c-0".into(),
+                name: "claim_gpu".into(),
+                args: serde_json::json!({}),
+                check: None,
+                secret: Some("0123456789abcdef0123456789abcdef".into()),
+            },
+            reply,
+        });
+        let s = rx.await.unwrap();
+        assert_eq!(
+            s.receipt.map(|r| r.outcome),
+            Some(fleet_core::Outcome::Committed)
+        );
+        let c = s.claim.expect("the claim with its receipt");
+        assert_eq!(c.id, "claim-1");
     }
 
     /// During a store outage the answers of closed sockets do not pile up: each reconnect

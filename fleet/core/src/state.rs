@@ -460,6 +460,29 @@ pub struct Claim {
     /// standby GPU. A borrowed tile keeps its place in the layout and is drawn black.
     #[serde(default)]
     pub borrowed: Option<String>,
+    /// Set when a coordinator restart carried the claim over: its viewer's connection ended
+    /// with the old process, so `viewer` is empty until a page presents the token
+    /// (`resume_claim`), and the claim ends at this time if none has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_by: Option<u64>,
+}
+
+/// How long after a restart a claim waits for its viewer's page to reconnect and present its
+/// token. A page reconnects within 0.5 to 10 s (`fleet/web/core/net.ts`).
+pub const CLAIM_RESUME_MS: u64 = 30_000;
+
+/// A GPU claim a restart carried over whose host's agent has not said hello again yet: it goes
+/// back on the slot of that GPU when the agent does (`apply::hello`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldClaim {
+    pub host: String,
+    pub sbdf: String,
+    /// The number of the slot (`slot-<n>`) the claim was on. The GPU gets that number back
+    /// when its host says hello, and no other GPU takes it meanwhile: the agent keys its VMs by
+    /// slot id, and a GPU under a new id would have the claim's VM torn down.
+    #[serde(default)]
+    pub slot: Option<u32>,
+    pub claim: Claim,
 }
 
 /// One tile's part in a race.
@@ -775,6 +798,9 @@ pub struct Fleet {
     /// Every host whose agent registered, since this coordinator started or resumed.
     #[serde(default)]
     pub registrations: Registrations,
+    /// GPU claims a restart carried over, waiting for their host's agent (see [`HeldClaim`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_claims: Vec<HeldClaim>,
 }
 
 /// The hosts whose agent said hello to this coordinator, by name (the EC2 instance id), since
@@ -905,6 +931,7 @@ impl State {
                     since: now_ms,
                     hosts: BTreeMap::new(),
                 },
+                held_claims: Vec::new(),
             },
             config,
             receipts: BTreeMap::new(),
@@ -912,10 +939,16 @@ impl State {
         }
     }
 
-    /// The state a restarted coordinator resumes from: the scene, the director, the races,
-    /// receipts, the action log, the per-address limits and the version carry over; hosts,
-    /// their slots, claims and viewers do not, because no agent or browser connection
-    /// survives the restart.
+    /// The state a restarted coordinator resumes from. Everything a viewer was told is
+    /// stored (the coordinator sends a receipt only once a stored state holds its change), so
+    /// what follows is decided per item: what can be restored is restored, and what was bound
+    /// to the old process, or to a connection that ended with it, is released.
+    ///
+    /// Kept: the scene, the director and the open stop vote (below), finished races,
+    /// receipts, the action log, the per-address limits, GPU claims (below), quarantines and
+    /// the version. Dropped: hosts and their slots, viewers and the rest listed below, because
+    /// no agent or browser connection survives the restart; agents say hello again and report
+    /// their slots, and pages reconnect.
     pub fn resumed(mut self, config: Config, now_ms: u64) -> Self {
         let f = &mut self.fleet;
         // the ladder and the records stay; the round and the players went with the agent
@@ -925,14 +958,52 @@ impl State {
             since: now_ms,
             hosts: BTreeMap::new(),
         };
+        // Restored: a GPU claim. Its VM runs on its host under the agent, which outlives the
+        // coordinator, and the claim carries a token only its viewer's page holds, so the page
+        // that reconnects proves it is that viewer (`resume_claim`). The viewer id is cleared:
+        // ids restart at v-1 with the process, and an old id would hand the claim to whichever
+        // new page gets it. A claim whose time ran out while the coordinator was down ends as
+        // the tick would have ended it.
+        let mut held = std::mem::take(&mut f.held_claims);
+        for (n, s) in f.slots.iter_mut() {
+            let (Some(c), Some(host), Some(gpu)) = (s.claim.take(), &s.host, &s.gpu) else {
+                continue;
+            };
+            if c.expires_at <= now_ms {
+                f.last_claim_end.insert(c.client.clone(), c.expires_at);
+                continue;
+            }
+            held.push(HeldClaim {
+                host: host.clone(),
+                sbdf: gpu.sbdf.clone(),
+                slot: Some(*n),
+                claim: c,
+            });
+        }
+        held.retain(|h| {
+            let keep = h.claim.expires_at > now_ms;
+            if !keep {
+                f.last_claim_end
+                    .insert(h.claim.client.clone(), h.claim.expires_at);
+            }
+            keep
+        });
+        for h in &mut held {
+            h.claim.viewer.clear();
+            h.claim.resume_by = Some(now_ms + CLAIM_RESUME_MS);
+        }
+        f.held_claims = held;
         f.hosts.clear();
         f.slots.clear();
+        // Released: a borrowed phone. Its borrower is known only by its connection id (no
+        // token), so no page that reconnects can show it was the borrower; the borrow ends
+        // as it would when that viewer left, and the phone is free when its host says hello.
         f.phones.clear();
-        // A lent sandbox's claim goes with the process; its host may come back running the
+        // Released, for the same reason: a lent sandbox. Its host may come back running the
         // borrower's desktop, so it is reset then, and the cooldown runs from now.
         crate::apply::forget_windows(f, |_| true, now_ms);
-        // The same for a lent Minecraft server: its host may come back running the borrower's
-        // world.
+        // Released, for the same reason: a lent Minecraft server. Its host may come back
+        // running the borrower's world.
         crate::apply::forget_minecraft(f, |_| true, now_ms);
         f.ec2.clear();
         f.n = 0;
@@ -948,14 +1019,16 @@ impl State {
         f.power.last_arrival_at.get_or_insert(now_ms);
         // The EC2 aggregator's names were for the previous coordinator's addresses.
         f.ec2_aggregate_published = None;
-        // A race interrupted by the restart cannot finish (its slots come back at
-        // generation 1), on either half.
+        // Released: a race the restart interrupted. Its times are the coordinator's sightings
+        // of each tile's first frame, and those during the restart were not seen, so it can
+        // never finish with a true time (and its slots come back at generation 1), on either
+        // half. Its tiles keep running.
         let finished = |h: &HalfRace| h.done_at.is_some() || h.tiles.is_empty();
         f.races.retain(|r| finished(&r.fcvm) && finished(&r.ec2));
         f.next_race_at = config.race_interval_secs.map(|s| now_ms + s * 1000);
-        // The open stop vote keeps its votes when the stored offer is the open round's: a vote
-        // is answered only once a stored state holds it. A stored vote whose offer is not that
-        // round's describes a round already decided, and starts again.
+        // Restored: the open stop vote, when the stored votes are for the round still open
+        // (a vote is answered only once a stored state holds it). A stored vote whose offer is
+        // not that round's describes a round already decided, and starts again.
         let now_t = f.scene.t_at(now_ms);
         f.director.resume_vote(now_t);
         self.config = config;

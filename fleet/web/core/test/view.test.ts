@@ -436,6 +436,7 @@ describe("your own GPU", () => {
     camera: [{ t: 0, x: 0, y: 0, zoom: 1 }],
     autopilot: true,
     ended: null,
+    token: null,
     ...over,
   });
 

@@ -1523,7 +1523,7 @@ test("your own GPU: a wall tile's GPU is lent, streams full screen with its own 
   // The cap: no second loan, and the button says why and when.
   await expect(other.getByTestId("own-gpu")).toBeDisabled();
   await expect(other.getByTestId("own-note")).toHaveText(/^the one GPU we lend is out; try again in 0:\d\d$/);
-  await other.evaluate(() => window.__fleet!.client.act("claim_gpu"));
+  await other.evaluate(() => window.__fleet!.client.act("claim_gpu", { token: crypto.randomUUID().replace(/-/g, "") }));
   await expect(other.getByTestId("own-refused")).toContainText(/^No GPU is free right now: all 1 GPUs we lend are out; the next comes back in \d+ s\. Try again in a minute\./);
   // The private stream arrives; the timer stops at the coordinator's click-to-first-frame.
   await expect(page.getByTestId("own-status")).toHaveText("Your GPU is streaming", { timeout: 10_000 });
