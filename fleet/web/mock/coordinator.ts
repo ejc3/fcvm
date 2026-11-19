@@ -99,6 +99,8 @@ const RETILE_LEAD_FRAMES = 15;
 const RECLAIM_KEPT_MS = 60_000;
 /** Races the scoreboard's medians are over. */
 const RACES_KEPT = 20;
+/** Why a claim_gpu without the page's token is refused (src/fleet/coord/live.rs CLAIM_TOKEN_REFUSAL). */
+const CLAIM_TOKEN_REFUSAL = "claim_gpu needs args.token: 32 to 128 letters, digits, - or _, made by the page";
 /** Why a late viewer's claim_gpu or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
 const LATE_CLAIM = "direct streams are full, so this page watches the broadcast";
 
@@ -173,6 +175,8 @@ interface CameraKey {
 
 interface ClaimRuntime {
   id: string;
+  /** The token the page sent with its claim_gpu, sent back in every claim message. */
+  token: string;
   tile: TileRuntime;
   client: Client;
   phase: "restoring" | "running" | "ended";
@@ -687,6 +691,12 @@ export class MockCoordinator {
       this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
       return;
     }
+    // A claim without the page's token is refused unrecorded once the connection is verified,
+    // as the coordinator does (live.rs `claim_token`), before its receipt is looked up.
+    if (client.verified && name === "claim_gpu" && !(typeof args["token"] === "string" && /^[A-Za-z0-9_-]{32,128}$/.test(args["token"]))) {
+      this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: CLAIM_TOKEN_REFUSAL, version: 0 });
+      return;
+    }
     const seen = this.receipts.get(id);
     if (seen) {
       this.sendTo(client, await seen);
@@ -701,8 +711,10 @@ export class MockCoordinator {
   }
 
   private log(c: Act, summary: string, outcome: string): void {
-    // A refused word's text appears nowhere, not even in its arguments.
-    const args = c.name === "word" && outcome === "refused" ? {} : c.args;
+    // A refused word's text appears nowhere, not even in its arguments; a claim's and a
+    // resume's args are the claim's token, which only its viewer holds (fleet-core apply.rs).
+    const hidden = (c.name === "word" && outcome === "refused") || c.name === "claim_gpu" || c.name === "resume_claim";
+    const args = hidden ? {} : c.args;
     this.actions = [...this.actions, { at: this.now(), viewer: c.viewer, id: c.id, name: c.name, args, summary, outcome }].slice(-50);
   }
 
@@ -799,6 +811,7 @@ export class MockCoordinator {
       }
       case "claim_gpu": {
         if (client.claim && client.claim.phase !== "ended") return this.refuse(c, "you already have one");
+        const token = c.args["token"] as string;
         const lent = this.lent();
         if (lent.length >= this.opts.borrowCap) {
           const back = Math.min(...lent.map((t) => t.borrowed!.until));
@@ -807,7 +820,7 @@ export class MockCoordinator {
         if (this.raceRunning()) return this.refuse(c, "a restart of every GPU is running; try again when it is done");
         const tile = [...this.tiles].reverse().find((t) => t.half === "fcvm" && t.slot && t.phase === "running" && !t.borrowed);
         if (!tile) return this.refuse(c, "no fcvm GPU is streaming to lend");
-        this.startClaim(client, tile);
+        this.startClaim(client, tile, token);
         return this.committed(c, `claim ${tile.slot}`);
       }
       case "release_gpu": {
@@ -1345,6 +1358,7 @@ export class MockCoordinator {
         camera: cl.camera,
         autopilot: cl.autopilot,
         ended: cl.ended,
+        token: cl.token,
       },
     };
   }
@@ -1390,11 +1404,12 @@ export class MockCoordinator {
     this.sendTo(cl.client, this.claimMsg(cl));
   }
 
-  private startClaim(client: Client, tile: TileRuntime): void {
+  private startClaim(client: Client, tile: TileRuntime, token: string): void {
     const now = this.now();
     const t = this.sceneNow();
     const cl: ClaimRuntime = {
       id: `claim-${++this.nextClaim}`,
+      token,
       tile,
       client,
       phase: "restoring",

@@ -108,6 +108,11 @@ async fn coordinator(checker: Arc<dyn TextChecker>) -> (String, Handle) {
     (c.url, c.handle)
 }
 
+/// A `claim_gpu`'s args: the token the page makes for each claim.
+fn claim_args() -> Value {
+    json!({"token": uuid::Uuid::new_v4().simple().to_string()})
+}
+
 fn allow_all() -> Arc<dyn TextChecker> {
     Arc::new(FakeCheck {
         refuse: vec![],
@@ -1086,7 +1091,7 @@ async fn a_claims_frame_urls_are_its_launchs_published_names() {
     agent.to_coord.send(report(1, "2001:db8::1")).unwrap();
     let mut a = Viewer::connect_from(&c.url, Some("198.51.100.1")).await;
     a.until(|s| !s["tiles"][0]["frame_url"].is_null()).await;
-    a.intent("c1", "claim_gpu", json!({})).await;
+    a.intent("c1", "claim_gpu", claim_args()).await;
     assert_eq!(a.receipt("c1").await["outcome"], "committed");
     agent.assign().await;
     agent.to_coord.send(report(2, "2001:db8::1")).unwrap();
@@ -1361,7 +1366,7 @@ async fn a_claim_borrows_a_tile_and_only_its_viewer_gets_the_frames() {
     let mut b = Viewer::connect_from(&url, Some("198.51.100.2")).await;
     b.until(|s| s["tiles"][1]["phase"] == "running").await;
 
-    a.intent("c1", "claim_gpu", json!({})).await;
+    a.intent("c1", "claim_gpu", claim_args()).await;
     let r = a.receipt("c1").await;
     assert_eq!(r["outcome"], "committed", "{r}");
     let slots = loop {
@@ -1377,12 +1382,12 @@ async fn a_claim_borrows_a_tile_and_only_its_viewer_gets_the_frames() {
     );
     assert!(slots[0].private_camera.is_none());
 
-    b.intent("c2", "claim_gpu", json!({})).await;
+    b.intent("c2", "claim_gpu", claim_args()).await;
     assert_eq!(
         b.receipt("c2").await["reason"],
         "1 of 1 wall tiles are already lent to visitors; try again when one returns"
     );
-    a.intent("c3", "claim_gpu", json!({})).await;
+    a.intent("c3", "claim_gpu", claim_args()).await;
     assert_eq!(
         a.receipt("c3").await["reason"],
         "one GPU per client at a time"
@@ -5034,7 +5039,7 @@ async fn a_claim_that_ends_while_its_receipt_waits_is_told_as_ended() {
     agent.assign().await;
     let mut v = Viewer::connect(&c.url).await;
     v.until(|s| s["fleet"]["n"] == 1).await;
-    v.intent("c-0", "claim_gpu", json!({})).await;
+    v.intent("c-0", "claim_gpu", claim_args()).await;
     // The claim lasts 1 s; the store ticks find every write failing for 3 s.
     tokio::time::sleep(Duration::from_secs(3)).await;
     failing.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -5074,10 +5079,10 @@ async fn a_claims_watcher_stays_with_its_own_session() {
     agent.assign().await;
     let mut v = Viewer::connect(&c.url).await;
     v.until(|s| s["fleet"]["n"] == 1).await;
-    v.intent("c-0", "claim_gpu", json!({})).await;
+    v.intent("c-0", "claim_gpu", claim_args()).await;
     // The first claim lasts 1 s; the second comes while every write still fails.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    v.intent("c-1", "claim_gpu", json!({})).await;
+    v.intent("c-1", "claim_gpu", claim_args()).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     failing.store(false, std::sync::atomic::Ordering::SeqCst);
     for id in ["c-0", "c-1"] {
@@ -5193,7 +5198,7 @@ async fn acknowledged_state_survives(signal: nix::sys::signal::Signal) {
         .to_string();
     v.intent("l-0", "light", light(3.0)).await;
     v.intent("n-0", "nudge", json!({"target": target})).await;
-    v.intent("c-0", "claim_gpu", json!({})).await;
+    v.intent("c-0", "claim_gpu", claim_args()).await;
     let mut versions = BTreeMap::new();
     for id in ["l-0", "n-0", "c-0"] {
         let r = v.receipt(id).await;
@@ -5231,7 +5236,7 @@ async fn acknowledged_state_survives(signal: nix::sys::signal::Signal) {
     // Each intent sent again: its first receipt, from the stored state.
     w.intent("l-0", "light", light(3.0)).await;
     w.intent("n-0", "nudge", json!({"target": target})).await;
-    w.intent("c-0", "claim_gpu", json!({})).await;
+    w.intent("c-0", "claim_gpu", claim_args()).await;
     for (id, version) in &versions {
         let r = w.receipt(id).await;
         assert_eq!(r["outcome"], "committed", "{r}");
@@ -5276,14 +5281,22 @@ async fn a_claims_token_is_the_one_its_page_sent() {
     let _agent = dial_agent(&c.url).await;
     let mut v = Viewer::connect(&c.url).await;
     v.until(|s| s["fleet"]["n"] == 1).await;
-    v.intent("bad", "claim_gpu", json!({"token": "short"}))
-        .await;
-    let r = v.receipt("bad").await;
-    assert_eq!(
-        (r["outcome"].as_str(), r["version"].as_u64()),
-        (Some("refused"), Some(0)),
-        "{r}"
-    );
+    // A claim needs the page's token: a malformed one, and none at all, are refused
+    // unrecorded (no coordinator-made token stands in for a page that sends none).
+    for (id, args) in [
+        ("bad", json!({"token": "short"})),
+        ("none", json!({})),
+        ("null", json!({"token": null})),
+    ] {
+        v.intent(id, "claim_gpu", args).await;
+        let r = v.receipt(id).await;
+        assert_eq!(
+            (r["outcome"].as_str(), r["version"].as_u64()),
+            (Some("refused"), Some(0)),
+            "{id}: {r}"
+        );
+        assert_eq!(r["reason"], live::CLAIM_TOKEN_REFUSAL, "{id}: {r}");
+    }
     let token = "0123456789abcdef0123456789abcdef";
     v.intent("c-0", "claim_gpu", json!({"token": token})).await;
     let r = v.receipt("c-0").await;
@@ -7636,7 +7649,7 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     assert_eq!(a["seat_free"], false);
     assert_eq!(a["capacity"], 2);
     // A GPU of its own is a direct stream too.
-    late.intent("own", "claim_gpu", json!({})).await;
+    late.intent("own", "claim_gpu", claim_args()).await;
     let r = late.receipt("own").await;
     assert_eq!(r["outcome"], "refused");
     assert_eq!(r["reason"], live::LATE_CLAIM);
@@ -7750,7 +7763,7 @@ async fn the_broadcast_never_streams_a_borrowed_tile() {
     agent.report("slot-2", "running", 1);
     let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
     a.until(|s| s["tiles"][1]["phase"] == "running").await;
-    a.intent("c1", "claim_gpu", json!({})).await;
+    a.intent("c1", "claim_gpu", claim_args()).await;
     assert_eq!(a.receipt("c1").await["outcome"], "committed");
     loop {
         if agent.assign().await[1].private_camera.is_some() {

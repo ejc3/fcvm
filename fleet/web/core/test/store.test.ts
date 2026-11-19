@@ -252,6 +252,40 @@ describe("a viewer's own GPU across a reconnect", () => {
     expect(s.own.requestId).toBeNull();
   });
 
+  it("keeps the request through a resend refused before verification while its resume takes the claim back", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu", { token: "token-a" }), at: EPOCH });
+    // The coordinator restarted before answering; the new connection asks for Turnstile.
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2", turnstile: "site-key" }), EPOCH + 5_000);
+    expect(s.own.resume).toBe("token-a");
+    // The resent claim_gpu, sent on open, is refused unrecorded until the page is verified.
+    s = feed(s, JSON.stringify({ type: "receipt", id: "own", outcome: "refused", reason: "verify first", version: 0 }), EPOCH + 5_100);
+    expect(s.own.requestId).toBe("own");
+    expect(s.own.refused).toBeNull();
+    // Verified, the queued resume goes and takes the stored claim back.
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("r1", "resume_claim", { token: "token-a" }), at: EPOCH + 6_000 });
+    s = feed(s, JSON.stringify({ type: "receipt", id: "r1", outcome: "committed", version: 9 }), EPOCH + 6_500);
+    s = feed(s, withToken("restoring"), EPOCH + 7_000);
+    expect(s.own.claim?.id).toBe("claim-1");
+    expect(s.own.claim?.phase).toBe("restoring");
+  });
+
+  it("takes a claim message only for the token its request sent", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
+    // An earlier claim (token-a) was dismissed; this request sent token-b.
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own-2", "claim_gpu", { token: "token-b" }), at: EPOCH });
+    // The earlier claim's watcher tells it ended, late.
+    s = feed(s, JSON.stringify({ type: "claim", claim: { ...JSON.parse(withToken("ended")).claim, ended: "expired" } }), EPOCH + 1_000);
+    expect(s.own.requestId).toBe("own-2");
+    expect(s.own.claim).toBeNull();
+    // This request's claim arrives and is taken.
+    s = feed(s, JSON.stringify({ type: "claim", claim: { ...JSON.parse(withToken("restoring")).claim, id: "claim-2", token: "token-b" } }), EPOCH + 2_000);
+    expect(s.own.claim?.id).toBe("claim-2");
+    expect(s.own.requestId).toBeNull();
+  });
+
   it("gives up a request whose claim the coordinator no longer holds for it", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
     s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));

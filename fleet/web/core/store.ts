@@ -530,6 +530,9 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             return s;
           }
           if (s.own.claim !== null && s.own.claim.id !== msg.claim.id) return s;
+          // A request's claim carries the token the request sent: a message for another claim
+          // (a watcher ending an earlier session late) is not this request's answer.
+          if (s.own.claim === null && s.own.requestToken !== null && msg.claim.token !== s.own.requestToken) return s;
           const agreed = s.own.autopilot !== null && msg.claim.autopilot === s.own.autopilot.on;
           const own = { ...s.own, requestId: null, claim: msg.claim, autopilot: agreed ? null : s.own.autopilot };
           const cameraWatches = resolveWatches(s.cameraWatches, msg.claim.camera);
@@ -602,7 +605,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             }
           } else if (s.own.requestId === msg.id) {
             // Applied: the claim message (which can come before or after this) ends the request.
-            if (!applied) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
+            // A resend refused unrecorded (`verify first` on a new connection) does not end it
+            // while the page takes its claim back with `resume_claim`: the claim may yet come.
+            const recovering = msg.version === 0 && (s.own.resume !== null || s.own.resumeId !== null);
+            if (!applied && !recovering) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
           } else if (s.own.abandoned === msg.id && !applied) {
             own = { ...s.own, abandoned: null };
           } else if (s.own.autopilot?.id === msg.id && !applied) {

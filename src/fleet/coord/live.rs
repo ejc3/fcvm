@@ -823,9 +823,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     // A page taking back its claim after a restart is told about it as a new
                     // claim is.
                     let tells = claim || name == "resume_claim";
-                    // The claim's token is the page's own when it sends one, so a page that
-                    // reconnects before it heard about its claim can still take it back
-                    // (`resume_claim`); an older page gets one made here.
+                    // The claim's token is the page's own, so a page that reconnects before it
+                    // heard about its claim can still take it back (`resume_claim`); a claim
+                    // without one is refused, unrecorded.
                     let secret = if claim {
                         match claim_token(&args) {
                             Ok(t) => Some(t),
@@ -905,11 +905,14 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         .await;
 }
 
+/// Why a `claim_gpu` without a well-formed token is refused (unrecorded).
+pub const CLAIM_TOKEN_REFUSAL: &str =
+    "claim_gpu needs args.token: 32 to 128 letters, digits, - or _, made by the page";
+
 /// The token of a `claim_gpu`: the page's own (`args.token`, 32 to 128 letters, digits, `-`
-/// or `_`), or one made here when the page sends none.
+/// or `_`), which the page needs to take the claim back after a reconnect.
 pub fn claim_token(args: &serde_json::Value) -> Result<String, &'static str> {
     match args.get("token") {
-        None | Some(serde_json::Value::Null) => Ok(uuid::Uuid::new_v4().simple().to_string()),
         Some(serde_json::Value::String(t))
             if (32..=128).contains(&t.len())
                 && t.bytes()
@@ -917,7 +920,7 @@ pub fn claim_token(args: &serde_json::Value) -> Result<String, &'static str> {
         {
             Ok(t.clone())
         }
-        Some(_) => Err("args.token must be 32 to 128 letters, digits, - or _"),
+        _ => Err(CLAIM_TOKEN_REFUSAL),
     }
 }
 

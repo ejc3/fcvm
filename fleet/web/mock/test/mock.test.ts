@@ -529,8 +529,15 @@ describe("mock race, second design review", () => {
   it("lends a wall GPU: the tile is borrowed and sits out races, the claim streams, then the tile restores", async () => {
     const c = await live();
     const other = await live();
-    c.ws.send(JSON.stringify({ type: "intent", id: `claim-${Date.now()}`, name: "claim_gpu", args: {} }));
-    expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "committed" });
+    // Without the page's token a claim is refused unrecorded, with the coordinator's reason.
+    const tokenReason = /pub const CLAIM_TOKEN_REFUSAL: &str =\s*"([^"]+)";/.exec(readFileSync("../../src/fleet/coord/live.rs", "utf8"))?.[1];
+    expect(tokenReason).toBeDefined();
+    const none = `claim-none-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id: none, name: "claim_gpu", args: {} }));
+    expect(await c.next((m) => m["type"] === "receipt" && m["id"] === none)).toMatchObject({ outcome: "refused", reason: tokenReason, version: 0 });
+    const ok = `claim-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id: ok, name: "claim_gpu", args: { token: "a".repeat(32) } }));
+    expect(await c.next((m) => m["type"] === "receipt" && m["id"] === ok)).toMatchObject({ outcome: "committed" });
     const first = await c.next((m) => m["type"] === "claim");
     const claim = first["claim"] as Record<string, unknown>;
     expect(claim).toMatchObject({ phase: "restoring", frame_url: null, tile: "fcvm:2" });
@@ -538,7 +545,7 @@ describe("mock race, second design review", () => {
     expect(tile().phase).toBe("borrowed");
     expect(coord.fleetState().borrow).toMatchObject({ cap: 1, lent: 1 });
     // The cap: a second viewer is told when to try again.
-    other.ws.send(JSON.stringify({ type: "intent", id: `claim2-${Date.now()}`, name: "claim_gpu", args: {} }));
+    other.ws.send(JSON.stringify({ type: "intent", id: `claim2-${Date.now()}`, name: "claim_gpu", args: { token: "b".repeat(32) } }));
     const refused = await other.next((m) => m["type"] === "receipt");
     expect(String(refused["reason"])).toMatch(/^all 1 GPUs we lend are out; the next comes back in \d+ s$/);
     const running = await c.next((m) => m["type"] === "claim" && (m["claim"] as { phase: string }).phase === "running");
@@ -836,7 +843,7 @@ describe("mock phones", () => {
       // The coordinator's own reason (src/fleet/coord/live.rs LATE_CLAIM), answered before the intent is applied (version 0).
       const reason = /pub const LATE_CLAIM: &str =\s*"([^"]+)";/.exec(readFileSync("../../src/fleet/coord/live.rs", "utf8"))?.[1];
       expect(reason).toBeDefined();
-      expect(await send(late, "claim_gpu")).toMatchObject({ outcome: "refused", reason, version: 0 });
+      expect(await send(late, "claim_gpu", { token: "c".repeat(32) })).toMatchObject({ outcome: "refused", reason, version: 0 });
       expect(await send(late, "claim_phone")).toMatchObject({ outcome: "refused", reason, version: 0 });
       expect(actions()).toBe(before);
       expect(phonesNow().tiles.every((t) => t.borrowed === null)).toBe(true);
