@@ -139,7 +139,7 @@ class TileNginxTests(unittest.TestCase):
         try:
             while b"\r\n" not in reply and (chunk := s.recv(65536)):
                 reply += chunk
-        except (ssl.SSLEOFError, ConnectionResetError):
+        except (ssl.SSLEOFError, ConnectionResetError, BrokenPipeError):
             pass
         if not reply:
             s.close()

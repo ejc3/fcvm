@@ -6256,7 +6256,7 @@ async fn cmd_snapshot_run_disk_only(
         .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
-    let mut run_args = run_args_from_snapshot_metadata(
+    let run_args = run_args_from_snapshot_metadata(
         meta,
         &port_mappings,
         vm_name,
@@ -6280,7 +6280,10 @@ async fn cmd_snapshot_run_disk_only(
         ),
         args.host_ipv6,
     );
-    run_args.publish_limit_per_source = args.publish_limit_per_source;
+    let run_args = RunArgs {
+        publish_limit_per_source: args.publish_limit_per_source,
+        ..run_args
+    };
 
     info!(
         snapshot = %snapshot_name,
