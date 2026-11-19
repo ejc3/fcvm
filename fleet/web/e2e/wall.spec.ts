@@ -1442,25 +1442,38 @@ test("a quarantined GPU leaves the wall and the strip says which and why; a dark
   await expect(page.getByTestId(`dark-${id}`)).toHaveCount(0, { timeout: 45_000 });
 });
 
-test("Turnstile: the first action waits for the check, then goes through", async ({ page, browser }) => {
-  await admin("/mock/turnstile", { sitekey: "example-sitekey" });
-  const stub = () => {
-    window.turnstile = {
-      render(el: HTMLElement, o: { callback: (t: string) => void }) {
-        const b = document.createElement("button");
-        b.textContent = "Verify (test)";
-        b.onclick = () => o.callback("mock-pass");
-        el.appendChild(b);
-        return "w";
-      },
-      remove() {},
-    };
+/** A Turnstile widget for tests, run in the page: a button that hands it the next of `ts`, one per render. */
+function turnstileStub(ts: string[]) {
+  let n = 0;
+  window.turnstile = {
+    render(el: HTMLElement, o: { callback: (t: string) => void }) {
+      const token = ts[Math.min(n++, ts.length - 1)]!;
+      const b = document.createElement("button");
+      b.textContent = "Verify (test)";
+      b.onclick = () => o.callback(token);
+      el.appendChild(b);
+      return "w";
+    },
+    remove() {},
   };
+}
+
+async function tilesSynced(page: Page): Promise<number> {
+  return page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0);
+}
+
+test("Turnstile: an unchecked page gets the check at once and no direct stream; it streams once it passes, and its first action waits for it", async ({ page, browser }) => {
+  await admin("/mock/turnstile", { sitekey: "example-sitekey" });
   try {
-    await page.addInitScript(stub);
-    await openWall(page, 15);
+    await page.addInitScript(turnstileStub, ["mock-pass"]);
+    await openWall(page, 0);
+    // Shown before any action: the coordinator seats the page only once it passes.
+    await expect(page.locator(".verify-pop [data-testid=verify]")).toBeVisible();
+    await expect(page.locator(".verify-pop")).toContainText("One check, then every VM's own stream");
+    await page.waitForTimeout(1500);
+    expect(await tilesSynced(page)).toBe(0);
     await page.getByTestId("play").click();
-    await expect(page.getByTestId("verify")).toBeVisible();
+    await expect(page.getByTestId("drawer").getByTestId("verify")).toBeVisible();
     await page.getByTestId("nudge-nebula").click();
     // Held, not sent: nothing reached the coordinator yet.
     await expect(page.getByTestId("nudge-nebula")).toContainText("0 votes");
@@ -1468,11 +1481,12 @@ test("Turnstile: the first action waits for the check, then goes through", async
     await expect(page.getByTestId("verify")).toHaveCount(0);
     await expect(page.getByTestId("nudge-nebula")).toContainText("1 vote");
     await expect(page.getByTestId("nudge-nebula")).toHaveAttribute("aria-pressed", "true");
+    await expect.poll(() => tilesSynced(page), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 
-    // With the drawer closed, the first press brings the check to the button.
+    // With the drawer closed, the check is already at the button.
     const other = await (await browser.newContext()).newPage();
-    await other.addInitScript(stub);
-    await openWall(other, 15);
+    await other.addInitScript(turnstileStub, ["mock-pass"]);
+    await openWall(other, 0);
     await other.getByTestId("restart-all").click();
     await expect(other.locator(".verify-pop [data-testid=verify]")).toBeVisible();
     expect((await fleetNow()).relaunch_all?.by ?? "").not.toMatch(/^v-/);
@@ -1482,22 +1496,29 @@ test("Turnstile: the first action waits for the check, then goes through", async
   }
 });
 
+test("Turnstile: a failed check says it could not verify, and Retry starts the widget again", async ({ page }) => {
+  await admin("/mock/turnstile", { sitekey: "example-sitekey" });
+  try {
+    await page.addInitScript(turnstileStub, ["mock-fail", "mock-pass"]);
+    await openWall(page, 0);
+    await page.getByRole("button", { name: "Verify (test)" }).click();
+    await expect(page.getByTestId("verify-error")).toHaveText("Couldn't verify — retry");
+    expect(await tilesSynced(page)).toBe(0);
+    await page.getByTestId("verify-retry").click();
+    await expect(page.getByTestId("verify-error")).toHaveCount(0);
+    await page.getByRole("button", { name: "Verify (test)" }).click();
+    await expect(page.getByTestId("verify")).toHaveCount(0);
+    await expect.poll(() => tilesSynced(page), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+  } finally {
+    await admin("/mock/turnstile", { sitekey: null });
+  }
+});
+
 test("Turnstile: the check shows in the About panel too, for an action queued while it is open", async ({ page }) => {
   await admin("/mock/turnstile", { sitekey: "example-sitekey" });
   try {
-    await page.addInitScript(() => {
-      window.turnstile = {
-        render(el: HTMLElement, o: { callback: (t: string) => void }) {
-          const b = document.createElement("button");
-          b.textContent = "Verify (test)";
-          b.onclick = () => o.callback("mock-pass");
-          el.appendChild(b);
-          return "w";
-        },
-        remove() {},
-      };
-    });
-    await openWall(page, 15);
+    await page.addInitScript(turnstileStub, ["mock-pass"]);
+    await openWall(page, 0);
     await page.getByTestId("menu").click();
     await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "about");
     await page.getByTestId("restart-all").click();

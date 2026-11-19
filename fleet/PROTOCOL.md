@@ -38,14 +38,20 @@ I/O and no randomness, so every viewer sees the same sequence.
 
 The first message on every connection: the id this connection acts as (`actions[].viewer`
 names it, so a page can find its own intents in the shared list), and the Turnstile site
-key when intents need a `verify` first (`null` when they do not).
+key when the connection must `verify` before it is a viewer (`null` when it need not; see
+"Turnstile" below).
 
 ```json
 {"type": "admission", "seat": "<ticket>", "locked": false, "reason": null,
  "direct": {"value": "v1.1761135000.v-17.<mac>", "expires_at": 1761135000000},
  "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761134760000},
- "seat_free": false, "capacity": 500}
+ "seat_free": false, "capacity": 500, "verify": false}
 ```
+
+`verify` is true while the connection has not passed Turnstile: it then has no `seat` and no
+`direct` token, `locked` is true, `reason` is "One check first, then the direct streams.", and
+it watches the broadcast when the fleet runs one (asleep, the page shows the wake reel). Once
+it passes, a new `admission` follows its `verified` and admits it as below.
 
 Second on every connection, then again every 5 minutes with fresh tokens, and to a late
 viewer whenever `seat_free` changes (docs/fleet/ARCHITECTURE.md, "Broadcast mode"). A
@@ -119,7 +125,9 @@ be sent again.
 {"type": "verified", "ok": true, "reason": null}
 ```
 
-The answer to a `verify`.
+The answer to a `verify`. `ok` is false when Cloudflare refused the token and also when
+siteverify could not be asked (an error status, no answer within 10 s, no connection);
+`reason` says which. The page says it could not verify and offers a retry either way.
 
 ```json
 {"type": "claim", "claim": {"id": "claim-3", "tile": "fcvm:5", "phase": "running",
@@ -182,10 +190,24 @@ A message the coordinator could not read; nothing was applied.
 until it reports `visible: false` (the page sends that when its tab has been hidden long
 enough to pause its streams) and again once it reports `true`.
 
-With Turnstile configured (`hello.turnstile` is the site key), every intent is refused
-(`"verify first"`, not recorded) until the connection has sent a token that Cloudflare's
-siteverify accepts; the answer is `verified`. Without it (local runs) every connection
-counts as verified.
+**Turnstile.** With Turnstile configured (`hello.turnstile` is the site key), a connection
+is not a viewer until it has sent a token that Cloudflare's siteverify accepts (the answer is
+`verified`). Until then it receives snapshots and, when the fleet runs one, the broadcast
+(`admission` with `verify` true), but it is not joined: it is not counted in `viewers`, is
+never active, is no arrival (so it neither wakes a sleeping fleet nor holds one awake), holds
+no seat and no direct token, its `visibility` is ignored, and every intent is refused
+(`"verify first"`, not recorded), `wake` included. A siteverify error or timeout fails closed
+the same way: the connection stays as it was and may `verify` again with a new token. Once it
+passes it joins, as an arrival unless its first message carried a ticket or `returning`, and
+is admitted (a seat when one is free, else late). Two things count as verified without a
+token: a seat ticket this coordinator still holds (it was given to a connection that had
+passed; a ticket it does not hold proves nothing), and a request whose headers prove it (a
+valid Cloudflare Access JWT: the owner, and the fleet's CI and smokes through the
+Access-protected hostname). Seat tickets live in the coordinator's memory, so after a
+coordinator restart every page checks again. While the day's GPU budget holds the fleet
+asleep (`power.reason` `budget`) the page shows no check, since nothing a viewer does wakes it
+then. Without Turnstile (staging behind Access, local runs, tests) every connection is
+verified.
 
 Intents:
 
@@ -536,7 +558,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
   that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
   arrival is a new viewer connection (one whose first message carries no seat ticket and
-  not `returning`, see `admission`) or a connected page's `wake` intent. A page that
+  not `returning`, see `admission`; with Turnstile on, at the moment it is verified) or a
+  connected page's `wake` intent. A page that
   reconnects after a network blip or reloads in the same tab sends its ticket and is not an
   arrival; neither is a page turning visible again. A reconnect after the ticket's 60 s
   grace still carries the ticket, so it is not an arrival either. A tab whose storage is
@@ -659,7 +682,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
                   [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
-                 [--trust-cf-connecting-ip] [--access-viewer-address] [--turnstile-secret <secret> --turnstile-site-key <key>]
+                 [--trust-cf-connecting-ip] [--access-viewer-address]
+                 [--turnstile-secret <secret> --turnstile-site-key <key> | --turnstile-secret-id <name or ARN>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
@@ -919,10 +943,15 @@ restores what it can and releases what was bound to the old process:
 - `--race-every` (also `FLEET_RACE_EVERY`) is the owner's race cadence; without it races
   run only on `restart_now`.
 - `--turnstile-secret` and `--turnstile-site-key` (also `FLEET_TURNSTILE_SECRET`,
-  `FLEET_TURNSTILE_SITE_KEY`) turn on Turnstile verification: the site key goes out in
-  each hello, and a `verify` token is checked with
+  `FLEET_TURNSTILE_SITE_KEY`) turn on Turnstile verification ("Turnstile" above): the site key
+  goes out in each hello, and a `verify` token is checked with
   `POST https://challenges.cloudflare.com/turnstile/v0/siteverify` (the secret, the token
-  and the client address).
+  and the client address). `--turnstile-secret-id` (also `FLEET_TURNSTILE_SECRET_ID`) reads
+  both from a Secrets Manager secret instead (a name or ARN, read in `--secrets-region`), JSON
+  with the keys `FLEET_TURNSTILE_SITE_KEY` and `FLEET_TURNSTILE_SECRET`; the coordinator does
+  not start when it cannot read it. Production's is `fcvm-fleet/prod/turnstile`. With
+  neither, verification is off. A siteverify call that fails (not a refusal) is logged at warn
+  with `marker=turnstile-siteverify-error`.
 - `GET /healthz` answers `ok`.
 - `/live` refuses a cross-origin browser with `403`: a request whose `Origin` is neither
   the coordinator's own (`Origin` naming the request's `Host`) nor one given with

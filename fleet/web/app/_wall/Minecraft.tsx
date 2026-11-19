@@ -20,7 +20,7 @@ import {
 } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { McTiles } from "./minecraft-tiles.ts";
-import { TurnstileWidget } from "./Turnstile.tsx";
+import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
 import { WakeCard } from "./Overlays.tsx";
 import { boxOf, sameBox, useMedia } from "./hooks.ts";
@@ -41,21 +41,6 @@ declare global {
   }
 }
 
-function Verify({ client, view }: { client: WallClient; view: MinecraftView }) {
-  const sitekey = client.getState().turnstile.sitekey;
-  if (sitekey === null) return null;
-  return (
-    <div className="verify" data-testid="verify">
-      <p>{view.verify.text}</p>
-      <TurnstileWidget sitekey={sitekey} onToken={(token) => client.verify(token)} onError={(error) => client.dispatch({ type: "turnstile-error", error })} />
-      {view.verify.error ? (
-        <p className="error" role="alert">
-          {view.verify.error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
 
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
 
@@ -469,7 +454,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   }, [client, tiles]);
 
   const resetAllPending = state.pending.some((p) => p.intent.name === "minecraft_reset" && p.intent.args["all"] === true);
-  const needsVerifyPrompt = view.verify.needed && state.turnstile.queued.length > 0;
+  const needsVerifyPrompt = view.verify.prompt;
   const sheetTop = stage ? Math.round(narrow ? stage.y + stage.h * 0.5 + 8 : stage.y) : 0;
   const h = view.header;
 
@@ -579,7 +564,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       {panel ? <Sheet panel={panel} narrow={narrow} top={sheetTop} onGiveBack={giveBack} onPad={input} onRetry={() => tiles.retryNow(panel.id)} /> : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>
-          <Verify client={client} view={view} />
+          <VerifyCard client={client} verify={view.verify} />
         </div>
       ) : null}
       {view.notice ? (

@@ -461,7 +461,9 @@ describe("admission", () => {
       broadcast: { value: "https://playback.example/c.m3u8?token=x", expires_at: 2 },
       seat_free: false,
       capacity: 500,
+      verify: false,
     });
+    expect(parseServerMsg(JSON.stringify({ type: "admission", seat: null, locked: true, reason: null, direct: null, broadcast: null, seat_free: false, capacity: null, verify: true }))).toMatchObject({ verify: true });
   });
 
   it("refuses a malformed admission", () => {

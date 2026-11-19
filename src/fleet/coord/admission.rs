@@ -6,6 +6,9 @@
 //!   closes, for a page that reconnects with its ticket. A viewer that arrives with every
 //!   seat held, or whose client already holds [`SEATS_PER_CLIENT`], is late: broadcast
 //!   only, for the whole connection.
+//! - With Turnstile on, a connection that has not passed it is [`Admitted::Unverified`]: the
+//!   broadcast only, and no seat until it verifies. A seat ticket the coordinator still holds
+//!   counts as verified: it was given to a connection that had passed.
 //! - Direct tokens: `v1.<expiry unix s>.<viewer>.<mac>`, the mac an HMAC-SHA256 of the first
 //!   three fields with the admission key, base64url without padding. Renderers and
 //!   aggregators that hold the key refuse `GET /frames` without a valid one.
@@ -196,6 +199,9 @@ pub enum Admitted {
     /// Its client already held [`SEATS_PER_CLIENT`] seats when it arrived: the broadcast only,
     /// like a late viewer, but a free seat elsewhere is no reason to reload.
     ClientFull,
+    /// Turnstile is on and the connection has not passed it: the broadcast only, until it
+    /// verifies and is admitted again.
+    Unverified,
 }
 
 impl Admitted {
@@ -276,6 +282,20 @@ impl Seats {
             },
         );
         Admitted::Seat { ticket }
+    }
+
+    /// The seat `ticket` names, when this coordinator still holds it (open, or closed within
+    /// the grace); never a new seat. How an unverified connection that kept its ticket gets its
+    /// seat back.
+    pub fn resume(&self, ticket: &str, now: Instant) -> Option<Admitted> {
+        let mut held = self.held.lock().unwrap();
+        self.expire(&mut held, now);
+        let s = held.get_mut(ticket)?;
+        s.open += 1;
+        s.closed_at = None;
+        Some(Admitted::Seat {
+            ticket: ticket.to_string(),
+        })
     }
 
     /// A seated connection closed.
@@ -394,6 +414,8 @@ pub const LATE_REASON: &str = "Direct streams are full, so you are watching the 
 /// What a viewer whose client already holds its direct seats is told.
 pub const CLIENT_FULL_REASON: &str =
     "Your network already has 2 direct streams open, so this page watches the broadcast.";
+/// What a connection that has not passed Turnstile is told.
+pub const UNVERIFIED_REASON: &str = "One check first, then the direct streams.";
 
 /// The admission policy of one coordinator: its seats, the key direct tokens are made with,
 /// and the broadcast's playback.
@@ -467,6 +489,7 @@ impl Gate {
                     broadcast,
                     seat_free: false,
                     capacity: self.seats.capacity(),
+                    verify: false,
                 }
             }
             Admitted::Late => Admission {
@@ -477,6 +500,7 @@ impl Gate {
                 broadcast,
                 seat_free: self.seats.free(client, now),
                 capacity: self.seats.capacity(),
+                verify: false,
             },
             Admitted::ClientFull => Admission {
                 seat: None,
@@ -486,6 +510,17 @@ impl Gate {
                 broadcast,
                 seat_free: false,
                 capacity: self.seats.capacity(),
+                verify: false,
+            },
+            Admitted::Unverified => Admission {
+                seat: None,
+                locked: true,
+                reason: Some(UNVERIFIED_REASON.into()),
+                direct: None,
+                broadcast,
+                seat_free: false,
+                capacity: self.seats.capacity(),
+                verify: true,
             },
         }
     }
@@ -600,6 +635,68 @@ mod tests {
         assert!(
             matches!(s.admit(Some(&ticket), "c", t2), Admitted::Seat { ticket: n } if n != ticket)
         );
+    }
+
+    /// `resume` gives back only a seat the coordinator holds: it never makes one, so a
+    /// connection that has not verified gets no seat from a ticket it made up.
+    #[test]
+    fn resume_returns_only_a_held_seat() {
+        let s = Seats::new(Some(3)).with_grace(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(s.resume("not-a-ticket", t0), None);
+        assert_eq!(s.held(t0), 0, "no seat made");
+        let Admitted::Seat { ticket } = s.admit(None, "c", t0) else {
+            panic!("no seat")
+        };
+        s.release(&ticket, t0);
+        let t1 = t0 + Duration::from_secs(30);
+        assert_eq!(
+            s.resume(&ticket, t1),
+            Some(Admitted::Seat {
+                ticket: ticket.clone()
+            })
+        );
+        s.release(&ticket, t1);
+        assert_eq!(s.resume(&ticket, t1 + Duration::from_secs(61)), None);
+    }
+
+    /// An unverified connection is told to verify and gets the broadcast but no seat and no
+    /// direct token.
+    #[test]
+    fn an_unverified_admission_holds_no_direct_token() {
+        let gate = Gate {
+            seats: Seats::new(Some(10)),
+            key: AdmitKey([1; 32]),
+            playback: Some(Playback::Open("https://playback.example/c.m3u8".into())),
+            tick: Duration::from_secs(10),
+        };
+        let a = gate.message(
+            &Admitted::Unverified,
+            "v-1",
+            "c",
+            Some("https://wall.example"),
+            1_000_000,
+            Instant::now(),
+        );
+        assert!(a.verify);
+        assert_eq!(a.seat, None);
+        assert_eq!(a.direct, None);
+        assert!(a.locked);
+        assert_eq!(a.reason.as_deref(), Some(UNVERIFIED_REASON));
+        assert_eq!(
+            a.broadcast.map(|b| b.value).as_deref(),
+            Some("https://playback.example/c.m3u8")
+        );
+        assert!(Admitted::Unverified.late());
+        let seated = gate.message(
+            &Admitted::Seat { ticket: "t".into() },
+            "v-1",
+            "c",
+            None,
+            1_000_000,
+            Instant::now(),
+        );
+        assert!(!seated.verify);
     }
 
     #[test]

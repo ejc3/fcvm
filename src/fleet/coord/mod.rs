@@ -1631,7 +1631,19 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             }
         });
     }
-    let verifier: Arc<dyn turnstile::Verifier> = match args.turnstile_secret {
+    let (turnstile_secret, turnstile_site_key) = match &args.turnstile_secret_id {
+        Some(id) => {
+            let json = secrets::Secrets::new(&secrets_region()?)?
+                .get(id)
+                .await
+                .with_context(|| format!("reading the Turnstile secret {id}"))?;
+            let (site, secret) = turnstile::parse_secret(&json)
+                .with_context(|| format!("reading the Turnstile secret {id}"))?;
+            (Some(secret), Some(site))
+        }
+        None => (args.turnstile_secret, args.turnstile_site_key),
+    };
+    let verifier: Arc<dyn turnstile::Verifier> = match turnstile_secret {
         Some(secret) => Arc::new(turnstile::Siteverify::new(secret, None)?),
         None => Arc::new(turnstile::Off),
     };
@@ -1663,9 +1675,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         checker,
         allowed_origins: args.allowed_origins,
         verifier,
+        proof: Arc::new(turnstile::NoProof),
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
         access_viewer_address: args.access_viewer_address,
-        turnstile_site_key: args.turnstile_site_key,
+        turnstile_site_key,
         poster,
         gate: Arc::new(gate),
         sockets: live::SocketCaps::default(),

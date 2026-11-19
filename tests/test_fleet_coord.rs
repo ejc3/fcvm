@@ -28,6 +28,8 @@ struct Opts {
     config: Config,
     checker: Arc<dyn TextChecker>,
     verifier: Arc<dyn Verifier>,
+    /// What counts as verified without a token.
+    proof: Arc<dyn turnstile::RequestProof>,
     trust_cf: bool,
     access_viewer: bool,
     /// The EC2 aggregator as the coordinator reaches it.
@@ -52,6 +54,7 @@ impl Default for Opts {
             },
             checker: allow_all(),
             verifier: Arc::new(turnstile::Off),
+            proof: Arc::new(turnstile::NoProof),
             trust_cf: true,
             access_viewer: false,
             ec2_local: None,
@@ -86,6 +89,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         verifier: o.verifier,
         trust_cf_connecting_ip: o.trust_cf,
         access_viewer_address: o.access_viewer,
+        proof: o.proof,
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
@@ -834,6 +838,267 @@ async fn intents_wait_for_turnstile() {
     a.intent("l", "light", light(1.0)).await;
     let r = a.nth_receipt("l", 1).await;
     assert_eq!(r["outcome"], "committed", "{r}");
+}
+
+/// A Turnstile verifier for tests that accepts the token `good`.
+fn turnstile_fake() -> Arc<dyn Verifier> {
+    Arc::new(turnstile::Fake {
+        accept: ["good".to_string()].into_iter().collect(),
+    })
+}
+
+/// The latest published state, as a page would read it.
+fn published(handle: &Handle) -> Value {
+    let text = handle.snapshot.borrow().text.clone();
+    serde_json::from_str::<Value>(&text).unwrap()["state"].clone()
+}
+
+/// With Turnstile on, a connection that has not verified is not a viewer: it holds no seat and
+/// no direct token (it watches the broadcast), and it is neither counted nor active. Once
+/// siteverify accepts its token it joins and is seated.
+#[tokio::test]
+async fn an_unverified_connection_neither_joins_nor_takes_a_seat_until_it_verifies() {
+    let gate = test_gate(10, Duration::from_secs(60));
+    let c = coordinator_with(Opts {
+        verifier: turnstile_fake(),
+        site_key: Some("site-key-for-tests".into()),
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let mut a = Viewer::connect(&c.url).await;
+    let mut b = Viewer::connect(&c.url).await;
+    for v in [&mut a, &mut b] {
+        let adm = v.message("admission").await;
+        assert_eq!(adm["verify"], true, "{adm}");
+        assert_eq!(adm["seat"], Value::Null, "{adm}");
+        assert_eq!(
+            adm["direct"],
+            Value::Null,
+            "no direct token before verify: {adm}"
+        );
+        assert_eq!(adm["locked"], true, "{adm}");
+        assert_eq!(
+            adm["broadcast"]["value"], "https://playback.example/channel.m3u8",
+            "an unverified connection watches the broadcast: {adm}"
+        );
+    }
+    b.send(json!({"type": "visibility", "visible": true})).await;
+    assert_eq!(gate.seats.held(Instant::now()), 0, "no seat before verify");
+    // One of them verifies: it joins and is seated; the other is still nobody.
+    a.send(json!({"type": "verify", "token": "good"})).await;
+    assert_eq!(a.message("verified").await["ok"], true);
+    let seated = a
+        .message_where("admission", |m| m["seat"].is_string())
+        .await;
+    assert_eq!(seated["verify"], false, "{seated}");
+    assert!(seated["direct"]["value"].is_string(), "{seated}");
+    let s = a.until(|s| s["viewers"]["count"] == 1).await;
+    assert_eq!(s["viewers"]["active"], 1, "{s}");
+    assert_eq!(gate.seats.held(Instant::now()), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = published(&c.handle);
+    assert_eq!(
+        s["viewers"]["count"], 1,
+        "the unverified connection is not a viewer: {}",
+        s["viewers"]
+    );
+    // The other verifies too.
+    b.send(json!({"type": "verify", "token": "good"})).await;
+    assert!(b
+        .message_where("admission", |m| m["seat"].is_string())
+        .await["direct"]["value"]
+        .is_string());
+    b.until(|s| s["viewers"]["active"] == 2).await;
+}
+
+/// An unverified connection is no arrival: it does not wake a sleeping fleet, and its Wake
+/// button is refused until it verifies. Verifying is its arrival, and the fleet wakes.
+#[tokio::test]
+async fn an_unverified_connection_does_not_wake_the_fleet_and_a_verified_one_does() {
+    let c = coordinator_with(Opts {
+        config: Config {
+            light_interval_ms: 0,
+            power_managed: true,
+            idle_scale_down_secs: 600,
+            sleep_without_new_viewer_secs: 1,
+            ..Config::default()
+        },
+        verifier: turnstile_fake(),
+        site_key: Some("site-key-for-tests".into()),
+        ..Opts::default()
+    })
+    .await;
+    let mut v = Viewer::connect(&c.url).await;
+    assert_eq!(v.message("admission").await["verify"], true);
+    let asleep = v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    let arrived = asleep["fleet"]["power"]["last_arrival_at"].clone();
+    // The Wake button before verifying: refused and not recorded.
+    v.intent("w", "wake", json!({})).await;
+    assert_eq!(v.nth_receipt("w", 0).await["reason"], "verify first");
+    // Another new page that has not verified: no arrival either.
+    let mut other = Viewer::connect(&c.url).await;
+    assert_eq!(other.message("admission").await["verify"], true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = published(&c.handle);
+    assert_eq!(
+        s["fleet"]["power"]["state"], "asleep",
+        "{}",
+        s["fleet"]["power"]
+    );
+    assert_eq!(s["fleet"]["power"]["last_arrival_at"], arrived);
+    assert_eq!(s["viewers"]["count"], 0, "{}", s["viewers"]);
+    // Verified: an arrival, and the fleet wakes.
+    v.send(json!({"type": "verify", "token": "good"})).await;
+    assert_eq!(v.message("verified").await["ok"], true);
+    let s = v.until(|s| s["fleet"]["power"]["state"] != "asleep").await;
+    assert!(
+        s["fleet"]["power"]["last_arrival_at"].as_u64() > arrived.as_u64(),
+        "{}",
+        s["fleet"]["power"]
+    );
+    assert_eq!(s["viewers"]["active"], 1, "{}", s["viewers"]);
+}
+
+/// A siteverify that answers an error, never answers, or cannot be reached fails closed: the
+/// connection is told it is not verified, stays unseated with no direct token, and its intents
+/// are still refused.
+#[tokio::test]
+async fn a_siteverify_outage_leaves_the_connection_unverified() {
+    use axum::routing::post;
+    let serve = |app: axum::Router| async move {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/siteverify", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        url
+    };
+    let error = serve(axum::Router::new().route(
+        "/siteverify",
+        post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down") }),
+    ))
+    .await;
+    let hangs = serve(axum::Router::new().route(
+        "/siteverify",
+        post(|| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            "never"
+        }),
+    ))
+    .await;
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/siteverify", l.local_addr().unwrap())
+    };
+    for url in [error, hangs, closed] {
+        let gate = test_gate(10, Duration::from_secs(60));
+        let verifier = turnstile::Siteverify::with_timeout(
+            "secret-for-tests".into(),
+            Some(url.clone()),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let c = coordinator_with(Opts {
+            verifier: Arc::new(verifier),
+            site_key: Some("site-key-for-tests".into()),
+            gate: Some(gate.clone()),
+            ..Opts::default()
+        })
+        .await;
+        let mut v = Viewer::connect(&c.url).await;
+        assert_eq!(v.message("admission").await["verify"], true);
+        v.send(json!({"type": "verify", "token": "good"})).await;
+        let answer = v.message("verified").await;
+        assert_eq!(answer["ok"], false, "{url}: {answer}");
+        v.intent("l", "light", light(1.0)).await;
+        assert_eq!(
+            v.nth_receipt("l", 0).await["reason"],
+            "verify first",
+            "{url}"
+        );
+        assert!(
+            v.other
+                .iter()
+                .filter(|m| m["type"] == "admission")
+                .all(|m| m["seat"].is_null() && m["direct"].is_null()),
+            "{url}: {:?}",
+            v.other
+        );
+        assert_eq!(gate.seats.held(Instant::now()), 0, "{url}");
+        assert_eq!(published(&c.handle)["viewers"]["count"], 0, "{url}");
+    }
+}
+
+/// A seat ticket this coordinator still holds was given to a verified connection, so a page
+/// that reconnects with it is seated at once, without a new check, and returns (no arrival).
+/// A ticket the coordinator does not hold proves nothing.
+#[tokio::test]
+async fn a_held_seat_ticket_counts_as_verified_and_a_forged_one_does_not() {
+    let gate = test_gate(10, Duration::from_secs(60));
+    let c = coordinator_with(Opts {
+        verifier: turnstile_fake(),
+        site_key: Some("site-key-for-tests".into()),
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let mut a = Viewer::connect(&c.url).await;
+    a.send(json!({"type": "verify", "token": "good"})).await;
+    let ticket = a
+        .message_where("admission", |m| m["seat"].is_string())
+        .await["seat"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.until(|s| s["viewers"]["count"] == 1).await;
+    drop(a);
+    let mut back = Viewer::connect_with_seat(&c.url, &ticket).await;
+    let adm = back.message("admission").await;
+    assert_eq!(adm["seat"], ticket.as_str(), "{adm}");
+    assert_eq!(adm["verify"], false, "{adm}");
+    assert!(adm["direct"]["value"].is_string(), "{adm}");
+    back.until(|s| s["viewers"]["count"] == 1).await;
+    // Intents go through without a verify.
+    back.intent("l", "light", light(1.0)).await;
+    assert_eq!(back.receipt("l").await["outcome"], "committed");
+    let mut forged = Viewer::connect_with_seat(&c.url, "not-a-ticket").await;
+    let adm = forged.message("admission").await;
+    assert_eq!(adm["verify"], true, "{adm}");
+    assert_eq!(adm["seat"], Value::Null, "{adm}");
+    assert_eq!(adm["direct"], Value::Null, "{adm}");
+    assert_eq!(gate.seats.held(Instant::now()), 1);
+}
+
+/// What the request proves ([`turnstile::RequestProof`], a valid Access JWT in production)
+/// counts as verified before any token; a request it does not accept waits for `verify`.
+#[tokio::test]
+async fn a_request_the_proof_accepts_is_verified_from_the_start() {
+    struct HeaderProof;
+    #[async_trait::async_trait]
+    impl turnstile::RequestProof for HeaderProof {
+        async fn verified(&self, headers: &axum::http::HeaderMap) -> bool {
+            headers.get("x-test-proof").is_some_and(|v| v == "yes")
+        }
+    }
+    let gate = test_gate(10, Duration::from_secs(60));
+    let c = coordinator_with(Opts {
+        verifier: turnstile_fake(),
+        proof: Arc::new(HeaderProof),
+        site_key: Some("site-key-for-tests".into()),
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let mut proven = Viewer::connect_seated_with_headers(&c.url, &[("x-test-proof", "yes")]).await;
+    let adm = proven.message("admission").await;
+    assert_eq!(adm["verify"], false, "{adm}");
+    assert!(adm["direct"]["value"].is_string(), "{adm}");
+    proven.until(|s| s["viewers"]["count"] == 1).await;
+    proven.intent("l", "light", light(1.0)).await;
+    assert_eq!(proven.receipt("l").await["outcome"], "committed");
+    let mut not = Viewer::connect_seated_with_headers(&c.url, &[("x-test-proof", "no")]).await;
+    let adm = not.message("admission").await;
+    assert_eq!(adm["verify"], true, "{adm}");
+    assert_eq!(adm["direct"], Value::Null, "{adm}");
 }
 
 #[tokio::test]
@@ -1638,6 +1903,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
         access_viewer_address: false,
+        proof: Arc::new(turnstile::NoProof),
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
@@ -3455,6 +3721,7 @@ async fn page_url(handle: &Handle) -> String {
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
         access_viewer_address: false,
+        proof: Arc::new(turnstile::NoProof),
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),

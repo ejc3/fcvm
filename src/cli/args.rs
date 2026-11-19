@@ -396,15 +396,23 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub access_viewer_address: bool,
 
-    /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
-    /// intent. Without it no verification is asked for (local runs).
+    /// Cloudflare Turnstile secret: a connection must pass `verify` before it joins (counts
+    /// as a viewer or an arrival), takes a seat or sends an intent. Without it, or
+    /// --turnstile-secret-id, no verification is asked for (staging, local runs, tests)
     #[arg(
         long,
         env = "FLEET_TURNSTILE_SECRET",
         hide_env_values = true,
-        requires = "turnstile_site_key"
+        requires = "turnstile_site_key",
+        conflicts_with = "turnstile_secret_id"
     )]
     pub turnstile_secret: Option<String>,
+
+    /// The Turnstile site key and secret from Secrets Manager (a secret name or ARN, read in
+    /// --secrets-region): JSON with the keys FLEET_TURNSTILE_SITE_KEY and
+    /// FLEET_TURNSTILE_SECRET. The coordinator does not start when it cannot read it
+    #[arg(long, env = "FLEET_TURNSTILE_SECRET_ID")]
+    pub turnstile_secret_id: Option<String>,
 
     /// The Turnstile site key the page's widget uses, sent in each connection's hello
     #[arg(long, env = "FLEET_TURNSTILE_SITE_KEY", requires = "turnstile_secret")]

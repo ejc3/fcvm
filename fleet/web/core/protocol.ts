@@ -700,6 +700,11 @@ export interface Admission {
   /** A late viewer: a new connection would get a seat now. */
   seat_free: boolean;
   capacity: number | null;
+  /**
+   * The connection must pass Turnstile before it is seated: until then it has no seat and no
+   * direct token, and watches the broadcast when there is one.
+   */
+  verify: boolean;
 }
 
 export interface AdmissionMsg extends Admission {
@@ -1431,6 +1436,7 @@ function parseAdmission(v: Obj): AdmissionMsg {
     broadcast: parseToken(v, "broadcast", w),
     seat_free: v["seat_free"] === true,
     capacity: typeof capacity === "number" ? capacity : null,
+    verify: v["verify"] === true,
   };
 }
 

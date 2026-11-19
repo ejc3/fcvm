@@ -5,6 +5,8 @@
 // it are sent once the coordinator says the connection is verified.
 
 import { useEffect, useRef } from "react";
+import type { VerifyView } from "../../core/index.ts";
+import type { WallClient } from "./wall-client.ts";
 
 const SCRIPT = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
 
@@ -63,4 +65,30 @@ export function TurnstileWidget({ sitekey, onToken, onError }: { sitekey: string
     };
   }, [sitekey]);
   return <div ref={el} className="turnstile" data-testid="turnstile" />;
+}
+
+/**
+ * The check as every mode shows it: what it is for, the widget, and after a failed check
+ * (refused, or Cloudflare unreachable) `COULD_NOT_VERIFY` beside a Retry button that starts
+ * the widget again.
+ */
+export function VerifyCard({ client, verify }: { client: WallClient; verify: VerifyView }) {
+  const ts = client.getState().turnstile;
+  if (ts.sitekey === null || !verify.widget) return null;
+  return (
+    <div className="verify" data-testid="verify">
+      <p>{verify.text}</p>
+      <TurnstileWidget key={ts.attempt} sitekey={ts.sitekey} onToken={(token) => client.verify(token)} onError={(error) => client.dispatch({ type: "turnstile-error", error })} />
+      {verify.error ? (
+        <p className="error" role="alert" data-testid="verify-error">
+          {verify.error}
+        </p>
+      ) : null}
+      {verify.retry ? (
+        <button type="button" className="btn" data-testid="verify-retry" onClick={() => client.dispatch({ type: "turnstile-retry" })}>
+          {verify.retry}
+        </button>
+      ) : null}
+    </div>
+  );
 }
