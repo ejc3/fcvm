@@ -455,8 +455,13 @@ def prove_resolves(tile):
 
 # The modes a viewer can open, and where the coordinator's state lists their tiles.
 MODES = ("wall", "phones", "windows", "minecraft", "potato")
-# A frame decoded to a flat image is a blank tile: its luma spread (brightest less darkest, of
-# 255) must reach this. A rendered scene, a phone's screen and a desktop all exceed it.
+# A picture whose luma spread (brightest less darkest, of 255) is below this is flat. A tile is
+# blank when every picture it sends within PROBE_SECONDS is flat. One flat picture is not enough:
+# the wall's scene fills tiles with one tone for seconds at a time. Measured on staging
+# 2026-11-19: inside the cloud layer during a dive every tile but the one carrying the clock is
+# uniform (13 of 14 failed one smoke), the night between dusk and dawn draws the ground black
+# (spread 0, mean 0), and open sky in a corner reads 3 to 12. The longest such stretch seen on
+# one tile, sampled every 2 s for 11 minutes, was 10.3 s.
 FLAT_SPREAD = 16
 # How long one tile may take to give its first payload, and to accept TCP and finish TLS.
 PROBE_SECONDS = 40
@@ -692,12 +697,32 @@ def decode(units, width, height):
 
 
 def prove_stream(connection, deadline, probe):
-    """A frame stream: its header, then FCVF frames from a keyframe that decode to a picture
-    that is not flat. Returns the picture's size and luma spread."""
-    header, units, size = None, [], None
+    """A frame stream: its header, then FCVF frames that decode to a picture that is not flat.
+    A flat picture is followed by the next keyframe's (a renderer sends one at least every 2 s)
+    until one is not flat or the probe's time is up. Returns the size and luma spread of the
+    first picture that is not flat, and how many flat ones came before it."""
+    header, units, size, flat = None, [], None, []
     probe.step = "stream header"
+
+    def judge():
+        """The picture of `units`: the probe's detail when it is not flat, else None."""
+        picture = decode(units, *size)
+        spread = max(picture) - min(picture)
+        if spread >= FLAT_SPREAD:
+            detail = {"width": size[0], "height": size[1], "lumaSpread": spread}
+            if flat:
+                detail["flatPictures"] = len(flat)
+            return detail
+        flat.append((spread, round(sum(picture) / len(picture))))
+        return None
+
     while time.monotonic() < deadline:
-        opcode, payload = connection.message(deadline)
+        try:
+            opcode, payload = connection.message(deadline)
+        except TimeoutError:
+            if not flat:
+                raise
+            break
         if opcode == 1 and header is None:
             try:
                 header = json.loads(payload)
@@ -722,14 +747,20 @@ def prove_stream(connection, deadline, probe):
         units.append(payload[22:])
         probe.step = "decode"
         if len(units) >= 4:
-            break
-    if not units:
+            detail = judge()
+            if detail:
+                return detail
+            units, size = [], None
+            probe.step = "a picture that is not flat"
+    if units:
+        detail = judge()
+        if detail:
+            return detail
+    if not flat:
         raise TimeoutError("the tile sent no keyframe in time")
-    picture = decode(units, *size)
-    spread = max(picture) - min(picture)
-    if spread < FLAT_SPREAD:
-        raise AssertionError("the tile's first picture is flat: a blank tile")
-    return {"width": size[0], "height": size[1], "lumaSpread": spread}
+    probe.seen = {"flatPictures": len(flat), "lumaSpreadMax": max(s for s, _ in flat),
+                  "lumaMean": [m for _, m in flat][:10]}
+    raise AssertionError("every picture the tile sent is flat: a blank tile")
 
 
 def prove_view(connection, slot, deadline, probe):

@@ -695,8 +695,44 @@ class ViewerPathTests(unittest.TestCase):
         server = FakeViewerServer(self, "v4", stream_of("color=c=black"))
         p = self.probe("wall", self.tile("wall", server), "v4", server)
         self.assertFalse(p.ok)
-        self.assertEqual(p.error[1], "the tile's first picture is flat: a blank tile")
+        self.assertEqual(p.error[1], "every picture the tile sent is flat: a blank tile")
+        self.assertEqual(p.seen, {"flatPictures": 1, "lumaSpreadMax": 0, "lumaMean": [0]})
         self.assertEqual(p.attributed()["verdict"], "inconclusive")
+
+    def test_a_tile_that_streams_only_flat_pictures_is_a_blank_tile(self):
+        # A renderer that keeps streaming one colour, a keyframe every 0.3 s, until the probe's
+        # time is up: every picture is read and none is a picture of anything.
+        units = h264("color=c=0x404040")
+        def blank(s, server):
+            send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
+            n = 0
+            with contextlib.suppress(OSError):
+                for _ in range(20):
+                    for i, u in enumerate(units):
+                        send_server(s, fcvf(u, i == 0, n), opcode=2)
+                        n += 1
+                    time.sleep(0.3)
+        server = FakeViewerServer(self, "v4", blank)
+        p = self.probe("wall", self.tile("wall", server), "v4", server)
+        self.assertFalse(p.ok)
+        self.assertEqual(p.error[1], "every picture the tile sent is flat: a blank tile")
+        self.assertGreater(p.seen["flatPictures"], 3, p.seen)
+        self.assertEqual(p.seen["lumaSpreadMax"], 0)
+
+    def test_a_flat_stretch_of_the_scene_passes_once_a_later_picture_is_not_flat(self):
+        # #1953: the staging smoke failed tiles whose first picture was the scene itself in one
+        # tone (inside the cloud layer, the ground at night, open sky in a corner). The next
+        # keyframe, at most 2 s later, is read before the tile is called blank.
+        flat, scene = h264("color=c=0x404040"), h264("testsrc")
+        def behave(s, server):
+            send_server(s, {"codec": "avc1.64000A", "width": 64, "height": 48})
+            for n, (i, u) in enumerate([(i, u) for i, u in enumerate(flat)] + [(i, u) for i, u in enumerate(scene)]):
+                send_server(s, fcvf(u, i == 0, n), opcode=2)
+        server = FakeViewerServer(self, "v4", behave)
+        p = self.probe("wall", self.tile("wall", server), "v4", server)
+        self.assertTrue(p.ok, p.line())
+        self.assertEqual(p.detail["flatPictures"], 1)
+        self.assertGreaterEqual(p.detail["lumaSpread"], smoke.FLAT_SPREAD)
 
     def test_protocol_invalid_data_blames_only_the_identified_direct_stream(self):
         def malformed(s, server):
@@ -1540,6 +1576,24 @@ class WorkflowTests(unittest.TestCase):
         patterns = re.findall(r"^      - '([^']+)'", workflow, re.M)
         for path in ("src/cli/mod.rs", "src/cli/args.rs"):
             self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns), path)
+
+    def test_the_coordinator_release_and_the_smokes_never_overlap(self):
+        # A web deploy's IPv6 smoke read /live while a coordinator deploy replaced the one
+        # coordinator task, and got "WebSocket upgrade refused".
+        # The job that replaces the task takes the group every smoke job holds.
+        import re
+        workflows = HERE.parent.parent / ".github/workflows"
+        viewer = (workflows / "fleet-viewer-smoke.yml").read_text()
+        # queue: max on every job in the group: with GitHub's default of one pending job, a
+        # smoke that queues behind a pending release cancels the release.
+        block = (r"(?m)^    concurrency:\n      group: (\S+)\n      cancel-in-progress: false\n"
+                 r"(?:      #.*\n)*      queue: max$")
+        groups = re.findall(block, viewer)
+        self.assertEqual(groups, ["fleet-viewer-smoke"] * 2, "the IPv4 and IPv6 smoke jobs share one queued group")
+        deploy = (workflows / "fleet-coordinator-deploy.yml").read_text()
+        job = deploy.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        self.assertIn("python3 -B fleet/coord/publish.py", job, "this is the job that replaces the task")
+        self.assertEqual(re.findall(block, job), ["fleet-viewer-smoke"])
 
 
 if __name__ == "__main__":
