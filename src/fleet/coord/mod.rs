@@ -153,9 +153,9 @@ pub struct Outputs {
     pub broadcast_layout: watch::Sender<Option<Layout>>,
     /// The fleet's power state (`awake`, `asleep`, `waking`).
     pub power: watch::Sender<String>,
-    /// The hosts whose agents reported a spot interruption notice, by name (the instance id
-    /// of a host the coordinator launched).
-    pub draining: watch::Sender<std::collections::BTreeSet<String>>,
+    /// Spot interruption notices for the host launcher, by host name (the instance id of a
+    /// host the coordinator launched).
+    pub draining: DrainNotices,
     /// The shared scene, for the EC2 tiles' renderers.
     pub scene: watch::Sender<Option<SharedScene>>,
     /// The grid budget, for the EC2 tiles' renderers.
@@ -448,19 +448,15 @@ impl Actor {
             *cur = power.clone();
             changed
         });
-        let draining: std::collections::BTreeSet<String> = self
-            .state
-            .fleet
-            .hosts
-            .iter()
-            .filter(|(_, h)| h.draining)
-            .map(|(name, _)| name.clone())
-            .collect();
-        self.out.draining.send_if_modified(|cur| {
-            let changed = *cur != draining;
-            *cur = draining.clone();
-            changed
-        });
+        self.out.draining.publish(
+            self.state
+                .fleet
+                .hosts
+                .iter()
+                .filter(|(_, h)| h.draining)
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
         let ec2 = ec2_assignment(&self.state);
         self.out.ec2.send_if_modified(|cur| {
             if *cur == ec2 {
@@ -1125,6 +1121,39 @@ impl Handle {
     }
 }
 
+/// Spot interruption notices, each host's sent once to the host launcher on a channel that
+/// keeps every notice until the launcher reads it. A watch of the draining hosts would lose a
+/// notice whose host left the state (its agent disconnected) before the launcher looked.
+#[derive(Default)]
+pub struct DrainNotices {
+    tx: Option<mpsc::UnboundedSender<String>>,
+    /// The hosts draining now whose notice was sent.
+    sent: std::collections::BTreeSet<String>,
+}
+
+impl DrainNotices {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            DrainNotices {
+                tx: Some(tx),
+                sent: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    /// Send the notice of every host in `draining` not sent yet.
+    fn publish(&mut self, draining: std::collections::BTreeSet<String>) {
+        if let Some(tx) = &self.tx {
+            for id in draining.difference(&self.sent) {
+                let _ = tx.send(id.clone());
+            }
+        }
+        self.sent = draining;
+    }
+}
+
 /// The launch names' subzone, served by this coordinator ([`authority`]): names are
 /// published as they are minted, and the zone the server answers from is sent on `zone`.
 pub struct Names {
@@ -1151,7 +1180,7 @@ pub fn start(
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (broadcast_layout_tx, broadcast_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
-    let (draining_tx, draining_rx) = watch::channel(std::collections::BTreeSet::new());
+    let (draining_tx, draining_rx) = DrainNotices::new();
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
     let (owned_tx, owned_rx) = watch::channel(store.is_none());
@@ -1942,7 +1971,7 @@ mod store_tests {
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,
-            draining: watch::channel(Default::default()).0,
+            draining: Default::default(),
             scene: watch::channel(None).0,
             budget: watch::channel(None).0,
             zone: None,
@@ -1997,7 +2026,7 @@ mod store_tests {
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,
-            draining: watch::channel(Default::default()).0,
+            draining: Default::default(),
             scene: watch::channel(None).0,
             budget: watch::channel(None).0,
             zone: None,

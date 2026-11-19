@@ -3566,7 +3566,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         ec2_layout,
         broadcast_layout: tokio::sync::watch::channel(None).0,
         power: tokio::sync::watch::channel(String::new()).0,
-        draining: tokio::sync::watch::channel(Default::default()).0,
+        draining: Default::default(),
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
         zone: None,
@@ -4949,6 +4949,48 @@ async fn a_drained_host_whose_agent_leaves_first_does_not_cost_its_replacement()
         fake.calls()
     );
     assert_eq!(live.len(), 3, "{:?}", fake.calls());
+}
+
+/// A spot notice whose agent disconnects while the launcher waits on an EC2 list, before it
+/// has read the notice, still launches the replacement: the notice is not lost when the
+/// host leaves the state (Codex on #1973).
+#[tokio::test]
+async fn a_notice_whose_agent_leaves_before_the_launcher_reads_it_still_replaces_the_host() {
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        fill_from_serving_hosts: true,
+        ..Config::default()
+    };
+    let (fake, _handle, ids, mut agents, mut v) = two_spread_hosts(config).await;
+    let launched = launches(&fake).len();
+    let lists = |f: &fcvm::fleet::coord::hosts::FakeHosts| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count()
+    };
+    // Hold the launcher inside its next list.
+    let held = fake.hold_lists.clone().lock_owned().await;
+    let before = lists(&fake);
+    until_hosts(&fake, "the launcher inside a list", |f| lists(f) > before).await;
+    agents[1]
+        .to_coord
+        .send(AgentMsg::Draining {
+            reason: "spot interruption notice".into(),
+        })
+        .unwrap();
+    v.until_within(|s| s["fleet"]["hosts"][1]["draining"] == true)
+        .await;
+    let gone = agents.pop().unwrap();
+    drop(gone.to_coord);
+    gone.conn.await.unwrap().unwrap();
+    v.until_within(|s| s["fleet"]["hosts"].as_array().is_some_and(|h| h.len() == 1))
+        .await;
+    drop(held);
+    // EC2 still lists the drained host running: only the notice says it is going.
+    until_hosts(&fake, "the replacement, and the drained host gone", |f| {
+        let live = f.live_zones("us-east-1");
+        launches(f).len() > launched && live.len() == 2 && !live.contains_key(&ids[1])
+    })
+    .await;
 }
 
 /// When the zones no host is in have no capacity, a spread launch takes a zone a host is

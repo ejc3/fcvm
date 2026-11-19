@@ -886,7 +886,8 @@ What it covers is `--tls-scope`:
   coordinator's own names). Its one TXT record is answered at `_acme-challenge.<subzone>` by
   the coordinator's own DNS server for the subzone, so the coordinator holds no token that
   can write the parent zone: `--dns-token-secret` is refused. The EC2 tiles' health name is
-  `ec2-<n>.<subzone>`.
+  `ec2-<n>.<subzone>`. A stored certificate that names anything else (a zone certificate
+  from before the switch) is renewed at once.
 
 Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
 or does not cover every one of those names) it orders a new certificate from Let's Encrypt

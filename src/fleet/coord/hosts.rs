@@ -348,12 +348,12 @@ fn unix_ms() -> u64 {
 
 /// Follow the fleet's power state: launch each region's shortfall (spot, then on demand in
 /// the same pass), terminate what is over, report the instances while a wake's hosts come
-/// up, and terminate every host while the fleet sleeps. `draining` names the hosts whose
-/// agents reported a spot interruption notice.
+/// up, and terminate every host while the fleet sleeps. `draining` carries the host of each
+/// spot interruption notice an agent reported.
 pub async fn run(
     cfg: HostConfig,
     mut power: watch::Receiver<String>,
-    mut draining: watch::Receiver<BTreeSet<String>>,
+    mut draining: tokio::sync::mpsc::UnboundedReceiver<String>,
     handle: Handle,
 ) {
     let mut watch: Vec<Watch> = cfg.regions.iter().map(|_| Watch::default()).collect();
@@ -370,7 +370,9 @@ pub async fn run(
     let mut reported = false;
     loop {
         let state = power.borrow_and_update().clone();
-        drained.extend(draining.borrow_and_update().iter().cloned());
+        while let Ok(id) = draining.try_recv() {
+            drained.insert(id);
+        }
         let want = if state == "asleep" {
             0
         } else {
@@ -642,7 +644,10 @@ pub async fn run(
         };
         tokio::select! {
             r = power.changed() => if r.is_err() { return },
-            r = draining.changed() => if r.is_err() { return },
+            id = draining.recv() => match id {
+                Some(id) => { drained.insert(id); }
+                None => return,
+            },
             _ = tokio::time::sleep(wait) => {}
         }
     }
@@ -1502,6 +1507,9 @@ pub struct FakeHosts {
     pub capacity: Mutex<HashMap<(String, Market), u32>>,
     pub zones: Mutex<HashMap<String, Vec<String>>>,
     pub zone_capacity: Mutex<HashMap<(String, String, Market), u32>>,
+    /// Every list waits for this lock after recording its call: a test that holds it keeps
+    /// the launcher inside a list.
+    pub hold_lists: Arc<tokio::sync::Mutex<()>>,
     pub launch_state: Mutex<Option<String>>,
     pub calls: Mutex<Vec<String>>,
     pub fail_lists: Mutex<HashMap<String, u32>>,
@@ -1552,6 +1560,7 @@ impl FakeHosts {
 impl HostDriver for FakeHosts {
     async fn hosts(&self, region: &str) -> Result<Vec<Host>> {
         self.calls.lock().unwrap().push(format!("list {region}"));
+        drop(self.hold_lists.lock().await);
         if let Some(n) = self.fail_lists.lock().unwrap().get_mut(region) {
             if *n > 0 {
                 *n -= 1;

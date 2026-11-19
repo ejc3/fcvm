@@ -101,6 +101,8 @@ pub struct Renewal {
     /// certificate (the subzone's server answers the subzone's challenge with a CNAME to it),
     /// `_acme-challenge.<subzone>` for a subzone certificate.
     pub challenge: String,
+    /// The certificate must name `domains` and nothing more (a subzone certificate).
+    pub exact: bool,
     pub directory: String,
     pub check_every: Duration,
     /// How soon a renewal that failed is tried again (a certificate that does not cover a
@@ -133,11 +135,27 @@ impl Renewal {
     /// `_acme-challenge.<subzone>`, which the subzone's own server answers.
     pub fn subzone(secret: String, subzone: &str) -> Self {
         let sub = subzone.trim_end_matches('.').to_ascii_lowercase();
-        Renewal::new(
-            secret,
-            vec![format!("*.{sub}")],
-            format!("_acme-challenge.{sub}"),
-        )
+        Renewal {
+            exact: true,
+            ..Renewal::new(
+                secret,
+                vec![format!("*.{sub}")],
+                format!("_acme-challenge.{sub}"),
+            )
+        }
+    }
+
+    /// Whether the stored secret needs a new certificate now ([`needs_renewal`]). With
+    /// `exact`, a certificate that also names anything else does too: switching to a subzone
+    /// certificate must replace a key that is valid for the parent zone.
+    pub fn needs_renewal(&self, secret: Option<&str>, now: jiff::Timestamp) -> bool {
+        if needs_renewal(secret, &self.domains, now) {
+            return true;
+        }
+        self.exact
+            && secret
+                .and_then(|s| serde_json::from_str::<CertDoc>(s).ok())
+                .is_some_and(|doc| doc.domains.iter().any(|d| !self.domains.contains(d)))
     }
 
     fn new(secret: String, domains: Vec<String>, challenge: String) -> Self {
@@ -145,6 +163,7 @@ impl Renewal {
             secret,
             domains,
             challenge,
+            exact: false,
             directory: instant_acme::LetsEncrypt::Production.url().to_string(),
             check_every: Duration::from_secs(12 * 3600),
             retry_after: Duration::from_secs(15 * 60),
@@ -425,7 +444,7 @@ pub async fn run(r: Renewal, secrets: Secrets, mut dns: Box<dyn Dns01>) {
     loop {
         let current = secrets.get(&r.secret).await;
         let due = match &current {
-            Ok(s) => needs_renewal(Some(s), &r.domains, jiff::Timestamp::now()),
+            Ok(s) => r.needs_renewal(Some(s), jiff::Timestamp::now()),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the certificate secret could not be read");
                 false
@@ -595,10 +614,21 @@ mod tests {
             vec!["*.fcvm.example", "fcvm.example", "*.tiles.fcvm.example"]
         );
         assert_eq!(z.challenge, "_acme-challenge.fcvm.example");
-        // A secret that still holds the zone certificate is renewed for the subzone alone.
+        // A secret that still holds the zone certificate is renewed for the subzone alone,
+        // also when that certificate covers the subzone's wildcard among its names: its key is
+        // valid for the parent zone (Codex on #1973).
         let now = "2026-10-23T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let zone_cert = doc("2027-01-01T00:00:00Z", &["*.fcvm.example", "fcvm.example"]);
-        assert!(needs_renewal(Some(&zone_cert), &r.domains, now));
+        assert!(r.needs_renewal(Some(&zone_cert), now));
+        let wider = doc(
+            "2027-01-01T00:00:00Z",
+            &["*.fcvm.example", "fcvm.example", "*.tiles.fcvm.example"],
+        );
+        assert!(r.needs_renewal(Some(&wider), now));
+        let own = doc("2027-01-01T00:00:00Z", &["*.tiles.fcvm.example"]);
+        assert!(!r.needs_renewal(Some(&own), now));
+        // A zone certificate still takes a secret that covers more than it asks for.
+        assert!(!z.needs_renewal(Some(&wider), now));
     }
 
     fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {
