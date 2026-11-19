@@ -91,6 +91,13 @@ pub enum Event {
         at: u64,
         instances: Vec<ScaleInstance>,
     },
+    /// The spend meter's burn rate: USD per hour of the `instances` the fleet runs, each
+    /// priced at its market's price (`crate::spend`).
+    Burn {
+        at: u64,
+        usd_per_hour: f64,
+        instances: u32,
+    },
     /// The GPU hosts the launcher keeps for the awake capacity (`--host-template`), by
     /// instance id (an agent's host name), when every region is listed and holds that many
     /// pending or running hosts; `None` while any region is unlisted or short, or when the
@@ -132,6 +139,7 @@ impl Event {
             | Event::Visibility { at, .. }
             | Event::Ec2Health { at, .. }
             | Event::ScaleInstances { at, .. }
+            | Event::Burn { at, .. }
             | Event::HostsExpected { at, .. }
             | Event::Published { at, .. } => *at,
         }

@@ -182,7 +182,7 @@ Intents:
 | `release_phone` | `{"claim": "phone-claim-3"}` (or `{}`) | gives your phone back early; it is restored from its snapshot for the next viewer |
 | `phone_action` | `{"action": "rotate", "claim": "phone-claim-3"}` (`claim` optional), or `{"action": "tap", "x": 0.25, "y": 0.9}` | one of the fixed take-over actions on your borrowed phone, or a tap on its screen while Robot Park is in front; see "Phones mode" |
 | `phones_zoom` | `{"out": true}` or `{"out": false}` | zooms every viewer's phones out (each phone shows its app's bars) or back in; one change every 2 s per client; see "Phones mode" |
-| `wake` | `{}` | an arrival (`fleet.power`): wakes a sleeping fleet and starts `--sleep-without-new-viewer` again; the page's Wake button sends it. Refused when the fleet does not sleep |
+| `wake` | `{}` | an arrival (`fleet.power`): wakes a sleeping fleet and starts `--sleep-without-new-viewer` again; the page's Wake button sends it. Refused when the fleet does not sleep, and while the day's spend ceiling holds it asleep (`fleet.spend`) |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
@@ -548,6 +548,26 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   accepted, when the instance was first seen running, when its renderer first answered
   `/health`, and when it was ready). A starting tile is described every 3 s and, once it
   runs with an address, its renderer's `/health` is asked every 250 ms in between.
+  `reason` is absent, except `budget` while the daily spend ceiling holds the fleet asleep
+  (`fleet.spend`).
+- `fleet.spend` is present with `--daily-spend-usd`: today's spend against the ceiling, per
+  UTC day. The coordinator's meter prices every GPU host and EC2 tile instance the fleet runs
+  every 30 s (spot at the current spot price of its type in its zone, on demand at its
+  on-demand rate) and the state integrates that burn rate: `usd_today` is what the day
+  cost through `at` (Unix ms of the last meter report, null before the first),
+  `usd_per_hour` the current burn of `instances` instances, `ceiling_usd` the ceiling,
+  `day_start` and `resets_at` the day's 00:00 UTC and the next. The ledger is part of the
+  stored state: a restart keeps the day's spend and charges the time it was down at the
+  last burn it knew. When `usd_today` plus 15 minutes at the current burn reaches the
+  ceiling, `reason` is `budget` (null before), and the fleet goes `asleep` at once, with
+  `fleet.power.reason` `budget`: every claim (a wall GPU, a phone, a sandbox, a server) ends,
+  a running race ends with the tiles that had reached their first frame, and every host is
+  terminated. Until 00:00 UTC `wake`, `restart_now` and every claim are refused with
+  `today's GPU budget is spent; the fleet rests until 00:00 UTC`, and arrivals and active
+  viewers do not wake it. The meter charges every instance whatever keeps it running, and
+  the trip overrides every reason to be awake, a schedule that keeps hosts up included. At 00:00 UTC the next day starts from 0 and the fleet wakes by the
+  rules above. The page shows "Resting until 00:00 UTC" and "Today's GPU budget is spent."
+  with no Wake button.
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
@@ -621,6 +641,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--sleep-without-new-viewer 3600] [--history-idle 60]
+                 [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
@@ -648,6 +669,22 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   or more and `--image-height 720 --tile-query q=std --maxrate-kbps 4500 --crf 21 --preset
   veryfast` on a smaller one, then any `--broadcast-arg`.
 
+- `--daily-spend-usd` (also `FLEET_DAILY_SPEND_USD`) is the most the fleet may spend in one
+  UTC day, in USD (`fleet.spend` above); off without it. It needs a fleet that sleeps
+  (`--host-template` or `--sleep-when-idle`) and instances to meter (`--host-template` or
+  `--ec2 aws`). Every 30 s the meter lists the instances tagged `Fleet=<--fleet-name>` and
+  `Purpose` `fcvm-fleet-host` or `fcvm-fleet-tile` in every host and tile region
+  (`DescribeInstances`, pending to shutting-down) and prices each: spot at the current spot
+  price of its type in its zone (`DescribeSpotPriceHistory`, `Linux/UNIX`, read again after
+  30 minutes), on demand at the on-demand rate of its type. `--spend-rates` (also
+  `FLEET_SPEND_RATES`) sets on-demand rates, `<instance type>=<USD per hour>` comma
+  separated, over the built-in us-east-1 list prices of `g4dn.metal` (7.824), `g4dn.xlarge`
+  (0.526), `g5g.metal` (2.744) and `g5g.xlarge` (0.42). The meter errs high where it cannot
+  know: a spot instance without a spot price is charged its on-demand rate, an instance
+  type without a rate the highest rate known, and a region it cannot list keeps its last
+  listed instances; each marks the `spend` component degraded (`degraded`). Each pass also
+  writes one CloudWatch embedded metric format line to stdout, namespace `FCVM/Fleet`,
+  dimension `Fleet`: `SpendUsdToday` and `Power` (0 asleep, 1 waking, 2 awake).
 - `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
   keeps versions) at most once a second while it changes and at shutdown. A missing object
