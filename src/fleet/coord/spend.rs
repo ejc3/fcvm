@@ -9,12 +9,8 @@
 //! (`--spend-rates`, over [`DEFAULT_ON_DEMAND`]). It errs high where it cannot know: a spot
 //! instance whose price is not available is priced on demand, an instance whose type has no
 //! on-demand rate at the highest rate known, and a region it cannot list keeps its last
-//! listed instances. Each of those marks the `spend` component degraded.
-//!
-//! Each pass also writes one CloudWatch embedded metric format line to stdout (the log
-//! stream; tracing writes to stderr): `SpendUsdToday` and `Power` (0 asleep, 1 waking,
-//! 2 awake) in namespace [`EMF_NAMESPACE`], with a `Fleet` dimension, from the snapshot the
-//! previous report produced.
+//! listed instances. Each of those marks the `spend` component degraded. The day's spend
+//! reaches CloudWatch as `SpendUsdToday` (`super::metrics`).
 
 use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
@@ -35,8 +31,6 @@ pub const DEFAULT_ON_DEMAND: &[(&str, f64)] = &[
     ("g5g.metal", 2.744),
     ("g5g.xlarge", 0.42),
 ];
-
-pub const EMF_NAMESPACE: &str = "FCVM/Fleet";
 
 /// The instance states the meter charges for: from launch until the instance is gone or
 /// stopped. A pending instance is not billed yet; it is counted so a wake's launches show at
@@ -70,8 +64,6 @@ pub struct MeterConfig {
     pub on_demand: BTreeMap<String, f64>,
     pub every: Duration,
     pub spot_ttl: Duration,
-    /// The `Fleet` dimension of the metrics.
-    pub fleet: String,
 }
 
 /// `--spend-rates`: `<instance type>=<USD per hour>` on-demand rates, over the defaults.
@@ -203,45 +195,6 @@ pub fn burn_report(
     Ok((rate, instances, why))
 }
 
-/// The metric line for one pass, from a snapshot's text; `None` before the first snapshot or
-/// without a ceiling.
-pub fn emf_line(snapshot: &str, fleet: &str, now_ms: u64) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(snapshot).ok()?;
-    let f = &v["state"]["fleet"];
-    let usd = f["spend"]["usd_today"].as_f64()?;
-    let power = match f["power"]["state"].as_str()? {
-        "asleep" => 0,
-        "waking" => 1,
-        _ => 2,
-    };
-    Some(
-        serde_json::json!({
-            "_aws": {
-                "Timestamp": now_ms,
-                "CloudWatchMetrics": [{
-                    "Namespace": EMF_NAMESPACE,
-                    "Dimensions": [["Fleet"]],
-                    "Metrics": [
-                        {"Name": "SpendUsdToday", "Unit": "None"},
-                        {"Name": "Power", "Unit": "None"},
-                    ],
-                }],
-            },
-            "Fleet": fleet,
-            "SpendUsdToday": usd,
-            "Power": power,
-        })
-        .to_string(),
-    )
-}
-
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// The meter `--daily-spend-usd` asks for, or `None` without it. A ceiling needs a fleet that
 /// sleeps and instances to meter.
 pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
@@ -276,7 +229,6 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
         on_demand: on_demand_rates(&args.spend_rates)?,
         every: Duration::from_secs(30),
         spot_ttl: Duration::from_secs(1800),
-        fleet: args.fleet_name.clone(),
     }))
 }
 
@@ -290,9 +242,6 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        if let Some(line) = emf_line(&handle.snapshot.borrow().text, &cfg.fleet, unix_ms()) {
-            println!("{line}");
-        }
         let mut problems: Vec<String> = Vec::new();
         for region in &cfg.regions {
             match cfg.driver.instances(region).await {
@@ -673,7 +622,6 @@ mod tests {
         args.extend(["--daily-spend-usd", "750", "--fleet-name", "prod"]);
         let m = meter(&coord(&args)).unwrap().unwrap();
         assert_eq!(m.regions, ["us-east-1", "us-east-2"]);
-        assert_eq!(m.fleet, "prod");
         // Nothing to sleep, nothing to meter, or not a positive amount: refused at start.
         for bad in [
             vec![
@@ -697,36 +645,5 @@ mod tests {
         ] {
             assert!(meter(&coord(&bad)).is_err(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn the_metric_line_carries_spend_and_power_with_the_fleet_dimension() {
-        let snap = r#"{"type":"snapshot","version":3,"state":{"fleet":{"power":{"state":"waking"},"spend":{"usd_today":12.34}}}}"#;
-        let line: serde_json::Value =
-            serde_json::from_str(&emf_line(snap, "prod", 1_700_000_000_000).unwrap()).unwrap();
-        assert_eq!(
-            line,
-            serde_json::json!({
-                "_aws": {
-                    "Timestamp": 1_700_000_000_000u64,
-                    "CloudWatchMetrics": [{
-                        "Namespace": "FCVM/Fleet",
-                        "Dimensions": [["Fleet"]],
-                        "Metrics": [
-                            {"Name": "SpendUsdToday", "Unit": "None"},
-                            {"Name": "Power", "Unit": "None"},
-                        ],
-                    }],
-                },
-                "Fleet": "prod",
-                "SpendUsdToday": 12.34,
-                "Power": 1,
-            })
-        );
-        // No snapshot yet, or no ceiling: no line.
-        assert_eq!(emf_line("", "prod", 0), None);
-        let no_ceiling =
-            r#"{"type":"snapshot","version":3,"state":{"fleet":{"power":{"state":"awake"}}}}"#;
-        assert_eq!(emf_line(no_ceiling, "prod", 0), None);
     }
 }

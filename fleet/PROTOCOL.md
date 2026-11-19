@@ -736,9 +736,16 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   (0.526), `g5g.metal` (2.744) and `g5g.xlarge` (0.42). The meter errs high where it cannot
   know: a spot instance without a spot price is charged its on-demand rate, an instance
   type without a rate the highest rate known, and a region it cannot list keeps its last
-  listed instances; each marks the `spend` component degraded (`degraded`). Each pass also
-  writes one CloudWatch embedded metric format line to stdout, namespace `FCVM/Fleet`,
-  dimension `Fleet`: `SpendUsdToday` and `Power` (0 asleep, 1 waking, 2 awake).
+  listed instances; each marks the `spend` component degraded (`degraded`).
+- Every 30 s the coordinator writes one CloudWatch embedded metric format line to stdout,
+  namespace `FCVM/Fleet`, dimension `Fleet` (`--fleet-name`), with or without a ceiling:
+  `ActiveViewers` (joined viewers whose page is not hidden), `VerifiedViewers` (joined
+  viewers; with Turnstile on, only verified connections join), `Power` (0 asleep, 1 waking,
+  2 awake), `AwakeHosts` (hosts with a connected agent that reported a GPU, not draining), `SpendUsdToday`
+  (with `--daily-spend-usd`), `BroadcastLive` (1 when IVS `GetStream` answers the
+  broadcast channel is `LIVE`, else 0; with a broadcast secret that has `channel_arn`) and
+  `CertDaysLeft` (days until the `not_after` of `--tls-secret`, read hourly; with
+  `--tls-secret`, after its first read). `src/fleet/coord/metrics.rs`.
 - `--warm-hours` (also `FLEET_WARM_HOURS`) lists weekly UTC windows in which the fleet
   stays awake with no viewers, comma separated, each `<day> HH:MM-HH:MM` with `<day>` one of
   `Mon` to `Sun` (any case): `Sat 17:00-23:00,Sun 17:00-21:00`. A window starts on its day at
