@@ -11,8 +11,15 @@ declares for its mode and family. A tile that does not answer, or a family it ha
 fails the check, and a check that cannot run (no ffmpeg, a viewer that does not have the family)
 blocks.
 
-    stage-smoke.py [--family v4|v6] [--single-family] [--modes wall,phones,...] [--relaunch]
-                   [--takeover]
+    stage-smoke.py [--target stage|prod] [--family v4|v6] [--single-family] [--modes wall,phones,...]
+                   [--relaunch] [--takeover] [--broadcast]
+    stage-smoke.py --target prod --unverified [--family v4|v6] [--single-family]
+
+`--target prod` points the same checks at the production fleet: /live through its Access hostname
+(PROD_API_URL, the owner and prod CI only) with the page's origin (PROD_ORIGIN). `--broadcast` then
+plays the broadcast over the family (a playlist and a segment). `--unverified` is a visitor who has
+not passed Turnstile, on the public /live (PROD_PUBLIC_URL): it must be asked to verify, get no
+seat and no direct token, and its wake must be refused without waking the fleet.
 
 Failure output carries no URL, host name or token: tile ids, the mode, the family and fixed text
 (and, for potato, the numbers and fixed words PotatoWatch keeps).
@@ -21,6 +28,7 @@ import ast
 import base64
 import errno
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -1005,16 +1013,19 @@ def get(url, headers=None):
         return error.code, error.headers, b""
 
 
-def live_target():
-    """Where /live is and how to reach it: staging through Access, or a host-image acceptance's
-    own coordinator on loopback (SMOKE_LIVE_URL, plain ws://, no Access)."""
+def live_target(target="stage"):
+    """Where /live is and how to reach it: staging (or prod) through Access, or a host-image
+    acceptance's own coordinator on loopback (SMOKE_LIVE_URL, plain ws://, no Access)."""
     local = os.environ.get("SMOKE_LIVE_URL")
     if local:
+        if target != "stage":
+            raise ValueError("SMOKE_LIVE_URL is a host-image acceptance's coordinator, never prod")
         parsed = urllib.parse.urlsplit(local)
         if parsed.scheme != "ws" or not ipaddress.ip_address(parsed.hostname).is_loopback:
             raise ValueError("SMOKE_LIVE_URL must be a ws:// URL on loopback")
         return None, local, {}
-    api, origin = os.environ["STAGING_API_URL"].rstrip("/"), os.environ["STAGING_ORIGIN"].rstrip("/")
+    names = ("PROD_API_URL", "PROD_ORIGIN") if target == "prod" else ("STAGING_API_URL", "STAGING_ORIGIN")
+    api, origin = (os.environ[n].rstrip("/") for n in names)
     headers = {"CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"],
                "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"], "Origin": origin}
     return (api, origin), api.replace("https://", "wss://", 1) + "/live", headers
@@ -1028,9 +1039,14 @@ def plain(host, port):
 
 
 def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False,
-         settle_seconds=SETTLE_SECONDS):
+         settle_seconds=SETTLE_SECONDS, target="stage", unverified=False, broadcast=False):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
+    if unverified:
+        step(f"viewer: this runner as a {family} viewer")
+        prove_viewer(family, single)
+        unverified_probe(family)
+        return 0
     if modes and host_local() is None:
         step(f"viewer: this runner as a {family} viewer")
         prove_viewer(family, single)
@@ -1038,12 +1054,15 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         # The viewer is the host itself: whether it has a route out in either family says
         # nothing about the tiles it serves.
         print(json.dumps({"viewer": "host-local", "family": family}), flush=True)
-    stage, live_url, headers = live_target()
+    stage, live_url, headers = live_target(target)
     resolvers = [r for r in os.environ.get("SMOKE_RESOLVERS", "").split(",") if r] or list(PUBLIC_RESOLVERS)
     if stage is not None:
         api, origin = stage
         step("Access check")
-        for role, url, path in (("api", api + "/healthz", "/healthz"), ("origin", origin + "/", "/")):
+        # Prod's page is public (and not served before go-live): only its coordinator host is behind Access.
+        checks = (("api", api + "/healthz", "/healthz"),) if target == "prod" else (
+            ("api", api + "/healthz", "/healthz"), ("origin", origin + "/", "/"))
+        for role, url, path in checks:
             code, response_headers, _ = get(url)
             location = urllib.parse.urlsplit(response_headers.get("Location", ""))
             if code != 302 or location.scheme != "https" or not (location.hostname or "").endswith(".cloudflareaccess.com"):
@@ -1053,7 +1072,9 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             if code != 200:
                 raise AssertionError(f"authenticated staging request failed: {role} {path} answered {code}")
         step("agents-only endpoint check")
-        code, _, _ = get(api + "/agent", headers)
+        # Prod's /agent is on its public hostname (the Access hostname answers 404 there).
+        agents_url = (os.environ["PROD_PUBLIC_URL"].rstrip("/") if target == "prod" else api) + "/agent"
+        code, _, _ = get(agents_url, headers)
         if code not in (401, 403, 302):
             raise AssertionError("the CI token reached the agents-only endpoint")
     def live():
@@ -1150,6 +1171,17 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
                                    lambda: (state, admission, viewer), settle_seconds)
+        if broadcast:
+            step("broadcast: a fresh playback token")
+            before = admission
+            connection.send({"type": "playback"})
+            until(lambda s: admission is not before and (admission.get("broadcast") or {}).get("value"),
+                  by=time.monotonic() + 30)
+            url = (admission.get("broadcast") or {}).get("value") if admission is not before else None
+            if not url:
+                raise AssertionError("the coordinator gave this viewer no broadcast to play")
+            prove_broadcast(url, family)
+            print(json.dumps({"broadcast": True, "family": family}), flush=True)
         if not relaunch:
             return failures
         for half in ("fcvm", "ec2"):
@@ -1186,6 +1218,117 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     finally:
         connection.close()
     return failures
+
+
+def https_get(url, family, limit=8 << 20):
+    """GET over one family only (public endpoints); status and up to `limit` bytes of body."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname:
+        raise ValueError("a public https URL is required")
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=20)
+    connection.sock = public(parsed.hostname, parsed.port or 443, family)
+    try:
+        connection.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""),
+                            headers={"User-Agent": "fcvm-stage-smoke/1"})
+        response = connection.getresponse()
+        return response.status, response.read(limit)
+    finally:
+        connection.close()
+
+
+def playlist_entries(body):
+    if not body.startswith(b"#EXTM3U"):
+        raise AssertionError("the broadcast answered something other than a playlist")
+    return [line for line in body.decode("utf-8", "replace").splitlines() if line and not line.startswith("#")]
+
+
+def prove_broadcast(url, family):
+    """Play the broadcast as a viewer's player starts: its playlist, a stream's playlist, and one
+    media segment, all over `family`. The token in `url` is single-use: it is fetched once."""
+    step(f"broadcast: playlist over {family}")
+    code, body = https_get(url, family)
+    if code != 200:
+        raise AssertionError("the broadcast playlist did not load")
+    entries = playlist_entries(body)
+    if not entries:
+        raise AssertionError("the broadcast playlist names no stream")
+    media = url
+    if b"#EXT-X-STREAM-INF" in body:
+        media = urllib.parse.urljoin(url, entries[0])
+        step(f"broadcast: stream playlist over {family}")
+        code, body = https_get(media, family)
+        if code != 200:
+            raise AssertionError("the broadcast stream playlist did not load")
+        entries = playlist_entries(body)
+        if not entries:
+            raise AssertionError("the broadcast stream has no segment yet")
+    step(f"broadcast: a segment over {family}")
+    code, body = https_get(urllib.parse.urljoin(media, entries[-1]), family)
+    if code != 200 or not body:
+        raise AssertionError("a broadcast segment did not load")
+
+
+def unverified_probe(family, watch_seconds=20):
+    """A visitor who has not passed Turnstile, on prod's public /live: asked to verify, no seat or
+    direct token, its wake refused unrecorded, and the fleet does not wake for it."""
+    public_url = os.environ["PROD_PUBLIC_URL"].rstrip("/")
+    if not public_url.startswith("https://"):
+        raise ValueError("PROD_PUBLIC_URL must be an https URL")
+    step("unverified: public /live")
+    connection = Socket(public_url.replace("https://", "wss://", 1) + "/live",
+                        {"Origin": os.environ["PROD_ORIGIN"].rstrip("/")}, opener=lambda h, p: public(h, p, family))
+    try:
+        connection.send({"type": "seat", "ticket": None})
+        deadline = time.monotonic() + 30
+        hello, admission, state = None, None, None
+        def read(limit):
+            nonlocal hello, admission, state
+            opcode, payload = connection.message(limit)
+            if opcode != 1:
+                return None
+            message = json.loads(payload)
+            kind = message.get("type")
+            if kind == "hello":
+                hello = message
+            elif kind == "admission":
+                admission = message
+            elif kind == "snapshot":
+                state = message.get("state") or {}
+            return message
+        step("unverified: hello, admission and a snapshot")
+        while hello is None or admission is None or state is None:
+            read(deadline)
+        if not isinstance(hello.get("turnstile"), str) or not hello["turnstile"]:
+            raise AssertionError("the public /live asked an unverified visitor for no Turnstile check")
+        if admission.get("verify") is not True or admission.get("seat") or admission.get("direct"):
+            raise AssertionError("an unverified visitor was seated or given a direct token")
+        power = ((state.get("fleet") or {}).get("power") or {}).get("state")
+        step("unverified: a wake intent")
+        intent = str(uuid.uuid4())
+        connection.send({"type": "intent", "id": intent, "name": "wake", "args": {}})
+        while True:
+            message = read(deadline)
+            if message and message.get("type") == "receipt" and message.get("id") == intent:
+                break
+        if message.get("outcome") != "refused" or message.get("version") != 0 \
+                or "verify" not in str(message.get("reason", "")):
+            raise AssertionError("the coordinator took a wake from an unverified visitor")
+        step("unverified: the fleet stays asleep")
+        watch = time.monotonic() + watch_seconds
+        while power == "asleep" and time.monotonic() < watch:
+            try:
+                read(watch)
+            except TimeoutError:
+                break
+            now = ((state.get("fleet") or {}).get("power") or {}).get("state")
+            if now != "asleep":
+                raise AssertionError("the fleet woke for an unverified visitor")
+            if admission.get("seat") or admission.get("direct") or admission.get("verify") is not True:
+                raise AssertionError("an unverified visitor was seated or given a direct token")
+    finally:
+        connection.close()
+    print(json.dumps({"unverified": True, "family": family, "seated": False, "wakeRefused": True,
+                      "power": power if power in ("asleep", "waking", "awake") else None}), flush=True)
 
 
 def viewer_path(family, modes, takeover, resolvers, until, commit, now, settle_seconds=SETTLE_SECONDS):
@@ -1263,6 +1406,11 @@ def arguments(argv):
     parser.add_argument("--takeover", action="store_true", help="borrow and drive a Minecraft server")
     parser.add_argument("--agents", action="store_true",
                         help="print the coordinator's record of registered agents (digests), and nothing else")
+    parser.add_argument("--target", choices=("stage", "prod"), default="stage",
+                        help="the fleet: staging, or prod through its Access hostname")
+    parser.add_argument("--unverified", action="store_true",
+                        help="prod only: a visitor without Turnstile on the public /live, and nothing else")
+    parser.add_argument("--broadcast", action="store_true", help="play the broadcast over the family")
     parser.add_argument("--settle-seconds", type=int, default=SETTLE_SECONDS,
                         help=f"how long to wait for every mode's tiles to run (1 to {SETTLE_SECONDS})")
     args = parser.parse_args(argv)
@@ -1273,11 +1421,15 @@ def arguments(argv):
         parser.error("unknown mode")
     if args.agents and (modes or args.relaunch or args.takeover):
         parser.error("--agents reads the coordinator's agents and nothing else")
-    if not modes and not args.relaunch and not args.agents:
-        parser.error("nothing to check: give --modes, --relaunch or --agents")
+    if args.unverified and (args.target != "prod" or modes or args.relaunch or args.takeover
+                            or args.agents or args.broadcast):
+        parser.error("--unverified is prod's unverified-visitor probe, alone")
+    if not modes and not args.relaunch and not args.agents and not args.unverified and not args.broadcast:
+        parser.error("nothing to check: give --modes, --relaunch, --agents, --broadcast or --unverified")
     return dict(family=args.family, single=args.single_family, modes=modes,
                 relaunch=args.relaunch, takeover=args.takeover, agents=args.agents,
-                settle_seconds=args.settle_seconds)
+                settle_seconds=args.settle_seconds, target=args.target, unverified=args.unverified,
+                broadcast=args.broadcast)
 
 
 def run(argv=None):

@@ -9,6 +9,8 @@ on:
       - 'fleet/core/**'
       - 'fleet/coord/**'
       - 'fleet/published-ports.json'
+      # The build job compiles and runs this test (make test-fleet-coordinator).
+      - 'tests/test_fleet_coord.rs'
       - '.github/workflows/fleet-viewer-smoke.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'

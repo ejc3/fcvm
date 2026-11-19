@@ -1,0 +1,152 @@
+name: Fleet prod smoke
+
+# What a viewer gets from the production fleet: the staging viewer smoke (fleet/coord/stage-smoke.py)
+# with --target prod. It reaches the prod coordinator's /live through fleet-ops.fcvm.dev (Access: the
+# owner and prod CI only) with the page's origin, so it is a verified viewer, and it wakes prod. For
+# every mode and every tile the coordinator's own state lists, a decoded, non-flat frame (or a
+# Minecraft map, or a verified potato catch), once from a viewer with IPv4 only and once from one with
+# IPv6; then the broadcast plays over the same family. Before that, each viewer is a visitor who has
+# not passed Turnstile on the public /live (fleet-api.fcvm.dev): it must be asked to verify, get no
+# seat and no direct token, and its wake must be refused without waking the fleet. Once the page is
+# live (PROD_SITE_LIVE, ejc3/aws plan A6), fcvm.dev must serve it over both families.
+#
+# No relaunch and no take-over: either would replace or borrow a tile a real viewer may be using.
+# fleet-prod-promote.yml calls it after each promotion and rolls the set back when it fails; it can
+# also be run by hand. The jobs read fleet-prod-deploy, which exists only while the prod stack does
+# (ejc3/aws fcvm-fleet-prod-ci.tf); while FLEET_PROD_ENABLED is not set, nothing runs.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Every mode is public in prod (owner, 2026-11-19).
+env:
+  MODES: wall,phones,windows,minecraft,potato
+
+jobs:
+  ipv4:
+    name: IPv4-only viewer
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 45
+    # A prod coordinator release (fleet-prod-promote.yml, fleet-prod-rollback.yml) takes this group too.
+    concurrency:
+      group: fleet-prod-viewer-smoke
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install ffmpeg (the smoke decodes each tile's first picture)
+        run: fleet/coord/install-ffmpeg.sh "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"
+      - name: An unverified visitor over IPv4 gets no seat and does not wake prod
+        env:
+          PROD_PUBLIC_URL: ${{ vars.PROD_PUBLIC_URL }}
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+        run: python3 -B fleet/coord/stage-smoke.py --target prod --unverified --family v4 --single-family
+      - name: Every mode and the broadcast over IPv4
+        env:
+          PROD_API_URL: ${{ vars.PROD_API_URL }}
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+          PROD_PUBLIC_URL: ${{ vars.PROD_PUBLIC_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -o pipefail
+          python3 -B fleet/coord/stage-smoke.py --target prod --family v4 --single-family --modes "$MODES" --broadcast | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: The page at fcvm.dev over IPv4
+        if: vars.PROD_SITE_LIVE == 'true'
+        env:
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+        run: fleet/coord/prod-page-check.sh -4 "$PROD_ORIGIN"
+      - name: Failing tiles to the job summary
+        if: ${{ failure() }}
+        run: |
+          test -s "$RUNNER_TEMP/smoke.jsonl" || exit 0
+          { echo "### prod v4 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ipv6:
+    name: IPv6 viewer
+    needs: ipv4
+    if: ${{ !cancelled() && needs.ipv4.result != 'skipped' && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, Linux, ARM64]
+    environment: fleet-prod-deploy
+    timeout-minutes: 45
+    concurrency:
+      group: fleet-prod-viewer-smoke
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Fix workspace permissions (pre-checkout)
+        run: sudo chown -R "$USER:$USER" "$GITHUB_WORKSPACE/fcvm" 2>/dev/null || true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: fcvm
+          persist-credentials: false
+      - name: Install ffmpeg (the smoke decodes each tile's first picture)
+        run: ./fcvm/fleet/coord/install-ffmpeg.sh "$RUNNER_TEMP/ffmpeg" >> "$GITHUB_PATH"
+      - name: An unverified visitor over IPv6 gets no seat
+        env:
+          PROD_PUBLIC_URL: ${{ vars.PROD_PUBLIC_URL }}
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+        run: python3 -B fcvm/fleet/coord/stage-smoke.py --target prod --unverified --family v6
+      - name: Every mode and the broadcast over IPv6
+        env:
+          PROD_API_URL: ${{ vars.PROD_API_URL }}
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+          PROD_PUBLIC_URL: ${{ vars.PROD_PUBLIC_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -o pipefail
+          python3 -B fcvm/fleet/coord/stage-smoke.py --target prod --family v6 --modes "$MODES" --broadcast | tee "$RUNNER_TEMP/smoke.jsonl"
+      - name: The page at fcvm.dev over IPv6
+        if: vars.PROD_SITE_LIVE == 'true'
+        env:
+          PROD_ORIGIN: ${{ vars.PROD_ORIGIN }}
+        run: fcvm/fleet/coord/prod-page-check.sh -6 "$PROD_ORIGIN"
+      - name: Failing tiles to the job summary
+        if: ${{ failure() }}
+        run: |
+          test -s "$RUNNER_TEMP/smoke.jsonl" || exit 0
+          { echo "### prod v6 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: Report a failure
+    needs: [ipv4, ipv6]
+    if: ${{ failure() && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the fleet-prod-smoke issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          WORKFLOW: ${{ github.workflow }}
+          IPV4: ${{ needs.ipv4.result }}
+          IPV6: ${{ needs.ipv6.result }}
+        run: |
+          set -euo pipefail
+          body=$(printf 'The prod viewer smoke failed on %s (workflow "%s").\n\n- IPv4-only viewer: %s\n- IPv6 viewer: %s\n\nRun: %s\n\nEach failing tile is in the job summary. A promotion whose smoke fails is rolled back (fleet-prod-promote.yml).\n' \
+            "$SHA" "$WORKFLOW" "$IPV4" "$IPV6" "$RUN_URL")
+          gh label create fleet-prod-smoke --force --color B60205 --description "The fleet prod smoke is failing"
+          issue=$(gh issue list --label fleet-prod-smoke --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "Fleet prod smoke is failing" --label fleet-prod-smoke --body "$body"
+          fi

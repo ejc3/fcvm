@@ -1,0 +1,367 @@
+name: Fleet prod promote
+
+# Promotes the set staging smoked together to the production fleet (fcvm.dev): the host and tile image
+# generation the image release gate verified, staging's coordinator image and staging's web commit.
+# Owner, 2026-11-19: automatic after a green staging smoke, no approval. fleet/coord/prod_release.py
+# decides; ejc3/aws fcvm-fleet-prod-ci.tf holds the release functions, the role and the environment.
+#
+# 1. enabled: nothing runs while the prod stack is off (repository variable FLEET_PROD_ENABLED).
+# 2. candidate: the staging set, and a staging viewer smoke (both families) that ran against exactly
+#    it (prod_release.py decide). Nothing changes when prod already runs it, when staging is
+#    changing or unverified, or when no smoke covers the set yet. It also skips, with a message,
+#    while the environment has no role yet.
+# 3. hold: until prod is asleep when its images change, otherwise until it has had no active viewer
+#    for 5 minutes; up to 350 minutes, then nothing changes and a later run tries again.
+# 4. release: the host and tile templates (only while asleep), the coordinator (only with no viewer),
+#    then the Worker (`wrangler versions upload` and `versions deploy`, `wrangler deploy` the first
+#    time). The coordinator and the Worker are built and published by staging's own deploys; prod
+#    pushes no image.
+# 5. smoke: fleet-prod-smoke.yml. 6. record: /fcvm-fleet/prod/release names the new set and the one it
+#    replaced. On a failed release or smoke, rollback returns all three to the previous set and the
+#    run fails.
+#
+# Security (CLAUDE.md, "GitHub Actions Workflow Security"): workflow_run is taken only from this
+# repository's own main runs; no github.event value reaches a run: line, only env; every job that
+# holds a credential runs in fleet-prod-deploy, which admits main only. Checkouts are of main and of
+# a web commit a staging deploy run on main built.
+
+# Triggers: a staging coordinator or web deploy that passed its smoke; the image release gate when it
+# verifies a generation (fleet-release-gate.yml's promote job dispatches this, since the gate runs on
+# a schedule and a workflow_run consumer of it would start every 5 minutes; see
+# tests/test_default_kernel_release.rs, no_workflow_run_consumer_names_a_workflow_that_runs_on_a_schedule);
+# a schedule, so a promotion held for viewers is tried again while staging is quiet; and by hand.
+on:
+  workflow_run:
+    workflows: ["Fleet coordinator staging deploy", "Fleet web staging deploy"]
+    types: [completed]
+  schedule:
+    - cron: '23 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One promotion or rollback at a time; a newer pending run replaces an older pending one.
+concurrency:
+  group: fleet-prod-release
+  cancel-in-progress: false
+
+jobs:
+  enabled:
+    name: Prod enabled
+    if: >-
+      ${{ github.repository == 'ejc3/fcvm' && (
+        (github.event_name != 'workflow_run' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+         && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event != 'pull_request'
+         && github.event.workflow_run.head_repository.full_name == github.repository)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/coord
+      - id: check
+        env:
+          ENABLED: ${{ vars.FLEET_PROD_ENABLED }}
+        run: python3 -B fleet/coord/prod_release.py enabled
+
+  candidate:
+    name: Staging set
+    needs: enabled
+    if: needs.enabled.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      promote: ${{ steps.decide.outputs.promote }}
+      target: ${{ steps.decide.outputs.target }}
+      prior: ${{ steps.decide.outputs.prior }}
+      image: ${{ steps.decide.outputs.image }}
+      coordinator: ${{ steps.decide.outputs.coordinator }}
+      web: ${{ steps.decide.outputs.web }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/coord
+      - id: role
+        env:
+          ROLE: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::fleet-prod-deploy has no release role yet (ejc3/aws fcvm-fleet-prod-ci.tf): nothing promoted"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.role.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-${{ github.run_id }}
+          mask-aws-account-id: true
+      - id: decide
+        if: steps.role.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+        run: python3 -B fleet/coord/prod_release.py decide
+
+  hold:
+    name: Wait for a quiet prod
+    needs: candidate
+    if: needs.candidate.outputs.promote == 'true'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      free: ${{ steps.hold.outputs.free }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/coord
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-hold-${{ github.run_id }}
+          role-duration-seconds: 21600
+          mask-aws-account-id: true
+      - id: hold
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          IMAGE: ${{ needs.candidate.outputs.image }}
+        run: python3 -B fleet/coord/prod_release.py hold --image "$IMAGE"
+
+  release:
+    name: Release to prod
+    needs: [candidate, hold]
+    if: needs.hold.outputs.free == 'true'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 90
+    # As staging's coordinator release: never while a prod smoke reads /live.
+    concurrency:
+      group: fleet-prod-viewer-smoke
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      held: ${{ steps.image.outputs.held }}
+      worker_version: ${{ steps.worker.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: fcvm
+      # The Worker is built from the web commit staging runs, before anything in prod changes.
+      - if: needs.candidate.outputs.web == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: web
+          ref: ${{ fromJSON(needs.candidate.outputs.target).web_commit }}
+      - if: needs.candidate.outputs.web == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - if: needs.candidate.outputs.web == 'true'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12.15.0
+      - name: Build the prod Worker
+        if: needs.candidate.outputs.web == 'true'
+        working-directory: web/fleet/web
+        run: pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm cf:build
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-release-${{ github.run_id }}
+          mask-aws-account-id: true
+      # Asleep only (the function checks again under Terraform's lock). Held here: nothing has changed.
+      - name: Host and tile images
+        id: image
+        if: needs.candidate.outputs.image == 'true'
+        env:
+          IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+        run: |
+          rc=0
+          python3 -B fcvm/fleet/coord/prod_release.py image-promote "$TARGET" || rc=$?
+          if [ "$rc" = 3 ]; then echo "::notice::prod woke before its images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          exit "$rc"
+      - name: Coordinator
+        if: needs.candidate.outputs.coordinator == 'true' && steps.image.outputs.held != 'true'
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+        run: |
+          python3 -B fcvm/fleet/coord/publish.py --stack prod \
+            --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")"
+      - name: Worker
+        id: worker
+        if: needs.candidate.outputs.web == 'true' && steps.image.outputs.held != 'true'
+        working-directory: web/fleet/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIOR: ${{ needs.candidate.outputs.prior }}
+          COMMIT: ${{ fromJSON(needs.candidate.outputs.target).web_commit }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/wrangler.jsonl"
+          export WRANGLER_SEND_METRICS=false WRANGLER_OUTPUT_FILE_PATH="$out"
+          if [ -z "$(jq -r '.worker_version // empty' <<<"$PRIOR")" ]; then
+            # The first prod Worker: nothing to upload a version beside.
+            pnpm exec wrangler deploy --env production --message "fcvm $COMMIT"
+            version=$(jq -r 'select(.type == "deploy") | .version_id' "$out" | tail -1)
+          else
+            pnpm exec wrangler versions upload --env production --message "fcvm $COMMIT"
+            version=$(jq -r 'select(.type == "version-upload") | .version_id' "$out" | tail -1)
+            [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+            pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm $COMMIT"
+          fi
+          [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: release
+    if: needs.release.result == 'success' && needs.release.outputs.held != 'true'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/fleet-prod-smoke.yml
+    # The smoke's jobs read fleet-prod-deploy's Access token; a called workflow sees secrets only when passed.
+    secrets: inherit
+
+  record:
+    name: Record the release
+    needs: [candidate, release, smoke]
+    if: needs.smoke.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: fleet/coord
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-record-${{ github.run_id }}
+          mask-aws-account-id: true
+      - env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+          PRIOR: ${{ needs.candidate.outputs.prior }}
+          VERSION: ${{ needs.release.outputs.worker_version }}
+        run: |
+          version="${VERSION:-$(jq -r '.worker_version // empty' <<<"$PRIOR")}"
+          python3 -B fleet/coord/prod_release.py record "$TARGET" "$version" "$PRIOR"
+
+  rollback:
+    name: Roll the set back
+    needs: [candidate, release, smoke]
+    # A release that failed part way, or a set the prod smoke failed. A release held before any change
+    # skips the smoke and needs no rollback.
+    if: >-
+      ${{ always() && needs.candidate.outputs.promote == 'true' && (needs.release.result == 'failure' ||
+        (needs.release.result == 'success' && needs.release.outputs.held != 'true' && needs.smoke.result != 'success')) }}
+    runs-on: ubuntu-24.04
+    environment: fleet-prod-deploy
+    timeout-minutes: 360
+    concurrency:
+      group: fleet-prod-viewer-smoke
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12.15.0
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-prod-rollback-${{ github.run_id }}
+          role-duration-seconds: 21600
+          mask-aws-account-id: true
+      - name: Worker
+        if: needs.candidate.outputs.web == 'true'
+        working-directory: fleet/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIOR: ${{ needs.candidate.outputs.prior }}
+        run: |
+          set -euo pipefail
+          previous=$(jq -r '.worker_version // empty' <<<"$PRIOR")
+          if [ -z "$previous" ]; then
+            echo "::warning::this was prod's first Worker: there is no earlier version to return to"
+            exit 0
+          fi
+          [[ "$previous" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          pnpm install --frozen-lockfile
+          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm rollback"
+      - name: Coordinator
+        if: needs.candidate.outputs.coordinator == 'true'
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          PRIOR: ${{ needs.candidate.outputs.prior }}
+        run: |
+          set -euo pipefail
+          commit=$(jq -r '.coordinator.commit // empty' <<<"$PRIOR")
+          if [ -z "$commit" ]; then
+            echo "::error::prod's previous coordinator image has no commit tag, so the release function cannot return to it"
+            exit 1
+          fi
+          python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")"
+      # Waits for prod to sleep: its templates change only then.
+      - name: Host and tile images
+        if: needs.candidate.outputs.image == 'true'
+        env:
+          IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+          PRIOR: ${{ needs.candidate.outputs.prior }}
+        run: python3 -B fleet/coord/prod_release.py image-rollback "$TARGET" "$PRIOR"
+      - name: The promotion failed
+        run: |
+          echo "::error::the promotion failed; prod was returned to its previous set"
+          exit 1

@@ -8,3 +8,12 @@ paths:
   .github/workflows/fleet-coordinator-deploy.yml:
     ignore:
       - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/fleet-prod-promote.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/fleet-prod-rollback.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/fleet-prod-smoke.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
