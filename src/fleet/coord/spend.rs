@@ -177,6 +177,32 @@ pub fn burn_rate(
     (total, why)
 }
 
+/// One pass's report: the burn rate, the instances it prices and why any could not be
+/// priced exactly. An error while any region has never been listed: an unknown inventory is
+/// not an empty one, so no rate is reported and the ledger keeps charging the last rate it
+/// has (the one stored across a restart included).
+pub fn burn_report(
+    regions: &[String],
+    listed: &BTreeMap<String, Vec<Billed>>,
+    spot: &HashMap<(String, String), BTreeMap<String, f64>>,
+    on_demand: &BTreeMap<String, f64>,
+) -> std::result::Result<(f64, u32, Option<String>), String> {
+    let unlisted: Vec<&str> = regions
+        .iter()
+        .filter(|r| !listed.contains_key(*r))
+        .map(String::as_str)
+        .collect();
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "no listing yet of {}; the last reported burn stays in use",
+            unlisted.join(", ")
+        ));
+    }
+    let (rate, why) = burn_rate(listed, spot, on_demand);
+    let instances = listed.values().map(|l| l.len() as u32).sum();
+    Ok((rate, instances, why))
+}
+
 /// The metric line for one pass, from a snapshot's text; `None` before the first snapshot or
 /// without a ceiling.
 pub fn emf_line(snapshot: &str, fleet: &str, now_ms: u64) -> Option<String> {
@@ -319,20 +345,24 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
                 Err(e) => problems.push(format!("spot prices in {region}: {e:#}")),
             }
         }
-        let (usd_per_hour, why) = burn_rate(&listed, &spot, &cfg.on_demand);
-        problems.extend(why);
-        let instances = listed.values().map(|l| l.len() as u32).sum();
-        tracing::debug!(usd_per_hour, instances, "spend meter");
+        let burn = burn_report(&cfg.regions, &listed, &spot, &cfg.on_demand);
         if handle.cmds.is_closed() {
             return;
         }
-        handle
-            .send(Event::Burn {
-                at: 0,
-                usd_per_hour,
-                instances,
-            })
-            .await;
+        match burn {
+            Ok((usd_per_hour, instances, why)) => {
+                problems.extend(why);
+                tracing::debug!(usd_per_hour, instances, "spend meter");
+                handle
+                    .send(Event::Burn {
+                        at: 0,
+                        usd_per_hour,
+                        instances,
+                    })
+                    .await;
+            }
+            Err(why) => problems.push(why),
+        }
         let reason = (!problems.is_empty()).then(|| problems.join("; "));
         if reason.is_some() || degraded_now {
             if let Some(r) = &reason {
@@ -586,6 +616,33 @@ mod tests {
         ] {
             assert!(on_demand_rates(&[bad.into()]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn no_rate_is_reported_until_every_region_has_been_listed() {
+        let on_demand = on_demand_rates(&[]).unwrap();
+        let regions = vec!["us-east-1".to_string(), "us-east-2".to_string()];
+        let spot = HashMap::new();
+        // A restart whose first listings failed: reporting 0 would overwrite the stored rate.
+        let none = BTreeMap::new();
+        assert_eq!(
+            burn_report(&regions, &none, &spot, &on_demand),
+            Err(
+                "no listing yet of us-east-1, us-east-2; the last reported burn stays in use"
+                    .into()
+            )
+        );
+        // One region listed, the other not yet: its hosts would go uncharged.
+        let mut listed = BTreeMap::from([(
+            "us-east-1".to_string(),
+            vec![host("i-1", "g4dn.xlarge", false, "us-east-1a")],
+        )]);
+        assert!(burn_report(&regions, &listed, &spot, &on_demand).is_err());
+        listed.insert("us-east-2".to_string(), Vec::new());
+        assert_eq!(
+            burn_report(&regions, &listed, &spot, &on_demand),
+            Ok((0.526, 1, None))
+        );
     }
 
     fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {

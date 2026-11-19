@@ -1,6 +1,8 @@
 //! The daily spend ceiling across a coordinator restart and a UTC day boundary.
 
+use fleet_core::protocol::{AgentMsg, SlotReport};
 use fleet_core::spend::{DAY_MS, SPENT};
+use fleet_core::state::Gpu;
 use fleet_core::{apply, view, Config, Event, Outcome, State};
 
 const HOUR: u64 = 3_600_000;
@@ -152,4 +154,86 @@ fn a_tick_under_the_ceiling_keeps_the_version() {
         ..config()
     });
     assert_eq!(run(config()), without);
+}
+
+#[test]
+fn a_claim_at_the_trip_point_is_refused_not_committed_and_undone() {
+    // 8 USD spent at 4 USD an hour: the projection reaches the 10 USD ceiling 15 minutes
+    // after the report, at the moment the claim arrives.
+    let day = 20_003 * DAY_MS;
+    let mut s = State::new(
+        Config {
+            max_tiles: 2,
+            daily_spend_usd: Some(10.0),
+            ..config()
+        },
+        day,
+    );
+    s = apply(
+        s,
+        &Event::Agent {
+            at: day + 1000,
+            host: "h1".into(),
+            msg: AgentMsg::Hello {
+                host: "h1".into(),
+                arch: "x86_64".into(),
+                gpus: (1..=3)
+                    .map(|i| Gpu {
+                        sbdf: format!("0000:0{i}:00.0"),
+                        name: "Tesla T4".into(),
+                    })
+                    .collect(),
+                capacity: 8,
+                store_ready_at: None,
+                boot: Default::default(),
+                phones: vec![],
+                phone_actions: vec![],
+                potato_players: 0,
+                windows: 0,
+                windows_actions: Vec::new(),
+                minecraft: 0,
+                minecraft_server: None,
+            },
+        },
+    );
+    for n in 1..=3 {
+        s = apply(
+            s,
+            &Event::Agent {
+                at: day + 2000,
+                host: "h1".into(),
+                msg: AgentMsg::Slot(SlotReport {
+                    id: format!("slot-{n}"),
+                    phase: "running".into(),
+                    generation: 1,
+                    ..Default::default()
+                }),
+            },
+        );
+    }
+    s = apply(s, &joined(day + 3000, "v1"));
+    s = apply(s, &burn(day + 3000, 4.0));
+    s = apply(s, &burn(day + 2 * HOUR + 3000, 4.0));
+    assert_eq!(spend(&s)["usd_today"], 8.0);
+    assert_eq!(s.fleet.power.state, "awake");
+    s = apply(
+        s,
+        &Event::Intent {
+            at: day + 2 * HOUR + 3000 + 15 * 60_000,
+            viewer: "v1".into(),
+            client: None,
+            id: "c1".into(),
+            name: "claim_gpu".into(),
+            args: serde_json::json!({}),
+            check: None,
+            secret: Some("token-a".into()),
+        },
+    );
+    let r = s.receipt("c1").unwrap();
+    assert_eq!(
+        (r.outcome, r.reason.as_deref()),
+        (Outcome::Refused, Some(SPENT))
+    );
+    assert_eq!(s.fleet.power.reason.as_deref(), Some("budget"));
+    assert!(s.fleet.last_claim_end.is_empty());
 }

@@ -59,6 +59,9 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
 /// before changes nothing (its first receipt stays in `state.receipts`).
 pub fn apply(mut state: State, event: &Event) -> State {
     let before = state.fleet.clone();
+    // Before the event as well as after it: an intent that arrives once the day's budget is
+    // spent is refused, not committed and then undone.
+    budget_step(&mut state, event.at());
     let receipt = apply_inner(&mut state, event);
     budget_step(&mut state, event.at());
     // Retile, step the power state on what is placed, and retile again when that changed
