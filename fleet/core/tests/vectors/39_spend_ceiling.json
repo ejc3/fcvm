@@ -1,0 +1,1114 @@
+{
+  "config": {
+    "claim_secs": 120,
+    "daily_spend_usd": 10.0,
+    "max_tiles": 2,
+    "power_managed": true,
+    "restart_cooldown_secs": 1,
+    "sleep_without_new_viewer_secs": 0
+  },
+  "description": "A daily spend ceiling (daily_spend_usd). The coordinator's meter reports the fleet's burn rate (burn), and the ledger integrates it per UTC day. When today's spend plus 15 minutes at the current rate reaches the ceiling, the fleet sleeps at once, with power.reason budget: a claim is released and a running race ends. Until 00:00 UTC a wake, a claim, a race and a new viewer are refused or ignored. At 00:00 UTC a new ledger starts and the fleet wakes by the usual rules.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "client": "198.51.100.41",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 10000,
+      "instances": 1,
+      "type": "burn",
+      "usd_per_hour": 8.0
+    },
+    {
+      "args": {},
+      "at": 20000,
+      "client": "198.51.100.41",
+      "id": "c1",
+      "name": "claim_gpu",
+      "secret": "token-a",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 30000,
+      "client": "198.51.100.41",
+      "id": "r1",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 3610000,
+      "instances": 5,
+      "type": "burn",
+      "usd_per_hour": 40.0
+    },
+    {
+      "args": {},
+      "at": 3700000,
+      "client": "198.51.100.41",
+      "id": "w1",
+      "name": "wake",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 3710000,
+      "client": "198.51.100.41",
+      "id": "c2",
+      "name": "claim_gpu",
+      "secret": "token-b",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 3720000,
+      "client": "198.51.100.41",
+      "id": "r2",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 3800000,
+      "client": "198.51.100.42",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 3801000,
+      "type": "tick"
+    },
+    {
+      "at": 80000000,
+      "instances": 0,
+      "type": "burn",
+      "usd_per_hour": 0.0
+    },
+    {
+      "at": 86399999,
+      "type": "tick"
+    },
+    {
+      "at": 86400000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 86401000,
+      "client": "198.51.100.42",
+      "id": "w2",
+      "name": "wake",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 86460000,
+      "instances": 6,
+      "type": "burn",
+      "usd_per_hour": 48.0
+    }
+  ],
+  "expect": [
+    {
+      "after": 5,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/fleet/spend/ceiling_usd": 10.0,
+        "/view/fleet/spend/reason": null,
+        "/view/fleet/spend/resets_at": 86400000,
+        "/view/fleet/spend/usd_per_hour": 8.0,
+        "/view/fleet/spend/usd_today": 0.0
+      },
+      "note": "8 USD an hour: 2 USD by the trip point, under the 10 USD ceiling"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/c1/outcome": "committed",
+        "/view/claims/0/slot": "slot-3"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/r1/outcome": "committed",
+        "/view/relaunch_all/fcvm_pending": 2
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/view/claims": [],
+        "/view/fleet/power/asleep_since": 3610000,
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep",
+        "/view/fleet/spend/instances": 5,
+        "/view/fleet/spend/reason": "budget",
+        "/view/fleet/spend/usd_per_hour": 40.0,
+        "/view/fleet/spend/usd_today": 8.0,
+        "/view/next_race_at": null,
+        "/view/relaunch_all/fcvm_pending": 0,
+        "/view/tiles": []
+      },
+      "note": "an hour at 8 USD, then 40 USD an hour: 8 + 40/4 reaches 10, so the fleet sleeps now; the claim and the race end with it"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/receipts/w1/outcome": "refused",
+        "/receipts/w1/reason": "today's GPU budget is spent; the fleet rests until 00:00 UTC",
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "a wake does not wake it"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/receipts/c2/outcome": "refused",
+        "/receipts/c2/reason": "today's GPU budget is spent; the fleet rests until 00:00 UTC",
+        "/view/claims": []
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/r2/outcome": "refused",
+        "/receipts/r2/reason": "today's GPU budget is spent; the fleet rests until 00:00 UTC"
+      }
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep",
+        "/view/viewers/active": 2
+      },
+      "note": "neither does a new viewer"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/view/fleet/power/reason": null,
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/spend/day_start": 86400000,
+        "/view/fleet/spend/reason": null,
+        "/view/fleet/spend/resets_at": 172800000,
+        "/view/fleet/spend/usd_today": 0.0
+      },
+      "note": "00:00 UTC: a new ledger, and the viewer rules decide again"
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/receipts/w2/outcome": "committed"
+      }
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep",
+        "/view/fleet/spend/usd_today": 0.0
+      },
+      "note": "48 USD an hour: 12 USD by the trip point, so the new day trips at once"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 20000,
+        "id": "c1",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-1 on slot-3",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 30000,
+        "id": "r1",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 1",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3700000,
+        "id": "w1",
+        "name": "wake",
+        "outcome": "refused",
+        "summary": "today's GPU budget is spent; the fleet rests until 00:00 UTC",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3710000,
+        "id": "c2",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "today's GPU budget is spent; the fleet rests until 00:00 UTC",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3720000,
+        "id": "r2",
+        "name": "restart_now",
+        "outcome": "refused",
+        "summary": "today's GPU budget is spent; the fleet rests until 00:00 UTC",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 86401000,
+        "id": "w2",
+        "name": "wake",
+        "outcome": "committed",
+        "summary": "wake",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": 31000,
+    "counters": {
+      "restores": 3,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 1000,
+            "name": "h1"
+          }
+        ],
+        "since": 0
+      },
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": 86460000,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 86401000,
+        "last_wake": null,
+        "reason": "budget",
+        "sleep_without_arrival_at": null,
+        "state": "asleep",
+        "wakes": [],
+        "woke_at": null
+      },
+      "spend": {
+        "at": 86460000,
+        "ceiling_usd": 10.0,
+        "day_start": 86400000,
+        "instances": 6,
+        "reason": "budget",
+        "resets_at": 172800000,
+        "usd_per_hour": 48.0,
+        "usd_today": 0.0
+      },
+      "standby": [
+        "slot-1",
+        "slot-2",
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 2593845,
+      "from_t": 86461.5,
+      "generation": 4
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 86416000,
+      "closes_at": 86424000,
+      "holding": null,
+      "holding_label": null,
+      "leading": "coast",
+      "next": "valley",
+      "next_hold_at": null,
+      "next_label": "Into the valley",
+      "opened_at": 86400000,
+      "targets": [
+        {
+          "arrive_at": 86448000,
+          "id": "coast",
+          "label": "Across the bay to the mountains",
+          "votes": 0
+        },
+        {
+          "arrive_at": 86446000,
+          "id": "peak-west",
+          "label": "The peak from the west",
+          "votes": 0
+        },
+        {
+          "arrive_at": 86448000,
+          "id": "western-sea",
+          "label": "Over the western sea",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [
+      {
+        "by": "viewer:v1",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 2,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 1,
+        "started_at": 30000
+      }
+    ],
+    "relaunch_all": {
+      "by": "viewer:v1",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": 30000,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": 30000,
+      "fcvm_gpus": 0,
+      "fcvm_ms": null,
+      "fcvm_pending": 0,
+      "race": 1,
+      "started_at": 30000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -72.695893,
+            5.2,
+            -96.436477
+          ],
+          "pos": [
+            -58.0,
+            7.0,
+            -79.0
+          ],
+          "t": 86388.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -73.712695,
+            5.2,
+            -96.046171
+          ],
+          "pos": [
+            -58.363636,
+            7.0,
+            -79.181818
+          ],
+          "t": 86389.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -74.707242,
+            5.2,
+            -95.631414
+          ],
+          "pos": [
+            -58.727273,
+            7.0,
+            -79.363636
+          ],
+          "t": 86390.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -75.678619,
+            5.2,
+            -95.19307
+          ],
+          "pos": [
+            -59.090909,
+            7.0,
+            -79.545455
+          ],
+          "t": 86391.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -76.625946,
+            5.2,
+            -94.732039
+          ],
+          "pos": [
+            -59.454545,
+            7.0,
+            -79.727273
+          ],
+          "t": 86392.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -77.548376,
+            5.2,
+            -94.249252
+          ],
+          "pos": [
+            -59.818182,
+            7.0,
+            -79.909091
+          ],
+          "t": 86393.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -78.445099,
+            5.2,
+            -93.745673
+          ],
+          "pos": [
+            -60.181818,
+            7.0,
+            -80.090909
+          ],
+          "t": 86394.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -79.315342,
+            5.2,
+            -93.222296
+          ],
+          "pos": [
+            -60.545455,
+            7.0,
+            -80.272727
+          ],
+          "t": 86395.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -80.15837,
+            5.2,
+            -92.680144
+          ],
+          "pos": [
+            -60.909091,
+            7.0,
+            -80.454545
+          ],
+          "t": 86396.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -80.973489,
+            5.2,
+            -92.120265
+          ],
+          "pos": [
+            -61.272727,
+            7.0,
+            -80.636364
+          ],
+          "t": 86397.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -81.760043,
+            5.2,
+            -91.543736
+          ],
+          "pos": [
+            -61.636364,
+            7.0,
+            -80.818182
+          ],
+          "t": 86398.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -82.51742,
+            5.2,
+            -90.951656
+          ],
+          "pos": [
+            -62.0,
+            7.0,
+            -81.0
+          ],
+          "t": 86399.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -83.260015,
+            5.2,
+            -90.352173
+          ],
+          "pos": [
+            -62.363636,
+            7.0,
+            -81.181818
+          ],
+          "t": 86400.0
+        },
+        {
+          "fov_deg": 62.439453,
+          "look": [
+            -82.813464,
+            5.397949,
+            -91.293525
+          ],
+          "pos": [
+            -62.235296,
+            7.141821,
+            -81.569285
+          ],
+          "t": 86401.0
+        },
+        {
+          "fov_deg": 63.53125,
+          "look": [
+            -80.952495,
+            5.902749,
+            -93.231775
+          ],
+          "pos": [
+            -61.195285,
+            7.522787,
+            -82.284084
+          ],
+          "t": 86402.0
+        },
+        {
+          "fov_deg": 64.970703,
+          "look": [
+            -77.729781,
+            6.659377,
+            -95.878138
+          ],
+          "pos": [
+            -59.354451,
+            8.095042,
+            -83.211731
+          ],
+          "t": 86403.0
+        },
+        {
+          "fov_deg": 66.5,
+          "look": [
+            -73.21693,
+            7.585466,
+            -98.877093
+          ],
+          "pos": [
+            -56.826876,
+            8.791666,
+            -84.253035
+          ],
+          "t": 86404.0
+        },
+        {
+          "fov_deg": 67.908203,
+          "look": [
+            -67.643185,
+            8.526301,
+            -101.775018
+          ],
+          "pos": [
+            -53.729875,
+            9.483105,
+            -85.324095
+          ],
+          "t": 86405.0
+        },
+        {
+          "fov_deg": 69.03125,
+          "look": [
+            -61.210088,
+            9.174204,
+            -104.311446
+          ],
+          "pos": [
+            -50.183999,
+            9.94769,
+            -86.356301
+          ],
+          "t": 86406.0
+        },
+        {
+          "fov_deg": 69.751953,
+          "look": [
+            -54.162157,
+            9.411736,
+            -106.299619
+          ],
+          "pos": [
+            -46.313028,
+            10.0,
+            -87.296334
+          ],
+          "t": 86407.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -46.860752,
+            9.638864,
+            -107.600154
+          ],
+          "pos": [
+            -42.243982,
+            10.0,
+            -88.106164
+          ],
+          "t": 86408.0
+        },
+        {
+          "fov_deg": 69.751953,
+          "look": [
+            -39.663917,
+            9.850959,
+            -108.204315
+          ],
+          "pos": [
+            -38.107109,
+            10.0,
+            -88.763053
+          ],
+          "t": 86409.0
+        },
+        {
+          "fov_deg": 69.03125,
+          "look": [
+            -32.850089,
+            9.870403,
+            -108.210781
+          ],
+          "pos": [
+            -34.035895,
+            9.926116,
+            -89.259554
+          ],
+          "t": 86410.0
+        },
+        {
+          "fov_deg": 67.908203,
+          "look": [
+            -26.578187,
+            9.05809,
+            -107.758131
+          ],
+          "pos": [
+            -30.167057,
+            9.13921,
+            -89.603511
+          ],
+          "t": 86411.0
+        },
+        {
+          "fov_deg": 66.5,
+          "look": [
+            -21.161082,
+            7.641551,
+            -107.0415
+          ],
+          "pos": [
+            -26.640547,
+            7.653952,
+            -89.818058
+          ],
+          "t": 86412.0
+        },
+        {
+          "fov_deg": 64.970703,
+          "look": [
+            -16.858085,
+            5.996683,
+            -106.315477
+          ],
+          "pos": [
+            -23.59955,
+            5.76356,
+            -89.941619
+          ],
+          "t": 86413.0
+        },
+        {
+          "fov_deg": 63.53125,
+          "look": [
+            -13.655797,
+            4.356595,
+            -105.734202
+          ],
+          "pos": [
+            -21.190486,
+            3.853094,
+            -90.027911
+          ],
+          "t": 86414.0
+        },
+        {
+          "fov_deg": 62.439453,
+          "look": [
+            -11.593733,
+            3.098535,
+            -105.423035
+          ],
+          "pos": [
+            -19.563007,
+            2.369741,
+            -90.145938
+          ],
+          "t": 86415.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.87,
+            1.779,
+            -90.38
+          ],
+          "t": 86416.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.696,
+            1.7832,
+            -90.704
+          ],
+          "t": 86417.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.522,
+            1.7874,
+            -91.028
+          ],
+          "t": 86418.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.348,
+            1.7916,
+            -91.352
+          ],
+          "t": 86419.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.174,
+            1.7958,
+            -91.676
+          ],
+          "t": 86420.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.0,
+            1.8,
+            -92.0
+          ],
+          "t": 86421.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -17.826,
+            1.8042,
+            -92.324
+          ],
+          "t": 86422.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -17.652,
+            1.8084,
+            -92.648
+          ],
+          "t": 86423.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -17.478,
+            1.8126,
+            -92.972
+          ],
+          "t": 86424.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -17.304,
+            1.8168,
+            -93.296
+          ],
+          "t": 86425.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -17.13,
+            1.821,
+            -93.62
+          ],
+          "t": 86426.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -16.956,
+            1.8252,
+            -93.944
+          ],
+          "t": 86427.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.7825,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.8872,
+          "t": 86399.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.55,
+          "rays": 1.0,
+          "snow_line_km": 0.9858,
+          "t": 86416.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 2,
+      "count": 2
+    }
+  }
+}

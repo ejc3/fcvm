@@ -6,7 +6,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { INTENT_NAMES, parseServerMsg, type FleetState } from "../protocol.ts";
-import { lastRaceLine, wakeMedianMs } from "../view.ts";
+import { lastRaceLine, sleepView, wakeMedianMs } from "../view.ts";
 
 type Fixture = { source: { commit: string }; intents: { known: string[]; unknown: string[] }; views: Record<string, Record<string, unknown>> };
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/coordinator.json", import.meta.url), "utf8")) as Fixture;
@@ -96,6 +96,13 @@ describe(`the coordinator's snapshot states (#1146 at ${fixture.source.commit})`
     // The last arrival and when the hour without one runs out, under the coordinator's names.
     const arrivals = parse(fixture.views["31_no_new_viewer"]!).fleet.power;
     expect([arrivals.last_arrival_at, arrivals.sleep_without_arrival_at]).toEqual([2_200_000, 3_200_000]);
+  });
+
+  it("reads the coordinator's budget sleep, and shows its card", () => {
+    const st = parse(fixture.views["39_spend_ceiling"]!);
+    expect(st.fleet.power.state).toBe("asleep");
+    expect(st.fleet.power.reason).toBe("budget");
+    expect(sleepView(st, 0, true, false)).toMatchObject({ title: "Resting until 00:00 UTC", wake: null });
   });
 
   it("the page sends only intents the coordinator knows", () => {

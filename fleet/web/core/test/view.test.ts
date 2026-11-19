@@ -1094,6 +1094,15 @@ describe("asleep and waking", () => {
     expect(view(stateWith(waking), EPOCH).sleep!.wake).toBeNull();
   });
 
+  it("asleep for the day's GPU budget: rests until 00:00 UTC, says why, and offers no Wake button", () => {
+    const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, reason: "budget" });
+    const v = view(stateWith(st), EPOCH);
+    expect(v.sleep).toEqual({ state: "asleep", title: "Resting until 00:00 UTC", line: "Today's GPU budget is spent.", clock: "", steps: [], wake: null });
+    // The poster fills the image as for any sleep; nothing is left blank.
+    expect(v.plan.posterFull).toBe(true);
+    expect(v.tiles.every((t) => !t.dark)).toBe(true);
+  });
+
   it("formats dates and minutes the way the page shows them", () => {
     expect(fmt.utcDate(Date.UTC(2026, 9, 22, 23, 14, 59))).toBe("22 Oct 2026, 23:14 UTC");
     expect(fmt.utcDate(Date.UTC(2024, 1, 29, 0, 5))).toBe("29 Feb 2024, 00:05 UTC");

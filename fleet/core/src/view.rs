@@ -124,6 +124,9 @@ pub struct FleetView {
     /// GPUs starting their VM before they join the wall (slot ids).
     pub warming: Vec<String>,
     pub power: PowerView,
+    /// With a daily spend ceiling: today's spend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend: Option<SpendView>,
     /// Every host whose agent registered since `since` (crate::state::Registrations).
     pub agents: AgentsView,
 }
@@ -387,6 +390,27 @@ pub struct PowerView {
     /// When the fleet sleeps if no viewer arrives before then (past while asleep); null
     /// when the fleet does not sleep or `--sleep-without-new-viewer` is 0.
     pub sleep_without_arrival_at: Option<u64>,
+    /// `budget` while the day's spend ceiling holds the fleet asleep; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Today's spend against the daily ceiling (`crate::spend`), with a ceiling set.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpendView {
+    /// Spent today (UTC) through `at`, in USD, to the cent.
+    pub usd_today: f64,
+    pub ceiling_usd: f64,
+    /// The current burn rate, USD per hour, to the cent, and the instances it prices.
+    pub usd_per_hour: f64,
+    pub instances: u32,
+    /// When the ledger was last brought forward (Unix ms); null before the first report.
+    pub at: Option<u64>,
+    /// The start of the day the ledger is for, and when the next one starts (00:00 UTC).
+    pub day_start: u64,
+    pub resets_at: u64,
+    /// `budget` once the day's spend reached the ceiling; null otherwise.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -721,6 +745,7 @@ pub fn view(state: &State) -> View {
                 .map(|n| crate::state::slot_name(*n))
                 .collect(),
             power: power_view(&f.power, &state.config),
+            spend: spend_view(&f.spend, &state.config),
             agents: AgentsView {
                 since: f.registrations.since,
                 hosts: f
@@ -1062,7 +1087,24 @@ fn power_view(p: &Power, c: &crate::state::Config) -> PowerView {
             .collect(),
         last_wake: p.wakes.back().cloned(),
         wakes: p.wakes.iter().cloned().collect(),
+        reason: p.reason.clone(),
     }
+}
+
+fn spend_view(s: &crate::spend::Spend, c: &crate::state::Config) -> Option<SpendView> {
+    let ceiling = c.daily_spend_usd?;
+    let cents = |x: f64| (x * 100.0).round() / 100.0;
+    let day_start = s.day * crate::spend::DAY_MS;
+    Some(SpendView {
+        usd_today: cents(s.usd),
+        ceiling_usd: ceiling,
+        usd_per_hour: cents(s.usd_per_hour),
+        instances: s.instances,
+        at: (s.at != 0).then_some(s.at),
+        day_start,
+        resets_at: day_start + crate::spend::DAY_MS,
+        reason: s.tripped.then(|| crate::spend::BUDGET.to_string()),
+    })
 }
 
 /// When the fleet sleeps without a new viewer: the last arrival plus

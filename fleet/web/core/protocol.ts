@@ -214,6 +214,8 @@ export interface Power {
   last_wake: Wake | null;
   /** The last completed wakes, oldest first (the coordinator keeps 20). */
   wakes: Wake[];
+  /** `budget` while the day's spend ceiling holds the fleet asleep until 00:00 UTC; else null. */
+  reason?: string | null;
 }
 
 export interface Wake {
@@ -300,6 +302,7 @@ function parsePower(v: unknown): Power {
       const wk = parseWake(x, `${w}.wakes[${i}]`);
       return wk ? [wk] : [];
     }),
+    reason: strOrNull(v, "reason", w),
   };
 }
 

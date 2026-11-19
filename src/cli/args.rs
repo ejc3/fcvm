@@ -467,6 +467,21 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_SLEEP_WITHOUT_NEW_VIEWER", default_value_t = 3600)]
     pub sleep_without_new_viewer: u64,
 
+    /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
+    /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
+    /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet
+    /// until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps (--host-template
+    /// or --sleep-when-idle) and instances to meter (--host-template or --ec2 aws). Off
+    /// without it.
+    #[arg(long, env = "FLEET_DAILY_SPEND_USD")]
+    pub daily_spend_usd: Option<f64>,
+
+    /// On-demand rates the spend meter uses, `<instance type>=<USD per hour>`, comma
+    /// separated, over its built-in rates for the fleet's instance types (us-east-1 list
+    /// prices). Spot instances are priced at their current spot price.
+    #[arg(long, env = "FLEET_SPEND_RATES", value_delimiter = ',')]
+    pub spend_rates: Vec<String>,
+
     /// Seconds a viewer watches an empty sky, after the last word has left it, before the
     /// wall writes a line of GPU history itself. 0 turns it off.
     #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]

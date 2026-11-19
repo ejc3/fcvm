@@ -526,7 +526,8 @@ export function wakeMedianMs(p: FleetState["fleet"]["power"]): number | null {
 }
 
 /**
- * Asleep or waking, for the wall and phones mode alike. A page that is connected and visible
+ * Asleep or waking, for the wall and phones mode alike. Asleep for the day's spend ceiling
+ * (`power.reason` `budget`), it says so and offers no Wake button. A page that is connected and visible
  * while the fleet sleeps sees it because nobody new arrived for an hour (a visible page wakes
  * a fleet that slept for want of viewers), so the card offers the Wake button.
  * `waking`: a `wake` this page sent has no receipt yet.
@@ -535,6 +536,10 @@ export function sleepView(st: FleetState, srvNow: number, online: boolean, wakin
   const p = st.fleet.power;
   if (p.state === "awake") return null;
   const gpus = p.last_wake?.gpus ?? p.wakes.at(-1)?.gpus ?? 0;
+  // The day's GPU budget is spent: nothing a viewer does wakes it before 00:00 UTC.
+  if (p.state === "asleep" && p.reason === "budget") {
+    return { state: "asleep", title: "Resting until 00:00 UTC", line: "Today's GPU budget is spent.", clock: "", steps: [], wake: null };
+  }
   if (p.state === "asleep") {
     const median = wakeMedianMs(p);
     return {

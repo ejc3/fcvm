@@ -72,6 +72,10 @@ pub struct Config {
     /// long (`Power::last_arrival_at`), even while viewers stay connected. 0: never.
     #[serde(default = "one_hour")]
     pub sleep_without_new_viewer_secs: u64,
+    /// The most the fleet may spend in one UTC day, in USD: at it the fleet sleeps until
+    /// 00:00 UTC (`crate::spend`). `None`: no ceiling.
+    #[serde(default)]
+    pub daily_spend_usd: Option<f64>,
     /// The coordinator writes each launch's DNS names and a tile's frame URLs are its
     /// published names (`Slot::published`), not the URL its agent reported.
     #[serde(default)]
@@ -177,6 +181,10 @@ pub struct Power {
     /// page's `wake`. A state that records none counts from the coordinator's start.
     #[serde(default)]
     pub last_arrival_at: Option<u64>,
+    /// Why the fleet sleeps when no viewer rule says so: `budget` while the day's spend
+    /// ceiling holds it asleep (`crate::spend`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Default for Power {
@@ -189,6 +197,7 @@ impl Default for Power {
             hosts: BTreeMap::new(),
             wakes: VecDeque::new(),
             last_arrival_at: None,
+            reason: None,
         }
     }
 }
@@ -243,6 +252,7 @@ impl Default for Config {
             power_managed: false,
             idle_scale_down_secs: 600,
             sleep_without_new_viewer_secs: 3600,
+            daily_spend_usd: None,
             names_published: false,
             phone_claim_secs: 120,
             phone_claim_cooldown_secs: 60,
@@ -713,6 +723,9 @@ pub struct Fleet {
     /// The grid's render budget.
     #[serde(default)]
     pub budget: crate::budget::Budget,
+    /// Today's spend (`crate::spend`).
+    #[serde(default)]
+    pub spend: crate::spend::Spend,
     /// Coordinator components that are degraded: reason and since when.
     pub degraded: BTreeMap<String, (String, u64)>,
     /// The EC2 half's aggregator's published DNS names (`EC2_AGGREGATE_ID`).
@@ -887,6 +900,7 @@ impl State {
                     ..Power::default()
                 },
                 budget: Default::default(),
+                spend: Default::default(),
                 ec2_aggregate_published: None,
                 phones: BTreeMap::new(),
                 phone_claim_count: 0,

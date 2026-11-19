@@ -75,6 +75,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     environment: fleet-stage-deploy
     timeout-minutes: 45
+    # The release replaces the one coordinator task, and a smoke that reads /live meanwhile
+    # fails: a web deploy's IPv6 smoke got "WebSocket upgrade refused" while this job replaced
+    # the task. The smokes' group (fleet-viewer-smoke.yml) holds the release until
+    # a running smoke ends, and holds any smoke until the release ends. queue: max keeps a
+    # pending release from being cancelled by a smoke that queues behind it.
+    concurrency:
+      group: fleet-viewer-smoke
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write
