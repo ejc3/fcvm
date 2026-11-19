@@ -1312,6 +1312,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         };
         let b = broadcast::BroadcastSecret::parse(&json)?;
         gate.playback = b.playback()?;
+        admission::check_direct_capacity(args.direct_capacity)?;
         gate.seats = admission::Seats::new(Some(args.direct_capacity));
         let mut argv = vec![
             std::env::current_exe()

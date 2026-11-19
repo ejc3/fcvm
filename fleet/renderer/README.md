@@ -172,6 +172,14 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+A fleet renderer (`SCENE_TOKEN_FILE` or `TLS_CERT_FILE` set) limits these tools
+(PROTOCOL.md, "Access" and "Stream limits"): `GET /still` and `GET /raw` need
+`Authorization: Bearer <scene token>`, a stream asks for at most `h=1080`, `q=hi`
+needs an aggregator's token once the scene brought `admit_keys`, and at most 512
+streams run at once (one per viewer a token names). The EC2 tile's nginx passes
+only `/frames`, `/health`, `/scene` and `/budget` (`fleet/ami/tile/nginx-renderer.conf`).
+A local renderer has none of these limits.
+
 ## The trace's code size (round 21, 2026-11-05)
 
 Round 20 left the heavy terrain tiles 1.53 (432 lines) and 1.68 (540 lines) times short of one

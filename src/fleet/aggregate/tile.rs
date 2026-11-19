@@ -25,8 +25,10 @@ pub(crate) async fn read(
     events: mpsc::Sender<TileEvent>,
     cancel: CancellationToken,
 ) {
+    // One name for this reader's subscriptions: a reconnect replaces its own stale stream.
+    let name = super::subscriber_name();
     while !cancel.is_cancelled() {
-        let admit = super::own_token(&keys);
+        let admit = super::own_token(&keys, &name);
         tokio::select! {
             _ = cancel.cancelled() => return,
             r = stream(tile, &base, admit.as_deref(), codec.as_ref(), fps, &events) => {

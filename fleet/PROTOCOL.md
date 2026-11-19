@@ -1801,13 +1801,24 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   doubling to 30 s. A viewer that falls behind the stream starts again from the newest
   keyframe.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
-  the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
+  the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored. A
+  fleet renderer streams a tile at most 1080 tall ("Stream limits"): a tile taller than
+  that at `--image-height` is refused.
 - `admit_keys` in a layout (the coordinator's admission keys, hex): the public
   listener's `/frames` then needs a first message `{"admit": "<direct token>"}` made with
   one of them within 5 s (the socket is closed with 1008 otherwise; before its first layout
   it answers `503`; it takes no message over 4 KiB), and the aggregator's own tile
   subscriptions send a token it makes with the first. The coordinator's poster sends one
-  the same way. The agent passes its scene's keys; the coordinator its own.
+  the same way. The agent passes its scene's keys; the coordinator its own. Each tile
+  reader names a viewer of its own, `aggregator-<id>`, in every token it makes (a renderer
+  serves one stream per viewer, and `q=hi` only to an aggregator: "Stream limits").
+- The public listener serves one stream per viewer and at most 512 at once, as a renderer
+  does ("Stream limits"): a stream whose token names a viewer that already streams closes
+  the older one with 1008 and takes its place once it has ended, so the count never passes
+  the cap. The close waits at most 0.5 s (`REPLACED_CLOSE_WAIT`) to be sent; an older stream
+  whose client stopped reading is dropped without it. A new viewer past 512 is closed with
+  1013. Without
+  `admit_keys` streams are counted, never replaced.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
@@ -1877,6 +1888,10 @@ certificate JSON, whose `scene_token` field is the token: a VM on a host agent) 
   (a new inode, size or modification time), and a removed file authorizes nothing.
 - `GET /frames` is `503` until the first scene: that scene says whether streams need a
   direct token (`admit_keys`), and a stream opened before it would keep its frames after.
+  What a stream may ask for, and how many streams run at once, is under "Stream limits".
+- `GET /still` and `GET /raw` need the scene token as `POST /scene` does (`401` without it,
+  `503` while none can be read): no viewer uses them, and each makes the renderer draw or
+  encode a frame for the caller.
 - The scene token is the `scene_token` field of the certificate secret ("Certificate"
   under the coordinator), so it reaches each renderer the way its certificate does. The
   coordinator adds one when the secret has none (32 random bytes, hex; two coordinators
@@ -1887,6 +1902,35 @@ certificate JSON, whose `scene_token` field is the token: a VM on a host agent) 
   coordinator and relaunch the tiles and hosts: a tile reads its token once, at boot.
 
 A renderer with neither variable set (a local run) takes any scene and streams at once.
+
+### Stream limits
+
+A fleet renderer serves a stream no more than the page asks for, and a bounded number of
+them (`fleet/renderer/src/access.h`):
+
+- `h` is at most 1080 (`FLEET_MAX_STREAM_H`), the largest height the page asks for
+  (`STREAM_HEIGHTS` in `fleet/web/core/layout.ts`, already scaled by the device pixel ratio);
+  `400` above it, before the upgrade. A height message above it is ignored.
+- `q=hi` is for an aggregator: once a scene brought `admit_keys`, a stream asking for it
+  must be admitted with a token naming a viewer `aggregator-<id>` (the aggregator's own
+  tokens, `subscriber_name` in `src/fleet/aggregate/mod.rs`), and is closed with 1008 ("q=hi
+  is for aggregators") otherwise; a `{"q": "hi"}` message from such a stream is ignored. The
+  page asks for `std` and `lo` only. Without `admit_keys` no token names anyone and any
+  quality is served.
+- One stream per viewer: a stream admitted with a token naming a viewer that already
+  streams from this renderer ends the older stream (its connection is shut down), so a
+  reloaded page streams at once and one token, or the page's refreshed token for the same
+  viewer, never holds two. Each of an aggregator's tile readers names a viewer of its own.
+- At most 512 streams at once (`MAX_FLEET_STREAMS`): a stream past it is closed with 1013
+  (try again later), except one that replaces its viewer's own. 512 is the coordinator's
+  most seats (`MAX_SEATS`, 500, the default `--direct-capacity`) and 12 for the aggregators
+  that read a tile (`STREAM_RESERVE`, `src/fleet/coord/admission.rs`); a coordinator with a
+  broadcast does not start with `--direct-capacity` above 500. Without `admit_keys` streams
+  are counted, never replaced.
+
+A renderer outside the fleet keeps the earlier limits: `h` up to 2160, any `q`, any number
+of streams. The phone streamer and the Windows bridge serve frames with the renderer's code,
+under the same limits.
 
 ### Coordinates and time
 
@@ -2087,8 +2131,9 @@ the field. A change of the weather a hold draws starts a new hold.
 
 ### `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
-`h` is 16 to 2160. `q` is optional: `hi`, `std` (the default) or `lo`; see
-"Stream quality". A fleet renderer answers `503` before its first scene ("Access").
+`h` is 16 to 2160 (16 to 1080 on a fleet renderer). `q` is optional: `hi`, `std` (the
+default) or `lo`; see "Stream quality" and, on a fleet renderer, "Stream limits". A fleet
+renderer answers `503` before its first scene ("Access").
 Once a scene has brought `admit_keys`, the client's first message must be
 `{"admit": "<direct token>"}` (the coordinator's `admission` message), made with one of
 them and not expired, within 5 s; anything else closes the socket with 1008 before a
@@ -2497,7 +2542,7 @@ must differ.
 
 ### `GET /still?h=<height>&quality=<1-100>` (addition, round 5)
 
-A poster frame: the next frame of this renderer's rectangle, as a baseline
+A fleet renderer serves it only to a holder of the scene token ("Access"). A poster frame: the next frame of this renderer's rectangle, as a baseline
 JPEG (`image/jpeg`, 4:2:0, default `quality` 90), with the same
 `X-Fleet-Tile` header as `GET /raw` (it says `hold` and `hold_samples`, so a
 page can tell how far the image has converged). `Access-Control-Allow-Origin:
@@ -2551,7 +2596,8 @@ with a header `X-Fleet-Tile: {"t":..,"x0":..,"y0":..,"width":..,"height":..,
 under `previous_rect` before `rect_from_frame`; `404` if the renderer skipped that
 slot. `tools/rawmosaic.py` uses it to stitch an unencoded mosaic that can be
 compared pixel for pixel with the same frame drawn whole
-(`fleet-renderer still --seq 12`). Not for browsers.
+(`fleet-renderer still --seq 12`). Not for browsers; a fleet renderer serves it only to a
+holder of the scene token ("Access").
 
 ### Process
 
@@ -2800,7 +2846,8 @@ the clone's GPU.
   has one consumer).
 - `POST /budget`: accepted when well formed and ignored (the wall's budget controller posts
   every tile; a phone draws at its display's rate).
-- `GET /still`: the screen as last copied, JPEG.
+- `GET /still`: the screen as last copied, JPEG. A fleet streamer serves it only to a holder
+  of the scene token, as the renderer does ("Access").
 - `GET /health`: the renderer's first six keys (`fps`, `heights`, `streams`, `gpu`, `t`,
   `frame`), `boot_id`, `ready`, `error` when failed, `startup_ms` (`first_capture`,
   `first_frame_sent`, from the process start), and `phone`:

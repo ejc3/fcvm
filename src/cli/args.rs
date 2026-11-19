@@ -360,7 +360,8 @@ pub struct FleetCoordArgs {
     /// With a broadcast, how many viewers hold a seat (direct or aggregated streams); a
     /// viewer that connects while every seat is held watches the broadcast only. 500 is the
     /// measured capacity of the wall as deployed (fleet/renderer/README.md, "Viewers per
-    /// renderer"). Without a broadcast every viewer is seated.
+    /// renderer"), and the most a tile streams to (`MAX_SEATS`, fleet/PROTOCOL.md "Stream
+    /// limits"). Without a broadcast every viewer is seated.
     #[arg(long, env = "FLEET_DIRECT_CAPACITY", default_value_t = 500)]
     pub direct_capacity: usize,
 

@@ -3,8 +3,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -30,16 +34,33 @@
 #include "tls_check.h"
 
 struct ServerTest {
-  struct PosterSource : FrameSource {
-    explicit PosterSource(bool public_poster) : public_poster(public_poster) {}
-    bool public_poster;
-    int reads = 0;
-    std::shared_ptr<Subscriber> subscribe(int, int) override { return nullptr; }
-    void unsubscribe(const std::shared_ptr<Subscriber>&) override {}
+  // A frame source with a stream's interfaces and no GPU: it counts what the server asked of it.
+  struct FakeSource : FrameSource {
+    explicit FakeSource(bool public_poster, bool admission = true) : public_poster(public_poster), admission(admission) {}
+    bool public_poster, admission;
+    std::atomic<int> reads{0}, raws{0};
+    std::mutex mu;
+    std::vector<std::shared_ptr<Subscriber>> subs;  // every stream subscribed, in order
+    std::shared_ptr<Subscriber> subscribe(int h, int q) override {
+      auto s = std::make_shared<Subscriber>();
+      s->want_h = h;
+      s->want_q = q;
+      std::lock_guard<std::mutex> l(mu);
+      subs.push_back(s);
+      return s;
+    }
+    void unsubscribe(const std::shared_ptr<Subscriber>& s) override { s->close(); }
+    size_t subscribed() {
+      std::lock_guard<std::mutex> l(mu);
+      return subs.size();
+    }
     void wake() override {}
     bool post_scene(const std::string&, std::string*) override { return false; }
     bool post_budget(const std::string&, std::string*) override { return false; }
-    bool raw_frame(double, std::string*, std::string*) override { return false; }
+    bool raw_frame(double, std::string*, std::string*) override {
+      ++raws;
+      return false;
+    }
     bool next_frame(int, std::vector<uint8_t>* rgba, int* w, int* h, std::string*) override {
       ++reads;
       *w = *h = 16;
@@ -48,19 +69,21 @@ struct ServerTest {
     }
     bool allows_fleet_still() const override { return public_poster; }
     std::string health_json() override { return "{}"; }
-    bool admits(const std::string&) override { return false; }
-    bool requires_admit() override { return true; }
+    // Any token shaped like one is admitted: these tests are about what follows admission.
+    bool admits(const std::string& token) override { return !admit_token_viewer(token).empty(); }
+    bool requires_admit() override { return admission; }
     bool has_scene() override { return true; }
   };
 
-  static std::string request(Server& server, const std::string& method) {
+  // One request on a socket pair, the server's handler run to its end on this thread.
+  static std::string exchange(Server& server, const std::string& req) {
     int fd[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return {};
     Conn client(fd[0], nullptr);
     {
       Conn peer(fd[1], nullptr);
-      std::string req = method + " /still?h=16 HTTP/1.1\r\nHost: localhost\r\n\r\n";
       if (!client.write_all(req.data(), req.size())) return {};
+      ::shutdown(fd[0], SHUT_WR);  // nothing more is sent: a read for more ends the handler
       server.handle(peer);
     }
     client.set_read_deadline_ms(2000);
@@ -69,12 +92,109 @@ struct ServerTest {
     for (long n; (n = client.read(bytes, sizeof bytes)) > 0;) response.append(bytes, n);
     return response;
   }
+  static std::string request(Server& server, const std::string& method, const std::string& target = "/still?h=16",
+                             const std::string& headers = "") {
+    return exchange(server, method + " " + target + " HTTP/1.1\r\nHost: localhost\r\n" + headers + "\r\n");
+  }
+  // A client's text message: masked (with a zero mask), at most 125 bytes.
+  static std::string client_text(const std::string& text) {
+    std::string f;
+    f.push_back((char)0x81);
+    f.push_back((char)(0x80 | text.size()));
+    f.append(4, '\0');
+    return f + text;
+  }
+  static std::string upgrade(const std::string& query) {
+    return "GET /frames?" + query +
+           " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+  }
+  static std::string token_for(const std::string& viewer) { return "v1.4000000000." + viewer + ".mac"; }
+
+  // A frame stream served on its own thread until the client closes its end (or the server
+  // ends the stream). `done` turns true when the server's handler has returned.
+  struct Stream {
+    std::unique_ptr<Conn> client;
+    std::thread server_side;
+    std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+    std::string head;  // the response's head, as far as it was read
+    void end() {
+      if (client) client->shutdown_both();
+      if (server_side.joinable()) server_side.join();
+    }
+    ~Stream() { end(); }
+  };
+  static std::unique_ptr<Stream> stream(Server& server, const std::string& query, const std::string& first) {
+    auto st = std::make_unique<Stream>();
+    int fd[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return st;
+    st->client.reset(new Conn(fd[0], nullptr));
+    std::string req = upgrade(query);
+    st->client->write_all(req.data(), req.size());
+    auto done = st->done;
+    int peer_fd = fd[1];
+    st->server_side = std::thread([&server, peer_fd, done] {
+      Conn peer(peer_fd, nullptr);
+      server.handle(peer);
+      *done = true;
+    });
+    // The first message goes after the 101, as a browser sends it.
+    st->client->set_read_deadline_ms(2000);
+    char b;
+    while (st->head.find("\r\n\r\n") == std::string::npos && st->client->read(&b, 1) == 1) st->head.push_back(b);
+    if (!first.empty()) {
+      std::string m = client_text(first);
+      st->client->write_all(m.data(), m.size());
+    }
+    return st;
+  }
+  static bool within(int ms, const std::function<bool()>& ok) {
+    for (int i = 0; i < ms / 5; i++) {
+      if (ok()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return ok();
+  }
+  // What the server wrote to a stream's client so far, read until `ms` pass with nothing more.
+  static std::string received(Stream& st, int ms) {
+    st.client->set_read_deadline_ms(ms);
+    std::string out = st.head;
+    char bytes[4096];
+    for (long n; (n = st.client->read(bytes, sizeof bytes)) > 0;) {
+      out.append(bytes, n);
+      st.client->set_read_deadline_ms(ms);
+    }
+    return out;
+  }
+  static bool closed_with(const std::string& response, uint16_t code) {
+    size_t at = response.find("\r\n\r\n");
+    if (at == std::string::npos || response.size() < at + 6) return false;
+    const unsigned char* f = (const unsigned char*)response.data() + at + 4;
+    return f[0] == 0x88 && (f[2] << 8 | f[3]) == code;
+  }
+
+  // A fleet server's scene token, in a file of its own.
+  struct TokenFile {
+    char dir[32] = "/tmp/fleet-routes-XXXXXX";
+    std::string path;
+    SceneToken token;
+    TokenFile() {
+      if (!mkdtemp(dir)) return;
+      path = std::string(dir) + "/token";
+      std::ofstream(path) << "s-1\n";
+      token.configure(path, false);
+    }
+    ~TokenFile() {
+      unlink(path.c_str());
+      rmdir(dir);
+    }
+  };
 
   static void still_never_reads_a_private_fleet_frame() {
     // The configured path need not hold a token yet for the listener to be a fleet listener.
     SceneToken scene;
     scene.configure("unused.json", true);
-    PosterSource desktop(false);
+    FakeSource desktop(false);
     Server fleet_desktop(desktop);
     fleet_desktop.set_scene_token(&scene);
     for (const char* method : {"GET", "HEAD"}) {
@@ -83,19 +203,142 @@ struct ServerTest {
                 response.size() >= 4 && response.find("\r\n\r\n") == response.size() - 4,
             "private fleet %s returns 404 without any frame bytes", method);
     }
-    CHECK(desktop.reads == 0, "private fleet requests never ask for desktop pixels (reads %d)", desktop.reads);
+    CHECK(desktop.reads == 0, "private fleet requests never ask for desktop pixels (reads %d)", desktop.reads.load());
 
-    PosterSource local_source(false);
+    FakeSource local_source(false);
     Server local_desktop(local_source);
     auto local = request(local_desktop, "GET");
     CHECK(local.find("HTTP/1.1 200 ") == 0 && local.find("image/jpeg") != std::string::npos && local_source.reads == 1,
           "a local desktop can still return its JPEG");
-    PosterSource renderer(true);
-    Server fleet_renderer(renderer);
-    fleet_renderer.set_scene_token(&scene);
-    auto poster = request(fleet_renderer, "GET");
-    CHECK(poster.find("HTTP/1.1 200 ") == 0 && poster.find("image/jpeg") != std::string::npos && renderer.reads == 1,
-          "a fleet renderer can still return its public poster");
+  }
+
+  // GET /still and /raw on a fleet server need the scene token (nothing a viewer runs uses them);
+  // outside the fleet they need none.
+  static void still_and_raw_need_the_scene_token_on_a_fleet_server() {
+    TokenFile tf;
+    FakeSource renderer(true);
+    Server fleet(renderer);
+    fleet.set_scene_token(&tf.token);
+    for (const char* target : {"/still?h=2160", "/raw?t=1"}) {
+      for (const char* auth : {"", "Authorization: Bearer s-2\r\n", "Authorization: s-1\r\n"}) {
+        auto r = request(fleet, "GET", target, auth);
+        CHECK(r.find("HTTP/1.1 401 ") == 0, "a fleet GET %s with [%s] is refused: %.40s", target, auth, r.c_str());
+      }
+    }
+    CHECK(renderer.reads == 0 && renderer.raws == 0, "no frame was drawn or read for a refused request (%d %d)",
+          renderer.reads.load(), renderer.raws.load());
+    auto still = request(fleet, "GET", "/still?h=16", "Authorization: Bearer s-1\r\n");
+    CHECK(still.find("HTTP/1.1 200 ") == 0 && still.find("image/jpeg") != std::string::npos && renderer.reads == 1,
+          "the scene token's holder gets the poster");
+    request(fleet, "GET", "/raw?t=1", "Authorization: Bearer s-1\r\n");
+    CHECK(renderer.raws == 1, "the scene token's holder reaches /raw");
+    FakeSource local_source(true);
+    Server local(local_source);
+    request(local, "GET", "/raw?t=1");
+    CHECK(local_source.raws == 1, "outside the fleet /raw needs no token");
+  }
+
+  // A fleet stream asks for no more than the page does: h up to 1080 (the request is refused
+  // before the upgrade), q=hi only for an aggregator's token, and neither later by message.
+  static void fleet_streams_ask_no_more_than_the_page() {
+    TokenFile tf;
+    FakeSource src(true);
+    Server fleet(src);
+    fleet.set_scene_token(&tf.token);
+    for (int h : {1081, 2160}) {
+      auto r = exchange(fleet, upgrade("h=" + std::to_string(h)));
+      CHECK(r.find("HTTP/1.1 400 ") == 0, "a fleet stream at h=%d is refused: %.40s", h, r.c_str());
+    }
+    CHECK(exchange(fleet, upgrade("h=1080")).find("HTTP/1.1 101 ") == 0, "h=1080 is the page's tallest and upgrades");
+    {
+      auto st = stream(fleet, "h=270&q=hi", "{\"admit\":\"" + token_for("v-7") + "\"}");
+      std::string got = received(*st, 1000);
+      CHECK(closed_with(got, 1008) && got.find("q=hi is for aggregators") != std::string::npos && src.subscribed() == 0,
+            "a viewer's q=hi is refused before it subscribes");
+    }
+    {
+      auto st = stream(fleet, "h=270&q=hi", "{\"admit\":\"" + token_for("aggregator-1f") + "\"}");
+      CHECK(within(2000, [&] { return src.subscribed() == 1; }) && src.subscribed() == 1 && src.subs[0]->want_q == 2,
+            "an aggregator gets q=hi");
+    }
+    // A viewer's stream asks for hi or a taller picture later by message: both are ignored.
+    auto st = stream(fleet, "h=270", "{\"admit\":\"" + token_for("v-8") + "\"}");
+    bool served = within(2000, [&] { return src.subscribed() == 2; });
+    CHECK(served, "the viewer's std stream is served");
+    if (!served) return;
+    std::string more = client_text("{\"h\":2160}") + client_text("{\"q\":\"hi\"}") + client_text("{\"h\":540}");
+    st->client->write_all(more.data(), more.size());
+    CHECK(within(2000, [&] { return src.subs[1]->want_h == 540; }) && src.subs[1]->want_q == 1,
+          "h=2160 and q=hi by message are ignored (h %d q %d)", src.subs[1]->want_h.load(), src.subs[1]->want_q.load());
+    // Outside the fleet the limits are the old ones.
+    FakeSource local_source(true, false);
+    Server local(local_source);
+    auto open = stream(local, "h=2160&q=hi", "");
+    CHECK(within(2000, [&] { return local_source.subscribed() == 1; }), "outside the fleet h=2160 q=hi streams");
+  }
+
+  // A replaced stream whose client stopped reading ends at once: the replacement shuts its
+  // socket down (StreamTable's stop), which fails the writer's blocked write, so it never waits
+  // to send anything first and its place is free before the next replacement.
+  static void a_replaced_stream_that_stopped_reading_ends_at_once() {
+    TokenFile tf;
+    FakeSource src(true);
+    Server fleet(src);
+    fleet.set_scene_token(&tf.token);
+    fleet.streams_.set_cap(1);
+    std::vector<std::unique_ptr<Stream>> held;  // every client, none of them ever read
+    for (int i = 0; i < 4; i++) {
+      held.push_back(stream(fleet, "h=270", "{\"admit\":\"v1.400000000" + std::to_string(i) + ".v-1.mac\"}"));
+      CHECK(within(2000, [&] { return src.subscribed() == (size_t)i + 1; }), "client %d streams", i);
+      if (src.subscribed() != (size_t)i + 1) return;
+      // 64 MiB the client never reads: its writer blocks in a write.
+      auto sub = src.subs[i];
+      for (int k = 0; k < 64; k++) sub->push(std::make_shared<const std::string>(std::string(1 << 20, 'x')));
+      CHECK(within(1000, [&] { return fleet.streams_.size() == 1; }) && (i == 0 || held[i - 1]->done->load()),
+            "client %d replaced its predecessor's stream within 1 s (%zu open)", i, fleet.streams_.size());
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
+  // One stream per viewer on a fleet server: a newer one with the same viewer's token ends the
+  // older; other viewers' streams stay. At most the cap in all; a refusal is close 1013.
+  static void a_fleet_server_streams_once_per_viewer_and_up_to_its_cap() {
+    TokenFile tf;
+    FakeSource src(true);
+    Server fleet(src);
+    fleet.set_scene_token(&tf.token);
+    auto first = stream(fleet, "h=270", "{\"admit\":\"" + token_for("v-1") + "\"}");
+    CHECK(within(2000, [&] { return src.subscribed() == 1; }), "the first stream is served");
+    // The page's refreshed token names the same viewer with a later expiry.
+    auto again = stream(fleet, "h=270", "{\"admit\":\"v1.4000000300.v-1.mac2\"}");
+    CHECK(within(2000, [&] { return first->done->load(); }), "the viewer's newer stream ended the older one");
+    CHECK(within(2000, [&] { return src.subscribed() == 2 && fleet.streams_.size() == 1; }) && !again->done->load(),
+          "the newer one streams, alone (%zu open)", fleet.streams_.size());
+    auto other = stream(fleet, "h=270", "{\"admit\":\"" + token_for("v-2") + "\"}");
+    CHECK(within(2000, [&] { return fleet.streams_.size() == 2; }) && !again->done->load(), "another viewer streams beside it");
+    fleet.streams_.set_cap(2);
+    auto third = stream(fleet, "h=270", "{\"admit\":\"" + token_for("v-3") + "\"}");
+    std::string got = received(*third, 1000);
+    CHECK(closed_with(got, 1013) && third->done->load() && fleet.streams_.size() == 2 && src.subscribed() == 3,
+          "past the cap a new viewer is refused with 1013 (%zu open)", fleet.streams_.size());
+    auto replaced = stream(fleet, "h=270", "{\"admit\":\"" + token_for("v-2") + "\"}");
+    CHECK(within(2000, [&] { return other->done->load() && src.subscribed() == 4; }) && !again->done->load(),
+          "at the cap a viewer's newer stream still replaces its own");
+    other->end();
+    first->end();
+    again->end();
+    replaced->end();
+    CHECK(within(2000, [&] { return fleet.streams_.size() == 0; }), "every ended stream gave back its place (%zu open)",
+          fleet.streams_.size());
+    // Without admission no token names a viewer: streams are counted, never replaced.
+    FakeSource open_src(true, false);
+    Server open_fleet(open_src);
+    open_fleet.set_scene_token(&tf.token);
+    open_fleet.streams_.set_cap(2);
+    auto a = stream(open_fleet, "h=270", ""), b = stream(open_fleet, "h=270", "");
+    CHECK(within(2000, [&] { return open_src.subscribed() == 2; }) && !a->done->load() && !b->done->load(), "two anonymous streams");
+    auto c = stream(open_fleet, "h=270", "");
+    CHECK(closed_with(received(*c, 1000), 1013) && !a->done->load() && !b->done->load(), "a third is refused at the cap");
   }
 };
 
@@ -260,6 +503,49 @@ int main() {
     CHECK(!none.configured(), "no token file: not a fleet renderer");
   }
   ServerTest::still_never_reads_a_private_fleet_frame();
+  ServerTest::still_and_raw_need_the_scene_token_on_a_fleet_server();
+  ServerTest::fleet_streams_ask_no_more_than_the_page();
+  ServerTest::a_fleet_server_streams_once_per_viewer_and_up_to_its_cap();
+  ServerTest::a_replaced_stream_that_stopped_reading_ends_at_once();
+  // --- stream limits (access.h): the viewer a token names, who may ask q=hi, the table
+  {
+    CHECK(admit_token_viewer("v1.1000.v-3.77RQ") == "v-3" && admit_token_viewer("v1.1000.aggregator-ab.x") == "aggregator-ab" &&
+              admit_token_viewer("v1.1000.x") == "" && admit_token_viewer("v2.1000.v-3.x") == "" && admit_token_viewer("") == "",
+          "the viewer a token names");
+    CHECK(fleet_max_quality(true, "v-3") == 1 && fleet_max_quality(true, "aggregator") == 1 &&
+              fleet_max_quality(true, "aggregator-") == 1 && fleet_max_quality(true, "aggregator-1f") == 2 &&
+              fleet_max_quality(false, "") == 2,
+          "q=hi for an aggregator's token, or with admission off");
+    StreamTable t(2);
+    int stopped_a = 0, stopped_b = 0;
+    uint64_t a = 0, b = 0, c = 0, d = 0;
+    CHECK(t.open("v-1", [&] { stopped_a++; }, &a) && t.open("v-1", [&] { stopped_b++; }, &b) && stopped_a == 1 && t.size() == 2,
+          "a viewer's second stream stops its first, which stays counted until it closes");
+    CHECK(!t.open("v-2", [] {}, &c), "the cap counts a stopped stream that has not closed");
+    CHECK(t.open("v-1", [] {}, &d) && stopped_a == 1 && stopped_b == 1, "each stream is stopped once");
+    t.close(a);
+    t.close(b);
+    CHECK(t.size() == 1 && t.open("v-2", [] {}, &c), "closed streams free their places");
+    t.close(a);
+    CHECK(t.size() == 2, "closing twice frees nothing more");
+    uint64_t e = 0;
+    t.close(d);
+    CHECK(t.open("v-1", [] {}, &e) && t.size() == 2, "a viewer whose stream closed opens a new one in its place");
+    CHECK(MAX_FLEET_STREAMS == 512, "the cap src/fleet/coord/admission.rs checks");
+  }
+  // The tallest stream a fleet server sends is the page's tallest ask.
+  {
+    auto layout = source_lines("../../web/core/layout.ts");
+    std::smatch m;
+    int tallest = -1;
+    for (const std::string& l : layout)
+      if (std::regex_search(l, m, std::regex(R"(STREAM_HEIGHTS = \[([0-9, ]+)\])"))) {
+        std::string list = m[1];
+        tallest = atoi(list.substr(list.find_last_of(',') + 1).c_str());
+      }
+    CHECK(tallest == FLEET_MAX_STREAM_H, "fleet/web/core/layout.ts STREAM_HEIGHTS ends at %d, the renderer allows %d", tallest,
+          FLEET_MAX_STREAM_H);
+  }
   // Ordering of access checks in the server's request and stream handlers.
   {
     auto src = source_lines("../src/server.cpp");
@@ -269,7 +555,7 @@ int main() {
       return -1;
     };
     long scene = find_from(0, "path == \"/scene\" || path == \"/budget\"");
-    long access = find_from(scene, "scene_access(fleet()");
+    long access = find_from(scene, "refuse_without_scene_token(c, hdr)");
     long body = find_from(scene, "c.read(tmp, sizeof tmp)");
     long post = find_from(scene, "p_.post_scene(body");
     CHECK(scene >= 0 && access > scene && body > access && post > access,

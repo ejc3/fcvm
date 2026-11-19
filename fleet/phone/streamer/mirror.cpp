@@ -6,14 +6,6 @@
 
 #include "admit.h"
 
-std::string admit_token_viewer(const std::string& token) {
-  size_t last = token.rfind('.');
-  if (last == std::string::npos || token.compare(0, 3, "v1.") != 0) return "";
-  size_t dot = token.find('.', 3);
-  if (dot == std::string::npos || dot >= last) return "";
-  return token.substr(dot + 1, last - dot - 1);
-}
-
 bool mirror_admits(const std::vector<std::string>& keys, const std::string& mirror_viewer, const std::string& token,
                    int64_t now_s) {
   if (mirror_viewer.empty() || keys.empty()) return false;

@@ -1,9 +1,10 @@
 // HTTP/1.1 and WebSocket server: GET /health, POST /scene, GET /frames?h=,
-// GET /still, GET /raw. Plain on one port; with a TlsFront, also HTTPS/WSS
+// GET /still, GET /raw (the last two need the scene token on a fleet server). Plain on one port; with a TlsFront, also HTTPS/WSS
 // on another.
 #pragma once
 #include "access.h"
 #include <atomic>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,5 +70,9 @@ class Server {
   TlsFront* tls_ = nullptr;
   SceneToken* token_ = nullptr;
   bool fleet() const { return token_ && token_->configured(); }
+  // A fleet server's GET /raw and /still (debug and poster routes, which no viewer uses) need the
+  // scene token as POST /scene does: 0 to go ahead, else the response already sent.
+  int refuse_without_scene_token(Conn& c, std::map<std::string, std::string>& hdr);
   std::atomic<unsigned long long> refused_{0};  // connections refused for want of a thread (both accept loops)
+  StreamTable streams_{MAX_FLEET_STREAMS};  // a fleet server's open frame streams
 };

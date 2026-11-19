@@ -10,9 +10,7 @@
 #include <utility>
 #include <vector>
 
-// The viewer a direct token names (`v1.<expiry>.<viewer>.<mac>`), or "" for anything else.
-// It does not check the mac: admits() does.
-std::string admit_token_viewer(const std::string& token);
+#include "admit.h"  // admit_token_viewer
 
 // Whether a mirror stream may open for this token: the scene names the viewer holding the
 // phone (`mirror_viewer`), the coordinator's keys made the token, and it names that viewer.
