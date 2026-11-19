@@ -259,14 +259,12 @@ impl Seats {
                 };
             }
         }
+        // The client's own limit first: a client at it is not offered a seat that frees later.
+        if self.client_full(&held, client) {
+            return Admitted::ClientFull;
+        }
         if self.capacity.is_some_and(|c| held.len() >= c) {
             return Admitted::Late;
-        }
-        // Only where a late viewer has a broadcast to watch: unlimited seats mean no broadcast.
-        if self.capacity.is_some()
-            && held.values().filter(|s| s.client == client).count() >= SEATS_PER_CLIENT
-        {
-            return Admitted::ClientFull;
         }
         let ticket = uuid::Uuid::new_v4().simple().to_string();
         held.insert(
@@ -292,11 +290,19 @@ impl Seats {
         self.expire(&mut held, now);
     }
 
-    /// Whether a new connection would get a seat now.
-    pub fn free(&self, now: Instant) -> bool {
+    /// Whether `client` holds its share of seats. Only where a late viewer has a broadcast to
+    /// watch: unlimited seats mean no broadcast.
+    fn client_full(&self, held: &HashMap<String, Seat>, client: &str) -> bool {
+        self.capacity.is_some()
+            && held.values().filter(|s| s.client == client).count() >= SEATS_PER_CLIENT
+    }
+
+    /// Whether a new connection from `client` would get a seat now: one is free, and the
+    /// client does not already hold its share.
+    pub fn free(&self, client: &str, now: Instant) -> bool {
         let mut held = self.held.lock().unwrap();
         self.expire(&mut held, now);
-        self.capacity.is_none_or(|c| held.len() < c)
+        self.capacity.is_none_or(|c| held.len() < c) && !self.client_full(&held, client)
     }
 
     pub fn capacity(&self) -> Option<usize> {
@@ -469,7 +475,7 @@ impl Gate {
                 reason: Some(LATE_REASON.into()),
                 direct: None,
                 broadcast,
-                seat_free: self.seats.free(now),
+                seat_free: self.seats.free(client, now),
                 capacity: self.seats.capacity(),
             },
             Admitted::ClientFull => Admission {
@@ -559,12 +565,12 @@ mod tests {
     fn seats_admit_up_to_capacity_then_viewers_are_late() {
         let s = Seats::new(Some(2));
         let now = Instant::now();
-        let a = s.admit(None, "c", now);
-        let b = s.admit(None, "c", now);
+        let a = s.admit(None, "a", now);
+        let b = s.admit(None, "b", now);
         assert!(matches!(a, Admitted::Seat { .. }));
         assert!(matches!(b, Admitted::Seat { .. }));
         assert_eq!(s.admit(None, "c", now), Admitted::Late);
-        assert!(!s.free(now));
+        assert!(!s.free("c", now));
         // A forged or stale ticket is not a seat.
         assert_eq!(s.admit(Some("not-a-ticket"), "c", now), Admitted::Late);
     }
@@ -579,7 +585,7 @@ mod tests {
         s.release(&ticket, t0);
         // Within the grace: held for the ticket, not free for anyone else.
         let t1 = t0 + Duration::from_secs(30);
-        assert!(!s.free(t1));
+        assert!(!s.free("c", t1));
         assert_eq!(s.admit(None, "c", t1), Admitted::Late);
         assert_eq!(
             s.admit(Some(&ticket), "c", t1),
@@ -590,7 +596,7 @@ mod tests {
         s.release(&ticket, t1);
         // Past the grace: free, and the old ticket is just another arrival.
         let t2 = t1 + Duration::from_secs(61);
-        assert!(s.free(t2));
+        assert!(s.free("c", t2));
         assert!(
             matches!(s.admit(Some(&ticket), "c", t2), Admitted::Seat { ticket: n } if n != ticket)
         );
@@ -603,7 +609,7 @@ mod tests {
         for _ in 0..1000 {
             assert!(matches!(s.admit(None, "c", now), Admitted::Seat { .. }));
         }
-        assert!(s.free(now));
+        assert!(s.free("c", now));
     }
 
     /// One client cannot take every seat: past `SEATS_PER_CLIENT` its connections watch the
@@ -633,6 +639,48 @@ mod tests {
             }
         );
         assert!(CLIENT_FULL_REASON.contains(&SEATS_PER_CLIENT.to_string()));
+    }
+
+    /// A client at its share is told so even when every seat is held, and is never offered a
+    /// reload when a seat frees: a reload would only meet its own limit.
+    #[test]
+    fn a_client_at_its_share_is_never_offered_a_free_seat() {
+        let s = Seats::new(Some(3)).with_grace(Duration::from_secs(60));
+        let t0 = Instant::now();
+        for c in ["a", "a", "b"] {
+            assert!(matches!(s.admit(None, c, t0), Admitted::Seat { .. }));
+        }
+        // Every seat held, and "a" at its share: its limit, not the capacity, is the reason.
+        assert_eq!(s.admit(None, "a", t0), Admitted::ClientFull);
+        // "c" arrives late; then "b"'s seat frees.
+        assert_eq!(s.admit(None, "c", t0), Admitted::Late);
+        let b_ticket = s
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, seat)| seat.client == "b")
+            .map(|(t, _)| t.clone())
+            .expect("a seat for b");
+        s.release(&b_ticket, t0);
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(s.free("c", t1), "a free seat for a client below its share");
+        assert!(!s.free("a", t1), "no free seat for a client at its share");
+        let gate = Gate {
+            seats: s,
+            key: AdmitKey([1; 32]),
+            playback: None,
+            tick: Duration::from_secs(10),
+        };
+        let late = |client: &str| {
+            gate.message(&Admitted::Late, "v-1", client, None, 1_000_000, t1)
+                .seat_free
+        };
+        assert!(late("c"));
+        assert!(
+            !late("a"),
+            "a late viewer of a client at its share is not offered a reload"
+        );
     }
 
     fn test_key_pem() -> String {

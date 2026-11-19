@@ -584,7 +584,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 // Only a viewer late for the capacity is told of a free seat: one whose client
                 // holds its seats would be late again after a reload.
                 let free_changed =
-                    admitted == Admitted::Late && gate.seats.free(now) != last.seat_free;
+                    admitted == Admitted::Late && gate.seats.free(&client, now) != last.seat_free;
                 if !free_changed && now.duration_since(sent_at) < super::admission::DIRECT_REFRESH {
                     continue;
                 }

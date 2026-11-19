@@ -6716,8 +6716,9 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     .await;
     let now = || now_ms() / 1000;
     let mut seated = Vec::new();
-    for _ in 0..2 {
-        let mut v = Viewer::connect(&c.url).await;
+    // Each from its own address: one client at its own seat limit is told that instead.
+    for ip in ["198.51.100.1", "198.51.100.2"] {
+        let mut v = Viewer::connect_from(&c.url, Some(ip)).await;
         let a = v.message("admission").await;
         assert_eq!(a["locked"], false);
         assert!(a["seat"].is_string());

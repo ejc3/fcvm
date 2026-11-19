@@ -138,6 +138,14 @@ fn ec2_budget(
     launches: usize,
     at: u64,
 ) -> Result<(), String> {
+    // More launches than the whole budget never fit, however long the viewer waits
+    // (`--ec2-tiles` refuses such a count; a state from elsewhere could still hold one).
+    if launches > EC2_LAUNCH_BUDGET {
+        return Err(format!(
+            "this fleet has more EC2 tiles ({launches}) than viewers may launch in {} minutes ({EC2_LAUNCH_BUDGET})",
+            EC2_LAUNCH_WINDOW_MS / 60_000
+        ));
+    }
     let since = at.saturating_sub(EC2_LAUNCH_WINDOW_MS);
     let in_window: Vec<u64> = recent.iter().copied().filter(|t| *t > since).collect();
     if in_window.len() + launches <= EC2_LAUNCH_BUDGET {
@@ -811,16 +819,18 @@ fn intent_effect(
                 return Err(format!("{} is a viewer's own GPU right now", slot.id));
             }
             if half == Half::Ec2 {
-                if let Some(rl) = slot
+                // Its last launch: a relaunch, or, before the first running report fills
+                // that in, the launch that created the slot.
+                let launched = slot
                     .last_relaunch
                     .as_ref()
-                    .filter(|rl| at < rl.clicked_at + EC2_RELAUNCH_COOLDOWN_MS)
-                {
+                    .map_or(slot.created_at, |rl| rl.clicked_at);
+                if at < launched + EC2_RELAUNCH_COOLDOWN_MS {
                     return Err(format!(
-                        "{} relaunched {} s ago; it can be relaunched again in {} s",
+                        "{} launched {} s ago; it can be relaunched in {} s",
                         slot.id,
-                        (at - rl.clicked_at) / 1000,
-                        (rl.clicked_at + EC2_RELAUNCH_COOLDOWN_MS - at).div_ceil(1000)
+                        at.saturating_sub(launched) / 1000,
+                        (launched + EC2_RELAUNCH_COOLDOWN_MS - at).div_ceil(1000)
                     ));
                 }
                 ec2_budget(&f.ec2_viewer_launches, 1, at)?;

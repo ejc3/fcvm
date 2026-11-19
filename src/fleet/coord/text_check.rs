@@ -87,8 +87,10 @@ impl Guarded {
     }
 
     fn take(&self) -> bool {
-        let now = tokio::time::Instant::now();
         let mut b = self.bucket.lock().unwrap();
+        // Read under the lock: a time read before it could be older than the one another
+        // call stored meanwhile, move the refill time back, and credit that interval twice.
+        let now = tokio::time::Instant::now();
         let (tokens, at) = &mut *b;
         *tokens =
             (*tokens + now.duration_since(*at).as_secs_f64() * CHECKS_PER_SECOND).min(CHECK_BURST);
@@ -481,6 +483,25 @@ mod tests {
             check_text(&g, &[], &format!("later{i}")).await;
         }
         assert_eq!(calls(), burst + 3);
+    }
+
+    /// The bucket's refill time is read with its lock held, so two concurrent takes cannot
+    /// store their times out of order and credit one interval twice. An interleaving test
+    /// would need a descheduling between the read and the lock, so the order is pinned in
+    /// the source.
+    #[test]
+    fn the_bucket_reads_the_time_under_its_lock() {
+        let src = include_str!("text_check.rs");
+        let body = src
+            .split("    fn take(&self) -> bool {")
+            .nth(1)
+            .expect("Guarded::take")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        let lock = body.find(".lock()").expect("take locks the bucket");
+        let now = body.find("Instant::now()").expect("take reads the time");
+        assert!(lock < now, "take reads the time before it holds the lock");
     }
 
     #[tokio::test(start_paused = true)]

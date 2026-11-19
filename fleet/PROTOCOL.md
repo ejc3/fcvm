@@ -58,7 +58,9 @@ page shows, and `seat_free` true once a new connection would be seated (the page
 reload; a late connection is never promoted). One client (as counted for the limits below)
 holds at most 2 seats: its further connections are admitted like late ones, with `reason`
 "Your network already has 2 direct streams open, so this page watches the broadcast." and
-`seat_free` always false, since a reload would not seat them while its seats are held. This
+`seat_free` always false, since a reload would not seat them while its seats are held. The
+limit is checked before the capacity, and a late connection's `seat_free` is true only when a
+seat is free and its client holds fewer than 2. This
 applies only while `capacity` is set (there is a broadcast to watch). A page sends `{"type": "seat", "ticket":
 "<ticket>", "returning": false}` (`null` without one) as its first message, so one that reconnects keeps its seat
 if the ticket's connection closed less than 60 s before. `returning` is true when the page
@@ -221,16 +223,17 @@ lent to a visitor sit the race out.
 
 **EC2 launches.** Every relaunch of an EC2 tile launches an instance, so viewers' relaunches
 of EC2 tiles are bounded. An EC2 tile is not relaunched by a viewer within 90 s of its last
-launch (a relaunch, a race, or its launch at a wake): a launch takes 81 to 84 s to its first
-frame (`--ec2-pool` below), and a relaunch while it comes up throws away an instance that is
-billed its 60 s minimum and drew nothing.
-The receipt says `ec2-1 relaunched 1 s ago; it can be relaunched again in 89 s`. Across the
+launch (a relaunch, a race, or its launch at a wake, also one that has not reported running
+yet): a launch takes 81 to 84 s to its first frame (`--ec2-pool` below), and a relaunch while
+it comes up throws away an instance that is billed its 60 s minimum and drew nothing.
+The receipt says `ec2-1 launched 1 s ago; it can be relaunched in 89 s`. Across the
 fleet, viewers may cause 40 EC2 launches in any 10 minutes, a `relaunch` of an EC2 tile counting
 one and a `restart_now` race one per EC2 tile (five races of 8 EC2 tiles, or 40 relaunches).
 Past it both are refused with `viewers have used this fleet's EC2 launches for now (40 in 10
 minutes); try again in <n> s`. At the g4dn.xlarge on-demand price ($0.526 an hour, us-east-1)
 a launch that serves nothing costs at least $0.0088, so the budget bounds that waste to about
-$2.10 an hour. The owner's scheduled races (`--race-every`) are not counted.
+$2.10 an hour. The owner's scheduled races (`--race-every`) are not counted. A whole race
+must fit the budget, so `--ec2-tiles` above 40 is refused when the coordinator starts.
 
 **The directed camera.** The coordinator flies the wall's camera along a program generated
 from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:

@@ -1488,6 +1488,33 @@ mod power_tests {
         ])));
     }
 
+    /// A race launches every EC2 tile, so more EC2 tiles than the viewers' launch budget would
+    /// leave `restart_now` refused for ever: such a count is refused when the coordinator starts.
+    #[test]
+    fn the_ec2_tile_count_fits_the_launch_budget() {
+        let budget = fleet_core::apply::EC2_LAUNCH_BUDGET;
+        assert_eq!(coord(&[]).ec2_tiles, 8);
+        assert_eq!(
+            coord(&["--ec2-tiles", &budget.to_string()]).ec2_tiles,
+            budget
+        );
+        let over = (budget + 1).to_string();
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--ec2-tiles",
+            &over,
+        ];
+        let e = match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("--ec2-tiles {over} was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("no race could ever start"), "{e}");
+    }
+
     #[test]
     fn the_on_demand_host_cap_is_at_most_eight() {
         assert_eq!(coord(&[]).host_on_demand_max, 8);

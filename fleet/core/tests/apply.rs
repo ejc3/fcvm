@@ -426,7 +426,7 @@ fn viewer_ec2_launches_wait_for_the_tile_and_stay_within_the_budget() {
     assert_eq!(r.outcome, Outcome::Refused);
     assert_eq!(
         r.reason.as_deref(),
-        Some("ec2-1 relaunched 1 s ago; it can be relaunched again in 89 s")
+        Some("ec2-1 launched 1 s ago; it can be relaunched in 89 s")
     );
     // Another tile is not held back.
     let (s, r) = intent(s, 101_000, "relaunch", serde_json::json!({"tile": "ec2-2"}));
@@ -471,6 +471,68 @@ fn viewer_ec2_launches_wait_for_the_tile_and_stay_within_the_budget() {
         &events(serde_json::json!([{"type": "tick", "at": 10 * EC2_LAUNCH_WINDOW_MS}]))[0],
     );
     assert!(s.fleet.ec2_viewer_launches.is_empty());
+}
+
+/// An EC2 tile still booting its first instance (no running report yet, so no last relaunch)
+/// is held by the cooldown from its creation: a relaunch 1 s in is refused, one 90 s in is
+/// not.
+#[test]
+fn an_ec2_tile_booting_its_first_instance_is_not_relaunched_within_the_cooldown() {
+    use fleet_core::apply::EC2_RELAUNCH_COOLDOWN_MS;
+    use fleet_core::state::Outcome;
+    let config = config_with(serde_json::json!({
+        "ec2_max": 1, "fcvm_tiles": 0, "relaunch_interval_ms": 0
+    }));
+    let mut s = State::new(config, 0);
+    s = apply(s, &Event::Tick { at: 1000 });
+    let created = s.fleet.ec2[&1].created_at;
+    assert!(
+        s.fleet.ec2[&1].last_relaunch.is_none(),
+        "no running report yet"
+    );
+    let relaunch = |s: State, at: u64, id: &str| {
+        let e = events(
+            serde_json::json!([{"type": "intent", "at": at, "viewer": "v1",
+            "client": "198.51.100.1", "id": id, "name": "relaunch", "args": {"tile": "ec2-1"}}]),
+        );
+        let s = apply(s, &e[0]);
+        let r = s.receipts[id].clone();
+        (s, r)
+    };
+    let (s, r) = relaunch(s, created + 1000, "early");
+    assert_eq!(r.outcome, Outcome::Refused, "{r:?}");
+    assert_eq!(
+        r.reason.as_deref(),
+        Some("ec2-1 launched 1 s ago; it can be relaunched in 89 s")
+    );
+    let (_, r) = relaunch(s, created + EC2_RELAUNCH_COOLDOWN_MS, "later");
+    assert_eq!(r.outcome, Outcome::Committed, "{r:?}");
+}
+
+/// A race that needs more launches than the whole budget can never fit, so it is refused
+/// without a retry delay that would never come true.
+#[test]
+fn a_race_larger_than_the_budget_is_refused_without_a_wait() {
+    use fleet_core::apply::EC2_LAUNCH_BUDGET;
+    use fleet_core::state::Outcome;
+    let tiles = EC2_LAUNCH_BUDGET + 1;
+    let config = config_with(serde_json::json!({"ec2_max": tiles, "fcvm_tiles": 0}));
+    let mut s = State::new(config, 0);
+    s = apply(s, &Event::Tick { at: 1000 });
+    assert_eq!(s.fleet.ec2.len(), tiles);
+    let e = events(
+        serde_json::json!([{"type": "intent", "at": 2000, "viewer": "v1",
+        "client": "198.51.100.1", "id": "race", "name": "restart_now", "args": {}}]),
+    );
+    let s = apply(s, &e[0]);
+    let r = &s.receipts["race"];
+    assert_eq!(r.outcome, Outcome::Refused, "{r:?}");
+    let reason = r.reason.clone().unwrap();
+    assert!(!reason.contains("try again"), "{reason}");
+    assert_eq!(
+        reason,
+        format!("this fleet has more EC2 tiles ({tiles}) than viewers may launch in 10 minutes ({EC2_LAUNCH_BUDGET})")
+    );
 }
 
 fn half(x: f64) -> Option<Rect> {
