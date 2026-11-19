@@ -202,7 +202,24 @@ A host boots a fixed AMI (Ubuntu, IOMMU on, GPUs bound to vfio-pci, fcvm and its
 that architecture, the agent as a systemd unit), so a replacement host joins in minutes
 without building anything. The agent builds the gold snapshot on first start and keeps it
 on the instance store. A spot interruption notice (two minutes) makes the agent report its
-slots as draining; the coordinator stops sending relaunches there.
+slots as draining; the coordinator stops sending relaunches there and takes the host's GPUs
+off the wall. With one awake host per region, which is what the spot quota holds, the
+replacement is launched when EC2 takes the instance.
+
+Production is to run two hosts awake in one region (`--awake-hosts 2 --host-spread az`), so a
+spot reclaim leaves no gap. With more than one awake host the replacement is launched at the
+notice, two minutes before EC2 takes the instance, so the quota must hold one host more than
+the awake ones; the draining host is terminated once its region runs its awake hosts without
+it. Each host is launched by its own request into the subnets of an
+availability zone no live host of the region is in (a draining host's zone counts as used,
+since its spot pool was just reclaimed); when those have no capacity in either market, a
+zone only the draining host is in, then any zone. With more than one awake host the fcvm side
+holds no dark place for a missing host while another renders: at the notice the remaining
+host's GPUs re-tile coarser over the whole side, and the side gets finer again as the
+replacement's GPUs render. One host alone keeps the old behaviour: its places stay dark for
+its replacement, which is what a viewer of a one-host fleet sees anyway. The spend meter
+prices every instance the fleet runs, the replacement included, and a budget trip sleeps the
+fleet, which terminates every host.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
@@ -299,12 +316,17 @@ unproxied AAAA record pointing at the slot's address, which the coordinator writ
 the Cloudflare API when a slot is placed on a host (TTL 60 s). The host's security group
 allows TCP 443 from anywhere over IPv6.
 
-TLS terminates in the VM. The coordinator keeps one wildcard certificate for
-`*.<fleet zone>` from Let's Encrypt (DNS-01 through the Cloudflare API, renewed 30 days
-before expiry) in Secrets Manager; the agent reads it with its instance role and hands it to
-each renderer read-only. Every VM holds the wildcard key, which is acceptable because a
-viewer can only send scene parameters, never code; per-slot certificates are the follow-up
-if that changes.
+TLS terminates in the VM. The coordinator keeps one wildcard certificate from Let's Encrypt
+(renewed 30 days before expiry) in Secrets Manager; the agent reads it with its instance role
+and hands it to each renderer read-only. Every VM holds the wildcard key, which is acceptable
+because a viewer can only send scene parameters, never code; per-slot certificates are the
+follow-up if that changes. Staging's (`--tls-scope zone`) covers `*.<fleet zone>`, the zone
+and `*.<launch subzone>`, with DNS-01 written in the zone through the Cloudflare API.
+Production's (`--tls-scope subzone`) covers `*.<launch subzone>` alone, so no key a VM holds
+is valid for a name in front of Cloudflare (the apex, `fleet-api`), and the coordinator
+answers its DNS-01 TXT record from its own authoritative server for the subzone, so it holds
+no Cloudflare token that can write the parent zone. The EC2 tiles' health checks then use
+subzone names too (`ec2-<n>.<subzone>`).
 
 A viewer with no IPv6 cannot reach a VM directly. For them each launch also has a `-v4`
 name, `<label>-v4.<zone>`, the A record of the GPU host's one public IPv4 address (an EC2

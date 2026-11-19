@@ -480,9 +480,18 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub sleep_when_idle: bool,
 
-    /// GPU hosts per region while the fleet is awake
-    #[arg(long, default_value_t = 1)]
-    pub awake_capacity: u32,
+    /// GPU hosts per host region while the fleet is awake. Above 1, a host that gets a spot
+    /// interruption notice is replaced at the notice, and the fcvm side re-tiles across the
+    /// GPUs that render when a host drains or is not yet back, instead of keeping dark places
+    /// for it
+    #[arg(long, env = "FLEET_AWAKE_HOSTS", default_value_t = 1)]
+    pub awake_hosts: u32,
+
+    /// How a region's GPU hosts are placed across its availability zones: `none` (one
+    /// request for the shortfall, EC2 picks the subnets) or `az` (one host per request, into
+    /// a zone no live host of the region is in, while the region has a --host-subnet in one)
+    #[arg(long, env = "FLEET_HOST_SPREAD", value_enum, default_value_t = crate::fleet::coord::hosts::HostSpread::None)]
+    pub host_spread: crate::fleet::coord::hosts::HostSpread,
 
     /// Most on-demand GPU hosts the fleet runs, all regions together (spot's fallback)
     #[arg(
@@ -580,8 +589,9 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_NAME", default_value = "stage")]
     pub fleet_name: String,
 
-    /// The fleet's DNS zone: the certificate's (`*.<zone>`), the EC2 tiles' health name
-    /// (`ec2-<n>.<zone>`), and the parent of --dns-subzone
+    /// The fleet's DNS zone: the certificate's (`*.<zone>`, with --tls-scope zone), the EC2
+    /// tiles' health name (`ec2-<n>.<zone>`, with --tls-scope zone), and the parent of
+    /// --dns-subzone
     #[arg(long, default_value = "fcvm.dev")]
     pub dns_zone: String,
 
@@ -615,9 +625,18 @@ pub struct FleetCoordArgs {
     pub dns_rate_limit: u32,
 
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
-    /// DNS-01 through the DNS token)
-    #[arg(long, requires = "dns_token_secret")]
+    /// DNS-01: through the DNS token with --tls-scope zone, through the subzone's own DNS
+    /// server with --tls-scope subzone)
+    #[arg(long)]
     pub tls_secret: Option<String>,
+
+    /// What the --tls-secret certificate covers. `zone`: `*.<zone>`, `<zone>` and, with
+    /// --dns-subzone, `*.<subzone>`, its DNS-01 records written in --dns-zone with
+    /// --dns-token-secret. `subzone`: `*.<subzone>` only, its DNS-01 record answered by this
+    /// coordinator's DNS server for --dns-subzone, with no Cloudflare token (--dns-token-secret
+    /// is refused). The EC2 tiles' health name is then `ec2-<n>.<subzone>`
+    #[arg(long, value_enum, default_value_t = crate::fleet::coord::cert::TlsScope::Zone)]
+    pub tls_scope: crate::fleet::coord::cert::TlsScope,
 
     /// The ACME directory (default: Let's Encrypt production)
     #[arg(long)]

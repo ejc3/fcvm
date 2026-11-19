@@ -576,7 +576,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
   is there and the last arrival is within the limit (a new viewer arrived, a page sent
   `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
-  from `woke_at`, the moment the wake began: every host region gets `--awake-capacity` hosts
+  from `woke_at`, the moment the wake began: every host region gets `--awake-hosts` hosts
   again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. Connected pages alone
   never wake a fleet whose limit has run out: the page shows the sleep card with a Wake
   button, which sends `wake`. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
@@ -692,7 +692,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--access-team-domain <team>.cloudflareaccess.com [--access-aud <aud>]... [--agent-access-aud <aud>]...]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
-                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
+                 [--awake-hosts 1] [--host-spread none|az] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--sleep-without-new-viewer 3600] [--history-idle 60]
                  [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
                  [--warm-hours <Mon..Sun> HH:MM-HH:MM,...]
@@ -703,7 +703,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                   [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
                  [--dns-zone fcvm.dev] [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
-                 [--tls-secret <secret>] [--secrets-region <region>]
+                 [--tls-secret <secret> [--tls-scope zone|subzone]] [--secrets-region <region>]
                  [--broadcast-listen <addr:port> (--broadcast-secret <secret> | --broadcast-file <path>)
                   [--broadcast-arg <arg>]... [--direct-capacity 500]]
 ```
@@ -746,7 +746,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   the start is on the next day (`Sat 22:00-02:00` ends Sunday 02:00), and `24:00` is an end.
   A window whose start equals its end is refused. It needs a fleet that sleeps
   (`--host-template` or `--sleep-when-idle`); off without it. Inside a window the fleet wakes
-  at once with no viewer, with `--awake-capacity` hosts per region as any wake, and neither
+  at once with no viewer, with `--awake-hosts` hosts per region as any wake, and neither
   `--idle-scale-down` nor `--sleep-without-new-viewer` sleeps it; outside every window the
   viewer rules alone decide, so at a window's end a fleet with no viewer sleeps. While a
   window holds, `fleet.power.reason` is `warm`. Nothing about a window is stored: a restarted
@@ -792,7 +792,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   it tries `--ec2-on-demand-template` the same way,
   and without one the tile waits for capacity (recorded on its own) and asks again every
   10 s. A tile is ready once its instance runs and its renderer answers
-  `https://ec2-<n>.<zone>/health` (the name resolved to the instance) with `ready` true; a
+  `https://ec2-<n>.<zone>/health` (the name resolved to the instance; `<zone>` is the
+  subzone with `--tls-scope subzone`, a name the certificate covers) with `ready` true; a
   reply carrying `error` fails the launch like no answer at all. It is terminated by
   id. A relaunch launches the replacement first and terminates the old instance once the
   new launch is accepted. A tile whose instance never serves `/health` has that instance
@@ -826,8 +827,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
   (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
   started again only once its request is `disabled`, 42 to 54 s after it stopped.
-- `--dns-token-secret` is the zone's Cloudflare token, which the certificate renewal writes
-  its DNS-01 records with (see "Certificate").
+- `--dns-token-secret` is the zone's Cloudflare token, which the renewal of a zone
+  certificate writes its DNS-01 records with (see "Certificate"). It is refused with
+  `--tls-scope subzone`.
 - `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
   `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
   record) and names launches there. Every launch of an fcvm slot or EC2 tile that reports
@@ -845,12 +847,15 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   answers from the moment a viewer can learn it, with no wait. It listens on
   `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
   the subzone: SOA (negative TTL 5 s), NS, the published names, and
-  `_acme-challenge.<subzone>` as a CNAME to `_acme-challenge.<zone>`; NXDOMAIN or NODATA
+  `_acme-challenge.<subzone>`: a CNAME to `_acme-challenge.<zone>` with `--tls-scope zone`,
+  or, with `--tls-scope subzone`, the TXT records of the renewal in progress (TTL 5 s;
+  NXDOMAIN while there is none); NXDOMAIN or NODATA
   with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
   the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
   per source /24 or /56, every second response goes out truncated and the rest are
   dropped.
-- `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
+- `--tls-secret` keeps the wildcard certificate renewed, and `--tls-scope` (default `zone`)
+  says what it covers (see "Certificate").
 - `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
   `--dns-subzone`) serves the EC2 half's aggregator to browsers with TLS on port 443
   of the coordinator task's own addresses, read at start on ECS: the global IPv6 address
@@ -866,18 +871,29 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 
 ### Certificate
 
-The wildcard certificate (`*.<zone>`, `<zone>` and, with `--dns-subzone`, `*.<subzone>`)
-lives in one Secrets Manager secret,
+The wildcard certificate lives in one Secrets Manager secret,
 a JSON object: `cert` (PEM full chain), `key` (PEM private key), `domains`, `not_after` and
 `issued_at` (RFC 3339 UTC), `issuer` (fleet/tools/issue-cert.sh writes the first one) and
 `scene_token`, the renderers' scene token (renderer, "Access"), which the coordinator adds at
 startup when the secret has none and every renewal and issue-cert.sh keep.
+What it covers is `--tls-scope`:
+
+- `zone` (the default): `*.<zone>`, `<zone>` and, with `--dns-subzone`, `*.<subzone>`. Its
+  DNS-01 TXT records are written at `_acme-challenge.<zone>` through the DNS token
+  (`--dns-token-secret`, required); the subzone's challenge name is a CNAME to it.
+- `subzone` (needs `--dns-subzone`): `*.<subzone>` and nothing else, so no key the fleet
+  hands its hosts and tiles is valid for a name in front of Cloudflare (the apex or the
+  coordinator's own names). Its one TXT record is answered at `_acme-challenge.<subzone>` by
+  the coordinator's own DNS server for the subzone, so the coordinator holds no token that
+  can write the parent zone: `--dns-token-secret` is refused. The EC2 tiles' health name is
+  `ec2-<n>.<subzone>`. A stored certificate that names anything else (a zone certificate
+  from before the switch) is renewed at once.
+
 Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
 or does not cover every one of those names) it orders a new certificate from Let's Encrypt
-(`--acme-directory` for another CA), answers DNS-01 with TXT records at
-`_acme-challenge.<zone>` through the DNS token (the subzone's challenge name is a CNAME to
-it), waits until public DNS shows them, stores the new version and removes the records. A
-renewal that fails is tried again 15 minutes later. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
+(`--acme-directory` for another CA), writes the DNS-01 TXT records, waits until public DNS
+shows them, stores the new version and removes the records. A renewal that fails is tried
+again 15 minutes later. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 
@@ -888,7 +904,7 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   `FLEET_HOST_TEMPLATES` and `FLEET_HOST_SUBNETS`, and `--host-on-demand-max` from
   `FLEET_HOST_ON_DEMAND_MAX`. The coordinator launches the hosts itself, with
   the credentials of its task or instance role: a region with fewer pending or running
-  hosts than `--awake-capacity` asks EC2 for the shortfall on spot (`CreateFleet` of type
+  hosts than `--awake-hosts` (also `FLEET_AWAKE_HOSTS`, default 1) asks EC2 for the shortfall on spot (`CreateFleet` of type
   `instant` over every template and subnet of the region, `price-capacity-optimized`), and
   when the answer refuses spot for capacity (`InsufficientInstanceCapacity`,
   `MaxSpotInstanceCountExceeded`, `UnfulfillableCapacity`, `VcpuLimitExceeded`, ...) asks
@@ -900,7 +916,21 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   `Fleet=<--fleet-name>` and `Market=spot|on-demand`, and is found by those tags, so a
   restarted coordinator keeps the hosts it finds. Asleep, every host of the fleet is
   terminated; awake, a stopped host and a host over the awake capacity (on-demand first)
-  are terminated, and a host that is reclaimed or terminated is replaced. The regions are
+  are terminated, and a host that is reclaimed or terminated is replaced. With
+  `--awake-hosts` above 1, a host whose agent reported a spot interruption notice
+  (`draining`) is not counted: its replacement is launched at the notice, two minutes before
+  EC2 takes the instance (the spot quota must hold the extra host, or the replacement falls
+  back to on demand), and the draining host is terminated once its region runs
+  `--awake-hosts` other hosts; with 1 the replacement is launched when EC2 takes the
+  instance. With `--awake-hosts` above 1 the fcvm side also keeps no dark place for a host that drains, is gone or has not
+  joined while any GPU renders: it re-tiles across the GPUs that render (coarser at the
+  notice) and finer again as the replacement's GPUs render. `--host-spread az` (also
+  `FLEET_HOST_SPREAD`; default `none`, one request for the whole shortfall) launches the
+  hosts one request at a time, each into the subnets of zones no live host of the region is
+  in (a draining host's zone included), then into zones no serving host is in, then into
+  any zone, passing to the next set in the same pass when both markets refuse for capacity.
+  The subnets' zones are read once (`DescribeSubnets`); without them the launch is not
+  spread. A launch logs its `zone`. The regions are
   listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
   they run; an instance a launch named counts as pending while lists leave it out (60 s at
   most), and a launch whose answer is lost is asked again with the same idempotency token and

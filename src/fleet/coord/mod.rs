@@ -153,6 +153,9 @@ pub struct Outputs {
     pub broadcast_layout: watch::Sender<Option<Layout>>,
     /// The fleet's power state (`awake`, `asleep`, `waking`).
     pub power: watch::Sender<String>,
+    /// Spot interruption notices for the host launcher, by host name (the instance id of a
+    /// host the coordinator launched).
+    pub draining: DrainNotices,
     /// The shared scene, for the EC2 tiles' renderers.
     pub scene: watch::Sender<Option<SharedScene>>,
     /// The grid budget, for the EC2 tiles' renderers.
@@ -445,6 +448,15 @@ impl Actor {
             *cur = power.clone();
             changed
         });
+        self.out.draining.publish(
+            self.state
+                .fleet
+                .hosts
+                .iter()
+                .filter(|(_, h)| h.draining)
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
         let ec2 = ec2_assignment(&self.state);
         self.out.ec2.send_if_modified(|cur| {
             if *cur == ec2 {
@@ -1109,6 +1121,39 @@ impl Handle {
     }
 }
 
+/// Spot interruption notices, each host's sent once to the host launcher on a channel that
+/// keeps every notice until the launcher reads it. A watch of the draining hosts would lose a
+/// notice whose host left the state (its agent disconnected) before the launcher looked.
+#[derive(Default)]
+pub struct DrainNotices {
+    tx: Option<mpsc::UnboundedSender<String>>,
+    /// The hosts draining now whose notice was sent.
+    sent: std::collections::BTreeSet<String>,
+}
+
+impl DrainNotices {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            DrainNotices {
+                tx: Some(tx),
+                sent: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    /// Send the notice of every host in `draining` not sent yet.
+    fn publish(&mut self, draining: std::collections::BTreeSet<String>) {
+        if let Some(tx) = &self.tx {
+            for id in draining.difference(&self.sent) {
+                let _ = tx.send(id.clone());
+            }
+        }
+        self.sent = draining;
+    }
+}
+
 /// The launch names' subzone, served by this coordinator ([`authority`]): names are
 /// published as they are minted, and the zone the server answers from is sent on `zone`.
 pub struct Names {
@@ -1135,6 +1180,7 @@ pub fn start(
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (broadcast_layout_tx, broadcast_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
+    let (draining_tx, draining_rx) = DrainNotices::new();
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
     let (owned_tx, owned_rx) = watch::channel(store.is_none());
@@ -1149,6 +1195,7 @@ pub fn start(
             ec2_layout: ec2_layout_tx,
             broadcast_layout: broadcast_layout_tx,
             power: power_tx,
+            draining: draining_tx,
             scene: scene_tx,
             budget: budget_tx,
             zone: names,
@@ -1199,7 +1246,7 @@ pub fn start(
         });
     }
     if let Some(cfg) = power {
-        tokio::spawn(hosts::run(cfg, power_rx, handle.clone()));
+        tokio::spawn(hosts::run(cfg, power_rx, draining_rx, handle.clone()));
     }
     (handle, task)
 }
@@ -1317,6 +1364,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     let config = Config {
         max_tiles: args.max_tiles,
         fcvm_tiles: args.fcvm_tiles.min(args.max_tiles),
+        fill_from_serving_hosts: args.awake_hosts > 1,
         ec2_max: match args.ec2 {
             FleetEc2::None => 0,
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
@@ -1342,6 +1390,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     if !config.warm_hours.is_empty() && !config.power_managed {
         bail!("--warm-hours needs a fleet that sleeps (--host-template or --sleep-when-idle)");
     }
+    // What the certificate covers, where its DNS-01 records go, and the tiles' health zone.
+    let tls = cert::plan(&args)?;
     let meter = spend::meter(&args)?;
     let checker: Arc<dyn text_check::TextChecker> = match args.text_check {
         FleetTextCheck::None => Arc::new(text_check::NoCheck),
@@ -1414,7 +1464,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 args.ec2_regions.clone(),
                 args.ec2_template.clone(),
                 args.ec2_on_demand_template.clone(),
-                args.dns_zone.clone(),
+                tls.tile_zone.clone(),
             )?;
             d.fleet = args.fleet_name.clone();
             d.pool_max = args.ec2_pool;
@@ -1445,7 +1495,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         Some(hosts::HostConfig {
             regions: driver.regions(),
             driver: Arc::new(driver),
-            awake_capacity: args.awake_capacity,
+            awake_hosts: args.awake_hosts,
+            spread: args.host_spread,
             on_demand_max: args.host_on_demand_max,
             // While hosts come up or go away: one DescribeInstances per region.
             poll: Duration::from_secs(2),
@@ -1505,12 +1556,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             {
                 bail!("--dns-subzone {sub} is not below --dns-zone {parent}");
             }
-            // The certificate's DNS-01 records for the subzone's wildcard live in the parent
-            // zone, at the name the parent's own challenge uses.
             let cfg = Arc::new(authority::ZoneConfig::new(
                 sub,
                 &args.dns_subzone_ns,
-                Some(&format!("_acme-challenge.{parent}")),
+                tls.acme.clone(),
             )?);
             let (tx, rx) = watch::channel(Arc::new(authority::Zone::default()));
             let listen = args
@@ -1527,17 +1576,17 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         }
         None => None,
     };
-    if let Some(secret) = &args.tls_secret {
-        let token = dns_token
-            .as_deref()
-            .context("--tls-secret needs --dns-token-secret (DNS-01 challenges)")?;
-        let mut renewal = cert::Renewal::new(secret.clone(), args.dns_zone.clone());
-        if let Some(sub) = &args.dns_subzone {
-            renewal.extra.push(format!(
-                "*.{}",
-                sub.trim_end_matches('.').to_ascii_lowercase()
-            ));
-        }
+    if let Some(mut renewal) = tls.renewal {
+        // A subzone certificate's records are answered by the subzone's server; a zone
+        // certificate's are written in the zone with its Cloudflare token.
+        let dns: Box<dyn cert::Dns01> = match tls.challenge {
+            Some(txt) => Box::new(txt),
+            None => {
+                Box::new(cloudflare(dns_token.as_deref().context(
+                    "--tls-secret needs --dns-token-secret (DNS-01 challenges)",
+                )?)?)
+            }
+        };
         if let Some(d) = &args.acme_directory {
             renewal.directory = d.clone();
         }
@@ -1545,7 +1594,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         tokio::spawn(cert::run(
             renewal,
             secrets::Secrets::new(&secrets_region()?)?,
-            cloudflare(token)?,
+            dns,
         ));
     }
     let ec2_sweep = ec2.clone();
@@ -1922,6 +1971,7 @@ mod store_tests {
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,
+            draining: Default::default(),
             scene: watch::channel(None).0,
             budget: watch::channel(None).0,
             zone: None,
@@ -1976,6 +2026,7 @@ mod store_tests {
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,
+            draining: Default::default(),
             scene: watch::channel(None).0,
             budget: watch::channel(None).0,
             zone: None,

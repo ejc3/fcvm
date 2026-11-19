@@ -1,5 +1,5 @@
 //! The GPU hosts. The coordinator launches and terminates them itself, from the host launch
-//! templates: none while the fleet is asleep, `awake_capacity` per region otherwise.
+//! templates: none while the fleet is asleep, `awake_hosts` per region otherwise.
 //!
 //! A host region short of hosts asks EC2 for the shortfall on spot first (EC2 Fleet,
 //! `CreateFleet` of type `instant`, over every host template and subnet of the region, so EC2
@@ -24,6 +24,20 @@
 //! leave it out, for up to a minute, so DescribeInstances lagging behind CreateFleet does not
 //! launch it twice; a launch whose answer is lost is asked again with the same idempotency
 //! token, so EC2 answers with what it launched instead of launching more.
+//!
+//! With more than one awake host per region, a host whose agent reported a spot interruption
+//! notice (`draining`, from the state) is not counted: its replacement is launched at the
+//! notice, not when EC2 takes the instance two minutes later, and the draining host is
+//! terminated once the region again runs its awake hosts without it. Asleep, it is terminated
+//! with the rest. With one, the replacement waits for EC2 to take the instance, as the
+//! region's spot quota usually holds one host.
+//!
+//! With `--host-spread az` each host is launched on its own, into the subnets of availability
+//! zones no live host of the region is in (a draining host's zone included), so one zone's
+//! spot reclaim or capacity shortage takes at most one host. When every zone holds a host,
+//! the zones of draining hosts are allowed again, then every zone; a tier that both markets
+//! refused for capacity falls through to the next in the same pass, since a second host in a
+//! used zone shows more of the wall than none.
 
 use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
@@ -32,7 +46,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::event::ScaleInstance;
 use fleet_core::Event;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -57,6 +71,17 @@ impl std::str::FromStr for Regional {
             name: name.into(),
         })
     }
+}
+
+/// How a region's hosts are placed across its availability zones (`--host-spread`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum HostSpread {
+    /// One request for the region's whole shortfall; EC2 picks the subnets.
+    #[default]
+    None,
+    /// One host per request, into a zone no live host of the region is in when the region
+    /// has a subnet in one.
+    Az,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,6 +110,8 @@ pub struct Host {
     /// Where a connection from this instance can come from: its public IPv4 address, its IPv6
     /// addresses, and its delegated IPv6 prefixes as `<address>/<length>`.
     pub sources: Vec<String>,
+    /// Its availability zone, when known.
+    pub zone: Option<String>,
 }
 
 impl Host {
@@ -106,19 +133,29 @@ pub struct Launch {
     pub ids: Vec<String>,
     pub refused: Vec<String>,
     pub failed: Vec<String>,
+    /// The availability zone of each launched instance the answer places.
+    pub zones: BTreeMap<String, String>,
 }
 
 #[async_trait]
 pub trait HostDriver: Send + Sync {
     /// This fleet's GPU hosts in `region`, in any state EC2 still lists.
     async fn hosts(&self, region: &str) -> Result<Vec<Host>>;
-    /// Launch `count` hosts in `region` in `market`. `token` is the request's idempotency
-    /// token: the same token with the same count answers what the first request launched
-    /// instead of launching again. An error is a request that did not reach a decision (no
-    /// answer, refused credentials), which may still have launched; EC2's per-instance
-    /// refusals come back in [`Launch`].
-    async fn launch(&self, region: &str, market: Market, count: u32, token: &str)
-        -> Result<Launch>;
+    /// The availability zones of `region`'s host subnets, each once.
+    async fn zones(&self, region: &str) -> Result<Vec<String>>;
+    /// Launch `count` hosts in `region` in `market`, in the subnets of `zones` (every subnet
+    /// when empty). `token` is the request's idempotency token: the same token with the same
+    /// count answers what the first request launched instead of launching again. An error is a
+    /// request that did not reach a decision (no answer, refused credentials), which may still
+    /// have launched; EC2's per-instance refusals come back in [`Launch`].
+    async fn launch(
+        &self,
+        region: &str,
+        market: Market,
+        count: u32,
+        token: &str,
+        zones: &[String],
+    ) -> Result<Launch>;
     async fn terminate(&self, region: &str, ids: &[String]) -> Result<()>;
 }
 
@@ -127,7 +164,9 @@ pub struct HostConfig {
     pub driver: Arc<dyn HostDriver>,
     pub regions: Vec<String>,
     /// Hosts per region while the fleet is awake.
-    pub awake_capacity: u32,
+    pub awake_hosts: u32,
+    /// How a region's hosts are placed across its availability zones.
+    pub spread: HostSpread,
     /// At most this many on-demand hosts in all regions together.
     pub on_demand_max: u32,
     /// How often the regions are listed while hosts come up or go away.
@@ -153,6 +192,8 @@ const ASLEEP_CHECK: Duration = Duration::from_secs(300);
 struct Recent {
     region: String,
     market: Market,
+    /// Its availability zone, when the launch's answer placed it.
+    zone: Option<String>,
     /// When the launch was asked for.
     asked: Instant,
     /// The first running observation has already been logged.
@@ -194,6 +235,7 @@ fn with_recent(
             state: "pending".into(),
             market: r.market,
             sources: Vec::new(),
+            zone: r.zone.clone(),
         });
         true
     });
@@ -209,16 +251,30 @@ pub fn excess(hosts: &[Host], want: u32) -> Vec<String> {
     live.into_iter().take(n).map(|h| h.id.clone()).collect()
 }
 
+/// The hosts of `hosts` that serve: pending or running, and not draining.
+pub fn serving(hosts: &[Host], draining: &BTreeSet<String>) -> Vec<Host> {
+    hosts
+        .iter()
+        .filter(|h| h.live() && !draining.contains(&h.id))
+        .cloned()
+        .collect()
+}
+
 /// The hosts the launcher keeps for `want` per region, by instance id, sorted: every
-/// region's pending or running hosts less those over the capacity. `None` while any region
-/// is unlisted or short of `want`, or asleep.
-pub fn expected_hosts(listed: &[Option<Vec<Host>>], want: u32) -> Option<Vec<String>> {
+/// region's serving hosts (pending or running, not draining) less those over the capacity.
+/// `None` while any region is unlisted or short of `want`, or asleep.
+pub fn expected_hosts(
+    listed: &[Option<Vec<Host>>],
+    want: u32,
+    draining: &BTreeSet<String>,
+) -> Option<Vec<String>> {
     if want == 0 {
         return None;
     }
     let mut ids = Vec::new();
     for hosts in listed {
-        let hosts = hosts.as_ref()?;
+        let hosts = serving(hosts.as_ref()?, draining);
+        let hosts = &hosts[..];
         let over = excess(hosts, want);
         let kept: Vec<String> = hosts
             .iter()
@@ -292,22 +348,35 @@ fn unix_ms() -> u64 {
 
 /// Follow the fleet's power state: launch each region's shortfall (spot, then on demand in
 /// the same pass), terminate what is over, report the instances while a wake's hosts come
-/// up, and terminate every host while the fleet sleeps.
-pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Handle) {
+/// up, and terminate every host while the fleet sleeps. `draining` carries the host of each
+/// spot interruption notice an agent reported.
+pub async fn run(
+    cfg: HostConfig,
+    mut power: watch::Receiver<String>,
+    mut draining: tokio::sync::mpsc::UnboundedReceiver<String>,
+    handle: Handle,
+) {
     let mut watch: Vec<Watch> = cfg.regions.iter().map(|_| Watch::default()).collect();
     let mut recent: HashMap<String, Recent> = HashMap::new();
     // Per region and market, a launch whose outcome is unknown: its token and count.
     let mut tokens: Tokens = HashMap::new();
     let mut last_want: Option<u32> = None;
     let mut last_expected: Option<Option<Vec<String>>> = None;
+    // Every host an agent reported draining, kept until no list names it live: its agent can
+    // disconnect before EC2's lists show the instance going, and counted as serving then it
+    // would put the region over its capacity and get its replacement terminated.
+    let mut drained: BTreeSet<String> = BTreeSet::new();
     // A degraded `scale` was reported and not cleared yet.
     let mut reported = false;
     loop {
         let state = power.borrow_and_update().clone();
+        while let Ok(id) = draining.try_recv() {
+            drained.insert(id);
+        }
         let want = if state == "asleep" {
             0
         } else {
-            cfg.awake_capacity
+            cfg.awake_hosts
         };
         let changed = last_want != Some(want);
         if changed {
@@ -350,6 +419,23 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 }
             }
         }
+        if listed.iter().all(Option::is_some) {
+            drained.retain(|id| {
+                listed
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|h| h.id == *id && h.live())
+            });
+        }
+        // With one awake host per region a notice changes nothing here: the replacement is
+        // launched when EC2 takes the instance, since a region's spot quota usually holds one
+        // host and a launch beside it would fall back to on demand.
+        let leaving = if cfg.awake_hosts > 1 {
+            drained.clone()
+        } else {
+            BTreeSet::new()
+        };
         // The fleet's on-demand hosts, when every region could be counted.
         let mut on_demand: Option<u32> = listed.iter().try_fold(0u32, |n, l| {
             l.as_ref().map(|hosts| {
@@ -401,14 +487,19 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                     })
             });
             // Stopped or stopping hosts serve nothing: terminate them, as everything when
-            // asleep, and what is over the awake capacity.
+            // asleep, and what is over the awake capacity. A draining host goes once the
+            // region runs its awake hosts without it: its GPUs left the wall at the notice.
+            let kept = serving(hosts, &leaving);
+            let replaced = kept.iter().filter(|h| h.state == "running").count() as u32 >= want;
             let mut ids: Vec<String> = hosts
                 .iter()
-                .filter(|h| h.present() && (want == 0 || !h.live()))
+                .filter(|h| {
+                    h.present() && (want == 0 || !h.live() || (replaced && leaving.contains(&h.id)))
+                })
                 .map(|h| h.id.clone())
                 .collect();
             if want > 0 {
-                ids.extend(excess(hosts, want));
+                ids.extend(excess(&kept, want));
             }
             if !ids.is_empty() {
                 busy = true;
@@ -451,7 +542,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 }
                 continue;
             }
-            let mut live = hosts.iter().filter(|h| h.live()).count() as u32;
+            let mut live = kept.len() as u32;
             if live >= want || watch[i].next_launch.is_none_or(|t| now >= t) {
                 busy |= live < want;
                 // Lost launches first, each asked again with its own token and count, so EC2
@@ -472,24 +563,29 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                     busy |= found > 0;
                     if live < want {
                         let short = want - live;
-                        let (launched, retry) = launch_shortfall(
-                            &cfg,
-                            region,
-                            short,
-                            &mut on_demand,
-                            &mut recent,
-                            &mut tokens,
-                            &mut errors,
-                        )
-                        .await;
+                        let mut pass = Pass {
+                            on_demand: &mut on_demand,
+                            recent: &mut recent,
+                            tokens: &mut tokens,
+                            errors: &mut errors,
+                        };
+                        let (launched, retry) = match cfg.spread {
+                            HostSpread::None => {
+                                let (zones, retry) =
+                                    launch_shortfall(&cfg, region, short, &[], &mut pass).await;
+                                (zones.len() as u32, retry)
+                            }
+                            HostSpread::Az => {
+                                launch_spread(&cfg, region, short, hosts, &leaving, &mut pass).await
+                            }
+                        };
                         watch[i].next_launch =
                             (launched < short && retry).then(|| now + cfg.capacity_retry);
                     }
                 }
             }
             let running = |m: Market| {
-                hosts
-                    .iter()
+                kept.iter()
                     .filter(|h| h.market == m && h.state == "running")
                     .count() as u32
             };
@@ -509,7 +605,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
         }
         // The hosts kept for the awake capacity, once every region is listed and holds that
         // many: the side then needs no place for a GPU no connected host listed (#1517).
-        let expected = expected_hosts(&listed, want);
+        let expected = expected_hosts(&listed, want, &leaving);
         if last_expected.as_ref() != Some(&expected) {
             handle
                 .send(Event::HostsExpected {
@@ -548,6 +644,10 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
         };
         tokio::select! {
             r = power.changed() => if r.is_err() { return },
+            id = draining.recv() => match id {
+                Some(id) => { drained.insert(id); }
+                None => return,
+            },
             _ = tokio::time::sleep(wait) => {}
         }
     }
@@ -580,7 +680,8 @@ async fn reconcile(
         if let Some(t) = tokens.get_mut(&key) {
             t.3 = asked;
         }
-        match cfg.driver.launch(region, market, count, &token).await {
+        // A known token sends its first request's parameters again, zones included.
+        match cfg.driver.launch(region, market, count, &token, &[]).await {
             Ok(got) => {
                 tokens.remove(&key);
                 let new: Vec<&String> = got
@@ -600,6 +701,7 @@ async fn reconcile(
                         Recent {
                             region: region.to_string(),
                             market,
+                            zone: got.zones.get(id).cloned(),
                             asked,
                             running_reported: false,
                         }
@@ -624,19 +726,33 @@ async fn reconcile(
     (!held).then_some(found)
 }
 
-/// Launch `short` hosts in `region`: spot, then what spot refused for capacity on demand
-/// within the fleet's on-demand cap (`on_demand` counts the fleet's on-demand hosts, `None`
-/// when a region could not be listed). Returns how many were launched and whether the rest
-/// waits for capacity (as opposed to an error, retried at the next poll).
+/// What one pass of [`run`] carries through its launches.
+struct Pass<'a> {
+    /// The fleet's on-demand hosts, `None` when a region could not be listed.
+    on_demand: &'a mut Option<u32>,
+    recent: &'a mut HashMap<String, Recent>,
+    tokens: &'a mut Tokens,
+    errors: &'a mut Vec<String>,
+}
+
+/// Launch `short` hosts in `region`, in the subnets of `zones` (every subnet when empty):
+/// spot, then what spot refused for capacity on demand within the fleet's on-demand cap.
+/// Returns the zone of each host launched (`None` where the answer did not place it) and
+/// whether the rest waits for capacity (as opposed to an error, retried at the next poll).
 async fn launch_shortfall(
     cfg: &HostConfig,
     region: &str,
     short: u32,
-    on_demand: &mut Option<u32>,
-    recent: &mut HashMap<String, Recent>,
-    tokens: &mut Tokens,
-    errors: &mut Vec<String>,
-) -> (u32, bool) {
+    zones: &[String],
+    pass: &mut Pass<'_>,
+) -> (Vec<Option<String>>, bool) {
+    let Pass {
+        on_demand,
+        recent,
+        tokens,
+        errors,
+    } = pass;
+    let mut placed: Vec<Option<String>> = Vec::new();
     let mut launched = 0;
     let mut refused = Vec::new();
     let mut failed = false;
@@ -650,7 +766,7 @@ async fn launch_shortfall(
             if refused.is_empty() {
                 break;
             }
-            let Some(n) = *on_demand else {
+            let Some(n) = **on_demand else {
                 // Asked again at the next poll, not after the capacity retry.
                 tracing::warn!(%region, "the fleet's on-demand hosts could not all be counted; not launching on demand");
                 failed = true;
@@ -670,7 +786,7 @@ async fn launch_shortfall(
         };
         let token = uuid::Uuid::new_v4().to_string();
         let asked = Instant::now();
-        let got = match cfg.driver.launch(region, market, ask, &token).await {
+        let got = match cfg.driver.launch(region, market, ask, &token, zones).await {
             Ok(g) => g,
             Err(e) => {
                 // It may have launched: [`reconcile`] asks again with this token, and an
@@ -683,21 +799,24 @@ async fn launch_shortfall(
                 }
                 tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
                 errors.push(format!("{region} {}: {e:#}", market.name()));
-                return (launched, false);
+                return (placed, false);
             }
         };
         let request_ms = asked.elapsed().as_millis() as u64;
         for id in &got.ids {
-            tracing::info!(%region, instance = %id, market = market.name(), request_ms, "wake: host launch accepted");
+            let zone = got.zones.get(id).cloned();
+            tracing::info!(%region, instance = %id, market = market.name(), zone = ?zone, request_ms, "wake: host launch accepted");
             recent.insert(
                 id.clone(),
                 Recent {
                     region: region.to_string(),
                     market,
+                    zone: zone.clone(),
                     asked,
                     running_reported: false,
                 },
             );
+            placed.push(zone);
         }
         if market == Market::OnDemand {
             if let Some(n) = on_demand.as_mut() {
@@ -723,10 +842,96 @@ async fn launch_shortfall(
     }
     if launched < short {
         // `refused` is the last market's: on demand's, when spot fell back to it.
-        tracing::warn!(%region, launched, short, reason = %refused.join("; "),
+        tracing::warn!(%region, launched, short, zones = ?zones, reason = %refused.join("; "),
             "GPU hosts still short; asking again after the capacity retry");
     }
-    (launched, !failed)
+    (placed, !failed)
+}
+
+/// The zones a spread launch tries, in order: those no live host of the region is in, then
+/// those no serving (not draining) host is in, then every zone (empty: no restriction). A
+/// tier equal to every zone, or empty, is left out; the last tier is always every zone.
+pub fn zone_tiers(
+    zones: &[String],
+    every: &BTreeSet<String>,
+    serving: &BTreeSet<String>,
+) -> Vec<Vec<String>> {
+    let mut tiers: Vec<Vec<String>> = Vec::new();
+    for avoid in [every, serving] {
+        let t: Vec<String> = zones
+            .iter()
+            .filter(|z| !avoid.contains(*z))
+            .cloned()
+            .collect();
+        if !t.is_empty() && t.len() < zones.len() && !tiers.contains(&t) {
+            tiers.push(t);
+        }
+    }
+    tiers.push(Vec::new());
+    tiers
+}
+
+/// Launch `short` hosts in `region` one at a time, each into the first tier of
+/// [`zone_tiers`] that has capacity, counting the zone of each host launched before the
+/// next. Returns how many were launched and whether the rest waits for capacity.
+async fn launch_spread(
+    cfg: &HostConfig,
+    region: &str,
+    short: u32,
+    hosts: &[Host],
+    leaving: &BTreeSet<String>,
+    pass: &mut Pass<'_>,
+) -> (u32, bool) {
+    let zones = match cfg.driver.zones(region).await {
+        Ok(z) => z,
+        Err(e) => {
+            // Without the zones, launch over every subnet rather than not at all.
+            tracing::warn!(%region, error = %format!("{e:#}"), "the host subnets' zones could not be read; launching without the spread");
+            pass.errors.push(format!("{region} zones: {e:#}"));
+            Vec::new()
+        }
+    };
+    let mut every: BTreeSet<String> = BTreeSet::new();
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    let recent = pass
+        .recent
+        .iter()
+        .filter(|(_, r)| r.region == region)
+        .filter_map(|(id, r)| Some((id.as_str(), r.zone.as_deref()?)));
+    for (id, zone) in hosts
+        .iter()
+        .filter(|h| h.live())
+        .filter_map(|h| Some((h.id.as_str(), h.zone.as_deref()?)))
+        .chain(recent)
+    {
+        every.insert(zone.to_string());
+        if !leaving.contains(id) {
+            kept.insert(zone.to_string());
+        }
+    }
+    let mut launched = 0;
+    for _ in 0..short {
+        let mut placed = false;
+        for tier in zone_tiers(&zones, &every, &kept) {
+            let (got, retry) = launch_shortfall(cfg, region, 1, &tier, pass).await;
+            if let Some(zone) = got.into_iter().next() {
+                if let Some(z) = zone {
+                    every.insert(z.clone());
+                    kept.insert(z);
+                }
+                placed = true;
+                break;
+            }
+            if !retry {
+                return (launched, false);
+            }
+        }
+        if !placed {
+            break;
+        }
+        launched += 1;
+    }
+    (launched, true)
 }
 
 async fn degraded(handle: &Handle, reason: &str) {
@@ -782,6 +987,8 @@ pub struct AwsHosts {
     /// other parameters (IdempotentParameterMismatch), and the template's instance type can
     /// change between the two requests.
     unanswered: Mutex<HashMap<String, (QueryParams, Instant)>>,
+    /// Per region, each host subnet's availability zone, read once (a subnet never moves).
+    subnet_zones: Mutex<HashMap<String, BTreeMap<String, String>>>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
@@ -825,6 +1032,7 @@ impl AwsHosts {
             template_type_ttl: TEMPLATE_TYPE_TTL,
             types: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
+            subnet_zones: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -917,6 +1125,34 @@ impl AwsHosts {
             .unwrap()
             .insert(key, (ty.clone(), Instant::now()));
         Ok(ty)
+    }
+
+    /// Each host subnet of `region` and its availability zone (DescribeSubnets), read once.
+    async fn subnet_zones(&self, region: &str) -> Result<BTreeMap<String, String>> {
+        if let Some(z) = self.subnet_zones.lock().unwrap().get(region) {
+            return Ok(z.clone());
+        }
+        let subnets = self
+            .subnets
+            .get(region)
+            .with_context(|| format!("no host subnet in {region}"))?;
+        let mut params = vec![p("Action", "DescribeSubnets")];
+        for (i, s) in subnets.iter().enumerate() {
+            params.push(p(format!("SubnetId.{}", i + 1), s.as_str()));
+        }
+        let xml = self
+            .call_ok(region, &params)
+            .await
+            .with_context(|| format!("reading the host subnets of {region}"))?;
+        let zones = parse_subnet_zones(&xml);
+        if let Some(s) = subnets.iter().find(|s| !zones.contains_key(*s)) {
+            bail!("DescribeSubnets in {region} did not name the zone of {s}");
+        }
+        self.subnet_zones
+            .lock()
+            .unwrap()
+            .insert(region.to_string(), zones.clone());
+        Ok(zones)
     }
 
     async fn call_ok(&self, region: &str, params: &[(String, String)]) -> Result<String> {
@@ -1031,13 +1267,31 @@ fn items_of(xml: &str, name: &str) -> Vec<String> {
     out
 }
 
+/// Each subnet of a DescribeSubnets answer and its availability zone.
+pub fn parse_subnet_zones(xml: &str) -> BTreeMap<String, String> {
+    set_items(xml, "subnetSet")
+        .into_iter()
+        .filter_map(|seg| Some((xml_tag(seg, "subnetId")?, xml_tag(seg, "availabilityZone")?)))
+        .collect()
+}
+
 /// A `CreateFleet` (instant) answer: the instances launched, and its errors split into
-/// capacity refusals and everything else, each `<code>: <message>`, without repeats.
-pub fn parse_create_fleet(xml: &str) -> Launch {
+/// capacity refusals and everything else, each `<code>: <message>`, without repeats. Each
+/// instance's zone is its subnet's in `subnet_zones` (the answer names the override's subnet).
+pub fn parse_create_fleet(xml: &str, subnet_zones: &BTreeMap<String, String>) -> Launch {
     let mut out = Launch {
         ids: items_of(xml, "instanceIds"),
         ..Launch::default()
     };
+    for item in set_items(xml, "fleetInstanceSet") {
+        let Some(zone) = xml_tag(item, "subnetId").and_then(|s| subnet_zones.get(&s).cloned())
+        else {
+            continue;
+        };
+        for id in items_of(item, "instanceIds") {
+            out.zones.insert(id, zone.clone());
+        }
+    }
     for item in set_items(xml, "errorSet") {
         let Some(code) = xml_tag(item, "errorCode") else {
             continue;
@@ -1094,6 +1348,7 @@ pub fn parse_hosts(xml: &str) -> Vec<Host> {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect(),
+                zone: xml_tag(seg, "placement").and_then(|p| xml_tag(&p, "availabilityZone")),
             })
         })
         .collect()
@@ -1127,12 +1382,24 @@ impl HostDriver for AwsHosts {
         Ok(out)
     }
 
+    async fn zones(&self, region: &str) -> Result<Vec<String>> {
+        let zones = self.subnet_zones(region).await?;
+        let mut out: Vec<String> = Vec::new();
+        for s in self.subnets.get(region).into_iter().flatten() {
+            if let Some(z) = zones.get(s).filter(|z| !out.contains(z)) {
+                out.push(z.clone());
+            }
+        }
+        Ok(out)
+    }
+
     async fn launch(
         &self,
         region: &str,
         market: Market,
         count: u32,
         token: &str,
+        zones: &[String],
     ) -> Result<Launch> {
         let kept = self
             .unanswered
@@ -1151,19 +1418,46 @@ impl HostDriver for AwsHosts {
                     .subnets
                     .get(region)
                     .with_context(|| format!("no host subnet in {region}"))?;
+                // The zones come from `zones`, which read the subnets' zones; a request that
+                // names none of them launches over every subnet.
+                let by_zone = self
+                    .subnet_zones
+                    .lock()
+                    .unwrap()
+                    .get(region)
+                    .cloned()
+                    .unwrap_or_default();
+                let within: Vec<String> = subnets
+                    .iter()
+                    .filter(|s| by_zone.get(*s).is_some_and(|z| zones.contains(z)))
+                    .cloned()
+                    .collect();
+                let subnets = if within.is_empty() {
+                    subnets.clone()
+                } else {
+                    within
+                };
                 let mut typed = Vec::with_capacity(templates.len());
                 for t in templates {
                     typed.push((t.clone(), self.template_type(region, t).await?));
                 }
-                create_fleet_params(&typed, subnets, market, count, &self.fleet, token)
+                create_fleet_params(&typed, &subnets, market, count, &self.fleet, token)
             }
         };
         let answer = self.call(region, &params).await;
+        // Zones are named when the subnets' zones were read (`zones`, the spread's first call).
+        let subnet_zones = self
+            .subnet_zones
+            .lock()
+            .unwrap()
+            .get(region)
+            .cloned()
+            .unwrap_or_default();
         let mut unanswered = self.unanswered.lock().unwrap();
         match answer {
             Ok(xml) => {
                 unanswered.remove(token);
-                Ok(parse_create_fleet(&xml))
+                Ok(parse_create_fleet(&xml, &subnet_zones))
             }
             // A request refused as a whole for capacity is a refusal like a per-pool one.
             Err((code, msg)) if CAPACITY_CODES.contains(&code.as_str()) => {
@@ -1203,11 +1497,19 @@ impl HostDriver for AwsHosts {
 /// instance is named by its region's next `show` lists, left out of the `hide` after them,
 /// then named again, as an eventually consistent DescribeInstances. `stuck` makes that many
 /// next launches with a new token fail without launching, and every later request with one of
-/// their tokens fail too, as a retry EC2 never answers.
+/// their tokens fail too, as a retry EC2 never answers. `zones` are each region's
+/// availability zones: a launch places each instance in the first of the zones it may use
+/// (the request's, or every zone of the region) that `zone_capacity` (region, zone, market;
+/// unlimited when absent) still has room in, and records ` in <zones>` when it named zones.
 #[derive(Default)]
 pub struct FakeHosts {
     pub hosts: Mutex<BTreeMap<String, Vec<Host>>>,
     pub capacity: Mutex<HashMap<(String, Market), u32>>,
+    pub zones: Mutex<HashMap<String, Vec<String>>>,
+    pub zone_capacity: Mutex<HashMap<(String, String, Market), u32>>,
+    /// Every list waits for this lock after recording its call: a test that holds it keeps
+    /// the launcher inside a list.
+    pub hold_lists: Arc<tokio::sync::Mutex<()>>,
     pub launch_state: Mutex<Option<String>>,
     pub calls: Mutex<Vec<String>>,
     pub fail_lists: Mutex<HashMap<String, u32>>,
@@ -1243,12 +1545,22 @@ impl FakeHosts {
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// The zone of each live host of `region`, by instance id.
+    pub fn live_zones(&self, region: &str) -> BTreeMap<String, Option<String>> {
+        self.present(region)
+            .into_iter()
+            .filter(|h| h.live())
+            .map(|h| (h.id, h.zone))
+            .collect()
+    }
 }
 
 #[async_trait]
 impl HostDriver for FakeHosts {
     async fn hosts(&self, region: &str) -> Result<Vec<Host>> {
         self.calls.lock().unwrap().push(format!("list {region}"));
+        drop(self.hold_lists.lock().await);
         if let Some(n) = self.fail_lists.lock().unwrap().get_mut(region) {
             if *n > 0 {
                 *n -= 1;
@@ -1279,17 +1591,33 @@ impl HostDriver for FakeHosts {
             .collect())
     }
 
+    async fn zones(&self, region: &str) -> Result<Vec<String>> {
+        Ok(self
+            .zones
+            .lock()
+            .unwrap()
+            .get(region)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn launch(
         &self,
         region: &str,
         market: Market,
         count: u32,
         token: &str,
+        zones: &[String],
     ) -> Result<Launch> {
+        let named = if zones.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", zones.join(","))
+        };
         self.calls
             .lock()
             .unwrap()
-            .push(format!("launch {region} {} {count}", market.name()));
+            .push(format!("launch {region} {} {count}{named}", market.name()));
         if let Some(l) = self.by_token.lock().unwrap().get(token) {
             return Ok(l.clone());
         }
@@ -1321,12 +1649,50 @@ impl HostDriver for FakeHosts {
             .unwrap()
             .clone()
             .unwrap_or_else(|| "pending".into());
+        let allowed: Vec<String> = if zones.is_empty() {
+            self.zones
+                .lock()
+                .unwrap()
+                .get(region)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            zones.to_vec()
+        };
         let mut out = Launch::default();
+        let mut placed = 0;
         for _ in 0..n {
+            // The first allowed zone with room; none at all when the region has no zones.
+            let zone = {
+                let mut cap = self.zone_capacity.lock().unwrap();
+                let mut pick = None;
+                for z in &allowed {
+                    match cap.get_mut(&(region.to_string(), z.clone(), market)) {
+                        Some(0) => continue,
+                        Some(c) => {
+                            *c -= 1;
+                            pick = Some(z.clone());
+                            break;
+                        }
+                        None => {
+                            pick = Some(z.clone());
+                            break;
+                        }
+                    }
+                }
+                if pick.is_none() && !allowed.is_empty() {
+                    continue;
+                }
+                pick
+            };
+            placed += 1;
             let id = format!(
                 "i-{:017x}",
                 self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             );
+            if let Some(z) = &zone {
+                out.zones.insert(id.clone(), z.clone());
+            }
             self.hosts
                 .lock()
                 .unwrap()
@@ -1337,13 +1703,25 @@ impl HostDriver for FakeHosts {
                     state: state.clone(),
                     market,
                     sources: Vec::new(),
+                    zone,
                 });
             if let Some(v) = *self.hide_new.lock().unwrap() {
                 self.visibility.lock().unwrap().insert(id.clone(), v);
             }
             out.ids.push(id);
         }
-        if n < count {
+        if placed < n {
+            // What the zones had no room for stays in the region's capacity.
+            if let Some(c) = self
+                .capacity
+                .lock()
+                .unwrap()
+                .get_mut(&(region.to_string(), market))
+            {
+                *c += n - placed;
+            }
+        }
+        if placed < count {
             out.refused.push(format!(
                 "InsufficientInstanceCapacity: no {} capacity",
                 market.name()
@@ -1354,7 +1732,7 @@ impl HostDriver for FakeHosts {
             .unwrap()
             .insert(token.to_string(), out.clone());
         let mut amb = self.ambiguous.lock().unwrap();
-        if *amb > 0 && n > 0 {
+        if *amb > 0 && placed > 0 {
             *amb -= 1;
             bail!("injected: the launch's answer was lost");
         }
@@ -1402,6 +1780,7 @@ mod tests {
             state: state.into(),
             market,
             sources: Vec::new(),
+            zone: None,
         }
     }
 
@@ -1437,7 +1816,8 @@ mod tests {
         let cfg = HostConfig {
             driver: fake.clone(),
             regions: vec!["r".into()],
-            awake_capacity: 1,
+            awake_hosts: 1,
+            spread: HostSpread::None,
             on_demand_max: 8,
             poll: Duration::from_millis(50),
             liveness: Duration::from_millis(50),
@@ -1446,17 +1826,14 @@ mod tests {
         };
         let (mut on_demand, mut recent, mut tokens, mut errors) =
             (Some(0), HashMap::new(), HashMap::new(), Vec::new());
-        let (launched, _) = launch_shortfall(
-            &cfg,
-            "r",
-            1,
-            &mut on_demand,
-            &mut recent,
-            &mut tokens,
-            &mut errors,
-        )
-        .await;
-        assert_eq!(launched, 0);
+        let mut pass = Pass {
+            on_demand: &mut on_demand,
+            recent: &mut recent,
+            tokens: &mut tokens,
+            errors: &mut errors,
+        };
+        let (launched, _) = launch_shortfall(&cfg, "r", 1, &[], &mut pass).await;
+        assert!(launched.is_empty());
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line = out
             .lines()
@@ -1473,15 +1850,83 @@ mod tests {
             host("i-0", "shutting-down", Market::Spot),
         ];
         let b = vec![host("i-3", "running", Market::Spot)];
+        let none = BTreeSet::new();
         assert_eq!(
-            expected_hosts(&[Some(a.clone()), Some(b.clone())], 1),
+            expected_hosts(&[Some(a.clone()), Some(b.clone())], 1, &none),
             Some(vec!["i-2".to_string(), "i-3".to_string()]),
             "the on-demand host over the capacity is not kept"
         );
-        assert_eq!(expected_hosts(&[Some(a.clone()), Some(b.clone())], 2), None);
-        assert_eq!(expected_hosts(&[Some(a.clone()), None], 1), None);
-        assert_eq!(expected_hosts(&[Some(a), Some(b)], 0), None);
-        assert_eq!(expected_hosts(&[Some(vec![])], 1), None);
+        assert_eq!(
+            expected_hosts(&[Some(a.clone()), Some(b.clone())], 2, &none),
+            None
+        );
+        assert_eq!(expected_hosts(&[Some(a.clone()), None], 1, &none), None);
+        assert_eq!(
+            expected_hosts(&[Some(a.clone()), Some(b.clone())], 0, &none),
+            None
+        );
+        assert_eq!(expected_hosts(&[Some(vec![])], 1, &none), None);
+        // A draining host is not kept: its region is short until the replacement is listed.
+        let leaving: BTreeSet<String> = ["i-3".to_string()].into();
+        assert_eq!(expected_hosts(&[Some(a), Some(b)], 1, &leaving), None);
+    }
+
+    fn zoned(z: &[&str]) -> BTreeSet<String> {
+        z.iter().map(|z| z.to_string()).collect()
+    }
+
+    /// A spread launch tries the zones no live host is in, then those no serving host is in
+    /// (a draining host's zone allowed again), then every zone; a tier that is every zone or
+    /// none is left out, and the last is always every zone.
+    #[test]
+    fn spread_tiers_avoid_live_zones_then_serving_zones() {
+        let zones: Vec<String> = ["a", "b", "c"].iter().map(|z| z.to_string()).collect();
+        let s = |v: &[&str]| v.iter().map(|z| z.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            zone_tiers(&zones, &zoned(&["a", "b"]), &zoned(&["a"])),
+            vec![s(&["c"]), s(&["b", "c"]), vec![]]
+        );
+        // Two zones, one serving host in a and one draining in b: b first, then any.
+        let two = s(&["a", "b"]);
+        assert_eq!(
+            zone_tiers(&two, &zoned(&["a", "b"]), &zoned(&["a"])),
+            vec![s(&["b"]), vec![]]
+        );
+        // No host yet: every zone, once.
+        let any: Vec<Vec<String>> = vec![vec![]];
+        assert_eq!(zone_tiers(&zones, &zoned(&[]), &zoned(&[])), any);
+        // Zones unknown: no restriction.
+        assert_eq!(zone_tiers(&[], &zoned(&["a"]), &zoned(&["a"])), any);
+    }
+
+    #[test]
+    fn subnets_and_launches_carry_their_zones() {
+        let xml = r#"<DescribeSubnetsResponse><subnetSet>
+  <item><subnetId>subnet-1</subnetId><availabilityZone>us-east-1a</availabilityZone></item>
+  <item><availabilityZone>us-east-1b</availabilityZone><subnetId>subnet-2</subnetId></item>
+</subnetSet></DescribeSubnetsResponse>"#;
+        let zones = parse_subnet_zones(xml);
+        assert_eq!(
+            zones.get("subnet-2").map(String::as_str),
+            Some("us-east-1b")
+        );
+        let fleet = r#"<CreateFleetResponse><fleetInstanceSet>
+  <item><launchTemplateAndOverrides><overrides><subnetId>subnet-2</subnetId></overrides></launchTemplateAndOverrides>
+    <lifecycle>spot</lifecycle><instanceIds><item>i-0123456789abcdef0</item></instanceIds></item>
+</fleetInstanceSet></CreateFleetResponse>"#;
+        let got = parse_create_fleet(fleet, &zones);
+        assert_eq!(
+            got.zones.get("i-0123456789abcdef0").map(String::as_str),
+            Some("us-east-1b")
+        );
+        let described = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
+  <item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState>
+    <placement><availabilityZone>us-east-1b</availabilityZone><tenancy>default</tenancy></placement></item>
+</instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
+        assert_eq!(
+            parse_hosts(described)[0].zone.as_deref(),
+            Some("us-east-1b")
+        );
     }
 
     #[test]
@@ -1582,13 +2027,15 @@ mod tests {
       <instanceType>g4dn.metal</instanceType></item>
   </fleetInstanceSet>
 </CreateFleetResponse>"#;
-        let got = parse_create_fleet(xml);
+        let got = parse_create_fleet(xml, &BTreeMap::new());
         assert_eq!(got.ids, vec!["i-0123456789abcdef0".to_string()]);
         assert_eq!(got.refused.len(), 1, "{got:?}");
         assert!(got.refused[0].starts_with("InsufficientInstanceCapacity: "));
         assert_eq!(got.failed.len(), 1, "{got:?}");
-        let none =
-            parse_create_fleet("<CreateFleetResponse><fleetInstanceSet/></CreateFleetResponse>");
+        let none = parse_create_fleet(
+            "<CreateFleetResponse><fleetInstanceSet/></CreateFleetResponse>",
+            &BTreeMap::new(),
+        );
         assert_eq!(none, Launch::default());
     }
 
@@ -1671,6 +2118,7 @@ mod tests {
             Recent {
                 region: "us-east-1".into(),
                 market: Market::Spot,
+                zone: None,
                 asked: now,
                 running_reported: false,
             },
@@ -1697,6 +2145,7 @@ mod tests {
             Recent {
                 region: "us-east-1".into(),
                 market: Market::Spot,
+                zone: None,
                 asked: now,
                 running_reported: false,
             },

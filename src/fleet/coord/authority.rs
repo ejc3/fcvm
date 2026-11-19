@@ -8,8 +8,9 @@
 //!
 //! What is answered, for names in the subzone only (anything else is REFUSED, no recursion):
 //! the apex's SOA and NS, `A` (`<label>-v4`) and `AAAA` (`<label>`) for published launches,
-//! and `_acme-challenge.<subzone>` as a CNAME into the parent zone, where the certificate
-//! renewal writes its DNS-01 TXT records. A missing name is NXDOMAIN and a missing type is
+//! and `_acme-challenge.<subzone>` ([`Acme`]): a CNAME into the parent zone, where the renewal
+//! of a zone certificate writes its DNS-01 TXT records, or, for a subzone certificate, the
+//! TXT records its renewal holds ([`ChallengeTxt`]), answered from here. A missing name is NXDOMAIN and a missing type is
 //! NODATA, both with the SOA, whose negative TTL is [`NEGATIVE_TTL`]. Every in-zone answer has
 //! AA set. EDNS(0) is read and answered; a UDP answer larger than the client's buffer is sent
 //! truncated (TC) with no records. Over UDP, responses per source prefix are limited
@@ -18,6 +19,7 @@
 //! Parsing never follows a compression pointer: a name in a query must be written out, so a
 //! pointer loop cannot occur, and every read is bounded by the packet.
 
+pub use super::cert::ChallengeTxt;
 use anyhow::{bail, Context, Result};
 use fleet_core::State;
 use std::collections::{BTreeMap, HashMap};
@@ -33,6 +35,9 @@ pub const RECORD_TTL: u32 = 60;
 pub const NEGATIVE_TTL: u32 = 5;
 /// TTL of the apex's NS records and the ACME CNAME.
 pub const NS_TTL: u32 = 3600;
+/// TTL of a DNS-01 TXT record: the renewal checks it through a public resolver, and its
+/// value changes with every order.
+pub const TXT_TTL: u32 = 5;
 /// The UDP payload size this server advertises and answers within (RFC 9715's default).
 pub const EDNS_SIZE: u16 = 1232;
 /// The longest query read; anything longer is dropped (a query is a header, one name of at
@@ -47,6 +52,18 @@ pub const TCP_IDLE: Duration = Duration::from_secs(10);
 /// Source prefixes tracked per second by the rate limit; past it, new prefixes are limited.
 pub const RATE_PREFIXES: usize = 16384;
 
+/// What `_acme-challenge.<apex>` answers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Acme {
+    /// Nothing: the name does not exist.
+    None,
+    /// A CNAME to this name outside the subzone, where a zone certificate's renewal writes
+    /// its DNS-01 records.
+    Cname(String),
+    /// The TXT values a subzone certificate's renewal holds.
+    Txt(ChallengeTxt),
+}
+
 /// The subzone and what is fixed about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoneConfig {
@@ -54,8 +71,8 @@ pub struct ZoneConfig {
     pub apex: String,
     /// Its nameservers' names, as the parent's NS records name them.
     pub nameservers: Vec<String>,
-    /// Where `_acme-challenge.<apex>` points (a CNAME), when the certificate covers the zone.
-    pub acme_target: Option<String>,
+    /// What `_acme-challenge.<apex>` answers.
+    pub acme: Acme,
 }
 
 fn normal(name: &str) -> Result<String> {
@@ -77,7 +94,7 @@ fn normal(name: &str) -> Result<String> {
 }
 
 impl ZoneConfig {
-    pub fn new(apex: &str, nameservers: &[String], acme_target: Option<&str>) -> Result<Self> {
+    pub fn new(apex: &str, nameservers: &[String], acme: Acme) -> Result<Self> {
         let apex = normal(apex)?;
         if nameservers.is_empty() {
             bail!("the subzone {apex} needs at least one nameserver name");
@@ -86,16 +103,27 @@ impl ZoneConfig {
             .iter()
             .map(|n| normal(n))
             .collect::<Result<Vec<_>>>()?;
-        let acme_target = acme_target.map(normal).transpose()?;
-        if let Some(t) = &acme_target {
-            if in_zone(t, &apex) {
-                bail!("the ACME target {t} must be outside {apex}");
+        let acme = match acme {
+            Acme::Cname(t) => {
+                let t = normal(&t)?;
+                if in_zone(&t, &apex) {
+                    bail!("the ACME target {t} must be outside {apex}");
+                }
+                Acme::Cname(t)
             }
-        }
+            Acme::Txt(txt) => {
+                let want = format!("_acme-challenge.{apex}");
+                if txt.name != want {
+                    bail!("the ACME challenge {} is not {want}", txt.name);
+                }
+                Acme::Txt(txt)
+            }
+            Acme::None => Acme::None,
+        };
         Ok(ZoneConfig {
             apex,
             nameservers,
-            acme_target,
+            acme,
         })
     }
 
@@ -167,6 +195,7 @@ const T_A: u16 = 1;
 const T_NS: u16 = 2;
 const T_CNAME: u16 = 5;
 const T_SOA: u16 = 6;
+const T_TXT: u16 = 16;
 const T_AAAA: u16 = 28;
 const T_OPT: u16 = 41;
 const T_IXFR: u16 = 251;
@@ -416,14 +445,37 @@ fn lookup(cfg: &ZoneConfig, zone: &Zone, q: &Query) -> Reply {
             found(answer)
         };
     }
-    if let Some(target) = cfg
-        .acme_target
-        .as_ref()
-        .filter(|_| q.name == cfg.acme_name())
-    {
-        let mut rdata = Vec::new();
-        put_name(&mut rdata, target);
-        return found(vec![rr(None, T_CNAME, NS_TTL, &rdata)]);
+    // The challenge's TXT values now; the name exists while it holds any.
+    let txt: Vec<String> = match &cfg.acme {
+        Acme::Txt(t) => t.values(),
+        _ => Vec::new(),
+    };
+    if q.name == cfg.acme_name() {
+        match &cfg.acme {
+            Acme::Cname(target) => {
+                let mut rdata = Vec::new();
+                put_name(&mut rdata, target);
+                return found(vec![rr(None, T_CNAME, NS_TTL, &rdata)]);
+            }
+            Acme::Txt(_) if !txt.is_empty() => {
+                let answer: Vec<_> = txt
+                    .iter()
+                    .filter(|_| q.qtype == T_TXT || q.qtype == T_ANY)
+                    .filter(|v| v.len() <= 255)
+                    .map(|v| {
+                        let mut rdata = vec![v.len() as u8];
+                        rdata.extend_from_slice(v.as_bytes());
+                        rr(None, T_TXT, TXT_TTL, &rdata)
+                    })
+                    .collect();
+                return if answer.is_empty() {
+                    negative(0)
+                } else {
+                    found(answer)
+                };
+            }
+            _ => {}
+        }
     }
     if zone.a.contains_key(&q.name) || zone.aaaa.contains_key(&q.name) {
         let answer: Vec<_> = a(q.qtype == T_A || q.qtype == T_ANY)
@@ -437,7 +489,7 @@ fn lookup(cfg: &ZoneConfig, zone: &Zone, q: &Query) -> Reply {
     }
     // A name with names below it exists (NODATA), though launch labels never nest.
     let below = format!(".{}", q.name);
-    let acme = cfg.acme_target.as_ref().map(|_| cfg.acme_name());
+    let acme = (matches!(cfg.acme, Acme::Cname(_)) || !txt.is_empty()).then(|| cfg.acme_name());
     if zone
         .a
         .keys()
@@ -757,7 +809,7 @@ mod tests {
                 "ns1-tiles.fcvm.example".into(),
                 "ns2-tiles.fcvm.example".into(),
             ],
-            Some("_acme-challenge.fcvm.example"),
+            Acme::Cname("_acme-challenge.fcvm.example".into()),
         )
         .unwrap()
     }
@@ -951,12 +1003,52 @@ mod tests {
             assert_eq!(r.answer, vec![(T_CNAME, NS_TTL, target)]);
         }
         let no_acme = ZoneConfig {
-            acme_target: None,
+            acme: Acme::None,
             ..cfg()
         };
         let m = query("_acme-challenge.tiles.fcvm.example", 16, None);
         let r = read(&respond(&no_acme, &zone(), &m, false).unwrap());
         assert_eq!(r.rcode, NXDOMAIN);
+    }
+
+    /// A subzone certificate's challenge is answered here: the renewal's TXT values, with no
+    /// CNAME into the parent zone; before and after the order the name does not exist.
+    #[test]
+    fn a_subzone_certificate_challenge_is_answered_with_its_txt_values() {
+        let txt = ChallengeTxt::new("_acme-challenge.tiles.fcvm.example");
+        let own = ZoneConfig::new(
+            "tiles.fcvm.example",
+            &["ns1-tiles.fcvm.example".into()],
+            Acme::Txt(txt.clone()),
+        )
+        .unwrap();
+        let ask_own = |t| {
+            let m = query("_acme-challenge.tiles.fcvm.example", t, None);
+            read(&respond(&own, &zone(), &m, false).unwrap())
+        };
+        assert_eq!(ask_own(T_TXT).rcode, NXDOMAIN);
+        let mut w = txt.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        use super::super::cert::Dns01;
+        rt.block_on(w.add_txt("_acme-challenge.tiles.fcvm.example", "abc"))
+            .unwrap();
+        let r = ask_own(T_TXT);
+        assert_eq!((r.rcode, r.aa), (0, true), "{r:?}");
+        assert_eq!(r.answer, vec![(T_TXT, TXT_TTL, b"\x03abc".to_vec())]);
+        // Another type at the name: NODATA, not a CNAME.
+        let r = ask_own(T_CNAME);
+        assert_eq!((r.rcode, r.answer.len()), (0, 0), "{r:?}");
+        rt.block_on(w.delete("abc")).unwrap();
+        assert_eq!(ask_own(T_TXT).rcode, NXDOMAIN);
+        // A challenge that is not the subzone's own name is refused.
+        assert!(ZoneConfig::new(
+            "tiles.fcvm.example",
+            &["ns1-tiles.fcvm.example".into()],
+            Acme::Txt(ChallengeTxt::new("_acme-challenge.fcvm.example")),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1158,15 +1250,18 @@ mod tests {
 
     #[test]
     fn the_zone_config_is_checked() {
-        assert!(ZoneConfig::new("tiles.fcvm.example.", &[], None).is_err());
-        assert!(ZoneConfig::new("ti les.fcvm.example", &["ns.example".into()], None).is_err());
+        assert!(ZoneConfig::new("tiles.fcvm.example.", &[], Acme::None).is_err());
+        assert!(
+            ZoneConfig::new("ti les.fcvm.example", &["ns.example".into()], Acme::None).is_err()
+        );
         assert!(ZoneConfig::new(
             "tiles.fcvm.example",
             &["ns.example".into()],
-            Some("_acme-challenge.tiles.fcvm.example")
+            Acme::Cname("_acme-challenge.tiles.fcvm.example".into())
         )
         .is_err());
-        let c = ZoneConfig::new("Tiles.FCVM.example.", &["NS1.example".into()], None).unwrap();
+        let c =
+            ZoneConfig::new("Tiles.FCVM.example.", &["NS1.example".into()], Acme::None).unwrap();
         assert_eq!(
             (c.apex.as_str(), c.nameservers[0].as_str()),
             ("tiles.fcvm.example", "ns1.example")
