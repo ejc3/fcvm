@@ -762,7 +762,20 @@ export interface SeatMsg {
   returning: boolean;
 }
 
-export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg | SeatMsg;
+/**
+ * A request for a fresh `admission`: a playback token plays once, so the broadcast player asks
+ * for one before it loads again with a token it has used.
+ */
+export interface PlaybackMsg {
+  type: "playback";
+}
+
+export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg | SeatMsg | PlaybackMsg;
+
+export function playbackMessage(): string {
+  const m: PlaybackMsg = { type: "playback" };
+  return JSON.stringify(m);
+}
 
 /**
  * The first message on /live, with the seat ticket this tab holds, if any. A URL would carry

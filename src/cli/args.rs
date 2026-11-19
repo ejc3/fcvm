@@ -472,13 +472,14 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]
     pub history_idle: u64,
 
-    /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
-    /// or a private network. Off without it.
+    /// Operator endpoint (POST /quarantine/release) on this address, which must be loopback
+    /// (127.0.0.0/8 or ::1): it has no authentication. Off without it.
     #[arg(long)]
     pub admin_listen: Option<String>,
 
-    /// EC2 tiles the EC2 side runs; one without an instance is a dark tile
-    #[arg(long, default_value_t = 8)]
+    /// EC2 tiles the EC2 side runs; one without an instance is a dark tile. At most 40, the
+    /// EC2 launches viewers may cause in 10 minutes, so a race of every tile fits
+    #[arg(long, default_value_t = 8, value_parser = parse_ec2_tiles)]
     pub ec2_tiles: usize,
 
     /// Regions to launch EC2 tiles in, tried in order (comma separated)
@@ -2160,6 +2161,21 @@ fn parse_health_check(s: &str) -> Result<String, String> {
     crate::health::parse_health_check_url(s)
         .map(|_| s.to_string())
         .map_err(|e| format!("{e:#}"))
+}
+
+/// `--ec2-tiles`: at most the viewers' EC2 launch budget, so a viewer's race (one launch per
+/// EC2 tile) can fit it once the window clears.
+fn parse_ec2_tiles(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("invalid --ec2-tiles value '{s}': expected an integer"))?;
+    let budget = fleet_core::apply::EC2_LAUNCH_BUDGET;
+    if n > budget {
+        return Err(format!(
+            "--ec2-tiles {n} is more than the {budget} EC2 launches viewers may cause in 10 minutes, so no race could ever start"
+        ));
+    }
+    Ok(n)
 }
 
 fn parse_cpu(s: &str) -> Result<u8, String> {

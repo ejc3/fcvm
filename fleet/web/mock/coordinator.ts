@@ -601,6 +601,9 @@ export class MockCoordinator {
           this.lastArrivalAt = this.now();
           this.markDirty();
         }
+      } else if (m["type"] === "playback") {
+        // A fresh admission, as the coordinator answers a player whose token is used.
+        if (this.broadcast || this.minecraft) this.sendTo(client, this.admissionFor(client));
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
         if (ok) client.verified = true;
@@ -632,10 +635,23 @@ export class MockCoordinator {
       locked: c.late,
       reason: c.late ? "Direct streams are full, so you are watching the broadcast." : null,
       direct: c.late ? null : { value: `v1.${Math.floor(expires / 1000)}.${c.viewer}.mock`, expires_at: expires },
-      broadcast: this.broadcast ? { value: this.broadcast.url, expires_at: expires } : null,
+      broadcast: this.broadcast ? { value: this.playbackUrl(this.broadcast.url), expires_at: expires } : null,
       seat_free: false,
       capacity: null,
     };
+  }
+
+  /** Signed playback tokens issued so far, so each signed admission carries a token of its own. */
+  private playbackTokens = 0;
+
+  /**
+   * A signed URL (`token=`) with a new token, as the coordinator signs a single-use token for
+   * every admission; an open URL as it is.
+   */
+  private playbackUrl(url: string): string {
+    if (!/[?&]token=/.test(url)) return url;
+    const token = `mock-${++this.playbackTokens}`;
+    return url.replace(/([?&]token=)[^&]*/, `$1${token}`);
   }
 
   private sendTo(c: Client, msg: unknown): void {

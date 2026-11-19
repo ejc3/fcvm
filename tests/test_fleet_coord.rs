@@ -37,6 +37,8 @@ struct Opts {
     dns: Option<fcvm::fleet::coord::Names>,
     /// Seats and tokens; everyone seated when absent.
     gate: Option<Arc<admission::Gate>>,
+    /// Caps on open `/live` sockets.
+    sockets: live::SocketCaps,
 }
 
 impl Default for Opts {
@@ -54,6 +56,7 @@ impl Default for Opts {
             dns: None,
             site_key: None,
             gate: None,
+            sockets: live::SocketCaps::default(),
         }
     }
 }
@@ -83,6 +86,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
+        sockets: o.sockets,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -628,6 +632,109 @@ async fn limits_are_keyed_by_the_client_address() {
         b.receipt("w2").await["reason"],
         "one word per 5 s per client"
     );
+}
+
+/// An IPv6 client is counted by its /64: a second address in the same /64 shares the first
+/// one's limits, an address in another /64 does not.
+#[tokio::test]
+async fn ipv6_limits_are_keyed_by_the_slash_64() {
+    let c = coordinator_with(Opts::default()).await;
+    let mut a = Viewer::connect_from(&c.url, Some("2001:db8:1:2::1")).await;
+    let mut a2 = Viewer::connect_from(&c.url, Some("2001:db8:1:2:abcd::7")).await;
+    let mut b = Viewer::connect_from(&c.url, Some("2001:db8:1:3::1")).await;
+    a.intent("w1", "word", json!({"text": "one"})).await;
+    assert_eq!(a.receipt("w1").await["outcome"], "committed");
+    a2.intent("w2", "word", json!({"text": "two"})).await;
+    assert_eq!(
+        a2.receipt("w2").await["reason"],
+        "one word per 5 s per client",
+        "another address in the same /64 is the same client"
+    );
+    b.intent("w3", "word", json!({"text": "three"})).await;
+    assert_eq!(b.receipt("w3").await["outcome"], "committed");
+}
+
+/// Open a `/live` socket as a client at `ip`, or the HTTP status it was refused with.
+async fn try_live(url: &str, ip: &str) -> Result<Ws, (u16, Option<String>)> {
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("cf-connecting-ip", ip.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err((
+            r.status().as_u16(),
+            r.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        )),
+        Err(e) => panic!("connecting to {url}: {e}"),
+    }
+}
+
+/// One IPv6 /64 holds at most `per_ipv6_64` `/live` sockets, one IPv4 address (carrier NAT
+/// puts many people behind one) the larger `per_ipv4`, and the coordinator `total`; a socket
+/// past any of them is refused with 503 and a `Retry-After`, and a closed socket gives its
+/// place back.
+#[tokio::test]
+async fn live_sockets_are_capped_per_client_and_in_all() {
+    let c = coordinator_with(Opts {
+        sockets: live::SocketCaps {
+            per_ipv6_64: 2,
+            per_ipv4: 4,
+            total: 7,
+        },
+        ..Opts::default()
+    })
+    .await;
+    let full = Some((503, Some(live::FULL_RETRY_AFTER_SECS.to_string())));
+    // One subscriber's /64, from two of its addresses.
+    let _v1 = try_live(&c.url, "2001:db8:1:2::1")
+        .await
+        .expect("first IPv6 socket");
+    let _v2 = try_live(&c.url, "2001:db8:1:2::2")
+        .await
+        .expect("second IPv6 socket");
+    assert_eq!(
+        try_live(&c.url, "2001:db8:1:2::3").await.err(),
+        full,
+        "a third socket from one /64"
+    );
+    // One IPv4 address holds more than a /64 may.
+    let mut v4 = Vec::new();
+    for i in 0..4 {
+        v4.push(
+            try_live(&c.url, "198.51.100.1")
+                .await
+                .unwrap_or_else(|e| panic!("IPv4 socket {}: {e:?}", i + 1)),
+        );
+    }
+    assert_eq!(
+        try_live(&c.url, "198.51.100.1").await.err(),
+        full,
+        "a fifth socket from one IPv4 address"
+    );
+    let _b1 = try_live(&c.url, "198.51.100.2")
+        .await
+        .expect("another client");
+    let a1 = v4.pop().unwrap();
+    assert_eq!(
+        try_live(&c.url, "198.51.100.3").await.err().map(|e| e.0),
+        Some(503),
+        "past the total"
+    );
+    // A closed socket frees its place.
+    drop(a1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match try_live(&c.url, "198.51.100.3").await {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(e) => panic!("a closed socket's place was never given back: {e:?}"),
+        }
+    }
 }
 
 /// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
@@ -1526,6 +1633,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         turnstile_site_key: None,
         poster,
         gate: Arc::new(admission::Gate::open()),
+        sockets: live::SocketCaps::default(),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -3319,6 +3427,7 @@ async fn page_url(handle: &Handle) -> String {
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),
+        sockets: live::SocketCaps::default(),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -6607,8 +6716,9 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     .await;
     let now = || now_ms() / 1000;
     let mut seated = Vec::new();
-    for _ in 0..2 {
-        let mut v = Viewer::connect(&c.url).await;
+    // Each from its own address: one client at its own seat limit is told that instead.
+    for ip in ["198.51.100.1", "198.51.100.2"] {
+        let mut v = Viewer::connect_from(&c.url, Some(ip)).await;
         let a = v.message("admission").await;
         assert_eq!(a["locked"], false);
         assert!(a["seat"].is_string());
@@ -6793,19 +6903,23 @@ async fn the_broadcast_never_streams_a_borrowed_tile() {
     }
 }
 
-/// The GPU mirror's key is handed out with or without a broadcast, and reaches the agents'
-/// scenes (which give it to phones only) but no browser; direct streams stay unchecked
-/// without a broadcast.
+/// The GPU mirror's key and the direct-stream key are handed out with or without a
+/// broadcast, and reach the agents' scenes (which give the mirror's to phones only) but no
+/// browser.
 #[tokio::test]
 async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
     use fcvm::fleet::coord::admission_keys;
     let key = "cd".repeat(32);
+    let mut gate = admission::Gate::open();
+    gate.key = admission::AdmitKey::from_hex(&key).unwrap();
+    assert_eq!(gate.seats.capacity(), None, "no broadcast");
     assert_eq!(
-        admission_keys(false, key.clone()),
-        (vec![], vec![key.clone()])
+        admission_keys(&gate),
+        (vec![key.clone()], vec![key.clone()])
     );
+    gate.seats = admission::Seats::new(Some(500));
     assert_eq!(
-        admission_keys(true, key.clone()),
+        admission_keys(&gate),
         (vec![key.clone()], vec![key.clone()])
     );
     let config = Config {
@@ -6814,7 +6928,10 @@ async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
         ..Config::default()
     };
     let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
-    let (admit, mirror) = admission_keys(false, key.clone());
+    let (admit, mirror) = admission_keys(&admission::Gate {
+        seats: admission::Seats::new(None),
+        ..gate
+    });
     handle.set_admit_keys(admit).await;
     handle.set_mirror_keys(mirror).await;
     let mut a = FakeAgent::connect(&handle, "gpu-a", 1);
@@ -6826,9 +6943,10 @@ async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
         }
     };
     assert_eq!(scene.mirror_keys, vec![key.clone()]);
-    assert!(
-        scene.admit_keys.is_empty(),
-        "no broadcast: direct streams stay open"
+    assert_eq!(
+        scene.admit_keys,
+        vec![key.clone()],
+        "no broadcast: direct streams are checked too"
     );
     let body = scene.for_renderer(fleet_core::tiling::Rect {
         x: 0.0,

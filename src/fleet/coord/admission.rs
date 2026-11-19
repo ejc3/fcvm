@@ -4,7 +4,8 @@
 //! - [`Seats`]: at most `--direct-capacity` viewers hold a seat (direct and aggregated
 //!   streams). A seat is kept while its connection is open and for [`SEAT_GRACE`] after it
 //!   closes, for a page that reconnects with its ticket. A viewer that arrives with every
-//!   seat held is late: broadcast only, for the whole connection.
+//!   seat held, or whose client already holds [`SEATS_PER_CLIENT`], is late: broadcast
+//!   only, for the whole connection.
 //! - Direct tokens: `v1.<expiry unix s>.<viewer>.<mac>`, the mac an HMAC-SHA256 of the first
 //!   three fields with the admission key, base64url without padding. Renderers and
 //!   aggregators that hold the key refuse `GET /frames` without a valid one.
@@ -19,11 +20,29 @@ use std::time::{Duration, Instant};
 
 /// How long a closed connection's seat waits for the page to come back with its ticket.
 pub const SEAT_GRACE: Duration = Duration::from_secs(60);
+/// Seats one client key (`live::client_key`) may hold when seats are limited. Without it one
+/// client could take all `--direct-capacity` seats (500, the wall's measured capacity) by
+/// opening that many connections and leave every later viewer on the broadcast. A page holds
+/// one seat; two lets a second device or tab of the same household or office be seated, and
+/// a reconnect with its ticket takes its own seat back without counting again. A client past
+/// it watches the broadcast, which shows the same picture.
+pub const SEATS_PER_CLIENT: usize = 2;
 /// How long a direct token lasts, and how often a seated connection gets a new one.
 pub const DIRECT_TOKEN_SECS: u64 = 600;
 pub const DIRECT_REFRESH: Duration = Duration::from_secs(300);
-/// How long a playback token lasts (renewed with the direct token).
-pub const PLAYBACK_TOKEN_SECS: u64 = 3600;
+/// How long a playback token lasts. IVS checks it only when a player starts playback (its
+/// `exp` "does not indicate the length of time that the stream can be viewed"), and a token
+/// carrying `aws:viewer-id` or `aws:single-use-uuid` may expire at most 10 minutes ahead
+/// (Amazon IVS Low-Latency User Guide, "Generate and Sign IVS Playback Tokens"). The page loads
+/// its player with the newest token, which is renewed every [`DIRECT_REFRESH`] (300 s, looked
+/// at every `Gate::tick`), or asks for one (`playback`); 360 s covers that with a minute to
+/// spare.
+pub const PLAYBACK_TOKEN_SECS: u64 = 360;
+/// The longest `aws:viewer-id` IVS accepts.
+pub const IVS_VIEWER_ID_MAX: usize = 40;
+/// How often one connection may ask for a fresh playback token (`playback`). The page's player
+/// retries a failed load every 3 s (fleet/web Broadcast.tsx `RETRY_MS`).
+pub const PLAYBACK_REQUEST_EVERY: Duration = Duration::from_secs(2);
 /// The direct token's query parameter on a frame URL.
 pub const ADMIT_PARAM: &str = "admit";
 
@@ -98,6 +117,14 @@ impl AdmitKey {
         let mac = self.mac(&signed);
         format!("{signed}.{mac}")
     }
+
+    /// The `aws:viewer-id` of a client key: a keyed hash, so IVS (whose guide says the field
+    /// must not hold personally identifying information) never sees the address, while one
+    /// client's sessions share an id the operator can revoke together. 32 characters, under
+    /// [`IVS_VIEWER_ID_MAX`]; a domain prefix keeps it apart from direct tokens' macs.
+    pub fn viewer_id(&self, client: &str) -> String {
+        self.mac(&format!("ivs-viewer.{client}"))[..32].to_string()
+    }
 }
 
 /// Whether `token` is a direct token made with one of `keys` that has not expired at `now`
@@ -166,11 +193,23 @@ pub enum Admitted {
     Seat { ticket: String },
     /// Every seat was held when it arrived: the broadcast only.
     Late,
+    /// Its client already held [`SEATS_PER_CLIENT`] seats when it arrived: the broadcast only,
+    /// like a late viewer, but a free seat elsewhere is no reason to reload.
+    ClientFull,
+}
+
+impl Admitted {
+    /// Whether the connection watches the broadcast only.
+    pub fn late(&self) -> bool {
+        !matches!(self, Admitted::Seat { .. })
+    }
 }
 
 struct Seat {
     /// Open connections holding it (a page has one; two with the same ticket share it).
     open: usize,
+    /// The client key it was given to.
+    client: String,
     /// When the last connection closed.
     closed_at: Option<Instant>,
 }
@@ -204,9 +243,11 @@ impl Seats {
         });
     }
 
-    /// Admit a new connection. A ticket the page kept from a seat it still holds (open, or
-    /// closed within the grace) gets that seat back; otherwise a free seat, else late.
-    pub fn admit(&self, ticket: Option<&str>, now: Instant) -> Admitted {
+    /// Admit a new connection from `client` (its client key). A ticket the page kept from a
+    /// seat it still holds (open, or closed within the grace) gets that seat back; otherwise a
+    /// free seat, unless seats are limited and `client` already holds [`SEATS_PER_CLIENT`];
+    /// else late.
+    pub fn admit(&self, ticket: Option<&str>, client: &str, now: Instant) -> Admitted {
         let mut held = self.held.lock().unwrap();
         self.expire(&mut held, now);
         if let Some(t) = ticket {
@@ -218,6 +259,10 @@ impl Seats {
                 };
             }
         }
+        // The client's own limit first: a client at it is not offered a seat that frees later.
+        if self.client_full(&held, client) {
+            return Admitted::ClientFull;
+        }
         if self.capacity.is_some_and(|c| held.len() >= c) {
             return Admitted::Late;
         }
@@ -226,6 +271,7 @@ impl Seats {
             ticket.clone(),
             Seat {
                 open: 1,
+                client: client.to_string(),
                 closed_at: None,
             },
         );
@@ -244,11 +290,19 @@ impl Seats {
         self.expire(&mut held, now);
     }
 
-    /// Whether a new connection would get a seat now.
-    pub fn free(&self, now: Instant) -> bool {
+    /// Whether `client` holds its share of seats. Only where a late viewer has a broadcast to
+    /// watch: unlimited seats mean no broadcast.
+    fn client_full(&self, held: &HashMap<String, Seat>, client: &str) -> bool {
+        self.capacity.is_some()
+            && held.values().filter(|s| s.client == client).count() >= SEATS_PER_CLIENT
+    }
+
+    /// Whether a new connection from `client` would get a seat now: one is free, and the
+    /// client does not already hold its share.
+    pub fn free(&self, client: &str, now: Instant) -> bool {
         let mut held = self.held.lock().unwrap();
         self.expire(&mut held, now);
-        self.capacity.is_none_or(|c| held.len() < c)
+        self.capacity.is_none_or(|c| held.len() < c) && !self.client_full(&held, client)
     }
 
     pub fn capacity(&self) -> Option<usize> {
@@ -287,10 +341,21 @@ impl PlaybackSigner {
         })
     }
 
-    /// A token for pages served from `origin`, valid until `exp` (unix seconds).
-    pub fn token(&self, origin: Option<&str>, exp: u64) -> Result<String> {
+    /// A token for pages served from `origin`, for the viewer `viewer_id` (at most
+    /// [`IVS_VIEWER_ID_MAX`] characters), valid until `exp` (unix seconds, at most 10 minutes
+    /// ahead) and for one playback: `aws:single-use-uuid` makes IVS invalidate it once it has
+    /// fetched the multivariant playlist, so a URL copied from a page plays nowhere else.
+    pub fn token(&self, origin: Option<&str>, viewer_id: &str, exp: u64) -> Result<String> {
+        if viewer_id.is_empty() || viewer_id.len() > IVS_VIEWER_ID_MAX {
+            bail!("an IVS viewer id is 1 to {IVS_VIEWER_ID_MAX} characters");
+        }
         let header = b64url(br#"{"alg":"ES384","typ":"JWT"}"#);
-        let mut claims = serde_json::json!({"aws:channel-arn": self.channel_arn, "exp": exp});
+        let mut claims = serde_json::json!({
+            "aws:channel-arn": self.channel_arn,
+            "aws:viewer-id": viewer_id,
+            "aws:single-use-uuid": uuid::Uuid::new_v4().to_string(),
+            "exp": exp,
+        });
         if let Some(o) = origin {
             claims["aws:access-control-allow-origin"] = o.into();
         }
@@ -304,7 +369,7 @@ impl PlaybackSigner {
     }
 
     /// The playback URL with a token.
-    pub fn url(&self, origin: Option<&str>, exp: u64) -> Result<String> {
+    pub fn url(&self, origin: Option<&str>, viewer_id: &str, exp: u64) -> Result<String> {
         let sep = if self.playback_url.contains('?') {
             '&'
         } else {
@@ -313,7 +378,7 @@ impl PlaybackSigner {
         Ok(format!(
             "{}{sep}token={}",
             self.playback_url,
-            self.token(origin, exp)?
+            self.token(origin, viewer_id, exp)?
         ))
     }
 }
@@ -326,6 +391,9 @@ pub enum Playback {
 
 /// What a late viewer is told beside its disabled toggle.
 pub const LATE_REASON: &str = "Direct streams are full, so you are watching the broadcast.";
+/// What a viewer whose client already holds its direct seats is told.
+pub const CLIENT_FULL_REASON: &str =
+    "Your network already has 2 direct streams open, so this page watches the broadcast.";
 
 /// The admission policy of one coordinator: its seats, the key direct tokens are made with,
 /// and the broadcast's playback.
@@ -350,11 +418,12 @@ impl Gate {
     }
 
     /// The admission message for a connection admitted as `admitted`, acting as `viewer`
-    /// from a page at `origin`, at `now_ms` (unix ms).
+    /// for the client key `client` from a page at `origin`, at `now_ms` (unix ms).
     pub fn message(
         &self,
         admitted: &Admitted,
         viewer: &str,
+        client: &str,
         origin: Option<&str>,
         now_ms: u64,
         now: Instant,
@@ -372,7 +441,7 @@ impl Gate {
             Some(Playback::Signed(_)) if origin.is_none() => None,
             Some(Playback::Signed(s)) => {
                 let exp = now_s + PLAYBACK_TOKEN_SECS;
-                match s.url(origin, exp) {
+                match s.url(origin, &self.key.viewer_id(client), exp) {
                     Ok(value) => Some(Token {
                         value,
                         expires_at: exp * 1000,
@@ -406,7 +475,16 @@ impl Gate {
                 reason: Some(LATE_REASON.into()),
                 direct: None,
                 broadcast,
-                seat_free: self.seats.free(now),
+                seat_free: self.seats.free(client, now),
+                capacity: self.seats.capacity(),
+            },
+            Admitted::ClientFull => Admission {
+                seat: None,
+                locked: true,
+                reason: Some(CLIENT_FULL_REASON.into()),
+                direct: None,
+                broadcast,
+                seat_free: false,
                 capacity: self.seats.capacity(),
             },
         }
@@ -487,30 +565,30 @@ mod tests {
     fn seats_admit_up_to_capacity_then_viewers_are_late() {
         let s = Seats::new(Some(2));
         let now = Instant::now();
-        let a = s.admit(None, now);
-        let b = s.admit(None, now);
+        let a = s.admit(None, "a", now);
+        let b = s.admit(None, "b", now);
         assert!(matches!(a, Admitted::Seat { .. }));
         assert!(matches!(b, Admitted::Seat { .. }));
-        assert_eq!(s.admit(None, now), Admitted::Late);
-        assert!(!s.free(now));
+        assert_eq!(s.admit(None, "c", now), Admitted::Late);
+        assert!(!s.free("c", now));
         // A forged or stale ticket is not a seat.
-        assert_eq!(s.admit(Some("not-a-ticket"), now), Admitted::Late);
+        assert_eq!(s.admit(Some("not-a-ticket"), "c", now), Admitted::Late);
     }
 
     #[test]
     fn a_closed_seat_waits_for_its_ticket_then_frees() {
         let s = Seats::new(Some(1)).with_grace(Duration::from_secs(60));
         let t0 = Instant::now();
-        let Admitted::Seat { ticket } = s.admit(None, t0) else {
+        let Admitted::Seat { ticket } = s.admit(None, "c", t0) else {
             panic!("no seat")
         };
         s.release(&ticket, t0);
         // Within the grace: held for the ticket, not free for anyone else.
         let t1 = t0 + Duration::from_secs(30);
-        assert!(!s.free(t1));
-        assert_eq!(s.admit(None, t1), Admitted::Late);
+        assert!(!s.free("c", t1));
+        assert_eq!(s.admit(None, "c", t1), Admitted::Late);
         assert_eq!(
-            s.admit(Some(&ticket), t1),
+            s.admit(Some(&ticket), "c", t1),
             Admitted::Seat {
                 ticket: ticket.clone()
             }
@@ -518,8 +596,10 @@ mod tests {
         s.release(&ticket, t1);
         // Past the grace: free, and the old ticket is just another arrival.
         let t2 = t1 + Duration::from_secs(61);
-        assert!(s.free(t2));
-        assert!(matches!(s.admit(Some(&ticket), t2), Admitted::Seat { ticket: n } if n != ticket));
+        assert!(s.free("c", t2));
+        assert!(
+            matches!(s.admit(Some(&ticket), "c", t2), Admitted::Seat { ticket: n } if n != ticket)
+        );
     }
 
     #[test]
@@ -527,9 +607,80 @@ mod tests {
         let s = Seats::new(None);
         let now = Instant::now();
         for _ in 0..1000 {
-            assert!(matches!(s.admit(None, now), Admitted::Seat { .. }));
+            assert!(matches!(s.admit(None, "c", now), Admitted::Seat { .. }));
         }
-        assert!(s.free(now));
+        assert!(s.free("c", now));
+    }
+
+    /// One client cannot take every seat: past `SEATS_PER_CLIENT` its connections watch the
+    /// broadcast while other clients are still seated, and its own ticket still brings a page
+    /// back to its seat.
+    #[test]
+    fn one_client_holds_at_most_its_share_of_seats() {
+        let s = Seats::new(Some(10));
+        let now = Instant::now();
+        let mut tickets = Vec::new();
+        for _ in 0..SEATS_PER_CLIENT {
+            let Admitted::Seat { ticket } = s.admit(None, "a", now) else {
+                panic!("no seat")
+            };
+            tickets.push(ticket);
+        }
+        assert_eq!(s.admit(None, "a", now), Admitted::ClientFull);
+        assert!(s.admit(None, "a", now).late());
+        assert!(matches!(s.admit(None, "b", now), Admitted::Seat { .. }));
+        assert_eq!(s.held(now), SEATS_PER_CLIENT + 1);
+        // A page reconnecting with its ticket takes its own seat back.
+        s.release(&tickets[0], now);
+        assert_eq!(
+            s.admit(Some(&tickets[0]), "a", now),
+            Admitted::Seat {
+                ticket: tickets[0].clone()
+            }
+        );
+        assert!(CLIENT_FULL_REASON.contains(&SEATS_PER_CLIENT.to_string()));
+    }
+
+    /// A client at its share is told so even when every seat is held, and is never offered a
+    /// reload when a seat frees: a reload would only meet its own limit.
+    #[test]
+    fn a_client_at_its_share_is_never_offered_a_free_seat() {
+        let s = Seats::new(Some(3)).with_grace(Duration::from_secs(60));
+        let t0 = Instant::now();
+        for c in ["a", "a", "b"] {
+            assert!(matches!(s.admit(None, c, t0), Admitted::Seat { .. }));
+        }
+        // Every seat held, and "a" at its share: its limit, not the capacity, is the reason.
+        assert_eq!(s.admit(None, "a", t0), Admitted::ClientFull);
+        // "c" arrives late; then "b"'s seat frees.
+        assert_eq!(s.admit(None, "c", t0), Admitted::Late);
+        let b_ticket = s
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, seat)| seat.client == "b")
+            .map(|(t, _)| t.clone())
+            .expect("a seat for b");
+        s.release(&b_ticket, t0);
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(s.free("c", t1), "a free seat for a client below its share");
+        assert!(!s.free("a", t1), "no free seat for a client at its share");
+        let gate = Gate {
+            seats: s,
+            key: AdmitKey([1; 32]),
+            playback: None,
+            tick: Duration::from_secs(10),
+        };
+        let late = |client: &str| {
+            gate.message(&Admitted::Late, "v-1", client, None, 1_000_000, t1)
+                .seat_free
+        };
+        assert!(late("c"));
+        assert!(
+            !late("a"),
+            "a late viewer of a client at its share is not offered a reload"
+        );
     }
 
     fn test_key_pem() -> String {
@@ -571,7 +722,9 @@ mod tests {
             &pem,
         )
         .unwrap();
-        let url = s.url(Some("https://stage.example"), 2_000_000_000).unwrap();
+        let url = s
+            .url(Some("https://stage.example"), "viewer-1", 2_000_000_000)
+            .unwrap();
         let token = url.split_once("?token=").unwrap().1;
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -628,9 +781,16 @@ mod tests {
         };
         let seat = Admitted::Seat { ticket: "t".into() };
         let now = Instant::now();
-        let with = gate.message(&seat, "v-1", Some("https://stage.example"), 1_000_000, now);
+        let with = gate.message(
+            &seat,
+            "v-1",
+            "c",
+            Some("https://stage.example"),
+            1_000_000,
+            now,
+        );
         assert!(with.broadcast.is_some());
-        let without = gate.message(&seat, "v-1", None, 1_000_000, now);
+        let without = gate.message(&seat, "v-1", "c", None, 1_000_000, now);
         assert!(without.broadcast.is_none(), "an unbound playback token");
     }
 
@@ -651,6 +811,68 @@ mod tests {
             access_h.lines().any(|l| l.trim() == want),
             "fleet/renderer/src/access.h does not say `{want}`"
         );
+    }
+
+    fn claims_of(url: &str) -> serde_json::Value {
+        let token = url.split_once("?token=").unwrap().1;
+        let payload = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&b64url_decode(payload).unwrap()).unwrap()
+    }
+
+    /// A playback token plays once (`aws:single-use-uuid`, new in every token), names its
+    /// client by a keyed hash (`aws:viewer-id`, never the address, at most 40 characters) and
+    /// expires within IVS's 10-minute limit for such tokens, not an hour later.
+    #[test]
+    fn a_playback_token_is_single_use_names_its_client_and_expires_within_ten_minutes() {
+        let gate = Gate {
+            seats: Seats::new(Some(1)),
+            key: AdmitKey([1; 32]),
+            playback: Some(Playback::Signed(Box::new(
+                PlaybackSigner::new(
+                    "arn:aws:ivs:us-east-1:000000000000:channel/example".into(),
+                    "https://playback.example/x.m3u8".into(),
+                    &test_key_pem(),
+                )
+                .unwrap(),
+            ))),
+            tick: Duration::from_secs(10),
+        };
+        let seat = Admitted::Seat { ticket: "t".into() };
+        let now = Instant::now();
+        let origin = Some("https://stage.example");
+        let token = |client: &str| {
+            let a = gate.message(&seat, "v-1", client, origin, 1_000_000_000, now);
+            let b = a.broadcast.unwrap();
+            (claims_of(&b.value), b.expires_at)
+        };
+        let (a, a_expires) = token("198.51.100.1");
+        let (a2, _) = token("198.51.100.1");
+        let (b, _) = token("2001:db8:1:2::/64");
+        let id = a["aws:viewer-id"].as_str().unwrap();
+        assert!(!id.is_empty() && id.len() <= IVS_VIEWER_ID_MAX, "{id}");
+        assert!(!id.contains("198.51.100"), "the address is not sent to IVS");
+        assert_eq!(
+            a2["aws:viewer-id"], a["aws:viewer-id"],
+            "one client, one id"
+        );
+        assert_ne!(b["aws:viewer-id"], a["aws:viewer-id"]);
+        let uuid = a["aws:single-use-uuid"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(uuid).is_ok(), "{uuid}");
+        assert_ne!(a2["aws:single-use-uuid"], a["aws:single-use-uuid"]);
+        let exp = a["exp"].as_u64().unwrap();
+        assert!(exp > 1_000_000 && exp <= 1_000_000 + 600, "exp {exp}");
+        assert_eq!(a_expires, exp * 1000);
+        // A viewer id IVS would refuse is not signed.
+        let s = PlaybackSigner::new(
+            "a".into(),
+            "https://p.example/x.m3u8".into(),
+            &test_key_pem(),
+        )
+        .unwrap();
+        assert!(s.token(None, "", 1).is_err());
+        assert!(s
+            .token(None, &"x".repeat(IVS_VIEWER_ID_MAX + 1), 1)
+            .is_err());
     }
 
     #[test]

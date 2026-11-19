@@ -6,8 +6,9 @@
 //! reach it through a bounded channel. A client that stops reading until that channel is
 //! full is disconnected.
 //!
-//! Every intent carries the connection's client address (`CF-Connecting-IP` when trusted,
-//! else the peer address), which the per-client limits are keyed by. With a Turnstile
+//! Every intent carries the connection's client key, which the per-client limits count by:
+//! the client address (`CF-Connecting-IP` when trusted, else the peer address), an IPv6
+//! address cut to its /64 ([`client_key`]). With a Turnstile
 //! secret configured, a connection's intents are refused until it has passed `verify`.
 
 use super::admission::{Admitted, Gate};
@@ -38,6 +39,108 @@ const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
 
+/// `/live` sockets one IPv6 /64 may hold open at once. A /64 is one subscriber, and a page
+/// holds one socket (fleet/web wall-client.ts opens the next only after the last has closed);
+/// eight lets one household watch on several devices.
+pub const SOCKETS_PER_IPV6_64: usize = 8;
+/// `/live` sockets one IPv4 address may hold open at once. Mobile carriers and many ISPs put
+/// many subscribers behind one IPv4 address (carrier-grade NAT), so a cap of a household's
+/// size would refuse the next visitor on that carrier outright. A socket costs only memory,
+/// which [`MAX_SOCKETS`] already bounds; 64 still keeps one address to 1.3% of it.
+pub const SOCKETS_PER_IPV4: usize = 64;
+/// `/live` sockets the coordinator holds in all. The coordinator holds about 5,000 of them,
+/// bound by memory at about 160 KB each (docs/fleet/ARCHITECTURE.md, "Past about 5,000
+/// viewers the coordinator needs more"); past that a flood of sockets would take the task's
+/// memory from the viewers already connected.
+pub const MAX_SOCKETS: usize = 5_000;
+/// How long a refused `/live` request is told to wait (`Retry-After`). The page does not read
+/// it: a refused handshake is a failed connect to it, retried with its own backoff.
+pub const FULL_RETRY_AFTER_SECS: u64 = 30;
+
+/// The caps on open `/live` sockets: per client key of each family, and in all.
+#[derive(Debug, Clone, Copy)]
+pub struct SocketCaps {
+    /// Per IPv6 /64, and per any other key (one that is not an IPv4 address).
+    pub per_ipv6_64: usize,
+    /// Per IPv4 address.
+    pub per_ipv4: usize,
+    pub total: usize,
+}
+
+impl SocketCaps {
+    /// The cap for one client key ([`client_key`]).
+    fn per_client(&self, key: &str) -> usize {
+        if key.parse::<std::net::Ipv4Addr>().is_ok() {
+            self.per_ipv4
+        } else {
+            self.per_ipv6_64
+        }
+    }
+}
+
+impl Default for SocketCaps {
+    fn default() -> Self {
+        SocketCaps {
+            per_ipv6_64: SOCKETS_PER_IPV6_64,
+            per_ipv4: SOCKETS_PER_IPV4,
+            total: MAX_SOCKETS,
+        }
+    }
+}
+
+/// The open `/live` sockets: in all and per client key.
+struct Sockets {
+    caps: SocketCaps,
+    open: Mutex<(usize, std::collections::HashMap<String, usize>)>,
+}
+
+/// One open socket's place under the caps, given back when it drops (the socket closed, or the
+/// upgrade never happened).
+struct SocketPermit {
+    sockets: Arc<Sockets>,
+    key: String,
+}
+
+/// Why a socket was refused.
+enum SocketsFull {
+    Client,
+    Total,
+}
+
+impl Sockets {
+    fn take(self: &Arc<Self>, key: &str) -> Result<SocketPermit, SocketsFull> {
+        let mut open = self.open.lock().unwrap();
+        let (total, per) = &mut *open;
+        if *total >= self.caps.total {
+            return Err(SocketsFull::Total);
+        }
+        let n = per.entry(key.to_string()).or_default();
+        if *n >= self.caps.per_client(key) {
+            return Err(SocketsFull::Client);
+        }
+        *n += 1;
+        *total += 1;
+        Ok(SocketPermit {
+            sockets: self.clone(),
+            key: key.to_string(),
+        })
+    }
+}
+
+impl Drop for SocketPermit {
+    fn drop(&mut self) {
+        let mut open = self.sockets.open.lock().unwrap();
+        let (total, per) = &mut *open;
+        *total = total.saturating_sub(1);
+        if let Some(n) = per.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub struct LiveConfig {
     pub checker: Arc<dyn TextChecker>,
     /// Browser origins allowed besides the coordinator's own.
@@ -53,6 +156,8 @@ pub struct LiveConfig {
     pub poster: Arc<Poster>,
     /// Who gets direct streams and who the broadcast, and their tokens.
     pub gate: Arc<Gate>,
+    /// How many `/live` sockets may be open.
+    pub sockets: SocketCaps,
 }
 
 #[derive(Clone)]
@@ -60,9 +165,14 @@ pub struct App {
     pub handle: Handle,
     pub cfg: Arc<LiveConfig>,
     next_viewer: Arc<AtomicU64>,
+    sockets: Arc<Sockets>,
 }
 
 pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
+    let sockets = Arc::new(Sockets {
+        caps: cfg.sockets,
+        open: Mutex::default(),
+    });
     Router::new()
         .route("/live", get(live))
         .route("/agent", get(agent_socket))
@@ -71,6 +181,7 @@ pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
         .with_state(App {
             handle,
             cfg: Arc::new(cfg),
+            sockets,
             next_viewer: Arc::new(AtomicU64::new(1)),
         })
 }
@@ -194,6 +305,28 @@ pub fn client_address(
     peer.ip().to_string()
 }
 
+/// The key every per-client limit counts by: an IPv4 address as it is, an IPv6 address as its
+/// /64 (`2001:db8:1:2::/64`). One subscriber or one cloud instance is commonly given a whole
+/// /64 (RFC 6177 recommends at least a /64 per end site, and an EC2 interface takes its IPv6
+/// addresses from its subnet's /64), so keying by the full address let one client rotate
+/// through 2^64 keys and pass every limit. The Minecraft join guard counts sources the same way
+/// (`agent::joinguard::SOURCE_MASK`). An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, a peer on a
+/// dual-stack listener) is its IPv4 address. Anything that is not an address is kept as given.
+pub fn client_key(address: &str) -> String {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let mut o = v6.octets();
+                o[8..].fill(0);
+                format!("{}/64", std::net::Ipv6Addr::from(o))
+            }
+        },
+        Err(_) => address.to_string(),
+    }
+}
+
 /// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
 /// it forwards names one (`common_name`, the token's client id) and no person (`email`).
 /// The signature is not checked here, so this is trusted only with `--access-viewer-address`:
@@ -235,17 +368,44 @@ async fn live(
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    let client = client_address(
+    let address = client_address(
         &headers,
         peer,
         app.cfg.trust_cf_connecting_ip,
         app.cfg.access_viewer_address,
     );
+    let client = Client {
+        key: client_key(&address),
+        address,
+    };
+    let permit = match app.sockets.take(&client.key) {
+        Ok(p) => p,
+        Err(full) => {
+            let why = match full {
+                SocketsFull::Client => "too many connections from this network",
+                SocketsFull::Total => "the coordinator is full",
+            };
+            tracing::info!(client = %client.key, why, "refusing /live");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, FULL_RETRY_AFTER_SECS.to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                why,
+            )
+                .into_response();
+        }
+    };
     let page = Page {
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
-        .on_upgrade(move |socket| viewer(socket, app, client, page))
+        .on_upgrade(move |socket| async move {
+            // Held for the socket's life; an upgrade that never happens drops it unused.
+            let _permit = permit;
+            viewer(socket, app, client, page).await
+        })
         .into_response()
 }
 
@@ -282,6 +442,13 @@ fn unrecorded_refusal(id: String, reason: &str) -> ServerMsg {
     }
 }
 
+/// Who a connection is: its address, which Turnstile's siteverify is given, and the key every
+/// per-client limit counts by.
+struct Client {
+    address: String,
+    key: String,
+}
+
 /// What the page said about itself when it connected.
 struct Page {
     /// Its origin, which a playback token is bound to.
@@ -307,7 +474,11 @@ pub const LATE_REFUSED: [&str; 4] = [
     "claim_minecraft",
 ];
 
-async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
+async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
+    let Client {
+        address,
+        key: client,
+    } = who;
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
     let (mut sink, mut stream) = socket.split();
     // Tell the viewer who it is before anything else, so it can find its own actions.
@@ -362,11 +533,14 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
         .await;
     // A seat is held from here until the connection ends.
     let gate = app.cfg.gate.clone();
-    let admitted = gate.seats.admit(seat.as_deref(), std::time::Instant::now());
-    let late = admitted == Admitted::Late;
+    let admitted = gate
+        .seats
+        .admit(seat.as_deref(), &client, std::time::Instant::now());
+    let late = admitted.late();
     let admission = gate.message(
         &admitted,
         &viewer,
+        &client,
         page.origin.as_deref(),
         now_ms(),
         std::time::Instant::now(),
@@ -398,6 +572,7 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
         let gate = gate.clone();
         let admitted = admitted.clone();
         let viewer = viewer.clone();
+        let client = client.clone();
         let origin = page.origin.clone();
         let direct = direct.clone();
         tokio::spawn(async move {
@@ -406,11 +581,21 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
             loop {
                 tokio::time::sleep(gate.tick).await;
                 let now = std::time::Instant::now();
-                let free_changed = late && gate.seats.free(now) != last.seat_free;
+                // Only a viewer late for the capacity is told of a free seat: one whose client
+                // holds its seats would be late again after a reload.
+                let free_changed =
+                    admitted == Admitted::Late && gate.seats.free(&client, now) != last.seat_free;
                 if !free_changed && now.duration_since(sent_at) < super::admission::DIRECT_REFRESH {
                     continue;
                 }
-                last = gate.message(&admitted, &viewer, origin.as_deref(), now_ms(), now);
+                last = gate.message(
+                    &admitted,
+                    &viewer,
+                    &client,
+                    origin.as_deref(),
+                    now_ms(),
+                    now,
+                );
                 sent_at = now;
                 if direct
                     .send(ServerMsg::Admission(last.clone()))
@@ -460,6 +645,8 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // When this connection last asked for a fresh playback token.
+    let mut last_playback: Option<std::time::Instant> = None;
     loop {
         let msg = match pending.take() {
             Some(m) => m,
@@ -494,6 +681,30 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
             }),
             // Only a first message carries a seat ticket.
             Ok(ClientMsg::Seat { .. }) => None,
+            // A playback token plays once, so a player that loads again asks for a fresh one.
+            Ok(ClientMsg::Playback {}) => {
+                let now = std::time::Instant::now();
+                if last_playback.is_some_and(|t| {
+                    now.duration_since(t) < super::admission::PLAYBACK_REQUEST_EVERY
+                }) {
+                    Some(ServerMsg::Error {
+                        reason: format!(
+                            "a fresh playback token at most every {} s",
+                            super::admission::PLAYBACK_REQUEST_EVERY.as_secs()
+                        ),
+                    })
+                } else {
+                    last_playback = Some(now);
+                    Some(ServerMsg::Admission(gate.message(
+                        &admitted,
+                        &viewer,
+                        &client,
+                        page.origin.as_deref(),
+                        now_ms(),
+                        now,
+                    )))
+                }
+            }
             Ok(ClientMsg::Visibility { visible }) => {
                 app.handle
                     .send(Event::Visibility {
@@ -505,7 +716,7 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
                 None
             }
             Ok(ClientMsg::Verify { token }) => {
-                let r = app.cfg.verifier.verify(&token, &client).await;
+                let r = app.cfg.verifier.verify(&token, &address).await;
                 let (ok, reason) = match r {
                     Ok(None) => (true, None),
                     Ok(Some(why)) => (false, Some(why)),
@@ -669,14 +880,17 @@ async fn word(
             let sky = app.handle.sky().await;
             let verdict = check_text(app.cfg.checker.as_ref(), &sky, &normalised).await;
             *checking.lock().unwrap() = None;
-            // A check that cannot run degrades the coordinator until one runs again.
-            app.handle
-                .send(Event::Degraded {
-                    at: 0,
-                    component: "text_check".into(),
-                    reason: (verdict.verdict == "error").then(|| verdict.reason.clone()),
-                })
-                .await;
+            // A check that cannot run degrades the coordinator until one runs again. One held
+            // back by the global rate ran nothing and says nothing about the checker.
+            if verdict.reason != super::text_check::CHECK_BUSY {
+                app.handle
+                    .send(Event::Degraded {
+                        at: 0,
+                        component: "text_check".into(),
+                        reason: (verdict.verdict == "error").then(|| verdict.reason.clone()),
+                    })
+                    .await;
+            }
             Some(verdict)
         }
     };
@@ -697,7 +911,22 @@ async fn word(
 
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{client_key, origin_allowed};
+
+    /// One subscriber holds a whole /64, so every address in it shares one key; IPv4 stays
+    /// per address.
+    #[test]
+    fn ipv6_clients_are_keyed_by_their_slash_64() {
+        let a = client_key("2001:db8:1:2::1");
+        assert_eq!(a, "2001:db8:1:2::/64");
+        assert_eq!(client_key("2001:db8:1:2:ffff:ffff:ffff:fffe"), a);
+        assert_eq!(client_key("2001:db8:1:2:abcd::9"), a);
+        assert_ne!(client_key("2001:db8:1:3::1"), a);
+        assert_eq!(client_key("198.51.100.1"), "198.51.100.1");
+        assert_ne!(client_key("198.51.100.2"), client_key("198.51.100.1"));
+        assert_eq!(client_key("::ffff:198.51.100.1"), "198.51.100.1");
+        assert_eq!(client_key("v-3"), "v-3");
+    }
 
     #[test]
     fn only_listed_or_own_origins_pass() {

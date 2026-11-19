@@ -755,6 +755,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
           onFrame={(f) => {
             client.shown = f;
           }}
+          onStaleToken={() => client.requestPlayback()}
         />
       ) : null}
       {view.reel?.show && view.plan.image && areas.mosaic ? (

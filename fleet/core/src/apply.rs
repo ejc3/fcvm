@@ -14,6 +14,22 @@ use std::collections::BTreeMap;
 pub const RECLAIMED_KEEP_MS: u64 = 60_000;
 /// Races counted in the scoreboard's medians.
 pub const SCOREBOARD_RACES: usize = 20;
+/// After any launch of an EC2 tile (a viewer's relaunch, a race, or its launch at a wake), a
+/// viewer's `relaunch` of that tile is refused for this long. A launch takes 81 to 84 s to its
+/// first frame (g4dn.xlarge, fleet/PROTOCOL.md `--ec2-pool`), and a relaunch while it starts
+/// terminates an instance that never drew a frame but is billed its 60 s minimum; 90 s lets
+/// the launch finish first.
+pub const EC2_RELAUNCH_COOLDOWN_MS: u64 = 90_000;
+/// The window of the viewers' EC2 launch budget.
+pub const EC2_LAUNCH_WINDOW_MS: u64 = 600_000;
+/// EC2 instance launches viewers may cause in [`EC2_LAUNCH_WINDOW_MS`], counting a `relaunch`
+/// of an EC2 tile as one and a `restart_now` race as one per EC2 tile. Each launch bills at
+/// least 60 s of an instance that, relaunched again at once, would serve nothing: at the
+/// g4dn.xlarge on-demand price ($0.526 an hour, us-east-1) that is $0.0088, so 40 launches in
+/// 10 minutes bound the waste viewers can cause to about $2.10 an hour. 40 is five races of the default 8 EC2 tiles
+/// (`--ec2-tiles`) in 10 minutes, one every two minutes, or 40 single relaunches. The owner's
+/// scheduled races (`--race-every`) are not counted.
+pub const EC2_LAUNCH_BUDGET: usize = 40;
 
 /// Give `before` the bookkeeping of `after`: state that nobody sees and that a tick moves on
 /// its own (the per-client limits it forgets, the budget's round clock, smoothed fit and
@@ -24,6 +40,7 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
     before.last_word_at = after.last_word_at.clone();
     before.last_light_at = after.last_light_at.clone();
     before.last_relaunch_at = after.last_relaunch_at.clone();
+    before.ec2_viewer_launches = after.ec2_viewer_launches.clone();
     before.last_claim_end = after.last_claim_end.clone();
     before.last_windows_reset_at = after.last_windows_reset_at.clone();
     before.last_windows_reset_all_at = after.last_windows_reset_all_at.clone();
@@ -112,6 +129,39 @@ fn word_rate(state: &State, client: &str, at: u64) -> Result<(), String> {
         state.config.word_interval_ms,
         "word",
     )
+}
+
+/// Refuse `launches` more viewer-caused EC2 launches when they would pass
+/// [`EC2_LAUNCH_BUDGET`] in the window ending at `at`, saying when enough of the budget frees.
+fn ec2_budget(
+    recent: &std::collections::VecDeque<u64>,
+    launches: usize,
+    at: u64,
+) -> Result<(), String> {
+    // More launches than the whole budget never fit, however long the viewer waits
+    // (`--ec2-tiles` refuses such a count; a state from elsewhere could still hold one).
+    if launches > EC2_LAUNCH_BUDGET {
+        return Err(format!(
+            "this fleet has more EC2 tiles ({launches}) than viewers may launch in {} minutes ({EC2_LAUNCH_BUDGET})",
+            EC2_LAUNCH_WINDOW_MS / 60_000
+        ));
+    }
+    let since = at.saturating_sub(EC2_LAUNCH_WINDOW_MS);
+    let in_window: Vec<u64> = recent.iter().copied().filter(|t| *t > since).collect();
+    if in_window.len() + launches <= EC2_LAUNCH_BUDGET {
+        return Ok(());
+    }
+    // The budget frees as the oldest launches leave the window.
+    let must_leave = in_window.len() + launches - EC2_LAUNCH_BUDGET;
+    let free_at = in_window
+        .get(must_leave - 1)
+        .map(|t| t + EC2_LAUNCH_WINDOW_MS)
+        .unwrap_or(at + EC2_LAUNCH_WINDOW_MS);
+    Err(format!(
+        "viewers have used this fleet's EC2 launches for now ({EC2_LAUNCH_BUDGET} in {} minutes); try again in {} s",
+        EC2_LAUNCH_WINDOW_MS / 60_000,
+        free_at.saturating_sub(at).div_ceil(1000)
+    ))
 }
 
 /// Refuse when this client's last committed intent of this kind is less than
@@ -768,9 +818,29 @@ fn intent_effect(
             if slot.claim.is_some() {
                 return Err(format!("{} is a viewer's own GPU right now", slot.id));
             }
+            if half == Half::Ec2 {
+                // Its last launch: a relaunch, or, before the first running report fills
+                // that in, the launch that created the slot.
+                let launched = slot
+                    .last_relaunch
+                    .as_ref()
+                    .map_or(slot.created_at, |rl| rl.clicked_at);
+                if at < launched + EC2_RELAUNCH_COOLDOWN_MS {
+                    return Err(format!(
+                        "{} launched {} s ago; it can be relaunched in {} s",
+                        slot.id,
+                        at.saturating_sub(launched) / 1000,
+                        (launched + EC2_RELAUNCH_COOLDOWN_MS - at).div_ceil(1000)
+                    ));
+                }
+                ec2_budget(&f.ec2_viewer_launches, 1, at)?;
+            }
             bump(slot, &by, at);
             let summary = format!("relaunch {}", slot.id);
             f.last_relaunch_at.insert(c.client.to_string(), at);
+            if half == Half::Ec2 {
+                f.ec2_viewer_launches.push_back(at);
+            }
             Ok(summary)
         }
         Intent::Wake => {
@@ -792,6 +862,15 @@ fn intent_effect(
                     "restart is cooling down for another {} s",
                     (until - at).div_ceil(1000)
                 ));
+            }
+            // Every EC2 tile races (`start_race`), each with a launch.
+            let ec2 = state.fleet.ec2.len();
+            if ec2 > 0 {
+                ec2_budget(&state.fleet.ec2_viewer_launches, ec2, at)?;
+                state
+                    .fleet
+                    .ec2_viewer_launches
+                    .extend(std::iter::repeat_n(at, ec2));
             }
             let id = start_race(state, &by, at);
             Ok(format!("race {id}"))
@@ -1370,6 +1449,13 @@ fn tick(state: &mut State, at: u64) {
     keep(&mut f.last_word_at, state.config.word_interval_ms);
     keep(&mut f.last_light_at, state.config.light_interval_ms);
     keep(&mut f.last_relaunch_at, state.config.relaunch_interval_ms);
+    while f
+        .ec2_viewer_launches
+        .front()
+        .is_some_and(|t| t + EC2_LAUNCH_WINDOW_MS <= at)
+    {
+        f.ec2_viewer_launches.pop_front();
+    }
     keep(
         &mut f.last_claim_end,
         state.config.claim_cooldown_secs * 1000,

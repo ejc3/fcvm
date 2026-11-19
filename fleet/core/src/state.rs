@@ -652,6 +652,11 @@ pub struct Fleet {
     pub last_word_at: BTreeMap<String, u64>,
     pub last_light_at: BTreeMap<String, u64>,
     pub last_relaunch_at: BTreeMap<String, u64>,
+    /// When each EC2 instance launch a viewer asked for was committed (a `relaunch` of an EC2
+    /// tile, and one per EC2 tile of a `restart_now` race), oldest first, for the last
+    /// `apply::EC2_LAUNCH_WINDOW_MS`.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub ec2_viewer_launches: VecDeque<u64>,
     pub last_claim_end: BTreeMap<String, u64>,
     /// System words placed so far: which line comes next, and in which style.
     #[serde(default)]
@@ -839,6 +844,7 @@ impl State {
                 last_word_at: BTreeMap::new(),
                 last_light_at: BTreeMap::new(),
                 last_relaunch_at: BTreeMap::new(),
+                ec2_viewer_launches: VecDeque::new(),
                 last_claim_end: BTreeMap::new(),
                 history_count: 0,
                 history_ready_at: None,

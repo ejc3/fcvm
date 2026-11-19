@@ -43,7 +43,7 @@ key when intents need a `verify` first (`null` when they do not).
 ```json
 {"type": "admission", "seat": "<ticket>", "locked": false, "reason": null,
  "direct": {"value": "v1.1761135000.v-17.<mac>", "expires_at": 1761135000000},
- "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761138000000},
+ "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761134760000},
  "seat_free": false, "capacity": 500}
 ```
 
@@ -51,10 +51,17 @@ Second on every connection, then again every 5 minutes with fresh tokens, and to
 viewer whenever `seat_free` changes (docs/fleet/ARCHITECTURE.md, "Broadcast mode"). A
 connection admitted while fewer than `capacity` seats are held gets a `seat` ticket and a
 `direct` token, which every frame socket it opens sends as its first message
-(`{"admit": "<value>"}`, renderer `GET /frames`); one admitted
+(`{"admit": "<value>"}`, renderer `GET /frames`); the renderers and aggregators require it
+with or without a broadcast (without one every connection is seated); one admitted
 with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
-reload; a late connection is never promoted). A page sends `{"type": "seat", "ticket":
+reload; a late connection is never promoted). One client (as counted for the limits below)
+holds at most 2 seats: its further connections are admitted like late ones, with `reason`
+"Your network already has 2 direct streams open, so this page watches the broadcast." and
+`seat_free` always false, since a reload would not seat them while its seats are held. The
+limit is checked before the capacity, and a late connection's `seat_free` is true only when a
+seat is free and its client holds fewer than 2. This
+applies only while `capacity` is set (there is a broadcast to watch). A page sends `{"type": "seat", "ticket":
 "<ticket>", "returning": false}` (`null` without one) as its first message, so one that reconnects keeps its seat
 if the ticket's connection closed less than 60 s before. `returning` is true when the page
 had a connection open before (a reconnect, also of a late page, which keeps no ticket). A
@@ -62,8 +69,15 @@ first message with a ticket or `returning` true is a reconnect, not an arrival
 (`fleet.power`); the viewer joins once the first message is read. The coordinator waits up to 2 s for
 that first message; any other first message is admitted without a ticket and handled as
 usual. A ticket is never read from the URL, which proxies and access logs keep. `broadcast` is the playback URL (signed for a private channel, bound to the page's
-`Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
-connection that sent no `Origin`; `capacity` is null when every viewer is seated (no broadcast).
+`Origin`), null without a broadcast or, on a private channel, for a
+connection that sent no `Origin`. A private channel's token starts one playback: it carries
+`aws:single-use-uuid` (a new UUID in every token, so IVS refuses it once it has fetched the
+playlist), `aws:viewer-id` (a 32-character HMAC of the client key with the coordinator's
+admission key, never the address, so one client's sessions can be revoked together), and an
+`exp` 6 minutes ahead (IVS allows at most 10 with either claim; IVS checks it only when playback
+starts, and the page always holds a token under 5 minutes old). A page whose player must load
+again with a token it has used sends `{"type": "playback"}` and gets a fresh `admission` (at
+most one every 2 s per connection; sooner is answered with an `error`); `capacity` is null when every viewer is seated (no broadcast).
 `claim_gpu` from a late connection is refused unrecorded (`version: 0`).
 
 ```json
@@ -137,7 +151,10 @@ A message the coordinator could not read; nothing was applied.
 {"type": "visibility", "visible": false}
 {"type": "intent", "id": "<client uuid>", "name": "nudge", "args": {"target": "coast"}}
 {"type": "ping", "client_unix_ms": 1761134400100.5}
+{"type": "playback"}
 ```
+
+`playback` asks for a fresh `admission` (a new single-use playback token, see `admission`).
 
 `visibility` says whether the page is visible. A connection counts as an active viewer
 until it reports `visible: false` (the page sends that when its tab has been hidden long
@@ -152,8 +169,8 @@ Intents:
 
 | name | args | effect |
 |------|------|--------|
-| `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`) |
-| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s |
+| `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`), and when its EC2 launches (one per EC2 tile) would pass the viewers' EC2 launch budget (below) |
+| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s; for an EC2 tile also within 90 s of that tile's last launch (anyone's relaunch, a race, or its launch at a wake) and past the viewers' EC2 launch budget (below) |
 | `nudge` | `{"target": "<viewpoint>"}` | a vote in the open vote (below), among `nudges.targets`; one vote per client, the latest counts; a pick of the hold just decided (`nudges.next`) is accepted and changes nothing; refused only for a target not offered |
 | `word` | `{"text": "hello", "text_style": "skywriting"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below). `text_style` is how the renderer draws it (#1178): `lockup` (when absent or null), `skywriting` or `landmark`; anything else is refused before the text check |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
@@ -192,7 +209,10 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 with one service token, and its subrequests all arrive with the Worker's own
 `CF-Connecting-IP`. The coordinator does not verify that JWT itself, so the switch belongs
 only behind a tunnel connector that requires Access (`access.required`), which does.
-Reconnecting does not reset a limit.
+An IPv6 address counts as its /64: every address of `2001:db8:1:2::/64` is one client, since one
+subscriber or instance is usually given a whole /64. An IPv4 address counts on its own, and an
+IPv4-mapped IPv6 address as its IPv4 address. Turnstile's siteverify still gets the full
+address. Reconnecting does not reset a limit.
 
 **Races.** A race relaunches every tile at once and times both halves by the
 coordinator's clock. The owner sets the cadence (`--race-every <secs>`); `race.next_race_at`
@@ -200,6 +220,20 @@ says when the next one starts. Any race starts a global cooldown (`--restart-coo
 default 60 s) during which `restart_now` is refused for everyone; `restart_now` then
 starts one at once and the schedule restarts from it. Tiles on a draining host and GPUs
 lent to a visitor sit the race out.
+
+**EC2 launches.** Every relaunch of an EC2 tile launches an instance, so viewers' relaunches
+of EC2 tiles are bounded. An EC2 tile is not relaunched by a viewer within 90 s of its last
+launch (a relaunch, a race, or its launch at a wake, also one that has not reported running
+yet): a launch takes 81 to 84 s to its first frame (`--ec2-pool` below), and a relaunch while
+it comes up throws away an instance that is billed its 60 s minimum and drew nothing.
+The receipt says `ec2-1 launched 1 s ago; it can be relaunched in 89 s`. Across the
+fleet, viewers may cause 40 EC2 launches in any 10 minutes, a `relaunch` of an EC2 tile counting
+one and a `restart_now` race one per EC2 tile (five races of 8 EC2 tiles, or 40 relaunches).
+Past it both are refused with `viewers have used this fleet's EC2 launches for now (40 in 10
+minutes); try again in <n> s`. At the g4dn.xlarge on-demand price ($0.526 an hour, us-east-1)
+a launch that serves nothing costs at least $0.0088, so the budget bounds that waste to about
+$2.10 an hour. The owner's scheduled races (`--race-every`) are not counted. A whole race
+must fit the budget, so `--ec2-tiles` above 40 is refused when the coordinator starts.
 
 **The directed camera.** The coordinator flies the wall's camera along a program generated
 from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
@@ -245,7 +279,13 @@ Only an explicit allow commits the word; a refusal, an error, a timeout (5 s) or
 coordinator started without a text check (`--text-check none`) refuses it. An error's
 reason, in the receipt, its `check` and `actions`, is one of two fixed sentences, "words are
 turned off right now" (`--text-check none`) or "couldn't check that word, try again"
-(anything else); what went wrong is in the coordinator's log. A word checked
+(anything else); what went wrong is in the coordinator's log. Across every viewer the
+coordinator sends at most 10 checks at once and one a second after that (a token bucket:
+about 400 input and 64 output tokens a check bound a flood's cost to about $2.60 an hour at
+Claude Haiku 4.5's list price); a word past it is refused with the error "too many words are
+being checked right now, try again in a few seconds", which does not mark the coordinator
+degraded. An allow or refuse verdict is kept for 10 minutes (at most 1024) by the sky and the
+text, so the same text against the same sky is answered from it without a check. A word checked
 against a sky that changed meanwhile is refused (send it again). A check that cannot run
 marks the coordinator degraded (`failures`) until one runs again. The scene keeps the
 latest 16 words. A refused word's text appears nowhere: not in the scene, not in
@@ -754,7 +794,9 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
-  rotation. It has no authentication: keep it on loopback or a private network.
+  rotation. It has no authentication, so the coordinator refuses to start when the address
+  (or any address a name resolves to) is not loopback (127.0.0.0/8 or `::1`); reach it from
+  elsewhere through an SSH tunnel or `ecs execute-command`.
 
 - `--agent-cmd` starts an agent as a child process and talks to it over its stdin and
   stdout: `fcvm fleet agent --stdio ...` locally, `ssh <host> fcvm fleet agent --stdio ...`
@@ -776,6 +818,14 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
 - `/live` refuses a cross-origin browser with `403`: a request whose `Origin` is neither
   the coordinator's own (`Origin` naming the request's `Host`) nor one given with
   `--allowed-origin`. A request without `Origin` (not a browser) is served.
+- `/live` refuses a socket with `503` (`Retry-After: 30`, body `too many connections from this
+  network` or `the coordinator is full`) while its client holds 8 open sockets if it is an
+  IPv6 /64 (one subscriber) or 64 if it is an IPv4 address (carrier-grade NAT puts many
+  subscribers behind one), or the coordinator holds 5,000 in all (about its memory's worth at
+  about 160 KB a socket, docs/fleet/ARCHITECTURE.md), which is what bounds memory. A page
+  holds one. The
+  page does not read the status: a browser's WebSocket reports a refused handshake as a failed
+  connection, so the page shows the connection as closed and tries again with its usual backoff.
 - SIGTERM or SIGINT stops the coordinator after it has written the last state to
   `--state-file`; its agents' commands then end, and their VMs with them.
 
@@ -2028,7 +2078,7 @@ grants. The body is at most 1 MiB.
 
 `Authorization: Bearer <scene token>` is required on a fleet renderer ("Access").
 `admit_keys` (optional): the coordinator's admission keys, hex, newest first, at
-most 4 (see `GET /frames`). The coordinator sends them only when it runs a
+most 4 (see `GET /frames`). The coordinator always sends them, with or without a
 broadcast; they never appear in a browser's snapshot.
 
 | field | meaning | accepted |

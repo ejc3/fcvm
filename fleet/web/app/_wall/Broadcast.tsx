@@ -6,12 +6,20 @@
 // the frame on screen and draws the overlay for that moment (core/broadcast.ts).
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { FrameMatcher, memoUntilFailure, type ShownFrame } from "../../core/index.ts";
+import { FrameMatcher, memoUntilFailure, tokenUsed, type ShownFrame } from "../../core/index.ts";
 
 /** The IVS web player, pinned. */
 export const IVS_PLAYER_URL = "https://player.live-video.net/1.57.0/amazon-ivs-player.min.js";
 /** After an error or the end of the stream, the player is loaded again this much later. */
 const RETRY_MS = 3000;
+
+/**
+ * The signed URL the player last loaded, across mounts. A private channel's token plays once
+ * (`aws:single-use-uuid`), so a load with that URL again would be refused: the player asks the
+ * coordinator for a fresh one (`onStaleToken`) and loads when it arrives. An open channel's URL
+ * carries no token and is loaded again as it is.
+ */
+let lastLoaded: string | null = null;
 
 interface IvsPlayer {
   attachHTMLVideoElement(v: HTMLVideoElement): void;
@@ -110,8 +118,11 @@ export function Broadcast({
   box,
   zoom,
   onFrame,
+  onStaleToken,
 }: {
   url: string;
+  /** The URL's token was used: ask the coordinator for a fresh admission. */
+  onStaleToken: () => void;
   /** The page's Pause: the picture stops (the player holds its frame). */
   paused: boolean;
   /** Where the image goes, relative to the stage. */
@@ -126,6 +137,10 @@ export function Broadcast({
   urlRef.current = url;
   const onFrameRef = useRef(onFrame);
   onFrameRef.current = onFrame;
+  const onStaleRef = useRef(onStaleToken);
+  onStaleRef.current = onStaleToken;
+  // Waiting for a fresh token before loading.
+  const waitingRef = useRef(false);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const playerRef = useRef<IvsPlayer | null>(null);
@@ -135,6 +150,15 @@ export function Broadcast({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    if (tokenUsed(urlRef.current, lastLoaded)) {
+      // Load once a fresh URL arrives (the effect on `url` below); ask again until it does.
+      waitingRef.current = true;
+      setStatus("reconnecting");
+      onStaleRef.current();
+      const ask = setInterval(() => onStaleRef.current(), RETRY_MS);
+      return () => clearInterval(ask);
+    }
+    waitingRef.current = false;
     let gone = false;
     let player: IvsPlayer | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
@@ -175,6 +199,7 @@ export function Broadcast({
           if (!("requestVideoFrameCallback" in video)) onFrameRef.current({ ...f, at: performance.timeOrigin + performance.now() });
         });
         if ("requestVideoFrameCallback" in video) callback = video.requestVideoFrameCallback(onPresented);
+        lastLoaded = urlRef.current;
         p.load(urlRef.current);
         if (!pausedRef.current) p.play();
       })
@@ -187,6 +212,11 @@ export function Broadcast({
       playerRef.current = null;
     };
   }, [attempt]);
+
+  // A fresh URL while waiting for one: load now.
+  useEffect(() => {
+    if (waitingRef.current && !tokenUsed(url, lastLoaded)) setAttempt((a) => a + 1);
+  }, [url]);
 
   // The page's Pause and Resume.
   useEffect(() => {

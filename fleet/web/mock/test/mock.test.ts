@@ -855,6 +855,27 @@ describe("mock phones", () => {
     }
   });
 
+  it("answers playback with a signed URL carrying a new token, and an open URL as it is", async () => {
+    await settle();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8?token=first", late: false });
+    const v = await live();
+    try {
+      const url = (m: Record<string, unknown>) => (m["broadcast"] as { value: string } | null)?.value;
+      const first = url(await v.next((m) => m["type"] === "admission"));
+      expect(first).toMatch(/^https:\/\/broadcast\.example\/playback\.m3u8\?token=/);
+      v.ws.send(JSON.stringify({ type: "playback" }));
+      const fresh = url(await v.next((m) => m["type"] === "admission" && url(m) !== first));
+      expect(fresh).toMatch(/^https:\/\/broadcast\.example\/playback\.m3u8\?token=/);
+      expect(fresh).not.toBe(first);
+      await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: false });
+      v.ws.send(JSON.stringify({ type: "playback" }));
+      expect(url(await v.next((m) => m["type"] === "admission" && !url(m)?.includes("token=")))).toBe("https://broadcast.example/playback.m3u8");
+    } finally {
+      v.ws.close();
+      await admin("/mock/broadcast", { url: null });
+    }
+  });
+
   it("takes only the enumerated actions, from the holder, one a second", async () => {
     await settle();
     const a = await live();

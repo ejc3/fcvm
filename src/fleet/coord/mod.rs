@@ -42,6 +42,7 @@ use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -167,17 +168,14 @@ pub struct Actor {
     clock: Box<dyn Fn() -> u64 + Send>,
 }
 
-/// The keys the coordinator hands out at start: the direct-stream keys (only with a broadcast,
-/// whose seats they enforce) and the GPU mirror's (always: the mirror is the holder's alone).
-pub fn admission_keys(broadcast: bool, key_hex: String) -> (Vec<String>, Vec<String>) {
-    (
-        if broadcast {
-            vec![key_hex.clone()]
-        } else {
-            Vec::new()
-        },
-        vec![key_hex],
-    )
+/// The keys the coordinator hands out at start: the direct-stream keys and the GPU mirror's.
+/// Both always, with or without a broadcast: every viewer the coordinator admits gets a direct
+/// token, so a renderer, aggregator, phone or server that checks one turns away only a client
+/// that never came through `/live` (and its per-client limits). Without a broadcast every
+/// connection is seated, so checking costs no viewer its picture.
+pub fn admission_keys(gate: &admission::Gate) -> (Vec<String>, Vec<String>) {
+    let key = gate.key.hex();
+    (vec![key.clone()], vec![key])
 }
 
 pub fn snapshot_of(state: &State) -> Arc<Snapshot> {
@@ -1037,7 +1035,33 @@ pub fn power_managed(args: &FleetCoordArgs) -> bool {
     !args.host_templates.is_empty() || args.sleep_when_idle
 }
 
+/// The addresses `--admin-listen` binds: every address it names must be loopback. The endpoint
+/// has no authentication (`POST /quarantine/release` returns a GPU to rotation), so on any
+/// other address, a private network included, anyone who reaches it could undo a quarantine.
+/// A name is resolved, and refused when any of its addresses is not loopback.
+pub async fn admin_addresses(addr: &str) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("--admin-listen {addr} is not an address and port"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("--admin-listen {addr} names no address");
+    }
+    if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
+        bail!(
+            "--admin-listen {addr} reaches {a}, which is not loopback: the admin endpoint has \
+             no authentication, so it binds only 127.0.0.0/8 or ::1"
+        );
+    }
+    Ok(addrs)
+}
+
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    // Before anything starts: a refused admin address stops the coordinator at once.
+    let admin_addrs = match &args.admin_listen {
+        Some(a) => Some(admin_addresses(a).await?),
+        None => None,
+    };
     if args.ec2_aggregate_listen.is_some()
         && args.ec2_aggregate_url.is_none()
         && !args.ec2_aggregate_tls
@@ -1092,7 +1116,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             let region = args
                 .text_check_region
                 .context("--text-check bedrock needs --text-check-region")?;
-            Arc::new(text_check::Bedrock::new(region, model)?)
+            Arc::new(text_check::Guarded::new(Arc::new(
+                text_check::Bedrock::new(region, model)?,
+            )))
         }
     };
     let (state, store_tx) = match &args.state_file {
@@ -1354,10 +1380,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    if let Some(addr) = &args.admin_listen {
-        let admin = tokio::net::TcpListener::bind(addr)
+    if let Some(addrs) = &admin_addrs {
+        // The checked addresses, not the name again: a second lookup could answer otherwise.
+        let admin = tokio::net::TcpListener::bind(&addrs[..])
             .await
-            .with_context(|| format!("listening on {addr}"))?;
+            .with_context(|| format!("listening on {addrs:?}"))?;
         eprintln!("fleet coordinator admin on {}", admin.local_addr()?);
         let h = handle.clone();
         tokio::spawn(async move {
@@ -1388,10 +1415,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         decoder,
         encoder,
     ));
-    // With a broadcast, direct streams are for seated viewers only: renderers and aggregators
-    // check the direct token made with this key. Without one, nothing is checked. The GPU
-    // mirror is checked either way: only a phone's holder receives it.
-    let (admit, mirror) = admission_keys(gate.seats.capacity().is_some(), gate.key.hex());
+    // Direct streams are for viewers the coordinator admitted: renderers and aggregators check
+    // the direct token made with this key, with or without a broadcast. The GPU mirror is
+    // checked too: only a phone's holder receives it.
+    let (admit, mirror) = admission_keys(&gate);
     handle.set_admit_keys(admit).await;
     handle.set_mirror_keys(mirror).await;
     let cfg = live::LiveConfig {
@@ -1403,6 +1430,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         turnstile_site_key: args.turnstile_site_key,
         poster,
         gate: Arc::new(gate),
+        sockets: live::SocketCaps::default(),
     };
     tokio::select! {
         r = live::serve(listener, handle.clone(), cfg) => r?,
@@ -1460,6 +1488,33 @@ mod power_tests {
         ])));
     }
 
+    /// A race launches every EC2 tile, so more EC2 tiles than the viewers' launch budget would
+    /// leave `restart_now` refused for ever: such a count is refused when the coordinator starts.
+    #[test]
+    fn the_ec2_tile_count_fits_the_launch_budget() {
+        let budget = fleet_core::apply::EC2_LAUNCH_BUDGET;
+        assert_eq!(coord(&[]).ec2_tiles, 8);
+        assert_eq!(
+            coord(&["--ec2-tiles", &budget.to_string()]).ec2_tiles,
+            budget
+        );
+        let over = (budget + 1).to_string();
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--ec2-tiles",
+            &over,
+        ];
+        let e = match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("--ec2-tiles {over} was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("no race could ever start"), "{e}");
+    }
+
     #[test]
     fn the_on_demand_host_cap_is_at_most_eight() {
         assert_eq!(coord(&[]).host_on_demand_max, 8);
@@ -1503,5 +1558,57 @@ mod zone_order_tests {
             zone < first_send,
             "dispatch_agents sends an output before it updates the zone"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_key_tests {
+    use super::{admission, admission_keys};
+
+    /// Every coordinator hands its key to the renderers and aggregators, so a direct stream
+    /// needs a token from `/live` also without a broadcast; before, a fleet without one checked
+    /// nothing and any client could open frame streams past every `/live` limit.
+    #[test]
+    fn direct_streams_are_checked_with_or_without_a_broadcast() {
+        let open = admission::Gate::open();
+        assert_eq!(open.seats.capacity(), None, "no broadcast");
+        let (admit, mirror) = admission_keys(&open);
+        assert_eq!(admit, vec![open.key.hex()]);
+        assert_eq!(mirror, vec![open.key.hex()]);
+        let mut broadcast = admission::Gate::open();
+        broadcast.seats = admission::Seats::new(Some(500));
+        assert_eq!(admission_keys(&broadcast).0, vec![broadcast.key.hex()]);
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::admin_addresses;
+
+    /// The admin endpoint has no authentication, so it binds loopback only; any other address
+    /// stops the coordinator before it starts.
+    #[tokio::test]
+    async fn the_admin_endpoint_binds_only_loopback() {
+        for ok in ["127.0.0.1:9000", "[::1]:9000", "127.0.0.2:0"] {
+            let a = admin_addresses(ok)
+                .await
+                .unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+            assert!(a.iter().all(|a| a.ip().is_loopback()), "{ok}: {a:?}");
+        }
+        for refused in [
+            "0.0.0.0:9000",
+            "[::]:9000",
+            "10.0.0.5:9000",
+            "192.0.2.1:9000",
+            "[2001:db8::1]:9000",
+            "[::ffff:127.0.0.1]:9000",
+        ] {
+            let e = admin_addresses(refused)
+                .await
+                .expect_err(refused)
+                .to_string();
+            assert!(e.contains("not loopback"), "{refused}: {e}");
+        }
+        assert!(admin_addresses("no-port").await.is_err());
     }
 }

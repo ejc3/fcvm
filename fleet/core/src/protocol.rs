@@ -42,6 +42,10 @@ pub enum ClientMsg {
         #[serde(default)]
         returning: bool,
     },
+    /// The page's broadcast player needs a playback token it has not used: a playback token is
+    /// single use, so a player that loads again (after an error, or a switch back to the
+    /// broadcast) asks for a fresh `admission`.
+    Playback {},
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
