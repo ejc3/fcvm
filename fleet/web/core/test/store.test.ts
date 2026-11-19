@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseServerMsg, ProtocolError } from "../protocol.ts";
-import { CLAIM_DROPPED, HIDDEN_PAUSE_MS, initialState, intentsToResend, makeIntent, reduce, cameraTargets, streamsSuspended, type ClientState } from "../store.ts";
+import { HIDDEN_PAUSE_MS, initialState, intentsToResend, makeIntent, reduce, cameraTargets, streamsSuspended, type ClientState } from "../store.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 import { wallView } from "../view.ts";
 
@@ -204,68 +204,6 @@ describe("a viewer's own GPU across a reconnect", () => {
     expect(s.own.claim?.phase).toBe("ended");
     expect(s.own.claim?.frame_url).toBeNull();
     expect(s.own.claim?.ended).toBeTruthy();
-  });
-
-  const withToken = (phase: string) =>
-    JSON.stringify({ type: "claim", claim: { ...JSON.parse(running).claim, phase, token: "token-a" } });
-
-  it("presents the claim's token on the new connection, and a coordinator that carried the claim over gives it back", () => {
-    let s = feed(initialState(), snapshotText(1, fleet()));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
-    s = feed(s, withToken("running"));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }), EPOCH + 10_000);
-    // Shown as coming back, with no frames, until the coordinator answers.
-    expect(s.own.claim?.phase).toBe("restoring");
-    expect(s.own.claim?.frame_url).toBeNull();
-    expect(s.own.resume).toBe("token-a");
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("r1", "resume_claim", { token: "token-a" }), at: EPOCH + 10_100 });
-    expect([s.own.resume, s.own.resumeId]).toEqual([null, "r1"]);
-    // Another drop before the answer (the coordinator may have stored r1 and restarted again,
-    // leaving the claim waiting for a viewer): the new connection presents the token under a
-    // new intent id, and r1 is not sent again, since a repeated id gets its first receipt
-    // without binding the claim to this connection.
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2" }), EPOCH + 10_200);
-    expect([s.own.resume, s.own.resumeId]).toEqual(["token-a", null]);
-    expect(intentsToResend(s).map((i) => i.id)).not.toContain("r1");
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("r2", "resume_claim", { token: "token-a" }), at: EPOCH + 10_300 });
-    expect(s.own.resumeId).toBe("r2");
-    s = feed(s, JSON.stringify({ type: "receipt", id: "r2", outcome: "committed", version: 9 }), EPOCH + 11_000);
-    expect(s.own.resumeId).toBeNull();
-    s = feed(s, withToken("running"), EPOCH + 12_000);
-    expect(s.own.claim?.phase).toBe("running");
-    expect(s.own.claim?.frame_url).toBe("ws://example-host:2/frames/claim-1");
-  });
-
-  it("drops a resume still waiting for the Turnstile check when the viewer closes the claim", () => {
-    let s = feed(initialState(), snapshotText(1, fleet()));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
-    s = feed(s, withToken("running"));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2", turnstile: "site-key" }), EPOCH + 10_000);
-    s = reduce(s, { type: "queue", action: { name: "resume_claim", args: { token: "token-a" } } });
-    s = reduce(s, { type: "queue", action: { name: "light", args: {} } });
-    s = reduce(s, { type: "own-closed" });
-    // Sent once verified, the resume would take back the GPU the viewer gave up.
-    expect(s.turnstile.queued.map((q) => q.name)).toEqual(["light"]);
-    expect(s.own.claim).toBeNull();
-  });
-
-  it("ends the claim when the coordinator refuses the resume: it ended with the old connection", () => {
-    let s = feed(initialState(), snapshotText(1, fleet()));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
-    s = feed(s, withToken("running"));
-    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2" }), EPOCH + 10_000);
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("r1", "resume_claim", { token: "token-a" }), at: EPOCH + 10_100 });
-    s = feed(
-      s,
-      JSON.stringify({ type: "receipt", id: "r1", outcome: "refused", reason: "no claim waits for that token: it ended, or the coordinator did not restart", version: 9 }),
-      EPOCH + 10_500,
-    );
-    expect(s.own.claim?.phase).toBe("ended");
-    expect(s.own.claim?.ended).toBe(CLAIM_DROPPED);
-    expect(s.own.resumeId).toBeNull();
   });
 });
 

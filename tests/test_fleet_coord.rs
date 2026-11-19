@@ -4874,48 +4874,29 @@ async fn coord_process(state: &std::path::Path) -> CoordProcess {
     }
 }
 
-/// An agent on the coordinator's `/agent` socket with two GPUs: with one tile on the wall, the
-/// second is the standby GPU a claim takes.
-async fn dial_agent(live: &str) -> Ws {
-    let (mut ws, _) = tokio_tungstenite::connect_async(live.replace("/live", "/agent").as_str())
-        .await
-        .unwrap();
-    let hello = json!({"type": "hello", "host": "gpu-a", "arch": "x86_64", "capacity": 2,
-        "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"},
-                 {"sbdf": "0000:02:00.0", "name": "Tesla T4"}]});
-    ws.send(Message::Text(hello.to_string().into()))
-        .await
-        .unwrap();
-    ws
-}
-
 /// The owner's rule: a change the coordinator acknowledged survives the coordinator dying.
-/// A viewer drops a light, votes for the next stop and claims a GPU, and is answered for each;
-/// the process is then stopped with `signal` the moment the last answer arrives (SIGKILL: no
-/// shutdown runs at all). A new process on the same state file holds all of it: each intent
-/// sent again gets its first receipt, the light and the vote are in the snapshot, and the
-/// page that held the claim takes it back with its token.
+/// A viewer drops a light and votes for the next stop, and is answered for each; the process
+/// is then stopped with `signal` the moment the last answer arrives (SIGKILL: no shutdown runs
+/// at all). A new process on the same state file holds both: each intent sent again gets its
+/// first receipt, and the light and the vote are in the snapshot.
 async fn acknowledged_state_survives(signal: nix::sys::signal::Signal) {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("fleet.json");
     let mut first = coord_process(&state).await;
-    let _agent = dial_agent(&first.url).await;
     let mut v = Viewer::connect(&first.url).await;
-    let s = v.until(|s| s["fleet"]["n"] == 1).await;
+    let s = v.until(|s| !s["nudges"]["targets"][0].is_null()).await;
     let target = s["nudges"]["targets"][0]["id"]
         .as_str()
         .unwrap()
         .to_string();
     v.intent("l-0", "light", light(3.0)).await;
     v.intent("n-0", "nudge", json!({"target": target})).await;
-    v.intent("c-0", "claim_gpu", json!({})).await;
     let mut versions = BTreeMap::new();
-    for id in ["l-0", "n-0", "c-0"] {
+    for id in ["l-0", "n-0"] {
         let r = v.receipt(id).await;
         assert_eq!(r["outcome"], "committed", "{r}");
         versions.insert(id, r["version"].as_u64().unwrap());
     }
-    let claim = v.message("claim").await["claim"].clone();
     let pid = nix::unistd::Pid::from_raw(first.child.id().unwrap() as i32);
     nix::sys::signal::kill(pid, signal).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(30), first.child.wait())
@@ -4946,22 +4927,11 @@ async fn acknowledged_state_survives(signal: nix::sys::signal::Signal) {
     // Each intent sent again: its first receipt, from the stored state.
     w.intent("l-0", "light", light(3.0)).await;
     w.intent("n-0", "nudge", json!({"target": target})).await;
-    w.intent("c-0", "claim_gpu", json!({})).await;
     for (id, version) in &versions {
         let r = w.receipt(id).await;
         assert_eq!(r["outcome"], "committed", "{r}");
         assert_eq!(r["version"].as_u64(), Some(*version), "{id}: {r}");
     }
-    // The page that held the claim reconnects and takes it back with its token.
-    let mut page = Viewer::connect(&second.url).await;
-    page.intent("r-0", "resume_claim", json!({"token": claim["token"]}))
-        .await;
-    let r = page.receipt("r-0").await;
-    assert_eq!(r["outcome"], "committed", "{r}");
-    let back = page.message("claim").await["claim"].clone();
-    assert_eq!(back["id"], claim["id"]);
-    assert_eq!(back["token"], claim["token"]);
-    assert_eq!(back["expires_at"], claim["expires_at"]);
 }
 
 #[tokio::test]

@@ -776,9 +776,6 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     None
                 } else {
                     let claim = name == "claim_gpu";
-                    // A page taking back its claim after a restart is told about it as a new
-                    // claim is.
-                    let tells = claim || name == "resume_claim";
                     let r = app
                         .handle
                         .submit(Event::Intent {
@@ -805,7 +802,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                                 break;
                             }
                         } else if receipts
-                            .try_send((ServerMsg::receipt(&r), stored, tells))
+                            .try_send((ServerMsg::receipt(&r), stored, claim))
                             .is_err()
                         {
                             tracing::info!(%viewer, "viewer is not reading its receipts; closing");

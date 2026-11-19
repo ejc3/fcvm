@@ -180,14 +180,6 @@ export interface OwnGpu {
   /** A claim to release: it arrived for the abandoned request. The client sends release_gpu, then "own-released". */
   release: string | null;
   /**
-   * The token of the claim held when the connection dropped, to present on the new one
-   * (`resume_claim`): a coordinator that restarted carried the claim over and gives it back;
-   * otherwise it ended with the old connection and the resume is refused. Cleared once sent.
-   */
-  resume: string | null;
-  /** The resume_claim intent's id, while its receipt is awaited. */
-  resumeId: string | null;
-  /**
    * The autopilot as the viewer last set it (the pause button, or a drag that takes the
    * camera), shown until a claim message agrees or the intent is refused.
    */
@@ -270,9 +262,7 @@ const WATCHES_KEPT = 32;
 /** GPU readings kept per tile: two minutes at the coordinator's two-second cadence. */
 export const GPU_HISTORY = 60;
 
-const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refused: null, abandoned: null, release: null, resume: null, resumeId: null, autopilot: null };
-/** What the page says when its claim did not survive the dropped connection. */
-export const CLAIM_DROPPED = "The connection dropped, so the GPU went back to the pool.";
+const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refused: null, abandoned: null, release: null, autopilot: null };
 
 /**
  * Whether the viewer's own camera is on autopilot: what the viewer last asked for until
@@ -400,11 +390,9 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       const own =
         e.intent.name === "claim_gpu"
           ? { ...NO_OWN, requestId: e.intent.id, requestedAt: e.at }
-          : e.intent.name === "resume_claim"
-            ? { ...s.own, resume: null, resumeId: e.intent.id }
-            : on !== null
-              ? { ...s.own, autopilot: { id: e.intent.id, on } }
-              : s.own;
+          : on !== null
+            ? { ...s.own, autopilot: { id: e.intent.id, on } }
+            : s.own;
       // Asking for a GPU resumes the picture: the private view's stream has no place in a
       // paused wall's frame choice, and the view hides the Resume button.
       const ui = e.intent.name === "claim_gpu" && s.ui.paused ? { ...s.ui, paused: false } : s.ui;
@@ -440,13 +428,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
     }
     case "own-closed":
       // Dismissed while the request is still out: the claim it may yet bring is released when it comes.
-      // A resume still waiting for the Turnstile check is dropped with it: sent after the
-      // close, it would take back a claim the viewer gave up.
-      return {
-        ...s,
-        own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null },
-        turnstile: { ...s.turnstile, queued: s.turnstile.queued.filter((q) => q.name !== "resume_claim") },
-      };
+      return { ...s, own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null } };
     case "family":
       // Once per page load: the first answer stands.
       return s.net.family !== null ? s : { ...s, net: { family: e.family, probeMs: e.probeMs, via: e.via } };
@@ -470,25 +452,12 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           return { ...s, serverError: msg.reason };
         case "hello": {
           // A new connection: verification belongs to the connection, so it starts over.
-          // A claim the page held is presented again with its token (PROTOCOL.md,
-          // `resume_claim`): a coordinator that restarted carried it over and gives it back;
-          // otherwise the coordinator ended it when the old connection closed, the resume is
-          // refused, and the claim shows as ended. Its frames stop until a claim message
-          // says it runs again. Every connection presents it with an intent id of its own: a
-          // coordinator that stored an earlier resume and then restarted again has the claim
-          // waiting for a viewer once more, and answers a repeated id with its first receipt
-          // without binding the claim to this connection.
+          // So does a claim: the coordinator ended it when the old connection closed, and
+          // its last claim message went to that closed socket (PROTOCOL.md, "the viewer leaving").
           const c = s.own.claim;
           const own =
             c !== null && c.phase !== "ended"
-              ? c.token !== null
-                ? {
-                    ...s.own,
-                    claim: { ...c, phase: "restoring", frame_url: null, frame_url_v4: null },
-                    resume: c.token,
-                    resumeId: null,
-                  }
-                : { ...s.own, claim: { ...c, phase: "ended", frame_url: null, ended: CLAIM_DROPPED } }
+              ? { ...s.own, claim: { ...c, phase: "ended", frame_url: null, ended: "The connection dropped, so the GPU went back to the pool." } }
               : s.own;
           return {
             ...s,
@@ -573,14 +542,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           }
           const cameraWatches = applied ? s.cameraWatches : s.cameraWatches.filter((w) => w.id !== msg.id);
           let own = s.own;
-          if (s.own.resumeId === msg.id) {
-            const c = s.own.claim;
-            own = {
-              ...s.own,
-              resumeId: null,
-              claim: !applied && c !== null ? { ...c, phase: "ended", frame_url: null, frame_url_v4: null, ended: CLAIM_DROPPED } : c,
-            };
-          } else if (s.own.requestId === msg.id) {
+          if (s.own.requestId === msg.id) {
             // Applied: the claim message (which can come before or after this) ends the request.
             if (!applied) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
           } else if (s.own.abandoned === msg.id && !applied) {
@@ -597,8 +559,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
 
 /** Intents to send again after the socket reopens: those with no receipt yet. */
 export function intentsToResend(s: ClientState): IntentMsg[] {
-  // A resume belongs to its connection: the next one sends a new one (see "hello").
-  return s.pending.filter((p) => p.receipt === null && p.intent.name !== "resume_claim").map((p) => p.intent);
+  return s.pending.filter((p) => p.receipt === null).map((p) => p.intent);
 }
 
 /** Camera keys the frame drawer should watch for: drawn T at or past tEff ends the watch. */

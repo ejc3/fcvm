@@ -187,17 +187,6 @@
       "at": 41000,
       "type": "viewer_left",
       "viewer": "v2"
-    },
-    {
-      "args": {
-        "token": "token-a"
-      },
-      "at": 42000,
-      "client": "198.51.100.22",
-      "id": "res",
-      "name": "resume_claim",
-      "type": "intent",
-      "viewer": "v3"
     }
   ],
   "expect": [
@@ -302,14 +291,6 @@
         "/assign/h1/2/generation": 5,
         "/view/claims": []
       }
-    },
-    {
-      "after": 17,
-      "checks": {
-        "/receipts/res/outcome": "refused",
-        "/receipts/res/reason": "no claim waits for that token: it ended, or the coordinator did not restart"
-      },
-      "note": "a claim's token takes back only a claim a coordinator restart carried over; the action log shows none of its args"
     }
   ],
   "final_view": {
@@ -398,15 +379,6 @@
         "outcome": "refused",
         "summary": "\"claim-9\" is not this viewer's claim",
         "viewer": "v2"
-      },
-      {
-        "args": {},
-        "at": 42000,
-        "id": "res",
-        "name": "resume_claim",
-        "outcome": "refused",
-        "summary": "no claim waits for that token: it ended, or the coordinator did not restart",
-        "viewer": "v3"
       }
     ],
     "aggregates": [

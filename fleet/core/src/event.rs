@@ -164,11 +164,6 @@ pub enum Intent {
     ReleaseGpu {
         claim: Option<String>,
     },
-    /// Take back a claim a coordinator restart carried over: `token` is the claim's session
-    /// token, which only the claiming page was given.
-    ResumeClaim {
-        token: String,
-    },
     /// Turn and move the private session's camera.
     ClaimCamera {
         yaw_deg: f64,
@@ -384,14 +379,6 @@ impl Intent {
                 })
             }
             "claim_gpu" => Ok(Intent::ClaimGpu),
-            "resume_claim" => Ok(Intent::ResumeClaim {
-                token: args
-                    .get("token")
-                    .and_then(|v| v.as_str())
-                    .filter(|t| !t.is_empty())
-                    .ok_or("args.token must be the claim's token")?
-                    .to_string(),
-            }),
             "release_gpu" => Ok(Intent::ReleaseGpu {
                 claim: match args.get("claim") {
                     None | Some(serde_json::Value::Null) => None,

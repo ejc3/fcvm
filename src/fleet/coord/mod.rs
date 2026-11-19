@@ -527,9 +527,17 @@ impl Actor {
             let _ = reply.send(receipt);
             return;
         }
+        // Once nobody awaits the reply (its socket closed), the wait ends, which closes the
+        // answer `when_stored` keeps, so the next one dropped it.
+        let mut reply = reply;
         tokio::spawn(async move {
-            if stored.await == Ok(true) {
-                let _ = reply.send(receipt);
+            tokio::select! {
+                s = &mut stored => {
+                    if s == Ok(true) {
+                        let _ = reply.send(receipt);
+                    }
+                }
+                _ = reply.closed() => {}
             }
         });
     }
@@ -678,32 +686,6 @@ impl Actor {
                         } else {
                             Default::default()
                         },
-                        camera: c.camera.clone(),
-                        autopilot: c.autopilot,
-                        ended: None,
-                    })
-                });
-                // A claim a restart carried over whose GPU's host is not back yet: restoring.
-                let info = info.or_else(|| {
-                    let c = self
-                        .state
-                        .fleet
-                        .held_claims
-                        .iter()
-                        .map(|h| &h.claim)
-                        .find(|c| c.viewer == viewer)?;
-                    Some(ClaimMsg {
-                        id: c.session.clone(),
-                        tile: c.borrowed.clone(),
-                        phase: "restoring".into(),
-                        frame_url: None,
-                        frame_url_v4: None,
-                        token: c.token.clone(),
-                        clicked_at: c.claimed_at,
-                        first_frame_at: c.first_frame_at,
-                        expires_at: c.expires_at,
-                        gpu: None,
-                        phases: Default::default(),
                         camera: c.camera.clone(),
                         autopilot: c.autopilot,
                         ended: None,
@@ -1791,6 +1773,24 @@ mod store_tests {
             "only answers still awaited are kept"
         );
         drop((kept, live));
+        // The same through `Cmd::Apply`, whose reply waits in a task of its own (a `word`
+        // intent's path): a reply nobody awaits any more ends that wait.
+        for _ in 0..10 {
+            let (reply, rx) = oneshot::channel();
+            actor.handle(Cmd::Apply {
+                event: light(3),
+                reply: Some(reply),
+            });
+            drop(rx);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let live = submit(&mut actor, 4);
+        assert_eq!(
+            actor.waiting.len(),
+            1,
+            "a deferred reply nobody awaits keeps no answer"
+        );
+        drop(live);
     }
 }
 
