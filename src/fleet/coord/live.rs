@@ -39,11 +39,15 @@ const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
 
-/// `/live` sockets one client key may hold open at once. A page holds one (fleet/web
-/// wall-client.ts opens the next only after the last has closed); eight lets a household or
-/// small office behind one IPv4 address watch on several devices, while one client holds at
-/// most 0.16% of [`MAX_SOCKETS`].
-pub const SOCKETS_PER_CLIENT: usize = 8;
+/// `/live` sockets one IPv6 /64 may hold open at once. A /64 is one subscriber, and a page
+/// holds one socket (fleet/web wall-client.ts opens the next only after the last has closed);
+/// eight lets one household watch on several devices.
+pub const SOCKETS_PER_IPV6_64: usize = 8;
+/// `/live` sockets one IPv4 address may hold open at once. Mobile carriers and many ISPs put
+/// many subscribers behind one IPv4 address (carrier-grade NAT), so a cap of a household's
+/// size would refuse the next visitor on that carrier outright. A socket costs only memory,
+/// which [`MAX_SOCKETS`] already bounds; 64 still keeps one address to 1.3% of it.
+pub const SOCKETS_PER_IPV4: usize = 64;
 /// `/live` sockets the coordinator holds in all. The coordinator holds about 5,000 of them,
 /// bound by memory at about 160 KB each (docs/fleet/ARCHITECTURE.md, "Past about 5,000
 /// viewers the coordinator needs more"); past that a flood of sockets would take the task's
@@ -53,17 +57,32 @@ pub const MAX_SOCKETS: usize = 5_000;
 /// it: a refused handshake is a failed connect to it, retried with its own backoff.
 pub const FULL_RETRY_AFTER_SECS: u64 = 30;
 
-/// The caps on open `/live` sockets.
+/// The caps on open `/live` sockets: per client key of each family, and in all.
 #[derive(Debug, Clone, Copy)]
 pub struct SocketCaps {
-    pub per_client: usize,
+    /// Per IPv6 /64, and per any other key (one that is not an IPv4 address).
+    pub per_ipv6_64: usize,
+    /// Per IPv4 address.
+    pub per_ipv4: usize,
     pub total: usize,
+}
+
+impl SocketCaps {
+    /// The cap for one client key ([`client_key`]).
+    fn per_client(&self, key: &str) -> usize {
+        if key.parse::<std::net::Ipv4Addr>().is_ok() {
+            self.per_ipv4
+        } else {
+            self.per_ipv6_64
+        }
+    }
 }
 
 impl Default for SocketCaps {
     fn default() -> Self {
         SocketCaps {
-            per_client: SOCKETS_PER_CLIENT,
+            per_ipv6_64: SOCKETS_PER_IPV6_64,
+            per_ipv4: SOCKETS_PER_IPV4,
             total: MAX_SOCKETS,
         }
     }
@@ -96,7 +115,7 @@ impl Sockets {
             return Err(SocketsFull::Total);
         }
         let n = per.entry(key.to_string()).or_default();
-        if *n >= self.caps.per_client {
+        if *n >= self.caps.per_client(key) {
             return Err(SocketsFull::Client);
         }
         *n += 1;

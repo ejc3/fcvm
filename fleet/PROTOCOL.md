@@ -816,9 +816,11 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   the coordinator's own (`Origin` naming the request's `Host`) nor one given with
   `--allowed-origin`. A request without `Origin` (not a browser) is served.
 - `/live` refuses a socket with `503` (`Retry-After: 30`, body `too many connections from this
-  network` or `the coordinator is full`) while its client (as counted for the limits, an IPv6
-  address by its /64) holds 8 open sockets, or the coordinator holds 5,000 in all (about its
-  memory's worth at about 160 KB a socket, docs/fleet/ARCHITECTURE.md). A page holds one. The
+  network` or `the coordinator is full`) while its client holds 8 open sockets if it is an
+  IPv6 /64 (one subscriber) or 64 if it is an IPv4 address (carrier-grade NAT puts many
+  subscribers behind one), or the coordinator holds 5,000 in all (about its memory's worth at
+  about 160 KB a socket, docs/fleet/ARCHITECTURE.md), which is what bounds memory. A page
+  holds one. The
   page does not read the status: a browser's WebSocket reports a refused handshake as a failed
   connection, so the page shows the connection as closed and tries again with its usual backoff.
 - SIGTERM or SIGINT stops the coordinator after it has written the last state to

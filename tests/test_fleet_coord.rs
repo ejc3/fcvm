@@ -672,34 +672,52 @@ async fn try_live(url: &str, ip: &str) -> Result<Ws, (u16, Option<String>)> {
     }
 }
 
-/// One client holds at most `per_client` `/live` sockets and the coordinator `total`; a
-/// socket past either is refused with 503 and a `Retry-After`, and a closed socket gives its
+/// One IPv6 /64 holds at most `per_ipv6_64` `/live` sockets, one IPv4 address (carrier NAT
+/// puts many people behind one) the larger `per_ipv4`, and the coordinator `total`; a socket
+/// past any of them is refused with 503 and a `Retry-After`, and a closed socket gives its
 /// place back.
 #[tokio::test]
 async fn live_sockets_are_capped_per_client_and_in_all() {
     let c = coordinator_with(Opts {
         sockets: live::SocketCaps {
-            per_client: 2,
-            total: 3,
+            per_ipv6_64: 2,
+            per_ipv4: 4,
+            total: 7,
         },
         ..Opts::default()
     })
     .await;
-    let a1 = try_live(&c.url, "198.51.100.1")
+    let full = Some((503, Some(live::FULL_RETRY_AFTER_SECS.to_string())));
+    // One subscriber's /64, from two of its addresses.
+    let _v1 = try_live(&c.url, "2001:db8:1:2::1")
         .await
-        .expect("first socket");
-    let _a2 = try_live(&c.url, "198.51.100.1")
+        .expect("first IPv6 socket");
+    let _v2 = try_live(&c.url, "2001:db8:1:2::2")
         .await
-        .expect("second socket");
-    let refused = try_live(&c.url, "198.51.100.1").await.err();
+        .expect("second IPv6 socket");
     assert_eq!(
-        refused,
-        Some((503, Some(live::FULL_RETRY_AFTER_SECS.to_string()))),
-        "a third socket from one client"
+        try_live(&c.url, "2001:db8:1:2::3").await.err(),
+        full,
+        "a third socket from one /64"
+    );
+    // One IPv4 address holds more than a /64 may.
+    let mut v4 = Vec::new();
+    for i in 0..4 {
+        v4.push(
+            try_live(&c.url, "198.51.100.1")
+                .await
+                .unwrap_or_else(|e| panic!("IPv4 socket {}: {e:?}", i + 1)),
+        );
+    }
+    assert_eq!(
+        try_live(&c.url, "198.51.100.1").await.err(),
+        full,
+        "a fifth socket from one IPv4 address"
     );
     let _b1 = try_live(&c.url, "198.51.100.2")
         .await
         .expect("another client");
+    let a1 = v4.pop().unwrap();
     assert_eq!(
         try_live(&c.url, "198.51.100.3").await.err().map(|e| e.0),
         Some(503),
