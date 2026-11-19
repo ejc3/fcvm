@@ -1,0 +1,656 @@
+{
+  "config": {
+    "daily_spend_usd": 10.0,
+    "idle_scale_down_secs": 60,
+    "max_tiles": 2,
+    "power_managed": true,
+    "sleep_without_new_viewer_secs": 0,
+    "warm_hours": [
+      "Thu 23:00-01:00"
+    ]
+  },
+  "description": "Warm hours against the daily spend ceiling. The meter charges the hosts a window keeps up like any others. When the day's spend trips the ceiling inside a window, the fleet sleeps with power.reason budget and the window does not wake it until 00:00 UTC; the new day, still inside the window, wakes it.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 70000,
+      "type": "tick"
+    },
+    {
+      "at": 70000,
+      "instances": 0,
+      "type": "burn",
+      "usd_per_hour": 0.0
+    },
+    {
+      "at": 82800000,
+      "type": "tick"
+    },
+    {
+      "at": 82800000,
+      "instances": 1,
+      "type": "burn",
+      "usd_per_hour": 8.0
+    },
+    {
+      "at": 82900000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 2,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 82900000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 82900000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 2,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 83000000,
+      "instances": 5,
+      "type": "burn",
+      "usd_per_hour": 40.0
+    },
+    {
+      "at": 84000000,
+      "instances": 0,
+      "type": "burn",
+      "usd_per_hour": 0.0
+    },
+    {
+      "at": 84000000,
+      "type": "tick"
+    },
+    {
+      "at": 86399999,
+      "type": "tick"
+    },
+    {
+      "at": 86400000,
+      "type": "tick"
+    },
+    {
+      "at": 86460000,
+      "instances": 1,
+      "type": "burn",
+      "usd_per_hour": 8.0
+    },
+    {
+      "at": 90000000,
+      "type": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "after": 4,
+      "checks": {
+        "/view/fleet/power/state": "asleep"
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/fleet/power/reason": "warm",
+        "/view/fleet/power/state": "waking"
+      },
+      "note": "the window starts at 23:00: it wakes with no viewer"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/fleet/spend/usd_per_hour": 8.0
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep",
+        "/view/fleet/spend/reason": "budget"
+      },
+      "note": "the warm hosts are charged: 40 USD an hour reaches the ceiling and the fleet sleeps inside the window"
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "inside the window the warm rule does not wake it"
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/fleet/power/reason": "budget",
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "nor a millisecond before 00:00 UTC"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/view/fleet/power/reason": "warm",
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/power/woke_at": 86400000,
+        "/view/fleet/spend/usd_today": 0.0
+      },
+      "note": "00:00 UTC, still inside the window: a new ledger, and the window wakes it"
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/view/fleet/power/reason": null,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "the window ends at 01:00 with no viewer: it sleeps"
+    }
+  ],
+  "final_view": {
+    "actions": [],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 3,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 1000,
+            "name": "h1"
+          }
+        ],
+        "since": 0
+      },
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": 90000000,
+        "hosts": [],
+        "idle_since": 1000,
+        "last_arrival_at": 0,
+        "last_wake": {
+          "awake_at": 86460000,
+          "gpus": 2,
+          "ms": 60000,
+          "started_at": 86400000
+        },
+        "sleep_without_arrival_at": null,
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 82800000,
+            "gpus": 2,
+            "ms": 0,
+            "started_at": 82800000
+          },
+          {
+            "awake_at": 86460000,
+            "gpus": 2,
+            "ms": 60000,
+            "started_at": 86400000
+          }
+        ],
+        "woke_at": null
+      },
+      "spend": {
+        "at": 86460000,
+        "ceiling_usd": 10.0,
+        "day_start": 86400000,
+        "instances": 1,
+        "reason": null,
+        "resets_at": 172800000,
+        "usd_per_hour": 8.0,
+        "usd_today": 0.0
+      },
+      "standby": [
+        "slot-1",
+        "slot-2",
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 2700045,
+      "from_t": 90001.5,
+      "generation": 6
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 86515000,
+      "holding": "peak-lake",
+      "holding_label": "The peak over the lake",
+      "leading": "plains",
+      "next": null,
+      "next_hold_at": 86517000,
+      "next_label": null,
+      "opened_at": 90000000,
+      "targets": [
+        {
+          "arrive_at": 86539000,
+          "id": "plains",
+          "label": "Across the plains to the mountains",
+          "votes": 0
+        },
+        {
+          "arrive_at": 86539000,
+          "id": "ridges",
+          "label": "Across the ridges",
+          "votes": 0
+        },
+        {
+          "arrive_at": 86539000,
+          "id": "valley",
+          "label": "Into the valley",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 58.708496,
+          "look": [
+            -59.159895,
+            0.264455,
+            -117.862293
+          ],
+          "pos": [
+            -72.812969,
+            2.434793,
+            -111.350564
+          ],
+          "t": 86502.0
+        },
+        {
+          "fov_deg": 57.306955,
+          "look": [
+            -57.655308,
+            0.897898,
+            -117.108042
+          ],
+          "pos": [
+            -70.976122,
+            1.57302,
+            -112.603241
+          ],
+          "t": 86503.0
+        },
+        {
+          "fov_deg": 56.128768,
+          "look": [
+            -56.649706,
+            1.55506,
+            -116.02724
+          ],
+          "pos": [
+            -69.57598,
+            0.898505,
+            -113.592533
+          ],
+          "t": 86504.0
+        },
+        {
+          "fov_deg": 55.309372,
+          "look": [
+            -56.184334,
+            2.034493,
+            -115.094803
+          ],
+          "pos": [
+            -68.653639,
+            0.466239,
+            -114.245611
+          ],
+          "t": 86505.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -68.2475,
+            0.3043,
+            -114.48375
+          ],
+          "t": 86506.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -68.111591,
+            0.325336,
+            -114.486705
+          ],
+          "t": 86507.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.975682,
+            0.346373,
+            -114.489659
+          ],
+          "t": 86508.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.839773,
+            0.367409,
+            -114.492614
+          ],
+          "t": 86509.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.703864,
+            0.388445,
+            -114.495568
+          ],
+          "t": 86510.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.567955,
+            0.409482,
+            -114.498523
+          ],
+          "t": 86511.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.432045,
+            0.430518,
+            -114.501477
+          ],
+          "t": 86512.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.296136,
+            0.451555,
+            -114.504432
+          ],
+          "t": 86513.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.160227,
+            0.472591,
+            -114.507386
+          ],
+          "t": 86514.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -67.024318,
+            0.493627,
+            -114.510341
+          ],
+          "t": 86515.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -66.888409,
+            0.514664,
+            -114.513295
+          ],
+          "t": 86516.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -66.7525,
+            0.5357,
+            -114.51625
+          ],
+          "t": 86517.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.2,
+            -114.75
+          ],
+          "pos": [
+            -66.616591,
+            0.556736,
+            -114.519205
+          ],
+          "t": 86518.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.46,
+      "weather": [
+        {
+          "cover": 0.6,
+          "rays": 0.0,
+          "snow_line_km": 2.1128,
+          "t": 86506.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 0,
+      "count": 0
+    }
+  }
+}

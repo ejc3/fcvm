@@ -1332,11 +1332,15 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         idle_scale_down_secs: args.idle_scale_down,
         sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
         daily_spend_usd: args.daily_spend_usd,
+        warm_hours: args.warm_hours.clone(),
         history_idle_secs: args.history_idle,
         ..Config::default()
     };
     if config.max_tiles == 0 {
         bail!("--max-tiles must be at least 1");
+    }
+    if !config.warm_hours.is_empty() && !config.power_managed {
+        bail!("--warm-hours needs a fleet that sleeps (--host-template or --sleep-when-idle)");
     }
     let meter = spend::meter(&args)?;
     let checker: Arc<dyn text_check::TextChecker> = match args.text_check {
@@ -1826,6 +1830,33 @@ mod power_tests {
             Err(e) => e.to_string(),
         };
         assert!(e.contains("no race could ever start"), "{e}");
+    }
+
+    #[test]
+    fn warm_hours_parse_as_weekly_utc_windows() {
+        let a = coord(&["--warm-hours", "Sat 17:00-23:00,Sun 17:00-21:00"]);
+        let shown: Vec<String> = a.warm_hours.iter().map(|w| w.to_string()).collect();
+        assert_eq!(shown, ["Sat 17:00-23:00", "Sun 17:00-21:00"]);
+        assert!(coord(&[]).warm_hours.is_empty());
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--warm-hours",
+            "Saturday 17:00-23:00",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    /// A fleet that never sleeps has nothing to keep warm: the flag is refused at start.
+    #[tokio::test]
+    async fn warm_hours_need_a_fleet_that_sleeps() {
+        let e = super::run(coord(&["--warm-hours", "Sat 17:00-23:00"]))
+            .await
+            .expect_err("--warm-hours without power management was accepted");
+        assert!(e.to_string().contains("--warm-hours needs"), "{e}");
     }
 
     #[test]

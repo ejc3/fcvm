@@ -76,6 +76,10 @@ pub struct Config {
     /// 00:00 UTC (`crate::spend`). `None`: no ceiling.
     #[serde(default)]
     pub daily_spend_usd: Option<f64>,
+    /// With power management, weekly UTC windows in which the fleet stays awake with no
+    /// viewers (`crate::warm`). Empty: none.
+    #[serde(default)]
+    pub warm_hours: Vec<crate::warm::Window>,
     /// The coordinator writes each launch's DNS names and a tile's frame URLs are its
     /// published names (`Slot::published`), not the URL its agent reported.
     #[serde(default)]
@@ -153,7 +157,8 @@ pub struct HostWake {
     pub boot: BTreeMap<String, u64>,
 }
 
-/// One wake, measured from the first active viewer to the complete image.
+/// One wake, measured from the first active viewer (or a warm window's start) to the complete
+/// image.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Wake {
     pub started_at: u64,
@@ -181,8 +186,9 @@ pub struct Power {
     /// page's `wake`. A state that records none counts from the coordinator's start.
     #[serde(default)]
     pub last_arrival_at: Option<u64>,
-    /// Why the fleet sleeps when no viewer rule says so: `budget` while the day's spend
-    /// ceiling holds it asleep (`crate::spend`).
+    /// Why the power state is not the viewer rules' alone: `budget` while the day's spend
+    /// ceiling holds it asleep (`crate::spend`), `warm` while a warm window holds it awake
+    /// (`crate::warm`). Each is set again from the clock at every event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -253,6 +259,7 @@ impl Default for Config {
             idle_scale_down_secs: 600,
             sleep_without_new_viewer_secs: 3600,
             daily_spend_usd: None,
+            warm_hours: Vec::new(),
             names_published: false,
             phone_claim_secs: 120,
             phone_claim_cooldown_secs: 60,

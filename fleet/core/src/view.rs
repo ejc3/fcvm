@@ -390,7 +390,8 @@ pub struct PowerView {
     /// When the fleet sleeps if no viewer arrives before then (past while asleep); null
     /// when the fleet does not sleep or `--sleep-without-new-viewer` is 0.
     pub sleep_without_arrival_at: Option<u64>,
-    /// `budget` while the day's spend ceiling holds the fleet asleep; absent otherwise.
+    /// `budget` while the day's spend ceiling holds the fleet asleep, `warm` while a warm
+    /// window holds it awake; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

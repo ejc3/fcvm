@@ -22,6 +22,7 @@ pub mod state;
 pub mod terrain;
 pub mod tiling;
 pub mod view;
+pub mod warm;
 pub mod windows;
 
 pub use apply::{apply, precheck_word};

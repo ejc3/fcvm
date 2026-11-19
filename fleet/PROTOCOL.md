@@ -597,7 +597,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `/health`, and when it was ready). A starting tile is described every 3 s and, once it
   runs with an address, its renderer's `/health` is asked every 250 ms in between.
   `reason` is absent, except `budget` while the daily spend ceiling holds the fleet asleep
-  (`fleet.spend`).
+  (`fleet.spend`), and `warm` while a `--warm-hours` window holds it awake with or without
+  viewers: then it wakes at once, the two limits above do not sleep it, and
+  `sleep_without_arrival_at` applies only after the window ends.
 - `fleet.spend` is present with `--daily-spend-usd`: today's spend against the ceiling, per
   UTC day. The coordinator's meter prices every GPU host and EC2 tile instance the fleet runs
   every 30 s (spot at the current spot price of its type in its zone, on demand at its
@@ -693,6 +695,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--sleep-without-new-viewer 3600] [--history-idle 60]
                  [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
+                 [--warm-hours <Mon..Sun> HH:MM-HH:MM,...]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
@@ -736,6 +739,21 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   listed instances; each marks the `spend` component degraded (`degraded`). Each pass also
   writes one CloudWatch embedded metric format line to stdout, namespace `FCVM/Fleet`,
   dimension `Fleet`: `SpendUsdToday` and `Power` (0 asleep, 1 waking, 2 awake).
+- `--warm-hours` (also `FLEET_WARM_HOURS`) lists weekly UTC windows in which the fleet
+  stays awake with no viewers, comma separated, each `<day> HH:MM-HH:MM` with `<day>` one of
+  `Mon` to `Sun` (any case): `Sat 17:00-23:00,Sun 17:00-21:00`. A window starts on its day at
+  the first time, start included, and ends at the second, end excluded; an end at or before
+  the start is on the next day (`Sat 22:00-02:00` ends Sunday 02:00), and `24:00` is an end.
+  A window whose start equals its end is refused. It needs a fleet that sleeps
+  (`--host-template` or `--sleep-when-idle`); off without it. Inside a window the fleet wakes
+  at once with no viewer, with `--awake-capacity` hosts per region as any wake, and neither
+  `--idle-scale-down` nor `--sleep-without-new-viewer` sleeps it; outside every window the
+  viewer rules alone decide, so at a window's end a fleet with no viewer sleeps. While a
+  window holds, `fleet.power.reason` is `warm`. Nothing about a window is stored: a restarted
+  coordinator decides from the windows it starts with. The hosts a window keeps up are
+  charged to `--daily-spend-usd` like any others, and a spent budget wins: the fleet sleeps
+  with `reason` `budget`, and the window does not wake it before 00:00 UTC. The page shows a
+  warm fleet as it shows any awake or waking one.
 - `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
   keeps versions) at most once a second while it changes and at shutdown. A missing object

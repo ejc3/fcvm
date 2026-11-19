@@ -214,7 +214,7 @@ export interface Power {
   last_wake: Wake | null;
   /** The last completed wakes, oldest first (the coordinator keeps 20). */
   wakes: Wake[];
-  /** `budget` while the day's spend ceiling holds the fleet asleep until 00:00 UTC; else null. */
+  /** `budget` while the day's spend ceiling holds the fleet asleep until 00:00 UTC, `warm` while a warm window holds it awake (the page shows it as any awake fleet); else null. */
   reason?: string | null;
 }
 
