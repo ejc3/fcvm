@@ -20,6 +20,7 @@ pub mod ec2_aws;
 pub mod ecs;
 pub mod hosts;
 pub mod live;
+pub mod metrics;
 pub mod minecraft_log;
 pub mod poster;
 pub mod potato_log;
@@ -1590,6 +1591,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         ));
     }
     let mut gate = admission::Gate::open();
+    let mut broadcast_probe: Option<Arc<dyn metrics::BroadcastSource>> = None;
     if let Some(listen) = &args.broadcast_listen {
         let json = match (&args.broadcast_secret, &args.broadcast_file) {
             (Some(secret), _) => secrets::Secrets::new(&secrets_region()?)?
@@ -1604,6 +1606,12 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         };
         let b = broadcast::BroadcastSecret::parse(&json)?;
         gate.playback = b.playback()?;
+        match &b.channel_arn {
+            Some(arn) => broadcast_probe = Some(Arc::new(metrics::IvsStream::new(arn)?)),
+            None => {
+                tracing::warn!("the broadcast secret names no channel_arn: no BroadcastLive metric")
+            }
+        }
         admission::check_direct_capacity(args.direct_capacity)?;
         gate.seats = admission::Seats::new(Some(args.direct_capacity));
         let mut argv = vec![
@@ -1631,6 +1639,23 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             },
         ));
     }
+    let cert_probe: Option<Arc<dyn metrics::CertSource>> = match &args.tls_secret {
+        Some(id) => Some(Arc::new(metrics::SecretCert {
+            secrets: secrets::Secrets::new(&secrets_region()?)?,
+            id: id.clone(),
+        })),
+        None => None,
+    };
+    tokio::spawn(metrics::run(
+        metrics::MetricsConfig {
+            fleet: args.fleet_name.clone(),
+            every: metrics::EVERY,
+            cert: cert_probe,
+            broadcast: broadcast_probe,
+        },
+        handle.snapshot.clone(),
+        |line| println!("{line}"),
+    ));
     for cmd in args.agent_cmds {
         let argv =
             shell_words::split(&cmd).with_context(|| format!("splitting --agent-cmd {cmd:?}"))?;
