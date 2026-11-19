@@ -166,6 +166,27 @@ pub async fn signed(
     extra: &[(&str, String)],
     body: Vec<u8>,
 ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    let (status, _, bytes) = signed_with_headers(
+        chain, http, base, method, path, query, region, service, extra, body,
+    )
+    .await?;
+    Ok((status, bytes))
+}
+
+/// [`signed`], also returning the response's headers (S3's `ETag`).
+#[allow(clippy::too_many_arguments)]
+pub async fn signed_with_headers(
+    chain: &CredentialChain,
+    http: &reqwest::Client,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    query: &str,
+    region: &str,
+    service: &str,
+    extra: &[(&str, String)],
+    body: Vec<u8>,
+) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>)> {
     use sha2::{Digest, Sha256};
     let host = base
         .split_once("://")
@@ -217,8 +238,9 @@ pub async fn signed(
         .await
         .with_context(|| format!("calling {service}"))?;
     let status = r.status();
+    let headers = r.headers().clone();
     let bytes = r.bytes().await?.to_vec();
-    Ok((status, bytes))
+    Ok((status, headers, bytes))
 }
 
 /// A value from the instance metadata service (IMDSv2), e.g. `instance-id`.

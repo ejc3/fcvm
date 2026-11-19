@@ -39,6 +39,8 @@ struct Opts {
     gate: Option<Arc<admission::Gate>>,
     /// Caps on open `/live` sockets.
     sockets: live::SocketCaps,
+    /// The state store; none when absent.
+    store: Option<store::StoreTx>,
 }
 
 impl Default for Opts {
@@ -57,6 +59,7 @@ impl Default for Opts {
             site_key: None,
             gate: None,
             sockets: live::SocketCaps::default(),
+            store: None,
         }
     }
 }
@@ -69,7 +72,7 @@ struct Coord {
 async fn coordinator_with(o: Opts) -> Coord {
     let (handle, _actor) = start(
         State::new(o.config, now_ms()),
-        None,
+        o.store,
         None,
         o.ec2_local,
         None,
@@ -2706,8 +2709,9 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
     );
     // Let the first store tick (at start, an unchanged state) pass, then change the state.
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // Submitted, not applied: a receipt waits for the store, whose write is what is timed.
     handle
-        .apply(Event::Intent {
+        .submit(Event::Intent {
             at: 0,
             viewer: "v-1".into(),
             client: Some("198.51.100.9".into()),
@@ -2792,7 +2796,17 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
         let a2 = attempts.clone();
         tokio::spawn(async move {
             let mut pending = false;
+            let mut started = false;
             while let Some(cmd) = rx.recv().await {
+                // The coordinator's own first write at start (it confirms that it owns the state)
+                // is stored and not counted: this test is about the writes after it.
+                if !started && cmd.bytes.is_some() {
+                    started = true;
+                    if let Some(a) = cmd.ack {
+                        let _ = a.send(true);
+                    }
+                    continue;
+                }
                 let bytes = cmd.bytes.is_some();
                 pending |= bytes;
                 if pending {
@@ -2821,8 +2835,9 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
         );
         // The store tick at start finds the state unchanged and writes nothing.
         assert_eq!(seen.recv().await, Some(false));
+        // Submitted, not applied: a receipt waits for a stored state, and these writes fail.
         handle
-            .apply(Event::Intent {
+            .submit(Event::Intent {
                 at: 0,
                 viewer: "v-1".into(),
                 client: Some("198.51.100.9".into()),
@@ -2868,7 +2883,17 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     // Fails its first write and stores every later one.
     tokio::spawn(async move {
         let mut pending = false;
+        let mut started = false;
         while let Some(cmd) = rx.recv().await {
+            // The coordinator's own first write at start (it confirms that it owns the state)
+            // is stored and not counted: this test is about the writes after it.
+            if !started && cmd.bytes.is_some() {
+                started = true;
+                if let Some(a) = cmd.ack {
+                    let _ = a.send(true);
+                }
+                continue;
+            }
             pending |= cmd.bytes.is_some();
             if pending {
                 let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2904,6 +2929,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         budget: tokio::sync::watch::channel(None).0,
         zone: None,
         store: Some(tx),
+        owned: tokio::sync::watch::channel(false).0,
     };
     let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
     let actor = tokio::spawn(
@@ -2917,7 +2943,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     };
     let before = handle.snapshot.borrow().version;
     handle
-        .apply(Event::Intent {
+        .submit(Event::Intent {
             at: 0,
             viewer: "v-1".into(),
             client: Some("198.51.100.9".into()),
@@ -4304,12 +4330,60 @@ async fn an_agent_can_dial_the_agent_websocket() {
     v.until(|s| s["fleet"]["n"] == 0).await;
 }
 
-/// A fake S3: PUT stores the body at the path, GET returns it or 404, and every request
-/// must be SigV4-signed with the payload's hash. `deny` answers 403 to everything.
+/// A fake versioned S3. PUT adds a version of the body at the path and answers its ETag,
+/// which is a hash of the body as a single-part PUT's is, honouring `If-Match` and
+/// `If-None-Match: *` with 412 as S3 does (a PUT with neither replaces whatever is there);
+/// GET returns the newest version or 404, `?versionId=` that version, and
+/// `GET /<bucket>?prefix=<key>&versions=` lists the versions newest first. Every request
+/// must be SigV4-signed with the payload's hash. `deny` answers 403 to everything,
+/// `lose_put_answer` stores the next PUT and answers it 500, and a GET of the version named
+/// in `unreadable` answers 503.
+/// A path and a body to put there.
+type PathAndBody = (String, Vec<u8>);
+
+/// Per path, its versions oldest first: (version id, body).
+type Versions = BTreeMap<String, Vec<(String, Vec<u8>)>>;
+
 #[derive(Clone, Default)]
 struct FakeS3 {
-    objects: Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
+    objects: Arc<std::sync::Mutex<Versions>>,
+    next: Arc<std::sync::atomic::AtomicU64>,
     deny: Arc<std::sync::atomic::AtomicBool>,
+    lose_put_answer: Arc<std::sync::atomic::AtomicBool>,
+    unreadable: Arc<std::sync::Mutex<Option<String>>>,
+    /// A version another writer puts at this path just before the next version listing is
+    /// served (between a GET and the listing that follows it).
+    on_list: Arc<std::sync::Mutex<Option<PathAndBody>>>,
+}
+
+fn fake_etag(body: &[u8]) -> String {
+    use sha2::Digest;
+    format!("\"{}\"", hex::encode(&sha2::Sha256::digest(body)[..16]))
+}
+
+impl FakeS3 {
+    fn latest(&self, path: &str) -> Option<Vec<u8>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(|v| v.last())
+            .map(|(_, b)| b.clone())
+    }
+
+    /// Add a version as another writer would, bypassing the conditions.
+    fn put_version(&self, path: &str, body: Vec<u8>) {
+        let id = format!(
+            "v{}",
+            self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        self.objects
+            .lock()
+            .unwrap()
+            .entry(path.to_string())
+            .or_default()
+            .push((id, body));
+    }
 }
 
 async fn fake_s3(s3: FakeS3) -> String {
@@ -4322,9 +4396,10 @@ async fn fake_s3(s3: FakeS3) -> String {
              uri: Uri,
              headers: HeaderMap,
              body: Bytes| async move {
+                use axum::response::IntoResponse;
                 use sha2::Digest;
                 if s3.deny.load(std::sync::atomic::Ordering::SeqCst) {
-                    return (StatusCode::FORBIDDEN, Vec::new());
+                    return StatusCode::FORBIDDEN.into_response();
                 }
                 let auth = headers
                     .get("authorization")
@@ -4339,17 +4414,86 @@ async fn fake_s3(s3: FakeS3) -> String {
                     headers["x-amz-content-sha256"].to_str().unwrap(),
                     hex::encode(sha2::Sha256::digest(&body))
                 );
-                let mut o = s3.objects.lock().unwrap();
+                let query: BTreeMap<String, String> = uri
+                    .query()
+                    .unwrap_or("")
+                    .split('&')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                        (k.to_string(), v.replace("%2F", "/"))
+                    })
+                    .collect();
+                let path = uri.path().to_string();
                 match method {
                     Method::PUT => {
-                        o.insert(uri.path().to_string(), body.to_vec());
-                        (StatusCode::OK, Vec::new())
+                        let id = format!(
+                            "v{}",
+                            s3.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        );
+                        let mut o = s3.objects.lock().unwrap();
+                        let current = o.get(&path).and_then(|v| v.last()).map(|(_, b)| fake_etag(b));
+                        let header = |n: &str| headers.get(n).map(|v| v.to_str().unwrap().to_string());
+                        let refused = match (header("if-match"), header("if-none-match")) {
+                            (Some(m), _) => current.as_deref() != Some(m.as_str()),
+                            (None, Some(n)) if n == "*" => current.is_some(),
+                            _ => false,
+                        };
+                        if refused {
+                            return StatusCode::PRECONDITION_FAILED.into_response();
+                        }
+                        o.entry(path).or_default().push((id, body.to_vec()));
+                        if s3.lose_put_answer.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        (StatusCode::OK, [("etag", fake_etag(&body))]).into_response()
                     }
-                    Method::GET => match o.get(uri.path()) {
-                        Some(b) => (StatusCode::OK, b.clone()),
-                        None => (StatusCode::NOT_FOUND, Vec::new()),
-                    },
-                    _ => (StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
+                    Method::GET if query.contains_key("versions") => {
+                        if let Some((p, b)) = s3.on_list.lock().unwrap().take() {
+                            s3.put_version(&p, b);
+                        }
+                        let bucket = path.trim_matches('/').to_string();
+                        let prefix = query.get("prefix").cloned().unwrap_or_default();
+                        let mut xml = String::from("<ListVersionsResult>");
+                        for (p, versions) in s3.objects.lock().unwrap().iter() {
+                            let Some(key) = p.strip_prefix(&format!("/{bucket}/")) else {
+                                continue;
+                            };
+                            if !key.starts_with(&prefix) {
+                                continue;
+                            }
+                            for (i, (id, _)) in versions.iter().enumerate().rev() {
+                                xml.push_str(&format!(
+                                    "<Version><Key>{key}</Key><VersionId>{id}</VersionId><IsLatest>{}</IsLatest></Version>",
+                                    i + 1 == versions.len()
+                                ));
+                            }
+                        }
+                        xml.push_str("</ListVersionsResult>");
+                        (StatusCode::OK, xml).into_response()
+                    }
+                    Method::GET => {
+                        if query.contains_key("versionId")
+                            && *s3.unreadable.lock().unwrap() == query.get("versionId").cloned()
+                        {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        let o = s3.objects.lock().unwrap();
+                        let found = o.get(&path).and_then(|v| match query.get("versionId") {
+                            Some(id) => v.iter().find(|(e, _)| e == id),
+                            None => v.last(),
+                        });
+                        match found {
+                            Some((id, b)) => (
+                                StatusCode::OK,
+                                [("etag", fake_etag(b)), ("x-amz-version-id", id.clone())],
+                                b.clone(),
+                            )
+                                .into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
                 }
             },
         )
@@ -4379,7 +4523,7 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
             },
             1_000,
         ),
-        Some(store::spawn_s3_writer(obj())),
+        Some(store::spawn_s3_writer(obj()).0),
         None,
         None,
         None,
@@ -4419,6 +4563,618 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
     s3.deny.store(true, std::sync::atomic::Ordering::SeqCst);
     let e = obj().load().await.unwrap_err();
     assert!(format!("{e:#}").contains("403"), "{e:#}");
+}
+
+/// Two coordinators that write one state object: every write is conditional on the object
+/// this writer last read or wrote, so the second writer's write fails instead of replacing
+/// what the first acknowledged, and its writer stops writing and says so.
+#[tokio::test]
+async fn a_second_writer_of_the_state_object_loses_and_stops() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let obj =
+        || store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let lost = |e: anyhow::Error| e.downcast_ref::<store::LostWrite>().is_some();
+    // Each writer's states differ, as two coordinators' do: S3's ETag is a hash of the body.
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    let bytes = state(1);
+    let (a, b) = (obj(), obj());
+    assert!(a.load().await.unwrap().is_none());
+    assert!(b.load().await.unwrap().is_none());
+    a.put(&state(10)).await.unwrap();
+    let e = b.put(&state(20)).await.unwrap_err();
+    assert!(
+        lost(e),
+        "the second first write replaced the first writer's object"
+    );
+    a.put(&state(11)).await.unwrap();
+    // A writer that read the object since writes it, and the other one loses then.
+    b.load().await.unwrap();
+    b.put(&state(21)).await.unwrap();
+    assert!(lost(a.put(&state(12)).await.unwrap_err()));
+    // Through the writer task: the write is answered not stored, the writer says it lost,
+    // and a later state is not written at all.
+    let c = obj();
+    c.load().await.unwrap();
+    s3.put_version("/fleet-state/state.json", state(30));
+    let (tx, mut gone) = store::spawn_s3_writer(c);
+    let ask = |tx: &store::StoreTx| {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        tx.send(store::StoreCmd {
+            bytes: Some(Arc::new(bytes.clone())),
+            ack: Some(ack),
+        })
+        .unwrap();
+        done
+    };
+    assert!(!ask(&tx).await.unwrap(), "a lost write is not stored");
+    tokio::time::timeout(Duration::from_secs(5), gone.wait_for(|l| *l))
+        .await
+        .expect("the writer says it lost")
+        .unwrap();
+    let versions = s3.objects.lock().unwrap()["/fleet-state/state.json"].len();
+    assert!(!ask(&tx).await.unwrap());
+    assert_eq!(
+        s3.objects.lock().unwrap()["/fleet-state/state.json"].len(),
+        versions,
+        "a writer that lost writes nothing more"
+    );
+}
+
+/// A newest state object that does not parse does not stop the coordinator: it resumes from
+/// the newest earlier version that parses (the bucket keeps versions), and its next write is
+/// conditional on the newest version, so it replaces the broken one. With no version that
+/// parses it is an error.
+#[tokio::test]
+async fn an_unreadable_state_object_resumes_from_the_newest_version_that_parses() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let mut old = State::new(Config::default(), 1_000);
+    old.version = 40;
+    let mut good = old.clone();
+    good.version = 41;
+    good.fleet.race_count = 7;
+    s3.put_version(path, serde_json::to_vec(&old).unwrap());
+    s3.put_version(path, serde_json::to_vec(&good).unwrap());
+    s3.put_version(path, b"{\"version\": 42, \"fleet\": ".to_vec());
+    s3.put_version(path, b"not json".to_vec());
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let back = obj.load().await.unwrap().expect("an earlier version");
+    assert_eq!((back.version, back.fleet.race_count), (41, 7));
+    obj.put(&serde_json::to_vec(&back).unwrap()).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<State>(&s3.latest(path).unwrap())
+            .unwrap()
+            .version,
+        41
+    );
+    // Nothing parses.
+    let other = "/fleet-state/other.json";
+    s3.put_version(other, b"[]".to_vec());
+    s3.put_version(other, b"not json".to_vec());
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "other.json", "us-east-2", &base).unwrap();
+    let e = obj.load().await.unwrap_err();
+    assert!(format!("{e:#}").contains("no earlier version"), "{e:#}");
+}
+
+/// The last state a fake store stored.
+type StoredSlot = Arc<std::sync::Mutex<Option<Arc<Vec<u8>>>>>;
+
+/// A fake store that keeps an unwritten state, as the real writers do, and fails every write
+/// while `failing` is set. The last stored state is in the returned slot.
+fn failing_store(failing: Arc<std::sync::atomic::AtomicBool>) -> (store::StoreTx, StoredSlot) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let stored = Arc::new(std::sync::Mutex::new(None::<Arc<Vec<u8>>>));
+    let s2 = stored.clone();
+    tokio::spawn(async move {
+        let mut pending: Option<Arc<Vec<u8>>> = None;
+        while let Some(cmd) = rx.recv().await {
+            if cmd.bytes.is_some() {
+                pending = cmd.bytes;
+            }
+            if pending.is_some() && !failing.load(std::sync::atomic::Ordering::SeqCst) {
+                *s2.lock().unwrap() = pending.take();
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(pending.is_none());
+            }
+        }
+    });
+    (tx, stored)
+}
+
+/// A committed receipt tells the viewer its change is made, so it is sent only once a stored
+/// state holds the change: while every write fails the viewer hears nothing, and once one is
+/// stored the receipt comes, and the stored state holds it. A refusal changes nothing and is
+/// answered at once.
+#[tokio::test]
+async fn a_receipt_is_sent_only_once_a_stored_state_holds_its_change() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut refused = Viewer::connect_from(&c.url, Some("198.51.100.30")).await;
+    refused
+        .intent(
+            "bad-1",
+            "light",
+            json!({"pos": [1.0e9, 0.0, 0.0], "color": [1, 1, 1]}),
+        )
+        .await;
+    let r = tokio::time::timeout(Duration::from_secs(1), refused.receipt("bad-1"))
+        .await
+        .expect("a refusal is answered at once");
+    assert_eq!(r["outcome"], "refused");
+    let mut v = Viewer::connect_from(&c.url, Some("198.51.100.31")).await;
+    v.intent("l-0", "light", light(0.0)).await;
+    // A refusal on the same connection is not held behind the commit waiting for the store.
+    v.intent(
+        "bad-2",
+        "light",
+        json!({"pos": [1.0e9, 0.0, 0.0], "color": [1, 1, 1]}),
+    )
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(1), v.receipt("bad-2"))
+        .await
+        .expect("a refusal is answered while an earlier commit waits for the store");
+    assert_eq!(r["outcome"], "refused");
+    // The store ticks once a second: three ticks pass with every write failing.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), v.receipt("l-0"))
+            .await
+            .is_err(),
+        "a receipt was sent before any stored state held its change"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::time::timeout(Duration::from_secs(5), v.receipt("l-0"))
+        .await
+        .expect("the receipt once a write holding it is stored");
+    assert_eq!(r["outcome"], "committed");
+    let bytes = stored.lock().unwrap().clone().expect("a stored state");
+    let state: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(state.receipts.contains_key("l-0"));
+    assert!(state.version >= r["version"].as_u64().unwrap());
+}
+
+/// A PUT that S3 stored but whose answer was lost: the retry is refused (412) by the
+/// coordinator's own write, which is not another writer. The object is one of the bodies it
+/// sent, so it writes on it, and a later state is stored on top.
+#[tokio::test]
+async fn a_write_whose_answer_was_lost_is_not_taken_for_another_writer() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    let (tx, lost) = store::spawn_s3_writer(
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap(),
+    );
+    let write = |bytes: Vec<u8>| {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        tx.send(store::StoreCmd {
+            bytes: Some(Arc::new(bytes)),
+            ack: Some(ack),
+        })
+        .unwrap();
+        done
+    };
+    assert!(write(state(1)).await.unwrap());
+    // The second write is stored, and its answer lost.
+    s3.lose_put_answer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(!write(state(2)).await.unwrap(), "no answer, not stored");
+    assert_eq!(s3.latest(path), Some(state(2)), "S3 stored it");
+    // The writer sends a newer state on the old ETag.
+    assert!(
+        write(state(3)).await.unwrap(),
+        "a write refused only by this coordinator's own earlier write is stored"
+    );
+    assert!(!*lost.borrow(), "the writer did not stop");
+    assert_eq!(s3.latest(path), Some(state(3)));
+}
+
+/// Recovery from an unreadable object starts below the version its GET read. When another
+/// writer replaces the object between that GET and the version listing, the newest listed
+/// version is the replacement, which parses: the object is read again and the coordinator
+/// starts from it, not from a version older than both.
+#[tokio::test]
+async fn recovery_reads_again_when_the_object_is_replaced_meanwhile() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    s3.put_version(path, state(40));
+    s3.put_version(path, b"not json".to_vec());
+    *s3.on_list.lock().unwrap() = Some((path.to_string(), state(42)));
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let back = obj.load().await.unwrap().expect("a state");
+    assert_eq!(back.version, 42, "the replacement, not an older version");
+}
+
+/// Recovery from an unreadable newest object stops at an earlier version it cannot read
+/// (503): that version may hold changes the older ones lack, so loading an older one past it
+/// could drop them. A version that is gone (404) is passed over.
+#[tokio::test]
+async fn recovery_stops_at_an_earlier_version_it_cannot_read() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let mut old = State::new(Config::default(), 1_000);
+    old.version = 40;
+    let mut newer = old.clone();
+    newer.version = 41;
+    s3.put_version(path, serde_json::to_vec(&old).unwrap());
+    s3.put_version(path, serde_json::to_vec(&newer).unwrap());
+    s3.put_version(path, b"not json".to_vec());
+    // The fake numbers versions v0, v1, v2 in the order they were put: v1 is `newer`.
+    *s3.unreadable.lock().unwrap() = Some("v1".into());
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let e = obj.load().await.unwrap_err();
+    assert!(format!("{e:#}").contains("503"), "{e:#}");
+    *s3.unreadable.lock().unwrap() = None;
+    let back = obj.load().await.unwrap().expect("a version");
+    assert_eq!(back.version, 41);
+}
+
+/// The test's own coordinator dies with the test (SIGKILL on the parent's death, the parent
+/// rechecked after the fork), as tests/common/mod.rs::set_test_pdeathsig does for the VM
+/// tests: nextest's SIGKILL skips kill_on_drop.
+fn arm_test_pdeathsig(cmd: &mut tokio::process::Command) {
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: two async-signal-safe calls in the forked child; nothing allocated.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Every fcvm this file starts by hand dies with the test process (PR_SET_PDEATHSIG), as the
+/// repository's per-hop teardown rule asks, and starts from an empty environment, so a shell
+/// with deployment settings (FLEET_HOST_TEMPLATES, AWS credentials) cannot reach real capacity.
+#[test]
+fn every_fcvm_this_file_spawns_dies_with_the_test() {
+    let src = include_str!("test_fleet_coord.rs");
+    let needle = concat!("Command::new(env!(\"CARGO_BIN_", "EXE_fcvm\"))");
+    let mut found = 0;
+    for (i, _) in src.match_indices(needle) {
+        found += 1;
+        let after: String = src[i..].lines().take(24).collect::<Vec<_>>().join("\n");
+        assert!(
+            after.contains("arm_test_pdeathsig(&mut"),
+            "a spawn without a parent-death signal:\n{after}"
+        );
+        assert!(
+            after.contains(".env_clear()"),
+            "a spawn that inherits the test's environment:\n{after}"
+        );
+    }
+    assert!(found > 0, "the check found no spawn to look at");
+}
+
+/// An EC2 driver that counts its sweeps and launches nothing.
+#[derive(Default)]
+struct CountingSweeps {
+    sweeps: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for CountingSweeps {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Err(ec2::LaunchError::Failed(anyhow::anyhow!(
+            "no launches in this test"
+        )))
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn sweep(&self) -> anyhow::Result<usize> {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+/// A starting coordinator sweeps the EC2 tiles an earlier one left only once its first state
+/// write is stored, which the conditional PUT makes a proof that it owns the state object: a
+/// coordinator that lost the object to another one never sweeps that one's tiles.
+#[tokio::test]
+async fn the_startup_ec2_sweep_waits_for_a_stored_write() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let driver = Arc::new(CountingSweeps::default());
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        Some(tx),
+        Some(driver.clone()),
+        None,
+        None,
+        None,
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        driver.sweeps.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "swept before any write was stored"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while driver.sweeps.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the sweep once a write is stored");
+}
+
+/// A committed word's receipt waits for the store, so while writes fail a page's words wait
+/// too. A word id sent again joins the one waiting (one receipt, not one per copy), and past
+/// `WORDS_WAITING` waiting words a new one is refused at once, unrecorded, so a store outage
+/// cannot pile up a connection's tasks.
+#[tokio::test]
+async fn words_waiting_for_the_store_are_joined_and_capped() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        config: Config {
+            word_interval_ms: 0,
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut v = Viewer::connect_from(&c.url, Some("198.51.100.40")).await;
+    v.intent("w-0", "word", json!({"text": "w0"})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..50 {
+        v.intent("w-0", "word", json!({"text": "w0"})).await;
+    }
+    for i in 1..live::WORDS_WAITING {
+        v.intent(&format!("w-{i}"), "word", json!({"text": format!("w{i}")}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let over = format!("w-{}", live::WORDS_WAITING);
+    v.intent(&over, "word", json!({"text": "over"})).await;
+    let r = tokio::time::timeout(Duration::from_secs(1), v.receipt(&over))
+        .await
+        .expect("a word past the cap is answered at once");
+    assert_eq!(r["outcome"], "refused", "{r}");
+    assert_eq!(r["reason"], live::WORDS_WAITING_REFUSAL);
+    assert_eq!(r["version"], 0, "not recorded: it may be sent again");
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(3);
+    while tokio::time::timeout(until.saturating_duration_since(Instant::now()), v.recv())
+        .await
+        .is_ok()
+    {}
+    let first: Vec<&Value> = v.receipts.iter().filter(|r| r["id"] == "w-0").collect();
+    assert_eq!(first.len(), 1, "one receipt for one word id: {first:?}");
+    assert_eq!(first[0]["outcome"], "committed");
+}
+
+/// A claim that ends while its receipt waits for the store (here: writes fail for longer
+/// than the claim lasts) is still told to its page once the receipt goes, as ended, so the
+/// page does not wait for a GPU that is gone.
+#[tokio::test]
+async fn a_claim_that_ends_while_its_receipt_waits_is_told_as_ended() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        config: Config {
+            max_tiles: 1,
+            claim_secs: 1,
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut agent = FakeAgent::connect(&c.handle, "gpu-a", 2);
+    agent.assign().await;
+    let mut v = Viewer::connect(&c.url).await;
+    v.until(|s| s["fleet"]["n"] == 1).await;
+    v.intent("c-0", "claim_gpu", json!({})).await;
+    // The claim lasts 1 s; the store ticks find every write failing for 3 s.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::time::timeout(Duration::from_secs(5), v.receipt("c-0"))
+        .await
+        .expect("the receipt once stored");
+    assert_eq!(r["outcome"], "committed", "{r}");
+    let m = tokio::time::timeout(
+        Duration::from_secs(5),
+        v.message_where("claim", |m| m["claim"]["phase"] == "ended"),
+    )
+    .await
+    .expect("the page is told its claim ended");
+    assert_eq!(m["claim"]["ended"], "expired");
+}
+
+/// `fcvm fleet coord` on a state file, its stderr echoed to the test's, and its `/live` URL.
+struct CoordProcess {
+    child: tokio::process::Child,
+    url: String,
+}
+
+async fn coord_process(state: &std::path::Path) -> CoordProcess {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
+    // Nothing from the shell that runs the test: an operator's FLEET_* or AWS settings would
+    // turn on host launches, EC2 tiles or an S3 store in a test of a local state file.
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.args([
+        "fleet",
+        "coord",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-tiles",
+        "1",
+    ])
+    .arg("--state-file")
+    .arg(state)
+    .env("RUST_LOG", "fcvm=info")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+    arm_test_pdeathsig(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<String>();
+    // Read stderr to its end, so the process never blocks on a full pipe.
+    tokio::spawn(async move {
+        let mut addr_tx = Some(addr_tx);
+        while let Ok(Some(l)) = lines.next_line().await {
+            eprintln!("coord: {l}");
+            if let Some(a) = l.strip_prefix("fleet coordinator listening on ") {
+                if let Some(t) = addr_tx.take() {
+                    let _ = t.send(a.trim().to_string());
+                }
+            }
+        }
+    });
+    let addr = tokio::time::timeout(Duration::from_secs(30), addr_rx)
+        .await
+        .expect("the coordinator listens within 30 s")
+        .expect("the coordinator printed its address");
+    CoordProcess {
+        child,
+        url: format!("ws://{addr}/live"),
+    }
+}
+
+/// The owner's rule: a change the coordinator acknowledged survives the coordinator dying.
+/// A viewer drops a light and votes for the next stop, and is answered for each; the process
+/// is then stopped with `signal` the moment the last answer arrives (SIGKILL: no shutdown runs
+/// at all). A new process on the same state file holds both: each intent sent again gets its
+/// first receipt, and the light and the vote are in the snapshot.
+async fn acknowledged_state_survives(signal: nix::sys::signal::Signal) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("fleet.json");
+    let mut first = coord_process(&state).await;
+    let mut v = Viewer::connect(&first.url).await;
+    let s = v.until(|s| !s["nudges"]["targets"][0].is_null()).await;
+    let target = s["nudges"]["targets"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    v.intent("l-0", "light", light(3.0)).await;
+    v.intent("n-0", "nudge", json!({"target": target})).await;
+    let mut versions = BTreeMap::new();
+    for id in ["l-0", "n-0"] {
+        let r = v.receipt(id).await;
+        assert_eq!(r["outcome"], "committed", "{r}");
+        versions.insert(id, r["version"].as_u64().unwrap());
+    }
+    let pid = nix::unistd::Pid::from_raw(first.child.id().unwrap() as i32);
+    nix::sys::signal::kill(pid, signal).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+        .await
+        .expect("the coordinator exits")
+        .unwrap();
+    if signal == nix::sys::signal::Signal::SIGTERM {
+        assert!(
+            status.success(),
+            "a stopped coordinator stored its state: {status}"
+        );
+    }
+
+    let second = coord_process(&state).await;
+    let mut w = Viewer::connect(&second.url).await;
+    let s = w.until(|s| !s["scene"].is_null()).await;
+    let lights = s["scene"]["lights"].as_array().unwrap();
+    assert_eq!(lights.len(), 1, "the light: {lights:?}");
+    assert_eq!(lights[0]["pos"][0], 3.0);
+    let tally: u64 = s["nudges"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["id"] == target.as_str())
+        .map(|t| t["votes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(tally, 1, "the vote: {}", s["nudges"]);
+    // Each intent sent again: its first receipt, from the stored state.
+    w.intent("l-0", "light", light(3.0)).await;
+    w.intent("n-0", "nudge", json!({"target": target})).await;
+    for (id, version) in &versions {
+        let r = w.receipt(id).await;
+        assert_eq!(r["outcome"], "committed", "{r}");
+        assert_eq!(r["version"].as_u64(), Some(*version), "{id}: {r}");
+    }
+}
+
+#[tokio::test]
+async fn acknowledged_state_survives_a_sigkill() {
+    acknowledged_state_survives(nix::sys::signal::Signal::SIGKILL).await;
+}
+
+#[tokio::test]
+async fn acknowledged_state_survives_a_sigterm() {
+    acknowledged_state_survives(nix::sys::signal::Signal::SIGTERM).await;
 }
 
 /// One EC2 API call: its region and its parameters.

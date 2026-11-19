@@ -939,10 +939,11 @@ impl State {
         let finished = |h: &HalfRace| h.done_at.is_some() || h.tiles.is_empty();
         f.races.retain(|r| finished(&r.fcvm) && finished(&r.ec2));
         f.next_race_at = config.race_interval_secs.map(|s| now_ms + s * 1000);
-        // The open stop vote starts again: its votes were counted by the previous process, and
-        // a state stored before the vote stayed open describes a round already decided.
+        // The open stop vote keeps its votes when the stored offer is the open round's: a vote
+        // is answered only once a stored state holds it. A stored vote whose offer is not that
+        // round's describes a round already decided, and starts again.
         let now_t = f.scene.t_at(now_ms);
-        f.director.restart_vote(now_t);
+        f.director.resume_vote(now_t);
         self.config = config;
         self.version += 1;
         self

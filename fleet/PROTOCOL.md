@@ -99,8 +99,17 @@ the latest.
 ```
 
 One per intent. `version` is the state version that first holds the intent's effect (or
-its refusal in `actions`). An intent id the coordinator has seen before, from any viewer,
-returns that id's first receipt again and changes nothing. `check` is present on `word`
+its refusal in `actions`). With a state store (`--state-file` or `--state-bucket`), a
+`committed` receipt is sent only once a stored state holds that version, so a coordinator
+that dies, even by SIGKILL, has acknowledged nothing it would forget; without one, `committed`
+means the coordinator's memory holds the change, and a restart starts from an empty state.
+One write each store tick (1 s) answers every intent applied before it, so a committed receipt arrives within about a second plus
+the write. A receipt the store never holds is never sent: the page sends the intent again
+after it reconnects. A refusal changes nothing and is sent at once. Snapshots are not
+held back: a snapshot can show a change whose receipt has not come yet, and a coordinator
+that dies before storing it comes back without it. An intent id the coordinator has seen
+before, from any viewer, returns that id's first receipt again (also once stored) and
+changes nothing. `check` is present on `word`
 intents that reached the text check: `verdict` is `allow`, `refuse` or `error`, and `sky`
 the words the new one was judged together with. A refusal with `version: 0` was not
 recorded (`"verify first"`: the connection has not passed Turnstile yet); the same id may
@@ -652,7 +661,23 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
   keeps versions) at most once a second while it changes and at shutdown. A missing object
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
-  without `s3:ListBucket`) stops the coordinator rather than start it empty.
+  without `s3:ListBucket`) stops the coordinator rather than start it empty. Every PUT is
+  conditional on the object this coordinator last read or wrote (`If-Match` on its ETag, or
+  `If-None-Match: *` when there was none). A PUT answered 412 is first checked against the
+  object: when it holds a body this coordinator sent since its last answered PUT (an earlier
+  write that was stored and whose answer was lost), it takes that ETag and writes again.
+  Otherwise another coordinator writes the object now: the coordinator logs
+  `FLEET_STATE_WRITE_LOST` at error level and writes nothing more. When that happens while it
+  runs, it exits without its shutdown write; when its shutdown write is the one refused, that
+  write is attempted and refused. Either way it skips the EC2 sweep, which would terminate the
+  other coordinator's tiles, and it also skips the sweep whenever its last write was not
+  stored (a 412 whose check could not read the object leaves ownership unknown); the next
+  coordinator sweeps at its start. An object that does not parse does not stop the coordinator:
+  it logs `FLEET_STATE_UNREADABLE` at error level and resumes from the newest earlier
+  version that parses (the changes stored after it are lost); with no such version among
+  the 20 before it, it does not start. Its first write then replaces the unreadable object.
+  The task's role needs `s3:ListBucketVersions` and `s3:GetObjectVersion` for this. Alarms
+  match those two strings.
 - `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
   live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. GPUs
   that connected hosts run phones on, and quarantined GPUs of connected hosts, come off it. It and
@@ -805,8 +830,28 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   30 s.
 - `--state-file` keeps the state as JSON, rewritten atomically (temporary file, fsync,
   rename) at most once a second while it changes, and once more on shutdown; a restarted
-  coordinator resumes its version, scene, director, races, receipts and action log from
-  it. Hosts, slots, claims and viewers are rebuilt as agents and browsers connect.
+  coordinator resumes from it (below). A file that does not parse stops the coordinator.
+
+#### What a restart keeps
+
+A coordinator that starts from a stored state (`State::resumed` in `fleet/core/src/state.rs`)
+restores what it can and releases what was bound to the old process:
+
+- Kept: the version, the scene (words, lights), the director, finished races, receipts, the
+  action log, the per-address limits and cooldowns, quarantines and their reports, counters
+  and potato mode's ladder and records.
+- The open stop vote: kept with its votes when the stored offer is the open round's;
+  otherwise the vote starts again. A stored vote may not have been answered (a coordinator
+  that dies after the write and before the receipt goes); the page that resends the intent
+  after reconnecting gets that vote's first receipt.
+- Released: a GPU claim, a borrowed phone, Windows sandbox or Minecraft server. Each is bound
+  to its viewer's `/live` connection, which ended with the old process, so each ends as it
+  would when that viewer left; the page shows its claim ended when it reconnects (a sandbox
+  or server is reset when its host is back, and its cooldown runs from the restart).
+- Released: a race the restart interrupted. Its times are the coordinator's sightings of each
+  tile's first frame, and those during the restart were not seen, so it cannot finish with a
+  true time. It leaves the race list; its tiles keep running.
+- Rebuilt: hosts, slots, viewers and the layout, as agents say hello and pages reconnect.
 - `--race-every` (also `FLEET_RACE_EVERY`) is the owner's race cadence; without it races
   run only on `restart_now`.
 - `--turnstile-secret` and `--turnstile-site-key` (also `FLEET_TURNSTILE_SECRET`,

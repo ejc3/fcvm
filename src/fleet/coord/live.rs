@@ -15,7 +15,7 @@ use super::admission::{Admitted, Gate};
 use super::poster::Poster;
 use super::text_check::{check_text, TextChecker};
 use super::turnstile::Verifier;
-use super::Handle;
+use super::{Handle, Submitted};
 use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
@@ -32,12 +32,17 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The largest message a browser may send.
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
+/// `word` intents one connection may have waiting for their receipts (a committed word's
+/// receipt waits for the store); past it a word is refused unrecorded.
+pub const WORDS_WAITING: usize = 8;
+pub const WORDS_WAITING_REFUSAL: &str =
+    "too many words from this page wait for the state to be stored; send it again later";
 
 /// `/live` sockets one IPv6 /64 may hold open at once. A /64 is one subscriber, and a page
 /// holds one socket (fleet/web wall-client.ts opens the next only after the last has closed);
@@ -641,9 +646,48 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         }
     });
 
+    // Receipts in the order their intents arrived, each sent once a stored state holds its
+    // change (a committed one; a refused one at once), so a coordinator that crashes has
+    // acknowledged nothing it did not store. Waiting here keeps the reader reading. A receipt
+    // that no stored state ever holds is never sent. A claim's messages start after its
+    // receipt, from the claim as it was when its intent applied: one that ended while the
+    // receipt waited for the store is still told, as ended.
+    type Queued = (
+        ServerMsg,
+        oneshot::Receiver<bool>,
+        Option<fleet_core::protocol::ClaimMsg>,
+    );
+    let (receipts, mut receipts_rx) = mpsc::channel::<Queued>(DIRECT_QUEUE);
+    let forward = {
+        let direct = direct.clone();
+        let handle = app.handle.clone();
+        let viewer = viewer.clone();
+        tokio::spawn(async move {
+            let mut claims = tokio::task::JoinSet::new();
+            while let Some((msg, stored, claim)) = receipts_rx.recv().await {
+                if stored.await != Ok(true) {
+                    continue;
+                }
+                if direct.send(msg).await.is_err() {
+                    return;
+                }
+                if let Some(seen) = claim {
+                    claims.spawn(tell_claim(
+                        handle.clone(),
+                        viewer.clone(),
+                        direct.clone(),
+                        Some(seen),
+                    ));
+                }
+            }
+        })
+    };
     let verified = Arc::new(AtomicBool::new(!app.cfg.verifier.required()));
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // The `word` intent ids of this connection with a task working on them: a repeated id
+    // joins its task, and at most WORDS_WAITING wait, so a store outage cannot pile up tasks.
+    let words: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // When this connection last asked for a fresh playback token.
     let mut last_playback: Option<std::time::Instant> = None;
@@ -737,22 +781,45 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 } else if late && LATE_REFUSED.contains(&name.as_str()) {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
-                    let app = app.clone();
-                    let viewer = viewer.clone();
-                    let client = client.clone();
-                    let direct = direct.clone();
-                    let checking = checking.clone();
-                    tasks.push(tokio::spawn(async move {
-                        if let Some(r) = word(&app, &viewer, &client, id, args, &checking).await {
-                            let _ = direct.try_send(r);
+                    let admitted = {
+                        let mut w = words.lock().unwrap();
+                        if w.contains(&id) {
+                            // Its task answers it.
+                            Some(false)
+                        } else if w.len() >= WORDS_WAITING {
+                            None
+                        } else {
+                            w.insert(id.clone());
+                            Some(true)
                         }
-                    }));
-                    None
+                    };
+                    match admitted {
+                        None => Some(unrecorded_refusal(id, WORDS_WAITING_REFUSAL)),
+                        Some(false) => None,
+                        Some(true) => {
+                            let app = app.clone();
+                            let viewer = viewer.clone();
+                            let client = client.clone();
+                            let direct = direct.clone();
+                            let checking = checking.clone();
+                            let words = words.clone();
+                            tasks.retain(|t| !t.is_finished());
+                            tasks.push(tokio::spawn(async move {
+                                let r =
+                                    word(&app, &viewer, &client, id.clone(), args, &checking).await;
+                                words.lock().unwrap().remove(&id);
+                                if let Some(r) = r {
+                                    let _ = direct.try_send(r);
+                                }
+                            }));
+                            None
+                        }
+                    }
                 } else {
                     let claim = name == "claim_gpu";
                     let r = app
                         .handle
-                        .apply(Event::Intent {
+                        .submit(Event::Intent {
                             at: 0,
                             viewer: viewer.clone(),
                             client: Some(client.clone()),
@@ -763,14 +830,36 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             secret: claim.then(|| uuid::Uuid::new_v4().simple().to_string()),
                         })
                         .await;
-                    if claim && r.as_ref().is_some_and(|r| r.outcome == Outcome::Committed) {
-                        tasks.push(tokio::spawn(tell_claim(
-                            app.handle.clone(),
-                            viewer.clone(),
-                            direct.clone(),
-                        )));
+                    if let Some(Submitted {
+                        receipt: Some(r),
+                        stored,
+                    }) = r
+                    {
+                        if r.outcome != Outcome::Committed {
+                            // A refusal changed nothing: sent now, not behind a committed
+                            // receipt that waits for the store.
+                            if direct.try_send(ServerMsg::receipt(&r)).is_err() {
+                                tracing::info!(%viewer, "viewer is not reading; closing");
+                                break;
+                            }
+                        } else if receipts
+                            .try_send((
+                                ServerMsg::receipt(&r),
+                                stored,
+                                // The claim now, before the receipt waits for the store.
+                                if claim {
+                                    app.handle.claim_for(&viewer).await
+                                } else {
+                                    None
+                                },
+                            ))
+                            .is_err()
+                        {
+                            tracing::info!(%viewer, "viewer is not reading its receipts; closing");
+                            break;
+                        }
                     }
-                    r.map(|r| ServerMsg::receipt(&r))
+                    None
                 }
             }
         };
@@ -784,6 +873,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     for t in tasks {
         t.abort();
     }
+    forward.abort();
     renew.abort();
     writer.abort();
     release(&gate);
@@ -797,9 +887,17 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
 
 /// Keep the claiming viewer, and only it, told about its GPU: a `claim` message whenever
 /// the claim changes (restoring, then running with its frame URL, a new camera), and a
-/// last one when it ends.
-async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerMsg>) {
+/// last one when it ends. `seen` is the claim as it was before its receipt waited for the
+/// store, so a claim that ended meanwhile is told as ended.
+async fn tell_claim(
+    handle: Handle,
+    viewer: String,
+    direct: mpsc::Sender<ServerMsg>,
+    seen: Option<fleet_core::protocol::ClaimMsg>,
+) {
+    // The last message sent, and the claim as last seen.
     let mut last: Option<fleet_core::protocol::ClaimMsg> = None;
+    let mut known = seen;
     loop {
         match handle.claim_for(&viewer).await {
             Some(c) => {
@@ -811,11 +909,12 @@ async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerM
                     {
                         return;
                     }
-                    last = Some(c);
+                    last = Some(c.clone());
                 }
+                known = Some(c);
             }
             None => {
-                let Some(mut c) = last else { return };
+                let Some(mut c) = known else { return };
                 let now = now_ms();
                 c.ended = Some(
                     if now >= c.expires_at {
