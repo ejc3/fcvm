@@ -8,7 +8,7 @@
 //! | `VerifiedViewers` | joined viewers, hidden pages included. With Turnstile on, a connection joins only once verified (Turnstile, a seat ticket or an Access token); without it, every connection joins |
 //! | `Power` | 0 asleep, 1 waking, 2 awake |
 //! | `SpendUsdToday` | today's spend (UTC), USD; only with a spend ceiling (`--daily-spend-usd`) |
-//! | `AwakeHosts` | GPU hosts whose agent is connected and that are not draining |
+//! | `AwakeHosts` | hosts whose agent is connected, reported at least one GPU and is not draining |
 //! | `BroadcastLive` | 1 when IVS answers that the broadcast channel is live, else 0 (offline, or IVS could not be asked); only with a broadcast whose secret names its `channel_arn` |
 //! | `CertDaysLeft` | days until the tile certificate in `--tls-secret` expires; only with a certificate secret, from its first read |
 //!
@@ -92,6 +92,7 @@ struct FleetPart {
 
 #[derive(Deserialize)]
 struct HostPart {
+    gpus: Vec<serde_json::Value>,
     draining: bool,
 }
 
@@ -123,7 +124,11 @@ pub fn emf_line(snapshot: &str, fleet: &str, now_ms: u64, probed: &Probed) -> Op
     if let Some(spend) = &f.spend {
         metrics.push(("SpendUsdToday", "None", spend.usd_today.into()));
     }
-    let awake = f.hosts.iter().filter(|h| !h.draining).count() as u64;
+    let awake = f
+        .hosts
+        .iter()
+        .filter(|h| !h.draining && !h.gpus.is_empty())
+        .count() as u64;
     metrics.push(("AwakeHosts", "Count", awake.into()));
     if let Some(live) = probed.broadcast_live {
         metrics.push(("BroadcastLive", "None", u8::from(live).into()));
@@ -321,7 +326,7 @@ mod tests {
     use super::*;
     use fleet_core::state::{Config, State};
 
-    /// A fleet with two hosts (one draining), three viewers (one hidden) and, with
+    /// A fleet with three hosts (one draining, one with no GPU), three viewers (one hidden) and, with
     /// `ceiling`, a spend ledger.
     fn fixture(ceiling: Option<f64>) -> State {
         let mut state = State::new(
@@ -331,11 +336,13 @@ mod tests {
             },
             0,
         );
-        for host in ["h1", "h2"] {
+        let t4 = serde_json::json!([{"name": "Tesla T4", "sbdf": "0000:01:00.0"}]);
+        // h3 reports no GPU: it serves no tile.
+        for (host, gpus) in [("h1", &t4), ("h2", &t4), ("h3", &serde_json::json!([]))] {
             let hello: fleet_core::Event = serde_json::from_value(serde_json::json!({
                 "at": 0, "type": "agent", "host": host,
                 "msg": {"type": "hello", "host": host, "arch": "x86_64", "capacity": 1,
-                        "gpus": [{"name": "Tesla T4", "sbdf": "0000:01:00.0"}]}}))
+                        "gpus": gpus}}))
             .unwrap();
             state = fleet_core::apply(state, &hello);
         }

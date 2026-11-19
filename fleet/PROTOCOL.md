@@ -741,7 +741,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   namespace `FCVM/Fleet`, dimension `Fleet` (`--fleet-name`), with or without a ceiling:
   `ActiveViewers` (joined viewers whose page is not hidden), `VerifiedViewers` (joined
   viewers; with Turnstile on, only verified connections join), `Power` (0 asleep, 1 waking,
-  2 awake), `AwakeHosts` (GPU hosts with a connected agent, not draining), `SpendUsdToday`
+  2 awake), `AwakeHosts` (hosts with a connected agent that reported a GPU, not draining), `SpendUsdToday`
   (with `--daily-spend-usd`), `BroadcastLive` (1 when IVS `GetStream` answers the
   broadcast channel is `LIVE`, else 0; with a broadcast secret that has `channel_arn`) and
   `CertDaysLeft` (days until the `not_after` of `--tls-secret`, read hourly; with
