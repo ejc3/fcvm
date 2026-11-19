@@ -582,7 +582,7 @@ export function potatoView(inp: PotatoInput): PotatoView {
     verify: verifyView(s),
     notice: potatoNotice(s.notices),
     sleep: s.accepted === null ? null : sleepView(s.accepted, now, online, s.pending.some((x) => x.intent.name === "wake")),
-    banner: s.accepted !== null && !online ? "The coordinator is offline. The game is shown as it last was; the buttons wait until it is back." : null,
+    banner: s.accepted !== null && !online ? "Reconnecting to the coordinator. The game is shown as it last was; the buttons wait until it is back." : null,
   };
   if (s.accepted === null || p === null) {
     return {

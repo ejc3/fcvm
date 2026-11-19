@@ -423,7 +423,7 @@ describe("Faster and Restart", () => {
     const s = reduce(stateWith(potato()), { type: "socket", status: "closed", at: T });
     const v = potatoView(input(s));
     expect([v.faster.disabled, v.faster.note, v.restart.disabled]).toEqual([true, "paused while the coordinator is offline", true]);
-    expect(v.banner).toBe("The coordinator is offline. The game is shown as it last was; the buttons wait until it is back.");
+    expect(v.banner).toBe("Reconnecting to the coordinator. The game is shown as it last was; the buttons wait until it is back.");
   });
 
   it("puts a refusal on screen as the coordinator gave it", () => {

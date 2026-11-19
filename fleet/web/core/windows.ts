@@ -405,7 +405,7 @@ export function windowsView(inp: WindowsInput): WindowsView {
     : s.admission?.locked === true
       ? seatsFull(s.admission.reason ?? null, s.admission.seat_free)
       : s.accepted !== null && !online
-        ? "The coordinator is offline. The picture still streams straight from the sandboxes; the controls are paused until it is back."
+        ? "Reconnecting to the coordinator. The picture still streams straight from the sandboxes; the controls are paused until it is back."
         : null;
   if (w === null || s.accepted === null) {
     return {

@@ -8,6 +8,46 @@ import type { FleetState } from "./protocol.ts";
 import { serverNow, type ClockState } from "./clock.ts";
 import type { ClientState } from "./store.ts";
 
+/** The IVS web player's version, pinned; its files are served from the page's own origin. */
+export const IVS_PLAYER_VERSION = "1.57.0";
+/**
+ * The player, from `public/ivs/<version>/` (fleet/web/README.md, "The IVS player"). IVS's own
+ * host, player.live-video.net, has no IPv6 address, so an IPv6-only viewer could not load it.
+ * The player finds its workers and wasm beside its own URL.
+ */
+export const IVS_PLAYER_URL = `/ivs/${IVS_PLAYER_VERSION}/amazon-ivs-player.min.js`;
+
+/** The player as the page shows it. */
+export type BroadcastStatus = "loading" | "playing" | "buffering" | "reconnecting" | "unavailable" | "unsupported";
+
+/**
+ * After this many failed loads in a row (the script or the stream failed, or the stream ended),
+ * with no frame played in between, the player says the broadcast is unavailable. It keeps
+ * loading again every few seconds.
+ */
+export const BROADCAST_UNAVAILABLE_AFTER = 3;
+
+/** The status after `failures` failed loads in a row. */
+export function failedStatus(failures: number): BroadcastStatus {
+  return failures >= BROADCAST_UNAVAILABLE_AFTER ? "unavailable" : "reconnecting";
+}
+
+/** The line over the player for a status, or null while it plays or loads. */
+export function broadcastNote(status: BroadcastStatus): string | null {
+  switch (status) {
+    case "reconnecting":
+      return "The broadcast is reconnecting.";
+    case "buffering":
+      return "The broadcast is buffering.";
+    case "unavailable":
+      return "The broadcast is unavailable right now. Trying again.";
+    case "unsupported":
+      return "This browser cannot play the broadcast.";
+    default:
+      return null;
+  }
+}
+
 /** How long snapshots are kept for the overlay: well past the broadcast's latency. */
 export const HISTORY_MS = 30_000;
 /** At most this many: snapshots arrive at most every 50 ms. */

@@ -6,10 +6,8 @@
 // the frame on screen and draws the overlay for that moment (core/broadcast.ts).
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { FrameMatcher, memoUntilFailure, tokenUsed, type ShownFrame } from "../../core/index.ts";
+import { broadcastNote, failedStatus, FrameMatcher, IVS_PLAYER_URL, memoUntilFailure, tokenUsed, type BroadcastStatus, type ShownFrame } from "../../core/index.ts";
 
-/** The IVS web player, pinned. */
-export const IVS_PLAYER_URL = "https://player.live-video.net/1.57.0/amazon-ivs-player.min.js";
 /** After an error or the end of the stream, the player is loaded again this much later. */
 const RETRY_MS = 3000;
 
@@ -78,8 +76,6 @@ function seiFrame(data: unknown): { t: number; e: number } | null {
   }
 }
 
-export type BroadcastStatus = "loading" | "playing" | "buffering" | "reconnecting" | "unsupported";
-
 type Css = { left: number; top: number; width: number; height: number };
 
 /**
@@ -146,6 +142,8 @@ export function Broadcast({
   const playerRef = useRef<IvsPlayer | null>(null);
   const [status, setStatus] = useState<BroadcastStatus>("loading");
   const [attempt, setAttempt] = useState(0);
+  // Failed loads since the player last played: enough of them and the broadcast is unavailable.
+  const failuresRef = useRef(0);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -166,7 +164,8 @@ export function Broadcast({
     const matcher = new FrameMatcher();
     const again = () => {
       if (gone || retry) return;
-      setStatus("reconnecting");
+      failuresRef.current += 1;
+      setStatus(failedStatus(failuresRef.current));
       retry = setTimeout(() => setAttempt((a) => a + 1), RETRY_MS);
     };
     const onPresented = (_now: number, md: VideoFrameCallbackMetadata) => {
@@ -186,7 +185,10 @@ export function Broadcast({
         playerRef.current = p;
         p.attachHTMLVideoElement(video);
         p.setMuted(true);
-        p.addEventListener(IVS.PlayerState.PLAYING, () => setStatus("playing"));
+        p.addEventListener(IVS.PlayerState.PLAYING, () => {
+          failuresRef.current = 0;
+          setStatus("playing");
+        });
         p.addEventListener(IVS.PlayerState.BUFFERING, () => setStatus("buffering"));
         p.addEventListener(IVS.PlayerState.ENDED, again);
         p.addEventListener(IVS.PlayerEventType.ERROR, again);
@@ -226,14 +228,7 @@ export function Broadcast({
     else p.play();
   }, [paused]);
 
-  const note =
-    status === "reconnecting"
-      ? "The broadcast is reconnecting."
-      : status === "buffering"
-        ? "The broadcast is buffering."
-        : status === "unsupported"
-          ? "This browser cannot play the broadcast."
-          : null;
+  const note = broadcastNote(status);
   // Zoomed, the page around it is hidden: the player stays visible over it, clipped to the stage.
   return (
     <div

@@ -746,7 +746,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
     : s.admission?.locked === true
       ? seatsFull(s.admission)
     : s.accepted !== null && !online
-      ? "The coordinator is offline. The picture still streams straight from the phones; the controls are paused until it is back."
+      ? "Reconnecting to the coordinator. The picture still streams straight from the phones; the controls are paused until it is back."
       : null;
   if (phones === null || s.accepted === null) {
     return {

@@ -568,7 +568,7 @@ describe("the header", () => {
     const v = minecraftView(input(s));
     expect(v.resetAll.disabled).toBe(true);
     expect(v.cards.every((c) => c.reset.disabled && c.fork.disabled && c.take.disabled)).toBe(true);
-    expect(v.banner).toMatch(/coordinator is offline/);
+    expect(v.banner).toMatch(/^Reconnecting to the coordinator\./);
   });
 });
 

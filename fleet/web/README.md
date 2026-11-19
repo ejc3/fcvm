@@ -162,6 +162,30 @@ and the Faster and Restart buttons. The mock runs no game unless `FLEET_MOCK_POT
 is set; its sleep and wake times and starting pace are the other `FLEET_MOCK_POTATO_*` knobs at
 the top of `mock/main.ts`, and `POST /mock/potato {"size": n}` starts it over at a size.
 
+## Production
+
+`wrangler.jsonc` has two Workers. The top level is staging (`fcvm-fleet-stage`, stage.fcvm.dev,
+behind Cloudflare Access); `env.production` is `fcvm-fleet`, the page for fcvm.dev, with no
+Access secrets: the page connects to the coordinator's `FLEET_COORD_URL`
+(`wss://fleet-api.fcvm.dev/live`) itself. `pnpm cf:build && pnpm exec wrangler deploy --env
+production --dry-run --outdir dist` builds it without deploying. The custom domain, the
+coordinator's public tunnel and the Turnstile widget are ejc3/aws's; `FLEET_TURNSTILE_SITE_KEY`
+holds a placeholder until that widget exists.
+
+### The IVS player
+
+The broadcast player is Amazon IVS's web player 1.57.0, served from the page's own origin
+(`public/ivs/1.57.0/`), because IVS's host for it, player.live-video.net, has no IPv6 address:
+an IPv6-only viewer could not load it from there. The player loads its workers and wasm from
+beside its own URL. `amazon-ivs-player.min.js` is the file at
+`https://player.live-video.net/1.57.0/`; the two workers and the wasm are the npm package
+`amazon-ivs-player@1.57.0`'s `dist/assets` files, the same bytes as the CDN's (the CDN stores the
+wasm gzip-encoded). `LICENSE.txt` is `https://player.live-video.net/LICENSE.txt`, and
+`SHA256SUMS` lists every file; `core/test/same-origin.test.ts` checks them and that the page's
+code names no other script host but Turnstile's, which Cloudflare serves only from its own
+host. To move to another version, fetch the same five files, write their checksums, and change
+`IVS_PLAYER_VERSION` in `core/broadcast.ts`.
+
 ## How the page works
 
 **The race is the hero.** The owner's schedule restarts every GPU on a cadence; the
@@ -235,9 +259,16 @@ copy goes once the canvas has painted.
 
 **Failure states.** A VM that did not come back shows its error and when the coordinator
 retries it. A host AWS reclaimed shows its tiles as reclaimed, with a banner, while the
-image is re-tiled, then as places with no GPU. With the coordinator offline the streams
-keep playing (they come from the VMs), a banner says so, and the controls are paused
-until it is back. EC2 places with no instance are hatched "AWS had no spot GPU".
+image is re-tiled, then as places with no GPU. Once the wake is done (the fleet is awake
+and every host the wake launched renders), an fcvm place with no GPU is hatched "AWS had no
+GPU": the fleet is short of a host AWS has not supplied, and the EC2 half keeps streaming.
+While a host of the wake still boots, such a place says "no GPU here yet". While the
+coordinator restarts or is unreachable the streams keep playing (they come from the VMs), a
+banner says "Reconnecting to the coordinator", and the controls are paused until it is back.
+EC2 places with no instance are hatched "AWS had no spot GPU". In broadcast mode, after three
+failed loads of the stream in a row the player says "The broadcast is unavailable right now.
+Trying again." and keeps loading it every 3 s; seated viewers' direct streams do not depend
+on it. Asleep, a broadcast viewer gets the recording, as every viewer does, and no player.
 
 **Your own GPU.** "Get your own GPU" borrows one of the wall's fcvm GPUs. The page opens a
 full-screen private view at once, timing from the click; the coordinator restores a VM on

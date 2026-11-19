@@ -184,7 +184,7 @@ describe("the race", () => {
 });
 
 describe("the one button", () => {
-  it("names the GPUs it restarts, waits out the cooldown, and pauses while the coordinator is offline", () => {
+  it("names the GPUs it restarts, waits out the cooldown, and pauses while it reconnects to the coordinator", () => {
     const st = fleet(2, 2, { cooldown_until: EPOCH + 23_000 });
     expect(view(stateWith(st), EPOCH).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: true, note: "available again in 0:23", hidden: false });
     expect(view(stateWith(st), EPOCH + 23_000).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: false, note: "", hidden: false });
@@ -192,7 +192,7 @@ describe("the one button", () => {
     const v = view(off, EPOCH + 30_000);
     expect(v.score!.button).toMatchObject({ disabled: true, note: "paused while the coordinator is offline" });
     expect(v.banners.map((b) => b.kind)).toEqual(["offline"]);
-    expect(v.banners[0]!.text).toBe("The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back.");
+    expect(v.banners[0]!.text).toBe("Reconnecting to the coordinator. The picture still streams straight from the VMs; the controls are paused until it is back.");
     // The streams are still planned: the picture keeps playing.
     expect(v.plan.direct.length).toBe(8);
     expect(v.play!.disabled).toBe(true);
@@ -218,6 +218,34 @@ describe("failure states", () => {
     // Two reported hosts, one of them also draining: counted once each.
     v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "a", since: EPOCH, sbdf: null, error: null }, { kind: "host_reclaimed", host: "b", since: EPOCH, sbdf: null, error: null }, { kind: "coordinator_degraded", host: null, since: EPOCH, sbdf: null, error: null }], fleet: { ...st.fleet, hosts: [{ name: "a", draining: true }] } }), EPOCH);
     expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe("AWS reclaimed 2 fcvm hosts. The image is re-tiled onto the GPUs left.");
+  });
+
+  it("marks an fcvm place with no GPU 'AWS had no GPU' once the wake is done, and the EC2 half keeps streaming", () => {
+    // Both fcvm hosts gone, or never supplied: every fcvm place is dark with no GPU behind it.
+    const woke = { started_at: EPOCH - 200_000, awake_at: EPOCH - 80_000, gpus: 8 };
+    const st = fleet(2, 2);
+    st.fleet.power = { ...st.fleet.power, state: "awake", woke_at: EPOCH - 200_000, last_wake: woke, wakes: [woke] };
+    for (const t of st.tiles.filter((x) => x.half === "fcvm")) Object.assign(t, { phase: "waiting_capacity", slot: null, host: null, frame_url: null, frame_url_v4: null, gpu: null });
+    const v = view(stateWith(st), EPOCH);
+    for (const t of v.tiles.filter((x) => x.half === "fcvm")) {
+      expect(t).toMatchObject({ dark: true, hatch: true, phase: "AWS had no GPU", glyph: { kind: "capacity" } });
+      expect(t.hover).toMatchObject({ gpu: "no GPU in this place", host: "waiting for AWS to supply a GPU host" });
+    }
+    expect(v.tiles.filter((x) => x.half === "ec2").every((t) => !t.dark)).toBe(true);
+    expect(v.plan.direct.map((d) => d.id).sort()).toEqual(["d:ec2:1", "d:ec2:2", "d:ec2:3", "d:ec2:4"]);
+    // A host of the wake still booting: its places are still to come, not refused.
+    const booting = structuredClone(st);
+    booting.fleet.power.hosts = [
+      { host: "i-a", phases: [{ phase: "instance_pending", at: EPOCH - 190_000 }, { phase: "tiles_rendering", at: EPOCH - 90_000 }] },
+      { host: "i-b", phases: [{ phase: "instance_pending", at: EPOCH - 190_000 }, { phase: "booted", at: EPOCH - 150_000 }] },
+    ];
+    const vb = view(stateWith(booting), EPOCH).tiles.find((x) => x.id === "fcvm:1")!;
+    expect(vb).toMatchObject({ dark: true, hatch: false, phase: "no GPU here yet", glyph: { kind: "empty" } });
+    expect(vb.hover.host).toBe("waiting for a GPU to join");
+    // A fleet that never scales to zero has no wake and launches no hosts: no claim about AWS.
+    const fixed = structuredClone(st);
+    fixed.fleet.power = { ...fixed.fleet.power, last_wake: null, wakes: [] };
+    expect(view(stateWith(fixed), EPOCH).tiles.find((x) => x.id === "fcvm:1")!.phase).toBe("no GPU here yet");
   });
 
   it("names each quarantined GPU and why in the strip, and nothing when none is out", () => {
@@ -1165,6 +1193,23 @@ describe("asleep and waking", () => {
     // The poster fills the image as for any sleep; nothing is left blank.
     expect(v.plan.posterFull).toBe(true);
     expect(v.tiles.every((t) => !t.dark)).toBe(true);
+  });
+
+  it("asleep, a viewer of the broadcast gets the recording and no player: there is nothing to broadcast", () => {
+    const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, reason: "budget" });
+    let s = stateWith(st);
+    // Seats full: this viewer watches the broadcast while the fleet is awake.
+    const late = { type: "admission", seat: null, locked: true, reason: "Direct streams are full, so you are watching the broadcast.", direct: null, broadcast: { value: "https://playback.example/c.m3u8", expires_at: EPOCH + 600_000 }, seat_free: false, capacity: 500, verify: false };
+    s = msg(s, late);
+    const media = { base: "/media", meta: null };
+    let v = view(s, EPOCH, { media });
+    expect(v.broadcast).toBeNull();
+    expect(v.reel!.show).toBe(true);
+    expect(v.sleep!.title).toBe("Resting until 00:00 UTC");
+    // Awake again, the same viewer plays the broadcast.
+    s = reduce(s, { type: "message", text: snapshotText(2, fleet(2, 2)), at: EPOCH + 1000 });
+    v = view(s, EPOCH + 1000, { media });
+    expect(v.broadcast?.url).toBe("https://playback.example/c.m3u8");
   });
 
   it("formats dates and minutes the way the page shows them", () => {

@@ -275,7 +275,7 @@ describe("the header", () => {
     let s = stateWith(windowsOf(2));
     s = reduce(s, { type: "socket", status: "closed", at: EPOCH });
     expect(windowsView(input(s)).resetAll.disabled).toBe(true);
-    expect(windowsView(input(s)).banner).toMatch(/coordinator is offline/);
+    expect(windowsView(input(s)).banner).toMatch(/^Reconnecting to the coordinator\./);
   });
 });
 
