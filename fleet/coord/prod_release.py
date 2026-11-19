@@ -110,9 +110,11 @@ def job(listed, name):
 
 
 def released(kind):
-    """The commit staging runs for `kind` and when its release finished: the newest run whose release
-    step succeeded. A release still running stops the promotion; a failed one restored its previous."""
+    """The commit staging runs for `kind` and when its release finished: of the listed runs (their
+    latest attempts), the release step that succeeded last, since a rerun of an older run can deploy
+    after a newer one. A release still running stops the promotion; a failed one left the previous."""
     job_name, step_name = RELEASES[kind]
+    latest = None
     for run in runs(WORKFLOWS[kind]):
         found = job(jobs(run["id"]), job_name)
         if found is None or found.get("conclusion") == "skipped":
@@ -120,13 +122,16 @@ def released(kind):
         if found.get("status") != "completed":
             raise Skip(f"a staging {kind} release is in progress")
         step = next((s for s in found.get("steps", []) if s.get("name") == step_name), None)
-        if step is None or step.get("conclusion") is None:
-            continue
-        if step["conclusion"] == "success":
-            return run["head_sha"], when(step["completed_at"])
         # A failed wrangler deploy leaves the previous Worker version, and a failed coordinator release
         # restores the previous image (decide() checks staging's pointer against the commit found here).
-    raise Skip(f"no staging {kind} release among the last {RUNS} runs")
+        if step is None or step.get("conclusion") != "success":
+            continue
+        finished = when(step["completed_at"])
+        if latest is None or finished > latest[1]:
+            latest = (run["head_sha"], finished)
+    if latest is None:
+        raise Skip(f"no staging {kind} release among the last {RUNS} runs")
+    return latest
 
 
 def smokes(since):

@@ -1529,14 +1529,30 @@ class ResolveRetransmitTests(unittest.TestCase):
     def test_the_failure_names_the_tile_key_and_the_success_reports_sends(self):
         resolver, _ = self.serve(drop=None)
         tile = dict(frame_url="wss://a.fcvm.dev/frames", frame_url_v4="wss://b.fcvm.dev:20200/frames")
-        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6):
-            with self.assertRaises(TimeoutError) as caught:
+        out = io.StringIO()
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(TimeoutError):
                 smoke.prove_resolves(tile)
-        self.assertIn("frame_url", str(caught.exception))
+        self.assertEqual(json.loads(out.getvalue())["record"], "frame_url")
         resolver, _ = self.serve(drop=1)
         with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)):
             slowest, sends = smoke.prove_resolves(tile)
         self.assertEqual(sends, 2)
+
+    def test_the_failure_line_names_the_resolver_record_and_datagrams(self):
+        # 2026-11-19: the scheduled smoke printed {"errorType": "TimeoutError", "error": null}.
+        resolver, received = self.serve(drop=None)
+        tile = dict(frame_url="wss://a.fcvm.dev/frames", frame_url_v4="wss://b.fcvm.dev:20200/frames")
+        out = io.StringIO()
+        with patch.object(smoke, "PUBLIC_RESOLVERS", (resolver,)), patch.object(smoke, "RESOLVE_WITHIN", 0.6), \
+                contextlib.redirect_stdout(out), self.assertRaises(TimeoutError) as caught:
+            smoke.prove_resolves(tile)
+        self.assertIsNotNone(smoke.describe(caught.exception), "the failure line would print no error text")
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(lines, [{"resolve": "no answer", "record": "frame_url", "type": "AAAA",
+                                  "resolver": resolver, "sends": len(received), "within_s": 0.6}])
+        self.assertNotIn("fcvm.dev", out.getvalue() + str(caught.exception))
 
 
 class SettleBoundTests(unittest.TestCase):
@@ -1703,6 +1719,15 @@ class ProdDecideTests(unittest.TestCase):
     def test_a_failed_viewer_is_no_smoke(self):
         self.gh.jobs[self.coordinator_run][-1]["conclusion"] = "failure"
         self.skips("no staging smoke")
+
+    def test_the_release_that_finished_last_is_staging_even_from_an_older_run(self):
+        # An older run rerun after a newer one deployed: its deploy finished last, so staging serves it.
+        older = self.gh.runs["fleet-web-deploy.yml"][-1]
+        self.gh.run("fleet-web-deploy.yml", "f" * 40, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1020, 1040)])
+        self.assertEqual(prod.released("web")[0], self.W)
+        self.gh.jobs[older["id"]] = [release_job("Deploy fcvm-fleet-stage", "Deploy", 1600, 1700, status="in_progress")]
+        with self.assertRaisesRegex(prod.Skip, "in progress"):
+            prod.released("web")
 
     def test_staging_running_an_unverified_generation_promotes_nothing(self):
         self.status["stage_verified"] = False
@@ -2012,15 +2037,29 @@ class ProdWorkflowTests(unittest.TestCase):
             self.assertNotRegex(text, r"publish\.py(?! --stack prod)")
             self.assertNotIn("RELEASE_GATE", text)
 
-    def test_the_rollback_job_runs_on_a_failed_release_or_smoke_and_force_is_only_in_rollbacks(self):
+    def test_the_rollback_job_runs_on_a_failed_release_smoke_or_record_and_force_is_only_in_rollbacks(self):
         jobs = self.jobs("fleet-prod-promote.yml")
         self.assertIn("needs.release.result == 'failure'", jobs["rollback"])
         self.assertIn("needs.smoke.result != 'success'", jobs["rollback"])
+        # A record that was not written would leave prod on a set its record does not describe.
+        self.assertIn("needs.record.result != 'success'", jobs["rollback"])
+        self.assertIn("needs: [candidate, release, smoke, record]", jobs["rollback"])
         self.assertIn("--force", jobs["rollback"])
         for job, body in jobs.items():
             if job != "rollback":
                 self.assertNotIn("--force", body, job)
         self.assertIn("needs.smoke.result == 'success'", jobs["record"])
+
+    def test_every_component_rollback_is_attempted_whatever_failed_before_it(self):
+        steps = {"fleet-prod-promote.yml": self.jobs("fleet-prod-promote.yml")["rollback"],
+                 "fleet-prod-rollback.yml": self.jobs("fleet-prod-rollback.yml")["rollback"]}
+        for name, body in steps.items():
+            for step in ("Worker", "Coordinator", "Host and tile images"):
+                with self.subTest(workflow=name, step=step):
+                    block = body.split(f"      - name: {step}\n", 1)[1].split("\n      - ", 1)[0]
+                    self.assertRegex(block, r"(?m)^        if: \$\{\{ !cancelled\(\)", "a failed rollback step skips this one")
+        final = steps["fleet-prod-promote.yml"].split("      - name: The promotion failed\n", 1)[1]
+        self.assertIn("if: ${{ always() }}", final)
 
     def test_the_prod_smoke_is_both_families_with_the_unverified_probe_and_its_callers_pass_secrets(self):
         jobs = self.jobs("fleet-prod-smoke.yml")

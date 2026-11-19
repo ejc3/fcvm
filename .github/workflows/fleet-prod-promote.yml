@@ -288,12 +288,15 @@ jobs:
 
   rollback:
     name: Roll the set back
-    needs: [candidate, release, smoke]
-    # A release that failed part way, or a set the prod smoke failed. A release held before any change
-    # skips the smoke and needs no rollback.
+    needs: [candidate, release, smoke, record]
+    # A release that failed part way, a set the prod smoke failed, or a record that was not written (prod
+    # would run a set its record does not describe, and the next promotion would stop on that). A
+    # release held before any change skips the smoke and needs no rollback. Each step below runs
+    # whatever the one before it did, so one failed component never leaves another on the new set.
     if: >-
       ${{ always() && needs.candidate.outputs.promote == 'true' && (needs.release.result == 'failure' ||
-        (needs.release.result == 'success' && needs.release.outputs.held != 'true' && needs.smoke.result != 'success')) }}
+        (needs.release.result == 'success' && needs.release.outputs.held != 'true'
+         && (needs.smoke.result != 'success' || needs.record.result != 'success'))) }}
     runs-on: ubuntu-24.04
     environment: fleet-prod-deploy
     timeout-minutes: 360
@@ -325,7 +328,7 @@ jobs:
           role-duration-seconds: 21600
           mask-aws-account-id: true
       - name: Worker
-        if: needs.candidate.outputs.web == 'true'
+        if: ${{ !cancelled() && needs.candidate.outputs.web == 'true' }}
         working-directory: fleet/web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -341,7 +344,7 @@ jobs:
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm rollback"
       - name: Coordinator
-        if: needs.candidate.outputs.coordinator == 'true'
+        if: ${{ !cancelled() && needs.candidate.outputs.coordinator == 'true' }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
@@ -355,13 +358,14 @@ jobs:
           python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")"
       # Waits for prod to sleep: its templates change only then.
       - name: Host and tile images
-        if: needs.candidate.outputs.image == 'true'
+        if: ${{ !cancelled() && needs.candidate.outputs.image == 'true' }}
         env:
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
           TARGET: ${{ needs.candidate.outputs.target }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
         run: python3 -B fleet/coord/prod_release.py image-rollback "$TARGET" "$PRIOR"
       - name: The promotion failed
+        if: ${{ always() }}
         run: |
           echo "::error::the promotion failed; prod was returned to its previous set"
           exit 1

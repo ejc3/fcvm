@@ -58,7 +58,9 @@ jobs:
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
         run: python3 -B fleet/coord/prod_release.py current
+      # Each component is returned whatever the one before it did; any failure still fails the job.
       - name: Worker
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         working-directory: fleet/web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -75,6 +77,7 @@ jobs:
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm rollback"
       - name: Coordinator
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PREVIOUS: ${{ steps.current.outputs.previous }}
@@ -82,6 +85,7 @@ jobs:
           python3 -B fleet/coord/publish.py --stack prod --force \
             --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"
       - name: Host and tile images
+        if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
           CURRENT: ${{ steps.current.outputs.current }}

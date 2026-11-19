@@ -409,6 +409,10 @@ def resolver_address(resolver):
 RETRANSMIT_EVERY = 0.5
 
 
+class ResolveTimeout(TimeoutError):
+    """A resolver that did not answer in time; `sends` is how many datagrams it was sent."""
+
+
 def resolve(resolver, name, qtype, timeout):
     """One lookup at a resolver: (addresses, datagrams sent). The identical query (same id) is
     resent every RETRANSMIT_EVERY seconds until the answer or timeout, as a stub resolver does,
@@ -423,9 +427,10 @@ def resolve(resolver, name, qtype, timeout):
         while True:
             now = time.monotonic()
             if now >= deadline:
-                lost = TimeoutError(
+                lost = ResolveTimeout(
                     f"resolver {resolver} did not answer a {'AAAA' if qtype == 28 else 'A'} query "
                     f"within {timeout:g}s after {sends} datagrams")
+                lost.sends = sends
                 raise lost
             if now >= start + sends * RETRANSMIT_EVERY:
                 s.send(query)
@@ -449,9 +454,11 @@ def prove_resolves(tile):
             start = time.monotonic()
             try:
                 found, sends = resolve(resolver, host, qtype, RESOLVE_WITHIN)
-            except TimeoutError as error:
-                lost = TimeoutError(f"{key}: {error}")
-                raise lost from None
+            except ResolveTimeout as error:
+                # Which resolver, record and datagram count; never the tile's host name.
+                print(json.dumps({"resolve": "no answer", "record": key, "type": "AAAA" if qtype == 28 else "A",
+                                  "resolver": resolver, "sends": error.sends, "within_s": RESOLVE_WITHIN}), flush=True)
+                raise TimeoutError("a public resolver did not answer a fresh launch name in time") from None
             took = time.monotonic() - start
             if not found or took > RESOLVE_WITHIN:
                 raise AssertionError("a fresh launch name did not resolve on its first query")
