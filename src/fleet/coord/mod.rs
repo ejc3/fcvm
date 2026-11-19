@@ -699,6 +699,32 @@ impl Actor {
                         ended: None,
                     })
                 });
+                // A claim a restart carried over whose GPU's host is not back yet: restoring.
+                let info = info.or_else(|| {
+                    let c = self
+                        .state
+                        .fleet
+                        .held_claims
+                        .iter()
+                        .map(|h| &h.claim)
+                        .find(|c| c.viewer == viewer)?;
+                    Some(ClaimMsg {
+                        id: c.session.clone(),
+                        tile: c.borrowed.clone(),
+                        phase: "restoring".into(),
+                        frame_url: None,
+                        frame_url_v4: None,
+                        token: c.token.clone(),
+                        clicked_at: c.claimed_at,
+                        first_frame_at: c.first_frame_at,
+                        expires_at: c.expires_at,
+                        gpu: None,
+                        phases: Default::default(),
+                        camera: c.camera.clone(),
+                        autopilot: c.autopilot,
+                        ended: None,
+                    })
+                });
                 let _ = reply.send(info);
             }
             Cmd::AgentHello {

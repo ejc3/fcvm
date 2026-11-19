@@ -41,7 +41,7 @@ import {
   type ZoomStep,
 } from "../../core/index.ts";
 import { ModeSwitch } from "./ModeSwitch.tsx";
-import { canDecodeH264, WallClient } from "./wall-client.ts";
+import { canDecodeH264, newClaimToken, WallClient } from "./wall-client.ts";
 import { boxOf, sameBox, useMedia } from "./hooks.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
@@ -649,7 +649,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
   const getOwnGpu = (from: HTMLElement) => {
     returnFocus.current = from;
     client.ui({ drawer: false, focusId: null });
-    client.act("claim_gpu");
+    client.act("claim_gpu", { token: newClaimToken() });
   };
   const closeOwn = useCallback(() => {
     const c = client.getState().own.claim;

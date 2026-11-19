@@ -137,7 +137,20 @@ first frame, `phases` the agent's timings of the restore), again whenever its ca
 keyframes change (`claim_camera`, `claim_autopilot`, and the autopilot's next keyframes
 about every 8 s while it flies), and a last time with `phase: "ended"` and `ended` saying why
 (`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
-fleet). The frame URL and the token appear in no snapshot. `tile` is the wall tile it
+fleet). The frame URL and the token appear in no snapshot. A page whose connection drops
+while it holds a claim, or has sent a `claim_gpu` and not heard of the claim yet, presents
+the token on its new connection (`resume_claim`), under an
+intent id of that connection's own and never by resending an earlier connection's resume: a
+coordinator answers a repeated id with its first receipt and binds nothing. A
+coordinator that restarted carried the claim over and gives it back to that connection,
+which is told about it from then on as above (`restoring` until the claim's host is back
+and its VM reports running). Otherwise the claim ended when the old connection closed, the
+resume is refused, and the page shows the claim ended. A resume must arrive within the
+30 s window and before the claim expires, and the claim then counts against the address that
+took it back (one GPU per address). A `claim_gpu` resent on the new connection is answered
+with its first receipt when the coordinator stored it before restarting, and the resume binds
+the claim; when it had not, the resent request makes the claim for this connection with the
+same token, and the resume is answered as done. `tile` is the wall tile it
 borrowed, null for a standby GPU. `autopilot` is true while the camera flies the
 autopilot's loop (below) and false once the viewer has paused it or taken the camera.
 
@@ -183,8 +196,9 @@ Intents:
 | `nudge` | `{"target": "<viewpoint>"}` | a vote in the open vote (below), among `nudges.targets`; one vote per client, the latest counts; a pick of the hold just decided (`nudges.next`) is accepted and changes nothing; refused only for a target not offered |
 | `word` | `{"text": "hello", "text_style": "skywriting"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below). `text_style` is how the renderer draws it (#1178): `lockup` (when absent or null), `skywriting` or `landmark`; anything else is refused before the text check |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
-| `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
+| `claim_gpu` | `{"token": "<32 to 128 letters, digits, - or _>"}` (or `{}`) | a GPU of your own for 60 s (below). `token` becomes the claim's token, so the page knows it before any `claim` message; without one the coordinator makes one; a malformed one is refused unrecorded. Its args are never in `actions` |
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
+| `resume_claim` | `{"token": "<the claim's token>"}` | takes back, on a new connection, a claim a coordinator restart carried over (below, "What a restart keeps"); refused for any other claim, or when this connection already holds one. Its args are never in `actions` |
 | `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50. On a camera flying its autopilot it also stops the autopilot: the camera eases to rest along its path over 0.5 s while it turns by the drag |
 | `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
 | `claim_phone` | `{"phone": "phone-2"}` (or `{}`: any free phone) | borrows a phone for 120 s (`phone_claim_secs`); see "Phones mode" below |
@@ -844,10 +858,21 @@ restores what it can and releases what was bound to the old process:
   otherwise the vote starts again. A stored vote may not have been answered (a coordinator
   that dies after the write and before the receipt goes); the page that resends the intent
   after reconnecting gets that vote's first receipt.
-- Released: a GPU claim, a borrowed phone, Windows sandbox or Minecraft server. Each is bound
-  to its viewer's `/live` connection, which ended with the old process, so each ends as it
-  would when that viewer left; the page shows its claim ended when it reconnects (a sandbox
-  or server is reset when its host is back, and its cooldown runs from the restart).
+- A GPU claim: kept until it expires. A page proves it holds the claim with the claim's
+  token. Its VM keeps running only on a host whose agent outlives the coordinator (an agent
+  that dials in, or runs under its own service); an agent started with `--agent-cmd` is the
+  coordinator's child and stops with it, taking its VMs, and the claim then comes back on its
+  GPU's slot and is restored there anew. The claim waits for its host's agent to say
+  hello (then it is back on that GPU's slot, under the slot id it had and at the generation
+  the host runs, so nothing relaunches; hosts may come back in any order, and no other GPU
+  takes that slot id while the claim waits, since agents key their VMs by slot id) and for its page to present the token with `resume_claim`, which it must do
+  within 30 s of the restart or the claim ends and the GPU returns to the pool. A claim that
+  borrowed a wall tile counts toward `--max-borrowed` while it waits. A claim whose
+  time ran out while the coordinator was down ends then.
+- Released: a borrowed phone, Windows sandbox or Minecraft server. These carry no token, so
+  no page that reconnects can show it held one; each ends as it would when its viewer left
+  (a sandbox or server is reset when its host is back, and the cooldown runs from the
+  restart). The page sees the borrow gone from the snapshot.
 - Released: a race the restart interrupted. Its times are the coordinator's sightings of each
   tile's first frame, and those during the restart were not seen, so it cannot finish with a
   true time. It leaves the race list; its tiles keep running.
