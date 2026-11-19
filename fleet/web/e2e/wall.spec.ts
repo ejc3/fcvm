@@ -2,6 +2,7 @@ import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
 import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
+import { IVS_PLAYER_URL } from "../core/broadcast.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
@@ -1033,15 +1034,17 @@ const PLAYBACK_URL = "https://broadcast.example/playback.m3u8";
  * (fixtures/broadcast/ivs-player.js): every tile a flat colour, about 1.8 s behind. `late`: this
  * viewer connected while the seats were full, so it holds no direct token.
  */
-async function openBroadcast(page: Page, late: boolean): Promise<void> {
+async function openBroadcast(page: Page, late: boolean, opts: { fail?: boolean; frame?: boolean } = {}): Promise<void> {
   await admin("/mock/broadcast", { url: PLAYBACK_URL, late });
-  // The page loads the pinned player from IVS (Broadcast.tsx IVS_PLAYER_URL); the stand-in answers instead.
-  await page.route("https://player.live-video.net/**", (r) => r.fulfill({ path: "e2e/fixtures/broadcast/ivs-player.js", contentType: "text/javascript" }));
+  // The page loads the pinned player from its own origin (core/broadcast.ts IVS_PLAYER_URL); the stand-in answers instead.
+  await page.route(`**${IVS_PLAYER_URL}`, (r) => r.fulfill({ path: "e2e/fixtures/broadcast/ivs-player.js", contentType: "text/javascript" }));
   await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "broadcast"));
+  // IVS down: every load of the stream fails.
+  if (opts.fail) await page.addInitScript(() => ((window as unknown as { __fakeBroadcastFail: boolean }).__fakeBroadcastFail = true));
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet?.view().broadcast != null);
   // A frame presented and matched to its SEI: the overlay follows the picture.
-  await expect(page.getByTestId("broadcast-latency")).toHaveText(/behind the fleet/, { timeout: 20_000 });
+  if (opts.frame ?? !opts.fail) await expect(page.getByTestId("broadcast-latency")).toHaveText(/behind the fleet/, { timeout: 20_000 });
 }
 
 async function closeBroadcast(): Promise<void> {
@@ -1079,6 +1082,83 @@ const inside = (b: { x: number; y: number; w: number; h: number }, vw: number) =
     .flatMap((fy) => [0.06, 0.3, 0.5, 0.94].map((fx) => ({ x: b.x + b.w * fx, y: b.y + b.h * fy })))
     .filter((p) => p.x < vw - ZOOM_SHEET_W - 40);
 const zoomBox = (page: Page) => page.evaluate(() => window.__fleet!.view().plan.zoom?.box ?? null);
+
+test("broadcast mode: the player and every other script come from the page's own origin", async ({ page }) => {
+  // A script or worker from any other host is refused and kept for the assertion.
+  const foreign: string[] = [];
+  const own = new URL(test.info().project.use.baseURL!).origin;
+  await page.route(
+    (url) => url.origin !== own,
+    (r) => {
+      const t = r.request().resourceType();
+      if (t === "script" || t === "worker") {
+        foreign.push(r.request().url());
+        return r.abort();
+      }
+      return r.fallback();
+    },
+  );
+  const players: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes("amazon-ivs-player.min.js")) players.push(r.url());
+  });
+  await openBroadcast(page, true, { frame: false });
+  try {
+    await expect.poll(() => players.length).toBeGreaterThan(0);
+    expect(foreign).toEqual([]);
+    expect(players.every((u) => new URL(u).origin === own)).toBe(true);
+    // The stand-in plays from there.
+    await expect(page.getByTestId("broadcast-latency")).toHaveText(/behind the fleet/, { timeout: 20_000 });
+    expect(await page.evaluate(() => [...document.scripts].map((s) => s.src).filter((src) => src !== "" && new URL(src).origin !== location.origin))).toEqual([]);
+    expect(foreign).toEqual([]);
+  } finally {
+    await closeBroadcast();
+  }
+});
+
+test("the pinned IVS player runs from the page's origin and loads its worker and wasm from beside it", async ({ page }) => {
+  const asked: { url: string; status: number; type: string }[] = [];
+  page.on("response", (r) => {
+    if (r.url().includes("/ivs/")) asked.push({ url: r.url(), status: r.status(), type: r.headers()["content-type"] ?? "" });
+  });
+  await page.goto("/");
+  const supported = await page.evaluate(async (src) => {
+    await new Promise<void>((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = src;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error("the player did not load"));
+      document.head.appendChild(s);
+    });
+    const IVS = (window as unknown as { IVSPlayer: { isPlayerSupported: boolean; create(): { attachHTMLVideoElement(v: HTMLVideoElement): void; load(u: string): void } } }).IVSPlayer;
+    const p = IVS.create();
+    p.attachHTMLVideoElement(document.createElement("video"));
+    // No stream here: the load starts the player's worker, which is what this test needs.
+    p.load(`${location.origin}/ivs/no-such-stream.m3u8`);
+    return IVS.isPlayerSupported;
+  }, IVS_PLAYER_URL);
+  expect(supported).toBe(true);
+  const own = new URL(test.info().project.use.baseURL!).origin;
+  await expect.poll(() => asked.map((a) => new URL(a.url).pathname).sort(), { timeout: 15_000 }).toEqual(
+    expect.arrayContaining([IVS_PLAYER_URL, "/ivs/1.57.0/amazon-ivs-wasmworker.min.js", "/ivs/1.57.0/amazon-ivs-wasmworker.min.wasm"]),
+  );
+  for (const a of asked.filter((x) => x.url.includes("/ivs/1.57.0/"))) {
+    expect(new URL(a.url).origin, a.url).toBe(own);
+    expect(a.status, a.url).toBe(200);
+    if (a.url.endsWith(".wasm")) expect(a.type).toBe("application/wasm");
+  }
+});
+
+test("broadcast mode, IVS down: the player says the broadcast is unavailable and keeps trying", async ({ page }) => {
+  await openBroadcast(page, true, { fail: true });
+  try {
+    await expect(page.getByTestId("broadcast")).toHaveAttribute("data-status", "reconnecting");
+    await expect(page.getByTestId("broadcast").getByRole("status")).toHaveText("The broadcast is unavailable right now. Trying again.", { timeout: 20_000 });
+    await expect(page.getByTestId("broadcast")).toHaveAttribute("data-status", "unavailable");
+  } finally {
+    await closeBroadcast();
+  }
+});
 
 test("broadcast mode: a click on a tile zooms the broadcast at once, then shows that VM's own stream, and Escape closes it", async ({ page }) => {
   await openBroadcast(page, false);
@@ -1362,7 +1442,7 @@ test("failure states: a failed VM with its retry, a reclaimed host re-tiling, th
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 20_000 }).toBe(15);
 
   await admin("/mock/offline", { ms: 5000 });
-  await expect(page.getByTestId("banner-offline")).toHaveText("The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back.");
+  await expect(page.getByTestId("banner-offline")).toHaveText("Reconnecting to the coordinator. The picture still streams straight from the VMs; the controls are paused until it is back.");
   await expect(page.getByTestId("restart-all")).toBeDisabled();
   await expect(page.getByTestId("restart-note")).toHaveText("paused while the coordinator is offline");
   await expect(page.getByTestId("own-gpu")).toBeDisabled();

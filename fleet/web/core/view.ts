@@ -227,7 +227,7 @@ export interface TileView {
    * drawn over the image covers (clearBand), or null when the controls cover all of it.
    */
   content: Box | null;
-  /** Hatched: EC2 waiting for spot capacity. */
+  /** Hatched: EC2 waiting for spot capacity, or an fcvm place waiting for a host AWS has not supplied. */
   hatch: boolean;
   glyph: Glyph;
   /** One line over a dark tile: the phase, or the failure. */
@@ -281,6 +281,21 @@ function glyphFor(t: Tile, phase: string): Glyph {
   return { kind: "progress", steps, done: step ?? 0 };
 }
 
+/** What an fcvm place with no GPU says once nothing of the wake is still coming up (awaitsAwsGpu). */
+export const NO_AWS_GPU = "AWS had no GPU";
+
+/**
+ * Whether the fcvm places with no GPU wait on AWS: the fleet wakes from zero (it has woken
+ * before), is awake, and every host its wake launched has its tiles rendering, so the side is
+ * short of a host AWS has not supplied (a launch refused for capacity, a reclaimed host's
+ * replacement). Waking, or with a host of the wake still booting, such a place is still to come.
+ */
+export function awaitsAwsGpu(st: FleetState): boolean {
+  const p = st.fleet.power;
+  if (p.state !== "awake" || (p.last_wake === null && p.wakes.length === 0)) return false;
+  return p.hosts.every((h) => h.phases.some((x) => x.phase === "tiles_rendering"));
+}
+
 /** What a tile that is not up is waiting for, in a phrase that follows "waiting for". */
 function waitingFor(t: Tile): string {
   if (t.phase === "waiting_capacity") return t.half === "ec2" ? "EC2 capacity" : "a free GPU";
@@ -292,13 +307,14 @@ function waitingFor(t: Tile): string {
  * says the coordinator has not named it, one that is not up says what it waits for. The
  * host line is the tile's public place, never the agent's own host name.
  */
-export function hoverLabel(t: Tile, name: string, rms: number | null): HoverLabel {
+export function hoverLabel(t: Tile, name: string, rms: number | null, aws = false): HoverLabel {
   const up = t.phase === "running";
   const wait = `waiting for ${waitingFor(t)}`;
   // An fcvm place with no GPU behind it: the side keeps it for a GPU that has not joined
-  // (a host still connecting, a GPU warming after an operator released it).
+  // (a host still connecting, a GPU warming after an operator released it), or, once the
+  // wake is done (`aws`, awaitsAwsGpu), for a host AWS has not supplied.
   if (t.half === "fcvm" && t.slot === null && !up) {
-    return { id: name, kind: KIND_TAG[t.half], gpu: "no GPU in this place", host: "waiting for a GPU to join", last: "no VM has run here" };
+    return { id: name, kind: KIND_TAG[t.half], gpu: "no GPU in this place", host: aws ? "waiting for AWS to supply a GPU host" : "waiting for a GPU to join", last: "no VM has run here" };
   }
   return {
     id: name,
@@ -343,12 +359,16 @@ function tileView(
   const dark = !isLive(t) || requested;
   const accent = COLORS[t.half].accent;
   const rms = relaunchMs(t);
-  const glyph = glyphFor(t, phase);
+  const base = glyphFor(t, phase);
+  const aws = base.kind === "empty" && awaitsAwsGpu(st);
+  // Drawn as EC2's capacity wait is: hatched, with the dashed mark.
+  const glyph: Glyph = aws ? { ...base, kind: "capacity" } : base;
   const name = tileName(t);
 
   let phaseLine = phaseText(phase);
   let detail = "";
   if (glyph.kind === "empty") phaseLine = "no GPU here yet";
+  if (aws) phaseLine = NO_AWS_GPU;
   if (glyph.kind === "borrowed") {
     phaseLine = "a visitor's private GPU";
     const left = t.borrowed ? Math.max(0, t.borrowed.until - srvNow) : 0;
@@ -360,7 +380,7 @@ function tileView(
     detail = retry === null ? "" : retry > srvNow ? `retrying in ${fmt.countdown(retry - srvNow)}` : "retrying now";
   }
 
-  const hover = hoverLabel(t, name, rms);
+  const hover = hoverLabel(t, name, rms, aws);
 
   const stats: string[] = [];
   if (fs && fs.newestT !== null) {
@@ -1668,7 +1688,7 @@ export function wallView(input: WallInput): WallView {
   if (!st) {
     banners.push({ kind: "connecting", text: s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet." });
   } else if (!online) {
-    banners.push({ kind: "offline", text: "The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back." });
+    banners.push({ kind: "offline", text: "Reconnecting to the coordinator. The picture still streams straight from the VMs; the controls are paused until it is back." });
   }
   if (st) {
     // A reclaimed host's tiles leave the tiling at once; `failures` keeps it for a minute.
@@ -1933,8 +1953,9 @@ export function wallView(input: WallInput): WallView {
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     wallRate: wallRateLine(s.frames, st.tiles),
+    // Asleep there is nothing to broadcast: the recording shows, over the poster.
     broadcast:
-      broadcast && s.admission?.broadcast
+      broadcast && s.admission?.broadcast && st.fleet.power.state !== "asleep"
         ? {
             url: s.admission.broadcast.value,
             // The page's Pause, and a tab hidden long enough to close its streams.

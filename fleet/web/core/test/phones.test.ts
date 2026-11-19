@@ -315,6 +315,12 @@ describe("the draw plan", () => {
     expect(phonesView(input(st)).banner).toBeNull();
   });
 
+  it("says it is reconnecting while the coordinator is away, the phones still streaming", () => {
+    const st = stateWith(phonesOf(2));
+    const off = reduce(st, { type: "socket", status: "closed", at: EPOCH });
+    expect(phonesView(input(off)).banner).toBe("Reconnecting to the coordinator. The picture still streams straight from the phones; the controls are paused until it is back.");
+  });
+
   it("waits for the address family, as the wall does", () => {
     let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
     s = reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), phones: phonesOf(2) }), at: EPOCH });

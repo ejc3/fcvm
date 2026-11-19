@@ -1,9 +1,23 @@
-// The staging Worker for the wall page (stage.fcvm.dev, behind Cloudflare Access).
-// Terraform in ejc3/aws owns the envelope (the Access application, the custom domain);
-// wrangler owns the code. No workers.dev or preview URL: both would be outside Access.
-// worker.ts wraps OpenNext's .open-next/worker.js: with FLEET_ACCESS_CLIENT_ID and
-// FLEET_ACCESS_CLIENT_SECRET set (Worker secrets, from the deploy), /live and /poster.jpg
-// are forwarded to FLEET_COORD_URL's host, so the page needs one Access session.
+// The wall page's Workers. Terraform in ejc3/aws owns the envelope (Access applications, custom
+// domains); wrangler owns the code. No workers.dev or preview URL: either would be a public
+// address Terraform does not control.
+//
+// The top level is staging: fcvm-fleet-stage on stage.fcvm.dev, behind Cloudflare Access, deployed
+// by .github/workflows/fleet-web-deploy.yml with `wrangler deploy`. worker.ts wraps OpenNext's
+// .open-next/worker.js: with FLEET_ACCESS_CLIENT_ID and FLEET_ACCESS_CLIENT_SECRET set (Worker
+// secrets, from the deploy), /live and /poster.jpg are forwarded to FLEET_COORD_URL's host, so the
+// page needs one Access session.
+//
+// `env.production` is fcvm-fleet, the page for fcvm.dev, deployed with `wrangler deploy --env
+// production`. It is reachable once ejc3/aws gives it the fcvm.dev custom domain. It has no
+// Access secrets and no FLEET_DIRECT_COORD_URL: the page connects to FLEET_COORD_URL itself and
+// loads the poster from that host, and the coordinator sees each viewer's own address. Wrangler
+// does not inherit `vars` into an environment, so production lists all of its own.
+//   FLEET_COORD_URL            the prod coordinator's /live, public through its tunnel (ejc3/aws A2)
+//   FLEET_TILES_SUBZONE        the prod tiles' DNS subzone the coordinator serves (ejc3/aws A3);
+//                              every frame_url the prod coordinator hands out is under it
+//   FLEET_TURNSTILE_SITE_KEY   a placeholder until ejc3/aws A2 creates the prod Turnstile widget;
+//                              the coordinator's hello carries the key the page renders
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fcvm-fleet-stage",
@@ -13,5 +27,17 @@
   "workers_dev": false,
   "preview_urls": false,
   "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
-  "vars": { "FLEET_COORD_URL": "wss://fleet-api-stage.fcvm.dev/live", "FLEET_DIRECT_COORD_URL": "wss://fleet-api-direct-stage.fcvm.dev/live" }
+  "vars": { "FLEET_COORD_URL": "wss://fleet-api-stage.fcvm.dev/live", "FLEET_DIRECT_COORD_URL": "wss://fleet-api-direct-stage.fcvm.dev/live" },
+  "env": {
+    "production": {
+      "name": "fcvm-fleet",
+      "workers_dev": false,
+      "preview_urls": false,
+      "vars": {
+        "FLEET_COORD_URL": "wss://fleet-api.fcvm.dev/live",
+        "FLEET_TILES_SUBZONE": "tiles.fcvm.dev",
+        "FLEET_TURNSTILE_SITE_KEY": "PLACEHOLDER-set-by-ejc3-aws-A2"
+      }
+    }
+  }
 }

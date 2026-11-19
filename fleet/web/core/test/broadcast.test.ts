@@ -7,6 +7,9 @@ import {
   memoUntilFailure,
   broadcastShown,
   broadcastToggle,
+  broadcastNote,
+  BROADCAST_UNAVAILABLE_AFTER,
+  failedStatus,
   frameWallMs,
   HISTORY_MS,
   SHOWN_ADVANCE_MAX_MS,
@@ -356,6 +359,16 @@ describe("the broadcast's lifecycle", () => {
   it("pauses the player while the tab's streams are suspended", () => {
     const late = withSnapshots(admission(LATE), [fleet()]);
     expect(view({ ...late, ui: { ...late.ui, suspended: true } }).broadcast?.paused).toBe(true);
+  });
+
+  it("says the broadcast is unavailable after failed loads in a row, and reconnecting before that", () => {
+    // IVS down: every load fails. The player keeps trying, and after a few says so.
+    expect(BROADCAST_UNAVAILABLE_AFTER).toBe(3);
+    expect([1, 2, 3, 4].map(failedStatus)).toEqual(["reconnecting", "reconnecting", "unavailable", "unavailable"]);
+    expect(broadcastNote("unavailable")).toBe("The broadcast is unavailable right now. Trying again.");
+    expect(broadcastNote("reconnecting")).toBe("The broadcast is reconnecting.");
+    expect(broadcastNote("playing")).toBeNull();
+    expect(broadcastNote("loading")).toBeNull();
   });
 
   it("loads the player again after a failed load", async () => {

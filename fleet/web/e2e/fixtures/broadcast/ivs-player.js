@@ -34,6 +34,11 @@
     }
     setMuted() {}
     load() {
+      // IVS down (the test sets __fakeBroadcastFail): every load of the stream fails.
+      if (window.__fakeBroadcastFail) {
+        setTimeout(() => this.emit(window.IVSPlayer.PlayerEventType.ERROR, { type: "ErrorNetwork" }), 50);
+        return;
+      }
       const c = document.createElement("canvas");
       c.width = W;
       c.height = H;
