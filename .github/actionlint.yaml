@@ -1,0 +1,10 @@
+# actionlint 1.7.10 (ci.yml) predates the concurrency `queue` key GitHub added in May 2026
+# (docs: "control workflow concurrency"), and reports it as unexpected. Only that message, only
+# in the workflows that use it.
+paths:
+  .github/workflows/fleet-viewer-smoke.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/fleet-coordinator-deploy.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

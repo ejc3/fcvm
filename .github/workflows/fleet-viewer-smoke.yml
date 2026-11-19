@@ -58,6 +58,9 @@ jobs:
     concurrency:
       group: fleet-viewer-smoke
       cancel-in-progress: false
+      # Every job that waits in the group stays queued: with the default (one pending job) a
+      # smoke that queues cancels a pending coordinator release (fleet-coordinator-deploy.yml).
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -104,6 +107,9 @@ jobs:
     concurrency:
       group: fleet-viewer-smoke
       cancel-in-progress: false
+      # Every job that waits in the group stays queued: with the default (one pending job) a
+      # smoke that queues cancels a pending coordinator release (fleet-coordinator-deploy.yml).
+      queue: max
     steps:
       # As ci.yml's self-hosted jobs: a privileged run can leave root-owned files in the workspace.
       - name: Fix workspace permissions (pre-checkout)
