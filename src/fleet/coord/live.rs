@@ -38,6 +38,11 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
+/// `word` intents one connection may have waiting for their receipts (a committed word's
+/// receipt waits for the store); past it a word is refused unrecorded.
+pub const WORDS_WAITING: usize = 8;
+pub const WORDS_WAITING_REFUSAL: &str =
+    "too many words from this page wait for the state to be stored; send it again later";
 
 /// `/live` sockets one IPv6 /64 may hold open at once. A /64 is one subscriber, and a page
 /// holds one socket (fleet/web wall-client.ts opens the next only after the last has closed);
@@ -680,6 +685,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     let verified = Arc::new(AtomicBool::new(!app.cfg.verifier.required()));
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // The `word` intent ids of this connection with a task working on them: a repeated id
+    // joins its task, and at most WORDS_WAITING wait, so a store outage cannot pile up tasks.
+    let words: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // When this connection last asked for a fresh playback token.
     let mut last_playback: Option<std::time::Instant> = None;
@@ -773,17 +781,40 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 } else if late && LATE_REFUSED.contains(&name.as_str()) {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
-                    let app = app.clone();
-                    let viewer = viewer.clone();
-                    let client = client.clone();
-                    let direct = direct.clone();
-                    let checking = checking.clone();
-                    tasks.push(tokio::spawn(async move {
-                        if let Some(r) = word(&app, &viewer, &client, id, args, &checking).await {
-                            let _ = direct.try_send(r);
+                    let admitted = {
+                        let mut w = words.lock().unwrap();
+                        if w.contains(&id) {
+                            // Its task answers it.
+                            Some(false)
+                        } else if w.len() >= WORDS_WAITING {
+                            None
+                        } else {
+                            w.insert(id.clone());
+                            Some(true)
                         }
-                    }));
-                    None
+                    };
+                    match admitted {
+                        None => Some(unrecorded_refusal(id, WORDS_WAITING_REFUSAL)),
+                        Some(false) => None,
+                        Some(true) => {
+                            let app = app.clone();
+                            let viewer = viewer.clone();
+                            let client = client.clone();
+                            let direct = direct.clone();
+                            let checking = checking.clone();
+                            let words = words.clone();
+                            tasks.retain(|t| !t.is_finished());
+                            tasks.push(tokio::spawn(async move {
+                                let r =
+                                    word(&app, &viewer, &client, id.clone(), args, &checking).await;
+                                words.lock().unwrap().remove(&id);
+                                if let Some(r) = r {
+                                    let _ = direct.try_send(r);
+                                }
+                            }));
+                            None
+                        }
+                    }
                 } else {
                     let claim = name == "claim_gpu";
                     let r = app

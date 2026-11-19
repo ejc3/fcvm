@@ -155,6 +155,9 @@ pub struct Outputs {
     /// published names.
     pub zone: Option<Names>,
     pub store: Option<store::StoreTx>,
+    /// Turns true once a write the store acknowledged confirms that this coordinator owns the
+    /// state object (true from the start without a store); the EC2 driver waits for it.
+    pub owned: watch::Sender<bool>,
 }
 
 /// Minimum time between two browser snapshots; versions in between are skipped.
@@ -546,6 +549,11 @@ impl Actor {
     /// for it.
     fn stored_through(&mut self, version: u64) {
         self.durable = self.durable.max(version);
+        self.out.owned.send_if_modified(|o| {
+            let was = *o;
+            *o = true;
+            !was
+        });
         let durable = self.durable;
         let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
             .into_iter()
@@ -832,6 +840,14 @@ impl Actor {
         // version each holds, and its answer. One write per tick answers every receipt and
         // report applied before it; the writer answers in the order it was asked.
         let mut inflight: VecDeque<(u64, oneshot::Receiver<bool>)> = VecDeque::new();
+        // The first write, at once: S3's PUT is conditional on the object this coordinator
+        // read, so its being stored confirms this coordinator owns the state, which the EC2
+        // driver waits for before it sweeps or launches anything (`Outputs::owned`).
+        if self.out.store.is_some() {
+            self.stored = self.state.version.wrapping_add(1);
+            let version = self.state.version;
+            inflight.push_back((version, self.store(true)));
+        }
         let ack = loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -841,7 +857,11 @@ impl Actor {
                 },
                 _ = snap_tick.tick() => self.publish(),
                 _ = store_tick.tick() => {
-                    let waiting = !self.unacked.is_empty() || !self.waiting.is_empty();
+                    // Ownership not yet confirmed waits on a write as an answer does: a
+                    // retry of the failed start write must be answered to confirm it.
+                    let waiting = !self.unacked.is_empty()
+                        || !self.waiting.is_empty()
+                        || !*self.out.owned.borrow();
                     if self.state.version != self.stored || (waiting && inflight.is_empty()) {
                         // A changed state, or an unchanged one something waits on: the
                         // answer says whether the newest state is stored (also when it was
@@ -1059,6 +1079,7 @@ pub fn start(
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
+    let (owned_tx, owned_rx) = watch::channel(store.is_none());
     let mut state = state;
     // With named launches, tiles' frame URLs are the launches' published names.
     state.config.names_published = names.is_some();
@@ -1074,6 +1095,7 @@ pub fn start(
             budget: budget_tx,
             zone: names,
             store,
+            owned: owned_tx,
         },
         Box::new(now_ms),
     );
@@ -1107,18 +1129,27 @@ pub fn start(
         }
     });
     if let Some(driver) = ec2 {
-        tokio::spawn(ec2::run(
-            driver,
-            ec2_rx,
-            scene_rx,
-            budget_rx,
-            handle.clone(),
-        ));
+        let mut owned = owned_rx;
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            // No sweep and no launch before this coordinator's first write is stored: one
+            // that lost the state object to another coordinator would terminate that one's
+            // tiles. Once owned, ec2::run sweeps and retries as before.
+            if wait_owned(&mut owned).await {
+                ec2::run(driver, ec2_rx, scene_rx, budget_rx, handle).await;
+            }
+        });
     }
     if let Some(cfg) = power {
         tokio::spawn(hosts::run(cfg, power_rx, handle.clone()));
     }
     (handle, task)
+}
+
+/// Wait until a stored write confirms this coordinator owns the state object; false when
+/// the actor stopped first.
+async fn wait_owned(owned: &mut watch::Receiver<bool>) -> bool {
+    owned.wait_for(|o| *o).await.is_ok()
 }
 
 /// Whether another writer has taken the state object (`store::LostWrite`) by now.
@@ -1760,6 +1791,7 @@ mod store_tests {
             budget: watch::channel(None).0,
             zone: None,
             store: Some(tx),
+            owned: watch::channel(false).0,
         };
         let cfg = Config {
             light_interval_ms: 0,

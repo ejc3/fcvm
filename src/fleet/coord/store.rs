@@ -30,6 +30,18 @@ impl std::error::Error for LostWrite {}
 
 /// Most earlier versions of the state object tried when the newest does not parse.
 const EARLIER_VERSIONS_TRIED: usize = 20;
+/// Reads of the state object at start, when another writer replaces it while an unreadable
+/// one is being recovered.
+const LOAD_ATTEMPTS: usize = 3;
+
+/// What recovering from an unreadable object found.
+enum Recovered {
+    /// The newest earlier version that parses, and its version id.
+    From(String, Box<State>),
+    /// The newest listed version is not the one read: another writer replaced the object
+    /// since, so the object is read again.
+    Moved { listed: Option<String> },
+}
 
 pub fn load(path: &Path) -> Result<Option<State>> {
     match std::fs::read(path) {
@@ -238,12 +250,26 @@ impl S3Object {
     /// without the changes stored after that version, rather than not at all. With no
     /// version that parses it is an error. Writes stay conditional on the newest version.
     pub async fn load(&self) -> Result<Option<State>> {
+        for attempt in 1..=LOAD_ATTEMPTS {
+            if let Some(loaded) = self.load_once(attempt).await? {
+                return Ok(loaded);
+            }
+        }
+        anyhow::bail!(
+            "{} was replaced while an unreadable version of it was recovered, {LOAD_ATTEMPTS} times",
+            self.shown()
+        )
+    }
+
+    /// One read of the object: `None` when another writer replaced it while an unreadable
+    /// version was being recovered (read it again).
+    async fn load_once(&self, attempt: usize) -> Result<Option<Option<State>>> {
         let (status, headers, bytes) = self.get(&self.path(), "").await?;
         match status.as_u16() {
             200 => {
                 *self.etag.lock().unwrap() = etag_of(&headers);
                 match serde_json::from_slice::<State>(&bytes) {
-                    Ok(s) => Ok(Some(s)),
+                    Ok(s) => Ok(Some(Some(s))),
                     Err(e) => {
                         tracing::error!(
                             marker = UNREADABLE_STATE_MARKER,
@@ -251,12 +277,38 @@ impl S3Object {
                             error = %e,
                             "the stored state does not parse; starting from the newest earlier version that does"
                         );
-                        let (version, s) = self.earlier_version().await.with_context(|| {
+                        // Recovery starts below the version this GET read, so it needs that
+                        // version's id.
+                        let read = headers
+                            .get("x-amz-version-id")
+                            .and_then(|v| v.to_str().ok())
+                            .filter(|v| !v.is_empty() && *v != "null")
+                            .with_context(|| {
+                                format!(
+                                    "{} does not parse ({e}), and its read named no version, so there is no earlier version to recover from",
+                                    self.shown()
+                                )
+                            })?
+                            .to_string();
+                        let found = self.earlier_version(&read).await.with_context(|| {
                             format!(
                                 "{} does not parse ({e}), and no earlier version does",
                                 self.shown()
                             )
                         })?;
+                        let (version, s) = match found {
+                            Recovered::From(version, s) => (version, *s),
+                            Recovered::Moved { listed } => {
+                                tracing::warn!(
+                                    object = %self.shown(),
+                                    read = %read,
+                                    listed = ?listed,
+                                    attempt,
+                                    "the state object was replaced while it was recovered; reading it again"
+                                );
+                                return Ok(None);
+                            }
+                        };
                         tracing::error!(
                             marker = UNREADABLE_STATE_MARKER,
                             object = %self.shown(),
@@ -264,13 +316,13 @@ impl S3Object {
                             state_version = s.version,
                             "resuming from an earlier version of the state; changes stored after it are lost"
                         );
-                        Ok(Some(s))
+                        Ok(Some(Some(s)))
                     }
                 }
             }
             404 => {
                 *self.etag.lock().unwrap() = None;
-                Ok(None)
+                Ok(Some(None))
             }
             403 => anyhow::bail!(
                 "reading {} was refused (403): a missing object reads as 403 without s3:ListBucket, so the coordinator will not start from an empty state",
@@ -280,9 +332,10 @@ impl S3Object {
         }
     }
 
-    /// The newest version of the object after the current one that parses as a state, and
-    /// its version id.
-    async fn earlier_version(&self) -> Result<(String, State)> {
+    /// The newest version of the object older than `read` (the version a GET read and could
+    /// not parse) that parses as a state, and its version id; or `Moved` when the newest
+    /// listed version is not `read`, since recovering below it would skip a newer version.
+    async fn earlier_version(&self, read: &str) -> Result<Recovered> {
         let query = format!("prefix={}&versions=", super::sigv4::uri_encode(&self.key));
         let (status, _, body) = self.get(&format!("/{}", self.bucket), &query).await?;
         anyhow::ensure!(
@@ -291,7 +344,11 @@ impl S3Object {
             self.shown()
         );
         let ids = versions(&String::from_utf8_lossy(&body), &self.key);
-        // The first is the current version, which did not parse.
+        if ids.first().map(String::as_str) != Some(read) {
+            return Ok(Recovered::Moved {
+                listed: ids.first().cloned(),
+            });
+        }
         for id in ids.iter().skip(1).take(EARLIER_VERSIONS_TRIED) {
             let q = format!("versionId={}", super::sigv4::uri_encode(id));
             let (status, _, bytes) = self.get(&self.path(), &q).await?;
@@ -307,7 +364,7 @@ impl S3Object {
                 self.shown()
             );
             match serde_json::from_slice::<State>(&bytes) {
-                Ok(s) => return Ok((id.clone(), s)),
+                Ok(s) => return Ok(Recovered::From(id.clone(), Box::new(s))),
                 Err(e) => {
                     tracing::warn!(version_id = %id, error = %e, "an earlier state version does not parse")
                 }

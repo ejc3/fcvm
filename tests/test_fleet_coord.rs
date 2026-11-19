@@ -2796,7 +2796,17 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
         let a2 = attempts.clone();
         tokio::spawn(async move {
             let mut pending = false;
+            let mut started = false;
             while let Some(cmd) = rx.recv().await {
+                // The coordinator's own first write at start (it confirms that it owns the state)
+                // is stored and not counted: this test is about the writes after it.
+                if !started && cmd.bytes.is_some() {
+                    started = true;
+                    if let Some(a) = cmd.ack {
+                        let _ = a.send(true);
+                    }
+                    continue;
+                }
                 let bytes = cmd.bytes.is_some();
                 pending |= bytes;
                 if pending {
@@ -2873,7 +2883,17 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     // Fails its first write and stores every later one.
     tokio::spawn(async move {
         let mut pending = false;
+        let mut started = false;
         while let Some(cmd) = rx.recv().await {
+            // The coordinator's own first write at start (it confirms that it owns the state)
+            // is stored and not counted: this test is about the writes after it.
+            if !started && cmd.bytes.is_some() {
+                started = true;
+                if let Some(a) = cmd.ack {
+                    let _ = a.send(true);
+                }
+                continue;
+            }
             pending |= cmd.bytes.is_some();
             if pending {
                 let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2909,6 +2929,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         budget: tokio::sync::watch::channel(None).0,
         zone: None,
         store: Some(tx),
+        owned: tokio::sync::watch::channel(false).0,
     };
     let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
     let actor = tokio::spawn(
@@ -4317,6 +4338,9 @@ async fn an_agent_can_dial_the_agent_websocket() {
 /// must be SigV4-signed with the payload's hash. `deny` answers 403 to everything,
 /// `lose_put_answer` stores the next PUT and answers it 500, and a GET of the version named
 /// in `unreadable` answers 503.
+/// A path and a body to put there.
+type PathAndBody = (String, Vec<u8>);
+
 /// Per path, its versions oldest first: (version id, body).
 type Versions = BTreeMap<String, Vec<(String, Vec<u8>)>>;
 
@@ -4327,6 +4351,9 @@ struct FakeS3 {
     deny: Arc<std::sync::atomic::AtomicBool>,
     lose_put_answer: Arc<std::sync::atomic::AtomicBool>,
     unreadable: Arc<std::sync::Mutex<Option<String>>>,
+    /// A version another writer puts at this path just before the next version listing is
+    /// served (between a GET and the listing that follows it).
+    on_list: Arc<std::sync::Mutex<Option<PathAndBody>>>,
 }
 
 fn fake_etag(body: &[u8]) -> String {
@@ -4422,6 +4449,9 @@ async fn fake_s3(s3: FakeS3) -> String {
                         (StatusCode::OK, [("etag", fake_etag(&body))]).into_response()
                     }
                     Method::GET if query.contains_key("versions") => {
+                        if let Some((p, b)) = s3.on_list.lock().unwrap().take() {
+                            s3.put_version(&p, b);
+                        }
                         let bucket = path.trim_matches('/').to_string();
                         let prefix = query.get("prefix").cloned().unwrap_or_default();
                         let mut xml = String::from("<ListVersionsResult>");
@@ -4454,7 +4484,12 @@ async fn fake_s3(s3: FakeS3) -> String {
                             None => v.last(),
                         });
                         match found {
-                            Some((_, b)) => (StatusCode::OK, [("etag", fake_etag(b))], b.clone()).into_response(),
+                            Some((id, b)) => (
+                                StatusCode::OK,
+                                [("etag", fake_etag(b)), ("x-amz-version-id", id.clone())],
+                                b.clone(),
+                            )
+                                .into_response(),
                             None => StatusCode::NOT_FOUND.into_response(),
                         }
                     }
@@ -4757,6 +4792,31 @@ async fn a_write_whose_answer_was_lost_is_not_taken_for_another_writer() {
     assert_eq!(s3.latest(path), Some(state(3)));
 }
 
+/// Recovery from an unreadable object starts below the version its GET read. When another
+/// writer replaces the object between that GET and the version listing, the newest listed
+/// version is the replacement, which parses: the object is read again and the coordinator
+/// starts from it, not from a version older than both.
+#[tokio::test]
+async fn recovery_reads_again_when_the_object_is_replaced_meanwhile() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    s3.put_version(path, state(40));
+    s3.put_version(path, b"not json".to_vec());
+    *s3.on_list.lock().unwrap() = Some((path.to_string(), state(42)));
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let back = obj.load().await.unwrap().expect("a state");
+    assert_eq!(back.version, 42, "the replacement, not an older version");
+}
+
 /// Recovery from an unreadable newest object stops at an earlier version it cannot read
 /// (503): that version may hold changes the older ones lack, so loading an older one past it
 /// could drop them. A version that is gone (404) is passed over.
@@ -4825,6 +4885,131 @@ fn every_fcvm_this_file_spawns_dies_with_the_test() {
         );
     }
     assert!(found > 0, "the check found no spawn to look at");
+}
+
+/// An EC2 driver that counts its sweeps and launches nothing.
+#[derive(Default)]
+struct CountingSweeps {
+    sweeps: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for CountingSweeps {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Err(ec2::LaunchError::Failed(anyhow::anyhow!(
+            "no launches in this test"
+        )))
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn sweep(&self) -> anyhow::Result<usize> {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+/// A starting coordinator sweeps the EC2 tiles an earlier one left only once its first state
+/// write is stored, which the conditional PUT makes a proof that it owns the state object: a
+/// coordinator that lost the object to another one never sweeps that one's tiles.
+#[tokio::test]
+async fn the_startup_ec2_sweep_waits_for_a_stored_write() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let driver = Arc::new(CountingSweeps::default());
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        Some(tx),
+        Some(driver.clone()),
+        None,
+        None,
+        None,
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        driver.sweeps.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "swept before any write was stored"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while driver.sweeps.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the sweep once a write is stored");
+}
+
+/// A committed word's receipt waits for the store, so while writes fail a page's words wait
+/// too. A word id sent again joins the one waiting (one receipt, not one per copy), and past
+/// `WORDS_WAITING` waiting words a new one is refused at once, unrecorded, so a store outage
+/// cannot pile up a connection's tasks.
+#[tokio::test]
+async fn words_waiting_for_the_store_are_joined_and_capped() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        config: Config {
+            word_interval_ms: 0,
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut v = Viewer::connect_from(&c.url, Some("198.51.100.40")).await;
+    v.intent("w-0", "word", json!({"text": "w0"})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..50 {
+        v.intent("w-0", "word", json!({"text": "w0"})).await;
+    }
+    for i in 1..live::WORDS_WAITING {
+        v.intent(&format!("w-{i}"), "word", json!({"text": format!("w{i}")}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let over = format!("w-{}", live::WORDS_WAITING);
+    v.intent(&over, "word", json!({"text": "over"})).await;
+    let r = tokio::time::timeout(Duration::from_secs(1), v.receipt(&over))
+        .await
+        .expect("a word past the cap is answered at once");
+    assert_eq!(r["outcome"], "refused", "{r}");
+    assert_eq!(r["reason"], live::WORDS_WAITING_REFUSAL);
+    assert_eq!(r["version"], 0, "not recorded: it may be sent again");
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(3);
+    while tokio::time::timeout(until.saturating_duration_since(Instant::now()), v.recv())
+        .await
+        .is_ok()
+    {}
+    let first: Vec<&Value> = v.receipts.iter().filter(|r| r["id"] == "w-0").collect();
+    assert_eq!(first.len(), 1, "one receipt for one word id: {first:?}");
+    assert_eq!(first[0]["outcome"], "committed");
 }
 
 /// A claim that ends while its receipt waits for the store (here: writes fail for longer
