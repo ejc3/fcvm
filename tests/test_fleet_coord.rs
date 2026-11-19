@@ -5094,7 +5094,6 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
             on_demand: spend::on_demand_rates(&[]).unwrap(),
             every: Duration::from_millis(50),
             spot_ttl: Duration::from_secs(60),
-            fleet: "prod".into(),
         },
         handle.clone(),
     ));
