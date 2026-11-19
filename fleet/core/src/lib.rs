@@ -17,6 +17,7 @@ pub mod phone;
 pub mod potato;
 pub mod protocol;
 pub mod scene;
+pub mod spend;
 pub mod state;
 pub mod terrain;
 pub mod tiling;

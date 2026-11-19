@@ -59,7 +59,11 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
 /// before changes nothing (its first receipt stays in `state.receipts`).
 pub fn apply(mut state: State, event: &Event) -> State {
     let before = state.fleet.clone();
+    // Before the event as well as after it: an intent that arrives once the day's budget is
+    // spent is refused, not committed and then undone.
+    budget_step(&mut state, event.at());
     let receipt = apply_inner(&mut state, event);
+    budget_step(&mut state, event.at());
     // Retile, step the power state on what is placed, and retile again when that changed
     // the power (asleep, the EC2 side has no tiles).
     retile(&mut state.fleet, &state.config, event.at());
@@ -320,6 +324,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 {
                     s.published = Some(names.clone());
                 }
+            }
+            None
+        }
+        Event::Burn {
+            usd_per_hour,
+            instances,
+            ..
+        } => {
+            let s = &mut state.fleet.spend;
+            let rate = usd_per_hour.max(0.0);
+            // Nothing running and nothing changed (an asleep fleet's reports): the state stays
+            // as it is, so no snapshot or stored state is sent for it.
+            let idle = s.usd_per_hour == 0.0 && rate == 0.0 && s.instances == *instances;
+            if !idle || s.at == 0 || s.day != at / crate::spend::DAY_MS {
+                s.bring_forward(at);
+                s.usd_per_hour = rate;
+                s.instances = *instances;
             }
             None
         }
@@ -627,7 +648,8 @@ fn image_complete(f: &Fleet) -> bool {
 /// viewer while a viewer has arrived within that limit, and be awake once the image is
 /// complete.
 fn power_step(state: &mut State, at: u64) {
-    if !state.config.power_managed {
+    // The day's budget is spent: `budget_step` holds the fleet asleep until 00:00 UTC.
+    if !state.config.power_managed || crate::spend::resting(state, at) {
         return;
     }
     let idle_ms = state.config.idle_scale_down_secs * 1000;
@@ -706,6 +728,92 @@ fn power_step(state: &mut State, at: u64) {
         f.power.state = "awake".into();
         f.next_race_at = interval.map(|s| at + s * 1000);
     }
+}
+
+/// The daily spend ceiling (`crate::spend`). A new UTC day starts a new ledger and ends a
+/// forced sleep (the viewer rules decide from there). At the ceiling less
+/// [`crate::spend::TRIP_LEAD_MS`] of the current burn, the fleet sleeps at once and stays
+/// asleep until 00:00 UTC: every claim is released and every running race ends.
+fn budget_step(state: &mut State, at: u64) {
+    let f = &mut state.fleet;
+    let Some(ceiling) = state.config.daily_spend_usd else {
+        // A coordinator restarted without a ceiling lets the fleet wake again.
+        if f.power.reason.as_deref() == Some(crate::spend::BUDGET) {
+            f.power.reason = None;
+        }
+        return;
+    };
+    if f.spend.at == 0 || f.spend.day != at / crate::spend::DAY_MS {
+        f.spend.bring_forward(at);
+    }
+    if !f.spend.tripped && f.spend.reaches(at, ceiling) {
+        f.spend.bring_forward(at);
+        f.spend.tripped = true;
+    }
+    if !f.spend.tripped_on(at) {
+        if f.power.reason.as_deref() == Some(crate::spend::BUDGET) {
+            f.power.reason = None;
+        }
+        return;
+    }
+    f.power.reason = Some(crate::spend::BUDGET.into());
+    let claimed: Vec<u32> = f
+        .slots
+        .iter()
+        .filter(|(_, s)| s.claim.is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    for n in claimed {
+        release(f, n, at);
+    }
+    let phones: Vec<u32> = f
+        .phones
+        .iter()
+        .filter(|(_, s)| phone_claim(s).is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    for n in phones {
+        release_phone(f, n, at);
+    }
+    let sandboxes: Vec<u32> = f
+        .windows
+        .iter()
+        .filter(|(_, s)| windows_claim(s).is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    for n in sandboxes {
+        release_windows(f, n, at);
+    }
+    let servers: Vec<u32> = f
+        .minecraft
+        .iter()
+        .filter(|(_, s)| minecraft_claim(s).is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    for n in servers {
+        release_minecraft(f, n, at);
+    }
+    // A running race ends: tiles still to reach their first frame leave it, so each half is
+    // done with the tiles that finished, or holds none.
+    for race in f.races.iter_mut() {
+        for h in [&mut race.fcvm, &mut race.ec2] {
+            if h.done_at.is_some() {
+                continue;
+            }
+            let before = h.tiles.len();
+            h.tiles.retain(|_, t| t.first_frame_at.is_some());
+            h.dropped += before - h.tiles.len();
+            let last = h.last.clone();
+            finish_half(h, race.started_at, last, at);
+        }
+    }
+    if f.power.state != "asleep" {
+        f.power.state = "asleep".into();
+        f.power.asleep_since = Some(at);
+        f.power.woke_at = None;
+        f.power.hosts.clear();
+    }
+    f.next_race_at = None;
 }
 
 /// Whether the hosts' progress still belongs to the current wake: while it wakes, and after
@@ -794,6 +902,20 @@ fn intent_effect(
 ) -> Result<String, String> {
     let at = c.at;
     let by = format!("viewer:{}", c.viewer);
+    // Nothing a viewer does wakes a fleet whose day's budget is spent, or holds a GPU in it.
+    if crate::spend::resting(state, at)
+        && matches!(
+            intent,
+            Intent::Wake
+                | Intent::RestartNow
+                | Intent::ClaimGpu
+                | Intent::ClaimPhone { .. }
+                | Intent::ClaimWindows { .. }
+                | Intent::ClaimMinecraft { .. }
+        )
+    {
+        return Err(crate::spend::SPENT.into());
+    }
     match intent {
         Intent::Relaunch { tile } => {
             let (half, n) = state

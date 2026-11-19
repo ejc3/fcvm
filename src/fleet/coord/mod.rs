@@ -25,6 +25,7 @@ pub mod potato_log;
 pub mod scene_token;
 pub mod secrets;
 pub mod sigv4;
+pub mod spend;
 pub mod store;
 pub mod text_check;
 pub mod turnstile;
@@ -315,6 +316,8 @@ impl Actor {
                 viewers = f.viewers.len(),
                 hidden = f.hidden.len(),
                 last_arrival_at = ?f.power.last_arrival_at,
+                reason = ?f.power.reason,
+                spend_usd_today = f.spend.usd,
                 "fleet asleep"
             );
         }
@@ -936,6 +939,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
         | Event::ScaleInstances { at, .. }
+        | Event::Burn { at, .. }
         | Event::HostsExpected { at, .. }
         | Event::Ec2Health { at, .. }
         | Event::Published { at, .. } => *at = t,
@@ -1273,12 +1277,14 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
         sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
+        daily_spend_usd: args.daily_spend_usd,
         history_idle_secs: args.history_idle,
         ..Config::default()
     };
     if config.max_tiles == 0 {
         bail!("--max-tiles must be at least 1");
     }
+    let meter = spend::meter(&args)?;
     let checker: Arc<dyn text_check::TextChecker> = match args.text_check {
         FleetTextCheck::None => Arc::new(text_check::NoCheck),
         FleetTextCheck::Bedrock => {
@@ -1463,6 +1469,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     }
     let ec2_sweep = ec2.clone();
     let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, names);
+    if let Some(m) = meter {
+        tokio::spawn(spend::run(m, handle.clone()));
+    }
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
             std::env::current_exe()
