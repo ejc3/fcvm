@@ -1,6 +1,8 @@
 // Host-side tests: no GPU needed. Scene contract parsing, camera interpolation
 // and holds, tile geometry, wire formats.
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -300,6 +302,246 @@ struct ServerTest {
     }
   }
 
+  // --- connections that reach no stream (access.h, fleet/PROTOCOL.md "Connection limits")
+
+  // A server on a loopback listener, its accept loops on threads of their own. Connection
+  // threads are detached and may still be ending when a test returns, so a rig is never
+  // destroyed: kept from a pointer in static storage, it is not a leak to LeakSanitizer.
+  struct Rig {
+    char dir[32] = "/tmp/fleet-pending-XXXXXX";
+    std::string token_path, tls_path;
+    SceneToken token;
+    FakeSource src{true};
+    Server server{src};
+    TlsFront tls;
+    int lfd = -1, port = 0, tfd = -1, tport = 0;
+    std::thread plain, secure;
+    explicit Rig(bool with_tls) {
+      signal(SIGPIPE, SIG_IGN);  // as open_listener does: a write to a closed connection fails
+      if (!mkdtemp(dir)) return;
+      token_path = std::string(dir) + "/token";
+      std::ofstream(token_path) << "s-1\n";
+      token.configure(token_path, false);
+      server.set_scene_token(&token);
+      lfd = tlscheck::listen_lo(&port);
+      plain = std::thread([this] { server.accept_loop(lfd, false); });
+      if (!with_tls) return;
+      std::string cert, key, err;
+      tlscheck::make_pair("pending", &cert, &key);
+      tls_path = std::string(dir) + "/tls.json";
+      tlscheck::write_secret(tls_path, cert, key);
+      tls.load(tls_path, &err);
+      server.tls_ = &tls;
+      tfd = tlscheck::listen_lo(&tport);
+      secure = std::thread([this] { server.accept_loop(tfd, true); });
+    }
+    // Stops accepting (the loops end on the shut listeners); open connections are the test's.
+    void stop() {
+      for (int fd : {lfd, tfd})
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+      if (plain.joinable()) plain.join();
+      if (secure.joinable()) secure.join();
+      for (int fd : {lfd, tfd})
+        if (fd >= 0) close(fd);
+      unlink(token_path.c_str());
+      if (!tls_path.empty()) unlink(tls_path.c_str());
+      rmdir(dir);
+    }
+  };
+  static Rig* rig(bool with_tls) {
+    static std::vector<Rig*>* kept = new std::vector<Rig*>;
+    kept->push_back(new Rig(with_tls));
+    return kept->back();
+  }
+  // A TCP connection to the rig's port from `from` (a loopback address; null: any).
+  static int connect_lo(int port, const char* from = nullptr) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (from) {
+      sockaddr_in s{};
+      s.sin_family = AF_INET;
+      inet_pton(AF_INET, from, &s.sin_addr);
+      bind(fd, (sockaddr*)&s, sizeof s);
+    }
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (sockaddr*)&a, sizeof a) != 0) {
+      close(fd);
+      return -1;
+    }
+    return fd;
+  }
+  // Whether the server closed fd (end of stream or a reset) within ms, having sent nothing first.
+  static bool closed_within(int fd, int ms) {
+    pollfd p{fd, POLLIN, 0};
+    if (poll(&p, 1, ms) <= 0) return false;
+    char b;
+    return recv(fd, &b, 1, MSG_DONTWAIT) <= 0;
+  }
+  // A viewer's stream over the rig's plain listener: the upgrade, then its admission message.
+  static std::unique_ptr<Conn> viewer(Rig& r, const std::string& id) {
+    int fd = connect_lo(r.port);
+    if (fd < 0) return nullptr;
+    auto c = std::make_unique<Conn>(fd, nullptr);
+    std::string req = upgrade("h=270");
+    c->write_all(req.data(), req.size());
+    c->set_read_deadline_ms(2000);
+    std::string head;
+    char b;
+    while (head.find("\r\n\r\n") == std::string::npos && c->read(&b, 1) == 1) head.push_back(b);
+    if (head.find("HTTP/1.1 101 ") != 0) return nullptr;
+    std::string m = client_text("{\"admit\":\"" + token_for(id) + "\"}");
+    c->write_all(m.data(), m.size());
+    return c;
+  }
+
+  // Idle connections past MAX_PENDING_CONNECTIONS are closed at accept, while a viewer
+  // admitted before them keeps streaming and one admitted after them still gets a stream.
+  static void idle_connections_past_the_cap_are_refused_while_a_viewer_streams() {
+    Rig& r = *rig(false);
+    r.server.pending_.set_caps(4, MAX_PENDING_PER_SOURCE);
+    auto first = viewer(r, "v-1");
+    CHECK(first && within(2000, [&] { return r.src.subscribed() == 1 && r.server.pending_.size() == 0; }),
+          "an admitted viewer streams and holds no pending place (%zu)", r.server.pending_.size());
+    std::vector<int> idle;
+    for (int i = 0; i < 4; i++) idle.push_back(connect_lo(r.port));
+    CHECK(within(2000, [&] { return r.server.pending_.size() == 4; }), "4 idle connections are pending (%zu)",
+          r.server.pending_.size());
+    int refused = 0;
+    for (int i = 0; i < 6; i++) {
+      int fd = connect_lo(r.port);
+      if (fd >= 0 && closed_within(fd, 1000)) refused++;
+      if (fd >= 0) close(fd);
+    }
+    CHECK(refused == 6 && r.server.refused_pending_ == 6 && r.server.pending_.size() == 4,
+          "6 more past the cap are closed at once (%d closed, %llu counted, %zu pending)", refused,
+          (unsigned long long)r.server.refused_pending_, r.server.pending_.size());
+    for (int fd : idle) CHECK(!closed_within(fd, 0), "an idle connection inside the cap is still open");
+    if (r.src.subscribed() >= 1) {
+      r.src.subs[0]->push(std::make_shared<const std::string>("frame-bytes"));
+      std::string got;
+      char b[64];
+      first->set_read_deadline_ms(2000);
+      for (long n; got.find("frame-bytes") == std::string::npos && (n = first->read(b, sizeof b)) > 0;) got.append(b, n);
+      CHECK(got.find("frame-bytes") != std::string::npos, "the admitted viewer still gets its frames");
+    }
+    for (int fd : idle) close(fd);
+    CHECK(within(2000, [&] { return r.server.pending_.size() == 0; }), "the idle connections gave their places back (%zu)",
+          r.server.pending_.size());
+    auto second = viewer(r, "v-2");
+    CHECK(second && within(2000, [&] { return r.src.subscribed() == 2; }), "a new viewer streams once places are free");
+    first.reset();
+    second.reset();
+    CHECK(within(2000, [&] { return r.server.streams_.size() == 0; }), "both streams ended");
+    r.stop();
+  }
+
+  // One source (an IPv4 address or an IPv6 /64) holds at most MAX_PENDING_PER_SOURCE places;
+  // other sources still get one. The connections are socket pairs started as accepted ones from
+  // these peers.
+  static void one_source_cannot_take_every_pending_place() {
+    Rig& r = *rig(false);
+    r.server.pending_.set_caps(9, 3);
+    auto peer6 = [](const char* a) {
+      sockaddr_in6 s{};
+      s.sin6_family = AF_INET6;
+      inet_pton(AF_INET6, a, &s.sin6_addr);
+      return s;
+    };
+    const sockaddr_in6 any_of_first = peer6("2001:db8:1:2::1");
+    const std::string first_64 = pending_source((const sockaddr*)&any_of_first, sizeof any_of_first);
+    std::vector<int> clients;
+    auto start = [&](const sockaddr_in6& s) {
+      int fd[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return false;
+      clients.push_back(fd[0]);
+      return r.server.start_connection(fd[1], (const sockaddr*)&s, sizeof s, false);
+    };
+    // the same /64, any interface identifier
+    bool a1 = start(peer6("2001:db8:1:2::5")), a2 = start(peer6("2001:db8:1:2::6")), a3 = start(peer6("2001:db8:1:2:ffff::1"));
+    bool a4 = start(peer6("2001:db8:1:2:abcd::9"));
+    CHECK(a1 && a2 && a3 && !a4 && closed_within(clients[3], 1000), "a fourth connection from one /64 is refused and closed");
+    bool b = start(peer6("2001:db8:1:3::5"));
+    bool v4 = start(peer6("::ffff:198.51.100.7"));
+    // a relay on this host (loopback) is counted only in all: four, past the per-source cap
+    bool l1 = start(peer6("::1")), l2 = start(peer6("::1")), l3 = start(peer6("::1")), l4 = start(peer6("::1"));
+    CHECK(b && v4 && l1 && l2 && l3 && l4, "another /64, an IPv4 source and a local relay still get places");
+    CHECK(r.server.pending_.size() == 9 && r.server.pending_.from(first_64) == 3,
+          "9 pending, 3 of them from the first /64 (%zu)", r.server.pending_.size());
+    CHECK(!start(peer6("2001:db8:9::1")), "past the cap in all a new source is refused too");
+    for (int fd : clients) close(fd);
+    CHECK(within(2000, [&] { return r.server.pending_.size() == 0; }) &&
+              r.server.pending_.from(first_64) == 0,
+          "every place is given back when its client goes (%zu)", r.server.pending_.size());
+    r.stop();
+  }
+
+  // Every way a pending connection ends gives its place back: the request deadline (one for the
+  // TLS handshake and the header together), an admission message that never comes, a failed
+  // or abandoned TLS handshake.
+  static void pending_places_are_given_back_after_timeouts_and_failed_handshakes() {
+    Rig& r = *rig(true);
+    r.server.request_wait_ms_ = 600;
+    r.server.admit_wait_ms_ = 300;
+    auto drained = [&] { return within(3000, [&] { return r.server.pending_.size() == 0; }); };
+    CHECK(r.tls.loaded(), "the rig's certificate loads");
+    {
+      // plain: no byte, then a header that never ends
+      int idle = connect_lo(r.port), slow = connect_lo(r.port);
+      CHECK(write(slow, "GET /frames?h=270 HTTP/1.1\r\n", 28) == 28, "the slow request starts");
+      CHECK(within(2000, [&] { return r.server.pending_.size() == 2; }), "two plain connections pending");
+      for (int i = 0; i < 8; i++) {  // a header byte every 100 ms, past the deadline
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (write(slow, "X", 1) != 1) break;
+      }
+      CHECK(closed_within(idle, 2000) && drained(), "an idle and a slow plain request end at the request deadline (%zu)",
+            r.server.pending_.size());
+      close(idle);
+      close(slow);
+    }
+    {
+      // an upgrade whose admission message never comes
+      int fd = connect_lo(r.port);
+      std::string req = upgrade("h=270");
+      CHECK(write(fd, req.data(), req.size()) == (ssize_t)req.size(), "the upgrade is sent");
+      CHECK(within(2000, [&] { return r.server.pending_.size() == 1; }), "an upgraded connection waits for its token");
+      CHECK(drained(), "it gives its place back when the admission wait ends (%zu)", r.server.pending_.size());
+      close(fd);
+    }
+    {
+      // TLS: no ClientHello; bytes that are not TLS
+      int idle = connect_lo(r.tport), junk = connect_lo(r.tport);
+      CHECK(write(junk, "GET / HTTP/1.1\r\n\r\n", 18) == 18, "the plain request is sent");
+      CHECK(closed_within(junk, 1000), "a connection that is not TLS is closed at once");
+      CHECK(closed_within(idle, 2000) && drained(), "a handshake that never starts gives its place back (%zu)",
+            r.server.pending_.size());
+      close(idle);
+      close(junk);
+    }
+    {
+      // TLS: the handshake 400 ms after connecting, then no request: closed 600 ms after accept,
+      // not 600 ms after the handshake
+      auto t0 = std::chrono::steady_clock::now();
+      int fd = connect_lo(r.tport);
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+      SSL* ssl = SSL_new(ctx);
+      SSL_set_fd(ssl, fd);
+      bool shook = SSL_connect(ssl) == 1;
+      char b;
+      int got = SSL_read(ssl, &b, 1);  // ends when the server closes
+      long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      CHECK(shook && got <= 0 && ms >= 500 && ms < 900, "one deadline covers the handshake and the header (closed after %ld ms)", ms);
+      CHECK(drained(), "the handshaken connection gave its place back (%zu)", r.server.pending_.size());
+      SSL_free(ssl);
+      SSL_CTX_free(ctx);
+      close(fd);
+    }
+    CHECK(r.server.refused_pending_ == 0, "nothing was refused");
+    r.stop();
+  }
+
   // One stream per viewer on a fleet server: a newer one with the same viewer's token ends the
   // older; other viewers' streams stay. At most the cap in all; a refusal is close 1013.
   static void a_fleet_server_streams_once_per_viewer_and_up_to_its_cap() {
@@ -507,6 +749,56 @@ int main() {
   ServerTest::fleet_streams_ask_no_more_than_the_page();
   ServerTest::a_fleet_server_streams_once_per_viewer_and_up_to_its_cap();
   ServerTest::a_replaced_stream_that_stopped_reading_ends_at_once();
+  // --- connections that reach no stream (access.h): the source a connection counts under, the table
+  {
+    auto v4 = [](const char* a) {
+      sockaddr_in s{};
+      s.sin_family = AF_INET;
+      inet_pton(AF_INET, a, &s.sin_addr);
+      return pending_source((const sockaddr*)&s, sizeof s);
+    };
+    auto v6 = [](const char* a) {
+      sockaddr_in6 s{};
+      s.sin6_family = AF_INET6;
+      inet_pton(AF_INET6, a, &s.sin6_addr);
+      return pending_source((const sockaddr*)&s, sizeof s);
+    };
+    CHECK(!v4("198.51.100.7").empty() && v4("198.51.100.7") != v4("198.51.100.8") && v6("::ffff:198.51.100.7") == v4("198.51.100.7"),
+          "an IPv4 source is its address, mapped or not");
+    CHECK(!v6("2001:db8:1:2::5").empty() && v6("2001:db8:1:2::5") == v6("2001:db8:1:2:ffff:ffff:ffff:ffff") &&
+              v6("2001:db8:1:2::5") != v6("2001:db8:1:3::5") && v6("c633:6407::1") != v4("198.51.100.7"),
+          "an IPv6 source is its /64");
+    bool relays_uncounted = true;
+    for (const char* a : {"127.0.0.1", "10.0.2.2", "172.16.0.1", "172.31.255.1", "192.168.1.1", "100.64.0.1", "169.254.169.254"})
+      relays_uncounted = relays_uncounted && v4(a).empty() && v6(("::ffff:" + std::string(a)).c_str()).empty();
+    for (const char* a : {"::1", "fd00:ec2::254", "fc00::1", "fe80::1"}) relays_uncounted = relays_uncounted && v6(a).empty();
+    CHECK(relays_uncounted && !v4("172.32.0.1").empty() && !v4("100.128.0.1").empty(),
+          "loopback, private and link-local sources (this host's relays) are counted only in all");
+    sockaddr_un unix_peer{};
+    unix_peer.sun_family = AF_UNIX;
+    CHECK(pending_source((const sockaddr*)&unix_peer, sizeof unix_peer).empty() && pending_source(nullptr, 0).empty(),
+          "another family, or no address, is counted only in all");
+    PendingTable t(3, 2);
+    std::string a = v4("198.51.100.7"), b = v4("198.51.100.8");
+    CHECK(t.take(a) && t.take(a) && !t.take(a) && t.from(a) == 2, "a source holds at most its cap");
+    CHECK(t.take("") && !t.take(b) && t.size() == 3, "past the cap in all nothing is taken");
+    {
+      PendingPlace p(&t, a);  // a place handed over, as start_connection does
+      t.give_back(a);         // the second of a's two
+    }
+    CHECK(t.size() == 1 && t.from(a) == 0, "places are given back by owner or by hand (%zu, %zu)", t.size(), t.from(a));
+    {
+      CHECK(t.take(b), "a freed place is taken again");
+      PendingPlace p(&t, b);
+      p.release();
+      p.release();
+      CHECK(t.size() == 1 && t.from(b) == 0, "a released place is given back once");
+    }
+    CHECK(t.size() == 1, "and not again when its owner goes (%zu)", t.size());
+  }
+  ServerTest::idle_connections_past_the_cap_are_refused_while_a_viewer_streams();
+  ServerTest::one_source_cannot_take_every_pending_place();
+  ServerTest::pending_places_are_given_back_after_timeouts_and_failed_handshakes();
   // --- stream limits (access.h): the viewer a token names, who may ask q=hi, the table
   {
     CHECK(admit_token_viewer("v1.1000.v-3.77RQ") == "v-3" && admit_token_viewer("v1.1000.aggregator-ab.x") == "aggregator-ab" &&
@@ -575,13 +867,13 @@ int main() {
           sub);
     // One deadline per phase (tls_check.h tests the deadline itself): the request head, the
     // admission message of /frames and /mirror, and none once a stream runs.
-    long handle = find_from(0, "void Server::handle(Conn& c)");
-    long head_deadline = find_from(handle, "c.set_read_deadline_ms(10000)");
+    long handle = find_from(0, "void Server::handle(Conn& c,");
+    long head_deadline = find_from(handle, "c.set_read_deadline_ms(std::max(1, request_ms))");
     long head_read = find_from(handle, "c.read(tmp, sizeof tmp)");
-    long admit_deadline = find_from(needs, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long admit_deadline = find_from(needs, "c.set_read_deadline_ms(admit_wait_ms_)");
     long cleared = find_from(first, "c.set_read_deadline_ms(0)");
     long mirror = find_from(0, "path == \"/mirror\"");
-    long mirror_deadline = find_from(mirror, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long mirror_deadline = find_from(mirror, "c.set_read_deadline_ms(admit_wait_ms_)");
     long mirror_read = find_from(mirror, "read_ws_message(c, &op, &first)");
     CHECK(handle >= 0 && head_deadline > handle && head_read > head_deadline && admit_deadline > needs && admit_deadline < first &&
               cleared > first && cleared < sub && mirror_deadline > mirror && mirror_read > mirror_deadline,

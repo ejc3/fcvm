@@ -62,9 +62,16 @@ class Server {
  private:
   friend struct ServerTest;
   int open_listener(int port, std::string* err);
+  // Accepts until the listener is shut down.
   void accept_loop(int lfd, bool tls);
-  void handle(Conn& c);
-  void websocket(Conn& c, int h, int q, const std::string& key);
+  // An accepted connection from `peer`: takes its pending place and starts its thread, or
+  // closes it (refused) when there is no place (fleet/PROTOCOL.md, "Connection limits") or no
+  // thread. Returns whether it started.
+  bool start_connection(int fd, const sockaddr* peer, socklen_t peer_len, bool tls);
+  // One request. `pending` (null: none) is given back once the connection is admitted to a
+  // stream or a mirror; `request_ms` bounds the wait for the whole request header.
+  void handle(Conn& c, PendingPlace* pending = nullptr, int request_ms = REQUEST_WAIT_MS);
+  void websocket(Conn& c, int h, int q, const std::string& key, PendingPlace* pending);
   FrameSource& p_;
   int lfd_ = -1, tfd_ = -1;
   TlsFront* tls_ = nullptr;
@@ -75,4 +82,10 @@ class Server {
   int refuse_without_scene_token(Conn& c, std::map<std::string, std::string>& hdr);
   std::atomic<unsigned long long> refused_{0};  // connections refused for want of a thread (both accept loops)
   StreamTable streams_{MAX_FLEET_STREAMS};  // a fleet server's open frame streams
+  // Connections that have reached no stream, on both listeners, and those refused past its caps.
+  PendingTable pending_{MAX_PENDING_CONNECTIONS, MAX_PENDING_PER_SOURCE};
+  std::atomic<unsigned long long> refused_pending_{0};
+  // Tests: shorter waits.
+  int request_wait_ms_ = REQUEST_WAIT_MS;
+  int admit_wait_ms_ = ADMIT_WAIT_MS;
 };

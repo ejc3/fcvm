@@ -178,7 +178,55 @@ A fleet renderer (`SCENE_TOKEN_FILE` or `TLS_CERT_FILE` set) limits these tools
 needs an aggregator's token once the scene brought `admit_keys`, and at most 512
 streams run at once (one per viewer a token names). The EC2 tile's nginx passes
 only `/frames`, `/health`, `/scene` and `/budget` (`fleet/ami/tile/nginx-renderer.conf`).
-A local renderer has none of these limits.
+A local renderer has none of these limits. Connections that have not reached a stream
+are bounded on every server, local or not (next section).
+
+## Connections that reach no stream (2026-11-19)
+
+Every accepted connection gets a thread, which it holds until it is admitted to a
+stream (or the phone streamer's mirror), its request is answered, or a deadline
+passes. Before these limits an anonymous client could open thousands of idle
+connections to a public tile and hold a thread for each. Now (`src/access.h`,
+PROTOCOL.md "Connection limits"):
+
+- At most 512 connections are pending at once (`MAX_PENDING_CONNECTIONS`, the
+  stream cap: every seat and aggregator reader can reconnect at once). One past
+  it is closed at accept, before a thread is started or a byte is sent.
+- At most 16 of them from one source (`MAX_PENDING_PER_SOURCE`): an IPv4 address,
+  or an IPv6 /64. An anonymous client needs 32 sources to hold every place.
+  Loopback, private and link-local sources count only against the 512: they are
+  this host's relays, each carrying many viewers (the EC2 tile's nginx connects
+  from 127.0.0.1; a GPU host's IPv4 viewers arrive through its published-port
+  proxy and IPv4 front). Separating the viewers behind a relay is the relay's job.
+- The TLS handshake and the request header share one 10 s deadline from accept
+  (`REQUEST_WAIT_MS`); each had 10 s of its own before. The admission message
+  still has 5 s after the upgrade (`ADMIT_WAIT_MS`).
+- A connection gives its place back when it is admitted, and otherwise when its
+  thread ends, whatever ended it (`PendingPlace`, owned by the thread's function).
+  Refusals are logged at 1, 2, 4, ... so far.
+
+What the handshake and header need: a TLS 1.3 server (Python's `ssl`, P-256)
+timing accept to the end of a browser-sized WebSocket upgrade from a client with
+`TCP_NODELAY`, as browsers set, 200 connections per row, on the loopback of a
+private network namespace with `netem` delay and loss on it
+(`unshare -rn`, `tc qdisc add dev lo root netem delay 150ms loss 5%`):
+
+| round trip | loss each way | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 0 | 0 | 0.7 ms | 0.7 ms | 1.0 ms | 1.0 ms |
+| 100 ms | 0 | 101 ms | 101 ms | 102 ms | 106 ms |
+| 300 ms | 0 | 301 ms | 301 ms | 304 ms | 307 ms |
+| 600 ms | 0 | 601 ms | 601 ms | 602 ms | 606 ms |
+| 300 ms | 5% | 301 ms | 1.16 s | 3.20 s | 15.0 s |
+| 300 ms | 10% | 301 ms | 1.48 s | 6.81 s | 7.76 s |
+| 600 ms | 10% | 601 ms | 2.64 s | 8.30 s | 15.2 s |
+
+A healthy link needs one round trip, so 10 s per phase was far above it; a lossy
+link waits out retransmission timeouts, and its tail reaches several seconds. The
+page gives a frame socket 5 s, then 10 s, then 20 s to open (`frameOpenDeadlineMs`
+in `fleet/web/core/net.ts`), so one 10 s deadline lets a link that slow connect on
+its second try. A shorter one would change little against an attacker, who is
+bounded by the caps, and would cut more lossy viewers.
 
 ## The trace's code size (round 21, 2026-11-05)
 

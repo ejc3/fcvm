@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -153,34 +154,61 @@ void Server::serve() {
 
 void Server::accept_loop(int lfd, bool tls) {
   while (true) {
-    int fd = accept(lfd, nullptr, nullptr);
+    sockaddr_storage peer{};
+    socklen_t peer_len = sizeof peer;
+    int fd = accept(lfd, (sockaddr*)&peer, &peer_len);
     if (fd < 0) {
       if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE) continue;
+      if (errno == EINVAL || errno == EBADF) return;  // the listener was shut down
       perror("accept");
       continue;
     }
-    bool started = start_thread(
-        [this, fd, tls] {
-          int one = 1;
-          setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-          std::unique_ptr<Conn> c;
-          if (tls) {
-            std::string err;
-            c = tls_->accept(fd, 10000, &err);  // closes fd on failure
-            if (!c) return;
-          } else {
-            c.reset(new Conn(fd, nullptr));
-          }
-          handle(*c);
-        },
-        nullptr);
-    if (!started) {
-      // no thread for it (a pids or thread limit): refuse this connection
-      close(fd);
-      unsigned long long n = ++refused_;
-      if ((n & (n - 1)) == 0) fprintf(stderr, "fleet-renderer: no thread for a new connection; refused %llu so far\n", n);
-    }
+    start_connection(fd, (sockaddr*)&peer, peer_len, tls);
   }
+}
+
+bool Server::start_connection(int fd, const sockaddr* peer, socklen_t peer_len, bool tls) {
+  // One deadline for the TLS handshake and the request header, from accept.
+  const auto request_by = std::chrono::steady_clock::now() + std::chrono::milliseconds(request_wait_ms_);
+  std::string source = pending_source(peer, peer_len);
+  if (!pending_.take(source)) {
+    // past MAX_PENDING_CONNECTIONS, or MAX_PENDING_PER_SOURCE from this source: no thread, no byte
+    close(fd);
+    unsigned long long n = ++refused_pending_;
+    if ((n & (n - 1)) == 0)
+      fprintf(stderr, "fleet-renderer: refused a connection past the pending limits (in all or from its source); refused %llu so far\n",
+              n);
+    return false;
+  }
+  // Given back when the connection is admitted to a stream; else when its thread ends (the
+  // lambda and this copy are destroyed), or here when no thread starts.
+  auto place = std::make_shared<PendingPlace>(&pending_, std::move(source));
+  bool started = start_thread(
+      [this, fd, tls, place, request_by] {
+        auto left = [&request_by] {
+          long ms = std::chrono::duration_cast<std::chrono::milliseconds>(request_by - std::chrono::steady_clock::now()).count();
+          return (int)std::clamp(ms, 1L, (long)REQUEST_WAIT_MS);
+        };
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        std::unique_ptr<Conn> c;
+        if (tls) {
+          std::string err;
+          c = tls_->accept(fd, left(), &err);  // closes fd on failure
+          if (!c) return;
+        } else {
+          c.reset(new Conn(fd, nullptr));
+        }
+        handle(*c, place.get(), left());
+      },
+      nullptr);
+  if (!started) {
+    // no thread for it (a pids or thread limit): refuse this connection
+    close(fd);
+    unsigned long long n = ++refused_;
+    if ((n & (n - 1)) == 0) fprintf(stderr, "fleet-renderer: no thread for a new connection; refused %llu so far\n", n);
+  }
+  return started;
 }
 
 int Server::refuse_without_scene_token(Conn& c, std::map<std::string, std::string>& hdr) {
@@ -190,10 +218,10 @@ int Server::refuse_without_scene_token(Conn& c, std::map<std::string, std::strin
   return denied;
 }
 
-void Server::handle(Conn& c) {
+void Server::handle(Conn& c, PendingPlace* pending, int request_ms) {
   // Each phase has one deadline for all its reads: a per-read timeout lets a client that
   // sends a byte every few seconds hold this thread for as long as it likes.
-  c.set_read_deadline_ms(10000);
+  c.set_read_deadline_ms(std::max(1, request_ms));
   std::string buf;
   char tmp[4096];
   size_t he;
@@ -308,7 +336,7 @@ void Server::handle(Conn& c) {
     if (!c.write_all(resp.data(), resp.size())) return;
     // As for /frames, the token is the first message, never in the URL; here it must also
     // name the viewer holding the phone.
-    c.set_read_deadline_ms(ADMIT_WAIT_MS);
+    c.set_read_deadline_ms(admit_wait_ms_);
     int op = 0;
     std::string first, token;
     if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.mirror_admits(token)) {
@@ -317,6 +345,7 @@ void Server::handle(Conn& c) {
       c.write_all(close.data(), close.size());
       return;
     }
+    if (pending) pending->release();  // admitted: from here the mirror is the viewer's own
     c.set_read_deadline_ms(0);
     p_.mirror(c, token);
     return;
@@ -335,12 +364,12 @@ void Server::handle(Conn& c) {
     std::string qs = query_str(query, "q", "std");
     int q = quality_from_name(qs);
     if (q < 0) return respond(c, 400, "Bad Request", "{\"error\":\"q must be hi, std or lo\"}");
-    return websocket(c, h, q, hdr["sec-websocket-key"]);
+    return websocket(c, h, q, hdr["sec-websocket-key"], pending);
   }
   respond(c, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
-void Server::websocket(Conn& c, int h, int q, const std::string& key) {
+void Server::websocket(Conn& c, int h, int q, const std::string& key, PendingPlace* pending) {
   std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
                      ws_accept(key) + "\r\n\r\n";
   if (!c.write_all(resp.data(), resp.size())) return;
@@ -353,7 +382,7 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   const bool admission = p_.requires_admit();
   std::string viewer;
   if (admission) {
-    c.set_read_deadline_ms(ADMIT_WAIT_MS);
+    c.set_read_deadline_ms(admit_wait_ms_);
     int op = 0;
     std::string first, token;
     if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.admits(token)) {
@@ -384,6 +413,7 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
       if (table) table->close(id);
     }
   } held{fleet() ? &streams_ : nullptr, place};
+  if (pending) pending->release();  // a stream now, which MAX_FLEET_STREAMS bounds on a fleet server
   c.set_read_deadline_ms(0);  // the stream's reader waits for as long as the stream lasts
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   // Keep at most 64 KiB written and not yet sent in the kernel (about 26 ms at 20

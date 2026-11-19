@@ -1,8 +1,12 @@
 #include "access.h"
 
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <cstring>
 
 #include "json.h"
 
@@ -132,4 +136,68 @@ size_t StreamTable::size() {
 void StreamTable::set_cap(size_t cap) {
   std::lock_guard<std::mutex> l(mu_);
   cap_ = cap;
+}
+
+namespace {
+bool local_v4(const uint8_t* a) {
+  return a[0] == 127 || a[0] == 10 || (a[0] == 172 && (a[1] & 0xf0) == 16) || (a[0] == 192 && a[1] == 168) ||
+         (a[0] == 100 && (a[1] & 0xc0) == 64) || (a[0] == 169 && a[1] == 254) || a[0] == 0;
+}
+}  // namespace
+
+std::string pending_source(const sockaddr* addr, size_t len) {
+  if (!addr) return "";
+  if (addr->sa_family == AF_INET && len >= sizeof(sockaddr_in)) {
+    const uint8_t* a = (const uint8_t*)&((const sockaddr_in*)addr)->sin_addr;
+    return local_v4(a) ? "" : std::string("4") + std::string((const char*)a, 4);
+  }
+  if (addr->sa_family == AF_INET6 && len >= sizeof(sockaddr_in6)) {
+    const uint8_t* a = ((const sockaddr_in6*)addr)->sin6_addr.s6_addr;
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (memcmp(a, mapped, 12) == 0) return local_v4(a + 12) ? "" : std::string("4") + std::string((const char*)a + 12, 4);
+    static const uint8_t loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    bool local = memcmp(a, loopback, 16) == 0 || (a[0] & 0xfe) == 0xfc || (a[0] == 0xfe && (a[1] & 0xc0) == 0x80);
+    return local ? "" : std::string("6") + std::string((const char*)a, 8);
+  }
+  return "";
+}
+
+bool PendingTable::take(const std::string& source) {
+  std::lock_guard<std::mutex> l(mu_);
+  if (open_ >= cap_) return false;
+  if (!source.empty()) {
+    auto it = by_source_.find(source);
+    size_t held = it == by_source_.end() ? 0 : it->second;
+    if (held >= per_source_) return false;
+    if (it == by_source_.end()) by_source_.emplace(source, 1);
+    else it->second++;
+  }
+  open_++;
+  return true;
+}
+
+void PendingTable::give_back(const std::string& source) {
+  std::lock_guard<std::mutex> l(mu_);
+  if (open_ > 0) open_--;
+  if (source.empty()) return;
+  auto it = by_source_.find(source);
+  if (it == by_source_.end()) return;
+  if (--it->second == 0) by_source_.erase(it);
+}
+
+size_t PendingTable::size() {
+  std::lock_guard<std::mutex> l(mu_);
+  return open_;
+}
+
+size_t PendingTable::from(const std::string& source) {
+  std::lock_guard<std::mutex> l(mu_);
+  auto it = by_source_.find(source);
+  return it == by_source_.end() ? 0 : it->second;
+}
+
+void PendingTable::set_caps(size_t cap, size_t per_source) {
+  std::lock_guard<std::mutex> l(mu_);
+  cap_ = cap;
+  per_source_ = per_source;
 }

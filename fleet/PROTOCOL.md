@@ -1932,6 +1932,24 @@ A renderer outside the fleet keeps the earlier limits: `h` up to 2160, any `q`, 
 of streams. The phone streamer and the Windows bridge serve frames with the renderer's code,
 under the same limits.
 
+### Connection limits
+
+Every server built on the renderer's code (the renderer, the phone streamer, the Windows
+bridge; fleet or not) bounds the connections that have not reached a stream
+(`fleet/renderer/src/access.h`; measurements in `fleet/renderer/README.md`, "Connections
+that reach no stream"). A connection is pending from accept until it is admitted to a stream
+or a mirror, its request is answered, or it ends.
+
+- At most 512 are pending at once (`MAX_PENDING_CONNECTIONS`, the stream cap). One more is
+  closed at accept: no TLS handshake, no response.
+- At most 16 from one source (`MAX_PENDING_PER_SOURCE`): an IPv4 address (an IPv4-mapped
+  address counts as its IPv4 address), or an IPv6 /64. Loopback, private (10/8, 172.16/12,
+  192.168/16, 100.64/10, fc00::/7) and link-local sources count only against the 512: they
+  are the host's relays (a tile instance's nginx, a GPU host's published-port proxy and IPv4
+  front), each carrying many viewers.
+- The TLS handshake and the request header share one 10 s deadline from accept. The
+  admission message on `/frames` and `/mirror` then has its 5 s ("Access").
+
 ### Coordinates and time
 
 - **World units are kilometres.** A position is `[x, altitude, z]`: `x` and
