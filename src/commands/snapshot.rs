@@ -3732,6 +3732,7 @@ async fn cmd_snapshot_run_inner(
                 restore_prefix.clone(),
                 args.ipv6_address,
             )
+            .with_publish_limit_per_source(args.publish_limit_per_source.map(|n| n as usize))
             .with_port_listeners(port_listeners.take().unwrap_or_default());
             setup_try!(net
                 .preflight_check()
@@ -5838,6 +5839,8 @@ fn run_args_from_snapshot_metadata(
         .collect(),
         cmd: None,
         publish,
+        // `snapshot run` sets its own (`--publish-limit-per-source`).
+        publish_limit_per_source: None,
         balloon: balloon.map(|device| device.target_mib),
         free_page_reporting: balloon.is_some_and(|device| device.free_page_reporting),
         network,
@@ -6253,7 +6256,7 @@ async fn cmd_snapshot_run_disk_only(
         .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
-    let run_args = run_args_from_snapshot_metadata(
+    let mut run_args = run_args_from_snapshot_metadata(
         meta,
         &port_mappings,
         vm_name,
@@ -6277,6 +6280,7 @@ async fn cmd_snapshot_run_disk_only(
         ),
         args.host_ipv6,
     );
+    run_args.publish_limit_per_source = args.publish_limit_per_source;
 
     info!(
         snapshot = %snapshot_name,
@@ -8269,6 +8273,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            publish_limit_per_source: None,
             map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,
@@ -8756,6 +8761,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            publish_limit_per_source: None,
             map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,

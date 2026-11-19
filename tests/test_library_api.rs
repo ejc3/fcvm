@@ -31,6 +31,7 @@ fn test_run_args(name: &str) -> RunArgs {
         env: vec![],
         cmd: None,
         publish: vec![],
+        publish_limit_per_source: None,
         balloon: None,
         free_page_reporting: false,
         network: NetworkMode::Rootless,

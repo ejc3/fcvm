@@ -1617,8 +1617,9 @@ URL as `wss://<slot id>.<zone>/frames`.
 The IPv4 path: a GPU host has one public IPv4 address, shared by its slots.
 `--tls-publish-base <port>` forwards each slot's TLS port on the host (`--publish-ip`, port
 `<port> + GPU index`, fcvm's `--publish`, which relays into a routed VM and goes away with its
-fcvm), and `--public-ipv4-from-imds` reports the host's address (IMDS `public-ipv4`, assigned
-by EC2 at launch) as `ipv4`, with `v4_port` 443, the IPv4 front's port (below). Every place's
+fcvm, with `--publish-limit-per-source 32`, "Connection limits"), and
+`--public-ipv4-from-imds` reports the host's address (IMDS `public-ipv4`, assigned by EC2 at
+launch) as `ipv4`, with `v4_port` 443, the IPv4 front's port (below). Every place's
 TLS port is in its mode's range of `fleet/published-ports.json`: `<port>` plus the range's
 offset plus the place's index in its mode (GPU slots by GPU index, then Windows sandboxes,
 Minecraft servers and the aggregator in ranges of their own). The agent refuses to start with
@@ -1639,7 +1640,16 @@ is 8 base32 characters), and a place of this host reports `<id>`: a GPU slot or 
 (`slot-<n>`, `phone-<n>`), a Windows sandbox (`win-<n>`), a Minecraft server's view socket
 (`mc-<n>`) or the host's aggregator (`agg-<host>`). Every other connection is closed without a
 byte sent: bytes that are not a ClientHello, a hello with no server name, any other name, a
-hello not complete within 10 s or over 16 KiB, and connections past 8192 at once.
+hello not complete within 10 s or over 16 KiB, and connections past 8192 at once. Every place
+sees the front's connections come from the host's own address, so the front also counts them
+by source (an IPv4 address; `src/fleet/agent/sni.rs`) and closes, without a byte and before
+it dials the place, a connection whose source already has 32 connections in their
+ClientHello (`MAX_HELLO_PER_SOURCE`: a wall page opens one to each place of a host it shows,
+up to 8 GPU slots and the aggregator, plus the address-family probe's), 32 relayed to the
+place its name routes to (`MAX_RELAYED_PER_SOURCE_PLACE`, as the EC2 tile's nginx allows one
+source on its renderer) or 256 relayed in all (`MAX_RELAYED_PER_SOURCE`, 8192 / 32: one
+client needs 32 sources to fill the front). A connection gives its places back however it
+ends.
 
 The front learns where each place listens from the place's own reports. Every slot and
 aggregate message passes it on its way to the coordinator: a report whose IPv4 path names the
@@ -1650,8 +1660,8 @@ this one route (`src/fleet/agent/sni.rs`). Minecraft's Java Edition game port (2
 IPv6) is not TLS and not part of it.
 
 Rollout: the places' own ports still listen, as the front's backends, and the security group
-admits them as before, so a page that holds a URL an agent without the front published
-(`...-v4.<subzone>:<port>/...`) keeps working until that launch ends. The front takes effect
+admits them as before (with the per-source cap of "Connection limits" on each), so a page
+that holds a URL an agent without the front published (`...-v4.<subzone>:<port>/...`) keeps working until that launch ends. The front takes effect
 on a host started from a host image built with it (the agent binary is in the image). The
 security group's rule for 443 from any IPv4 address already covers the hosts (it is the
 fleet's one group, shared with the EC2 tiles). The per-place range can leave the security
@@ -1949,6 +1959,25 @@ or a mirror, its request is answered, or it ends.
   front), each carrying many viewers.
 - The TLS handshake and the request header share one 10 s deadline from accept. The
   admission message on `/frames` and `/mirror` then has its 5 s ("Access").
+
+A server behind a relay sees the relay's address for every viewer, so each relay in front of
+a fleet server counts its clients by the same source rule (an IPv4 address, or an IPv6 /64)
+and closes one past its cap without a response:
+
+- An EC2 tile's nginx (`fleet/ami/tile/nginx-renderer.conf`): at most 32 requests in
+  progress from one source, on every route; a frame socket counts for as long as it streams.
+  A page holds at most 3 sockets to one tile (its stream, the address-family probe's, and
+  across a reload the old page's stream until it closes), so 32 is about ten viewers behind
+  one address, and one client needs 16 sources to hold all 512 of the renderer's pending
+  places. The TLS handshake and the request header each have 10 s, and nginx gives the
+  renderer 5 s to accept.
+- A GPU host's IPv4 front ("The IPv4 front"): at most 32 connections from one source still
+  in their ClientHello, 32 relayed to one place and 256 relayed in all.
+- A GPU host's published ports (the places' own IPv4 ports, which fcvm's routed networking
+  relays into each VM): at most 32 connections from one source on one VM's published ports
+  (`fcvm podman run`/`snapshot run --publish-limit-per-source`, which the agent passes with
+  every TLS port). The host's own addresses are not counted there: the IPv4 front connects
+  from them, and has counted each viewer already.
 
 ### Coordinates and time
 

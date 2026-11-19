@@ -460,6 +460,9 @@ pub struct RoutedNetwork {
     ipv6_address: Option<std::net::Ipv6Addr>,
     /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     forward_localhost: Vec<u16>,
+    /// The most connections one source may hold on the published ports
+    /// (--publish-limit-per-source).
+    publish_limit_per_source: Option<usize>,
     /// The IPv6 resolver the launch's resolv.conf snapshot selected, threaded
     /// in by the caller. None means the snapshot named no IPv6 server.
     ipv6_dns: Option<String>,
@@ -507,6 +510,7 @@ impl RoutedNetwork {
             ipv6_prefix: None,
             ipv6_address: None,
             forward_localhost: Vec::new(),
+            publish_limit_per_source: None,
             ipv6_dns: None,
             restore_mode: false,
             namespace_id: None,
@@ -557,6 +561,13 @@ impl RoutedNetwork {
     /// addresses. `setup` closes the others.
     pub fn with_port_listeners(mut self, listeners: tcp_proxy::PortListeners) -> Self {
         self.handed_listeners = listeners;
+        self
+    }
+
+    /// Refuse a published port's client whose source already holds `limit` connections
+    /// on the VM's published ports (`tcp_proxy::SourceCap`).
+    pub fn with_publish_limit_per_source(mut self, limit: Option<usize>) -> Self {
+        self.publish_limit_per_source = limit;
         self
     }
 
@@ -1334,6 +1345,7 @@ impl NetworkManager for RoutedNetwork {
                 &self.port_mappings,
                 &ns_name,
                 GUEST_IP,
+                self.publish_limit_per_source,
             )
             .context("starting port forward proxies")?;
             self.proxy_handles.extend(handles);
