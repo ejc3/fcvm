@@ -467,6 +467,11 @@ pub const CLAIM_RESUME_MS: u64 = 30_000;
 pub struct HeldClaim {
     pub host: String,
     pub sbdf: String,
+    /// The number of the slot (`slot-<n>`) the claim was on. The GPU gets that number back
+    /// when its host says hello, and no other GPU takes it meanwhile: the agent keys its VMs by
+    /// slot id, and a GPU under a new id would have the claim's VM torn down.
+    #[serde(default)]
+    pub slot: Option<u32>,
     pub claim: Claim,
 }
 
@@ -946,7 +951,7 @@ impl State {
         // new page gets it. A claim whose time ran out while the coordinator was down ends as
         // the tick would have ended it.
         let mut held = std::mem::take(&mut f.held_claims);
-        for s in f.slots.values_mut() {
+        for (n, s) in f.slots.iter_mut() {
             let (Some(c), Some(host), Some(gpu)) = (s.claim.take(), &s.host, &s.gpu) else {
                 continue;
             };
@@ -957,6 +962,7 @@ impl State {
             held.push(HeldClaim {
                 host: host.clone(),
                 sbdf: gpu.sbdf.clone(),
+                slot: Some(*n),
                 claim: c,
             });
         }

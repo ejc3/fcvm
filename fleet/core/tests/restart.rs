@@ -279,3 +279,63 @@ fn a_restart_keeps_the_votes_of_the_open_round() {
         "the voted stop is next"
     );
 }
+
+fn host_hello(at: u64, host: &str, sbdfs: &[&str]) -> Event {
+    let gpus: Vec<serde_json::Value> = sbdfs
+        .iter()
+        .map(|s| json!({"name": "Tesla T4", "sbdf": s}))
+        .collect();
+    ev(
+        json!({"at": at, "type": "agent", "host": host, "msg": {"type": "hello", "host": host,
+        "arch": "x86_64", "capacity": 8, "gpus": gpus}}),
+    )
+}
+
+/// Hosts say hello again in any order after a restart, and slot names are handed out lowest
+/// first. The claimed GPU must come back under the slot id it had: the agent keys its VMs by
+/// slot id and tears down a slot whose id now names another GPU, so a new id would end the
+/// claim's VM. Its assignment keeps the same id, GPU and generation as before the restart.
+#[test]
+fn a_claimed_gpu_keeps_its_slot_id_when_hosts_return_in_another_order() {
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            host_hello(1000, "h1", &["0000:01:00.0", "0000:02:00.0"]),
+            host_hello(1100, "h2", &["0000:09:00.0"]),
+            joined(2000, "v1"),
+            intent(3000, "v1", "c1", "claim_gpu", json!({})),
+        ],
+    );
+    assert_eq!(s.receipts["c1"].outcome, Outcome::Committed);
+    let mine = |s: &State| {
+        host_assignments(s)["h2"]
+            .iter()
+            .find(|a| a.sbdf == "0000:09:00.0")
+            .map(|a| (a.id.clone(), a.generation))
+            .unwrap()
+    };
+    let before = mine(&s);
+    assert_eq!(before.0, "slot-3", "the claim is on h2's standby GPU");
+    let stored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    let s = stored.resumed(config(), 5000);
+    // h2 first: lowest first would give its GPU slot-1.
+    let s = run(
+        s,
+        vec![
+            host_hello(6000, "h2", &["0000:09:00.0"]),
+            host_hello(6100, "h1", &["0000:01:00.0", "0000:02:00.0"]),
+        ],
+    );
+    assert_eq!(
+        mine(&s),
+        before,
+        "the claimed GPU's assignment is unchanged"
+    );
+    let mut h1: Vec<String> = host_assignments(&s)["h1"]
+        .iter()
+        .map(|a| a.id.clone())
+        .collect();
+    h1.sort();
+    assert_eq!(h1, ["slot-1", "slot-2"]);
+    assert!(s.fleet.slots[&3].claim.is_some());
+}

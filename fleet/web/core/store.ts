@@ -468,7 +468,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           // `resume_claim`): a coordinator that restarted carried it over and gives it back;
           // otherwise the coordinator ended it when the old connection closed, the resume is
           // refused, and the claim shows as ended. Its frames stop until a claim message
-          // says it runs again. A resume already out is sent again with the pending intents.
+          // says it runs again. Every connection presents it with an intent id of its own: a
+          // coordinator that stored an earlier resume and then restarted again has the claim
+          // waiting for a viewer once more, and answers a repeated id with its first receipt
+          // without binding the claim to this connection.
           const c = s.own.claim;
           const own =
             c !== null && c.phase !== "ended"
@@ -476,7 +479,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
                 ? {
                     ...s.own,
                     claim: { ...c, phase: "restoring", frame_url: null, frame_url_v4: null },
-                    resume: s.own.resumeId === null ? c.token : null,
+                    resume: c.token,
+                    resumeId: null,
                   }
                 : { ...s.own, claim: { ...c, phase: "ended", frame_url: null, ended: CLAIM_DROPPED } }
               : s.own;
@@ -587,7 +591,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
 
 /** Intents to send again after the socket reopens: those with no receipt yet. */
 export function intentsToResend(s: ClientState): IntentMsg[] {
-  return s.pending.filter((p) => p.receipt === null).map((p) => p.intent);
+  // A resume belongs to its connection: the next one sends a new one (see "hello").
+  return s.pending.filter((p) => p.receipt === null && p.intent.name !== "resume_claim").map((p) => p.intent);
 }
 
 /** Camera keys the frame drawer should watch for: drawn T at or past tEff ends the watch. */

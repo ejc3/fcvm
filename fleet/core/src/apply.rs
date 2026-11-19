@@ -1588,8 +1588,21 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
         if exists {
             continue;
         }
-        // Slot names are reused lowest first.
-        let n = (1..).find(|n| !f.slots.contains_key(n)).unwrap();
+        // A GPU whose claim a restart carried over gets its old slot number back, and no
+        // other GPU takes a number a held claim waits for (see `HeldClaim::slot`): hosts can
+        // say hello again in any order. Other slot names are reused lowest first.
+        let own = f
+            .held_claims
+            .iter()
+            .find(|h| h.host == host && h.sbdf == g.sbdf)
+            .and_then(|h| h.slot)
+            .filter(|n| !f.slots.contains_key(n));
+        let reserved = |n: &u32| f.held_claims.iter().any(|h| h.slot == Some(*n));
+        let n = own.unwrap_or_else(|| {
+            (1..)
+                .find(|n| !f.slots.contains_key(n) && !reserved(n))
+                .unwrap()
+        });
         f.slots.insert(
             n,
             new_slot(

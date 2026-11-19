@@ -221,11 +221,16 @@ describe("a viewer's own GPU across a reconnect", () => {
     expect(s.own.resume).toBe("token-a");
     s = reduce(s, { type: "intent-sent", intent: makeIntent("r1", "resume_claim", { token: "token-a" }), at: EPOCH + 10_100 });
     expect([s.own.resume, s.own.resumeId]).toEqual([null, "r1"]);
-    // Another drop before the answer: the resume goes out again with the pending intents, not twice.
+    // Another drop before the answer (the coordinator may have stored r1 and restarted again,
+    // leaving the claim waiting for a viewer): the new connection presents the token under a
+    // new intent id, and r1 is not sent again, since a repeated id gets its first receipt
+    // without binding the claim to this connection.
     s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2" }), EPOCH + 10_200);
-    expect(s.own.resume).toBeNull();
-    expect(intentsToResend(s).map((i) => i.id)).toContain("r1");
-    s = feed(s, JSON.stringify({ type: "receipt", id: "r1", outcome: "committed", version: 9 }), EPOCH + 11_000);
+    expect([s.own.resume, s.own.resumeId]).toEqual(["token-a", null]);
+    expect(intentsToResend(s).map((i) => i.id)).not.toContain("r1");
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("r2", "resume_claim", { token: "token-a" }), at: EPOCH + 10_300 });
+    expect(s.own.resumeId).toBe("r2");
+    s = feed(s, JSON.stringify({ type: "receipt", id: "r2", outcome: "committed", version: 9 }), EPOCH + 11_000);
     expect(s.own.resumeId).toBeNull();
     s = feed(s, withToken("running"), EPOCH + 12_000);
     expect(s.own.claim?.phase).toBe("running");

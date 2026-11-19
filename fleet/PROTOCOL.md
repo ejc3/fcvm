@@ -137,7 +137,9 @@ keyframes change (`claim_camera`, `claim_autopilot`, and the autopilot's next ke
 about every 8 s while it flies), and a last time with `phase: "ended"` and `ended` saying why
 (`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
 fleet). The frame URL and the token appear in no snapshot. A page whose connection drops
-while it holds a claim presents the token on its new connection (`resume_claim`). A
+while it holds a claim presents the token on its new connection (`resume_claim`), under an
+intent id of that connection's own and never by resending an earlier connection's resume: a
+coordinator answers a repeated id with its first receipt and binds nothing. A
 coordinator that restarted carried the claim over and gives it back to that connection,
 which is told about it from then on as above (`restoring` until the claim's host is back
 and its VM reports running). Otherwise the claim ended when the old connection closed, the
@@ -843,8 +845,9 @@ restores what it can and releases what was bound to the old process:
   stored vote was answered); otherwise the vote starts again.
 - A GPU claim: kept until it expires. Its VM keeps running on its host, and a page proves it
   holds the claim with the claim's token. The claim waits for its host's agent to say
-  hello (then it is back on that GPU's slot, at the generation the host runs, so nothing
-  relaunches) and for its page to present the token with `resume_claim`, which it must do
+  hello (then it is back on that GPU's slot, under the slot id it had and at the generation
+  the host runs, so nothing relaunches; hosts may come back in any order, and no other GPU
+  takes that slot id while the claim waits, since agents key their VMs by slot id) and for its page to present the token with `resume_claim`, which it must do
   within 30 s of the restart or the claim ends and the GPU returns to the pool. A claim whose
   time ran out while the coordinator was down ends then.
 - Released: a borrowed phone, Windows sandbox or Minecraft server. These carry no token, so
