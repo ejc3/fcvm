@@ -4822,6 +4822,45 @@ fn every_fcvm_this_file_spawns_dies_with_the_test() {
     assert!(found > 0, "the check found no spawn to look at");
 }
 
+/// A claim that ends while its receipt waits for the store (here: writes fail for longer
+/// than the claim lasts) is still told to its page once the receipt goes, as ended, so the
+/// page does not wait for a GPU that is gone.
+#[tokio::test]
+async fn a_claim_that_ends_while_its_receipt_waits_is_told_as_ended() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        config: Config {
+            max_tiles: 1,
+            claim_secs: 1,
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut agent = FakeAgent::connect(&c.handle, "gpu-a", 2);
+    agent.assign().await;
+    let mut v = Viewer::connect(&c.url).await;
+    v.until(|s| s["fleet"]["n"] == 1).await;
+    v.intent("c-0", "claim_gpu", json!({})).await;
+    // The claim lasts 1 s; the store ticks find every write failing for 3 s.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::time::timeout(Duration::from_secs(5), v.receipt("c-0"))
+        .await
+        .expect("the receipt once stored");
+    assert_eq!(r["outcome"], "committed", "{r}");
+    let m = tokio::time::timeout(
+        Duration::from_secs(5),
+        v.message_where("claim", |m| m["claim"]["phase"] == "ended"),
+    )
+    .await
+    .expect("the page is told its claim ended");
+    assert_eq!(m["claim"]["ended"], "expired");
+}
+
 /// `fcvm fleet coord` on a state file, its stderr echoed to the test's, and its `/live` URL.
 struct CoordProcess {
     child: tokio::process::Child,

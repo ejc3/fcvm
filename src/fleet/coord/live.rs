@@ -645,9 +645,14 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     // change (a committed one; a refused one at once), so a coordinator that crashes has
     // acknowledged nothing it did not store. Waiting here keeps the reader reading. A receipt
     // that no stored state ever holds is never sent. A claim's messages start after its
-    // receipt.
-    let (receipts, mut receipts_rx) =
-        mpsc::channel::<(ServerMsg, oneshot::Receiver<bool>, bool)>(DIRECT_QUEUE);
+    // receipt, from the claim as it was when its intent applied: one that ended while the
+    // receipt waited for the store is still told, as ended.
+    type Queued = (
+        ServerMsg,
+        oneshot::Receiver<bool>,
+        Option<fleet_core::protocol::ClaimMsg>,
+    );
+    let (receipts, mut receipts_rx) = mpsc::channel::<Queued>(DIRECT_QUEUE);
     let forward = {
         let direct = direct.clone();
         let handle = app.handle.clone();
@@ -661,8 +666,13 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 if direct.send(msg).await.is_err() {
                     return;
                 }
-                if claim {
-                    claims.spawn(tell_claim(handle.clone(), viewer.clone(), direct.clone()));
+                if let Some(seen) = claim {
+                    claims.spawn(tell_claim(
+                        handle.clone(),
+                        viewer.clone(),
+                        direct.clone(),
+                        Some(seen),
+                    ));
                 }
             }
         })
@@ -802,7 +812,16 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                                 break;
                             }
                         } else if receipts
-                            .try_send((ServerMsg::receipt(&r), stored, claim))
+                            .try_send((
+                                ServerMsg::receipt(&r),
+                                stored,
+                                // The claim now, before the receipt waits for the store.
+                                if claim {
+                                    app.handle.claim_for(&viewer).await
+                                } else {
+                                    None
+                                },
+                            ))
                             .is_err()
                         {
                             tracing::info!(%viewer, "viewer is not reading its receipts; closing");
@@ -837,9 +856,17 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
 
 /// Keep the claiming viewer, and only it, told about its GPU: a `claim` message whenever
 /// the claim changes (restoring, then running with its frame URL, a new camera), and a
-/// last one when it ends.
-async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerMsg>) {
+/// last one when it ends. `seen` is the claim as it was before its receipt waited for the
+/// store, so a claim that ended meanwhile is told as ended.
+async fn tell_claim(
+    handle: Handle,
+    viewer: String,
+    direct: mpsc::Sender<ServerMsg>,
+    seen: Option<fleet_core::protocol::ClaimMsg>,
+) {
+    // The last message sent, and the claim as last seen.
     let mut last: Option<fleet_core::protocol::ClaimMsg> = None;
+    let mut known = seen;
     loop {
         match handle.claim_for(&viewer).await {
             Some(c) => {
@@ -851,11 +878,12 @@ async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerM
                     {
                         return;
                     }
-                    last = Some(c);
+                    last = Some(c.clone());
                 }
+                known = Some(c);
             }
             None => {
-                let Some(mut c) = last else { return };
+                let Some(mut c) = known else { return };
                 let now = now_ms();
                 c.ended = Some(
                     if now >= c.expires_at {
