@@ -663,10 +663,16 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
   without `s3:ListBucket`) stops the coordinator rather than start it empty. Every PUT is
   conditional on the object this coordinator last read or wrote (`If-Match` on its ETag, or
-  `If-None-Match: *` when there was none). A PUT answered 412 means another coordinator
-  writes the object now: the coordinator logs `FLEET_STATE_WRITE_LOST` at error level, writes
-  nothing more, and exits without its shutdown write or EC2 sweep, both of which would undo
-  the other coordinator's work. An object that does not parse does not stop the coordinator:
+  `If-None-Match: *` when there was none). A PUT answered 412 is first checked against the
+  object: when it holds a body this coordinator sent since its last answered PUT (an earlier
+  write that was stored and whose answer was lost), it takes that ETag and writes again.
+  Otherwise another coordinator writes the object now: the coordinator logs
+  `FLEET_STATE_WRITE_LOST` at error level and writes nothing more. When that happens while it
+  runs, it exits without its shutdown write; when its shutdown write is the one refused, that
+  write is attempted and refused. Either way it skips the EC2 sweep, which would terminate the
+  other coordinator's tiles, and it also skips the sweep whenever its last write was not
+  stored (a 412 whose check could not read the object leaves ownership unknown); the next
+  coordinator sweeps at its start. An object that does not parse does not stop the coordinator:
   it logs `FLEET_STATE_UNREADABLE` at error level and resumes from the newest earlier
   version that parses (the changes stored after it are lost); with no such version among
   the 20 before it, it does not start. Its first write then replaces the unreadable object.
@@ -834,8 +840,10 @@ restores what it can and releases what was bound to the old process:
 - Kept: the version, the scene (words, lights), the director, finished races, receipts, the
   action log, the per-address limits and cooldowns, quarantines and their reports, counters
   and potato mode's ladder and records.
-- The open stop vote: kept with its votes when the stored offer is the open round's (every
-  stored vote was answered); otherwise the vote starts again.
+- The open stop vote: kept with its votes when the stored offer is the open round's;
+  otherwise the vote starts again. A stored vote may not have been answered (a coordinator
+  that dies after the write and before the receipt goes); the page that resends the intent
+  after reconnecting gets that vote's first receipt.
 - Released: a GPU claim, a borrowed phone, Windows sandbox or Minecraft server. Each is bound
   to its viewer's `/live` connection, which ended with the old process, so each ends as it
   would when that viewer left; the page shows its claim ended when it reconnects (a sandbox

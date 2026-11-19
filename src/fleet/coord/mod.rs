@@ -1126,6 +1126,12 @@ fn store_lost(lost: &Option<watch::Receiver<bool>>) -> bool {
     lost.as_ref().is_some_and(|l| *l.borrow())
 }
 
+/// Whether this coordinator still owns the state object at shutdown: its last write was
+/// stored, and no write found another writer's object.
+fn owns_the_state(stored: bool, lost: &Option<watch::Receiver<bool>>) -> bool {
+    stored && !store_lost(lost)
+}
+
 /// Resolves once `lost` turns true (pending forever without one, or once its writer is gone).
 async fn lost_the_store(lost: &mut Option<watch::Receiver<bool>>) {
     let Some(rx) = lost else {
@@ -1604,7 +1610,19 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         );
     }
     // The next coordinator does not know these instances; terminate them now (it also
-    // sweeps at its start, for a coordinator that was killed).
+    // sweeps at its start, for a coordinator that was killed). Only while this coordinator
+    // still owns the state object, which its stored last write confirms: a last write that
+    // failed may have met another coordinator's object (a 412 whose check could not read
+    // it), and that coordinator's tiles are the ones the sweep would terminate.
+    let ec2_sweep = ec2_sweep.filter(|_| {
+        let owns = owns_the_state(stored, &lost);
+        if !owns {
+            tracing::warn!(
+                "the last state was not stored, so this coordinator may not own the state object; the EC2 sweep is left to the next coordinator's start"
+            );
+        }
+        owns
+    });
     if let Some(d) = ec2_sweep {
         match tokio::time::timeout(Duration::from_secs(20), d.sweep()).await {
             Ok(Ok(n)) => tracing::info!(instances = n, "EC2 tiles terminated"),
@@ -1697,7 +1715,9 @@ mod store_tests {
     use super::*;
 
     /// A coordinator that lost the state object to another writer while stopping does not
-    /// sweep the EC2 tiles, which are the other coordinator's now.
+    /// sweep the EC2 tiles, which are the other coordinator's now; nor does one whose last
+    /// write was not stored, since that write may have met the other coordinator's object
+    /// without the check reading it (a 412 followed by a failed GET).
     #[test]
     fn the_ec2_sweep_runs_only_while_this_coordinator_owns_the_state() {
         let src = include_str!("mod.rs");
@@ -1706,20 +1726,23 @@ mod store_tests {
             .nth(1)
             .expect("run");
         let shutdown = body.find("handle.shutdown().await").expect("the shutdown");
+        let lost_check = body.find("if store_lost(&lost)").expect("the lost check");
         let guard = body
-            .find("if store_lost(&lost)")
+            .find("owns_the_state(stored, &lost)")
             .expect("the ownership check");
         let sweep = body.find("d.sweep()").expect("the sweep");
         assert!(
-            shutdown < guard && guard < sweep,
+            shutdown < lost_check && shutdown < guard && guard < sweep,
             "the sweep is not guarded by the ownership check after the shutdown write"
         );
         let (tx, rx) = watch::channel(false);
         let lost = Some(rx);
-        assert!(!store_lost(&lost));
+        assert!(owns_the_state(true, &lost), "stored and not lost");
+        assert!(!owns_the_state(false, &lost), "the last write not stored");
+        assert!(owns_the_state(true, &None), "no S3 store: a stored write");
         tx.send(true).unwrap();
         assert!(store_lost(&lost));
-        assert!(!store_lost(&None));
+        assert!(!owns_the_state(true, &lost), "another writer took it");
     }
 
     /// During a store outage the answers of closed sockets do not pile up: each reconnect

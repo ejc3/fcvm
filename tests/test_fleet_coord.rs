@@ -4805,7 +4805,8 @@ fn arm_test_pdeathsig(cmd: &mut tokio::process::Command) {
 }
 
 /// Every fcvm this file starts by hand dies with the test process (PR_SET_PDEATHSIG), as the
-/// repository's per-hop teardown rule asks.
+/// repository's per-hop teardown rule asks, and starts from an empty environment, so a shell
+/// with deployment settings (FLEET_HOST_TEMPLATES, AWS credentials) cannot reach real capacity.
 #[test]
 fn every_fcvm_this_file_spawns_dies_with_the_test() {
     let src = include_str!("test_fleet_coord.rs");
@@ -4817,6 +4818,10 @@ fn every_fcvm_this_file_spawns_dies_with_the_test() {
         assert!(
             after.contains("arm_test_pdeathsig(&mut"),
             "a spawn without a parent-death signal:\n{after}"
+        );
+        assert!(
+            after.contains(".env_clear()"),
+            "a spawn that inherits the test's environment:\n{after}"
         );
     }
     assert!(found > 0, "the check found no spawn to look at");
@@ -4870,6 +4875,12 @@ struct CoordProcess {
 async fn coord_process(state: &std::path::Path) -> CoordProcess {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
+    // Nothing from the shell that runs the test: an operator's FLEET_* or AWS settings would
+    // turn on host launches, EC2 tiles or an S3 store in a test of a local state file.
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
     cmd.args([
         "fleet",
         "coord",
@@ -4880,8 +4891,6 @@ async fn coord_process(state: &std::path::Path) -> CoordProcess {
     ])
     .arg("--state-file")
     .arg(state)
-    .env_remove("FLEET_STATE_BUCKET")
-    .env_remove("FLEET_COORD_LISTEN")
     .env("RUST_LOG", "fcvm=info")
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null())
