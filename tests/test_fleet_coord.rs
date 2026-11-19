@@ -5051,6 +5051,58 @@ async fn a_claim_that_ends_while_its_receipt_waits_is_told_as_ended() {
     assert_eq!(m["claim"]["ended"], "expired");
 }
 
+/// A viewer whose claim ended while its receipt waited for the store, and that claimed again
+/// meanwhile, is told the first claim ended: the first claim's watcher stays with its own
+/// session instead of taking up the second, which has a watcher of its own.
+#[tokio::test]
+async fn a_claims_watcher_stays_with_its_own_session() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, _stored) = failing_store(failing.clone());
+    let c = coordinator_with(Opts {
+        config: Config {
+            max_tiles: 1,
+            claim_secs: 1,
+            claim_cooldown_secs: 0,
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        store: Some(tx),
+        ..Opts::default()
+    })
+    .await;
+    let mut agent = FakeAgent::connect(&c.handle, "gpu-a", 2);
+    agent.assign().await;
+    let mut v = Viewer::connect(&c.url).await;
+    v.until(|s| s["fleet"]["n"] == 1).await;
+    v.intent("c-0", "claim_gpu", json!({})).await;
+    // The first claim lasts 1 s; the second comes while every write still fails.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    v.intent("c-1", "claim_gpu", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    for id in ["c-0", "c-1"] {
+        let r = tokio::time::timeout(Duration::from_secs(5), v.receipt(id))
+            .await
+            .expect("the receipt once stored");
+        assert_eq!(r["outcome"], "committed", "{r}");
+    }
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        v.message_where("claim", |m| {
+            m["claim"]["id"] == "claim-1" && m["claim"]["phase"] == "ended"
+        }),
+    )
+    .await
+    .expect("the first claim is told ended");
+    assert_eq!(ended["claim"]["ended"], "expired");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        v.message_where("claim", |m| m["claim"]["id"] == "claim-2"),
+    )
+    .await
+    .expect("the second claim is told");
+}
+
 /// `fcvm fleet coord` on a state file, its stderr echoed to the test's, and its `/live` URL.
 struct CoordProcess {
     child: tokio::process::Child,

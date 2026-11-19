@@ -855,6 +855,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     if let Some(Submitted {
                         receipt: Some(r),
                         stored,
+                        claim: seen,
                     }) = r
                     {
                         if r.outcome != Outcome::Committed {
@@ -868,12 +869,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             .try_send((
                                 ServerMsg::receipt(&r),
                                 stored,
-                                // The claim now, before the receipt waits for the store.
-                                if tells {
-                                    app.handle.claim_for(&viewer).await
-                                } else {
-                                    None
-                                },
+                                // The claim as the intent left it, before the receipt
+                                // waits for the store.
+                                seen.filter(|_| tells),
                             ))
                             .is_err()
                         {
@@ -938,6 +936,25 @@ async fn tell_claim(
     let mut known = seen;
     loop {
         match handle.claim_for(&viewer).await {
+            // Another claim of this viewer (its earlier one ended while the receipt
+            // waited, and it claimed again): this watcher's claim is over, and the other one
+            // has a watcher of its own.
+            Some(c) if known.as_ref().is_some_and(|k| k.id != c.id) => {
+                let Some(mut k) = known else { return };
+                k.ended = Some(
+                    if now_ms() >= k.expires_at {
+                        "expired"
+                    } else {
+                        "released"
+                    }
+                    .into(),
+                );
+                k.phase = "ended".into();
+                k.frame_url = None;
+                k.frame_url_v4 = None;
+                let _ = direct.send(ServerMsg::Claim { claim: k }).await;
+                return;
+            }
             Some(c) => {
                 if last.as_ref() != Some(&c) {
                     if direct
