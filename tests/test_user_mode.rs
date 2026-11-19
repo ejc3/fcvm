@@ -9,6 +9,91 @@ mod common;
 
 use anyhow::{Context, Result};
 
+/// A login of the container user in the guest must not take the container's runtime state with
+/// it. `/run/user/<uid>` holds podman's run root, and logind mounts a fresh tmpfs over it on a
+/// login and removes it on the logout unless logind already owns it (fc-agent's
+/// `own_runtime_dir_through_logind`). Without that, the exec after the logout fails with
+/// `default OCI runtime "crun" not found`.
+#[tokio::test]
+async fn test_user_mode_container_survives_a_login_of_its_user() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("user-login");
+    let uid = 1000;
+    let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| format!("u{}", uid));
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--user",
+        &format!("{}:{}", uid, uid),
+        common::ALPINE_IMAGE,
+        "sleep",
+        "300",
+    ])
+    .await
+    .context("spawning fcvm with --user")?;
+    common::poll_health_by_pid(fcvm_pid, 300).await?;
+
+    let before = common::exec_in_container(fcvm_pid, &["id", "-u"]).await?;
+    assert_eq!(before.trim(), uid.to_string(), "exec before the login");
+
+    let login = common::exec_in_vm(
+        fcvm_pid,
+        &[
+            "su",
+            "-",
+            &username,
+            "-c",
+            "true",
+            "&&",
+            "echo",
+            "logged-in",
+        ],
+    )
+    .await?;
+    assert!(
+        login.contains("logged-in"),
+        "su - {username} failed: {login}"
+    );
+    // logind stops a user's units UserStopDelaySec (10 s) after the last session ends.
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+    let dir = common::exec_in_vm(
+        fcvm_pid,
+        &[
+            "test",
+            "-d",
+            &format!("/run/user/{uid}/containers"),
+            "&&",
+            "echo",
+            "present",
+            "||",
+            "echo",
+            "absent",
+        ],
+    )
+    .await?;
+    let after = common::exec_in_container(fcvm_pid, &["id", "-u"]).await;
+    common::kill_process(fcvm_pid).await;
+    assert!(
+        dir.contains("present"),
+        "/run/user/{uid}/containers is gone after the logout: {dir}"
+    );
+    let after = after?;
+    assert_eq!(
+        after.trim(),
+        uid.to_string(),
+        "exec after the login and logout"
+    );
+    Ok(())
+}
+
 /// Test that --user creates the specified user and runs the container as that user.
 /// Verifies: user creation in VM, rootless podman, correct UID/GID in container.
 /// Username is auto-injected from host $USER (no --env USER= needed).

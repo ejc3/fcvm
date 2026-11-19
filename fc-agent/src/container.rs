@@ -1870,6 +1870,30 @@ pub fn resolve_subgid_range(
     subgid_range.unwrap_or_else(|| resolve_subuid_range(subuid_range))
 }
 
+/// Hand `/run/user/<uid>`, podman's run root for the container user, to systemd-logind before
+/// anything is written there. The directory is logind's: a login of the user (`su -`, a login
+/// shell over exec) starts `user-runtime-dir@<uid>`, which mounts a fresh tmpfs over a
+/// directory made by hand, and the logout removes it. Podman then cannot find the container's
+/// runtime state, and every later exec fails with `default OCI runtime "crun" not found`.
+/// Starting the unit mounts logind's tmpfs now, and linger keeps it for the life of the VM
+/// whatever logins come and go. Without systemd or logind both commands fail, and the caller
+/// makes the directory itself as before.
+fn own_runtime_dir_through_logind(username: &str, uid: &str) {
+    let started = std::process::Command::new("systemctl")
+        .args(["start", &format!("user-runtime-dir@{uid}.service")])
+        .output();
+    let lingering = std::process::Command::new("loginctl")
+        .args(["enable-linger", username])
+        .output();
+    let ok =
+        |r: &std::io::Result<std::process::Output>| r.as_ref().is_ok_and(|o| o.status.success());
+    eprintln!(
+        "[fc-agent] /run/user/{uid} through logind: user-runtime-dir started {}, linger {}",
+        ok(&started),
+        ok(&lingering)
+    );
+}
+
 /// Create the VM user and set up rootless podman prerequisites.
 /// Call this BEFORE importing images so podman load runs as the target user.
 /// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
@@ -1919,6 +1943,7 @@ pub fn create_vm_user(
     );
 
     let runtime_dir = format!("/run/user/{}", uid);
+    own_runtime_dir_through_logind(&username, &uid);
     let _ = std::fs::create_dir_all(&runtime_dir);
     let _ = std::process::Command::new("chown")
         .args([&format!("{}:{}", uid, gid), &runtime_dir])
