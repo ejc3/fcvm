@@ -271,6 +271,17 @@ describe("a viewer's own GPU across a reconnect", () => {
     expect(s.own.claim?.phase).toBe("restoring");
   });
 
+  it("queues one claim_gpu behind the Turnstile check, so a second click does not replace its token", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1", turnstile: "site-key" }));
+    s = reduce(s, { type: "queue", action: { name: "claim_gpu", args: { token: "token-a" } } });
+    s = reduce(s, { type: "queue", action: { name: "claim_gpu", args: { token: "token-b" } } });
+    expect(s.turnstile.queued.map((q) => q.args["token"])).toEqual(["token-a"]);
+    // Other actions still queue behind it.
+    s = reduce(s, { type: "queue", action: { name: "light", args: {} } });
+    expect(s.turnstile.queued.map((q) => q.name)).toEqual(["claim_gpu", "light"]);
+  });
+
   it("takes a claim message only for the token its request sent", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
     s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));

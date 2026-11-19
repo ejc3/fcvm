@@ -436,6 +436,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
     case "notice-expired":
       return { ...s, notices: s.notices.filter((n) => n.at >= e.before) };
     case "queue":
+      // A claim_gpu already waiting covers this click: a second token would replace the first.
+      if (e.action.name === "claim_gpu" && s.turnstile.queued.some((q) => q.name === "claim_gpu")) return s;
       return { ...s, turnstile: { ...s.turnstile, queued: [...s.turnstile.queued, e.action].slice(-8), error: null } };
     case "verify-sent":
       return { ...s, turnstile: { ...s.turnstile, verifying: true, error: null } };
