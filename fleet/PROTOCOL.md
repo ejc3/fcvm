@@ -584,8 +584,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   last burn it knew. When `usd_today` plus 15 minutes at the current burn reaches the
   ceiling, `reason` is `budget` (null before), and the fleet goes `asleep` at once, with
   `fleet.power.reason` `budget`: every claim (a wall GPU, a phone, a sandbox, a server) ends,
+  a GPU claim a restart carried over and no page has taken back yet included,
   a running race ends with the tiles that had reached their first frame, and every host is
-  terminated. Until 00:00 UTC `wake`, `restart_now` and every claim are refused with
+  terminated. Until 00:00 UTC `wake`, `restart_now`, every claim and `resume_claim` are refused with
   `today's GPU budget is spent; the fleet rests until 00:00 UTC`, and arrivals and active
   viewers do not wake it. The meter charges every instance whatever keeps it running, and
   the trip overrides every reason to be awake, a schedule that keeps hosts up included. At 00:00 UTC the next day starts from 0 and the fleet wakes by the
