@@ -78,7 +78,7 @@ admission key, never the address, so one client's sessions can be revoked togeth
 starts, and the page always holds a token under 5 minutes old). A page whose player must load
 again with a token it has used sends `{"type": "playback"}` and gets a fresh `admission` (at
 most one every 2 s per connection; sooner is answered with an `error`); `capacity` is null when every viewer is seated (no broadcast).
-`claim_gpu` from a late connection is refused unrecorded (`version: 0`).
+`claim_gpu` and `resume_claim` from a late connection are refused unrecorded (`version: 0`).
 
 ```json
 {"type": "snapshot", "version": 42, "state": { ... }}
@@ -903,7 +903,9 @@ restores what it can and releases what was bound to the old process:
   hello (then it is back on that GPU's slot, under the slot id it had and at the generation
   the host runs, so nothing relaunches; hosts may come back in any order, and no other GPU
   takes that slot id while the claim waits, since agents key their VMs by slot id) and for its page to present the token with `resume_claim`, which it must do
-  within 30 s of the restart or the claim ends and the GPU returns to the pool. A claim that
+  within 30 s of the restart or the claim ends and the GPU returns to the pool. A page that
+  comes back late (past the direct seats) is refused the resume, since it holds no direct
+  token to view the GPU with, and the claim ends at the deadline. A claim that
   borrowed a wall tile counts toward `--max-borrowed` while it waits. A claim whose
   time ran out while the coordinator was down ends then.
 - Released: a borrowed phone, Windows sandbox or Minecraft server. These carry no token, so

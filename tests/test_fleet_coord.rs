@@ -7653,6 +7653,16 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     let r = late.receipt("own").await;
     assert_eq!(r["outcome"], "refused");
     assert_eq!(r["reason"], live::LATE_CLAIM);
+    // And so is taking one back after a restart: a page that comes back late holds no direct
+    // token to view it with. Refused before the claim is looked up, unrecorded.
+    late.intent("resume", "resume_claim", claim_args()).await;
+    let r = late.receipt("resume").await;
+    assert_eq!(
+        (r["outcome"].as_str(), r["version"].as_u64()),
+        (Some("refused"), Some(0)),
+        "{r}"
+    );
+    assert_eq!(r["reason"], live::LATE_CLAIM);
     // So is a borrowed phone.
     late.intent("phone", "claim_phone", json!({})).await;
     let r = late.receipt("phone").await;

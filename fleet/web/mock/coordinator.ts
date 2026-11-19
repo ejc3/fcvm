@@ -101,7 +101,7 @@ const RECLAIM_KEPT_MS = 60_000;
 const RACES_KEPT = 20;
 /** Why a claim_gpu without the page's token is refused (src/fleet/coord/live.rs CLAIM_TOKEN_REFUSAL). */
 const CLAIM_TOKEN_REFUSAL = "claim_gpu needs args.token: 32 to 128 letters, digits, - or _, made by the page";
-/** Why a late viewer's claim_gpu or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
+/** Why a late viewer's claim_gpu, resume_claim or claim_phone is refused (src/fleet/coord/live.rs LATE_CLAIM). */
 const LATE_CLAIM = "direct streams are full, so this page watches the broadcast";
 
 export const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: number }[] = [
@@ -687,7 +687,7 @@ export class MockCoordinator {
     // A late viewer holds no direct token, and a private GPU or a borrowed phone is a direct
     // stream: the coordinator refuses both before anything else, a repeated intent id included
     // (its receipt is not looked up), and records nothing (src/fleet/coord/live.rs, LATE_CLAIM).
-    if (client.late && (name === "claim_gpu" || name === "claim_phone" || name === "claim_windows" || name === "claim_minecraft")) {
+    if (client.late && (name === "claim_gpu" || name === "resume_claim" || name === "claim_phone" || name === "claim_windows" || name === "claim_minecraft")) {
       this.sendTo(client, { type: "receipt", id, outcome: "refused", reason: LATE_CLAIM, version: 0 });
       return;
     }
