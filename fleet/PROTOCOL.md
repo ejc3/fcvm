@@ -99,9 +99,10 @@ the latest.
 ```
 
 One per intent. `version` is the state version that first holds the intent's effect (or
-its refusal in `actions`). A `committed` receipt is sent only once a stored state
-(`--state-file` or `--state-bucket`) holds that version, so a coordinator that dies, even by
-SIGKILL, has acknowledged nothing it would forget; one write each store tick (1 s) answers
+its refusal in `actions`). With a state store (`--state-file` or `--state-bucket`), a
+`committed` receipt is sent only once a stored state holds that version, so a coordinator
+that dies, even by SIGKILL, has acknowledged nothing it would forget; without one, `committed`
+means the coordinator's memory holds the change, and a restart starts from an empty state; one write each store tick (1 s) answers
 every intent applied before it, so a committed receipt arrives within about a second plus
 the write. A receipt the store never holds is never sent: the page sends the intent again
 after it reconnects. A refusal changes nothing and is sent at once. Snapshots are not
@@ -143,7 +144,9 @@ coordinator answers a repeated id with its first receipt and binds nothing. A
 coordinator that restarted carried the claim over and gives it back to that connection,
 which is told about it from then on as above (`restoring` until the claim's host is back
 and its VM reports running). Otherwise the claim ended when the old connection closed, the
-resume is refused, and the page shows the claim ended. `tile` is the wall tile it
+resume is refused, and the page shows the claim ended. A resume must arrive within the
+30 s window and before the claim expires, and the claim then counts against the address that
+took it back (one GPU per address). `tile` is the wall tile it
 borrowed, null for a standby GPU. `autopilot` is true while the camera flies the
 autopilot's loop (below) and false once the viewer has paused it or taken the camera.
 
@@ -843,8 +846,11 @@ restores what it can and releases what was bound to the old process:
   and potato mode's ladder and records.
 - The open stop vote: kept with its votes when the stored offer is the open round's (every
   stored vote was answered); otherwise the vote starts again.
-- A GPU claim: kept until it expires. Its VM keeps running on its host, and a page proves it
-  holds the claim with the claim's token. The claim waits for its host's agent to say
+- A GPU claim: kept until it expires. A page proves it holds the claim with the claim's
+  token. Its VM keeps running only on a host whose agent outlives the coordinator (an agent
+  that dials in, or runs under its own service); an agent started with `--agent-cmd` is the
+  coordinator's child and stops with it, taking its VMs, and the claim then comes back on its
+  GPU's slot and is restored there anew. The claim waits for its host's agent to say
   hello (then it is back on that GPU's slot, under the slot id it had and at the generation
   the host runs, so nothing relaunches; hosts may come back in any order, and no other GPU
   takes that slot id while the claim waits, since agents key their VMs by slot id) and for its page to present the token with `resume_claim`, which it must do

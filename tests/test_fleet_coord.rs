@@ -4310,12 +4310,14 @@ async fn an_agent_can_dial_the_agent_websocket() {
 }
 
 /// A fake versioned S3. PUT adds a version of the body at the path and answers its ETag,
-/// honouring `If-Match` and `If-None-Match: *` with 412 as S3 does (a PUT with neither
-/// replaces whatever is there); GET returns the newest version or 404, `?versionId=` that
-/// version, and `GET /<bucket>?prefix=<key>&versions=` lists the versions newest first.
-/// Every request must be SigV4-signed with the payload's hash. `deny` answers 403 to
-/// everything.
-/// Per path, its versions oldest first: (version id, which is also the ETag, and body).
+/// which is a hash of the body as a single-part PUT's is, honouring `If-Match` and
+/// `If-None-Match: *` with 412 as S3 does (a PUT with neither replaces whatever is there);
+/// GET returns the newest version or 404, `?versionId=` that version, and
+/// `GET /<bucket>?prefix=<key>&versions=` lists the versions newest first. Every request
+/// must be SigV4-signed with the payload's hash. `deny` answers 403 to everything,
+/// `lose_put_answer` stores the next PUT and answers it 500, and a GET of the version named
+/// in `unreadable` answers 503.
+/// Per path, its versions oldest first: (version id, body).
 type Versions = BTreeMap<String, Vec<(String, Vec<u8>)>>;
 
 #[derive(Clone, Default)]
@@ -4323,6 +4325,13 @@ struct FakeS3 {
     objects: Arc<std::sync::Mutex<Versions>>,
     next: Arc<std::sync::atomic::AtomicU64>,
     deny: Arc<std::sync::atomic::AtomicBool>,
+    lose_put_answer: Arc<std::sync::atomic::AtomicBool>,
+    unreadable: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+fn fake_etag(body: &[u8]) -> String {
+    use sha2::Digest;
+    format!("\"{}\"", hex::encode(&sha2::Sha256::digest(body)[..16]))
 }
 
 impl FakeS3 {
@@ -4396,7 +4405,7 @@ async fn fake_s3(s3: FakeS3) -> String {
                             s3.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                         );
                         let mut o = s3.objects.lock().unwrap();
-                        let current = o.get(&path).and_then(|v| v.last()).map(|(e, _)| e.clone());
+                        let current = o.get(&path).and_then(|v| v.last()).map(|(_, b)| fake_etag(b));
                         let header = |n: &str| headers.get(n).map(|v| v.to_str().unwrap().to_string());
                         let refused = match (header("if-match"), header("if-none-match")) {
                             (Some(m), _) => current.as_deref() != Some(m.as_str()),
@@ -4406,8 +4415,11 @@ async fn fake_s3(s3: FakeS3) -> String {
                         if refused {
                             return StatusCode::PRECONDITION_FAILED.into_response();
                         }
-                        o.entry(path).or_default().push((id.clone(), body.to_vec()));
-                        (StatusCode::OK, [("etag", id)]).into_response()
+                        o.entry(path).or_default().push((id, body.to_vec()));
+                        if s3.lose_put_answer.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        (StatusCode::OK, [("etag", fake_etag(&body))]).into_response()
                     }
                     Method::GET if query.contains_key("versions") => {
                         let bucket = path.trim_matches('/').to_string();
@@ -4431,13 +4443,18 @@ async fn fake_s3(s3: FakeS3) -> String {
                         (StatusCode::OK, xml).into_response()
                     }
                     Method::GET => {
+                        if query.contains_key("versionId")
+                            && *s3.unreadable.lock().unwrap() == query.get("versionId").cloned()
+                        {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
                         let o = s3.objects.lock().unwrap();
                         let found = o.get(&path).and_then(|v| match query.get("versionId") {
                             Some(id) => v.iter().find(|(e, _)| e == id),
                             None => v.last(),
                         });
                         match found {
-                            Some((id, b)) => (StatusCode::OK, [("etag", id.clone())], b.clone()).into_response(),
+                            Some((_, b)) => (StatusCode::OK, [("etag", fake_etag(b))], b.clone()).into_response(),
                             None => StatusCode::NOT_FOUND.into_response(),
                         }
                     }
@@ -4525,26 +4542,32 @@ async fn a_second_writer_of_the_state_object_loses_and_stops() {
     let obj =
         || store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
     let lost = |e: anyhow::Error| e.downcast_ref::<store::LostWrite>().is_some();
-    let bytes = serde_json::to_vec(&State::new(Config::default(), 1_000)).unwrap();
+    // Each writer's states differ, as two coordinators' do: S3's ETag is a hash of the body.
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    let bytes = state(1);
     let (a, b) = (obj(), obj());
     assert!(a.load().await.unwrap().is_none());
     assert!(b.load().await.unwrap().is_none());
-    a.put(&bytes).await.unwrap();
-    let e = b.put(&bytes).await.unwrap_err();
+    a.put(&state(10)).await.unwrap();
+    let e = b.put(&state(20)).await.unwrap_err();
     assert!(
         lost(e),
         "the second first write replaced the first writer's object"
     );
-    a.put(&bytes).await.unwrap();
+    a.put(&state(11)).await.unwrap();
     // A writer that read the object since writes it, and the other one loses then.
     b.load().await.unwrap();
-    b.put(&bytes).await.unwrap();
-    assert!(lost(a.put(&bytes).await.unwrap_err()));
+    b.put(&state(21)).await.unwrap();
+    assert!(lost(a.put(&state(12)).await.unwrap_err()));
     // Through the writer task: the write is answered not stored, the writer says it lost,
     // and a later state is not written at all.
     let c = obj();
     c.load().await.unwrap();
-    s3.put_version("/fleet-state/state.json", bytes.clone());
+    s3.put_version("/fleet-state/state.json", state(30));
     let (tx, mut gone) = store::spawn_s3_writer(c);
     let ask = |tx: &store::StoreTx| {
         let (ack, done) = tokio::sync::oneshot::channel();
@@ -4663,6 +4686,17 @@ async fn a_receipt_is_sent_only_once_a_stored_state_holds_its_change() {
     assert_eq!(r["outcome"], "refused");
     let mut v = Viewer::connect_from(&c.url, Some("198.51.100.31")).await;
     v.intent("l-0", "light", light(0.0)).await;
+    // A refusal on the same connection is not held behind the commit waiting for the store.
+    v.intent(
+        "bad-2",
+        "light",
+        json!({"pos": [1.0e9, 0.0, 0.0], "color": [1, 1, 1]}),
+    )
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(1), v.receipt("bad-2"))
+        .await
+        .expect("a refusal is answered while an earlier commit waits for the store");
+    assert_eq!(r["outcome"], "refused");
     // The store ticks once a second: three ticks pass with every write failing.
     assert!(
         tokio::time::timeout(Duration::from_secs(3), v.receipt("l-0"))
@@ -4681,6 +4715,113 @@ async fn a_receipt_is_sent_only_once_a_stored_state_holds_its_change() {
     assert!(state.version >= r["version"].as_u64().unwrap());
 }
 
+/// A PUT that S3 stored but whose answer was lost: the retry is refused (412) by the
+/// coordinator's own write, which is not another writer. The object is one of the bodies it
+/// sent, so it writes on it, and a later state is stored on top.
+#[tokio::test]
+async fn a_write_whose_answer_was_lost_is_not_taken_for_another_writer() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let state = |version: u64| {
+        let mut s = State::new(Config::default(), 1_000);
+        s.version = version;
+        serde_json::to_vec(&s).unwrap()
+    };
+    let (tx, lost) = store::spawn_s3_writer(
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap(),
+    );
+    let write = |bytes: Vec<u8>| {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        tx.send(store::StoreCmd {
+            bytes: Some(Arc::new(bytes)),
+            ack: Some(ack),
+        })
+        .unwrap();
+        done
+    };
+    assert!(write(state(1)).await.unwrap());
+    // The second write is stored, and its answer lost.
+    s3.lose_put_answer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(!write(state(2)).await.unwrap(), "no answer, not stored");
+    assert_eq!(s3.latest(path), Some(state(2)), "S3 stored it");
+    // The writer sends a newer state on the old ETag.
+    assert!(
+        write(state(3)).await.unwrap(),
+        "a write refused only by this coordinator's own earlier write is stored"
+    );
+    assert!(!*lost.borrow(), "the writer did not stop");
+    assert_eq!(s3.latest(path), Some(state(3)));
+}
+
+/// Recovery from an unreadable newest object stops at an earlier version it cannot read
+/// (503): that version may hold changes the older ones lack, so loading an older one past it
+/// could drop them. A version that is gone (404) is passed over.
+#[tokio::test]
+async fn recovery_stops_at_an_earlier_version_it_cannot_read() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let path = "/fleet-state/state.json";
+    let mut old = State::new(Config::default(), 1_000);
+    old.version = 40;
+    let mut newer = old.clone();
+    newer.version = 41;
+    s3.put_version(path, serde_json::to_vec(&old).unwrap());
+    s3.put_version(path, serde_json::to_vec(&newer).unwrap());
+    s3.put_version(path, b"not json".to_vec());
+    // The fake numbers versions v0, v1, v2 in the order they were put: v1 is `newer`.
+    *s3.unreadable.lock().unwrap() = Some("v1".into());
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    let e = obj.load().await.unwrap_err();
+    assert!(format!("{e:#}").contains("503"), "{e:#}");
+    *s3.unreadable.lock().unwrap() = None;
+    let back = obj.load().await.unwrap().expect("a version");
+    assert_eq!(back.version, 41);
+}
+
+/// The test's own coordinator dies with the test (SIGKILL on the parent's death, the parent
+/// rechecked after the fork), as tests/common/mod.rs::set_test_pdeathsig does for the VM
+/// tests: nextest's SIGKILL skips kill_on_drop.
+fn arm_test_pdeathsig(cmd: &mut tokio::process::Command) {
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: two async-signal-safe calls in the forked child; nothing allocated.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Every fcvm this file starts by hand dies with the test process (PR_SET_PDEATHSIG), as the
+/// repository's per-hop teardown rule asks.
+#[test]
+fn every_fcvm_this_file_spawns_dies_with_the_test() {
+    let src = include_str!("test_fleet_coord.rs");
+    let needle = concat!("Command::new(env!(\"CARGO_BIN_", "EXE_fcvm\"))");
+    let mut found = 0;
+    for (i, _) in src.match_indices(needle) {
+        found += 1;
+        let after: String = src[i..].lines().take(24).collect::<Vec<_>>().join("\n");
+        assert!(
+            after.contains("arm_test_pdeathsig(&mut"),
+            "a spawn without a parent-death signal:\n{after}"
+        );
+    }
+    assert!(found > 0, "the check found no spawn to look at");
+}
+
 /// `fcvm fleet coord` on a state file, its stderr echoed to the test's, and its `/live` URL.
 struct CoordProcess {
     child: tokio::process::Child,
@@ -4689,26 +4830,26 @@ struct CoordProcess {
 
 async fn coord_process(state: &std::path::Path) -> CoordProcess {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"))
-        .args([
-            "fleet",
-            "coord",
-            "--listen",
-            "127.0.0.1:0",
-            "--max-tiles",
-            "1",
-        ])
-        .arg("--state-file")
-        .arg(state)
-        .env_remove("FLEET_STATE_BUCKET")
-        .env_remove("FLEET_COORD_LISTEN")
-        .env("RUST_LOG", "fcvm=info")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
+    cmd.args([
+        "fleet",
+        "coord",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-tiles",
+        "1",
+    ])
+    .arg("--state-file")
+    .arg(state)
+    .env_remove("FLEET_STATE_BUCKET")
+    .env_remove("FLEET_COORD_LISTEN")
+    .env("RUST_LOG", "fcvm=info")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+    arm_test_pdeathsig(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<String>();
     // Read stderr to its end, so the process never blocks on a full pipe.

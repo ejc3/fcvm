@@ -339,3 +339,107 @@ fn a_claimed_gpu_keeps_its_slot_id_when_hosts_return_in_another_order() {
     assert_eq!(h1, ["slot-1", "slot-2"]);
     assert!(s.fleet.slots[&3].claim.is_some());
 }
+
+/// A resume at the end of its window is refused at once, before the tick that would end the
+/// claim runs: the window is enforced at the intent's own time.
+#[test]
+fn a_resume_after_its_window_is_refused_before_the_next_tick() {
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(
+        s,
+        vec![
+            hello(6000),
+            joined(7000, "v-1"),
+            intent(
+                5000 + CLAIM_RESUME_MS,
+                "v-1",
+                "r1",
+                "resume_claim",
+                json!({"token": "token-a"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["r1"].outcome, Outcome::Refused);
+}
+
+/// A page whose address changed with its connection takes its claim back, and the claim then
+/// counts against the new address: a second page there gets no other GPU.
+#[test]
+fn a_resumed_claim_counts_against_the_address_that_took_it_back() {
+    let (s, _) = claimed_then_restarted(5000);
+    let s = run(
+        s,
+        vec![
+            hello(6000),
+            ev(json!({"at": 7000, "type": "viewer_joined", "viewer": "v-1",
+                "client": "203.0.113.7"})),
+            ev(
+                json!({"at": 7100, "type": "intent", "viewer": "v-1", "client": "203.0.113.7",
+                "id": "r1", "name": "resume_claim", "args": {"token": "token-a"}}),
+            ),
+            ev(json!({"at": 7200, "type": "viewer_joined", "viewer": "v-2",
+                "client": "203.0.113.7"})),
+            ev(
+                json!({"at": 7300, "type": "intent", "viewer": "v-2", "client": "203.0.113.7",
+                "id": "c2", "name": "claim_gpu", "args": {}, "secret": "token-b"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["r1"].outcome, Outcome::Committed);
+    assert_eq!(
+        s.receipts["c2"].reason.as_deref(),
+        Some("one GPU per client at a time")
+    );
+}
+
+/// An address that already holds a GPU cannot take back a second one with another claim's
+/// token.
+#[test]
+fn a_resume_is_refused_to_an_address_that_holds_another_gpu() {
+    let gpus = |at: u64| {
+        ev(
+            json!({"at": at, "type": "agent", "host": "h1", "msg": {"type": "hello", "host": "h1",
+            "arch": "x86_64", "capacity": 8, "gpus": [
+                {"name": "Tesla T4", "sbdf": "0000:01:00.0"},
+                {"name": "Tesla T4", "sbdf": "0000:02:00.0"},
+                {"name": "Tesla T4", "sbdf": "0000:03:00.0"},
+                {"name": "Tesla T4", "sbdf": "0000:04:00.0"}]}}),
+        )
+    };
+    let claim = |at: u64, viewer: &str, client: &str, id: &str, token: &str| {
+        ev(
+            json!({"at": at, "type": "intent", "viewer": viewer, "client": client, "id": id,
+            "name": "claim_gpu", "args": {}, "secret": token}),
+        )
+    };
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            gpus(1000),
+            joined(2000, "v1"),
+            claim(3000, "v1", "198.51.100.20", "c1", "token-a"),
+            ev(json!({"at": 3100, "type": "viewer_joined", "viewer": "v2",
+                "client": "203.0.113.7"})),
+            claim(3200, "v2", "203.0.113.7", "c2", "token-b"),
+        ],
+    );
+    assert_eq!(s.receipts["c1"].outcome, Outcome::Committed);
+    assert_eq!(s.receipts["c2"].outcome, Outcome::Committed);
+    let stored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    let s = run(
+        stored.resumed(config(), 5000),
+        vec![
+            gpus(6000),
+            ev(json!({"at": 7000, "type": "viewer_joined", "viewer": "v-1",
+                "client": "203.0.113.7"})),
+            ev(
+                json!({"at": 7100, "type": "intent", "viewer": "v-1", "client": "203.0.113.7",
+                "id": "r1", "name": "resume_claim", "args": {"token": "token-a"}}),
+            ),
+        ],
+    );
+    assert_eq!(
+        s.receipts["r1"].reason.as_deref(),
+        Some("one GPU per client at a time")
+    );
+}

@@ -440,7 +440,13 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
     }
     case "own-closed":
       // Dismissed while the request is still out: the claim it may yet bring is released when it comes.
-      return { ...s, own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null } };
+      // A resume still waiting for the Turnstile check is dropped with it: sent after the
+      // close, it would take back a claim the viewer gave up.
+      return {
+        ...s,
+        own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null },
+        turnstile: { ...s.turnstile, queued: s.turnstile.queued.filter((q) => q.name !== "resume_claim") },
+      };
     case "family":
       // Once per page load: the first answer stands.
       return s.net.family !== null ? s : { ...s, net: { family: e.family, probeMs: e.probeMs, via: e.via } };

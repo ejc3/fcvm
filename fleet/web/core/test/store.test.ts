@@ -237,6 +237,20 @@ describe("a viewer's own GPU across a reconnect", () => {
     expect(s.own.claim?.frame_url).toBe("ws://example-host:2/frames/claim-1");
   });
 
+  it("drops a resume still waiting for the Turnstile check when the viewer closes the claim", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    s = feed(s, withToken("running"));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2", turnstile: "site-key" }), EPOCH + 10_000);
+    s = reduce(s, { type: "queue", action: { name: "resume_claim", args: { token: "token-a" } } });
+    s = reduce(s, { type: "queue", action: { name: "light", args: {} } });
+    s = reduce(s, { type: "own-closed" });
+    // Sent once verified, the resume would take back the GPU the viewer gave up.
+    expect(s.turnstile.queued.map((q) => q.name)).toEqual(["light"]);
+    expect(s.own.claim).toBeNull();
+  });
+
   it("ends the claim when the coordinator refuses the resume: it ended with the old connection", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
     s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));

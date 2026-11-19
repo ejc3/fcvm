@@ -503,6 +503,9 @@ impl Actor {
         if self.out.store.is_none() || version <= self.durable {
             let _ = tx.send(true);
         } else {
+            // An answer nobody waits for any more (its socket closed) goes: during a store
+            // outage every reconnect submits its unanswered intents again.
+            self.waiting.retain(|(_, w)| !w.is_closed());
             self.waiting.push((version, tx));
         }
         rx
@@ -1136,6 +1139,11 @@ pub fn start(
     (handle, task)
 }
 
+/// Whether another writer has taken the state object (`store::LostWrite`) by now.
+fn store_lost(lost: &Option<watch::Receiver<bool>>) -> bool {
+    lost.as_ref().is_some_and(|l| *l.borrow())
+}
+
 /// Resolves once `lost` turns true (pending forever without one, or once its writer is gone).
 async fn lost_the_store(lost: &mut Option<watch::Receiver<bool>>) {
     let Some(rx) = lost else {
@@ -1601,6 +1609,18 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     if stored {
         tracing::info!("coordinator stopped; state written");
     }
+    // Another coordinator may have taken the state object while this one stopped (its
+    // shutdown write answered 412): the EC2 sweep below would terminate that one's tiles.
+    if store_lost(&lost) {
+        tracing::error!(
+            marker = store::LOST_WRITE_MARKER,
+            "another coordinator writes the state object; stopping without sweeping"
+        );
+        bail!(
+            "another coordinator writes the state object ({})",
+            store::LOST_WRITE_MARKER
+        );
+    }
     // The next coordinator does not know these instances; terminate them now (it also
     // sweeps at its start, for a coordinator that was killed).
     if let Some(d) = ec2_sweep {
@@ -1687,6 +1707,90 @@ mod power_tests {
             "9",
         ];
         assert!(Cli::try_parse_from(argv).is_err());
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    /// A coordinator that lost the state object to another writer while stopping does not
+    /// sweep the EC2 tiles, which are the other coordinator's now.
+    #[test]
+    fn the_ec2_sweep_runs_only_while_this_coordinator_owns_the_state() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub async fn run(args: FleetCoordArgs)")
+            .nth(1)
+            .expect("run");
+        let shutdown = body.find("handle.shutdown().await").expect("the shutdown");
+        let guard = body
+            .find("if store_lost(&lost)")
+            .expect("the ownership check");
+        let sweep = body.find("d.sweep()").expect("the sweep");
+        assert!(
+            shutdown < guard && guard < sweep,
+            "the sweep is not guarded by the ownership check after the shutdown write"
+        );
+        let (tx, rx) = watch::channel(false);
+        let lost = Some(rx);
+        assert!(!store_lost(&lost));
+        tx.send(true).unwrap();
+        assert!(store_lost(&lost));
+        assert!(!store_lost(&None));
+    }
+
+    /// During a store outage the answers of closed sockets do not pile up: each reconnect
+    /// submits its unanswered intents again, and the actor keeps only answers still awaited.
+    #[tokio::test]
+    async fn answers_nobody_awaits_are_not_kept() {
+        let (tx, _rx) = mpsc::unbounded_channel::<store::StoreCmd>();
+        let out = Outputs {
+            snapshot: watch::channel(snapshot_of(&State::new(Config::default(), 0))).0,
+            ec2: watch::channel(Vec::new()).0,
+            ec2_layout: watch::channel(None).0,
+            broadcast_layout: watch::channel(None).0,
+            power: watch::channel(String::new()).0,
+            scene: watch::channel(None).0,
+            budget: watch::channel(None).0,
+            zone: None,
+            store: Some(tx),
+        };
+        let cfg = Config {
+            light_interval_ms: 0,
+            ..Config::default()
+        };
+        let mut actor = Actor::new(State::new(cfg, 0), out, Box::new(|| 1_000));
+        let light = |i: usize| Event::Intent {
+            at: 0,
+            viewer: "v-1".into(),
+            client: Some("198.51.100.9".into()),
+            id: format!("l-{i}"),
+            name: "light".into(),
+            args: serde_json::json!({"pos": [i as f64, 2.0, -90.0], "color": [1.0, 0.5, 0.0]}),
+            check: None,
+            secret: None,
+        };
+        let submit = |actor: &mut Actor, i: usize| {
+            let (reply, rx) = oneshot::channel();
+            actor.handle(Cmd::Submit {
+                event: light(i),
+                reply,
+            });
+            rx
+        };
+        let kept = submit(&mut actor, 0);
+        // The same unstored intent submitted again by ten connections that each closed.
+        for _ in 0..10 {
+            drop(submit(&mut actor, 1));
+        }
+        let live = submit(&mut actor, 2);
+        assert_eq!(
+            actor.waiting.len(),
+            2,
+            "only answers still awaited are kept"
+        );
+        drop((kept, live));
     }
 }
 

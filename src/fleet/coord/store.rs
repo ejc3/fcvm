@@ -159,7 +159,12 @@ pub struct S3Object {
     /// The ETag of the object as this coordinator last read or wrote it; `None`: there was
     /// no object.
     etag: std::sync::Mutex<Option<String>>,
+    /// SHA-256 of each body sent since the last write S3 answered (see `put`).
+    unanswered: std::sync::Mutex<Vec<[u8; 32]>>,
 }
+
+/// Bodies remembered while writes go unanswered; the writer sends at most one a second.
+const UNANSWERED_KEPT: usize = 64;
 
 impl S3Object {
     pub fn new(bucket: &str, key: &str, region: &str) -> Result<Self> {
@@ -193,6 +198,7 @@ impl S3Object {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             etag: std::sync::Mutex::new(None),
+            unanswered: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -289,10 +295,17 @@ impl S3Object {
         for id in ids.iter().skip(1).take(EARLIER_VERSIONS_TRIED) {
             let q = format!("versionId={}", super::sigv4::uri_encode(id));
             let (status, _, bytes) = self.get(&self.path(), &q).await?;
-            if !status.is_success() {
-                tracing::warn!(version_id = %id, %status, "an earlier state version could not be read");
+            // A version that is gone is passed over. One that could not be read now may hold
+            // changes the older ones lack, so recovery stops rather than fall back past it.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                tracing::warn!(version_id = %id, "an earlier state version is gone");
                 continue;
             }
+            anyhow::ensure!(
+                status.is_success(),
+                "reading version {id} of {} answered {status}; not falling back past it",
+                self.shown()
+            );
             match serde_json::from_slice::<State>(&bytes) {
                 Ok(s) => return Ok((id.clone(), s)),
                 Err(e) => {
@@ -308,7 +321,40 @@ impl S3Object {
 
     /// Replace the object, if it is still the one this coordinator last read or wrote.
     /// Another writer's object fails the write with [`LostWrite`].
+    ///
+    /// A PUT whose answer was lost may still have been stored, and then the next one is
+    /// refused (412) by this coordinator's own write. So a 412 is checked against the bodies
+    /// sent since the last answered write: when the object is one of them, its ETag is taken
+    /// and the write is sent once more.
     pub async fn put(&self, bytes: &[u8]) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        {
+            let mut sent = self.unanswered.lock().unwrap();
+            sent.push(Sha256::digest(bytes).into());
+            if sent.len() > UNANSWERED_KEPT {
+                sent.remove(0);
+            }
+        }
+        match self.put_once(bytes).await {
+            Err(e) if e.downcast_ref::<LostWrite>().is_some() => {
+                let (status, headers, current) = self.get(&self.path(), "").await?;
+                let digest: [u8; 32] = Sha256::digest(&current).into();
+                let mine = status.is_success() && self.unanswered.lock().unwrap().contains(&digest);
+                if !mine {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    object = %self.shown(),
+                    "a write whose answer was lost was stored; writing again on it"
+                );
+                *self.etag.lock().unwrap() = etag_of(&headers);
+                self.put_once(bytes).await
+            }
+            r => r,
+        }
+    }
+
+    async fn put_once(&self, bytes: &[u8]) -> Result<()> {
         let condition = match self.etag.lock().unwrap().clone() {
             Some(e) => ("if-match", e),
             None => ("if-none-match", "*".to_string()),
@@ -355,6 +401,7 @@ impl S3Object {
             self.shown()
         );
         *self.etag.lock().unwrap() = etag;
+        self.unanswered.lock().unwrap().clear();
         Ok(())
     }
 }

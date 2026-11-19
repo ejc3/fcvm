@@ -797,9 +797,15 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                         stored,
                     }) = r
                     {
-                        let tell = tells && r.outcome == Outcome::Committed;
-                        if receipts
-                            .try_send((ServerMsg::receipt(&r), stored, tell))
+                        if r.outcome != Outcome::Committed {
+                            // A refusal changed nothing: sent now, not behind a committed
+                            // receipt that waits for the store.
+                            if direct.try_send(ServerMsg::receipt(&r)).is_err() {
+                                tracing::info!(%viewer, "viewer is not reading; closing");
+                                break;
+                            }
+                        } else if receipts
+                            .try_send((ServerMsg::receipt(&r), stored, tells))
                             .is_err()
                         {
                             tracing::info!(%viewer, "viewer is not reading its receipts; closing");
