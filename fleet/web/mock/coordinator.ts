@@ -117,7 +117,10 @@ interface Client {
   visible: boolean;
   /** The connection's viewer id, as the coordinator gives it. */
   viewer: string;
+  /** With Turnstile on, a connection is not a viewer (counted, an arrival, seated) until it passes. */
   verified: boolean;
+  /** Its first message said it is no arrival (a seat ticket, or `returning`); kept for when it verifies. */
+  returning: boolean;
   claim: ClaimRuntime | null;
   /** Connected while the broadcast took late viewers only: admitted to the broadcast alone. */
   late: boolean;
@@ -541,7 +544,7 @@ export class MockCoordinator {
         opened_at: this.nudge.openedAt,
         closes_at: this.nudge.nextHoldAt,
       },
-      viewers: { count: this.clients.size, active: [...this.clients].filter((c) => c.visible).length },
+      viewers: { count: [...this.clients].filter((c) => c.verified).length, active: [...this.clients].filter((c) => c.verified && c.visible).length },
       actions: this.actions,
       aggregates: this.aggregates.map((a) => ({
         ...a,
@@ -568,12 +571,13 @@ export class MockCoordinator {
 
   private connect(ws: WebSocket): void {
     const k = this.nextViewer++;
-    const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null, late: this.broadcast?.late ?? false };
+    const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, returning: false, claim: null, late: this.broadcast?.late ?? false };
     this.clients.add(client);
     this.sendTo(client, { type: "hello", viewer: client.viewer, ...(this.sitekey ? { turnstile: this.sitekey } : {}) });
     // The coordinator sends every connection its admission; the mock sends one when a test asks
-    // for a broadcast, and when it runs Minecraft servers, whose view sockets take only a direct token.
-    if (this.broadcast || this.minecraft) this.sendTo(client, this.admissionFor(client));
+    // for a broadcast, when it runs Minecraft servers, whose view sockets take only a direct token,
+    // and with Turnstile on, where a connection is seated only once it passes.
+    if (this.sendsAdmission()) this.sendTo(client, this.admissionFor(client));
     // Publish now, to everyone: a change made since the last snapshot belongs to
     // the next version, so the newcomer must not get it under the current one.
     this.dirty = true;
@@ -599,9 +603,10 @@ export class MockCoordinator {
         client.visible = m["visible"] === true;
         this.markDirty();
       } else if (m["type"] === "seat") {
-        // The mock seats every page; the ticket is not checked. A page with neither a ticket
-        // nor a reconnect to report arrives.
-        if (typeof m["ticket"] !== "string" && m["returning"] !== true) {
+        // The mock seats every verified page; the ticket is not checked. A page with neither a
+        // ticket nor a reconnect to report arrives, once it is verified.
+        client.returning = typeof m["ticket"] === "string" || m["returning"] === true;
+        if (!client.returning && client.verified) {
           this.lastArrivalAt = this.now();
           this.markDirty();
         }
@@ -610,8 +615,15 @@ export class MockCoordinator {
         if (this.broadcast || this.minecraft) this.sendTo(client, this.admissionFor(client));
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
+        const joins = ok && !client.verified;
         if (ok) client.verified = true;
         this.sendTo(client, { type: "verified", ok, ...(ok ? {} : { reason: "the check did not pass" }) });
+        if (joins) {
+          // Admitted now: seated, and an arrival unless it said it is returning.
+          if (this.sendsAdmission()) this.sendTo(client, this.admissionFor(client));
+          if (!client.returning) this.lastArrivalAt = this.now();
+          this.markDirty();
+        }
       } else if (m["type"] === "intent" && typeof m["id"] === "string" && typeof m["name"] === "string") {
         const args = typeof m["args"] === "object" && m["args"] !== null ? (m["args"] as Record<string, unknown>) : {};
         void this.intent(client, m["id"], m["name"], args);
@@ -630,18 +642,24 @@ export class MockCoordinator {
     ws.on("error", () => {});
   }
 
+  private sendsAdmission(): boolean {
+    return this.broadcast !== null || this.minecraft !== null || this.sitekey !== null;
+  }
+
   /** The admission message (PROTOCOL.md, "admission"): a seat and a direct token, or for a late viewer the broadcast alone. */
   private admissionFor(c: Client): Record<string, unknown> {
     const expires = this.now() + 600_000;
+    const unseated = c.late || !c.verified;
     return {
       type: "admission",
-      seat: c.late ? null : `mock-seat-${c.viewer}`,
-      locked: c.late,
-      reason: c.late ? "Direct streams are full, so you are watching the broadcast." : null,
-      direct: c.late ? null : { value: `v1.${Math.floor(expires / 1000)}.${c.viewer}.mock`, expires_at: expires },
+      seat: unseated ? null : `mock-seat-${c.viewer}`,
+      locked: unseated,
+      reason: !c.verified ? "One check first, then the direct streams." : c.late ? "Direct streams are full, so you are watching the broadcast." : null,
+      direct: unseated ? null : { value: `v1.${Math.floor(expires / 1000)}.${c.viewer}.mock`, expires_at: expires },
       broadcast: this.broadcast ? { value: this.playbackUrl(this.broadcast.url), expires_at: expires } : null,
       seat_free: false,
       capacity: null,
+      verify: !c.verified,
     };
   }
 

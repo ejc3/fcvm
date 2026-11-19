@@ -620,9 +620,34 @@ export interface PlayView {
   broadcast: BroadcastToggle | null;
   /** `family`: the stats drawer's line on the address family every tile streams over. */
   stats: { label: string; on: boolean; family: string };
-  verify: { needed: boolean; title: string; text: string; error: string };
+  verify: VerifyView;
   disabled: boolean;
 }
+
+/** The Turnstile check (PROTOCOL.md, "verify"). */
+export interface VerifyView {
+  /** The connection has not passed it. */
+  needed: boolean;
+  /**
+   * Shown now, without waiting for an action: the coordinator seats this connection, and lets
+   * it wake the fleet, only once it has passed.
+   */
+  prompt: boolean;
+  /**
+   * The widget may show. False while the day's GPU budget holds the fleet asleep
+   * (`power.reason` `budget`): nothing a viewer does wakes it then, so there is nothing to check for.
+   */
+  widget: boolean;
+  title: string;
+  text: string;
+  /** After a failed check (refused, or siteverify unreachable): `COULD_NOT_VERIFY`, else "". */
+  error: string;
+  /** The button that starts the widget again after a failed check; null without one. */
+  retry: string | null;
+}
+
+/** What a failed check says, whether Cloudflare refused it or could not be reached. */
+export const COULD_NOT_VERIFY = "Couldn't verify — retry";
 
 function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMsg[], plan: DrawPlan, input: WallInput, online: boolean): PlayView {
   const pendingWord = pend.find((i) => i.name === "word");
@@ -702,14 +727,32 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
   };
 }
 
-/** The one check before a first action: whether it is needed, and what it says. */
-export function verifyView(s: ClientState): PlayView["verify"] {
+/**
+ * The one check before a seat, a wake or a first action: whether it is needed, whether it shows
+ * now, and what it says.
+ */
+export function verifyView(s: ClientState): VerifyView {
   const ts = s.turnstile;
+  const needed = ts.sitekey !== null && !ts.verified;
+  // The coordinator holds this connection's seat, and its arrival, until it passes.
+  const seat = needed && s.admission?.verify === true;
+  const asleep = s.accepted !== null && s.accepted.fleet.power.state === "asleep";
+  const budget = asleep && s.accepted!.fleet.power.reason === "budget";
+  const text = ts.verifying
+    ? "Checking"
+    : seat
+      ? asleep
+        ? "One check, then the GPUs wake."
+        : "One check, then every VM's own stream and a say in the scene."
+      : "One check before your first action, so the fleet stays for people.";
   return {
-    needed: ts.sitekey !== null && !ts.verified,
+    needed,
+    prompt: needed && !budget && (seat || ts.queued.length > 0),
+    widget: needed && !budget,
     title: "One check first",
-    text: ts.verifying ? "Checking" : "One check before your first action, so the fleet stays for people.",
-    error: ts.error ?? "",
+    text,
+    error: ts.error === null ? "" : COULD_NOT_VERIFY,
+    retry: ts.error === null ? null : "Retry",
   };
 }
 
@@ -1807,7 +1850,9 @@ export function wallView(input: WallInput): WallView {
     focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight, "std"), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box, admit };
   }
   // Broadcast mode streams only the opened VM, and only while it is open and this viewer holds a direct token.
-  const shownDirect = broadcast ? direct.filter((d) => admit !== null && focusTile !== null && d.id === `d:${focusTile.id}`) : direct;
+  // A connection that has not passed Turnstile holds no token and, without a broadcast, streams nothing.
+  const unseated = !broadcast && s.admission?.verify === true;
+  const shownDirect = broadcast ? direct.filter((d) => admit !== null && focusTile !== null && d.id === `d:${focusTile.id}`) : unseated ? [] : direct;
   let zoomDraw: ZoomDraw | null = null;
   if (zoom) {
     const src = zoomed ? shownDirect.find((d) => d.id === `d:${zoomed.id}`) : undefined;
@@ -1825,13 +1870,13 @@ export function wallView(input: WallInput): WallView {
     // Broadcast mode streams nothing to the canvas but an opened VM's own stream: the video plays over it.
     mode: !broadcast && aggregatedAvailable(st.aggregates, family) && s.ui.mode === "aggregated" ? "aggregated" : "direct",
     direct: shownDirect,
-    aggregated: broadcast ? [] : aggregated,
-    suspended: s.ui.suspended || (broadcast && shownDirect.length === 0),
+    aggregated: broadcast || unseated ? [] : aggregated,
+    suspended: s.ui.suspended || unseated || (broadcast && shownDirect.length === 0),
     focus: focusSource,
     zoom: zoomDraw,
     estimatedBps: fitted.bps,
     image: own ? null : zoom ? zoom.layout.image : planLayout?.image ?? null,
-    posterFull: sleep !== null,
+    posterFull: sleep !== null || unseated,
     gen: st.layout.generation,
     atT: st.layout.from_frame / FRAME_RATE,
     tiles: st.tiles.map((t, i) => {

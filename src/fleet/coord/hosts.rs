@@ -82,6 +82,9 @@ pub struct Host {
     /// `stopped`).
     pub state: String,
     pub market: Market,
+    /// Where a connection from this instance can come from: its public IPv4 address, its IPv6
+    /// addresses, and its delegated IPv6 prefixes as `<address>/<length>`.
+    pub sources: Vec<String>,
 }
 
 impl Host {
@@ -190,6 +193,7 @@ fn with_recent(
             id: id.clone(),
             state: "pending".into(),
             market: r.market,
+            sources: Vec::new(),
         });
         true
     });
@@ -1056,6 +1060,20 @@ pub fn parse_create_fleet(xml: &str) -> Launch {
 /// (EC2 does not promise the order of an item's elements, so the item bounds an instance),
 /// with their state and market (an instance with `<instanceLifecycle>spot` is spot; one
 /// without is on demand).
+/// The text of every `<name>` element in `xml`.
+fn xml_all(xml: &str, name: &str) -> Vec<String> {
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let body = &rest[i + open.len()..];
+        let Some(end) = body.find(&close) else { break };
+        out.push(body[..end].trim().to_string());
+        rest = &body[end..];
+    }
+    out
+}
+
 pub fn parse_hosts(xml: &str) -> Vec<Host> {
     set_items(xml, "instancesSet")
         .into_iter()
@@ -1070,6 +1088,12 @@ pub fn parse_hosts(xml: &str) -> Vec<Host> {
                 } else {
                     Market::OnDemand
                 },
+                sources: ["ipAddress", "publicIp", "ipv6Address", "ipv6Prefix"]
+                    .iter()
+                    .flat_map(|t| xml_all(seg, t))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             })
         })
         .collect()
@@ -1312,6 +1336,7 @@ impl HostDriver for FakeHosts {
                     id: id.clone(),
                     state: state.clone(),
                     market,
+                    sources: Vec::new(),
                 });
             if let Some(v) = *self.hide_new.lock().unwrap() {
                 self.visibility.lock().unwrap().insert(id.clone(), v);
@@ -1376,6 +1401,7 @@ mod tests {
             id: id.into(),
             state: state.into(),
             market,
+            sources: Vec::new(),
         }
     }
 
@@ -1579,6 +1605,27 @@ mod tests {
                 host("i-0123456789abcdef0", "running", Market::Spot),
                 host("i-1234567890abcdef0", "pending", Market::OnDemand),
             ]
+        );
+    }
+
+    /// An instance's sources are its public IPv4 address and every IPv6 address and prefix of its
+    /// interfaces; its private addresses are not (a connection through Cloudflare never comes
+    /// from one).
+    #[test]
+    fn describe_answers_carry_each_hosts_public_addresses_and_ipv6_prefixes() {
+        let xml = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
+  <item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState>
+    <privateIpAddress>10.0.0.5</privateIpAddress><ipAddress>198.51.100.7</ipAddress>
+    <networkInterfaceSet><item><privateIpAddress>10.0.0.5</privateIpAddress>
+      <association><publicIp>198.51.100.7</publicIp></association>
+      <ipv6AddressesSet><item><ipv6Address>2001:db8:7:7::5</ipv6Address></item></ipv6AddressesSet>
+      <ipv6PrefixSet><item><ipv6Prefix>2001:db8:7:7:1::/80</ipv6Prefix></item></ipv6PrefixSet>
+    </item></networkInterfaceSet></item>
+</instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
+        let h = &parse_hosts(xml)[0];
+        assert_eq!(
+            h.sources,
+            vec!["198.51.100.7", "2001:db8:7:7:1::/80", "2001:db8:7:7::5"]
         );
     }
 

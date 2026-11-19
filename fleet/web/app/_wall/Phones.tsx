@@ -32,7 +32,7 @@ import {
 import { RateMeter } from "../../core/meter.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.ts";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
-import { TurnstileWidget } from "./Turnstile.tsx";
+import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
 import { WakeCard } from "./Overlays.tsx";
 import { Timeline } from "./FocusPanel.tsx";
@@ -48,21 +48,6 @@ declare global {
   }
 }
 
-function Verify({ client, view }: { client: WallClient; view: PhonesView }) {
-  const sitekey = client.getState().turnstile.sitekey;
-  if (sitekey === null) return null;
-  return (
-    <div className="verify" data-testid="verify">
-      <p>{view.verify.text}</p>
-      <TurnstileWidget sitekey={sitekey} onToken={(token) => client.verify(token)} onError={(error) => client.dispatch({ type: "turnstile-error", error })} />
-      {view.verify.error ? (
-        <p className="error" role="alert">
-          {view.verify.error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
 
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
 
@@ -566,7 +551,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   }, [panelOpen]);
 
   const zoomPending = state.pending.some((p) => p.intent.name === "phones_zoom");
-  const needsVerifyPrompt = view.verify.needed && state.turnstile.queued.length > 0;
+  const needsVerifyPrompt = view.verify.prompt;
   const sheetTop = stage ? Math.round(stage.y + stage.h * 0.5 + 8) : 0;
   const openedSlot = openId === null ? null : (phones?.tiles.find((t) => t.id === openId)?.slot ?? null);
 
@@ -660,7 +645,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
       ) : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>
-          <Verify client={client} view={view} />
+          <VerifyCard client={client} verify={view.verify} />
         </div>
       ) : null}
       {view.notice ? (

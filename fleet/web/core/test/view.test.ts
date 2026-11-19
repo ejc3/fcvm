@@ -13,6 +13,7 @@ import {
   isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
   needsVerify,
+  COULD_NOT_VERIFY,
   placeLabel,
   clearBand,
   outOfRotationLine,
@@ -522,12 +523,75 @@ describe("Turnstile", () => {
     s = reduce(s, { type: "verify-sent" });
     expect(view(s, EPOCH).play!.verify.text).toBe("Checking");
     s = msg(s, { type: "verified", ok: false, reason: "the check did not pass" });
-    expect(view(s, EPOCH).play!.verify.error).toBe("the check did not pass");
+    expect(view(s, EPOCH).play!.verify.error).toBe(COULD_NOT_VERIFY);
     s = msg(s, { type: "verified", ok: true });
     expect(needsVerify(s)).toBe(false);
     expect(s.turnstile.queued).toEqual([{ name: "restart_now", args: {} }]);
     s = msg(s, { type: "hello", viewer: "v-9", turnstile: "example-sitekey" });
     expect(needsVerify(s)).toBe(true);
+  });
+
+  /** The coordinator's admission of a connection that has not passed the check (PROTOCOL.md, "admission"). */
+  const unverified = { type: "admission", seat: null, locked: true, reason: "One check first, then the direct streams.", direct: null, broadcast: null, seat_free: false, capacity: null, verify: true };
+  const seated = { type: "admission", seat: "t-1", locked: false, reason: null, direct: { value: "v1.9.v-3.mac", expires_at: EPOCH + 600_000 }, broadcast: null, seat_free: false, capacity: null, verify: false };
+
+  it("shows the check at once to a connection the coordinator has not seated, which streams nothing until it passes", () => {
+    let s = msg(stateWith(fleet(4, 4)), { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
+    s = msg(s, unverified);
+    let v = view(s, EPOCH);
+    expect(v.play!.verify).toMatchObject({ needed: true, prompt: true, text: "One check, then every VM's own stream and a say in the scene.", error: "", retry: null });
+    expect(v.plan.direct).toEqual([]);
+    expect(v.plan.aggregated).toEqual([]);
+    expect(v.plan.suspended).toBe(true);
+    expect(v.plan.posterFull).toBe(true);
+    s = msg(s, { type: "verified", ok: true });
+    s = msg(s, seated);
+    v = view(s, EPOCH);
+    expect(v.play!.verify).toMatchObject({ needed: false, prompt: false });
+    expect(v.plan.direct.length).toBe(s.accepted!.tiles.length);
+    expect(v.plan.direct.every((d) => d.admit === "v1.9.v-3.mac")).toBe(true);
+    expect(v.plan.posterFull).toBe(false);
+  });
+
+  it("asleep, the check comes before the fleet wakes", () => {
+    const st = fleetSplit(0, 0, 1);
+    st.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [] };
+    let s = msg(stateWith(st), { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
+    s = msg(s, unverified);
+    expect(view(s, EPOCH).play!.verify).toMatchObject({ prompt: true, text: "One check, then the GPUs wake." });
+  });
+
+  it("asleep for the day's GPU budget, the check never shows: nothing a viewer does wakes the fleet", () => {
+    const st = fleetSplit(0, 0, 1);
+    st.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [], reason: "budget" };
+    let s = msg(stateWith(st), { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
+    s = msg(s, unverified);
+    s = reduce(s, { type: "queue", action: { name: "word", args: { text: "hi" } } });
+    expect(view(s, EPOCH).play!.verify).toMatchObject({ needed: true, prompt: false, widget: false });
+    expect(view(s, EPOCH).sleep!.wake).toBeNull();
+  });
+
+  it("a failed check says it could not verify and offers a retry that starts the widget again", () => {
+    let s = msg(stateWith(fleet()), { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
+    s = msg(s, unverified);
+    s = reduce(s, { type: "verify-sent" });
+    s = msg(s, { type: "verified", ok: false, reason: "calling Turnstile siteverify: operation timed out" });
+    expect(view(s, EPOCH).play!.verify).toMatchObject({ needed: true, prompt: true, error: "Couldn't verify — retry", retry: "Retry" });
+    expect(s.turnstile.attempt).toBe(0);
+    s = reduce(s, { type: "turnstile-retry" });
+    expect(s.turnstile.attempt).toBe(1);
+    expect(view(s, EPOCH).play!.verify).toMatchObject({ error: "", retry: null, prompt: true });
+    // A widget that does not load fails the same way.
+    s = reduce(s, { type: "turnstile-error", error: "Turnstile did not load" });
+    expect(view(s, EPOCH).play!.verify.error).toBe(COULD_NOT_VERIFY);
+  });
+
+  it("a connection the coordinator seats without a check (a held seat ticket) is verified", () => {
+    let s = msg(stateWith(fleet()), { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
+    expect(needsVerify(s)).toBe(true);
+    s = msg(s, seated);
+    expect(needsVerify(s)).toBe(false);
+    expect(view(s, EPOCH).play!.verify.prompt).toBe(false);
   });
 });
 

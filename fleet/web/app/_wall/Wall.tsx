@@ -834,7 +834,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
     if (!drawerOn) setDrawerPanel("play");
   }, [drawerOn]);
 
-  const needsVerifyPrompt = view.play?.verify.needed && state.turnstile.queued.length > 0 && !state.ui.drawer;
+  const needsVerifyPrompt = view.play?.verify.prompt && !state.ui.drawer;
 
   const brand = (
     <div className="masthead">

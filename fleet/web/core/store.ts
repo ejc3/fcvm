@@ -166,6 +166,8 @@ export interface TurnstileState {
   error: string | null;
   /** Actions pressed before verification, sent once it succeeds. */
   queued: QueuedAction[];
+  /** How many times the widget was started again after a failed check (its React key). */
+  attempt: number;
 }
 
 export interface OwnGpu {
@@ -260,6 +262,8 @@ export type ClientEvent =
   /** The queued actions were sent. */
   | { type: "queue-sent" }
   | { type: "turnstile-error"; error: string }
+  /** The viewer pressed Retry after a failed check: the widget starts again. */
+  | { type: "turnstile-retry" }
   /** The viewer closed its own-GPU view, or dismissed a refusal. */
   | { type: "own-closed" }
   /** The client sent release_gpu for own.release. */
@@ -305,7 +309,7 @@ export function initialState(): ClientState {
     lastProtocolError: null,
     serverError: null,
     you: null,
-    turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [] },
+    turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [], attempt: 0 },
     own: NO_OWN,
     net: { family: null, probeMs: null, via: null },
     gpuHistory: {},
@@ -445,6 +449,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, turnstile: { ...s.turnstile, queued: [] } };
     case "turnstile-error":
       return { ...s, turnstile: { ...s.turnstile, verifying: false, error: e.error } };
+    case "turnstile-retry":
+      return { ...s, turnstile: { ...s.turnstile, verifying: false, error: null, attempt: s.turnstile.attempt + 1 } };
     case "gen-shown": {
       const st = s.accepted;
       if (!st || st.layout.generation !== e.gen) return s;
@@ -517,7 +523,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
         }
         case "admission": {
           const { type: _type, ...admission } = msg;
-          return { ...s, admission };
+          // With Turnstile on, a connection admitted without a check is verified already: it
+          // brought a seat ticket the coordinator holds, or a request that proved itself.
+          const verified = s.turnstile.verified || (s.turnstile.sitekey !== null && !admission.verify);
+          return { ...s, admission, turnstile: verified === s.turnstile.verified ? s.turnstile : { ...s.turnstile, verified, verifying: false, error: null } };
         }
         case "verified":
           return {

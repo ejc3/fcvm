@@ -7,6 +7,7 @@
 //! assignment, and the state file. No other task reads or writes the state, so there is
 //! nothing to lock and no order to race on.
 
+pub mod access_jwt;
 pub mod admission;
 pub mod agents;
 pub mod authority;
@@ -1450,6 +1451,29 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             lost_launch_ttl: Duration::from_secs(120),
         })
     };
+    // With host templates the coordinator launches its GPU hosts, so a dialed agent must be on
+    // one of them.
+    let agent_identity: Option<Arc<dyn agents::AgentIdentity>> = power.as_ref().map(|p| {
+        Arc::new(agents::FleetHosts {
+            driver: p.driver.clone(),
+            regions: p.regions.clone(),
+            fleet: args.fleet_name.clone(),
+        }) as Arc<dyn agents::AgentIdentity>
+    });
+    let access = match &args.access_team_domain {
+        Some(team) => {
+            anyhow::ensure!(
+                !args.access_aud.is_empty() || !args.agent_access_aud.is_empty(),
+                "--access-team-domain needs --access-aud or --agent-access-aud"
+            );
+            Some(Arc::new(access_jwt::AccessCheck {
+                jwt: access_jwt::AccessJwt::new(team)?,
+                live: args.access_aud.clone(),
+                agent: args.agent_access_aud.clone(),
+            }))
+        }
+        None => None,
+    };
     let dns_token = match &args.dns_token_secret {
         Some(name) => Some(
             secrets::Secrets::new(&secrets_region()?)?
@@ -1631,7 +1655,19 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             }
         });
     }
-    let verifier: Arc<dyn turnstile::Verifier> = match args.turnstile_secret {
+    let (turnstile_secret, turnstile_site_key) = match &args.turnstile_secret_id {
+        Some(id) => {
+            let json = secrets::Secrets::new(&secrets_region()?)?
+                .get(id)
+                .await
+                .with_context(|| format!("reading the Turnstile secret {id}"))?;
+            let (site, secret) = turnstile::parse_secret(&json)
+                .with_context(|| format!("reading the Turnstile secret {id}"))?;
+            (Some(secret), Some(site))
+        }
+        None => (args.turnstile_secret, args.turnstile_site_key),
+    };
+    let verifier: Arc<dyn turnstile::Verifier> = match turnstile_secret {
         Some(secret) => Arc::new(turnstile::Siteverify::new(secret, None)?),
         None => Arc::new(turnstile::Off),
     };
@@ -1663,12 +1699,18 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         checker,
         allowed_origins: args.allowed_origins,
         verifier,
+        proof: match &access {
+            Some(a) => a.clone() as Arc<dyn turnstile::RequestProof>,
+            None => Arc::new(turnstile::NoProof),
+        },
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
         access_viewer_address: args.access_viewer_address,
-        turnstile_site_key: args.turnstile_site_key,
+        turnstile_site_key,
         poster,
         gate: Arc::new(gate),
         sockets: live::SocketCaps::default(),
+        access,
+        agent_identity,
     };
     tokio::select! {
         r = live::serve(listener, handle.clone(), cfg) => r?,

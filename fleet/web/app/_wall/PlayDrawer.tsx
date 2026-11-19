@@ -11,24 +11,11 @@
 
 import { useEffect, useRef } from "react";
 import { wordArgs, type WallView } from "../../core/index.ts";
-import { TurnstileWidget } from "./Turnstile.tsx";
+import { VerifyCard } from "./Turnstile.tsx";
 import type { WallClient } from "./wall-client.ts";
 
 export function VerifyBox({ client, view }: { client: WallClient; view: WallView }) {
-  const v = view.play?.verify;
-  const sitekey = client.getState().turnstile.sitekey;
-  if (!v || !v.needed || sitekey === null) return null;
-  return (
-    <div className="verify" data-testid="verify">
-      <p>{v.text}</p>
-      <TurnstileWidget
-        sitekey={sitekey}
-        onToken={(token) => client.verify(token)}
-        onError={(error) => client.dispatch({ type: "turnstile-error", error })}
-      />
-      {v.error ? <p className="error" role="alert">{v.error}</p> : null}
-    </div>
-  );
+  return view.play ? <VerifyCard client={client} verify={view.play.verify} /> : null;
 }
 
 export type DrawerPanel = "play" | "about" | "isolation";

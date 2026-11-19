@@ -8,13 +8,20 @@
 //!
 //! Every intent carries the connection's client key, which the per-client limits count by:
 //! the client address (`CF-Connecting-IP` when trusted, else the peer address), an IPv6
-//! address cut to its /64 ([`client_key`]). With a Turnstile
-//! secret configured, a connection's intents are refused until it has passed `verify`.
+//! address cut to its /64 ([`client_key`]).
+//!
+//! With a Turnstile secret configured, a connection that has not passed `verify` is not a
+//! viewer yet: it receives snapshots and, when the fleet runs one, the broadcast, but it is
+//! not joined (no arrival, so it wakes nothing, and it does not count as active), holds no
+//! seat and no direct token, and its intents are refused. It joins and is admitted once
+//! siteverify accepts its token; a siteverify error or timeout leaves it as it was. A seat
+//! ticket this coordinator still holds, or a request the [`RequestProof`] accepts (a valid
+//! Cloudflare Access JWT, [`super::access_jwt`]), counts as verified from the start.
 
 use super::admission::{Admitted, Gate};
 use super::poster::Poster;
 use super::text_check::{check_text, TextChecker};
-use super::turnstile::Verifier;
+use super::turnstile::{RequestProof, Verifier, SITEVERIFY_ERROR_MARKER};
 use super::{Handle, Submitted};
 use crate::fleet::now_ms;
 use anyhow::Result;
@@ -151,6 +158,9 @@ pub struct LiveConfig {
     /// Browser origins allowed besides the coordinator's own.
     pub allowed_origins: Vec<String>,
     pub verifier: Arc<dyn Verifier>,
+    /// What counts as verified without a Turnstile token (asked only when the verifier is
+    /// required).
+    pub proof: Arc<dyn RequestProof>,
     /// Sent in the hello when the verifier asks for a token.
     pub turnstile_site_key: Option<String>,
     /// Key clients by `CF-Connecting-IP` (only behind Cloudflare, which sets it).
@@ -163,6 +173,11 @@ pub struct LiveConfig {
     pub gate: Arc<Gate>,
     /// How many `/live` sockets may be open.
     pub sockets: SocketCaps,
+    /// Access tokens checked by the coordinator itself: on `/live` for the viewer address,
+    /// and on `/agent` when agent audiences are given. `None`: Access is trusted at the edge.
+    pub access: Option<Arc<super::access_jwt::AccessCheck>>,
+    /// The check on the host a dialed agent's hello names; `None` admits any.
+    pub agent_identity: Option<Arc<dyn super::agents::AgentIdentity>>,
 }
 
 #[derive(Clone)]
@@ -231,8 +246,31 @@ async fn poster(State(app): State<App>) -> Response {
 
 /// An agent that dials in (`fcvm fleet agent --dial`): the agent protocol with one JSON
 /// message per text frame. Cloudflare Access admits only the agents' service token on this
-/// path before a request reaches the coordinator.
-async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response {
+/// path before a request reaches the coordinator; with agent audiences configured the
+/// coordinator verifies that token itself, and with an identity check the host the hello
+/// names must be one of this fleet's.
+async fn agent_socket(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<App>,
+) -> Response {
+    // Where the agent's connection comes from (CF-Connecting-IP behind Cloudflare): the host
+    // its hello names must own it.
+    let source = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip, false)
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical());
+    if let Some(access) = app.cfg.access.as_ref().filter(|a| !a.agent.is_empty()) {
+        if let Err(e) = access.agent_claims(&headers).await {
+            tracing::warn!(
+                marker = super::agents::AGENT_REFUSED_MARKER,
+                reason = %format!("{e:#}"),
+                "refusing /agent: its Access token does not verify"
+            );
+            return (StatusCode::FORBIDDEN, "agent not admitted").into_response();
+        }
+    }
     ws.max_message_size(crate::fleet::lines::MAX_LINE)
         .on_upgrade(move |socket| async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -263,7 +301,14 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
                 }
                 let _ = sink.close().await;
             });
-            if let Err(e) = super::agents::serve_connection(serve_in, serve_out, &app.handle).await
+            if let Err(e) = super::agents::serve_checked(
+                serve_in,
+                serve_out,
+                &app.handle,
+                app.cfg.agent_identity.as_deref(),
+                source,
+            )
+            .await
             {
                 tracing::warn!(error = %format!("{e:#}"), "agent connection ended");
             }
@@ -279,15 +324,15 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
 pub const VIEWER_ADDRESS_HEADER: &str = "x-fleet-viewer-ip";
 
 /// The address the per-client limits use: `CF-Connecting-IP` behind Cloudflare (`trust_cf`),
-/// else the peer address. With `access_viewer`, a request Access admitted with a service token
-/// is keyed by [`VIEWER_ADDRESS_HEADER`] instead: only the fleet's own Worker and CI hold one,
-/// and a browser's Access JWT names a person, so a viewer cannot set the address it is limited
-/// by. That holds only where the connector verifies the JWT, hence the separate switch.
+/// else the peer address. With `forwarded_viewer` (`--access-viewer-address` and a request
+/// Access admitted with a service token, [`service_token`]), the request is keyed by
+/// [`VIEWER_ADDRESS_HEADER`] instead: only the fleet's own Worker and CI hold one, and a
+/// browser's Access JWT names a person, so a viewer cannot set the address it is limited by.
 pub fn client_address(
     headers: &HeaderMap,
     peer: SocketAddr,
     trust_cf: bool,
-    access_viewer: bool,
+    forwarded_viewer: bool,
 ) -> String {
     let ip = |name: &str| {
         headers
@@ -297,7 +342,7 @@ pub fn client_address(
             .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
             .map(str::to_string)
     };
-    if access_viewer && access_service_token(headers) {
+    if forwarded_viewer {
         if let Some(viewer) = ip(VIEWER_ADDRESS_HEADER) {
             return viewer;
         }
@@ -332,12 +377,26 @@ pub fn client_key(address: &str) -> String {
     }
 }
 
-/// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
-/// it forwards names one (`common_name`, the token's client id) and no person (`email`).
-/// The signature is not checked here, so this is trusted only with `--access-viewer-address`:
-/// staging's tunnel connector refuses a request whose token does not verify for the
-/// coordinator's applications (`access.required`, ejc3/aws fcvm-dev.tf).
-fn access_service_token(headers: &HeaderMap) -> bool {
+/// Whether Access admitted this request with a service token: its `Cf-Access-Jwt-Assertion`
+/// names one (`common_name`, the token's client id) and no person (`email`). With an
+/// [`super::access_jwt::AccessCheck`] the token must verify (signature, issuer, a `/live`
+/// audience, expiry). Without one the payload is read unverified, which is trusted only behind
+/// a tunnel connector that requires and verifies Access (`access.required`, ejc3/aws
+/// fcvm-dev.tf).
+pub async fn service_token(
+    access: Option<&super::access_jwt::AccessCheck>,
+    headers: &HeaderMap,
+) -> bool {
+    match access {
+        Some(a) => a
+            .live_claims(headers)
+            .await
+            .is_some_and(|c| c.service_token()),
+        None => unverified_service_token(headers),
+    }
+}
+
+fn unverified_service_token(headers: &HeaderMap) -> bool {
     let Some(jwt) = headers
         .get("cf-access-jwt-assertion")
         .and_then(|v| v.to_str().ok())
@@ -373,11 +432,13 @@ async fn live(
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+    let forwarded_viewer =
+        app.cfg.access_viewer_address && service_token(app.cfg.access.as_deref(), &headers).await;
     let address = client_address(
         &headers,
         peer,
         app.cfg.trust_cf_connecting_ip,
-        app.cfg.access_viewer_address,
+        forwarded_viewer,
     );
     let client = Client {
         key: client_key(&address),
@@ -402,8 +463,12 @@ async fn live(
                 .into_response();
         }
     };
+    // Without a verifier every connection is verified; with one, only a request whose
+    // headers prove it is, before any token.
+    let proven = !app.cfg.verifier.required() || app.cfg.proof.verified(&headers).await;
     let page = Page {
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
+        proven,
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
         .on_upgrade(move |socket| async move {
@@ -458,6 +523,9 @@ struct Client {
 struct Page {
     /// Its origin, which a playback token is bound to.
     origin: Option<String>,
+    /// Verified before any Turnstile token: no verifier is configured, or the request proved
+    /// itself ([`RequestProof`]).
+    proven: bool,
 }
 
 /// How long a connection waits for its first message, which may hold a seat ticket, before
@@ -526,35 +594,51 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         }
         _ => (None, false),
     };
+    // A seat is held from admission until the connection ends. A connection that has not
+    // proved itself is admitted only when it brings a seat ticket this coordinator still holds
+    // (given to a connection that had verified); otherwise it waits for `verify`.
+    let gate = app.cfg.gate.clone();
+    let first = if page.proven {
+        gate.seats
+            .admit(seat.as_deref(), &client, std::time::Instant::now())
+    } else {
+        seat.as_deref()
+            .and_then(|t| gate.seats.resume(t, std::time::Instant::now()))
+            .unwrap_or(Admitted::Unverified)
+    };
+    // Verified: joined as a viewer. Set once, never cleared.
+    let verified = Arc::new(AtomicBool::new(first != Admitted::Unverified));
     // A page that kept a ticket, or says it connected before, is reconnecting: it joins
     // without counting as an arrival (PROTOCOL.md, `fleet.power`). Nothing it sends is
-    // applied before this.
-    app.handle
-        .send(Event::ViewerJoined {
-            at: 0,
-            viewer: viewer.clone(),
-            client: Some(client.clone()),
-            returning,
-        })
-        .await;
-    // A seat is held from here until the connection ends.
-    let gate = app.cfg.gate.clone();
-    let admitted = gate
-        .seats
-        .admit(seat.as_deref(), &client, std::time::Instant::now());
-    let late = admitted.late();
+    // applied before this. An unverified connection joins when it verifies.
+    if verified.load(Ordering::SeqCst) {
+        app.handle
+            .send(Event::ViewerJoined {
+                at: 0,
+                viewer: viewer.clone(),
+                client: Some(client.clone()),
+                returning,
+            })
+            .await;
+    }
     let admission = gate.message(
-        &admitted,
+        &first,
         &viewer,
         &client,
         page.origin.as_deref(),
         now_ms(),
         std::time::Instant::now(),
     );
-    let release = |gate: &Gate| {
-        if let Admitted::Seat { ticket } = &admitted {
+    let admitted = Arc::new(Mutex::new(first));
+    // The seat back and the viewer gone, once the connection ends.
+    let leave = |gate: &Gate, admitted: &Mutex<Admitted>, verified: &AtomicBool| {
+        if let Admitted::Seat { ticket } = &*admitted.lock().unwrap() {
             gate.seats.release(ticket, std::time::Instant::now());
         }
+        verified.load(Ordering::SeqCst).then(|| Event::ViewerLeft {
+            at: 0,
+            viewer: viewer.clone(),
+        })
     };
     if sink
         .send(Message::Text(
@@ -563,13 +647,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         .await
         .is_err()
     {
-        release(&gate);
-        app.handle
-            .send(Event::ViewerLeft {
-                at: 0,
-                viewer: viewer.clone(),
-            })
-            .await;
+        if let Some(left) = leave(&gate, &admitted, &verified) {
+            app.handle.send(left).await;
+        }
         return;
     }
     let (direct, mut direct_rx) = mpsc::channel::<ServerMsg>(DIRECT_QUEUE);
@@ -587,6 +667,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
             loop {
                 tokio::time::sleep(gate.tick).await;
                 let now = std::time::Instant::now();
+                let admitted = admitted.lock().unwrap().clone();
                 // Only a viewer late for the capacity is told of a free seat: one whose client
                 // holds its seats would be late again after a reload.
                 let free_changed =
@@ -686,7 +767,6 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
             }
         })
     };
-    let verified = Arc::new(AtomicBool::new(!app.cfg.verifier.required()));
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // The `word` intent ids of this connection with a task working on them: a repeated id
@@ -695,6 +775,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // When this connection last asked for a fresh playback token.
     let mut last_playback: Option<std::time::Instant> = None;
+    // The visibility an unverified page reported last, applied when it joins: a background tab
+    // whose check passes on its own sends nothing more until it is shown.
+    let mut visible_before_join: Option<bool> = None;
     loop {
         let msg = match pending.take() {
             Some(m) => m,
@@ -743,6 +826,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     })
                 } else {
                     last_playback = Some(now);
+                    let admitted = admitted.lock().unwrap().clone();
                     Some(ServerMsg::Admission(gate.message(
                         &admitted,
                         &viewer,
@@ -753,27 +837,72 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     )))
                 }
             }
+            // An unverified connection is not a viewer, so it is neither active nor hidden.
             Ok(ClientMsg::Visibility { visible }) => {
-                app.handle
-                    .send(Event::Visibility {
-                        at: 0,
-                        viewer: viewer.clone(),
-                        visible,
-                    })
-                    .await;
+                if !verified.load(Ordering::SeqCst) {
+                    visible_before_join = Some(visible);
+                } else {
+                    app.handle
+                        .send(Event::Visibility {
+                            at: 0,
+                            viewer: viewer.clone(),
+                            visible,
+                        })
+                        .await;
+                }
                 None
             }
             Ok(ClientMsg::Verify { token }) => {
                 let r = app.cfg.verifier.verify(&token, &address).await;
+                // A siteverify error or timeout fails closed: the connection stays unverified.
                 let (ok, reason) = match r {
                     Ok(None) => (true, None),
                     Ok(Some(why)) => (false, Some(why)),
-                    Err(e) => (false, Some(format!("{e:#}"))),
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        tracing::warn!(
+                            marker = SITEVERIFY_ERROR_MARKER,
+                            %viewer,
+                            error = %e,
+                            "Turnstile siteverify failed; the connection stays unverified"
+                        );
+                        (false, Some(e))
+                    }
                 };
-                if ok {
-                    verified.store(true, Ordering::SeqCst);
+                if direct.try_send(ServerMsg::Verified { ok, reason }).is_err() {
+                    tracing::info!(%viewer, "viewer is not reading; closing");
+                    break;
                 }
-                Some(ServerMsg::Verified { ok, reason })
+                if ok && !verified.load(Ordering::SeqCst) {
+                    // Admitted now: joined (an arrival unless the page said it is returning),
+                    // then seated if a seat is free.
+                    app.handle
+                        .send(Event::ViewerJoined {
+                            at: 0,
+                            viewer: viewer.clone(),
+                            client: Some(client.clone()),
+                            returning,
+                        })
+                        .await;
+                    if visible_before_join == Some(false) {
+                        app.handle
+                            .send(Event::Visibility {
+                                at: 0,
+                                viewer: viewer.clone(),
+                                visible: false,
+                            })
+                            .await;
+                    }
+                    verified.store(true, Ordering::SeqCst);
+                    let now = std::time::Instant::now();
+                    let a = gate.seats.admit(None, &client, now);
+                    let msg =
+                        gate.message(&a, &viewer, &client, page.origin.as_deref(), now_ms(), now);
+                    *admitted.lock().unwrap() = a;
+                    Some(ServerMsg::Admission(msg))
+                } else {
+                    None
+                }
             }
             Ok(ClientMsg::Intent { id, name, args }) => {
                 if id.is_empty() || id.len() > 128 {
@@ -782,7 +911,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     })
                 } else if !verified.load(Ordering::SeqCst) {
                     Some(unrecorded_refusal(id, "verify first"))
-                } else if late && LATE_REFUSED.contains(&name.as_str()) {
+                } else if admitted.lock().unwrap().late() && LATE_REFUSED.contains(&name.as_str()) {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
                     let admitted = {
@@ -897,13 +1026,9 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
     forward.abort();
     renew.abort();
     writer.abort();
-    release(&gate);
-    app.handle
-        .send(Event::ViewerLeft {
-            at: 0,
-            viewer: viewer.clone(),
-        })
-        .await;
+    if let Some(left) = leave(&gate, &admitted, &verified) {
+        app.handle.send(left).await;
+    }
 }
 
 /// Why a `claim_gpu` without a well-formed token is refused (unrecorded).

@@ -106,6 +106,10 @@ pub struct Admission {
     pub seat_free: bool,
     /// Seats in all; null when every viewer is seated.
     pub capacity: Option<usize>,
+    /// The connection must pass Turnstile (`verify`) before it is seated: until then it has no
+    /// seat and no direct token, and watches the broadcast when there is one.
+    #[serde(default)]
+    pub verify: bool,
 }
 
 /// A credential and when it stops working (unix ms).

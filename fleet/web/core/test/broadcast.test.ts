@@ -35,6 +35,7 @@ function admission(over: Partial<Admission> = {}): Admission {
     broadcast: { value: PLAYBACK, expires_at: 9_999_999_999_000 },
     seat_free: false,
     capacity: 500,
+    verify: false,
     ...over,
   };
 }

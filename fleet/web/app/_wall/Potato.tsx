@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import { potatoView, SITE, type Box, type PotatoButton, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
-import { TurnstileWidget } from "./Turnstile.tsx";
+import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
 import { WakeCard } from "./Overlays.tsx";
 import { useMedia } from "./hooks.ts";
@@ -22,21 +22,6 @@ declare global {
   }
 }
 
-function Verify({ client, view }: { client: WallClient; view: PotatoView }) {
-  const sitekey = client.getState().turnstile.sitekey;
-  if (sitekey === null) return null;
-  return (
-    <div className="verify" data-testid="verify">
-      <p>{view.verify.text}</p>
-      <TurnstileWidget sitekey={sitekey} onToken={(token) => client.verify(token)} onError={(error) => client.dispatch({ type: "turnstile-error", error })} />
-      {view.verify.error ? (
-        <p className="error" role="alert">
-          {view.verify.error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
 
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
 
@@ -115,7 +100,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   }, [client]);
 
   const ring = view.ring;
-  const needsVerifyPrompt = view.verify.needed && state.turnstile.queued.length > 0;
+  const needsVerifyPrompt = view.verify.prompt;
 
   return (
     <main className="potato-page" data-testid="potato">
@@ -295,7 +280,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
       </div>
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>
-          <Verify client={client} view={view} />
+          <VerifyCard client={client} verify={view.verify} />
         </div>
       ) : null}
     </main>

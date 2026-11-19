@@ -1,14 +1,63 @@
 //! Cloudflare Turnstile: a `/live` connection proves it is a browser with a person behind it
-//! before its first intent. The page runs the widget and sends its token
-//! (`{"type":"verify","token"}`); the coordinator asks Cloudflare's siteverify with its
-//! secret. Without a secret configured (local runs) every connection counts as verified.
+//! before it counts as a viewer, takes a seat or sends an intent. The page runs the widget and
+//! sends its token (`{"type":"verify","token"}`); the coordinator asks Cloudflare's siteverify
+//! with its secret. Without a secret configured (staging, local runs, tests) every connection
+//! counts as verified.
+//!
+//! A request can also prove itself before any token ([`RequestProof`]): one that carries a valid
+//! Cloudflare Access JWT came from the owner or the fleet's own CI.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub const SITEVERIFY: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+/// How long one siteverify call may take. Past it the connection is not verified (it fails
+/// closed) and the page offers a retry.
+pub const SITEVERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The log marker of a siteverify call that failed (not a refusal: an error or a timeout).
+pub const SITEVERIFY_ERROR_MARKER: &str = "turnstile-siteverify-error";
+
+/// The keys of the Turnstile secret in Secrets Manager (`--turnstile-secret-id`), the same
+/// names as the environment variables the flags read.
+pub const SECRET_SITE_KEY: &str = "FLEET_TURNSTILE_SITE_KEY";
+pub const SECRET_SECRET: &str = "FLEET_TURNSTILE_SECRET";
+
+/// The site key and the secret from the Secrets Manager secret's JSON.
+pub fn parse_secret(json: &str) -> Result<(String, String)> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).context("the Turnstile secret is not JSON")?;
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match (field(SECRET_SITE_KEY), field(SECRET_SECRET)) {
+        (Some(site), Some(secret)) => Ok((site, secret)),
+        _ => bail!("the Turnstile secret needs the keys {SECRET_SITE_KEY} and {SECRET_SECRET}"),
+    }
+}
+
+/// What a `/live` request's headers prove about its viewer before any Turnstile token.
+#[async_trait]
+pub trait RequestProof: Send + Sync {
+    /// Whether the request counts as verified as it is.
+    async fn verified(&self, headers: &HeaderMap) -> bool;
+}
+
+/// Nothing in a request proves its viewer.
+pub struct NoProof;
+
+#[async_trait]
+impl RequestProof for NoProof {
+    async fn verified(&self, _headers: &HeaderMap) -> bool {
+        false
+    }
+}
 
 #[async_trait]
 pub trait Verifier: Send + Sync {
@@ -42,12 +91,14 @@ pub struct Siteverify {
 
 impl Siteverify {
     pub fn new(secret: String, url: Option<String>) -> Result<Self> {
+        Siteverify::with_timeout(secret, url, SITEVERIFY_TIMEOUT)
+    }
+
+    pub fn with_timeout(secret: String, url: Option<String>, timeout: Duration) -> Result<Self> {
         Ok(Siteverify {
             secret,
             url: url.unwrap_or_else(|| SITEVERIFY.to_string()),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
+            http: reqwest::Client::builder().timeout(timeout).build()?,
         })
     }
 }
@@ -66,6 +117,8 @@ impl Verifier for Siteverify {
             .send()
             .await
             .context("calling Turnstile siteverify")?
+            .error_for_status()
+            .context("Turnstile siteverify answered with an error")?
             .json()
             .await
             .context("reading Turnstile's answer")?;
@@ -96,6 +149,24 @@ impl Verifier for Fake {
 mod tests {
     use super::*;
     use axum::routing::post;
+
+    #[test]
+    fn the_secret_names_its_site_key_and_secret() {
+        let (site, secret) = parse_secret(
+            r#"{"FLEET_TURNSTILE_SITE_KEY": "0x-site", "FLEET_TURNSTILE_SECRET": "0x-secret"}"#,
+        )
+        .unwrap();
+        assert_eq!((site.as_str(), secret.as_str()), ("0x-site", "0x-secret"));
+        for bad in [
+            "not json",
+            r#"{"FLEET_TURNSTILE_SITE_KEY": "0x-site"}"#,
+            r#"{"FLEET_TURNSTILE_SITE_KEY": "0x-site", "FLEET_TURNSTILE_SECRET": " "}"#,
+            r#"{"FLEET_TURNSTILE_SITE_KEY": 1, "FLEET_TURNSTILE_SECRET": "0x-secret"}"#,
+        ] {
+            let e = parse_secret(bad).unwrap_err();
+            assert!(!format!("{e:#}").contains("0x-secret"), "{e:#}");
+        }
+    }
 
     #[tokio::test]
     async fn siteverify_posts_the_secret_token_and_address() {
