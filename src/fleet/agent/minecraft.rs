@@ -191,10 +191,7 @@ pub fn restore_argv(
     a.extend(network_args(prefix, place));
     // A port a restore can bind: given here, not in the gold snapshot, so every server shares it.
     if let Some(p) = place.tls_port {
-        a.extend(s(&[
-            "--publish",
-            &format!("{publish_ip}:{p}:{}", super::tls::PORT),
-        ]));
+        a.extend(super::vm::tls_publish_args(publish_ip, p));
     }
     a.extend(s(&["--on-restore", RESTORE_HOOK]));
     a

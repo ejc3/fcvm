@@ -72,7 +72,7 @@ wpx=$!
 t0=$(ms)
 RUST_LOG=info setsid \
   fcvm podman run --name warm-phone --kernel-profile phone --gpu "$G" --publish 127.0.0.1:20097:8080 \
-  --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20096:443 \
+  --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20096:443 --publish-limit-per-source 32 \
   --privileged --cpu 6 --mem 6144 --portable-volumes --map "$AOSP":/android:ro --map "$EMU":/emu:ro \
   --map "$WORK":/work:ro --env PHONE_APK=/work/"$APKN" --forward-localhost 3128 --env PHONE_BROWSER_APK=/work/"$BRN" \
   --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 \
@@ -100,7 +100,7 @@ kill -TERM $wp; wait $wp
 before=$(wc -l < "$LOG")
 click=$(ms)
 RUST_LOG=info setsid fcvm snapshot run --snapshot "$TAG" --name warm-phone-clone --gpu "$G2" \
-  --publish 127.0.0.1:20095:8080 --ipv6-prefix "$P" --ipv6-address "$A2" --publish 127.0.0.1:20094:443 \
+  --publish 127.0.0.1:20095:8080 --ipv6-prefix "$P" --ipv6-address "$A2" --publish 127.0.0.1:20094:443 --publish-limit-per-source 32 \
   --map "$TLS_DIR":/run/fleet-tls:ro >> "$LOG" 2>&1 < /dev/null &
 cp=$!
 posted=0 ok=0

@@ -1079,6 +1079,7 @@ fn snapshot_restore_args(
         } else {
             args.publish.clone()
         },
+        publish_limit_per_source: args.publish_limit_per_source,
         map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
@@ -2288,7 +2289,10 @@ async fn prepare_vm_for_lifecycle(
             NetworkMode::Routed => {
                 let mut net =
                     RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                        .with_ipv6_address(args.ipv6_address);
+                        .with_ipv6_address(args.ipv6_address)
+                        .with_publish_limit_per_source(
+                            args.publish_limit_per_source.map(|n| n as usize),
+                        );
                 if let Some(ref prefix) = args.ipv6_prefix {
                     net = net.with_ipv6_prefix(prefix.clone());
                 }
@@ -4422,6 +4426,7 @@ mod tests {
             env: vec![],
             cmd: None,
             publish: vec![],
+            publish_limit_per_source: None,
             balloon: None,
             free_page_reporting: false,
             network: NetworkMode::Rootless,
@@ -4575,6 +4580,7 @@ mod tests {
         let mut args = test_args();
         args.publish = vec!["[::]:80:80".to_string(), "127.0.0.1:8443:443".to_string()];
         args.vsock_dir = Some("/run/vsock".to_string());
+        args.publish_limit_per_source = Some(32);
         let restore = snapshot_restore_args(
             &args,
             "0123456789ab",
@@ -4582,6 +4588,8 @@ mod tests {
             (Some("/opt/firecracker".to_string()), None),
         );
         assert_eq!(restore.publish, args.publish);
+        // and with this run's per-source cap, which no snapshot key holds.
+        assert_eq!(restore.publish_limit_per_source, Some(32));
 
         // A run that published nothing restores publishing nothing, whatever the
         // snapshot recorded, instead of inheriting the snapshot's mappings (#1024).

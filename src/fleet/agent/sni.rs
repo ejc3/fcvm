@@ -18,7 +18,15 @@
 //! A connection is refused (closed without a byte sent) when its first bytes are not a TLS
 //! ClientHello, when the hello names no server, when the name is not a `-v4` launch name, or
 //! when no place on this host reports its id.
+//!
+//! Every place sees the front's connections come from this host's own address, which the
+//! renderer counts only against its total (fleet/PROTOCOL.md, "Connection limits"), so the
+//! front counts them by their source (an IPv4 address) instead: connections still in their
+//! ClientHello ([`MAX_HELLO_PER_SOURCE`]), relayed to one place
+//! ([`MAX_RELAYED_PER_SOURCE_PLACE`]) and relayed in all ([`MAX_RELAYED_PER_SOURCE`]). One
+//! past a cap is closed without a byte sent, and before the place is dialled.
 
+use crate::network::source_limit::{Counts, Held, Source};
 use anyhow::{bail, Context, Result};
 use fleet_core::protocol::AgentMsg;
 use std::collections::HashMap;
@@ -40,6 +48,36 @@ pub const MAX_HELLO: usize = 16 * 1024;
 /// `LimitNOFILE` is 65536), and the agent needs descriptors of its own to run its places;
 /// connections past the cap are closed at once.
 pub const MAX_CONNECTIONS: usize = 8192;
+/// Connections from one source that have not finished their ClientHello. A wall page opens a
+/// socket to each place of this host it shows at once (up to 8 GPU slots and the aggregator),
+/// and the address-family probe one more; 32 is that for about three viewers behind one
+/// address joining in the same round trip. One client then needs 256 sources to hold all
+/// [`MAX_CONNECTIONS`] idle.
+pub const MAX_HELLO_PER_SOURCE: usize = 32;
+/// Connections from one source relayed to one place at once, as the EC2 tile's nginx allows a
+/// source on its one renderer (`fleet/ami/tile/nginx-renderer.conf`): a page holds at most 3
+/// sockets to one place (its stream, the address-family probe's, and across a reload the old
+/// page's stream until it closes), so 32 is about ten viewers behind one address, and one
+/// client needs 16 sources to hold all 512 of a renderer's pending places.
+pub const MAX_RELAYED_PER_SOURCE_PLACE: usize = 32;
+/// Connections from one source relayed at once, to all of this host's places together:
+/// [`MAX_CONNECTIONS`] / 32, so one client needs 32 sources to fill the front. Eight viewers
+/// behind one address, each with 3 sockets to each of 9 places, hold 216.
+pub const MAX_RELAYED_PER_SOURCE: usize = 256;
+
+/// The front's per-source caps (tests use smaller ones).
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    hello_per_source: usize,
+    relayed_per_source_place: usize,
+    relayed_per_source: usize,
+}
+
+const LIMITS: Limits = Limits {
+    hello_per_source: MAX_HELLO_PER_SOURCE,
+    relayed_per_source_place: MAX_RELAYED_PER_SOURCE_PLACE,
+    relayed_per_source: MAX_RELAYED_PER_SOURCE,
+};
 
 /// What the first bytes of a connection say.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +219,13 @@ pub struct Front {
     aggregate_id: Option<String>,
     /// Each place's listener port, by the id it last reported.
     routes: Mutex<HashMap<String, u16>>,
+    limits: Limits,
+    /// Connections in their ClientHello, by source.
+    hellos: Arc<Counts<Source>>,
+    /// Connections relayed, by source.
+    relayed: Arc<Counts<Source>>,
+    /// Connections relayed, by source and place id.
+    relayed_to_place: Arc<Counts<(Source, String)>>,
 }
 
 impl Front {
@@ -190,6 +235,15 @@ impl Front {
         public_port: u16,
         aggregate_id: Option<String>,
     ) -> Result<Arc<Front>> {
+        Front::bind_limited(listen, public_port, aggregate_id, LIMITS).await
+    }
+
+    async fn bind_limited(
+        listen: SocketAddr,
+        public_port: u16,
+        aggregate_id: Option<String>,
+        limits: Limits,
+    ) -> Result<Arc<Front>> {
         let listener = TcpListener::bind(listen)
             .await
             .with_context(|| format!("binding the IPv4 front on {listen}"))?;
@@ -198,6 +252,10 @@ impl Front {
             public_port,
             aggregate_id,
             routes: Mutex::new(HashMap::new()),
+            limits,
+            hellos: Counts::new(),
+            relayed: Counts::new(),
+            relayed_to_place: Counts::new(),
         });
         tokio::spawn(front.clone().accept(listener));
         tracing::info!(listen = %front.listen, public_port, "IPv4 front listening");
@@ -279,7 +337,7 @@ impl Front {
     async fn accept(self: Arc<Self>, listener: TcpListener) {
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
-            let (sock, _) = match listener.accept().await {
+            let (sock, peer) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
                     // Out of descriptors, mostly: wait for some to close.
@@ -291,10 +349,17 @@ impl Front {
             let Ok(slot) = slots.clone().try_acquire_owned() else {
                 continue; // dropping `sock` closes it
             };
+            // Taken here, in accept order, so a source's connections past the cap are the
+            // ones refused; given back once the hello is read or the connection ends.
+            let source = Source::of(peer.ip());
+            let Some(hello) = self.hellos.take(source, self.limits.hello_per_source) else {
+                tracing::debug!(%peer, "IPv4 front: refused, its source has as many connections in their ClientHello as it may");
+                continue;
+            };
             let front = self.clone();
             tokio::spawn(async move {
                 let _slot = slot;
-                if let Err(e) = front.relay(sock).await {
+                if let Err(e) = front.relay(sock, source, hello).await {
                     tracing::debug!(error = %format!("{e:#}"), "IPv4 front: connection refused or ended");
                 }
             });
@@ -303,7 +368,12 @@ impl Front {
 
     /// Relay one connection to its place: the ClientHello, then both directions until both
     /// ends close.
-    async fn relay(&self, mut client: TcpStream) -> Result<()> {
+    async fn relay(
+        &self,
+        mut client: TcpStream,
+        source: Source,
+        hello: Held<Source>,
+    ) -> Result<()> {
         client.set_nodelay(true)?;
         // The place's listener is on the address the viewer reached (the host's private
         // address behind its public one), as a viewer connecting to its port directly would.
@@ -312,9 +382,19 @@ impl Front {
         let name = tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut client, &mut buf))
             .await
             .context("no ClientHello in time")??;
+        drop(hello);
         let port = self
             .backend(&name)
             .with_context(|| format!("no place here for server name {name:?}"))?;
+        let id = place_of(&name).unwrap_or_default().to_string();
+        let _relayed = self
+            .relayed
+            .take(source, self.limits.relayed_per_source)
+            .context("its source has as many connections relayed as it may")?;
+        let _to_place = self
+            .relayed_to_place
+            .take((source, id), self.limits.relayed_per_source_place)
+            .context("its source has as many connections relayed to this place as it may")?;
         let mut place = tokio::time::timeout(
             BACKEND_TIMEOUT,
             TcpStream::connect(SocketAddr::new(local.ip(), port)),
@@ -654,5 +734,190 @@ mod tests {
         let mut back = Vec::new();
         c.read_to_end(&mut back).await.unwrap();
         assert_eq!(back, b"from the place");
+    }
+
+    /// A place's listener that reads each connection's ClientHello, answers one byte and holds
+    /// the connection until the client closes it; it counts the connections it accepted.
+    async fn holding_place() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !matches!(parse_hello(&buf), Hello::Name(_)) {
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    if s.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                    while matches!(s.read(&mut chunk).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A connection to `front` from `source` (any loopback address).
+    async fn connect_from(front: &Front, source: &str) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+        socket.connect(front.local_addr()).await.unwrap()
+    }
+
+    /// Whether the front closed `c` without a byte: true when it did, false when the
+    /// connection is still open after a while.
+    async fn closed_without_a_byte(c: &mut TcpStream) -> bool {
+        let mut b = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(500), c.read(&mut b)).await {
+            Err(_) => false,
+            Ok(Ok(0)) | Ok(Err(_)) => true,
+            Ok(Ok(n)) => panic!("the front sent {n} bytes"),
+        }
+    }
+
+    /// Send `id`'s ClientHello from `source` and say whether the place answered (the
+    /// connection was relayed) or the front closed it without a byte.
+    async fn ask(front: &Front, source: &str, id: &str) -> (bool, TcpStream) {
+        let mut c = connect_from(front, source).await;
+        c.write_all(&client_hello(&format!("{id}-abcdefgh-v4.fcvm.dev")))
+            .await
+            .unwrap();
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut b))
+            .await
+            .expect("neither relayed nor refused")
+            .unwrap_or(0);
+        (n == 1, c)
+    }
+
+    /// Wait until every count the front holds is given back.
+    async fn wait_until_nothing_is_held(front: &Front) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while front.hellos.keys() + front.relayed.keys() + front.relayed_to_place.keys() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the front still holds counts: {} in hello, {} relayed, {} to a place",
+                front.hellos.keys(),
+                front.relayed.keys(),
+                front.relayed_to_place.keys()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// One source holds at most its cap of connections that have sent no whole ClientHello;
+    /// the next is closed without a byte, another source still gets through, and a connection
+    /// that finishes its hello gives its place back.
+    #[tokio::test]
+    async fn a_source_holds_at_most_its_cap_of_connections_in_their_hello() {
+        let limits = Limits {
+            hello_per_source: 2,
+            relayed_per_source_place: 8,
+            relayed_per_source: 8,
+        };
+        let front = Front::bind_limited("127.0.0.1:0".parse().unwrap(), 443, None, limits)
+            .await
+            .unwrap();
+        let (port, _) = holding_place().await;
+        front.publish(report("slot-1", Some(port)));
+        let mut idle = Vec::new();
+        for _ in 0..2 {
+            idle.push(connect_from(&front, "127.0.0.1").await);
+        }
+        let mut third = connect_from(&front, "127.0.0.1").await;
+        assert!(
+            closed_without_a_byte(&mut third).await,
+            "a third idle connection from one source was not refused"
+        );
+        for c in idle.iter_mut() {
+            assert!(
+                !closed_without_a_byte(c).await,
+                "an idle connection within the cap was closed"
+            );
+        }
+        let (relayed, other) = ask(&front, "127.0.0.2", "slot-1").await;
+        assert!(relayed, "another source was refused");
+        // One idle connection sends its hello and is relayed: its hello place is free again.
+        idle[0].write_all(&client_hello(NAME_SLOT_1)).await.unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(idle[0].read(&mut b).await.unwrap(), 1);
+        let mut next = connect_from(&front, "127.0.0.1").await;
+        assert!(!closed_without_a_byte(&mut next).await);
+        drop((idle, next, other));
+        wait_until_nothing_is_held(&front).await;
+    }
+
+    const NAME_SLOT_1: &str = "slot-1-abcdefgh-v4.fcvm.dev";
+
+    /// One source has at most its cap of connections relayed to one place and its cap in all;
+    /// one past either is closed without a byte and never reaches the place, another source is
+    /// still relayed, and a closed connection gives its places back.
+    #[tokio::test]
+    async fn a_source_is_relayed_at_most_its_caps_to_a_place_and_in_all() {
+        let limits = Limits {
+            hello_per_source: 8,
+            relayed_per_source_place: 2,
+            relayed_per_source: 3,
+        };
+        let front = Front::bind_limited("127.0.0.1:0".parse().unwrap(), 443, None, limits)
+            .await
+            .unwrap();
+        let mut places = HashMap::new();
+        for id in ["slot-1", "slot-2", "slot-3"] {
+            let (port, accepted) = holding_place().await;
+            front.publish(report(id, Some(port)));
+            places.insert(id, accepted);
+        }
+        let accepted = |id: &str| places[id].load(std::sync::atomic::Ordering::SeqCst);
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (relayed, c) = ask(&front, "127.0.0.1", "slot-1").await;
+            assert!(relayed, "a connection within the per-place cap was refused");
+            held.push(c);
+        }
+        assert!(
+            !ask(&front, "127.0.0.1", "slot-1").await.0,
+            "a third connection from one source to one place was relayed"
+        );
+        let (relayed, c) = ask(&front, "127.0.0.1", "slot-2").await;
+        assert!(relayed, "a connection to another place was refused");
+        held.push(c);
+        assert!(
+            !ask(&front, "127.0.0.1", "slot-3").await.0,
+            "a fourth connection from one source was relayed"
+        );
+        let (relayed, c) = ask(&front, "127.0.0.2", "slot-1").await;
+        assert!(relayed, "another source was refused");
+        held.push(c);
+        assert_eq!(
+            (accepted("slot-1"), accepted("slot-2"), accepted("slot-3")),
+            (3, 1, 0),
+            "a refused connection reached its place"
+        );
+        // A closed connection gives back both of its places once the front has seen it end.
+        drop(held.remove(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let again = loop {
+            let (relayed, c) = ask(&front, "127.0.0.1", "slot-3").await;
+            if relayed {
+                break c;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a closed connection kept its place"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        drop((held, again));
+        wait_until_nothing_is_held(&front).await;
     }
 }

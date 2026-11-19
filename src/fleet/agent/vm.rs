@@ -34,6 +34,22 @@ pub struct VmSpec {
     pub clone_of: Option<String>,
 }
 
+/// A place's TLS port (443 in the VM) published on the host's `port`, with fcvm's per-source
+/// cap on its relay (`--publish-limit-per-source`). IPv4 viewers reach this port through the
+/// agent's IPv4 front, from the host's own address, which fcvm does not count. A client that
+/// connects to the port directly (the security group admits the per-place range until no host
+/// runs an image without the front) reaches the renderer as the relay's address, which the
+/// renderer does not count by source, so fcvm gives it the cap the front gives a source on
+/// one place.
+pub fn tls_publish_args(publish_ip: &str, port: u16) -> [String; 4] {
+    [
+        "--publish".into(),
+        format!("{publish_ip}:{port}:{}", super::tls::PORT),
+        "--publish-limit-per-source".into(),
+        super::sni::MAX_RELAYED_PER_SOURCE_PLACE.to_string(),
+    ]
+}
+
 impl VmSpec {
     /// A slot's VM: its renderer published on `port` (HTTP, guest 8080) and `tls_port` (TLS,
     /// guest 443) at `publish_ip`, routed at `ipv6` when the host has a prefix.
@@ -57,8 +73,7 @@ impl VmSpec {
             None => Vec::new(),
         };
         if let Some(p) = tls_port {
-            extra_args.push("--publish".into());
-            extra_args.push(format!("{publish_ip}:{p}:443"));
+            extra_args.extend(tls_publish_args(publish_ip, p));
         }
         extra_args.extend(extra.iter().cloned());
         VmSpec {
@@ -171,8 +186,7 @@ impl VmSpec {
             ]);
         }
         if let Some(p) = tls_port {
-            extra_args.push("--publish".into());
-            extra_args.push(format!("{publish_ip}:{p}:443"));
+            extra_args.extend(tls_publish_args(publish_ip, p));
         }
         // a clone takes this host's read-only maps (the certificate); everything else, the
         // environment included, is the snapshot's
@@ -847,6 +861,8 @@ mod tests {
                 "2001:db8:1:2::5",
                 "--publish",
                 "127.0.0.1:20202:443",
+                "--publish-limit-per-source",
+                "32",
                 "--map",
                 "/etc/fleet-tls:/run/fleet-tls:ro",
             ]

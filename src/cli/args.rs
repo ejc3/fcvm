@@ -1152,6 +1152,16 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 
+    /// Routed networking: refuse a client of a published port, by closing it without a byte,
+    /// while its source holds N connections on this VM's published ports. A source is an
+    /// IPv4 address or an IPv6 /64. Loopback, private (10/8, 172.16/12, 192.168/16,
+    /// 100.64/10, fc00::/7) and link-local sources are not counted: they are this host's
+    /// own relays. The guest sees every relayed client come from the relay, so it cannot
+    /// count them itself. Not part of any snapshot key. The other network modes, which do
+    /// not relay published ports through fcvm, ignore it.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub publish_limit_per_source: Option<u32>,
+
     /// Balloon device target MiB. If not specified, no balloon device is configured.
     /// Whether a device exists is part of the snapshot key and the target is not:
     /// a run restored from a snapshot has its own target set before the guest resumes.
@@ -1656,6 +1666,16 @@ pub struct SnapshotRunArgs {
     /// pasta forward. `none` cannot be combined with another spec.
     #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
     pub publish: Vec<String>,
+
+    /// Routed networking: refuse a client of a published port, by closing it without a byte,
+    /// while its source holds N connections on the clone's published ports. A source is an
+    /// IPv4 address or an IPv6 /64. Loopback, private (10/8, 172.16/12, 192.168/16,
+    /// 100.64/10, fc00::/7) and link-local sources are not counted: they are this host's
+    /// own relays. The guest sees every relayed client come from the relay, so it cannot
+    /// count them itself. Not part of any snapshot key. The other network modes, which do
+    /// not relay published ports through fcvm, ignore it.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub publish_limit_per_source: Option<u32>,
 
     /// Serve a directory the snapshot mapped read-only from this host directory instead of
     /// the one it recorded. Grammar: HOST:GUEST:ro, as for `podman run --map`, repeated.
@@ -2417,6 +2437,41 @@ mod tests {
             vec!["[::]:80:80", "[::]:443:443", "127.0.0.1:8080:80/tcp"]
         );
         assert!(parse_snapshot_run(&[]).publish.is_empty());
+    }
+
+    /// `--publish-limit-per-source` on both commands that publish, and never 0, which would
+    /// refuse every client.
+    #[test]
+    fn publish_limit_per_source_parses_on_run_and_snapshot_run() {
+        let run = parse_run(&["--publish-limit-per-source", "32", "nginx:alpine"]);
+        assert_eq!(run.publish_limit_per_source, Some(32));
+        assert_eq!(parse_run(&["nginx:alpine"]).publish_limit_per_source, None);
+        let clone = parse_snapshot_run(&["--publish-limit-per-source", "32"]);
+        assert_eq!(clone.publish_limit_per_source, Some(32));
+        assert_eq!(parse_snapshot_run(&[]).publish_limit_per_source, None);
+        for argv in [
+            &[
+                "fcvm",
+                "podman",
+                "run",
+                "--name",
+                "t",
+                "--publish-limit-per-source",
+                "0",
+                "x",
+            ][..],
+            &[
+                "fcvm",
+                "snapshot",
+                "run",
+                "--snapshot",
+                "g",
+                "--publish-limit-per-source",
+                "0",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 
     /// #1079: `snapshot run` takes the prefix a routed clone's address is derived from.

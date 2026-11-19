@@ -533,6 +533,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)
 --ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE; also read from FCVM_IPV6_PREFIX)
 --ipv6-address <ADDR>   Routed mode only: the VM's address, inside the prefix in use, instead of a derived one
+--publish-limit-per-source <N>  Routed mode only: close a published port's client, without a byte, while its source (IPv4 address or IPv6 /64) holds N connections on the VM's published ports; the host's loopback, private and link-local sources are not counted (also `snapshot run`)
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """The EC2 tile's nginx site (tile/nginx-renderer.conf), run by a real nginx: it passes the
 routes something outside the instance uses to the renderer and answers 404 to every other
-path without reaching it. Needs nginx and openssl on PATH (or nginx at /usr/sbin/nginx)."""
+path without reaching it, and holds each source to its share of requests in progress. Needs nginx
+and openssl on PATH (or nginx at /usr/sbin/nginx)."""
 import http.server
 from pathlib import Path
+import re
 import shutil
 import socket
 import socketserver
@@ -38,6 +40,15 @@ def upstream(path, seen, headers):
         def handle_one(self):
             seen.append((self.command, self.path))
             headers.append({k.lower(): v for k, v in self.headers.items()})
+            if self.headers.get("Upgrade", "").lower() == "websocket":
+                # A frame socket: switch protocols and stream until nginx closes its end.
+                self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                                 b"Connection: Upgrade\r\n\r\n")
+                self.wfile.flush()
+                while self.rfile.read(1):
+                    pass
+                self.close_connection = True
+                return
             body = b"renderer"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -76,7 +87,9 @@ class TileNginxTests(unittest.TestCase):
                          ("http://127.0.0.1:8080", f"http://unix:{self.tmp}/up.sock:")):
             self.assertIn(old, site)
             site = site.replace(old, new)
-        temp = "".join(f"{k}_temp_path {self.tmp}/{k};\n" for k in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"))
+        # The source of a connection on the front socket is the X-Test-Source header's address
+        # (test-only, set_real_ip_from), so the test can connect from any IPv4 address or /64.
+        temp = "set_real_ip_from unix:;\nreal_ip_header X-Test-Source;\n" + "".join(f"{k}_temp_path {self.tmp}/{k};\n" for k in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"))
         (self.tmp / "nginx.conf").write_text(
             f"pid {self.tmp}/nginx.pid;\nerror_log {self.tmp}/error.log;\ndaemon off;\nevents {{}}\n"
             f"http {{\naccess_log off;\n{temp}{site}\n}}\n")
@@ -111,6 +124,55 @@ class TileNginxTests(unittest.TestCase):
             while b"\r\n" not in reply and (chunk := s.recv(65536)):
                 reply += chunk
         return int(reply.split(b" ", 2)[1])
+
+    def open_frames(self, source):
+        """Open a frame socket from `source` and keep it: the status (101 when the renderer took
+        it) and the socket, or None and no socket when nginx closed it without a response."""
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        raw.settimeout(10)
+        raw.connect(str(self.tmp / "front.sock"))
+        s = self.tls.wrap_socket(raw, server_hostname="tile.test")
+        s.sendall(f"GET /frames?h=180 HTTP/1.1\r\nHost: tile.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                  f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+                  f"X-Test-Source: {source}\r\n\r\n".encode())
+        reply = b""
+        try:
+            while b"\r\n" not in reply and (chunk := s.recv(65536)):
+                reply += chunk
+        except (ssl.SSLEOFError, ConnectionResetError):
+            pass
+        if not reply:
+            s.close()
+            return None, None
+        self.held.append(s)
+        return int(reply.split(b" ", 2)[1]), s
+
+    def test_one_source_holds_at_most_the_limit_and_others_still_connect(self):
+        found = re.search(r"limit_conn fleet_source (\d+);", SITE.read_text())
+        self.assertIsNotNone(found, "the site sets no per-source limit")
+        limit = int(found.group(1))
+        self.held = []
+        try:
+            # An IPv4 address, and an IPv6 /64 whose connections come from different addresses in it.
+            for name, source, same, other in (
+                    ("ipv4", lambda i: "192.0.2.1", "192.0.2.1", "192.0.2.2"),
+                    ("ipv6", lambda i: f"2001:db8:1:2::{i + 1:x}", "2001:db8:1:2:ffff::1", "2001:db8:1:3::1")):
+                with self.subTest(family=name):
+                    for i in range(limit):
+                        self.assertEqual(self.open_frames(source(i))[0], 101, f"connection {i + 1} of {limit}")
+                    self.assertEqual(self.open_frames(same), (None, None),
+                                     f"connection {limit + 1} from one source was not refused")
+                    self.assertEqual(self.open_frames(other)[0], 101, "another source was refused")
+            # A closed socket gives its place back: the source connects again once nginx has seen
+            # the close (it ends the request when it reads the end of the tunnel).
+            self.held.pop(0).close()
+            deadline = time.monotonic() + 5
+            while (status := self.open_frames("192.0.2.1")[0]) is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(status, 101, "a closed socket did not give its place back")
+        finally:
+            for s in self.held:
+                s.close()
 
     def test_the_routes_outside_clients_use_reach_the_renderer(self):
         for method, target in PASSED:

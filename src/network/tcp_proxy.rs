@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::source_limit::{is_relay_address, Counts, Source};
 use super::PortMapping;
 
 /// Port the proxy relay binds on inside the VM's network namespace.
@@ -119,6 +120,31 @@ pub fn relay_limit(connections: usize) -> RelayLimit {
     Arc::new(tokio::sync::Semaphore::new(connections))
 }
 
+/// A cap on the connections one source may hold in a set of relays
+/// (`--publish-limit-per-source`). The guest's server sees every relayed client come from
+/// the namespace's side of the relay, so it cannot count them by source itself.
+#[derive(Clone)]
+pub struct SourceCap {
+    counts: Arc<Counts<Source>>,
+    per_source: usize,
+    /// Sources the cap leaves alone.
+    exempt: fn(IpAddr) -> bool,
+}
+
+impl SourceCap {
+    /// At most `per_source` connections from one source (an IPv4 address or an IPv6 /64),
+    /// for every source but this host's own relays and readers (`is_relay_address`): the
+    /// fleet agent's IPv4 front and the agent itself connect from the host's addresses for
+    /// many viewers each.
+    pub fn new(per_source: usize) -> SourceCap {
+        SourceCap {
+            counts: Counts::new(),
+            per_source,
+            exempt: is_relay_address,
+        }
+    }
+}
+
 /// Accept connections on `listener` and relay each to an upstream via `connect`, with a
 /// limit of its own ([`RELAY_CONNECTION_LIMIT`]).
 fn spawn_relay_loop<F, Fut>(
@@ -133,6 +159,7 @@ where
     spawn_limited_relay_loop(
         listener,
         relay_limit(RELAY_CONNECTION_LIMIT),
+        None,
         connect,
         label,
     )
@@ -150,9 +177,14 @@ where
 /// client holds no permit, and at the limit each relay holds at most one waiting client.
 /// The dial is bounded by the kernel's SYN retries (`net.ipv4.tcp_syn_retries`, 6 by
 /// default: about 127 s), and a stopped relay ends a dial in progress with its task.
+///
+/// With `sources`, a client whose source already holds its cap is closed at once, without a
+/// byte and before a permit is taken or the upstream dialled. A relayed connection's place
+/// under the cap is given back when its task ends, on every path.
 fn spawn_limited_relay_loop<F, Fut>(
     listener: tokio::net::TcpListener,
     limit: RelayLimit,
+    sources: Option<SourceCap>,
     connect: F,
     label: &'static str,
 ) -> Relay
@@ -188,6 +220,18 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
+            };
+            let source_place = match &sources {
+                Some(cap) if !(cap.exempt)(peer.ip()) => {
+                    match cap.counts.take(Source::of(peer.ip()), cap.per_source) {
+                        Some(place) => Some(place),
+                        None => {
+                            debug!(%peer, per_source = cap.per_source, "{label} relay: refused, its source holds as many connections as it may");
+                            continue; // dropping `client` closes it
+                        }
+                    }
+                }
+                _ => None,
             };
             // The permit is taken after the accept, so a relay that waits for a client
             // holds none: the limit counts connections, not listeners. At the limit
@@ -226,6 +270,7 @@ where
             let connect = Arc::clone(&connect);
             connections.spawn(async move {
                 let _permit = permit;
+                let _source_place = source_place;
                 match connect().await {
                     Ok(mut upstream) => {
                         let mut client = client;
@@ -429,7 +474,8 @@ pub fn bind_port_forwards(
 }
 
 /// Start port forwarding on `listeners` (`bind_port_forwards` of the same `mappings`):
-/// relay each connection to the guest inside the namespace.
+/// relay each connection to the guest inside the namespace. With `per_source`, each source
+/// holds at most that many connections across the VM's published ports (`SourceCap`).
 ///
 /// Each relay accepts on a duplicate of its listener, so `listeners` still holds every
 /// socket when the relays stop (`PortListeners`). Returns a `Relay` per port mapping, for
@@ -439,6 +485,7 @@ pub fn start_port_forwards(
     mappings: &[PortMapping],
     ns_name: &str,
     guest_ip: &str,
+    per_source: Option<usize>,
 ) -> Result<Vec<Relay>> {
     anyhow::ensure!(
         listeners.listeners.len() == mappings.len(),
@@ -465,6 +512,8 @@ pub fn start_port_forwards(
     // relayed connections and pending guest dials however many ports it publishes. A
     // mapping with a HOSTIP can be reachable from other machines (`--publish [::]:80:80`).
     let limit = relay_limit(RELAY_CONNECTION_LIMIT);
+    // And one count of each source's connections, for the same reason.
+    let sources = per_source.map(SourceCap::new);
 
     Ok(accepting
         .into_iter()
@@ -475,6 +524,7 @@ pub fn start_port_forwards(
             spawn_limited_relay_loop(
                 listener,
                 Arc::clone(&limit),
+                sources.clone(),
                 move || {
                     let ns = Arc::clone(&ns_name);
                     async move { connect_in_namespace(&ns, guest_addr).await }
@@ -824,6 +874,7 @@ mod tests {
         let relay = spawn_limited_relay_loop(
             listener,
             relay_limit(2),
+            None,
             move || {
                 let counter = Arc::clone(&counter);
                 async move {
@@ -865,6 +916,7 @@ mod tests {
             relays.push(spawn_limited_relay_loop(
                 listener,
                 Arc::clone(&limit),
+                None,
                 move || {
                     let counter = Arc::clone(&counter);
                     async move {
@@ -898,6 +950,126 @@ mod tests {
         stop_relays(relays).await;
     }
 
+    /// An upstream that accepts every connection, counts it, and closes it when its client's
+    /// end closes.
+    async fn closing_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = upstream.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut b = [0u8; 64];
+                    while matches!(s.read(&mut b).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    async fn connect_from(source: &str, to: SocketAddr) -> tokio::net::TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// Whether the relay closed `c` without sending a byte (false: still open after a while).
+    async fn closed_without_a_byte(c: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_millis(300), c.read(&mut b)).await {
+            Err(_) => false,
+            Ok(Ok(0)) | Ok(Err(_)) => true,
+            Ok(Ok(n)) => panic!("the relay sent {n} bytes"),
+        }
+    }
+
+    /// With a per-source cap, one source holds at most the cap: the next of its clients is
+    /// closed without a byte and its upstream never dialled, another source is still relayed,
+    /// and a closed connection gives its place back.
+    #[tokio::test]
+    async fn a_source_holds_at_most_its_cap_of_a_relays_connections() {
+        let (upstream_addr, dialled) = closing_upstream().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        // Every source counted, loopback included, so the test can be one.
+        let cap = SourceCap {
+            counts: Counts::new(),
+            per_source: 2,
+            exempt: |_| false,
+        };
+        let relay = spawn_limited_relay_loop(
+            listener,
+            relay_limit(16),
+            Some(cap.clone()),
+            move || async move { Ok(tokio::net::TcpStream::connect(upstream_addr).await?) },
+            "test",
+        );
+        let mut held = vec![
+            connect_from("127.0.0.1", relay_addr).await,
+            connect_from("127.0.0.1", relay_addr).await,
+        ];
+        settles_at(&dialled, 2).await;
+        let mut third = connect_from("127.0.0.1", relay_addr).await;
+        assert!(
+            closed_without_a_byte(&mut third).await,
+            "a third client of one source was not refused"
+        );
+        held.push(connect_from("127.0.0.2", relay_addr).await);
+        settles_at(&dialled, 3).await;
+        // Its place comes back once the relay has seen the connection end on both sides.
+        drop(held.remove(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut c = connect_from("127.0.0.1", relay_addr).await;
+            if !closed_without_a_byte(&mut c).await {
+                held.push(c);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a closed connection kept its source's place"
+            );
+        }
+        settles_at(&dialled, 4).await;
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cap.counts.keys() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ended connections kept their places"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stop_relays([relay]).await;
+    }
+
+    /// The published ports' cap leaves this host's own addresses alone: the fleet agent's
+    /// IPv4 front connects from them for many viewers.
+    #[tokio::test]
+    async fn the_published_ports_cap_does_not_count_the_hosts_own_addresses() {
+        let (upstream_addr, dialled) = closing_upstream().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let relay = spawn_limited_relay_loop(
+            listener,
+            relay_limit(16),
+            Some(SourceCap::new(1)),
+            move || async move { Ok(tokio::net::TcpStream::connect(upstream_addr).await?) },
+            "test",
+        );
+        let _held = [
+            connect_from("127.0.0.1", relay_addr).await,
+            connect_from("127.0.0.1", relay_addr).await,
+            connect_from("127.0.0.1", relay_addr).await,
+        ];
+        settles_at(&dialled, 3).await;
+        stop_relays([relay]).await;
+    }
+
     /// A dial of the upstream that has not finished holds its place under the limit,
     /// and stopping the relay ends it.
     #[tokio::test]
@@ -917,6 +1089,7 @@ mod tests {
         let relay = spawn_limited_relay_loop(
             listener,
             relay_limit(1),
+            None,
             move || {
                 let counter = Arc::clone(&counter);
                 let guard = Dropped(Arc::clone(&flag));
@@ -1546,7 +1719,8 @@ mod tests {
             bind_port_forwards(&loopback.to_string(), &first_mappings, Default::default()).unwrap();
         let first_inode = socket_inode(&first[0]);
         let dropped_addr = first[1].local_addr().unwrap();
-        let relays = start_port_forwards(&first, &first_mappings, "unused", "10.0.2.100").unwrap();
+        let relays =
+            start_port_forwards(&first, &first_mappings, "unused", "10.0.2.100", None).unwrap();
         stop_relays(relays).await;
 
         // The gap: no relay accepts, and the socket still listens.
@@ -1904,7 +2078,7 @@ mod tests {
 
         let mappings = [mapping];
         let listeners = bind_port_forwards("127.0.0.1", &mappings, Default::default())?;
-        let handles = start_port_forwards(&listeners, &mappings, &ns_name, "127.0.0.1")?;
+        let handles = start_port_forwards(&listeners, &mappings, &ns_name, "127.0.0.1", None)?;
 
         // Give the listener a moment to start accepting
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

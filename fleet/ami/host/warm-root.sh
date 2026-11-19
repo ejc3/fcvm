@@ -47,7 +47,7 @@ launch() {
   local t0; t0=$(date +%s%N)
   RUST_LOG=info setsid "${trace[@]}" \
     fcvm podman run --name warm-root --kernel-profile gpu --gpu "$G" --publish 127.0.0.1:20099:8080 \
-    --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20098:443 \
+    --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20098:443 --publish-limit-per-source 32 \
     --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 "$IMG" \
     > "$LOG.${1:-launch}" 2>&1 < /dev/null &
   local wp=$! ok=0
