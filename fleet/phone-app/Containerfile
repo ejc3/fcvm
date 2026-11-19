@@ -7,16 +7,23 @@
 FROM docker.io/library/ubuntu:24.04
 # apt's Acquire::http::Timeout counts only time without data, so a connection that keeps
 # trickling never trips it: in run 44504825691 one archive.ubuntu.com address served the JDK at
-# 65 kB/s for 11 minutes while other runs fetched the same 133 MB in 2 to 49 s. Each attempt at
-# the downloads therefore has a wall-clock bound, and an attempt that runs out is retried on a
-# new connection; apt resumes its partial downloads. Installing reads only the downloaded files.
+# 65 kB/s for 11 minutes while other runs fetched the same 133 MB in 2 to 49 s. So the index
+# update and the package downloads each get a wall-clock bound per attempt and up to three
+# attempts, each on a new connection. The downloads retry without another update: the image's
+# docker-clean hook deletes downloaded and partial .debs after every update, and without it a
+# retry fetches only what the previous attempt did not. Installing reads only the downloaded files.
 RUN apt="apt-get -q -o Acquire::http::Timeout=30 -o Acquire::Retries=3" \
     pkgs="openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools"; \
-    for attempt in 1 2 3; do \
-      timeout 60 $apt update && timeout 120 $apt install -y --no-install-recommends --download-only $pkgs && break; \
-      [ "$attempt" -lt 3 ] || { echo "apt: the package downloads failed 3 times (60 s for update, 120 s for the packages, each attempt)" >&2; exit 1; }; \
-      echo "apt: attempt $attempt failed or ran out of time; retrying" >&2; \
-    done \
+    retry() { \
+      limit=$1 what=$2; shift 2; \
+      for attempt in 1 2 3; do \
+        timeout "$limit" "$@" && return 0; \
+        echo "apt: $what attempt $attempt of 3 failed or ran out of its $limit s" >&2; \
+      done; \
+      return 1; \
+    }; \
+    retry 60 update $apt update \
+    && retry 120 download $apt install -y --no-install-recommends --download-only $pkgs \
     && DEBIAN_FRONTEND=noninteractive $apt install -y --no-install-recommends $pkgs \
     && rm -rf /var/lib/apt/lists/*
 ARG GRADLE_VERSION=8.10.2

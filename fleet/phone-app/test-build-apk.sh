@@ -23,7 +23,7 @@ cat > "$dir/bin/java" <<'S'
 out=""; prev=""
 for a in "$@"; do [ "$prev" = --output ] || [ "$prev" = --out ] && out=$a; prev=$a; done
 # by the main class build-apk.sh names: the arguments also carry this test's mktemp paths,
-# which can contain "D8" (run 44508779070: /tmp/tmp.DD8w3flyPB)
+# which can contain "D8" (/tmp/tmp.xD8yzAbcde, say)
 case " $* " in
   *" com.android.tools.r8.D8 "*) echo "$RUN" > "$out/classes.dex" ;;
   *" com.android.apksigner.ApkSignerTool "*) sleep 0.5; echo "$RUN" > "$out" ;;
