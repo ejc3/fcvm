@@ -15,7 +15,8 @@
 //! Neither half assumes the fleet is awake only for viewers. The meter charges every instance
 //! the fleet runs, whatever keeps it up, and the trip overrides every reason to be awake: a
 //! viewer, a claim, a race, or any rule that keeps hosts up on a schedule. Such a rule must
-//! check [`resting`] and stand down while it holds, as `power_step` does.
+//! check [`resting`] and stand down while it holds, as `power_step` does and as the warm
+//! windows do (`crate::warm::holds`).
 
 use serde::{Deserialize, Serialize};
 

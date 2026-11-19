@@ -517,6 +517,15 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_SPEND_RATES", value_delimiter = ',')]
     pub spend_rates: Vec<String>,
 
+    /// Weekly UTC windows in which the fleet stays awake with no viewers, comma separated,
+    /// each `<Mon..Sun> HH:MM-HH:MM` (`Sat 17:00-23:00,Sun 17:00-21:00`; an end at or before
+    /// the start is on the next day). Inside one the fleet wakes at once and does not sleep for
+    /// want of viewers; the time is charged to --daily-spend-usd, and a spent budget still
+    /// sleeps it until 00:00 UTC. Needs a fleet that sleeps (--host-template or
+    /// --sleep-when-idle).
+    #[arg(long, env = "FLEET_WARM_HOURS", value_delimiter = ',')]
+    pub warm_hours: Vec<fleet_core::warm::Window>,
+
     /// Seconds a viewer watches an empty sky, after the last word has left it, before the
     /// wall writes a line of GPU history itself. 0 turns it off.
     #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]
