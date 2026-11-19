@@ -201,9 +201,9 @@ the same way: the connection stays as it was and may `verify` again with a new t
 passes it joins, as an arrival unless its first message carried a ticket or `returning`, and
 is admitted (a seat when one is free, else late). Two things count as verified without a
 token: a seat ticket this coordinator still holds (it was given to a connection that had
-passed; a ticket it does not hold proves nothing), and a request whose headers prove it (a
-valid Cloudflare Access JWT: the owner, and the fleet's CI and smokes through the
-Access-protected hostname). Seat tickets live in the coordinator's memory, so after a
+passed; a ticket it does not hold proves nothing), and a request carrying a Cloudflare Access
+JWT that verifies for one of `--access-aud` (the owner, and the fleet's CI and smokes through
+the Access-protected hostname). Seat tickets live in the coordinator's memory, so after a
 coordinator restart every page checks again. While the day's GPU budget holds the fleet
 asleep (`power.reason` `budget`) the page shows no check, since nothing a viewer does wakes it
 then. Without Turnstile (staging behind Access, local runs, tests) every connection is
@@ -252,8 +252,10 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 (its `Cf-Access-Jwt-Assertion` names a `common_name` and no `email`) is counted by its
 `x-fleet-viewer-ip` header instead: the staging page's Worker forwards every viewer's `/live`
 with one service token, and its subrequests all arrive with the Worker's own
-`CF-Connecting-IP`. The coordinator does not verify that JWT itself, so the switch belongs
-only behind a tunnel connector that requires Access (`access.required`), which does.
+`CF-Connecting-IP`. With `--access-team-domain` and `--access-aud` the coordinator verifies
+that JWT itself (signature, issuer, a `/live` audience, expiry) and honours the header only
+for a service token that verifies. Without them it reads the JWT unverified, so the switch
+belongs only behind a tunnel connector that requires Access (`access.required`), which does.
 An IPv6 address counts as its /64: every address of `2001:db8:1:2::/64` is one client, since one
 subscriber or instance is usually given a whole /64. An IPv4 address counts on its own, and an
 IPv4-mapped IPv6 address as its IPv4 address. Turnstile's siteverify still gets the full
@@ -684,6 +686,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--access-viewer-address]
                  [--turnstile-secret <secret> --turnstile-site-key <key> | --turnstile-secret-id <name or ARN>]
+                 [--access-team-domain <team>.cloudflareaccess.com [--access-aud <aud>]... [--agent-access-aud <aud>]...]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
@@ -952,6 +955,15 @@ restores what it can and releases what was bound to the old process:
   not start when it cannot read it. Production's is `fcvm-fleet/prod/turnstile`. With
   neither, verification is off. A siteverify call that fails (not a refusal) is logged at warn
   with `marker=turnstile-siteverify-error`.
+- `--access-team-domain` (also `FLEET_ACCESS_TEAM_DOMAIN`) makes the coordinator verify
+  Cloudflare Access tokens itself, with the keys the team publishes at
+  `https://<team domain>/cdn-cgi/access/certs` (kept an hour, read again early for a key id
+  it does not hold, at most every 10 s). `--access-aud` (also `FLEET_ACCESS_AUD`, comma
+  separated) lists the Access applications a `/live` token may be for: such a request is
+  verified for Turnstile, and with `--access-viewer-address` only a verified service token sets
+  the viewer address. `--agent-access-aud` (also `FLEET_AGENT_ACCESS_AUD`) lists the
+  applications an `/agent` token must be for (above). The team domain needs at least one of
+  the two.
 - `GET /healthz` answers `ok`.
 - `/live` refuses a cross-origin browser with `403`: a request whose `Origin` is neither
   the coordinator's own (`Origin` naming the request's `Host`) nor one given with
@@ -1373,7 +1385,16 @@ quarantines), so a coordinator that lost the host learns where each slot is with
 restart. A slot's report is replayed while the slot is assigned; a quarantine until the
 coordinator answers it with `quarantine_stored` (below). A reported generation above the
 coordinator's is adopted, so the next relaunch goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
-admits only the agents' service token there.
+admits only the agents' service token there. With `--agent-access-aud`, the coordinator also
+verifies that token itself (`Cf-Access-Jwt-Assertion`: the team's RS256 signature, issuer,
+one of those audiences, expiry, and a service token rather than a person) and answers `403`
+without it. With host templates (`--host-template`), the host a dialed agent's hello names
+must be one of this fleet's GPU hosts: an EC2 instance, pending or running, tagged
+`Purpose=fcvm-fleet-host` and `Fleet=<--fleet-name>` in a host region. Any other name
+(another fleet's instance, a terminated one, no instance), or a listing that fails, closes
+the connection before the hello is applied, and the agent dials again. Both refusals are
+logged at warn with `marker=fleet-agent-refused`. Agents started with `--agent-cmd` are not
+checked.
 
 When its input closes (`--stdio`), the agent tears down every VM it started and exits. If the agent
 is killed outright, each VM's fcvm gets SIGTERM from the kernel (the agent arms

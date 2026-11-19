@@ -7,7 +7,7 @@ use fcvm::fleet::aggregate::codec::Raw;
 use fcvm::fleet::aggregate::frame::Frame;
 use fcvm::fleet::coord::text_check::{FakeCheck, NoCheck, TextChecker, CHECK_FAILED, WORDS_OFF};
 use fcvm::fleet::coord::turnstile::{self, Verifier};
-use fcvm::fleet::coord::{admission, agents, ec2, live, poster, start, store, Handle};
+use fcvm::fleet::coord::{access_jwt, admission, agents, ec2, live, poster, start, store, Handle};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
 use fcvm::fleet::now_ms;
 use fleet_core::protocol::{AgentMsg, CoordMsg, SlotReport};
@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+
+#[path = "../src/fleet/coord/access_jwt_testing.rs"]
+mod access_testing;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -43,6 +46,10 @@ struct Opts {
     sockets: live::SocketCaps,
     /// The state store; none when absent.
     store: Option<store::StoreTx>,
+    /// Access tokens checked by the coordinator; trusted at the edge when absent.
+    access: Option<Arc<access_jwt::AccessCheck>>,
+    /// The check on a dialed agent's host; any host when absent.
+    agent_identity: Option<Arc<dyn agents::AgentIdentity>>,
 }
 
 impl Default for Opts {
@@ -63,6 +70,8 @@ impl Default for Opts {
             gate: None,
             sockets: live::SocketCaps::default(),
             store: None,
+            access: None,
+            agent_identity: None,
         }
     }
 }
@@ -94,6 +103,8 @@ async fn coordinator_with(o: Opts) -> Coord {
         poster: Arc::new(poster::Poster::default()),
         gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
         sockets: o.sockets,
+        access: o.access,
+        agent_identity: o.agent_identity,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -751,7 +762,7 @@ async fn live_sockets_are_capped_per_client_and_in_all() {
 
 /// An Access JWT as Cloudflare forwards it: only the payload is read, so the signature is
 /// a placeholder.
-fn access_jwt(claims: Value) -> String {
+fn unsigned_access_jwt(claims: Value) -> String {
     format!(
         "{}.{}.sig",
         admission::b64url(br#"{"alg":"RS256"}"#),
@@ -767,9 +778,10 @@ fn access_jwt(claims: Value) -> String {
 #[tokio::test]
 async fn a_forwarded_viewer_address_counts_only_with_a_service_token() {
     let worker = "2001:db8::103";
-    let service =
-        access_jwt(json!({"type": "app", "common_name": "example-client.access", "email": ""}));
-    let person = access_jwt(json!({"type": "app", "email": "viewer@example.test"}));
+    let service = unsigned_access_jwt(
+        json!({"type": "app", "common_name": "example-client.access", "email": ""}),
+    );
+    let person = unsigned_access_jwt(json!({"type": "app", "email": "viewer@example.test"}));
     for (access_viewer, jwt, separate) in [
         (true, Some(service.as_str()), true),
         (true, Some(person.as_str()), false),
@@ -1099,6 +1111,292 @@ async fn a_request_the_proof_accepts_is_verified_from_the_start() {
     let adm = not.message("admission").await;
     assert_eq!(adm["verify"], true, "{adm}");
     assert_eq!(adm["direct"], Value::Null, "{adm}");
+}
+
+const ACCESS_ISS: &str = "https://team.example.cloudflareaccess.com";
+const LIVE_AUD: &str = "aud-live-for-tests";
+const AGENT_AUD: &str = "aud-agent-for-tests";
+
+/// An Access check over a JWKS served by the test, and the signer whose key it publishes.
+async fn access_check(agent: bool) -> (Arc<access_jwt::AccessCheck>, access_testing::TestSigner) {
+    let signer = access_testing::TestSigner::new(false, "kid-1");
+    let (url, _) = access_testing::serve_keys(vec![signer.jwk()]).await;
+    let check = access_jwt::AccessCheck {
+        jwt: access_jwt::AccessJwt::with_certs_url(ACCESS_ISS, &url).unwrap(),
+        live: vec![LIVE_AUD.into()],
+        agent: if agent {
+            vec![AGENT_AUD.into()]
+        } else {
+            vec![]
+        },
+    };
+    (Arc::new(check), signer)
+}
+
+/// Access token claims: a service token for `aud`, valid for ten minutes.
+fn access_claims(aud: &str, over: Value) -> Value {
+    let now = now_ms() / 1000;
+    let mut c = json!({"iss": ACCESS_ISS, "aud": [aud], "exp": now + 600, "iat": now,
+        "type": "app", "common_name": "client-id.access", "email": ""});
+    for (k, v) in over.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    c
+}
+
+/// With Access checked by the coordinator, a `/live` request is verified for Turnstile only
+/// by a token that verifies: a forged one (another key), one for another application, and an
+/// expired one are not.
+#[tokio::test]
+async fn live_counts_only_a_valid_access_token_as_verified() {
+    let (access, signer) = access_check(false).await;
+    let forger = access_testing::TestSigner::new(true, "kid-1");
+    let c = coordinator_with(Opts {
+        verifier: turnstile_fake(),
+        proof: access.clone(),
+        access: Some(access),
+        site_key: Some("site-key-for-tests".into()),
+        gate: Some(test_gate(10, Duration::from_secs(60))),
+        ..Opts::default()
+    })
+    .await;
+    let valid = signer.token(&access_claims(LIVE_AUD, json!({})));
+    let mut v =
+        Viewer::connect_seated_with_headers(&c.url, &[("cf-access-jwt-assertion", &valid)]).await;
+    let adm = v.message("admission").await;
+    assert_eq!(adm["verify"], false, "a valid token is verified: {adm}");
+    assert!(adm["direct"]["value"].is_string(), "{adm}");
+    let past = now_ms() / 1000 - 10;
+    for (what, token) in [
+        ("forged", forger.token(&access_claims(LIVE_AUD, json!({})))),
+        (
+            "another application",
+            signer.token(&access_claims("aud-other", json!({}))),
+        ),
+        (
+            "expired",
+            signer.token(&access_claims(LIVE_AUD, json!({"exp": past}))),
+        ),
+        (
+            "unsigned",
+            unsigned_access_jwt(access_claims(LIVE_AUD, json!({}))),
+        ),
+    ] {
+        let mut v =
+            Viewer::connect_seated_with_headers(&c.url, &[("cf-access-jwt-assertion", &token)])
+                .await;
+        let adm = v.message("admission").await;
+        assert_eq!(adm["verify"], true, "{what}: {adm}");
+        assert_eq!(adm["direct"], Value::Null, "{what}: {adm}");
+    }
+}
+
+/// With `--access-viewer-address` and Access checked by the coordinator, only a service token
+/// that verifies sets the address a request is limited by: a forged one does not.
+#[tokio::test]
+async fn a_forwarded_viewer_address_needs_a_verified_service_token() {
+    let (access, signer) = access_check(false).await;
+    let forger = access_testing::TestSigner::new(true, "kid-1");
+    let worker = "2001:db8::103";
+    for (token, separate) in [
+        (signer.token(&access_claims(LIVE_AUD, json!({}))), true),
+        (forger.token(&access_claims(LIVE_AUD, json!({}))), false),
+        (
+            signer.token(&access_claims(
+                LIVE_AUD,
+                json!({"common_name": "", "email": "viewer@example.test"}),
+            )),
+            false,
+        ),
+    ] {
+        let c = coordinator_with(Opts {
+            access_viewer: true,
+            access: Some(access.clone()),
+            ..Opts::default()
+        })
+        .await;
+        let headers = |viewer: &'static str| {
+            vec![
+                ("cf-connecting-ip", worker),
+                ("x-fleet-viewer-ip", viewer),
+                ("cf-access-jwt-assertion", token.as_str()),
+            ]
+        };
+        let mut a = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.1")).await;
+        let mut b = Viewer::connect_seated_with_headers(&c.url, &headers("198.51.100.2")).await;
+        a.intent("w1", "word", json!({"text": "one"})).await;
+        assert_eq!(a.receipt("w1").await["outcome"], "committed");
+        b.intent("w2", "word", json!({"text": "two"})).await;
+        let r = b.receipt("w2").await;
+        if separate {
+            assert_eq!(r["outcome"], "committed", "{r}");
+        } else {
+            assert_eq!(r["reason"], "one word per 5 s per client", "{r}");
+        }
+    }
+}
+
+/// An agent's hello naming `host`, with nothing to offer.
+fn bare_hello(host: &str) -> AgentMsg {
+    AgentMsg::Hello {
+        host: host.into(),
+        arch: "x86_64".into(),
+        gpus: vec![],
+        capacity: 0,
+        store_ready_at: None,
+        boot: Default::default(),
+        phones: vec![],
+        phone_actions: vec![],
+        potato_players: 0,
+        windows: 0,
+        windows_actions: Vec::new(),
+        minecraft: 0,
+        minecraft_server: None,
+    }
+}
+
+/// The handshake status of `/agent` with these headers: 101 when it upgrades.
+async fn agent_status(url: &str, headers: &[(&str, &str)]) -> u16 {
+    let mut req = url.into_client_request().unwrap();
+    for (name, value) in headers {
+        let name =
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        req.headers_mut().insert(name, value.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(req).await {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// With agent audiences configured, `/agent` takes only a service token that verifies for one
+/// of them: none, a forged one, one for another application, an expired one and a person's
+/// are refused before the socket opens.
+#[tokio::test]
+async fn the_agent_socket_needs_a_verified_agent_service_token() {
+    let (access, signer) = access_check(true).await;
+    let forger = access_testing::TestSigner::new(true, "kid-1");
+    let c = coordinator_with(Opts {
+        access: Some(access),
+        ..Opts::default()
+    })
+    .await;
+    let url = c.url.replace("/live", "/agent");
+    let past = now_ms() / 1000 - 10;
+    assert_eq!(agent_status(&url, &[]).await, 403);
+    for (what, token) in [
+        ("forged", forger.token(&access_claims(AGENT_AUD, json!({})))),
+        (
+            "a /live token",
+            signer.token(&access_claims(LIVE_AUD, json!({}))),
+        ),
+        (
+            "expired",
+            signer.token(&access_claims(AGENT_AUD, json!({"exp": past}))),
+        ),
+        (
+            "a person",
+            signer.token(&access_claims(
+                AGENT_AUD,
+                json!({"common_name": "", "email": "owner@example.test"}),
+            )),
+        ),
+    ] {
+        assert_eq!(
+            agent_status(&url, &[("cf-access-jwt-assertion", &token)]).await,
+            403,
+            "{what}"
+        );
+    }
+    let valid = signer.token(&access_claims(AGENT_AUD, json!({})));
+    assert_eq!(
+        agent_status(&url, &[("cf-access-jwt-assertion", &valid)]).await,
+        101
+    );
+}
+
+/// A dialed agent's hello must name one of this fleet's GPU hosts, pending or running: an
+/// instance the host driver does not list (another fleet's, or no instance at all), one that
+/// is terminated, and any while the listing fails are refused and never register.
+#[tokio::test]
+async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
+    let fake = Arc::new(FakeHosts::default());
+    let host = |id: &str, state: &str| Host {
+        id: id.into(),
+        state: state.into(),
+        market: Market::Spot,
+    };
+    fake.hosts.lock().unwrap().insert(
+        "us-east-1".into(),
+        vec![
+            host("i-0aaaaaaaaaaaaaaa1", "running"),
+            host("i-0aaaaaaaaaaaaaaa2", "terminated"),
+        ],
+    );
+    let identity = agents::FleetHosts {
+        driver: fake.clone(),
+        regions: vec!["us-east-1".into()],
+        fleet: "prod".into(),
+    };
+    let c = coordinator_with(Opts {
+        agent_identity: Some(Arc::new(identity)),
+        ..Opts::default()
+    })
+    .await;
+    let url = c.url.replace("/live", "/agent");
+    // The socket of a refused agent closes after its hello.
+    let dial = |host: &'static str| {
+        let url = url.clone();
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(&bare_hello(host)).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+            ws
+        }
+    };
+    let closes = |mut ws: Ws| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await
+        .expect("the coordinator closes a refused agent's socket");
+    };
+    closes(dial("i-0bbbbbbbbbbbbbbb1").await).await;
+    closes(dial("i-0aaaaaaaaaaaaaaa2").await).await;
+    *fake.fail_lists.lock().unwrap() = [("us-east-1".to_string(), 1)].into_iter().collect();
+    closes(dial("i-0aaaaaaaaaaaaaaa1").await).await;
+    // This fleet's running host registers.
+    let _ok = dial("i-0aaaaaaaaaaaaaaa1").await;
+    let mut v = Viewer::connect(&c.url).await;
+    let s = v
+        .until(|s| {
+            s["fleet"]["agents"]["hosts"]
+                .as_array()
+                .is_some_and(|h| !h.is_empty())
+        })
+        .await;
+    let names: Vec<&str> = s["fleet"]["agents"]["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["i-0aaaaaaaaaaaaaaa1"],
+        "{}",
+        s["fleet"]["agents"]
+    );
 }
 
 #[tokio::test]
@@ -1908,6 +2206,8 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         poster,
         gate: Arc::new(admission::Gate::open()),
         sockets: live::SocketCaps::default(),
+        access: None,
+        agent_identity: None,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -3726,6 +4026,8 @@ async fn page_url(handle: &Handle) -> String {
         poster: Arc::new(poster::Poster::default()),
         gate: Arc::new(admission::Gate::open()),
         sockets: live::SocketCaps::default(),
+        access: None,
+        agent_identity: None,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });

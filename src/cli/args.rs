@@ -396,6 +396,33 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub access_viewer_address: bool,
 
+    /// Verify Cloudflare Access tokens (Cf-Access-Jwt-Assertion) with this team's published keys
+    /// (`<team>.cloudflareaccess.com`) instead of trusting the connector that admitted them.
+    /// Needs --access-aud or --agent-access-aud
+    #[arg(long, env = "FLEET_ACCESS_TEAM_DOMAIN")]
+    pub access_team_domain: Option<String>,
+
+    /// An Access application audience (AUD tag) a /live token may be for. A /live request with
+    /// a valid token for one is verified for Turnstile, and with --access-viewer-address only
+    /// such a token from a service token sets the viewer address. Repeatable
+    #[arg(
+        long,
+        env = "FLEET_ACCESS_AUD",
+        value_delimiter = ',',
+        requires = "access_team_domain"
+    )]
+    pub access_aud: Vec<String>,
+
+    /// An Access application audience an /agent token must be for: with it, /agent needs a
+    /// valid service-token JWT for one of these. Repeatable
+    #[arg(
+        long,
+        env = "FLEET_AGENT_ACCESS_AUD",
+        value_delimiter = ',',
+        requires = "access_team_domain"
+    )]
+    pub agent_access_aud: Vec<String>,
+
     /// Cloudflare Turnstile secret: a connection must pass `verify` before it joins (counts
     /// as a viewer or an arrival), takes a seat or sends an intent. Without it, or
     /// --turnstile-secret-id, no verification is asked for (staging, local runs, tests)

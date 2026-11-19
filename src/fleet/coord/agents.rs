@@ -1,22 +1,91 @@
-//! Agent connections. Each is newline-delimited JSON over a byte stream; today the stream
-//! is a child process's stdin and stdout (`fcvm fleet agent --stdio` locally, or the same
-//! through `ssh <host>`).
+//! Agent connections. Each is newline-delimited JSON over a byte stream: a child process's
+//! stdin and stdout (`fcvm fleet agent --stdio` locally, or the same through `ssh <host>`), or
+//! the `/agent` WebSocket a GPU host's agent dials.
+//!
+//! A dialed agent names its host in its hello, and the coordinator checks that name
+//! ([`AgentIdentity`]): with host templates configured, it must be an EC2 instance of this
+//! fleet's hosts (`Purpose=fcvm-fleet-host`, `Fleet=<--fleet-name>`, pending or running), so
+//! a host of another fleet, or a machine holding a stolen agent token, cannot join. A refusal
+//! is logged at warn with `marker=fleet-agent-refused`.
 
+use super::hosts::HostDriver;
 use super::{Cmd, Handle};
 use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use fleet_core::protocol::{AgentMsg, CoordMsg};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
+/// The log marker of an agent the coordinator refused (its Access token, or the host its hello
+/// names), for an alarm.
+pub const AGENT_REFUSED_MARKER: &str = "fleet-agent-refused";
+
+/// Whether the host an agent's hello names may join this fleet.
+#[async_trait]
+pub trait AgentIdentity: Send + Sync {
+    /// `Err` says why `host` may not join.
+    async fn check(&self, host: &str) -> std::result::Result<(), String>;
+}
+
+/// An agent's host must be one of this fleet's GPU hosts: an EC2 instance, pending or running,
+/// that the host driver lists in one of the host regions (`Purpose=fcvm-fleet-host`,
+/// `Fleet=<fleet>`). A listing that fails refuses the agent; it dials again.
+pub struct FleetHosts {
+    pub driver: Arc<dyn HostDriver>,
+    pub regions: Vec<String>,
+    /// For the refusal's text.
+    pub fleet: String,
+}
+
+#[async_trait]
+impl AgentIdentity for FleetHosts {
+    async fn check(&self, host: &str) -> std::result::Result<(), String> {
+        for region in &self.regions {
+            let hosts = self
+                .driver
+                .hosts(region)
+                .await
+                .map_err(|e| format!("listing this fleet's hosts in {region}: {e:#}"))?;
+            if let Some(h) = hosts.iter().find(|h| h.id == host) {
+                return if h.live() {
+                    Ok(())
+                } else {
+                    Err(format!("instance {host} is {}", h.state))
+                };
+            }
+        }
+        Err(format!(
+            "{host} is not an instance tagged Purpose=fcvm-fleet-host and Fleet={} in {}",
+            self.fleet,
+            self.regions.join(", ")
+        ))
+    }
+}
+
 /// Serve one agent connection until it closes. The first message must be a hello, and the
 /// actor must accept the host it names.
 pub async fn serve_connection<R, W>(input: R, output: W, handle: &Handle) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_checked(input, output, handle, None).await
+}
+
+/// [`serve_connection`], with the hello's host checked by `identity` first.
+pub async fn serve_checked<R, W>(
+    input: R,
+    output: W,
+    handle: &Handle,
+    identity: Option<&dyn AgentIdentity>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -28,6 +97,17 @@ where
         Some(other) => bail!("agent spoke before its hello: {other:?}"),
         None => bail!("agent closed before its hello"),
     };
+    if let (Some(identity), AgentMsg::Hello { host, .. }) = (identity, &hello) {
+        if let Err(why) = identity.check(host).await {
+            tracing::warn!(
+                marker = AGENT_REFUSED_MARKER,
+                host = %host,
+                reason = %why,
+                "refusing an agent: its host is not one of this fleet's"
+            );
+            bail!("refused the agent for {host}: {why}");
+        }
+    }
     let (tx, writer) = spawn_writer::<CoordMsg, _>(output, "agent");
     let (reply, accepted) = oneshot::channel();
     handle

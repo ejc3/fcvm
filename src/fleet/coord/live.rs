@@ -15,8 +15,8 @@
 //! not joined (no arrival, so it wakes nothing, and it does not count as active), holds no
 //! seat and no direct token, and its intents are refused. It joins and is admitted once
 //! siteverify accepts its token; a siteverify error or timeout leaves it as it was. A seat
-//! ticket this coordinator still holds, or a request the [`RequestProof`] accepts (F3: a valid
-//! Cloudflare Access JWT), counts as verified from the start.
+//! ticket this coordinator still holds, or a request the [`RequestProof`] accepts (a valid
+//! Cloudflare Access JWT, [`super::access_jwt`]), counts as verified from the start.
 
 use super::admission::{Admitted, Gate};
 use super::poster::Poster;
@@ -173,6 +173,11 @@ pub struct LiveConfig {
     pub gate: Arc<Gate>,
     /// How many `/live` sockets may be open.
     pub sockets: SocketCaps,
+    /// Access tokens checked by the coordinator itself: on `/live` for the viewer address,
+    /// and on `/agent` when agent audiences are given. `None`: Access is trusted at the edge.
+    pub access: Option<Arc<super::access_jwt::AccessCheck>>,
+    /// The check on the host a dialed agent's hello names; `None` admits any.
+    pub agent_identity: Option<Arc<dyn super::agents::AgentIdentity>>,
 }
 
 #[derive(Clone)]
@@ -241,8 +246,24 @@ async fn poster(State(app): State<App>) -> Response {
 
 /// An agent that dials in (`fcvm fleet agent --dial`): the agent protocol with one JSON
 /// message per text frame. Cloudflare Access admits only the agents' service token on this
-/// path before a request reaches the coordinator.
-async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response {
+/// path before a request reaches the coordinator; with agent audiences configured the
+/// coordinator verifies that token itself, and with an identity check the host the hello
+/// names must be one of this fleet's.
+async fn agent_socket(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    State(app): State<App>,
+) -> Response {
+    if let Some(access) = app.cfg.access.as_ref().filter(|a| !a.agent.is_empty()) {
+        if let Err(e) = access.agent_claims(&headers).await {
+            tracing::warn!(
+                marker = super::agents::AGENT_REFUSED_MARKER,
+                reason = %format!("{e:#}"),
+                "refusing /agent: its Access token does not verify"
+            );
+            return (StatusCode::FORBIDDEN, "agent not admitted").into_response();
+        }
+    }
     ws.max_message_size(crate::fleet::lines::MAX_LINE)
         .on_upgrade(move |socket| async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -273,7 +294,13 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
                 }
                 let _ = sink.close().await;
             });
-            if let Err(e) = super::agents::serve_connection(serve_in, serve_out, &app.handle).await
+            if let Err(e) = super::agents::serve_checked(
+                serve_in,
+                serve_out,
+                &app.handle,
+                app.cfg.agent_identity.as_deref(),
+            )
+            .await
             {
                 tracing::warn!(error = %format!("{e:#}"), "agent connection ended");
             }
@@ -289,15 +316,15 @@ async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response 
 pub const VIEWER_ADDRESS_HEADER: &str = "x-fleet-viewer-ip";
 
 /// The address the per-client limits use: `CF-Connecting-IP` behind Cloudflare (`trust_cf`),
-/// else the peer address. With `access_viewer`, a request Access admitted with a service token
-/// is keyed by [`VIEWER_ADDRESS_HEADER`] instead: only the fleet's own Worker and CI hold one,
-/// and a browser's Access JWT names a person, so a viewer cannot set the address it is limited
-/// by. That holds only where the connector verifies the JWT, hence the separate switch.
+/// else the peer address. With `forwarded_viewer` (`--access-viewer-address` and a request
+/// Access admitted with a service token, [`service_token`]), the request is keyed by
+/// [`VIEWER_ADDRESS_HEADER`] instead: only the fleet's own Worker and CI hold one, and a
+/// browser's Access JWT names a person, so a viewer cannot set the address it is limited by.
 pub fn client_address(
     headers: &HeaderMap,
     peer: SocketAddr,
     trust_cf: bool,
-    access_viewer: bool,
+    forwarded_viewer: bool,
 ) -> String {
     let ip = |name: &str| {
         headers
@@ -307,7 +334,7 @@ pub fn client_address(
             .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
             .map(str::to_string)
     };
-    if access_viewer && access_service_token(headers) {
+    if forwarded_viewer {
         if let Some(viewer) = ip(VIEWER_ADDRESS_HEADER) {
             return viewer;
         }
@@ -342,12 +369,26 @@ pub fn client_key(address: &str) -> String {
     }
 }
 
-/// Whether Access admitted this request with a service token: the `Cf-Access-Jwt-Assertion`
-/// it forwards names one (`common_name`, the token's client id) and no person (`email`).
-/// The signature is not checked here, so this is trusted only with `--access-viewer-address`:
-/// staging's tunnel connector refuses a request whose token does not verify for the
-/// coordinator's applications (`access.required`, ejc3/aws fcvm-dev.tf).
-fn access_service_token(headers: &HeaderMap) -> bool {
+/// Whether Access admitted this request with a service token: its `Cf-Access-Jwt-Assertion`
+/// names one (`common_name`, the token's client id) and no person (`email`). With an
+/// [`super::access_jwt::AccessCheck`] the token must verify (signature, issuer, a `/live`
+/// audience, expiry). Without one the payload is read unverified, which is trusted only behind
+/// a tunnel connector that requires and verifies Access (`access.required`, ejc3/aws
+/// fcvm-dev.tf).
+pub async fn service_token(
+    access: Option<&super::access_jwt::AccessCheck>,
+    headers: &HeaderMap,
+) -> bool {
+    match access {
+        Some(a) => a
+            .live_claims(headers)
+            .await
+            .is_some_and(|c| c.service_token()),
+        None => unverified_service_token(headers),
+    }
+}
+
+fn unverified_service_token(headers: &HeaderMap) -> bool {
     let Some(jwt) = headers
         .get("cf-access-jwt-assertion")
         .and_then(|v| v.to_str().ok())
@@ -383,11 +424,13 @@ async fn live(
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+    let forwarded_viewer =
+        app.cfg.access_viewer_address && service_token(app.cfg.access.as_deref(), &headers).await;
     let address = client_address(
         &headers,
         peer,
         app.cfg.trust_cf_connecting_ip,
-        app.cfg.access_viewer_address,
+        forwarded_viewer,
     );
     let client = Client {
         key: client_key(&address),
