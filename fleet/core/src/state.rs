@@ -27,6 +27,12 @@ pub struct Config {
     /// quarantined wall GPUs of connected hosts.
     #[serde(default)]
     pub fcvm_tiles: usize,
+    /// The fleet keeps more than one GPU host awake per region (`--awake-hosts`): while any
+    /// fcvm GPU renders on the wall, the side has one place per rendering GPU, so a host that
+    /// drains, is gone or has not joined yet leaves no dark places; the wall re-tiles coarser
+    /// across the GPUs that render and finer again as the others join.
+    #[serde(default)]
+    pub fill_from_serving_hosts: bool,
     /// Minimum milliseconds between two words from one viewer.
     pub word_interval_ms: u64,
     /// Seconds with a viewer on the wall, after the last word has left the sky, before the
@@ -241,6 +247,7 @@ impl Default for Config {
             tile_aspect: 16.0 / 9.0,
             ec2_max: 0,
             fcvm_tiles: 0,
+            fill_from_serving_hosts: false,
             word_interval_ms: 5_000,
             history_idle_secs: 0,
             light_interval_ms: 1_000,

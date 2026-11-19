@@ -325,6 +325,13 @@ impl Viewer {
     }
 
     /// Read until the latest snapshot satisfies `f`.
+    /// `until`, failing after 15 s: `until` alone waits for as long as snapshots come.
+    async fn until_within(&mut self, f: impl Fn(&Value) -> bool) -> Value {
+        tokio::time::timeout(Duration::from_secs(15), self.until(f))
+            .await
+            .expect("the snapshot within 15 s")
+    }
+
     async fn until(&mut self, f: impl Fn(&Value) -> bool) -> Value {
         loop {
             if let Some((_, s)) = self.snapshots.iter().next_back() {
@@ -1362,6 +1369,7 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
         state: state.into(),
         market: Market::Spot,
         sources: vec!["127.0.0.1".into(), "2001:db8:7:7::/80".into()],
+        zone: None,
     };
     fake.hosts.lock().unwrap().insert(
         "us-east-1".into(),
@@ -3558,6 +3566,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         ec2_layout,
         broadcast_layout: tokio::sync::watch::channel(None).0,
         power: tokio::sync::watch::channel(String::new()).0,
+        draining: tokio::sync::watch::channel(Default::default()).0,
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
         zone: None,
@@ -4053,13 +4062,14 @@ async fn a_replayed_quarantine_does_not_undo_an_operators_release() {
 fn host_config(
     fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
     regions: &[&str],
-    awake_capacity: u32,
+    awake_hosts: u32,
     on_demand_max: u32,
 ) -> fcvm::fleet::coord::hosts::HostConfig {
     fcvm::fleet::coord::hosts::HostConfig {
         driver: fake.clone(),
         regions: regions.iter().map(|r| r.to_string()).collect(),
-        awake_capacity,
+        awake_hosts,
+        spread: fcvm::fleet::coord::hosts::HostSpread::None,
         on_demand_max,
         poll: Duration::from_millis(50),
         liveness: Duration::from_millis(100),
@@ -4768,6 +4778,7 @@ async fn a_restart_keeps_the_hosts_it_finds() {
             state: "running".into(),
             market: Market::OnDemand,
             sources: Vec::new(),
+            zone: None,
         }],
     );
     let (_handle, _actor) = start(
@@ -4784,6 +4795,281 @@ async fn a_restart_keeps_the_hosts_it_finds() {
     .await;
     assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
     assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// Two awake hosts in `us-east-1`, spread over three zones and running, with an agent of
+/// two GPUs on each whose slots render: the fake, the coordinator, the agents and a viewer.
+async fn two_spread_hosts(
+    config: Config,
+) -> (
+    Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    Handle,
+    Vec<String>,
+    Vec<FakeAgent>,
+    Viewer,
+) {
+    use fcvm::fleet::coord::hosts::{FakeHosts, HostSpread};
+    let fake = Arc::new(FakeHosts::default());
+    fake.zones.lock().unwrap().insert(
+        "us-east-1".into(),
+        ["us-east-1a", "us-east-1b", "us-east-1c"]
+            .map(String::from)
+            .to_vec(),
+    );
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    let mut hosts = host_config(&fake, &["us-east-1"], 2, 8);
+    hosts.spread = HostSpread::Az;
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    until_hosts(&fake, "two hosts", |f| f.live_zones("us-east-1").len() == 2).await;
+    let first = fake.live_zones("us-east-1");
+    let zones: std::collections::BTreeSet<_> = first.values().flatten().collect();
+    assert_eq!(zones.len(), 2, "the two hosts share a zone: {first:?}");
+    let ids: Vec<String> = first.keys().cloned().collect();
+    let mut agents = Vec::new();
+    for id in &ids {
+        let mut a = FakeAgent::connect(&handle, id, 2);
+        for slot in a.assign().await {
+            a.report(&slot.id, "running", slot.generation);
+        }
+        agents.push(a);
+    }
+    v.until_within(|s| s["fleet"]["n"] == 4 && every_tile_has_a_gpu(s))
+        .await;
+    (fake, handle, ids, agents, v)
+}
+
+/// Every tile of the snapshot is a slot's, none dark.
+fn every_tile_has_a_gpu(s: &Value) -> bool {
+    s["tiles"]
+        .as_array()
+        .is_some_and(|t| !t.is_empty() && t.iter().all(|t| t["slot"].is_string()))
+}
+
+/// Two awake hosts: a spot notice on one launches its replacement at once, in the zone
+/// neither host is in; the other host's GPUs take every place, with no dark tile, until the
+/// replacement renders; and the drained host is terminated once its replacement runs.
+#[tokio::test]
+async fn a_reclaimed_host_of_two_is_replaced_in_another_zone_and_the_tiles_stay_assigned() {
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        fill_from_serving_hosts: true,
+        ..Config::default()
+    };
+    let (fake, _handle, ids, agents, mut v) = two_spread_hosts(config).await;
+    let before = fake.live_zones("us-east-1");
+    agents[1]
+        .to_coord
+        .send(AgentMsg::Draining {
+            reason: "spot interruption notice".into(),
+        })
+        .unwrap();
+    let s = v
+        .until_within(|s| s["fleet"]["n"] == 2 && every_tile_has_a_gpu(s))
+        .await;
+    for t in s["tiles"].as_array().unwrap() {
+        assert!(
+            ["slot-1", "slot-2"].contains(&t["slot"].as_str().unwrap()),
+            "a tile is not on the host that stays: {s}"
+        );
+    }
+    until_hosts(&fake, "the replacement, and the drained host gone", |f| {
+        let live = f.live_zones("us-east-1");
+        live.len() == 2 && !live.contains_key(&ids[1])
+    })
+    .await;
+    let after = fake.live_zones("us-east-1");
+    let new: Vec<_> = after
+        .iter()
+        .filter(|(id, _)| !before.contains_key(*id))
+        .collect();
+    assert_eq!(new.len(), 1, "{after:?}");
+    let used: Vec<_> = before.values().collect();
+    assert!(
+        !used.contains(&new[0].1),
+        "the replacement went into a zone a host was in: {before:?} -> {after:?}"
+    );
+    assert_eq!(new[0].1.as_deref(), Some("us-east-1c"));
+    assert_eq!(
+        launches(&fake).last().map(String::as_str),
+        Some("launch us-east-1 spot 1 in us-east-1c"),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+/// A reclaimed host's agent can go before EC2's lists show the instance going: the host still
+/// does not count, so the region is not over its capacity and its pending replacement is
+/// not terminated for it.
+#[tokio::test]
+async fn a_drained_host_whose_agent_leaves_first_does_not_cost_its_replacement() {
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        fill_from_serving_hosts: true,
+        ..Config::default()
+    };
+    let (fake, _handle, ids, mut agents, mut v) = two_spread_hosts(config).await;
+    *fake.launch_state.lock().unwrap() = Some("pending".into());
+    agents[1]
+        .to_coord
+        .send(AgentMsg::Draining {
+            reason: "spot interruption notice".into(),
+        })
+        .unwrap();
+    until_hosts(&fake, "the replacement", |f| {
+        f.live_zones("us-east-1").len() == 3
+    })
+    .await;
+    let replacement: Vec<String> = fake
+        .live_zones("us-east-1")
+        .into_keys()
+        .filter(|id| !ids.contains(id))
+        .collect();
+    // The agent goes; EC2 still lists its instance running.
+    let gone = agents.pop().unwrap();
+    drop(gone.to_coord);
+    gone.conn.await.unwrap().unwrap();
+    // Its host leaves the fleet's connected hosts.
+    v.until_within(|s| s["fleet"]["hosts"].as_array().is_some_and(|h| h.len() == 1))
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let live = fake.live_zones("us-east-1");
+    assert!(
+        live.contains_key(&replacement[0]),
+        "the replacement was terminated: {:?}",
+        fake.calls()
+    );
+    assert_eq!(live.len(), 3, "{:?}", fake.calls());
+}
+
+/// When the zones no host is in have no capacity, a spread launch takes a zone a host is
+/// in rather than leaving the region short.
+#[tokio::test]
+async fn a_spread_launch_falls_back_to_a_used_zone_when_the_others_are_full() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, HostSpread, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.zones.lock().unwrap().insert(
+        "us-east-1".into(),
+        ["us-east-1a", "us-east-1b"].map(String::from).to_vec(),
+    );
+    for m in [Market::Spot, Market::OnDemand] {
+        fake.zone_capacity
+            .lock()
+            .unwrap()
+            .insert(("us-east-1".into(), "us-east-1b".into(), m), 0);
+    }
+    let mut hosts = host_config(&fake, &["us-east-1"], 2, 8);
+    hosts.spread = HostSpread::Az;
+    let config = Config {
+        power_managed: true,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    let _v = page_viewer(&handle).await;
+    until_hosts(&fake, "two hosts", |f| f.live_zones("us-east-1").len() == 2).await;
+    let zones: Vec<_> = fake
+        .live_zones("us-east-1")
+        .into_values()
+        .flatten()
+        .collect();
+    assert_eq!(zones, ["us-east-1a", "us-east-1a"], "{:?}", fake.calls());
+    assert_eq!(
+        launches(&fake),
+        [
+            "launch us-east-1 spot 1",
+            "launch us-east-1 spot 1 in us-east-1b",
+            "launch us-east-1 on-demand 1 in us-east-1b",
+            "launch us-east-1 spot 1",
+        ]
+    );
+}
+
+/// The spend meter prices every host the fleet runs, a reclaimed host's replacement
+/// included, and the budget trip it causes terminates all of them.
+#[tokio::test]
+async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
+    use fcvm::fleet::coord::spend::{self, Billed, MeterConfig, MeterDriver, SpotPrice};
+    struct Meter(Arc<fcvm::fleet::coord::hosts::FakeHosts>);
+    #[async_trait::async_trait]
+    impl MeterDriver for Meter {
+        async fn instances(&self, region: &str) -> anyhow::Result<Vec<Billed>> {
+            Ok(self
+                .0
+                .present(region)
+                .into_iter()
+                .map(|h| Billed {
+                    id: h.id,
+                    instance_type: "g4dn.metal".into(),
+                    spot: false,
+                    zone: h.zone.unwrap_or_default(),
+                })
+                .collect())
+        }
+        async fn spot_prices(&self, _: &str, _: &[String]) -> anyhow::Result<Vec<SpotPrice>> {
+            Ok(Vec::new())
+        }
+    }
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        fill_from_serving_hosts: true,
+        daily_spend_usd: Some(1.0),
+        ..Config::default()
+    };
+    let (fake, handle, _ids, agents, mut v) = two_spread_hosts(config).await;
+    // The replacement stays pending, so the drained host is not terminated for it.
+    *fake.launch_state.lock().unwrap() = Some("pending".into());
+    agents[1]
+        .to_coord
+        .send(AgentMsg::Draining {
+            reason: "spot interruption notice".into(),
+        })
+        .unwrap();
+    until_hosts(&fake, "the replacement beside both hosts", |f| {
+        f.live_zones("us-east-1").len() == 3
+    })
+    .await;
+    tokio::spawn(spend::run(
+        MeterConfig {
+            driver: Arc::new(Meter(fake.clone())),
+            regions: vec!["us-east-1".into()],
+            on_demand: spend::on_demand_rates(&[]).unwrap(),
+            every: Duration::from_millis(50),
+            spot_ttl: Duration::from_secs(60),
+            fleet: "prod".into(),
+        },
+        handle.clone(),
+    ));
+    let s = v
+        .until_within(|s| s["fleet"]["spend"]["reason"] == "budget")
+        .await;
+    assert_eq!(
+        s["fleet"]["spend"]["instances"], 3,
+        "{}",
+        s["fleet"]["spend"]
+    );
+    v.until_within(|s| s["fleet"]["power"]["state"] == "asleep")
+        .await;
+    until_hosts(&fake, "every host terminated", |f| {
+        f.present("us-east-1").is_empty()
+    })
+    .await;
 }
 
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
@@ -6109,7 +6395,21 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                         if spot && !api.spot_capacity.contains(&region) {
                             return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
                         }
-                        (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-1234567890abcdef0</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>".into())
+                        // Placed in the first override's subnet.
+                        let subnet = params.get("LaunchTemplateConfigs.1.Overrides.1.SubnetId").cloned().unwrap_or_default();
+                        (StatusCode::OK, format!("<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><launchTemplateAndOverrides><overrides><subnetId>{subnet}</subnetId></overrides></launchTemplateAndOverrides><instanceIds><item>i-1234567890abcdef0</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>"))
+                    }
+                    // Each subnet is in the zone its id ends with (`...a` in `<region>a`).
+                    "DescribeSubnets" => {
+                        let items: String = params
+                            .iter()
+                            .filter(|(k, _)| k.starts_with("SubnetId."))
+                            .map(|(_, s)| {
+                                let zone = format!("{region}{}", &s[s.len() - 1..]);
+                                format!("<item><subnetId>{s}</subnetId><availabilityZone>{zone}</availabilityZone></item>")
+                            })
+                            .collect();
+                        (StatusCode::OK, format!("<DescribeSubnetsResponse><subnetSet>{items}</subnetSet></DescribeSubnetsResponse>"))
                     }
                     _ => error("InvalidAction"),
                 }
@@ -6120,6 +6420,71 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     base
+}
+
+/// A spread launch reads the region's subnets' zones once (DescribeSubnets), names only the
+/// subnets of the zones it was given, and reports the zone each instance landed in.
+#[tokio::test]
+async fn the_aws_host_driver_launches_into_the_subnets_of_the_zones_it_is_given() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::new(
+        &["us-east-1:fcvm-fleet-host-x86_64".parse().unwrap()],
+        &[
+            "us-east-1:subnet-0000000000000000a".parse().unwrap(),
+            "us-east-1:subnet-0000000000000000b".parse().unwrap(),
+        ],
+        "prod".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    assert_eq!(
+        d.zones("us-east-1").await.unwrap(),
+        ["us-east-1a", "us-east-1b"]
+    );
+    assert_eq!(
+        d.zones("us-east-1").await.unwrap(),
+        ["us-east-1a", "us-east-1b"]
+    );
+    let got = d
+        .launch(
+            "us-east-1",
+            Market::OnDemand,
+            1,
+            "t-1",
+            &["us-east-1b".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        got.zones.get("i-1234567890abcdef0").map(String::as_str),
+        Some("us-east-1b"),
+        "{got:?}"
+    );
+    let calls = api.calls.lock().unwrap().clone();
+    let reads = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeSubnets")
+        .count();
+    assert_eq!(reads, 1, "the zones are read once: {calls:?}");
+    let fleet = calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .map(|(_, p)| p.clone())
+        .unwrap();
+    let subnets: Vec<&String> = fleet
+        .iter()
+        .filter(|(k, _)| k.ends_with(".SubnetId"))
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(
+        subnets,
+        [&"subnet-0000000000000000b".to_string()],
+        "{fleet:?}"
+    );
 }
 
 /// The host driver asks EC2 Fleet for every template and subnet of the region at once, reads a
@@ -6151,14 +6516,14 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     .unwrap();
     d.endpoints.insert("us-east-1".into(), base);
     let spot = d
-        .launch("us-east-1", Market::Spot, 1, "token-spot")
+        .launch("us-east-1", Market::Spot, 1, "token-spot", &[])
         .await
         .unwrap();
     assert!(spot.ids.is_empty(), "{spot:?}");
     assert_eq!(spot.refused.len(), 1, "{spot:?}");
     assert!(spot.refused[0].starts_with("UnfulfillableCapacity: "));
     let od = d
-        .launch("us-east-1", Market::OnDemand, 1, "token-od")
+        .launch("us-east-1", Market::OnDemand, 1, "token-od", &[])
         .await
         .unwrap();
     assert_eq!(od.ids, vec!["i-1234567890abcdef0".to_string()]);
@@ -6237,11 +6602,11 @@ async fn a_lost_create_fleet_is_asked_again_with_the_same_parameters() {
     d.endpoints.insert("us-east-1".into(), base);
     // Every launch reads the template again, as one after the cache's five minutes does.
     d.template_type_ttl = Duration::ZERO;
-    d.launch("us-east-1", Market::OnDemand, 1, "token-lost")
+    d.launch("us-east-1", Market::OnDemand, 1, "token-lost", &[])
         .await
         .expect_err("the first answer is lost");
     let again = d
-        .launch("us-east-1", Market::OnDemand, 1, "token-lost")
+        .launch("us-east-1", Market::OnDemand, 1, "token-lost", &[])
         .await
         .expect("the retry with the same token is answered");
     assert_eq!(again.ids, vec!["i-1234567890abcdef0".to_string()]);
@@ -6258,7 +6623,7 @@ async fn a_lost_create_fleet_is_asked_again_with_the_same_parameters() {
         "g4dn.metal"
     );
     // A new launch reads the changed type.
-    d.launch("us-east-1", Market::OnDemand, 1, "token-new")
+    d.launch("us-east-1", Market::OnDemand, 1, "token-new", &[])
         .await
         .unwrap();
     let calls = api.calls.lock().unwrap().clone();
@@ -6972,12 +7337,12 @@ fn subzone_names() -> (
     fcvm::fleet::coord::Names,
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
 ) {
-    use fcvm::fleet::coord::authority::{Zone, ZoneConfig};
+    use fcvm::fleet::coord::authority::{Acme, Zone, ZoneConfig};
     let cfg = Arc::new(
         ZoneConfig::new(
             "tiles.fcvm.example",
             &["ns1-tiles.fcvm.example".into()],
-            Some("_acme-challenge.fcvm.example"),
+            Acme::Cname("_acme-challenge.fcvm.example".into()),
         )
         .unwrap(),
     );

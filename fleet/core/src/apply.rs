@@ -2150,7 +2150,9 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. Once
 ///   every host the launcher keeps (`expected_hosts`) has connected and none is draining,
 ///   the first term is at most the GPUs the wall could place, so a GPU no hello listed
-///   leaves no place. The
+///   leaves no place. With `fill_from_serving_hosts`, while any GPU is on the wall the side
+///   has one place per GPU on it: a host that drains or has not joined leaves no dark
+///   place. The
 ///   GPUs are grouped into one band per host and the places left over are one dark band
 ///   below them.
 /// - Asleep, neither side has a place.
@@ -2235,6 +2237,11 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     });
     let fcvm_places = if asleep {
         0
+    } else if c.fill_from_serving_hosts && !active.is_empty() {
+        // No place waits for a host while another renders: a reclaimed host's GPUs leave
+        // the wall at the notice and the rest re-tile coarser, with no hole, until its
+        // replacement's GPUs render.
+        active.len()
     } else {
         let configured = c
             .fcvm_tiles
