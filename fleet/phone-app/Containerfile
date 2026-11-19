@@ -5,8 +5,19 @@
 # Maven Central and the Gradle plugin portal, checked against gradle/verification-metadata.xml.
 # `make -C fleet/phone-app` builds it.
 FROM docker.io/library/ubuntu:24.04
-RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-      openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools \
+# apt's Acquire::http::Timeout counts only time without data, so a connection that keeps
+# trickling never trips it: in run 44504825691 one archive.ubuntu.com address served the JDK at
+# 65 kB/s for 11 minutes while other runs fetched the same 133 MB in 2 to 49 s. Each attempt at
+# the downloads therefore has a wall-clock bound, and an attempt that runs out is retried on a
+# new connection; apt resumes its partial downloads. Installing reads only the downloaded files.
+RUN apt="apt-get -q -o Acquire::http::Timeout=30 -o Acquire::Retries=3" \
+    pkgs="openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools"; \
+    for attempt in 1 2 3; do \
+      timeout 60 $apt update && timeout 120 $apt install -y --no-install-recommends --download-only $pkgs && break; \
+      [ "$attempt" -lt 3 ] || { echo "apt: the package downloads failed 3 times (60 s for update, 120 s for the packages, each attempt)" >&2; exit 1; }; \
+      echo "apt: attempt $attempt failed or ran out of time; retrying" >&2; \
+    done \
+    && DEBIAN_FRONTEND=noninteractive $apt install -y --no-install-recommends $pkgs \
     && rm -rf /var/lib/apt/lists/*
 ARG GRADLE_VERSION=8.10.2
 ARG GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26

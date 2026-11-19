@@ -21,11 +21,17 @@ IMAGE := localhost/fcvm-phone-app-build:$(shell sha256sum Containerfile | cut -c
 PODMAN ?= podman
 RUN = $(PODMAN) run --rm -v "$(CURDIR):/src" -v "$(GRADLE_HOME):/gradle-home" $(IMAGE)
 
-.PHONY: image gradle-dist test apk verification-metadata
+.PHONY: image image-name gradle-dist test apk verification-metadata
+# The build's output goes to stderr, where a log keeps it: make apk's stdout is the APK path
+# (scripts/phone/app.sh reads it).
 image:
 	@$(PODMAN) image exists $(IMAGE) || { \
 	  $(MAKE) --no-print-directory gradle-dist && \
-	  $(PODMAN) build -q -t $(IMAGE) . > /dev/null; }
+	  $(PODMAN) build -t $(IMAGE) . >&2; }
+
+# The tag `make image` builds; CI saves and loads that image by it.
+image-name:
+	@echo $(IMAGE)
 
 # Stages the distribution at .gradle-dist/$(GRADLE_ZIP). cached-download.sh publishes both the
 # cached copy and the staged one by rename: another `make image` in this checkout may be

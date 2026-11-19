@@ -300,7 +300,7 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.fleet == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The viewer-path smoke's tests encode and decode H.264 with ffmpeg (libx264); the EC2
@@ -347,8 +347,33 @@ jobs:
         with:
           path: ${{ runner.temp }}/gradle-home/caches
           key: phone-app-gradle-home-${{ hashFiles('fleet/phone-app/Containerfile', 'fleet/phone-app/**/*.gradle.kts', 'fleet/phone-app/gradle.properties', 'fleet/phone-app/gradle/verification-metadata.xml') }}
+      # The build image, keyed by the Containerfile like its tag. Building it fetches 167 MB from
+      # archive.ubuntu.com, which has taken from 15 s to past the job's timeout (run
+      # 44504825691), so a cache hit loads the image and makes no apt request.
+      - name: Restore the phone app build image
+        id: phone-image
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/phone-app-image
+          key: phone-app-image-${{ hashFiles('fleet/phone-app/Containerfile') }}
+      - name: Load the phone app build image
+        if: steps.phone-image.outputs.cache-hit == 'true'
+        run: podman load -i "$RUNNER_TEMP/phone-app-image/image.tar"
+      # A healthy run takes under a minute; the Containerfile bounds apt's attempts to 9 minutes.
       - name: Phone app scene tests (fleet/phone-app)
+        timeout-minutes: 11
         run: make -C fleet/phone-app test GRADLE_HOME="$RUNNER_TEMP/gradle-home" GRADLE_DIST="$RUNNER_TEMP/gradle-dist"
+      - name: Export the phone app build image
+        if: steps.phone-image.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/phone-app-image"
+          podman save -o "$RUNNER_TEMP/phone-app-image/image.tar" "$(make -s -C fleet/phone-app image-name)"
+      - name: Save the phone app build image
+        if: steps.phone-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/phone-app-image
+          key: phone-app-image-${{ hashFiles('fleet/phone-app/Containerfile') }}
       - name: Renderer host tests
         run: |
           set -euo pipefail
