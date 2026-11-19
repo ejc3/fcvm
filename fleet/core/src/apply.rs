@@ -773,6 +773,8 @@ fn budget_step(state: &mut State, at: u64) {
     for n in claimed {
         release(f, n, at);
     }
+    // A claim a restart carried over, its host not back yet, ends with the rest.
+    release_held(f, |_| true, at);
     let phones: Vec<u32> = f
         .phones
         .iter()
@@ -916,6 +918,7 @@ fn intent_effect(
             Intent::Wake
                 | Intent::RestartNow
                 | Intent::ClaimGpu
+                | Intent::ResumeClaim { .. }
                 | Intent::ClaimPhone { .. }
                 | Intent::ClaimWindows { .. }
                 | Intent::ClaimMinecraft { .. }

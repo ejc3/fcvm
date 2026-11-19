@@ -179,6 +179,44 @@ fn a_claim_no_page_takes_back_ends_when_the_resume_window_closes() {
     );
 }
 
+/// A spent day's budget ends a claim a restart carried over (its host not back yet), as it
+/// ends a claim on a slot, and refuses a page taking a claim back while the fleet rests.
+#[test]
+fn a_spent_budget_ends_a_held_claim_and_refuses_its_resume() {
+    let (mut s, _) = claimed_then_restarted(5000);
+    assert_eq!(s.fleet.held_claims.len(), 1);
+    s.config.daily_spend_usd = Some(10.0);
+    // 100 USD an hour reaches the 10 USD ceiling within the trip lead at once.
+    let s = run(
+        s,
+        vec![
+            ev(json!({"at": 6000, "type": "burn", "usd_per_hour": 100.0, "instances": 3})),
+            tick(7000),
+        ],
+    );
+    assert!(fleet_core::spend::resting(&s, 7000));
+    assert!(s.fleet.held_claims.is_empty(), "{:?}", s.fleet.held_claims);
+    assert_eq!(s.fleet.last_claim_end.get("198.51.100.20"), Some(&6000));
+    let s = run(
+        s,
+        vec![
+            joined(8000, "v2"),
+            intent(
+                8000,
+                "v2",
+                "r1",
+                "resume_claim",
+                json!({"token": "token-a"}),
+            ),
+        ],
+    );
+    let r = s.receipt("r1").unwrap();
+    assert_eq!(
+        (r.outcome, r.reason.as_deref()),
+        (Outcome::Refused, Some(fleet_core::spend::SPENT))
+    );
+}
+
 #[test]
 fn a_restarted_coordinator_gives_no_claim_to_a_new_viewer_with_the_old_id() {
     let (s, _) = claimed_then_restarted(5000);
