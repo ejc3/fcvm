@@ -50,6 +50,7 @@ fn test_run_args(name: &str) -> RunArgs {
         user: None,
         forward_localhost: vec![],
         hugepages: false,
+        host_thp: false,
         portable_volumes: false,
         image_mode: None,
         rootfs_type: None,

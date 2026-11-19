@@ -342,11 +342,15 @@ impl Default for BootSource {
     }
 }
 
+/// Firecracker's `huge_pages` value for guest memory on host transparent huge pages
+/// (`HugePageConfig::Transparent`, which applies `madvise(MADV_HUGEPAGE)`).
+pub const TRANSPARENT_HUGE_PAGES: &str = "Transparent";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MachineConfig {
     pub vcpu_count: u8,
     pub mem_size_mib: u32,
-    /// 2MB hugepage backing ("2M" or None)
+    /// Guest memory backing: "2M" (hugetlbfs), `TRANSPARENT_HUGE_PAGES`, or None (4 KiB)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub huge_pages: Option<String>,
 }
@@ -483,10 +487,20 @@ impl FirecrackerConfig {
     /// identity address (`commands::common::RestoreIdentity`), so runs on different
     /// hosts share one snapshot.
     fn keyed(&self) -> std::borrow::Cow<'_, Self> {
-        if self.port_mappings.is_empty() && !self.env_vars.iter().any(|e| is_restore_set_env(e)) {
+        let transparent = self.machine_config.huge_pages.as_deref() == Some(TRANSPARENT_HUGE_PAGES);
+        if self.port_mappings.is_empty()
+            && !transparent
+            && !self.env_vars.iter().any(|e| is_restore_set_env(e))
+        {
             return std::borrow::Cow::Borrowed(self);
         }
         let mut keyed = self.clone();
+        // Transparent huge pages change only how a cold boot's memory is backed: every
+        // restore loads with 4 KiB pages (`load_huge_pages`), so runs that differ in
+        // `--host-thp` share their snapshots.
+        if transparent {
+            keyed.machine_config.huge_pages = None;
+        }
         keyed.env_vars.retain(|entry| !is_restore_set_env(entry));
         let mut guest: Vec<crate::network::PortMapping> = self
             .port_mappings
@@ -1243,6 +1257,20 @@ mod tests {
         let mut config2 = test_config();
         config2.machine_config.huge_pages = Some("2M".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    /// `--host-thp` backs only a cold boot's memory with huge pages; every restore loads
+    /// with 4 KiB pages, so runs with and without it share their snapshots.
+    #[test]
+    fn transparent_huge_pages_are_not_in_the_snapshot_keys() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.machine_config.huge_pages = Some(TRANSPARENT_HUGE_PAGES.to_string());
+        assert_eq!(config1.snapshot_key(), config2.snapshot_key());
+        assert_eq!(
+            config1.startup_snapshot_base_key(),
+            config2.startup_snapshot_base_key()
+        );
     }
 
     /// The health-check URL decides when a run is Healthy, which is when its startup

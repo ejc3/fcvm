@@ -271,6 +271,12 @@ pub struct SnapshotMetadata {
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
+    /// Whether the snapshotted VM's memory was on host transparent huge pages
+    /// (`podman run --host-thp`). Firecracker records that setting in the snapshot and
+    /// would advise a restored clone's memory with MADV_HUGEPAGE too, so a restore asks
+    /// for plain 4 KiB memory instead.
+    #[serde(default)]
+    pub host_thp: bool,
     /// Extra disk images from the baseline VM (for clone disk-dir support)
     #[serde(default)]
     pub extra_disks: Vec<SnapshotExtraDisk>,
@@ -1183,6 +1189,7 @@ mod tests {
                 guest_thp_restore: false,
                 dns_override: None,
                 hugepages: false,
+                host_thp: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
                 nfs_shares: vec![],
@@ -1400,6 +1407,7 @@ mod tests {
                 guest_thp_restore: false,
                 dns_override: None,
                 hugepages: false,
+                host_thp: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
                 nfs_shares: vec![],
@@ -1500,6 +1508,7 @@ mod tests {
                     guest_thp_restore: false,
                     dns_override: None,
                     hugepages: false,
+                    host_thp: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
                     nfs_shares: vec![],
@@ -1587,6 +1596,7 @@ mod tests {
                 guest_thp_restore: false,
                 dns_override: None,
                 hugepages: false,
+                host_thp: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
                 nfs_shares: vec![],
@@ -1799,6 +1809,7 @@ mod tests {
                 guest_thp_restore: false,
                 dns_override: None,
                 hugepages: false,
+                host_thp: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
                 nfs_shares: vec![],
@@ -1998,6 +2009,7 @@ mod tests {
             guest_thp_restore: false,
             dns_override: None,
             hugepages: false,
+            host_thp: false,
             extra_disks: vec![],
             pmem_devices: vec![],
             nfs_shares: vec![],

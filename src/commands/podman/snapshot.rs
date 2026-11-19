@@ -547,11 +547,7 @@ pub(super) fn build_firecracker_config(
         machine_config: MachineConfig {
             vcpu_count: args.cpu,
             mem_size_mib: args.mem,
-            huge_pages: if args.hugepages {
-                Some("2M".to_string())
-            } else {
-                None
-            },
+            huge_pages: args.machine_huge_pages(),
         },
         drives: vec![Drive {
             drive_id: "rootfs".to_string(),

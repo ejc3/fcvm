@@ -1092,6 +1092,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub hugepages: bool,
 
+    /// Back a cold-booted VM's memory with the host's transparent huge pages
+    /// (Firecracker `huge_pages: "Transparent"`, `madvise(MADV_HUGEPAGE)`). The guest's
+    /// first write to a page of its memory then takes one host fault per 2 MiB instead of
+    /// one per 4 KiB. It needs a host whose transparent huge page mode is `madvise` or
+    /// `always`. It applies only while the cold-booted VM runs: restores of its snapshots
+    /// ask for plain 4 KiB memory, as every restore does, so it is not part of the
+    /// snapshot cache key, and a run that restores a cached snapshot, or that tears its
+    /// cold boot down and restores the pre-start snapshot, runs without it. Memory size
+    /// (--mem) must be divisible by 2.
+    #[arg(long, conflicts_with = "hugepages")]
+    pub host_thp: bool,
+
     /// Minimum free space on root filesystem (default: 10G).
     /// Disk is expanded after CoW copy if free space is below this threshold.
     #[arg(long, default_value = "10G")]
@@ -1441,6 +1453,21 @@ pub struct RunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+}
+
+impl RunArgs {
+    /// Firecracker's `huge_pages` for this run's cold boot: "2M" for `--hugepages`,
+    /// "Transparent" for `--host-thp`, and none (4 KiB pages) otherwise. The launch config
+    /// and the keyed config both take it from here.
+    pub fn machine_huge_pages(&self) -> Option<String> {
+        if self.hugepages {
+            Some("2M".to_string())
+        } else if self.host_thp {
+            Some(crate::firecracker::TRANSPARENT_HUGE_PAGES.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -2270,6 +2297,25 @@ mod tests {
             },
             _ => panic!("expected `podman run` command"),
         }
+    }
+
+    /// `--host-thp` asks for transparent huge pages and `--hugepages` for hugetlbfs pages;
+    /// a VM's memory takes one, so the two together are a usage error.
+    #[test]
+    fn host_thp_conflicts_with_hugepages() {
+        assert!(parse_run(&["--host-thp", "nginx"]).host_thp);
+        let error = Cli::try_parse_from([
+            "fcvm",
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--host-thp",
+            "--hugepages",
+            "nginx",
+        ])
+        .expect_err("--host-thp with --hugepages");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     fn parse_prepare(extra: &[&str]) -> PrepareArgs {

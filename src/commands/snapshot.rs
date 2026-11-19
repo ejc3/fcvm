@@ -4154,6 +4154,7 @@ async fn cmd_snapshot_run_inner(
         vsock_target_dir: clone_vsock_base.parent().map(std::path::Path::to_path_buf),
         snapshot_vm_id,
         hugepages,
+        host_thp: snapshot_config.metadata.host_thp,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
         snapshot_dir: Some(snapshot_dir),
     };
@@ -5869,6 +5870,9 @@ fn run_args_from_snapshot_metadata(
         user: meta.user.clone(),
         forward_localhost: meta.forward_localhost.clone(),
         hugepages: meta.hugepages,
+        // A podman run option for that run's own cold boot; a snapshot's later cold boots
+        // (a reboot, a disk-only clone) use 4 KiB pages, as its restores do.
+        host_thp: false,
         portable_volumes: meta.volumes.iter().any(|v| v.portable),
         // Recorded delivery mode so the MMDS plan tells fc-agent how to re-attach
         // the image device on a provisioned boot (overlay re-mounts its store).
@@ -6140,6 +6144,7 @@ async fn cmd_snapshot_run_raw(
             .is_some()
             .then(|| snapshot_config.vm_id.clone()),
         hugepages: false,
+        host_thp: false,
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
     };
@@ -7429,6 +7434,7 @@ mod tests {
             guest_thp_restore: false,
             dns_override: Some(None),
             hugepages: false,
+            host_thp: false,
             extra_disks: vec![],
             pmem_devices: vec![],
             nfs_shares: vec![],

@@ -957,6 +957,47 @@ fn validate_free_page_reporting(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `--host-thp` where it cannot apply: with `--hugepages`, for a memory size that
+/// is not a whole number of 2 MiB pages (Firecracker refuses it), on Cloud Hypervisor
+/// (not given the setting), and on a host whose transparent huge pages are off.
+fn validate_host_thp(args: &RunArgs) -> Result<()> {
+    if !args.host_thp {
+        return Ok(());
+    }
+    check_host_thp(
+        args,
+        &std::fs::read_to_string(HOST_THP_MODE_PATH).unwrap_or_default(),
+    )
+}
+
+/// `validate_host_thp` against the contents of `HOST_THP_MODE_PATH`.
+fn check_host_thp(args: &RunArgs, mode: &str) -> Result<()> {
+    anyhow::ensure!(
+        !args.hugepages,
+        "--host-thp and --hugepages are exclusive: guest memory is on transparent huge pages \
+         or on hugetlbfs pages, not both"
+    );
+    anyhow::ensure!(
+        args.mem.is_multiple_of(2),
+        "--mem {} is not divisible by 2: --host-thp requires 2MB-aligned memory size",
+        args.mem
+    );
+    anyhow::ensure!(
+        args.hypervisor == crate::cli::args::Hypervisor::Firecracker,
+        "--host-thp is not supported with --hypervisor cloud-hypervisor"
+    );
+    anyhow::ensure!(
+        !mode.contains("[never]"),
+        "--host-thp needs the host's transparent huge pages, and {HOST_THP_MODE_PATH} reads \
+         {:?}: set it to madvise or always",
+        mode.trim()
+    );
+    Ok(())
+}
+
+/// The host's transparent huge page mode; the selected one is in brackets.
+const HOST_THP_MODE_PATH: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
+
 /// Refuse `--nfs` without bridged networking. The share is exported to the guest's IP.
 /// A rootless guest reaches the host through pasta, so the host's nfsd sees the mount
 /// come from pasta's host-side address and refuses it ("access denied by server"); a
@@ -1643,6 +1684,7 @@ async fn prepare_vm_for_lifecycle(
             args.mem
         );
     }
+    validate_host_thp(&args)?;
     validate_balloon_target(args.balloon, args.mem)?;
     validate_free_page_reporting(&args)?;
     validate_nfs_network(&args)?;
@@ -2196,6 +2238,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.guest_thp_restore = true;
     vm_state.config.dns_override = Some(args.dns.clone());
     vm_state.config.hugepages = args.hugepages;
+    vm_state.config.host_thp = args.host_thp;
     vm_state.config.balloon_mib = args.balloon;
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
     vm_state.config.portable_volumes = args.portable_volumes;
@@ -4448,6 +4491,7 @@ mod tests {
             user: None,
             forward_localhost: vec![],
             hugepages: false,
+            host_thp: false,
             portable_volumes: false,
             image_mode: None,
             rootfs_type: None,
@@ -5437,6 +5481,40 @@ mod tests {
             switch_checked < looked_up,
             "prepare_vm_for_lifecycle looks the snapshot cache up before it checks --free-page-reporting"
         );
+    }
+
+    /// `--host-thp` is refused for an odd `--mem`, which Firecracker would reject at
+    /// boot, for Cloud Hypervisor, which is not given the setting, on a host whose
+    /// transparent huge pages are off, and with `--hugepages`, which RunArgs built without
+    /// clap (the serve API, a library caller) can carry.
+    #[test]
+    fn host_thp_needs_even_memory_and_firecracker() {
+        const MADVISE: &str = "always [madvise] never\n";
+        let mut args = test_args();
+        args.host_thp = true;
+        args.mem = 1025;
+        let error = check_host_thp(&args, MADVISE)
+            .expect_err("odd --mem")
+            .to_string();
+        assert!(error.contains("--mem 1025"), "{error}");
+        args.mem = 1024;
+        check_host_thp(&args, MADVISE).expect("even --mem");
+        check_host_thp(&args, "[always] madvise never\n").expect("always");
+        let error = check_host_thp(&args, "always madvise [never]\n")
+            .expect_err("host transparent huge pages off")
+            .to_string();
+        assert!(error.contains("[never]"), "{error}");
+        args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor;
+        let error = check_host_thp(&args, MADVISE)
+            .expect_err("cloud hypervisor")
+            .to_string();
+        assert!(error.contains("cloud-hypervisor"), "{error}");
+        args.hypervisor = crate::cli::args::Hypervisor::Firecracker;
+        args.hugepages = true;
+        let error = check_host_thp(&args, MADVISE)
+            .expect_err("with --hugepages")
+            .to_string();
+        assert!(error.contains("--hugepages"), "{error}");
     }
 
     /// A rootless or routed `--nfs` run is refused before it boots, by name (#1009: they

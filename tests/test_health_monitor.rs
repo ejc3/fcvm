@@ -72,6 +72,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             interactive: false,
             labels: std::collections::HashMap::new(),
             hugepages: false,
+            host_thp: false,
             portable_volumes: false,
             user: None,
             username: None,

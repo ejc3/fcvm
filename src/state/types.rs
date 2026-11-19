@@ -268,6 +268,11 @@ pub struct VmConfig {
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
+    /// Whether this VM was cold-booted with its memory on host transparent huge pages
+    /// (`podman run --host-thp`). Its snapshots record it, and their restores ask for plain
+    /// 4 KiB memory instead of the huge page setting the snapshot holds.
+    #[serde(default)]
+    pub host_thp: bool,
     /// Whether FUSE volumes use portable inode numbering (RemapFs)
     #[serde(default)]
     pub portable_volumes: bool,
@@ -450,6 +455,7 @@ impl VmState {
                 interactive: false,
                 labels: HashMap::new(),
                 hugepages: false,
+                host_thp: false,
                 portable_volumes: false,
                 user: None,
                 username: None,

@@ -2607,6 +2607,21 @@ fn serve_prefilled_backing(
     }))
 }
 
+/// The `huge_pages` a snapshot load asks for, or `None` for the setting the snapshot
+/// recorded. A prefilled backing is 2 MiB hugetlbfs pages. A snapshot of a VM cold-booted
+/// with `--host-thp` records `Transparent`, and a load that reused it would advise the
+/// clone's memory with MADV_HUGEPAGE; the load asks for "None" instead, so its clones
+/// restore exactly as clones of a 4 KiB VM do. Any other load sends no value, because a
+/// Firecracker build without the field (an older snapshot's recorded binary) refuses a
+/// load that names it.
+fn load_huge_pages(backend: &MemoryBackend, host_thp: bool) -> Option<String> {
+    match backend {
+        MemoryBackend::Prefilled { .. } => Some("2M".to_string()),
+        _ if host_thp => Some("None".to_string()),
+        _ => None,
+    }
+}
+
 /// Configuration for restoring a VM from a snapshot
 pub struct SnapshotRestoreConfig {
     /// VM state path (vmstate.bin)
@@ -2633,6 +2648,9 @@ pub struct SnapshotRestoreConfig {
     pub snapshot_vm_id: Option<String>,
     /// Whether this VM uses hugepages
     pub hugepages: bool,
+    /// Whether the snapshot was taken from a VM on host transparent huge pages, whose
+    /// load asks for plain 4 KiB memory (`load_huge_pages`).
+    pub host_thp: bool,
     /// Extra disk images to copy from snapshot directory
     pub extra_disks: Vec<crate::storage::snapshot::SnapshotExtraDisk>,
     /// Snapshot directory for extra disk source files
@@ -4133,10 +4151,7 @@ pub async fn restore_from_snapshot(
             } => Some(serve_prefilled_backing(socket_path, backing.clone())?),
             _ => None,
         };
-        let huge_pages = match &restore_config.memory_backend {
-            MemoryBackend::Prefilled { .. } => Some("2M".to_string()),
-            _ => None,
-        };
+        let huge_pages = load_huge_pages(&restore_config.memory_backend, restore_config.host_thp);
 
         // Timing instrumentation: measure snapshot load operation
         let load_start = std::time::Instant::now();
@@ -5008,6 +5023,7 @@ pub fn build_snapshot_config(
             guest_thp_restore: vm_state.config.guest_thp_restore,
             dns_override: vm_state.config.dns_override.clone(),
             hugepages: vm_state.config.hugepages,
+            host_thp: vm_state.config.host_thp,
             extra_disks,
             pmem_devices: vm_state.config.pmem_devices.clone(),
             nfs_shares: vm_state.config.nfs_shares.clone(),
@@ -7186,6 +7202,35 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// A prefilled load asks for 2 MiB pages, a load of a `--host-thp` snapshot for plain
+    /// 4 KiB memory, and any other load sends no value, so a Firecracker without the field
+    /// never sees it.
+    #[test]
+    fn a_host_thp_snapshot_loads_with_4k_pages() {
+        let uffd = super::MemoryBackend::Uffd {
+            socket_path: "/tmp/uffd.sock".into(),
+        };
+        let file = super::MemoryBackend::File {
+            memory_path: "/tmp/memory.bin".into(),
+        };
+        assert_eq!(super::load_huge_pages(&uffd, true).as_deref(), Some("None"));
+        assert_eq!(super::load_huge_pages(&file, true).as_deref(), Some("None"));
+        assert_eq!(super::load_huge_pages(&uffd, false), None);
+        assert_eq!(super::load_huge_pages(&file, false), None);
+        let prefilled = super::MemoryBackend::Prefilled {
+            socket_path: "/tmp/prefilled.sock".into(),
+            backing: std::sync::Arc::new(tempfile::tempfile().unwrap()),
+        };
+        assert_eq!(
+            super::load_huge_pages(&prefilled, false).as_deref(),
+            Some("2M")
+        );
+        assert_eq!(
+            super::load_huge_pages(&prefilled, true).as_deref(),
+            Some("2M")
+        );
+    }
+
     /// The namespace holder is not in fcvm's process group. In it, the Ctrl+C that fcvm
     /// handles also killed the holder, and the run loop could report that death and exit 1
     /// instead of shutting down cleanly (`test_ctrlc_via_terminal`).
@@ -10040,23 +10085,6 @@ mod tests {
         assert_eq!(&hello[..len], PREFILLED_BACKING_HELLO);
         assert_eq!(fd.expect("no descriptor").metadata().unwrap().ino(), ino);
         assert!(!socket.exists(), "the backing socket outlived the handover");
-    }
-
-    /// A prefilled load asks Firecracker for 2 MiB pages; others send no page size, so a
-    /// Firecracker without the field never sees it.
-    #[test]
-    fn only_a_prefilled_load_names_a_page_size() {
-        let code = include_str!("common.rs");
-        let code = &code[..code.find("#[cfg(test)]\nmod tests {").unwrap()];
-        let start = code
-            .find("let huge_pages = match &restore_config.memory_backend {")
-            .unwrap();
-        let body = &code[start..start + code[start..].find("};").unwrap()];
-        assert!(
-            body.contains(r#"MemoryBackend::Prefilled { .. } => Some("2M".to_string())"#),
-            "{body}"
-        );
-        assert!(body.contains("_ => None"), "{body}");
     }
 
     #[test]
