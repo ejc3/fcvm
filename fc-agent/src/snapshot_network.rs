@@ -2379,8 +2379,25 @@ async fn publish_with<G: FirewallGate, H: RestoreHook>(
     Ok(report)
 }
 
-pub async fn prepare_snapshot_network() -> Result<()> {
+/// The source boundary's prepare, for the create whose token is `token`
+/// (`boundary_token`). Under the boundary lock: a prepare that a reopen of its token
+/// already overtook refuses and changes nothing; otherwise the container is frozen first,
+/// so it opens no socket and faults no page while the boundary closes, and a restored
+/// clone starts with it frozen (payload_freeze). A failed prepare thaws it again: the host
+/// reopens the source on its own when the prepare fails.
+pub async fn prepare_snapshot_network(token: &str) -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
+    crate::boundary_token::prepare(
+        Path::new(crate::boundary_token::RECORD_PATH),
+        token,
+        crate::payload_freeze::freeze,
+        crate::payload_freeze::thaw,
+        prepare_source_boundary,
+    )
+    .await
+}
+
+async fn prepare_source_boundary() -> Result<()> {
     let gate = IptablesGate::new(SystemCommandRunner);
     let receive_barrier = SystemPacketReceiveBarrier::new();
     let mut diagnostic = SystemSocketDiagnostic::new();
@@ -2436,9 +2453,24 @@ pub fn resume_host_time(args: &[String]) -> Option<&str> {
 /// A clone also replaces its chronyd, because the daemon it inherits may have
 /// measured a lag before the snapshot, and the source's daemon has not. A failed step
 /// or chronyc call is logged and does not stop the reopen.
-pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
+pub async fn resume_source_network(host_time: Option<&str>, token: &str) -> Result<()> {
     let started = std::time::Instant::now();
     let _transaction_lock = acquire_boundary_lock()?;
+    // Under the lock: a prepare of this token that has not begun is cancelled before the
+    // reopen, and the container thaws after it (`boundary_token`).
+    crate::boundary_token::reopen(
+        Path::new(crate::boundary_token::RECORD_PATH),
+        token,
+        crate::payload_freeze::thaw,
+        || reopen_source_boundary(host_time, started),
+    )
+    .await
+}
+
+async fn reopen_source_boundary(
+    host_time: Option<&str>,
+    started: std::time::Instant,
+) -> Result<()> {
     // The pause is over (or never happened, after a failed prepare). A failure only
     // leaves the agent's lines held until the hold's cap.
     if let Err(error) = crate::console::request_source_release().await {

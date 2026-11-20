@@ -3463,3 +3463,175 @@ async fn test_lifecycle_interleave_snapshot_create_waits_behind_an_export_of_the
     common::delete_snapshot(&snapshot).await.ok();
     result
 }
+
+// ---------------------------------------------------------------------------
+// CASE: killed_snapshot_create_resumes_its_source
+// ---------------------------------------------------------------------------
+
+/// Pins #1936: a `snapshot create` killed while its source is paused leaves nothing paused.
+///
+/// Interleaving: the create is held at `snapshot.post_save_pre_resume`, where the source's
+/// VMM is paused and its guest gate shut, and is SIGKILLed there. A SIGKILL runs none of
+/// the create's own reopen paths. Oracle: within 15 s the guest answers an exec and the
+/// published port answers, and a following create of the same VM succeeds.
+///
+/// RED BEFORE THE FIX: nothing resumed the source; the exec and the port stayed dead, and
+/// the next create failed to reach fc-agent.
+async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &str) -> Result<()> {
+    let (vm_name, _, snapshot, second_snapshot) = common::unique_names(prefix);
+    let host_port = common::find_available_high_port()?;
+    let publish = format!("{host_port}:80");
+    let (mut vm, vm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--hypervisor",
+        hypervisor,
+        "--no-snapshot",
+        "--publish",
+        &publish,
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    // Outside the case, so every way out of it kills and reaps the create: one left held at
+    // its failpoint keeps the snapshot's generation lock, which the cleanup's delete waits on.
+    let mut held_create: Option<tokio::process::Child> = None;
+
+    let result = async {
+        common::poll_health_by_pid(vm_pid, 300).await?;
+        let ip = common::get_loopback_ip(vm_pid).await?;
+        let before = common::curl_check(&ip, host_port, 5).await;
+        anyhow::ensure!(
+            before.success,
+            "the published port did not answer before the snapshot: {}",
+            before.error
+        );
+
+        let scratch = tempfile::tempdir().context("creating the hold directory")?;
+        let hold = format!(
+            "snapshot.post_save_pre_resume:block_until_file:{}",
+            scratch.path().join("never").display()
+        );
+        let (create, create_pid, create_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &vm_pid.to_string(),
+                "--tag",
+                &snapshot,
+            ],
+            &[("FCVM_FAILPOINT", &hold)],
+        )
+        .await?;
+        let create = held_create.insert(create);
+        wait_for_marker(
+            &create_log,
+            "FAILPOINT snapshot.post_save_pre_resume reached",
+            0,
+            Duration::from_secs(180),
+        )
+        .await?;
+
+        // Non-vacuity: the source is paused while the create is held.
+        let held = common::curl_check(&ip, host_port, 2).await;
+        anyhow::ensure!(
+            !held.success,
+            "the published port answered while the create held the source paused"
+        );
+
+        let deadline = Duration::from_secs(15);
+        let in_time = |what: &str, at: Duration| {
+            if at <= deadline {
+                Ok(at)
+            } else {
+                Err(format!(
+                    "{what} answered {at:?} after the SIGKILL, past {deadline:?}"
+                ))
+            }
+        };
+        let killed_at = Instant::now();
+        // SAFETY: kill(2) on the create's pid, which this test spawned and has not reaped.
+        anyhow::ensure!(
+            unsafe { libc::kill(create_pid as libc::pid_t, libc::SIGKILL) } == 0,
+            "SIGKILL of the create: {}",
+            std::io::Error::last_os_error()
+        );
+        let status = wait_exit(create, Duration::from_secs(10)).await?;
+        anyhow::ensure!(
+            !status.success(),
+            "the held create exited on its own: {status}"
+        );
+
+        let give_up = killed_at + deadline;
+        let exec = loop {
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(5),
+                common::exec_in_vm(vm_pid, &["/bin/true"]),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(_)) => break in_time("exec", killed_at.elapsed()),
+                Ok(Err(error)) if Instant::now() >= give_up => break Err(format!("{error:#}")),
+                Err(_) if Instant::now() >= give_up => break Err("exec timed out".to_string()),
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        };
+        let port = loop {
+            let attempt = common::curl_check(&ip, host_port, 2).await;
+            if attempt.success {
+                break in_time("port", killed_at.elapsed());
+            }
+            if Instant::now() >= give_up {
+                break Err(attempt.error);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        println!("after the SIGKILL: guest exec {exec:?}, published port {port:?}");
+        anyhow::ensure!(
+            exec.is_ok() && port.is_ok(),
+            "the source did not answer within 15 s of the create's SIGKILL: exec {exec:?}, \
+             port {port:?}; create log tail:\n{}",
+            log_tail(&create_log, 40)
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(300),
+            common::create_snapshot_by_pid(vm_pid, &second_snapshot),
+        )
+        .await
+        .context("the following create did not finish within 300 s")?
+        .context("the following create of the same VM")?;
+        Ok(())
+    }
+    .await;
+
+    if let Some(mut create) = held_create.take() {
+        let _ = create.start_kill();
+        let _ = wait_exit(&mut create, Duration::from_secs(10)).await;
+    }
+    sigterm(vm_pid).await;
+    let _ = wait_exit(&mut vm, Duration::from_secs(60)).await;
+    common::delete_snapshot(&snapshot).await.ok();
+    common::delete_snapshot(&second_snapshot).await.ok();
+    result
+}
+
+#[tokio::test]
+async fn test_lifecycle_interleave_killed_snapshot_create_resumes_its_source() -> Result<()> {
+    killed_snapshot_create_resumes_its_source("ilv-killed-create", "firecracker").await
+}
+
+/// The same on Cloud Hypervisor, whose create pauses its VMM the same way.
+// Host-Root CI provisions Cloud Hypervisor; container-test-all does not.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_lifecycle_interleave_cloud_hypervisor_killed_snapshot_create_resumes_its_source(
+) -> Result<()> {
+    fcvm::commands::common::find_cloud_hypervisor()
+        .context("this test requires the Cloud Hypervisor backend")?;
+    killed_snapshot_create_resumes_its_source("ilv-ch-killed-create", "cloud-hypervisor").await
+}

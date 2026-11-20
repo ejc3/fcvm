@@ -12,6 +12,7 @@ macro_rules! eprintln {
 
 mod agent;
 mod bootplan;
+mod boundary_token;
 mod console;
 mod container;
 mod exec;
@@ -87,24 +88,34 @@ async fn main() {
     // exec exit status so snapshot creation fails closed.
     let one_shot = std::env::args().nth(1);
     let one_shot_result = match one_shot.as_deref() {
+        // Both take the boundary lock and the create's token (`boundary_token`). The
+        // prepare freezes the container under the lock, after the token's check, and thaws
+        // it when it fails; the reopen thaws it under the lock.
         Some("--prepare-snapshot-network") => {
-            // The container is frozen first, so it opens no socket and faults no page
-            // while the boundary closes, and a restored clone starts with it frozen
-            // (payload_freeze). A failed prepare thaws it again: the host resumes the
-            // source on its own when the prepare fails.
-            payload_freeze::freeze();
-            let prepared = snapshot_network::prepare_snapshot_network().await;
-            if prepared.is_err() {
-                payload_freeze::thaw();
-            }
-            Some(prepared)
+            let args: Vec<String> = std::env::args().collect();
+            Some(match boundary_token::from_args(&args) {
+                Ok(token) => snapshot_network::prepare_snapshot_network(token).await,
+                Err(error) => Err(error),
+            })
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
-            let resumed =
-                snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
-                    .await;
-            payload_freeze::thaw();
+            let resumed = match boundary_token::from_args(&args) {
+                Ok(token) => {
+                    snapshot_network::resume_source_network(
+                        snapshot_network::resume_host_time(&args),
+                        token,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            // A reopen that failed before its fenced step (no token, or the lock could not
+            // be taken) still leaves nothing frozen. Thawing is idempotent, and nothing can
+            // freeze in between: the host starts no prepare before this one-shot returns.
+            if resumed.is_err() {
+                payload_freeze::thaw();
+            }
             Some(resumed)
         }
         _ => None,
@@ -228,15 +239,35 @@ mod tests {
         let prepare = squeezed
             .find("Some(\"--prepare-snapshot-network\")=>{")
             .expect("no prepare one-shot");
-        let freeze = squeezed[prepare..]
-            .contains("payload_freeze::freeze();letprepared=snapshot_network::prepare_snapshot_network().await;ifprepared.is_err(){payload_freeze::thaw();}");
+        // The fenced steps freeze, and thaw on failure, under the lock (their own tests in
+        // boundary_token run the order); the one-shots hand them the real freeze and thaw.
+        let boundary: String = include_str!("snapshot_network.rs")
+            .split_whitespace()
+            .collect();
         assert!(
-            freeze,
-            "the prepare does not freeze first and thaw on failure"
+            boundary.contains(
+                "let_transaction_lock=acquire_boundary_lock()?;crate::boundary_token::prepare(\
+                 Path::new(crate::boundary_token::RECORD_PATH),token,\
+                 crate::payload_freeze::freeze,crate::payload_freeze::thaw,"
+            ),
+            "the prepare does not freeze under the boundary lock and thaw on failure"
         );
+        let resume = &boundary[boundary
+            .find("pubasyncfnresume_source_network(")
+            .expect("no source resume")..];
+        let resume = &resume[..resume
+            .find("asyncfnreopen_source_boundary(")
+            .expect("no source reopen")];
+        let locked = resume.find("acquire_boundary_lock()?;").expect("no lock");
+        let thawed = resume
+            .find(
+                "crate::boundary_token::reopen(Path::new(crate::boundary_token::RECORD_PATH),\
+                 token,crate::payload_freeze::thaw,",
+            )
+            .expect("the source resume does not thaw through the fenced reopen");
         assert!(
-            squeezed.contains(".await;payload_freeze::thaw();Some(resumed)"),
-            "the source resume does not thaw"
+            locked < thawed,
+            "the source resume thaws outside the boundary lock"
         );
 
         let restore: String = crate::restore::handle_clone_restore_source()

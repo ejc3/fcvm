@@ -452,7 +452,8 @@ pub fn scope_request(cmd: &crate::cli::Commands) -> Option<bool> {
             SnapshotCommands::Create(_)
             | SnapshotCommands::Ls
             | SnapshotCommands::Export(_)
-            | SnapshotCommands::Import(_) => None,
+            | SnapshotCommands::Import(_)
+            | SnapshotCommands::SourceGuard(_) => None,
         },
         Commands::Vm(args) => match &args.cmd {
             VmCommands::Run(_) => Some(false),
