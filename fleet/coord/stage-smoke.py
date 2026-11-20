@@ -70,7 +70,7 @@ def describe(error):
     """Fixed text for an exception: one of this file's own messages, or an OS error's errno
     name; None for anything else (its text could name an endpoint)."""
     message = str(error)
-    if message in own_messages():
+    if message in own_messages() or message in refused_relaunch_messages():
         return message
     if isinstance(error, OSError) and error.errno in errno.errorcode:
         return errno.errorcode[error.errno]
@@ -1043,8 +1043,17 @@ REFUSALS = (
 )
 
 
+UNLISTED_REFUSAL = "an unlisted reason"
+
+
 def refusal_category(reason):
-    return next((why for text, why in REFUSALS if text in (reason or "")), "an unlisted reason")
+    return next((why for text, why in REFUSALS if text in (reason or "")), UNLISTED_REFUSAL)
+
+
+def refused_relaunch_messages():
+    """Every message a refused relaunch can raise (the relaunch step's `raise`, same
+    template): fixed text `describe` may print."""
+    return {f"staging refused the relaunch: {why}" for why in {w for _, w in REFUSALS} | {UNLISTED_REFUSAL}}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

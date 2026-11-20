@@ -75,6 +75,18 @@ class ProbeTests(unittest.TestCase):
                          "the per-viewer relaunch interval")
         self.assertEqual(smoke.refusal_category("wss://secret.example/x?token=abc"), "an unlisted reason")
         self.assertEqual(smoke.refusal_category(None), "an unlisted reason")
+        # The failure line carries the categorized message, and nothing else it was not given.
+        for why in {w for _, w in smoke.REFUSALS} | {"an unlisted reason"}:
+            message = f"staging refused the relaunch: {why}"
+            self.assertEqual(smoke.describe(AssertionError(message)), message)
+        self.assertIsNone(smoke.describe(AssertionError("staging refused the relaunch: wss://x.example/?t=1")))
+        # The relaunch step raises with the template the allowlist is built from.
+        import ast
+        tree = ast.parse((HERE / "stage-smoke.py").read_text())
+        templates = [ast.unparse(n.exc.args[0]) for n in ast.walk(tree)
+                     if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and n.exc.args
+                     and isinstance(n.exc.args[0], ast.JoinedStr) and "refused the relaunch" in ast.unparse(n.exc.args[0])]
+        self.assertEqual(templates, ["f'staging refused the relaunch: {why}'"])
 
     def test_waits_for_the_same_slot_at_a_later_generation(self):
         old = self.tile()
