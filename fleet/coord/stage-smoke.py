@@ -1005,6 +1005,48 @@ def relaunch_interval_seconds():
     return int(value[1].replace("_", "")) / 1000
 
 
+def ec2_relaunch_cooldown_seconds():
+    # As above: the coordinator's own constant, from the same commit as the image.
+    source = (Path(__file__).resolve().parent.parent / "core/src/apply.rs").read_text()
+    value = re.search(r"pub const EC2_RELAUNCH_COOLDOWN_MS: u64 = ([0-9_]+);", source)
+    if value is None:
+        raise ValueError("coordinator EC2 relaunch cooldown unavailable")
+    return int(value[1].replace("_", "")) / 1000
+
+
+# The coordinator's clock and the runner's are both NTP-synced; this covers what is left.
+CLOCK_SKEW_SECONDS = 2
+
+
+def relaunch_wait(tile, now_ms, cooldown):
+    """Seconds until the coordinator accepts a relaunch of this tile: an EC2 tile is refused
+    for `cooldown` after its last launch (a wake sets that too), an fcvm tile never."""
+    if tile.get("half") != "ec2":
+        return 0
+    launched = (tile.get("last_relaunch") or {}).get("clicked_at")
+    if launched is None:
+        return cooldown + CLOCK_SKEW_SECONDS
+    return max(0, (launched - now_ms) / 1000 + cooldown + CLOCK_SKEW_SECONDS)
+
+
+# A relaunch refusal's reason, as fixed text: the coordinator's own words name tiles and
+# counts, and a failure's message reaches the public job summary (`failed`).
+REFUSALS = (
+    ("can be relaunched in", "the tile's launch cooldown"),
+    ("per client", "the per-viewer relaunch interval"),
+    ("EC2 launches", "the EC2 launch budget"),
+    ("than viewers may launch", "the EC2 launch budget"),
+    ("viewer's own GPU", "a viewer holds the tile"),
+    ("draining host", "its host is draining"),
+    ("budget is spent", "the day's GPU budget is spent"),
+    ("no GPU behind", "the tile is gone"),
+)
+
+
+def refusal_category(reason):
+    return next((why for text, why in REFUSALS if text in (reason or "")), "an unlisted reason")
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -1099,6 +1141,7 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         connection.send({"type": "seat", "ticket": None})
         deadline = time.monotonic() + 720 + (900 if modes else 0)
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
+        cooldown = ec2_relaunch_cooldown_seconds()
         state, admission = {}, {}
         seat, reconnects, viewer = None, 0, None
         def take(message):
@@ -1150,9 +1193,12 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             if not token:
                 raise AssertionError("the smoke connection was given no direct token")
             return token
+        refusal = {}
         def commit(name, args, by=None):
             """Send an intent and wait for its receipt; whether it committed. With `by`, a
-            receipt that has not come by then counts as not committed."""
+            receipt that has not come by then counts as not committed. A refusal's reason is
+            left in `refusal["reason"]`."""
+            refusal.clear()
             intent = str(uuid.uuid4())
             connection.send({"type": "intent", "id": intent, "name": name, "args": args})
             limit = deadline if by is None else min(deadline, by)
@@ -1169,6 +1215,7 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 message = json.loads(payload)
                 take(message)
                 if message.get("type") == "receipt" and message.get("id") == intent:
+                    refusal["reason"] = message.get("reason")
                     return message.get("outcome") == "committed"
         if agents:
             step("/live: registered agents")
@@ -1200,12 +1247,15 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 prove_refused(old)
             step(f"renderer socket: {half} tile frames")
             prove_frame(old, direct())
-            delay = next_relaunch - time.monotonic()
+            delay = max(next_relaunch - time.monotonic(),
+                        relaunch_wait(ready(state, half, slot=old["slot"]) or old,
+                                      time.time() * 1000, cooldown))
             if delay > 0:
                 time.sleep(delay)
             step(f"/live: {half} relaunch receipt")
             if not commit("relaunch", {"tile": old["id"]}):
-                raise AssertionError("staging refused the relaunch")
+                why = refusal_category(refusal.get("reason"))
+                raise AssertionError(f"staging refused the relaunch: {why}")
             # Start the interval at the receipt, after the server accepted
             # the intent, so varying network latency cannot shorten it.
             next_relaunch = time.monotonic() + interval

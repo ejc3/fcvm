@@ -53,6 +53,29 @@ class ProbeTests(unittest.TestCase):
         smoke.fresh(old, {**old, "generation": 2, "frame_url": "wss://new.fcvm.dev/frames",
                           "frame_url_v4": "wss://new-v4.fcvm.dev/frames"})
 
+    def test_an_ec2_relaunch_waits_out_the_cooldown_from_the_tiles_last_launch(self):
+        # The coordinator refuses an EC2 relaunch within EC2_RELAUNCH_COOLDOWN_MS of the
+        # tile's last launch (`last_relaunch.clicked_at`, which a wake also sets).
+        cooldown = smoke.ec2_relaunch_cooldown_seconds()
+        self.assertEqual(cooldown, 90)
+        tile = {**self.tile(), "half": "ec2", "last_relaunch": {"clicked_at": 1_000_000}}
+        self.assertAlmostEqual(smoke.relaunch_wait(tile, 1_000_000 + 30_000, cooldown),
+                               60 + smoke.CLOCK_SKEW_SECONDS)
+        self.assertEqual(smoke.relaunch_wait(tile, 1_000_000 + 200_000, cooldown), 0)
+        # fcvm tiles have no launch cooldown.
+        self.assertEqual(smoke.relaunch_wait({**tile, "half": "fcvm"}, 1_000_000, cooldown), 0)
+        # An EC2 tile with no launch on record waits the whole cooldown.
+        self.assertEqual(smoke.relaunch_wait({**tile, "last_relaunch": None}, 1_000_000, cooldown),
+                         cooldown + smoke.CLOCK_SKEW_SECONDS)
+
+    def test_a_relaunch_refusal_names_its_reason_in_fixed_text(self):
+        self.assertEqual(smoke.refusal_category("ec2-3 launched 5 s ago; it can be relaunched in 85 s"),
+                         "the tile's launch cooldown")
+        self.assertEqual(smoke.refusal_category("one relaunch per 30 s per client"),
+                         "the per-viewer relaunch interval")
+        self.assertEqual(smoke.refusal_category("wss://secret.example/x?token=abc"), "an unlisted reason")
+        self.assertEqual(smoke.refusal_category(None), "an unlisted reason")
+
     def test_waits_for_the_same_slot_at_a_later_generation(self):
         old = self.tile()
         other = {**old, "slot": "slot-2", "generation": 2}
