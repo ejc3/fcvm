@@ -50,7 +50,7 @@ dashmap = "5.5"
 [dev-dependencies]
 tokio = { version = "1.51.6", features = ["rt-multi-thread", "macros", "test-util", "process", "time"] }
 tempfile = "3"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "protocol"
