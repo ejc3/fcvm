@@ -18,6 +18,11 @@ name: Fleet prod smoke
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: "IPv4 viewer: keep its seat this many minutes after the viewer path, then check again (0 to 30; a drill runs meanwhile)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -32,7 +37,8 @@ jobs:
     if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true'
     runs-on: ubuntu-24.04
     environment: fleet-prod-deploy
-    timeout-minutes: 45
+    # A held seat (hold_minutes, up to 30) and the second viewer path need up to 45 more minutes.
+    timeout-minutes: ${{ (inputs.hold_minutes || '0') != '0' && 90 || 45 }}
     # A prod coordinator release (fleet-prod-promote.yml, fleet-prod-rollback.yml) takes this group too.
     concurrency:
       group: fleet-prod-viewer-smoke
@@ -56,9 +62,12 @@ jobs:
           PROD_PUBLIC_URL: ${{ vars.PROD_PUBLIC_URL }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOLD_MINUTES: ${{ inputs.hold_minutes || '0' }}
         run: |
           set -o pipefail
-          python3 -B fleet/coord/stage-smoke.py --target prod --family v4 --single-family --modes "$MODES" --broadcast | tee "$RUNNER_TEMP/smoke.jsonl"
+          case "$HOLD_MINUTES" in ''|*[!0-9]*) echo "hold_minutes must be a whole number" >&2; exit 2;; esac
+          python3 -B fleet/coord/stage-smoke.py --target prod --family v4 --single-family --modes "$MODES" --broadcast \
+            --hold-seconds "$((HOLD_MINUTES * 60))" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: The page at fcvm.dev over IPv4
         if: vars.PROD_SITE_LIVE == 'true'
         env:

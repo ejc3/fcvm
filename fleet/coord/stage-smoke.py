@@ -483,6 +483,7 @@ PROBE_SECONDS = 40
 # How long the viewer path waits for every mode's tiles to run before it probes what it has. A
 # tile still not running then fails its probe as "the tile is not running".
 SETTLE_SECONDS = 600
+HOLD_SECONDS = 1800
 CONNECT_SECONDS = 10
 # Control endpoints that say whether this viewer has a family at all: Cloudflare's resolver,
 # on 443, in each family.
@@ -1097,7 +1098,7 @@ def plain(host, port):
 
 
 def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False,
-         settle_seconds=SETTLE_SECONDS, target="stage", unverified=False, broadcast=False):
+         settle_seconds=SETTLE_SECONDS, target="stage", unverified=False, broadcast=False, hold_seconds=0):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
     if unverified:
@@ -1148,7 +1149,7 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     try:
         # The first message on /live: a page's seat ticket (none here).
         connection.send({"type": "seat", "ticket": None})
-        deadline = time.monotonic() + 720 + (900 if modes else 0)
+        deadline = time.monotonic() + 720 + (900 if modes else 0) + (hold_seconds + 900 if hold_seconds else 0)
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
         cooldown = ec2_relaunch_cooldown_seconds()
         state, admission = {}, {}
@@ -1234,6 +1235,14 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
                                    lambda: (state, admission, viewer), settle_seconds)
+            if hold_seconds:
+                # A drill (a Spot reclaim, a host replacement) runs while this viewer keeps its seat,
+                # which keeps the fleet awake; then every tile must reach this viewer again.
+                step(f"/live: hold the seat for {hold_seconds} s")
+                until(lambda s: False, by=time.monotonic() + hold_seconds)
+                print(json.dumps({"held": hold_seconds, "reconnects": reconnects}), flush=True)
+                failures += viewer_path(family, modes, takeover, resolvers, until, commit,
+                                        lambda: (state, admission, viewer), settle_seconds)
         if broadcast:
             step("broadcast: a fresh playback token")
             before = admission
@@ -1479,7 +1488,13 @@ def arguments(argv):
     parser.add_argument("--broadcast", action="store_true", help="play the broadcast over the family")
     parser.add_argument("--settle-seconds", type=int, default=SETTLE_SECONDS,
                         help=f"how long to wait for every mode's tiles to run (1 to {SETTLE_SECONDS})")
+    parser.add_argument("--hold-seconds", type=int, default=0,
+                        help=f"after the viewer path, keep the seat this long (0 to {HOLD_SECONDS}), then run it again")
     args = parser.parse_args(argv)
+    if not 0 <= args.hold_seconds <= HOLD_SECONDS:
+        parser.error(f"--hold-seconds is 0 to {HOLD_SECONDS}")
+    if args.hold_seconds and not args.modes:
+        parser.error("--hold-seconds needs --modes: it holds a viewer and checks it again")
     if not 0 < args.settle_seconds <= SETTLE_SECONDS:
         parser.error(f"--settle-seconds is 1 to {SETTLE_SECONDS}")
     modes = tuple(m for m in args.modes.split(",") if m)
@@ -1495,7 +1510,7 @@ def arguments(argv):
     return dict(family=args.family, single=args.single_family, modes=modes,
                 relaunch=args.relaunch, takeover=args.takeover, agents=args.agents,
                 settle_seconds=args.settle_seconds, target=args.target, unverified=args.unverified,
-                broadcast=args.broadcast)
+                broadcast=args.broadcast, hold_seconds=args.hold_seconds)
 
 
 def run(argv=None):

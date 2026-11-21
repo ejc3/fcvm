@@ -1325,6 +1325,67 @@ class HostLocalTests(unittest.TestCase):
             smoke.main(family="v6", modes=("wall",), relaunch=False)
 
 
+class SmokeHoldTests(unittest.TestCase):
+    """A drill (the prod Spot reclaim) needs a viewer holding a seat, or the fleet sleeps under it.
+    --hold-seconds keeps the smoke's seat after the viewer path and then checks every tile again."""
+
+    def run_main(self, **kw):
+        clock, opened, paths = [100.0], [], []
+        class Live:
+            def __init__(self, *a, **k):
+                opened.append(self)
+                self.queue = [{"type": "hello", "viewer": "v-1"}, {"type": "admission", "capacity": 5},
+                              {"type": "snapshot", "state": {"tiles": []}}]
+            def send(self, m): pass
+            def message(self, deadline):
+                clock[0] += 5
+                if clock[0] >= deadline:
+                    raise TimeoutError()
+                return 1, json.dumps(self.queue.pop(0) if self.queue else {"type": "snapshot", "state": {"tiles": []}}).encode()
+            def close(self): pass
+        def viewer_path(family, modes, takeover, resolvers, until, commit, now, settle_seconds):
+            until(lambda s: True)
+            paths.append(clock[0])
+            return 0
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), patch.object(smoke, "viewer_path", viewer_path), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v4", modes=("wall",), relaunch=False, **kw)
+        return failed, paths, len(opened), out.getvalue()
+
+    def test_a_held_seat_runs_the_viewer_path_again_after_the_hold_on_one_connection(self):
+        failed, paths, connections, out = self.run_main(hold_seconds=1800)
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(paths), 2)
+        self.assertGreaterEqual(paths[1] - paths[0], 1800)
+        self.assertEqual(connections, 1)
+        self.assertIn('"held": 1800', out)
+
+    def test_without_a_hold_the_viewer_path_runs_once(self):
+        self.assertEqual(len(self.run_main()[1]), 1)
+
+    def test_the_hold_argument_is_bounded_and_needs_modes(self):
+        self.assertEqual(smoke.arguments(["--modes", "wall"])["hold_seconds"], 0)
+        self.assertEqual(smoke.arguments(["--modes", "wall", "--hold-seconds", "1800"])["hold_seconds"], 1800)
+        for argv in (["--modes", "wall", "--hold-seconds", "1801"], ["--modes", "wall", "--hold-seconds", "-1"],
+                     ["--broadcast", "--hold-seconds", "60"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                smoke.arguments(argv)
+
+    def test_only_a_dispatch_holds_and_its_job_gets_the_time(self):
+        wf = (HERE.parent.parent / ".github/workflows/fleet-prod-smoke.yml").read_text()
+        self.assertIn('HOLD_MINUTES: ${{ inputs.hold_minutes || \'0\' }}', wf)
+        self.assertIn('--hold-seconds "$((HOLD_MINUTES * 60))"', wf)
+        self.assertIn("timeout-minutes: ${{ (inputs.hold_minutes || '0') != '0' && 90 || 45 }}", wf)
+        self.assertNotIn("${{ inputs.hold_minutes }}\n", wf.split("run: |", 1)[1].split("\n\n", 1)[0])
+
+
 class SmokeWorkflowTests(unittest.TestCase):
     """The deploys call fleet-viewer-smoke.yml. Its jobs read the Access token from the
     fleet-stage-deploy environment's secrets, which a called workflow gets only when its caller
