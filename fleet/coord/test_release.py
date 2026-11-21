@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks for publishing and the live IPv4/name-regression probe."""
+import subprocess
 import importlib.util
 import contextlib
 import fnmatch
@@ -1374,14 +1375,21 @@ class SmokeHoldTests(unittest.TestCase):
         self.assertEqual(smoke.arguments(["--modes", "wall"])["hold_seconds"], 0)
         self.assertEqual(smoke.arguments(["--modes", "wall", "--hold-seconds", "1800"])["hold_seconds"], 1800)
         for argv in (["--modes", "wall", "--hold-seconds", "1801"], ["--modes", "wall", "--hold-seconds", "-1"],
-                     ["--broadcast", "--hold-seconds", "60"]):
+                     ["--broadcast", "--hold-seconds", "60"],
+                     # A mode list that normalizes to nothing would run unheld.
+                     ["--modes", ",", "--broadcast", "--hold-seconds", "60"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 smoke.arguments(argv)
 
     def test_only_a_dispatch_holds_and_its_job_gets_the_time(self):
         wf = (HERE.parent.parent / ".github/workflows/fleet-prod-smoke.yml").read_text()
         self.assertIn('HOLD_MINUTES: ${{ inputs.hold_minutes || \'0\' }}', wf)
-        self.assertIn('--hold-seconds "$((HOLD_MINUTES * 60))"', wf)
+        # 10#: "010" is ten minutes, not octal eight, and "08" is not an arithmetic error.
+        self.assertIn('--hold-seconds "$((10#$HOLD_MINUTES * 60))"', wf)
+        for given, seconds in (("010", "600"), ("08", "480"), ("0", "0")):
+            got = subprocess.run(["bash", "-c", 'echo "$((10#$HOLD_MINUTES * 60))"'], env={"HOLD_MINUTES": given},
+                                 capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(got, seconds, given)
         self.assertIn("timeout-minutes: ${{ (inputs.hold_minutes || '0') != '0' && 90 || 45 }}", wf)
         self.assertNotIn("${{ inputs.hold_minutes }}\n", wf.split("run: |", 1)[1].split("\n\n", 1)[0])
 

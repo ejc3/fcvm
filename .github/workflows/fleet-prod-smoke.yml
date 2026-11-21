@@ -67,7 +67,7 @@ jobs:
           set -o pipefail
           case "$HOLD_MINUTES" in ''|*[!0-9]*) echo "hold_minutes must be a whole number" >&2; exit 2;; esac
           python3 -B fleet/coord/stage-smoke.py --target prod --family v4 --single-family --modes "$MODES" --broadcast \
-            --hold-seconds "$((HOLD_MINUTES * 60))" | tee "$RUNNER_TEMP/smoke.jsonl"
+            --hold-seconds "$((10#$HOLD_MINUTES * 60))" | tee "$RUNNER_TEMP/smoke.jsonl"
       - name: The page at fcvm.dev over IPv4
         if: vars.PROD_SITE_LIVE == 'true'
         env:

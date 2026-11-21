@@ -1493,13 +1493,13 @@ def arguments(argv):
     args = parser.parse_args(argv)
     if not 0 <= args.hold_seconds <= HOLD_SECONDS:
         parser.error(f"--hold-seconds is 0 to {HOLD_SECONDS}")
-    if args.hold_seconds and not args.modes:
-        parser.error("--hold-seconds needs --modes: it holds a viewer and checks it again")
     if not 0 < args.settle_seconds <= SETTLE_SECONDS:
         parser.error(f"--settle-seconds is 1 to {SETTLE_SECONDS}")
     modes = tuple(m for m in args.modes.split(",") if m)
     if any(m not in MODES for m in modes):
         parser.error("unknown mode")
+    if args.hold_seconds and not modes:
+        parser.error("--hold-seconds needs --modes: it holds a viewer and checks it again")
     if args.agents and (modes or args.relaunch or args.takeover):
         parser.error("--agents reads the coordinator's agents and nothing else")
     if args.unverified and (args.target != "prod" or modes or args.relaunch or args.takeover
