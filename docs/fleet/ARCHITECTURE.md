@@ -2323,13 +2323,17 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 Use `~/bin/fcvm-fleet-ops` on fcvm-arm for project AWS changes. It acquires short-lived
 fleet account credentials and selects the project's Terraform backend. Keep project-owned
 SSM parameters and CloudWatch log groups under `/fcvm/ops/` in us-east-2. Make changes in
-`fleet/ops/terraform`, then use the reviewed checkout on fcvm-arm. Set `FCVM_REPO` to
-that checkout when using a separate worktree.
+`fleet/ops/terraform`. The helper defaults to `~/.local/share/fcvm-fleet-ops/fcvm`
+regardless of the current directory. Update that checkout to the merged revision. To use
+any other clean checkout, export `FCVM_REPO` with its absolute path before running the helper.
 
 ```sh
 ~/bin/fcvm-fleet-ops terraform init
-~/bin/fcvm-fleet-ops terraform plan -out=/tmp/fleet-ops.tfplan
-~/bin/fcvm-fleet-ops terraform apply /tmp/fleet-ops.tfplan
+plan_dir=$(mktemp -d)
+~/bin/fcvm-fleet-ops terraform plan -out="$plan_dir/fleet.tfplan"
+# Review the plan output before applying it.
+~/bin/fcvm-fleet-ops terraform apply "$plan_dir/fleet.tfplan"
+rm -r -- "$plan_dir"
 ~/bin/fcvm-fleet-ops quota
 ```
 
