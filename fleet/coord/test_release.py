@@ -1442,6 +1442,24 @@ class PublishTests(unittest.TestCase):
             command.assert_not_called()
 
 
+class WorkerDeployMessageTests(unittest.TestCase):
+    def test_every_wrangler_message_is_one_word(self):
+        # fleet/web is an OpenNext project: `wrangler deploy` hands its arguments to `opennextjs-cloudflare deploy`,
+        # which splits them on whitespace, so `--message "fcvm <sha>"` made the commit the entry point and failed prod's
+        # first Worker release (ejc3/fcvm run 44872476086). Every message is one word.
+        import re
+        workflows = HERE.parent.parent / ".github" / "workflows"
+        found = 0
+        for path in sorted(workflows.glob("*.yml")):
+            for line in path.read_text().splitlines():
+                if "wrangler" not in line:
+                    continue
+                for value in re.findall(r'--message[ =]("[^"]*"|\S+)', line):
+                    found += 1
+                    self.assertNotRegex(value.strip('"'), r"\s", f"{path.name}: {line.strip()}")
+        self.assertGreater(found, 0, "no wrangler --message found: the check is not looking where the workflows are")
+
+
 class ReleaseInvocationTests(unittest.TestCase):
     """The Lambda invocation: what a failed release prints, and a call that ends without a result."""
 

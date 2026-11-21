@@ -235,13 +235,15 @@ jobs:
           export WRANGLER_SEND_METRICS=false WRANGLER_OUTPUT_FILE_PATH="$out"
           if [ -z "$(jq -r '.worker_version // empty' <<<"$PRIOR")" ]; then
             # The first prod Worker: nothing to upload a version beside.
-            pnpm exec wrangler deploy --env production --message "fcvm $COMMIT"
+            # Every --message is one word: wrangler hands an OpenNext project's arguments to
+            # opennextjs-cloudflare, which splits them on whitespace.
+            pnpm exec wrangler deploy --env production --message "fcvm:$COMMIT"
             version=$(jq -r 'select(.type == "deploy") | .version_id' "$out" | tail -1)
           else
-            pnpm exec wrangler versions upload --env production --message "fcvm $COMMIT"
+            pnpm exec wrangler versions upload --env production --message "fcvm:$COMMIT"
             version=$(jq -r 'select(.type == "version-upload") | .version_id' "$out" | tail -1)
             [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
-            pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm $COMMIT"
+            pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm:$COMMIT"
           fi
           [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -342,7 +344,7 @@ jobs:
           fi
           [[ "$previous" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           pnpm install --frozen-lockfile
-          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm rollback"
+          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm:rollback"
       - name: Coordinator
         if: ${{ !cancelled() && needs.candidate.outputs.coordinator == 'true' }}
         env:
