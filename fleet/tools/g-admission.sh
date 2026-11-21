@@ -100,22 +100,27 @@ ADMIT_AT=0
 S3A() { aws --region "$S3REGION" "$@"; }
 admit_lock() {
   ga_staging || return 0
-  local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) f held etag at
+  local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) f held etag at denied_read=0
   f=$(mktemp)
   while :; do
     ADMIT_AT=$(now); echo "$ADMIT_AT ${owner:-agent}" > "$f"
     if ADMIT_ETAG=$(S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --body "$f" --if-none-match '*' \
         --query ETag --output text 2>"$f.err"); then
-      rm -f "$f" "$f.err"; return 0
+      rm -f "$f" "$f.err" "$f.held"; return 0
     fi
     grep -q -E 'PreconditionFailed|ConditionalRequestConflict' "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
     if held=$(S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LOCK" "$f.held" --query ETag --output text 2>"$f.err"); then
+      denied_read=0
       etag=$held; at=$(awk 'NR == 1 {print $1}' "$f.held")
       if [[ "$at" =~ ^[0-9]+$ ]] && [ $(( $(now) - at )) -gt "$ADMIT_STALE_S" ]; then
         say "breaking an admission lock held $(( $(now) - at )) s"
         # Only that lock: a contender that broke it first and took a new one keeps its own.
         S3A s3api delete-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --if-match "$etag" >/dev/null 2>&1 && continue
       fi
+    elif [ "$denied_read" = 0 ] && grep -q '(AccessDenied)' "$f.err"; then
+      # Without ListBucket a lock released between our PUT and GET reads as 403.
+      # Try the conditional acquisition once more; an unreadable held lock cannot be overwritten.
+      denied_read=1
     elif ! grep -q NoSuchKey "$f.err"; then
       cat "$f.err" >&2; rm -f "$f" "$f.err" "$f.held"; return 1
     fi
@@ -146,8 +151,20 @@ admit_unlock() {
 ledger_recent() {
   local t f; t=$(now); f=$(mktemp)
   if ! S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err"; then
-    grep -q NoSuchKey "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
-    : > "$f"
+    if grep -q '(AccessDenied)' "$f.err"; then
+      # Missing objects also return 403 without ListBucket. A conditional empty seed cannot replace a ledger.
+      : > "$f"
+      if ! S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" --body "$f" --if-none-match '*' >/dev/null 2>"$f.err" \
+          && ! grep -qE 'PreconditionFailed|ConditionalRequestConflict' "$f.err"; then
+        cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1
+      fi
+      # Require a successful read even after creating it. A genuinely unreadable ledger still blocks launch.
+      S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err" \
+        || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
+    else
+      grep -q NoSuchKey "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
+      : > "$f"
+    fi
   fi
   # An expired line is dropped whatever its shape: the ledger is rewritten only by ledger_add,
   # which reads it first, so a refused expired line would refuse every launch for good.

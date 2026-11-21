@@ -38,6 +38,10 @@
 #
 # Credentials: assumes fcvm-fleet-terraform (named in SSM /infra/fcvm-fleet, us-west-1) unless
 # the environment already holds that role's credentials (or GPUBOX_USE_ENV=1 says to use them).
+# That role may only drive gpuboxes, and a box runs as fcvm-fleet-gpubox, which reads the
+# release artifacts and no secret (ejc3/aws#922): the fleet's host role reads its certificate
+# and the agents' token, and a gpubox needs neither (its agent unit starts only with the
+# agent.env a fleet host's boot writes).
 # Quota (2026-11-07): G spot 192 vCPU and G on demand 384 in us-west-2 and in us-east-1, two
 # and four g4dn.metal. In us-east-1, the staging region, they are shared with the wall's host and
 # its on-demand tiles, and `up` there goes through the wall's reserve (g-admission.sh). In
@@ -241,7 +245,7 @@ up)
       if id=$(A ec2 run-instances --image-id "$ami" --instance-type $TYPE "${mo[@]}" \
           --instance-initiated-shutdown-behavior terminate \
           --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,Ipv6PrefixCount=1,DeleteOnTermination=true" \
-          --iam-instance-profile Name=fcvm-fleet-host \
+          --iam-instance-profile Name=fcvm-fleet-gpubox \
           --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
           --user-data "$ud" \
           --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=gpubox-$owner},{Key=Purpose,Value=$PURPOSE},{Key=Owner,Value=$owner},{Key=LeaseUntil,Value=${lease/ /T}Z},{Key=Market,Value=$market},$ADMISSION_TAG]" \

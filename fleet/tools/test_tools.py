@@ -275,7 +275,10 @@ case "$args" in
   *" s3api get-object "*)
     key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); out=$(sed -n "s|.*--key [^ ]* \([^ ]*\).*|\1|p" <<<"$*")
     [ -z "${FAKE_S3_READ_FAIL:-}" ] || { echo "An error occurred (AccessDenied)" >&2; exit 254; }
-    [ -e "$FAKE_S3/$key" ] || { echo "An error occurred (NoSuchKey)" >&2; exit 254; }
+    if [ "$key" = "gpubox/admission.lock" ] && [ -n "${FAKE_RELEASE_BEFORE_READ:-}" ]; then
+      rm -f "$FAKE_S3/$key" "$FAKE_S3/$key.etag"
+    fi
+    [ -e "$FAKE_S3/$key" ] || { echo "An error occurred (${FAKE_MISSING_KEY_CODE:-NoSuchKey})" >&2; exit 254; }
     cp "$FAKE_S3/$key" "$out"; cat "$FAKE_S3/$key.etag" 2>/dev/null || echo '"none"' ;;
   *" s3api head-object "*)
     key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*")
@@ -385,18 +388,41 @@ class GpuboxWallReserve(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertEqual(launches, [], r.stderr)
 
+    def test_first_admission_initializes_the_ledger_without_bucket_listing(self):
+        r, launches, _ = self.up(FAKE_MISSING_KEY_CODE="AccessDenied")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(launches), 1)
+        self.assertTrue(any(" put-object " in call and "--key gpubox/admitted " in call
+                            and "--if-none-match *" in call for call in self.calls))
+
+    def test_contender_can_acquire_a_lock_released_before_read_without_bucket_listing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as s3:
+            folder = os.path.join(s3, "gpubox")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "admission.lock"), "w") as lock:
+                lock.write("123 previous-holder")
+            r, launches, _ = self.up(s3=s3, FAKE_MISSING_KEY_CODE="AccessDenied", FAKE_RELEASE_BEFORE_READ="1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len(launches), 1)
+
     def test_an_unreadable_lock_or_ledger_launches_nothing(self):
         import tempfile
-        # A lock is held and cannot be read; then no lock and a ledger that cannot be read.
-        for held in (True, False):
-            s3 = tempfile.mkdtemp()
-            os.makedirs(os.path.join(s3, "gpubox"))
-            if held:
-                with open(os.path.join(s3, "gpubox", "admission.lock"), "w") as f:
-                    f.write(f"{int(time.time())} someone\n")
-            r, launches, _ = self.up(od_in_use=boxes(3), s3=s3, FAKE_S3_READ_FAIL="1", GPUBOX_ADMIT_WAIT_S="4")
-            self.assertNotEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(launches, [], r.stderr)
+        # An unreadable existing ledger must keep both its contents and its reservation.
+        for target in ("admission.lock", "admitted", None):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as s3:
+                os.makedirs(os.path.join(s3, "gpubox"))
+                if target:
+                    path = os.path.join(s3, "gpubox", target)
+                    saved = f"{int(time.time())} " + ("someone" if target == "admission.lock" else "i-busy spot 96")
+                    with open(path, "w") as f:
+                        f.write(saved)
+                r, launches, _ = self.up(od_in_use=boxes(3), s3=s3, FAKE_S3_READ_FAIL="1", GPUBOX_ADMIT_WAIT_S="4")
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(launches, [], r.stderr)
+                if target:
+                    with open(path) as f:
+                        self.assertEqual(f.read(), saved)
 
     def test_every_admitted_launch_carries_the_admission_tag(self):
         # ejc3/aws denies the fleet's Terraform role a G RunInstances without it, so a launcher
