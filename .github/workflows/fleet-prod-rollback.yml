@@ -75,7 +75,7 @@ jobs:
           fi
           [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           pnpm install --frozen-lockfile
-          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm rollback"
+          WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm:rollback"
       - name: Coordinator
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
