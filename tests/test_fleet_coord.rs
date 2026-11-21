@@ -5042,6 +5042,51 @@ async fn a_spread_launch_falls_back_to_a_used_zone_when_the_others_are_full() {
     );
 }
 
+/// A meter whose listings keep failing does not leave the fleet unmetered: past its bound the
+/// regions it cannot list are charged at the fleet's launch cap, and the budget still trips.
+#[tokio::test]
+async fn an_inventory_that_stays_unknown_is_charged_at_the_launch_cap_and_trips() {
+    use fcvm::fleet::coord::spend::{self, Billed, MeterConfig, MeterDriver, SpotPrice};
+    struct Blind;
+    #[async_trait::async_trait]
+    impl MeterDriver for Blind {
+        async fn instances(&self, _: &str) -> anyhow::Result<Vec<Billed>> {
+            anyhow::bail!("DescribeInstances: UnauthorizedOperation")
+        }
+        async fn spot_prices(&self, _: &str, _: &[String]) -> anyhow::Result<Vec<SpotPrice>> {
+            Ok(Vec::new())
+        }
+    }
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        fill_from_serving_hosts: true,
+        daily_spend_usd: Some(1.0),
+        ..Config::default()
+    };
+    let (_fake, handle, _ids, _agents, mut v) = two_spread_hosts(config).await;
+    tokio::spawn(spend::run(
+        MeterConfig {
+            driver: Arc::new(Blind),
+            regions: vec!["us-east-1".into()],
+            on_demand: spend::on_demand_rates(&[]).unwrap(),
+            every: Duration::from_millis(50),
+            spot_ttl: Duration::from_secs(60),
+            stale_after: Duration::from_millis(100),
+            cap_usd_per_hour: 100.0,
+        },
+        handle.clone(),
+    ));
+    let s = v
+        .until_within(|s| s["fleet"]["spend"]["reason"] == "budget")
+        .await;
+    assert_eq!(
+        s["fleet"]["spend"]["usd_per_hour"], 100.0,
+        "{}",
+        s["fleet"]["spend"]
+    );
+}
+
 /// The spend meter prices every host the fleet runs, a reclaimed host's replacement
 /// included, and the budget trip it causes terminates all of them.
 #[tokio::test]
@@ -5094,6 +5139,8 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
             on_demand: spend::on_demand_rates(&[]).unwrap(),
             every: Duration::from_millis(50),
             spot_ttl: Duration::from_secs(60),
+            stale_after: Duration::from_secs(300),
+            cap_usd_per_hour: 0.0,
         },
         handle.clone(),
     ));
