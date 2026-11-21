@@ -58,6 +58,71 @@ fn spend(state: &State) -> serde_json::Value {
 }
 
 #[test]
+fn the_drill_expires_at_midnight_even_when_the_marker_cannot_be_read_after_a_restart() {
+    let day = 20_001;
+    let at = day * DAY_MS + 1000;
+    let s = apply(
+        State::new(config(), at),
+        &Event::BudgetDrill { at, day: Some(day) },
+    );
+    assert_eq!(spend(&s)["ceiling_usd"], 1.0);
+    let s = restart(&s, at + 1);
+    assert_eq!(spend(&s)["ceiling_usd"], 1.0);
+    let s = apply(s, &burn(at + 2, 8.0));
+    assert_eq!(s.fleet.power.reason.as_deref(), Some("budget"));
+    let s = apply(
+        s,
+        &Event::BudgetDrill {
+            at: at + 3,
+            day: None,
+        },
+    );
+    assert_eq!(spend(&s)["ceiling_usd"], 750.0);
+    assert_eq!(s.fleet.power.reason.as_deref(), Some("budget"));
+    let s = apply(
+        s,
+        &Event::BudgetDrill {
+            at: at + 4,
+            day: Some(day),
+        },
+    );
+    let next = (day + 1) * DAY_MS;
+    let s = apply(s, &Event::Tick { at: next });
+    assert_eq!(spend(&s)["ceiling_usd"], 750.0);
+    assert_eq!(s.fleet.power.reason, None);
+    let s = apply(
+        s,
+        &Event::BudgetDrill {
+            at: next + 1,
+            day: Some(day),
+        },
+    );
+    assert_eq!(spend(&s)["ceiling_usd"], 750.0);
+}
+
+#[test]
+fn the_drill_never_raises_the_configured_ceiling_or_enables_an_absent_meter() {
+    for (base, expected) in [
+        (None, None),
+        (Some(0.25), Some(0.25)),
+        (Some(750.0), Some(1.0)),
+    ] {
+        let c = Config {
+            daily_spend_usd: base,
+            ..config()
+        };
+        let s = apply(
+            State::new(c, DAY_MS),
+            &Event::BudgetDrill {
+                at: DAY_MS,
+                day: Some(1),
+            },
+        );
+        assert_eq!(s.fleet.spend.ceiling(base, 1), expected);
+    }
+}
+
+#[test]
 fn the_days_spend_survives_a_restart() {
     let day = 20_000 * DAY_MS;
     let mut s = State::new(config(), day);

@@ -1,5 +1,7 @@
 # fcvm Development Log
 
+For AWS fleet operations on fcvm-arm use `~/bin/fcvm-fleet-ops`. The [fleet operator runbook](../docs/fleet/ARCHITECTURE.md#operating-the-fleet-from-fcvm-arm) covers project Terraform changes, GPU quota history and the production budget drill.
+
 ## ALWAYS FIX FAILING TESTS. PERIOD.
 
 **If ANY test fails, FIX THE ROOT CAUSE.** No exceptions. No workarounds. No weakening assertions.

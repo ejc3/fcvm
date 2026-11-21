@@ -332,6 +332,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::BudgetDrill { day, .. } => {
+            state.fleet.spend.drill_day = day.filter(|d| *d == at / crate::spend::DAY_MS);
+            None
+        }
         Event::Burn {
             usd_per_hour,
             instances,
@@ -752,7 +756,10 @@ fn power_step(state: &mut State, at: u64) {
 /// asleep until 00:00 UTC: every claim is released and every running race ends.
 fn budget_step(state: &mut State, at: u64) {
     let f = &mut state.fleet;
-    let Some(ceiling) = state.config.daily_spend_usd else {
+    let Some(ceiling) = f
+        .spend
+        .ceiling(state.config.daily_spend_usd, at / crate::spend::DAY_MS)
+    else {
         // A coordinator restarted without a ceiling lets the fleet wake again.
         if f.power.reason.as_deref() == Some(crate::spend::BUDGET) {
             f.power.reason = None;

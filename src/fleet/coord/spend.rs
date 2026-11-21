@@ -417,6 +417,64 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
     }
 }
 
+pub(super) const DRILL_DAY_KEY: &str = "drills/prod-budget-day";
+
+fn drill_day(marker: Option<&[u8]>) -> Result<Option<u64>> {
+    let Some(marker) = marker else {
+        return Ok(None);
+    };
+    if marker == b"off" {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(marker)?;
+    anyhow::ensure!(text.len() == 10, "expected a UTC date or off");
+    let date: jiff::civil::Date = text.parse().context("expected a UTC date or off")?;
+    anyhow::ensure!(date.to_string() == text, "expected a UTC date or off");
+    let seconds = date
+        .to_zoned(jiff::tz::TimeZone::UTC)?
+        .timestamp()
+        .as_second();
+    Ok(u64::try_from(seconds).ok().map(|s| s / 86_400))
+}
+
+/// Read the fixed production drill marker. `None` clears the override. An error leaves its
+/// last observed value in the ledger.
+pub async fn read_drill(obj: &super::store::S3Object) -> Result<Option<u64>> {
+    let marker = tokio::time::timeout(Duration::from_secs(5), obj.drill_marker())
+        .await
+        .context("budget drill marker read timed out")??;
+    drill_day(marker.as_deref())
+}
+
+/// Failed reads leave the last observed day in the durable spend ledger. The actor enforces
+/// UTC expiry even if this task is offline at midnight.
+pub(super) async fn watch_drill(obj: super::store::S3Object, handle: Handle) {
+    let mut unavailable = false;
+    let mut ticks = tokio::time::interval(Duration::from_secs(30));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = handle.cmds.closed() => return,
+            _ = ticks.tick() => {}
+        }
+        match read_drill(&obj).await {
+            Ok(day) => {
+                if unavailable {
+                    tracing::info!("budget drill marker readable again");
+                }
+                unavailable = false;
+                handle.send(Event::BudgetDrill { at: 0, day }).await;
+            }
+            Err(error) => {
+                if !unavailable {
+                    tracing::warn!(%error, "budget drill marker unavailable");
+                }
+                unavailable = true;
+            }
+        }
+    }
+}
+
 /// The meter on AWS: EC2 query calls signed with the task's credentials.
 pub struct AwsMeter {
     pub fleet: String,
@@ -548,6 +606,23 @@ impl MeterDriver for AwsMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drill_marker_accepts_only_a_complete_utc_date_or_off() {
+        assert_eq!(drill_day(None).unwrap(), None);
+        assert_eq!(drill_day(Some(b"off")).unwrap(), None);
+        assert_eq!(drill_day(Some(b"1970-01-02")).unwrap(), Some(1));
+        assert_eq!(drill_day(Some(b"2000-02-29")).unwrap(), Some(11016));
+        for invalid in [
+            b"2026-02-29".as_slice(),
+            b"2026-10-10x",
+            b"off\n",
+            b"",
+            &[0xff],
+        ] {
+            assert!(drill_day(Some(invalid)).is_err(), "{invalid:?}");
+        }
+    }
 
     const INSTANCES: &str = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
 <item><instanceId>i-host1</instanceId><instanceType>g4dn.metal</instanceType><placement><availabilityZone>us-east-1b</availabilityZone><tenancy>default</tenancy></placement><instanceState><code>16</code><name>running</name></instanceState><instanceLifecycle>spot</instanceLifecycle><tagSet><item><key>Fleet</key><value>stage</value></item></tagSet></item>

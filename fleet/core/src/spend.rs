@@ -47,9 +47,22 @@ pub struct Spend {
     pub at: u64,
     /// The ceiling was reached on `day`.
     pub tripped: bool,
+    /// The UTC day for which the operator requested the $1 drill ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_day: Option<u64>,
 }
 
 impl Spend {
+    pub fn ceiling(&self, configured: Option<f64>, day: u64) -> Option<f64> {
+        configured.map(|usd| {
+            if self.drill_day == Some(day) {
+                usd.min(1.0)
+            } else {
+                usd
+            }
+        })
+    }
+
     /// The day and what it cost through `at`, with the current rate since `self.at`. Only
     /// the part of that time inside `at`'s day counts toward it.
     pub fn spent_at(&self, at: u64) -> (u64, f64) {
