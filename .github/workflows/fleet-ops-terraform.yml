@@ -1,0 +1,33 @@
+name: Fleet operations Terraform
+on:
+  pull_request:
+    paths:
+      - 'fleet/ops/terraform/**'
+      - '.github/workflows/fleet-ops-terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'fleet/ops/terraform/**'
+      - '.github/workflows/fleet-ops-terraform.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: fleet/ops/terraform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.10.3
+          terraform_wrapper: false
+      - run: terraform fmt -check
+      - run: terraform init -input=false -backend=false -lockfile=readonly
+      - run: terraform validate

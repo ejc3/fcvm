@@ -2317,3 +2317,33 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 4. **Quota.** Three regions at the current G spot quota give at most three hosts, and the
    EC2 tiles compete for the same quota. Raising it in each region allows more hosts and
    room for the EC2 half.
+
+## Operating the fleet from fcvm-arm
+
+Use `~/bin/fcvm-fleet-ops` on fcvm-arm for project AWS changes. It acquires short-lived
+fleet account credentials and selects the project's Terraform backend. Keep project-owned
+SSM parameters and CloudWatch log groups under `/fcvm/ops/` in us-east-2. Make changes in
+`fleet/ops/terraform`. The helper defaults to `~/.local/share/fcvm-fleet-ops/fcvm`
+regardless of the current directory. Update that checkout to the merged revision. To use
+any other clean checkout, export `FCVM_REPO` with its absolute path before running the helper.
+
+```sh
+~/bin/fcvm-fleet-ops terraform init
+plan_dir=$(mktemp -d)
+~/bin/fcvm-fleet-ops terraform plan -out="$plan_dir/fleet.tfplan"
+# Review the plan output before applying it.
+~/bin/fcvm-fleet-ops terraform apply "$plan_dir/fleet.tfplan"
+rm -r -- "$plan_dir"
+~/bin/fcvm-fleet-ops quota
+```
+
+The production coordinator checks a dated budget drill marker every 30 seconds. Use
+`~/bin/fcvm-fleet-ops budget status` to check the marker. During a planned rehearsal,
+`budget trip` sets today's UTC ceiling to the smaller of $1 and its configured value.
+Verify the applied ceiling in the coordinator's `spend.ceiling_usd` snapshot and the trip in
+`power.reason`. `budget restore` restores the configured ceiling. Once the ledger has
+tripped, the fleet continues to refuse wakes through 00:00 UTC. A marker from a previous
+UTC day has no effect. The process observes these changes while it is running.
+
+Fleet release workflows, account guardrails and project permission definitions are documented in
+the [AWS fleet runbook](https://github.com/ejc3/aws/blob/main/README.md).

@@ -98,6 +98,11 @@ pub enum Event {
         usd_per_hour: f64,
         instances: u32,
     },
+    /// UTC epoch day requested by the production budget drill, or `None` to restore the configured ceiling.
+    BudgetDrill {
+        at: u64,
+        day: Option<u64>,
+    },
     /// The GPU hosts the launcher keeps for the awake capacity (`--host-template`), by
     /// instance id (an agent's host name), when every region is listed and holds that many
     /// pending or running hosts; `None` while any region is unlisted or short, or when the
@@ -140,6 +145,7 @@ impl Event {
             | Event::Ec2Health { at, .. }
             | Event::ScaleInstances { at, .. }
             | Event::Burn { at, .. }
+            | Event::BudgetDrill { at, .. }
             | Event::HostsExpected { at, .. }
             | Event::Published { at, .. } => *at,
         }

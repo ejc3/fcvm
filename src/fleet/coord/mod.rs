@@ -1007,6 +1007,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::Visibility { at, .. }
         | Event::ScaleInstances { at, .. }
         | Event::Burn { at, .. }
+        | Event::BudgetDrill { at, .. }
         | Event::HostsExpected { at, .. }
         | Event::Ec2Health { at, .. }
         | Event::Published { at, .. } => *at = t,
@@ -1410,6 +1411,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     };
     // Turns true once another coordinator wrote the state object (`store::LostWrite`).
     let mut lost: Option<watch::Receiver<bool>> = None;
+    let mut budget_drill = None;
     let (state, store_tx) = match &args.state_file {
         Some(path) => {
             let state = match store::load(path)? {
@@ -1428,6 +1430,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                     .clone()
                     .or_else(|| std::env::var("AWS_REGION").ok())
                     .context("--state-bucket needs --state-region or AWS_REGION")?;
+                if meter.is_some() && args.fleet_name == "prod" {
+                    budget_drill =
+                        Some(store::S3Object::new(bucket, spend::DRILL_DAY_KEY, &region)?);
+                }
                 let obj = store::S3Object::new(bucket, &args.state_key, &region)?;
                 let state = match obj.load().await? {
                     Some(s) => {
@@ -1600,6 +1606,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     }
     let ec2_sweep = ec2.clone();
     let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, names);
+    if let Some(obj) = budget_drill {
+        tokio::spawn(spend::watch_drill(obj, handle.clone()));
+    }
     if let Some(m) = meter {
         tokio::spawn(spend::run(m, handle.clone()));
     }

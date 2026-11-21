@@ -242,6 +242,32 @@ impl S3Object {
         .await
     }
 
+    /// Read at most eleven bytes (one more than a date), so a malformed control object cannot
+    /// consume unbounded memory. Only 404 means absent; S3 also returns 403 on missing grants.
+    pub(super) async fn drill_marker(&self) -> Result<Option<Vec<u8>>> {
+        let (status, bytes) = super::aws::signed(
+            &self.chain,
+            &self.http,
+            &self.base,
+            reqwest::Method::GET,
+            &self.path(),
+            "",
+            &self.region,
+            "s3",
+            &[("range", "bytes=0-10".into())],
+            Vec::new(),
+        )
+        .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            status.is_success(),
+            "S3 budget drill marker read returned {status}"
+        );
+        Ok(Some(bytes))
+    }
+
     /// The stored state, or `None` when there is none yet. S3 answers 404 for a missing key
     /// only to a caller that may list the bucket; a 403 is an error, never "no state".
     ///

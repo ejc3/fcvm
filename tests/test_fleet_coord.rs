@@ -5409,6 +5409,9 @@ async fn fake_s3(s3: FakeS3) -> String {
              body: Bytes| async move {
                 use axum::response::IntoResponse;
                 use sha2::Digest;
+                if uri.path() == "/fleet-state/drills/prod-budget-day" {
+                    assert_eq!(headers["range"], "bytes=0-10");
+                }
                 if s3.deny.load(std::sync::atomic::Ordering::SeqCst) {
                     return StatusCode::FORBIDDEN.into_response();
                 }
@@ -5513,6 +5516,33 @@ async fn fake_s3(s3: FakeS3) -> String {
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     base
+}
+
+#[tokio::test]
+async fn a_missing_or_off_budget_marker_clears_the_override_but_a_failed_read_does_not() {
+    use fcvm::fleet::coord::spend::read_drill;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let obj =
+        store::S3Object::with_endpoint("fleet-state", "drills/prod-budget-day", "us-east-2", &base)
+            .unwrap();
+    let path = "/fleet-state/drills/prod-budget-day";
+    assert_eq!(read_drill(&obj).await.unwrap(), None);
+    s3.put_version(path, b"2000-02-29".to_vec());
+    assert_eq!(read_drill(&obj).await.unwrap(), Some(11_016));
+    s3.deny.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(read_drill(&obj)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("403"));
+    s3.deny.store(false, std::sync::atomic::Ordering::SeqCst);
+    s3.put_version(path, b"truncated!!".to_vec());
+    assert!(read_drill(&obj).await.is_err());
+    s3.put_version(path, b"off".to_vec());
+    assert_eq!(read_drill(&obj).await.unwrap(), None);
 }
 
 /// With --state-bucket the state is one S3 object: none at first, the last state written

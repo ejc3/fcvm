@@ -1093,7 +1093,7 @@ fn power_view(p: &Power, c: &crate::state::Config) -> PowerView {
 }
 
 fn spend_view(s: &crate::spend::Spend, c: &crate::state::Config) -> Option<SpendView> {
-    let ceiling = c.daily_spend_usd?;
+    let ceiling = s.ceiling(c.daily_spend_usd, s.day)?;
     let cents = |x: f64| (x * 100.0).round() / 100.0;
     let day_start = s.day * crate::spend::DAY_MS;
     Some(SpendView {
