@@ -64,6 +64,55 @@ pub struct MeterConfig {
     pub on_demand: BTreeMap<String, f64>,
     pub every: Duration,
     pub spot_ttl: Duration,
+    /// A region with no successful listing for this long (or since the meter started) is
+    /// unknown, and the fleet is charged at `cap_usd_per_hour`.
+    pub stale_after: Duration,
+    /// The most the fleet can be spending: every host and tile it may run, at the highest
+    /// on-demand rate (`launch_cap_usd_per_hour`).
+    pub cap_usd_per_hour: f64,
+}
+
+/// How long a region's instance list is trusted without a fresh listing: ten passes of the
+/// meter. Past it the list may be missing launches, so the fleet is charged at its launch cap.
+pub const STALE_AFTER: Duration = Duration::from_secs(300);
+
+/// The most the fleet can be running: in each host region its awake hosts and the
+/// replacement a spot interruption notice launches, and with EC2 tiles each tile plus a
+/// relaunch in flight, all at the highest on-demand rate known.
+pub fn launch_cap_usd_per_hour(
+    args: &crate::cli::FleetCoordArgs,
+    on_demand: &BTreeMap<String, f64>,
+) -> f64 {
+    let mut host_regions: Vec<&str> = args
+        .host_templates
+        .iter()
+        .map(|t| t.region.as_str())
+        .collect();
+    host_regions.sort();
+    host_regions.dedup();
+    let hosts = host_regions.len() as f64 * (args.awake_hosts as f64 + 1.0);
+    let tiles = if args.ec2 == crate::cli::FleetEc2::Aws {
+        2.0 * args.ec2_tiles as f64
+    } else {
+        0.0
+    };
+    (hosts + tiles) * on_demand.values().copied().fold(0.0, f64::max)
+}
+
+/// The regions whose last successful listing (or, never listed, the meter's start) is at
+/// least `bound` before `now`, in `regions` order.
+pub fn stale_regions(
+    regions: &[String],
+    listed_at: &HashMap<String, Instant>,
+    started: Instant,
+    now: Instant,
+    bound: Duration,
+) -> Vec<String> {
+    regions
+        .iter()
+        .filter(|r| now.duration_since(listed_at.get(*r).copied().unwrap_or(started)) >= bound)
+        .cloned()
+        .collect()
 }
 
 /// `--spend-rates`: `<instance type>=<USD per hour>` on-demand rates, over the defaults.
@@ -170,15 +219,34 @@ pub fn burn_rate(
 }
 
 /// One pass's report: the burn rate, the instances it prices and why any could not be
-/// priced exactly. An error while any region has never been listed: an unknown inventory is
-/// not an empty one, so no rate is reported and the ledger keeps charging the last rate it
-/// has (the one stored across a restart included).
+/// priced exactly. A region in `stale` (no listing within [`STALE_AFTER`], see
+/// [`stale_regions`]) may be running instances its last list does not show, so the rate is
+/// at least `cap`, the fleet's launch cap: an inventory that stays unknown makes the fleet
+/// rest, rather than run on an old list or, on a first start, on no rate at all. Before that
+/// bound, an error while any region has never been listed: an unknown inventory is not an
+/// empty one, so no rate is reported and the ledger keeps charging the last rate it has (the
+/// one stored across a restart included).
 pub fn burn_report(
     regions: &[String],
     listed: &BTreeMap<String, Vec<Billed>>,
+    stale: &[String],
     spot: &HashMap<(String, String), BTreeMap<String, f64>>,
     on_demand: &BTreeMap<String, f64>,
+    cap: f64,
 ) -> std::result::Result<(f64, u32, Option<String>), String> {
+    if !stale.is_empty() {
+        let (rate, why) = burn_rate(listed, spot, on_demand);
+        let instances = listed.values().map(|l| l.len() as u32).sum();
+        let mut reason = format!(
+            "no listing of {} for {} s; charged at the fleet's launch cap",
+            stale.join(", "),
+            STALE_AFTER.as_secs()
+        );
+        if let Some(w) = why {
+            reason = format!("{reason}; {w}");
+        }
+        return Ok((rate.max(cap), instances, Some(reason)));
+    }
     let unlisted: Vec<&str> = regions
         .iter()
         .filter(|r| !listed.contains_key(*r))
@@ -223,18 +291,23 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
         !regions.is_empty(),
         "--daily-spend-usd meters the instances the coordinator launches: it needs --host-template or --ec2 aws"
     );
+    let on_demand = on_demand_rates(&args.spend_rates)?;
     Ok(Some(MeterConfig {
         driver: Arc::new(AwsMeter::new(args.fleet_name.clone())?),
         regions,
-        on_demand: on_demand_rates(&args.spend_rates)?,
+        cap_usd_per_hour: launch_cap_usd_per_hour(args, &on_demand),
+        on_demand,
         every: Duration::from_secs(30),
         spot_ttl: Duration::from_secs(1800),
+        stale_after: STALE_AFTER,
     }))
 }
 
 /// List, price and report, every `cfg.every`, until the actor is gone.
 pub async fn run(cfg: MeterConfig, handle: Handle) {
     let mut listed: BTreeMap<String, Vec<Billed>> = BTreeMap::new();
+    let mut listed_at: HashMap<String, Instant> = HashMap::new();
+    let started = Instant::now();
     let mut spot: HashMap<(String, String), BTreeMap<String, f64>> = HashMap::new();
     let mut spot_read: HashMap<(String, String), Instant> = HashMap::new();
     let mut degraded_now = false;
@@ -247,8 +320,9 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
             match cfg.driver.instances(region).await {
                 Ok(list) => {
                     listed.insert(region.clone(), list);
+                    listed_at.insert(region.clone(), Instant::now());
                 }
-                // Its last listed instances stay charged.
+                // Its last listed instances stay charged, up to `stale_after`.
                 Err(e) => problems.push(format!("listing {region}: {e:#}")),
             }
         }
@@ -294,7 +368,21 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
                 Err(e) => problems.push(format!("spot prices in {region}: {e:#}")),
             }
         }
-        let burn = burn_report(&cfg.regions, &listed, &spot, &cfg.on_demand);
+        let stale = stale_regions(
+            &cfg.regions,
+            &listed_at,
+            started,
+            Instant::now(),
+            cfg.stale_after,
+        );
+        let burn = burn_report(
+            &cfg.regions,
+            &listed,
+            &stale,
+            &spot,
+            &cfg.on_demand,
+            cfg.cap_usd_per_hour,
+        );
         if handle.cmds.is_closed() {
             return;
         }
@@ -575,7 +663,7 @@ mod tests {
         // A restart whose first listings failed: reporting 0 would overwrite the stored rate.
         let none = BTreeMap::new();
         assert_eq!(
-            burn_report(&regions, &none, &spot, &on_demand),
+            burn_report(&regions, &none, &[], &spot, &on_demand, 0.0),
             Err(
                 "no listing yet of us-east-1, us-east-2; the last reported burn stays in use"
                     .into()
@@ -586,12 +674,106 @@ mod tests {
             "us-east-1".to_string(),
             vec![host("i-1", "g4dn.xlarge", false, "us-east-1a")],
         )]);
-        assert!(burn_report(&regions, &listed, &spot, &on_demand).is_err());
+        assert!(burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0).is_err());
         listed.insert("us-east-2".to_string(), Vec::new());
         assert_eq!(
-            burn_report(&regions, &listed, &spot, &on_demand),
+            burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0),
             Ok((0.526, 1, None))
         );
+    }
+
+    #[test]
+    fn a_region_unlisted_past_the_bound_is_charged_at_the_launch_cap() {
+        let on_demand = on_demand_rates(&[]).unwrap();
+        let regions = vec!["us-east-1".to_string(), "us-east-2".to_string()];
+        let spot = HashMap::new();
+        let cap = 100.0;
+        // Listed once, then its listings kept failing: the old list is not trusted past the bound.
+        let listed = BTreeMap::from([
+            (
+                "us-east-1".to_string(),
+                vec![host("i-1", "g4dn.xlarge", false, "us-east-1a")],
+            ),
+            ("us-east-2".to_string(), Vec::new()),
+        ]);
+        let stale = vec!["us-east-1".to_string()];
+        let (rate, instances, why) =
+            burn_report(&regions, &listed, &stale, &spot, &on_demand, cap).unwrap();
+        assert_eq!((rate, instances), (cap, 1));
+        assert!(why.unwrap().contains("us-east-1"));
+        // Never listed at all, past the bound: no longer "keep the last rate", which on a first
+        // start is none.
+        let stale = regions.clone();
+        let none = BTreeMap::new();
+        let (rate, _, _) = burn_report(&regions, &none, &stale, &spot, &on_demand, cap).unwrap();
+        assert_eq!(rate, cap);
+        // A known rate above the cap is kept.
+        let big = BTreeMap::from([
+            (
+                "us-east-1".to_string(),
+                vec![host("i-1", "g4dn.metal", false, "us-east-1a"); 40],
+            ),
+            ("us-east-2".to_string(), Vec::new()),
+        ]);
+        let stale = vec!["us-east-2".to_string()];
+        let (rate, _, _) = burn_report(&regions, &big, &stale, &spot, &on_demand, cap).unwrap();
+        assert!(rate > cap);
+    }
+
+    #[test]
+    fn regions_go_stale_after_the_bound_from_their_last_listing_or_the_start() {
+        let regions = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let start = Instant::now();
+        let bound = Duration::from_secs(300);
+        let listed_at = HashMap::from([
+            ("a".to_string(), start + Duration::from_secs(100)),
+            ("b".to_string(), start + Duration::from_secs(390)),
+        ]);
+        let at = |s| start + Duration::from_secs(s);
+        // At 399 s: a was last listed 299 s ago, b 9 s ago, c never (399 s since the start).
+        assert_eq!(
+            stale_regions(&regions, &listed_at, start, at(399), bound),
+            ["c"]
+        );
+        // At 400 s: a reaches the bound too.
+        assert_eq!(
+            stale_regions(&regions, &listed_at, start, at(400), bound),
+            ["a", "c"]
+        );
+        // Inside the grace after a start, nothing is stale yet.
+        assert!(stale_regions(&regions, &HashMap::new(), start, at(60), bound).is_empty());
+    }
+
+    #[test]
+    fn the_launch_cap_is_every_host_and_tile_the_fleet_may_run_at_the_highest_rate() {
+        let args = coord(&[
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--awake-hosts",
+            "2",
+            "--ec2",
+            "aws",
+            "--ec2-regions",
+            "us-east-1",
+            "--ec2-tiles",
+            "8",
+            "--daily-spend-usd",
+            "750",
+            "--fleet-name",
+            "prod",
+        ]);
+        let m = meter(&args).unwrap().unwrap();
+        let highest = on_demand_rates(&[])
+            .unwrap()
+            .values()
+            .copied()
+            .fold(0.0, f64::max);
+        // One host region: two awake hosts and a replacement. Eight tiles, each with a relaunch
+        // in flight.
+        assert_eq!(m.cap_usd_per_hour, highest * (3 + 16) as f64);
+        assert_eq!(m.stale_after, STALE_AFTER);
     }
 
     fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {
