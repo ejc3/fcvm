@@ -23,10 +23,17 @@ FUNCTIONS = {"stage": "fcvm-coordinator-release", "prod": "fcvm-coordinator-rele
 HELD = 3
 
 
+# The AWS CLI's "An error occurred (<code>) when calling ...": the code is a fixed token AWS defines;
+# the rest of the line can name resources and is never repeated.
+AWS_ERROR = re.compile(r"An error occurred \(([A-Za-z0-9]{1,64})\)")
+
+
 class CommandFailed(RuntimeError):
-    def __init__(self, name, returncode):
+    def __init__(self, name, returncode, code=None):
         super().__init__("command failed: " + name)
         self.returncode = returncode
+        # The AWS error code the CLI reported, when it reported one.
+        self.code = code
 
 
 class Held(RuntimeError):
@@ -38,7 +45,8 @@ def command(args, *, body=None, env=None, allow_missing=False):
     if result.returncode:
         if allow_missing and "ImageNotFoundException" in result.stderr:
             return None
-        raise CommandFailed(args[0], result.returncode)
+        found = AWS_ERROR.search(result.stderr or "")
+        raise CommandFailed(args[0], result.returncode, found.group(1) if found else None)
     return result.stdout
 
 
@@ -66,7 +74,8 @@ def invoke(function, payload, *, attempts=11):
                 # invoking anything, and the same call is refused again.
                 if attempt == attempts - 1 or error.returncode in (252, 253):
                     raise
-                print(f"The release invocation ended without a result (aws exit {error.returncode}); "
+                code = f", {error.code}" if error.code else ""
+                print(f"The release invocation ended without a result (aws exit {error.returncode}{code}); "
                       "retrying in 60 seconds", flush=True)
                 time.sleep(60)
                 continue
@@ -165,7 +174,8 @@ def run(argv=None):
         raise SystemExit(HELD)
     except Exception as error:
         # Never repeat subprocess output, request headers or a credential-bearing environment.
-        print(json.dumps({"status": "failed", "errorType": type(error).__name__}))
+        print(json.dumps({"status": "failed", "errorType": type(error).__name__,
+                          **({"code": error.code} if isinstance(error, CommandFailed) and error.code else {})}))
         raise SystemExit(1)
 
 
