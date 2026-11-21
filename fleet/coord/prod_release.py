@@ -332,7 +332,9 @@ def main(argv):
         # Fixed text and the error type only: never a response body or a credential.
         print(json.dumps({"status": "failed", "action": action, "errorType": type(error).__name__,
                           "error": str(error) if isinstance(error, (RuntimeError, ValueError)) and not isinstance(
-                              error, publish.CommandFailed) else None}), flush=True)
+                              error, publish.CommandFailed) else None,
+                          **({"code": error.code} if isinstance(error, publish.CommandFailed) and error.code else {})}),
+              flush=True)
         return 1
     return 0
 

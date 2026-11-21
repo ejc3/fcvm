@@ -14,6 +14,7 @@ import socket
 import struct
 import base64
 import hashlib
+import tempfile
 import threading
 import time
 import unittest
@@ -1498,6 +1499,36 @@ class ReleaseInvocationTests(unittest.TestCase):
             self.assertEqual(error.returncode, status)
             self.assertEqual(sleeps, [])
             self.assertEqual(printed, "")
+
+    def test_a_failed_aws_call_carries_its_error_code_and_nothing_else_of_stderr(self):
+        with tempfile.TemporaryDirectory() as d:
+            aws = Path(d) / "aws"
+            aws.write_text("#!/bin/sh\necho 'An error occurred (AccessDeniedException) when calling the Invoke operation: "
+                           "User: arn:aws:sts::111122223333:assumed-role/secret is not authorized' >&2\nexit 254\n")
+            aws.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ["PATH"]}):
+                with self.assertRaises(publish.CommandFailed) as caught:
+                    publish.command(["aws", "lambda", "invoke"])
+        self.assertEqual((caught.exception.returncode, caught.exception.code), (254, "AccessDeniedException"))
+        self.assertNotIn("111122223333", str(caught.exception))
+
+    def test_the_retry_line_names_the_aws_error_code(self):
+        results = [publish.CommandFailed("aws", 254, "ResourceConflictException"), {"status": "unchanged", "digest": self.DIGEST}]
+        sleeps, out = [], io.StringIO()
+        def command(args, body=None, env=None, allow_missing=False):
+            if args[1] == "ecr":
+                return json.dumps({"imageDetails": [{"imageDigest": self.DIGEST}]})
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            Path(args[-1]).write_text(json.dumps(outcome))
+            return json.dumps({"StatusCode": 200})
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
+               "COORDINATOR_RELEASE": "fcvm-coordinator-release"}
+        with patch.dict(os.environ, env), patch.object(publish, "command", command), \
+                patch.object(publish.time, "sleep", sleeps.append), contextlib.redirect_stdout(out):
+            publish.main()
+        self.assertIn("(aws exit 254, ResourceConflictException); retrying in 60 seconds", out.getvalue())
 
     def test_invocations_that_never_return_a_result_still_fail(self):
         printed, error, sleeps = self.run_publish([255] * 11)
