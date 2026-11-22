@@ -1843,14 +1843,13 @@ continue. Do not silently begin another repair and review cycle.
 
 When a user-controlled remote is authorized, push each signed, focused-green frozen
 checkpoint before beginning the next pass. A remote checkpoint is recovery and visibility;
-it is not merge authorization and its old checks do not cover later local commits.
+its old checks do not cover later local commits.
 
 **Land the smallest correct PR, then continue on the next stacked PR.** The architecture
 pass must partition the work into a sequence of independently useful, mergeable contracts.
 Once one PR satisfies its stated contract, focused and full tests, CI, and exact-head review,
-report it ready. Merge it only when the user has separately authorized that merge. Push or
-checkpoint authority is not merge authority. Do not hold a ready PR open to add adjacent
-features, speculative hardening, or cleanup that can be expressed safely in a follow-up.
+merge it; the maintainer does not need to be asked first. Do not hold a ready PR open to add
+adjacent features, speculative hardening, or cleanup that can be expressed safely in a follow-up.
 
 Every review finding must be classified before work starts:
 
