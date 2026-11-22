@@ -311,7 +311,7 @@ async fn output_writer(
                     // EPOLLERR on the idle connection: the vsock transport was
                     // reset — for an fc-agent-held connection that means a
                     // snapshot restore just happened. Publish the earliest
-                    // restore hint (the epoch watcher fast-polls on it), drop
+                    // restore hint (the epoch watcher fetches on it), drop
                     // the dead stream, and wait for the explicit reconnect from
                     // handle_clone_restore exactly like the write-failure path.
                     // The snapshot is virtually always taken with output idle,
