@@ -284,6 +284,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-system-image phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-sni-front bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	bench-start-rate-prep bench-start-rate-run bench-start-rate-teardown test-start-rate \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-kitesurf-build bench-live-campaign bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -393,6 +394,7 @@ help:
 	@echo "  test-chromium-scale  Run the scale harness's deterministic unit tests"
 	@echo "  test-chromium-fault  Run the fault harness's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
+	@echo "  bench-start-rate-prep/-run/-teardown  Snapshot clones reaching healthy per second (OUT=, PREP=, COUNT=, CONCURRENCY=, NETWORK=, UFFD=1)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
 	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
@@ -1712,6 +1714,33 @@ bench-sni-front: cargo-target-link
 bench-clone-latency: build setup-default
 	@echo "==> Running clone latency benchmark..."
 	bench/clone-latency.sh $(or $(LABEL),run) $(or $(N),10)
+
+# Start rate: snapshot clones reaching healthy per second (bench/start-rate/README.md).
+#   make bench-start-rate-prep OUT=/mnt/fcvm-btrfs/sr/prep-rootless NETWORK=rootless UFFD=1
+#   make bench-start-rate-run PREP=/mnt/fcvm-btrfs/sr/prep-rootless/prep.json OUT=... COUNT=1000 CONCURRENCY=128
+#   make bench-start-rate-teardown PREP=...
+# NETWORK=bridged|routed run fcvm under sudo. run and teardown have no build dependency:
+# a rebuild between prep and run would measure clones of a snapshot another binary made.
+START_RATE := python3 bench/start-rate/startrate.py
+START_RATE_FCVM := $(CURDIR)/target/release/fcvm
+bench-start-rate-prep: build setup-default
+	@test -n "$(OUT)" || { echo "OUT= is required"; exit 2; }
+	$(START_RATE) prep --fcvm $(START_RATE_FCVM) --out $(OUT) --network $(or $(NETWORK),rootless) \
+		$(if $(UFFD),--uffd) $(if $(filter rootless,$(or $(NETWORK),rootless)),,--sudo) \
+		--cpu $(or $(CPU),1) --mem $(or $(MEM),256) $(if $(IMAGE),--image $(IMAGE)) \
+		$(if $(IPV6_PREFIX),--ipv6-prefix $(IPV6_PREFIX))
+
+bench-start-rate-run:
+	@test -n "$(PREP)" -a -n "$(OUT)" -a -n "$(COUNT)" -a -n "$(CONCURRENCY)" || { echo "PREP= OUT= COUNT= CONCURRENCY= are required"; exit 2; }
+	$(START_RATE) run --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --count $(COUNT) \
+		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180)
+
+bench-start-rate-teardown:
+	@test -n "$(PREP)" || { echo "PREP= is required"; exit 2; }
+	$(START_RATE) teardown --prep $(PREP)
+
+test-start-rate:
+	python3 -m unittest discover -s bench/start-rate -p 'test_*.py' -v
 
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest
