@@ -21,7 +21,7 @@ pub struct DriveArgs {
     #[command(flatten)]
     pub piece: PieceArgs,
     /// Ops in the timed phase.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 100, value_parser = count_at_least_one)]
     pub count: usize,
     /// Most ops in flight at once.
     #[arg(long, default_value_t = 1, value_parser = concurrency_in_range)]
@@ -64,6 +64,13 @@ fn concurrency_in_range(text: &str) -> Result<usize, String> {
     match text.parse::<usize>() {
         Ok(n) if (1..=100_000).contains(&n) => Ok(n),
         _ => Err(format!("'{text}' is not a concurrency from 1 to 100000")),
+    }
+}
+
+fn count_at_least_one(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!("'{text}' is not a count of at least 1")),
     }
 }
 
@@ -465,7 +472,7 @@ fn dist(mut v: Vec<f64>) -> Value {
 
 fn summarize(results: &[OpResult], wall: f64, a: &Counters, b: &Counters, idle: &Value) -> Value {
     let ok: Vec<&OpResult> = results.iter().filter(|r| r.error.is_none()).collect();
-    let n = ok.len().max(1) as f64;
+    let n = ok.len() as f64;
     let mut stages: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for r in &ok {
         if let Some(map) = r.child.get("stages").and_then(|s| s.as_object()) {
@@ -477,7 +484,12 @@ fn summarize(results: &[OpResult], wall: f64, a: &Counters, b: &Counters, idle: 
             }
         }
     }
-    let per_op = delta(a, b, n);
+    // No op finished, so there is nothing to divide the window's cost by.
+    let per_op = if ok.is_empty() {
+        Value::Null
+    } else {
+        delta(a, b, n)
+    };
     // The held set's own cost over the window, from the idle sample, comes off each op.
     let idle_cg = idle["cgroup_cpu_s"].as_f64().unwrap_or(0.0);
     let idle_host = idle["host_busy_cpu_s"].as_f64().unwrap_or(0.0);
@@ -492,8 +504,28 @@ fn summarize(results: &[OpResult], wall: f64, a: &Counters, b: &Counters, idle: 
         "stages_ms": stages.into_iter().map(|(k, v)| (k, dist(v))).collect::<BTreeMap<_, _>>(),
         "per_op": per_op,
         "cgroup_cpu_s_per_op_net": per_op["cgroup_cpu_s"].as_f64().map(|cg| cg - idle_cg * wall / n),
-        "host_cpu_s_per_op_net": per_op["host_busy_cpu_s"].as_f64().unwrap() - idle_host * wall / n,
+        "host_cpu_s_per_op_net": per_op["host_busy_cpu_s"].as_f64().map(|h| h - idle_host * wall / n),
     })
+}
+
+/// How long a collector has to write its output and exit after SIGINT.
+const PERF_STOP_GRACE: Duration = Duration::from_secs(60);
+
+/// Wait for `child` up to `limit`; None if it is still running.
+fn wait_within(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 impl Drop for Perf {
@@ -501,11 +533,12 @@ impl Drop for Perf {
     /// reaped here, so it does not keep recording after the cell.
     fn drop(&mut self) {
         if let Some((mut child, _)) = self.0.take() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(child.id() as i32),
-                nix::sys::signal::Signal::SIGINT,
-            );
-            let _ = child.wait();
+            let group = nix::unistd::Pid::from_raw(child.id() as i32);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT);
+            if !matches!(wait_within(&mut child, self.1), Ok(Some(_))) {
+                let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -513,7 +546,7 @@ impl Drop for Perf {
 /// A perf collector over a phase. Its stderr goes to `err`; a perf that exits on its own
 /// before it is stopped, or exits non-zero when stopped, fails the run: a collector that
 /// cannot run must say so.
-struct Perf(Option<(std::process::Child, PathBuf)>);
+struct Perf(Option<(std::process::Child, PathBuf)>, Duration);
 
 impl Perf {
     fn start(cmd: &str, args: &[String], err: &Path) -> Result<Self> {
@@ -539,7 +572,7 @@ impl Perf {
                 Ok(())
             });
         }
-        Ok(Perf(Some((c.spawn()?, err.to_path_buf()))))
+        Ok(Perf(Some((c.spawn()?, err.to_path_buf())), PERF_STOP_GRACE))
     }
     fn stop(&mut self) -> Result<()> {
         let Some((mut child, err)) = self.0.take() else {
@@ -552,7 +585,21 @@ impl Perf {
                 nix::sys::signal::Signal::SIGINT,
             );
         }
-        let status = child.wait()?;
+        let status = match wait_within(&mut child, self.1)? {
+            Some(status) => status,
+            None => {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = child.wait();
+                bail!(
+                    "the perf collector did not stop within {:?} of SIGINT and was killed: {}",
+                    self.1,
+                    std::fs::read_to_string(&err).unwrap_or_default().trim()
+                );
+            }
+        };
         // perf exits 0 on SIGINT, and `sudo` reports a child the signal ended by ending
         // itself with the same signal: both are a collector that was stopped as asked.
         let stopped_as_asked = exited_early.is_none()
@@ -575,7 +622,7 @@ impl Perf {
 
 fn perf_stat(args: &DriveArgs, out: &Path, name: &str) -> Result<Perf> {
     if args.perf_events.is_empty() {
-        return Ok(Perf(None));
+        return Ok(Perf(None, PERF_STOP_GRACE));
     }
     Perf::start(
         &args.perf_cmd,
@@ -591,6 +638,150 @@ fn perf_stat(args: &DriveArgs, out: &Path, name: &str) -> Result<Perf> {
         ],
         &out.join(format!("{name}.err")),
     )
+}
+
+/// The idle, timed, steady and teardown phases over `held` (made before) and `prepared`
+/// (to start in the timed phase), returning the summary. On an error every instance still
+/// held is torn down and waited for before the error returns: the driver exiting at once
+/// would SIGKILL them (their parent-death signal) before they removed their disks and state.
+#[allow(clippy::too_many_arguments)]
+async fn measure(
+    args: &DriveArgs,
+    cgroup: &Option<PathBuf>,
+    argv: &Arc<Vec<String>>,
+    log: &Arc<std::fs::File>,
+    mut held: Vec<Inst>,
+    mut prepared: Vec<Inst>,
+    alive_s: f64,
+    prep_s: f64,
+) -> Result<Value> {
+    let measured = measure_held(
+        args,
+        cgroup,
+        argv,
+        log,
+        &mut held,
+        &mut prepared,
+        alive_s,
+        prep_s,
+    )
+    .await;
+    if measured.is_err() {
+        held.append(&mut prepared);
+        release(held).await;
+    }
+    measured
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn measure_held(
+    args: &DriveArgs,
+    cgroup: &Option<PathBuf>,
+    argv: &Arc<Vec<String>>,
+    log: &Arc<std::fs::File>,
+    held: &mut Vec<Inst>,
+    prepared: &mut Vec<Inst>,
+    alive_s: f64,
+    prep_s: f64,
+) -> Result<Value> {
+    let i0 = read_counters(cgroup)?;
+    tokio::time::sleep(Duration::from_secs(args.idle_secs)).await;
+    let i1 = read_counters(cgroup)?;
+    let idle = delta(
+        &i0,
+        &i1,
+        i1.at.unwrap().duration_since(i0.at.unwrap()).as_secs_f64(),
+    );
+
+    let mut record = if args.perf_freq > 0 {
+        Perf::start(
+            &args.perf_cmd,
+            &[
+                "record".into(),
+                "-a".into(),
+                "-g".into(),
+                "-F".into(),
+                args.perf_freq.to_string(),
+                "-o".into(),
+                args.out.join("perf.data").display().to_string(),
+            ],
+            &args.out.join("perf-record.err"),
+        )?
+    } else {
+        Perf(None, PERF_STOP_GRACE)
+    };
+    let mut stat = perf_stat(args, &args.out, "perfstat-timed.csv")?;
+    if record.0.is_some() || stat.0.is_some() {
+        // perf needs a moment to open its events on 192 CPUs.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let a = read_counters(cgroup)?;
+    let t = Instant::now();
+    let mut results = if args.cold {
+        cold_phase(args.count, args.concurrency, argv, log).await
+    } else {
+        phase(std::mem::take(prepared), args.concurrency, "go", "done").await
+    };
+    let wall = t.elapsed().as_secs_f64();
+    // Held from here, so an error below tears them down with the rest.
+    held.extend(results.iter_mut().filter_map(|r| r.inst.take()));
+    let b = read_counters(cgroup)?;
+    let mut perf_errors: Vec<String> = Vec::new();
+    for collector in [&mut record, &mut stat] {
+        if let Err(error) = collector.stop() {
+            perf_errors.push(format!("{error:#}"));
+        }
+    }
+    let timed = summarize(&results, wall, &a, &b, &idle);
+    let mut ops = String::new();
+    for r in &results {
+        ops.push_str(
+            &json!({"latency_ms": r.latency_ms, "child": r.child, "error": r.error}).to_string(),
+        );
+        ops.push('\n');
+    }
+    std::fs::write(args.out.join("ops.jsonl"), ops)?;
+
+    let mut stat = perf_stat(args, &args.out, "perfstat-steady.csv")?;
+    let s0 = read_counters(cgroup)?;
+    tokio::time::sleep(Duration::from_secs(args.steady_secs)).await;
+    let s1 = read_counters(cgroup)?;
+    if let Err(error) = stat.stop() {
+        perf_errors.push(format!("{error:#}"));
+    }
+    let steady_secs = s1.at.unwrap().duration_since(s0.at.unwrap()).as_secs_f64();
+    let steady = delta(&s0, &s1, steady_secs);
+
+    let held_n = held.len();
+    let d0 = read_counters(cgroup)?;
+    let t = Instant::now();
+    let torn = phase(std::mem::take(held), args.concurrency, "exit", "torn").await;
+    let down_wall = t.elapsed().as_secs_f64();
+    let d1 = read_counters(cgroup)?;
+    let teardown = summarize(&torn, down_wall, &d0, &d1, &json!({}));
+
+    Ok(json!({
+        "piece": args.piece.piece,
+        "count": args.count,
+        "concurrency": args.concurrency,
+        "alive": args.alive,
+        "cold": args.cold,
+        "uffd": args.piece.uffd_socket.is_some(),
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "alive_make_s": alive_s,
+        "prep_s": prep_s,
+        "idle_per_s": idle,
+        "timed": timed,
+        "steady_held": held_n,
+        "steady_per_s": steady,
+        "steady_per_instance_per_s": if held_n == 0 {
+            Value::Null
+        } else {
+            delta(&s0, &s1, steady_secs * held_n as f64)
+        },
+        "teardown": teardown,
+        "perf_errors": perf_errors,
+    }))
 }
 
 pub async fn run(args: DriveArgs) -> Result<()> {
@@ -624,7 +815,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     let argv = Arc::new(piece_argv(&args.piece));
 
     let t = Instant::now();
-    let mut held = make(args.alive, args.prep_concurrency, true, &argv, &log).await?;
+    let held = make(args.alive, args.prep_concurrency, true, &argv, &log).await?;
     let alive_s = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let prepared = if args.cold {
@@ -640,99 +831,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     };
     let prep_s = t.elapsed().as_secs_f64();
 
-    let i0 = read_counters(&cgroup)?;
-    tokio::time::sleep(Duration::from_secs(args.idle_secs)).await;
-    let i1 = read_counters(&cgroup)?;
-    let idle = delta(
-        &i0,
-        &i1,
-        i1.at.unwrap().duration_since(i0.at.unwrap()).as_secs_f64(),
-    );
-
-    let mut record = if args.perf_freq > 0 {
-        Perf::start(
-            &args.perf_cmd,
-            &[
-                "record".into(),
-                "-a".into(),
-                "-g".into(),
-                "-F".into(),
-                args.perf_freq.to_string(),
-                "-o".into(),
-                args.out.join("perf.data").display().to_string(),
-            ],
-            &args.out.join("perf-record.err"),
-        )?
-    } else {
-        Perf(None)
-    };
-    let mut stat = perf_stat(&args, &args.out, "perfstat-timed.csv")?;
-    if record.0.is_some() || stat.0.is_some() {
-        // perf needs a moment to open its events on 192 CPUs.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    let a = read_counters(&cgroup)?;
-    let t = Instant::now();
-    let results = if args.cold {
-        cold_phase(args.count, args.concurrency, &argv, &log).await
-    } else {
-        phase(prepared, args.concurrency, "go", "done").await
-    };
-    let wall = t.elapsed().as_secs_f64();
-    let b = read_counters(&cgroup)?;
-    let mut perf_errors: Vec<String> = Vec::new();
-    for collector in [&mut record, &mut stat] {
-        if let Err(error) = collector.stop() {
-            perf_errors.push(format!("{error:#}"));
-        }
-    }
-    let timed = summarize(&results, wall, &a, &b, &idle);
-    let mut ops = String::new();
-    for r in &results {
-        ops.push_str(
-            &json!({"latency_ms": r.latency_ms, "child": r.child, "error": r.error}).to_string(),
-        );
-        ops.push('\n');
-    }
-    std::fs::write(args.out.join("ops.jsonl"), ops)?;
-    held.extend(results.into_iter().filter_map(|r| r.inst));
-
-    let mut stat = perf_stat(&args, &args.out, "perfstat-steady.csv")?;
-    let s0 = read_counters(&cgroup)?;
-    tokio::time::sleep(Duration::from_secs(args.steady_secs)).await;
-    let s1 = read_counters(&cgroup)?;
-    if let Err(error) = stat.stop() {
-        perf_errors.push(format!("{error:#}"));
-    }
-    let steady_secs = s1.at.unwrap().duration_since(s0.at.unwrap()).as_secs_f64();
-    let steady = delta(&s0, &s1, steady_secs);
-
-    let held_n = held.len();
-    let d0 = read_counters(&cgroup)?;
-    let t = Instant::now();
-    let torn = phase(held, args.concurrency, "exit", "torn").await;
-    let down_wall = t.elapsed().as_secs_f64();
-    let d1 = read_counters(&cgroup)?;
-    let teardown = summarize(&torn, down_wall, &d0, &d1, &json!({}));
-
-    let summary = json!({
-        "piece": args.piece.piece,
-        "count": args.count,
-        "concurrency": args.concurrency,
-        "alive": args.alive,
-        "cold": args.cold,
-        "uffd": args.piece.uffd_socket.is_some(),
-        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
-        "alive_make_s": alive_s,
-        "prep_s": prep_s,
-        "idle_per_s": idle,
-        "timed": timed,
-        "steady_held": held_n,
-        "steady_per_s": steady,
-        "steady_per_instance_per_s": delta(&s0, &s1, steady_secs * held_n.max(1) as f64),
-        "teardown": teardown,
-        "perf_errors": perf_errors,
-    });
+    let summary = measure(&args, &cgroup, &argv, &log, held, prepared, alive_s, prep_s).await?;
     std::fs::write(
         args.out.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
@@ -833,6 +932,113 @@ mod tests {
                 "instance {i} was not torn down"
             );
         }
+    }
+
+    #[test]
+    fn a_run_with_no_finished_op_reports_no_per_op_cost() {
+        let c = read_counters(&None).unwrap();
+        let failed = OpResult {
+            latency_ms: 1.0,
+            child: json!({}),
+            error: Some("no".into()),
+            inst: None,
+        };
+        let s = summarize(&[failed], 1.0, &c, &c, &json!({}));
+        assert!(s["per_op"].is_null(), "{s}");
+        assert!(s["host_cpu_s_per_op_net"].is_null(), "{s}");
+        assert!(s["cgroup_cpu_s_per_op_net"].is_null(), "{s}");
+        assert!(count_at_least_one("0").is_err());
+        assert_eq!(count_at_least_one("1"), Ok(1));
+    }
+
+    /// An error after the timed phase (here the op log cannot be written) tears down every
+    /// instance still held, the ones the timed phase started and the ones made before it.
+    #[tokio::test]
+    async fn a_run_that_cannot_write_its_results_tears_its_instances_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        // A directory where ops.jsonl goes: writing it fails.
+        std::fs::create_dir(out.join("ops.jsonl")).unwrap();
+        let log = Arc::new(std::fs::File::create(dir.path().join("log")).unwrap());
+        let torn = dir.path().to_path_buf();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawner: Spawner = {
+            let log = log.clone();
+            Arc::new(move || {
+                let i = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = std::process::Command::new("sh");
+                cmd.arg("-c").arg(format!(
+                    "echo ready; while read word; do case $word in go) echo done;; \
+                     exit) sleep 0.3; touch {}/torn-{i}; echo torn; exit 0;; esac; done",
+                    torn.display()
+                ));
+                spawn_command(cmd, &log)
+            })
+        };
+        let held = make_with(2, 2, false, spawner.clone()).await.unwrap();
+        let prepared = make_with(2, 2, false, spawner).await.unwrap();
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            args: DriveArgs,
+        }
+        let args = Wrap::try_parse_from([
+            "drive",
+            "--piece",
+            "noop",
+            "--work-dir",
+            "/w",
+            "--count",
+            "2",
+            "--idle-secs",
+            "0",
+            "--steady-secs",
+            "0",
+            "--shared-cgroup",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        let argv = Arc::new(Vec::new());
+        let error = measure(&args, &None, &argv, &log, held, prepared, 0.0, 0.0)
+            .await
+            .expect_err("ops.jsonl is a directory");
+        assert!(
+            format!("{error:#}").to_lowercase().contains("directory"),
+            "{error:#}"
+        );
+        for i in 0..4 {
+            assert!(
+                dir.path().join(format!("torn-{i}")).exists(),
+                "instance {i} was not torn down"
+            );
+        }
+    }
+
+    /// A collector that ignores SIGINT is killed after the grace period, and the run is told.
+    #[test]
+    fn a_perf_collector_that_will_not_stop_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stubborn = Perf::start(
+            "python3",
+            &[
+                "-c".into(),
+                "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)"
+                    .into(),
+            ],
+            &dir.path().join("perf.err"),
+        )
+        .unwrap();
+        stubborn.1 = Duration::from_millis(300);
+        let pid = stubborn.0.as_ref().unwrap().0.id() as i32;
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = stubborn.stop().expect_err("a collector that never stopped");
+        assert!(format!("{error:#}").contains("did not stop"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
     }
 
     /// Dropping a collector the run did not stop stops it: it does not keep recording.

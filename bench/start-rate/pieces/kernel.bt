@@ -27,7 +27,8 @@ kretprobe:synchronize_rcu_expedited /@rcu_exp_s[tid]/ {
 kprobe:synchronize_rcu { @rcu_sync[comm] = count(); @rcu_sync_stack[comm, kstack(12)] = count(); }
 kprobe:synchronize_net { @sync_net[comm] = count(); }
 
-kprobe:copy_net_ns { @netns_new = count(); }
+// copy_net_ns(flags, ...) returns the old namespace unless CLONE_NEWNET (0x40000000) is set.
+kprobe:copy_net_ns /arg0 & 0x40000000/ { @netns_new_requests = count(); }
 kprobe:kvm_create_vm { @kvm_create_s[tid] = nsecs; }
 kretprobe:kvm_create_vm /@kvm_create_s[tid]/ {
   @kvm_create_vm_us = hist((nsecs - @kvm_create_s[tid]) / 1000); delete(@kvm_create_s[tid]);

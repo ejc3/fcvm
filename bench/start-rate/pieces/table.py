@@ -75,7 +75,7 @@ def main():
         t = s["timed"]
         host = t["host_cpu_s_per_op_net"]
         cg = t["cgroup_cpu_s_per_op_net"]
-        cpu = max(host, cg)
+        cpu = host if cg is None else max(host, cg)
         best = best_rate(v)
         limit = min(best, args.cores / cpu) if cpu > 0 else best
         rates = {}
