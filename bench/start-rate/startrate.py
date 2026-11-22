@@ -609,7 +609,7 @@ def main():
     r.add_argument("--concurrency", type=int, required=True)
     r.add_argument("--launchers", type=int, default=4)
     r.add_argument("--timeout", type=float, default=180)
-    r.add_argument("--rust-log", default="fcvm=info")
+    r.add_argument("--rust-log", default="fcvm=info,health-monitor=info")
     r.add_argument("--pidstat-interval", type=int, default=2)
     r.add_argument("--fail-fast", action="store_true")
     r.set_defaults(fn=cmd_run)
