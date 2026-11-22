@@ -166,8 +166,12 @@ def cmd_prep(a):
     serve_proc = None
     if a.uffd:
         slog = open(out / "serve.log", "w")
+        # The serve admits 256 clones by default (uffd::server DEFAULT_MAX_CLONES_PER_SERVER);
+        # a start-rate run keeps every clone alive, so it raises the cap.
+        senv = dict(env, FCVM_UFFD_MAX_CLONES=str(a.max_clones))
+        sfc = (["sudo", "--preserve-env=RUST_LOG,FCVM_UFFD_MAX_CLONES", a.fcvm] if a.sudo and os.geteuid() != 0 else [a.fcvm])
         serve_proc = subprocess.Popen(
-            fc + ["snapshot", "serve", snap], stdout=slog, stderr=subprocess.STDOUT, env=env, start_new_session=True
+            sfc + ["snapshot", "serve", snap], stdout=slog, stderr=subprocess.STDOUT, env=senv, start_new_session=True
         )
         deadline = time.time() + 120
         while time.time() < deadline and serve_pid is None:
@@ -184,6 +188,7 @@ def cmd_prep(a):
         "baseline": base, "baseline_pid": base_pid, "baseline_launcher_pid": base_proc.pid,
         "snapshot": snap, "serve_pid": serve_pid,
         "serve_launcher_pid": serve_proc.pid if serve_proc else None,
+        "max_clones": a.max_clones if a.uffd else None,
         "network": a.network, "cpu": a.cpu, "mem_mib": a.mem, "image": a.image, "sudo": a.sudo,
         "ipv6_prefix": a.ipv6_prefix,
     }
@@ -608,6 +613,7 @@ def main():
     p.add_argument("--image", default="docker.io/library/nginx:alpine")
     p.add_argument("--ipv6-prefix")
     p.add_argument("--sudo", action="store_true")
+    p.add_argument("--max-clones", type=int, default=8192, help="FCVM_UFFD_MAX_CLONES for the serve")
     p.set_defaults(fn=cmd_prep)
     r = sub.add_parser("run")
     r.add_argument("--fcvm", required=True)
