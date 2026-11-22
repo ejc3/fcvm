@@ -282,6 +282,20 @@ a launch that serves nothing costs at least $0.0088, so the budget bounds that w
 $2.10 an hour. The owner's scheduled races (`--race-every`) are not counted. A whole race
 must fit the budget, so `--ec2-tiles` above 40 is refused when the coordinator starts.
 
+**Lambda tiles.** The state's `lambda_max` tiles of the AWS half (at most all of them) are
+Lambda tiles, each a T4 in a Lambda Managed Instances execution environment, and the rest of
+the half's `--ec2-tiles` places stay EC2 tiles: 8 with 4 Lambda tiles are 4 EC2 and 4 Lambda
+tiles. `lambda_max` is 0, and every AWS tile an EC2 tile, until the coordinator's Lambda
+driver and its `--lambda-tiles` flag land. The half keeps its places, so a race costs one
+launch per AWS tile whichever its backing and the budget above is unchanged; a Lambda tile's
+relaunch counts one and waits 90 s after its last launch, as an EC2 tile's does
+(`lam-1 launched 13 s ago; it can be relaunched in 77 s`). A race times the EC2 tiles and the
+Lambda tiles apart, so the scoreboard has a row for each. A Lambda tile's relaunch is a new
+published version of its function, so a race times a new environment, and its time ends,
+like every tile's, when the coordinator sees the new generation's first frame. The time of
+one invoke of a running environment (`warm_invoke_ms` in the tile's phases) is shown beside
+the race number and never counted in it.
+
 **The directed camera.** The coordinator flies the wall's camera along a program generated
 from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
 the main peak and the clock in the sky framed across the fcvm/EC2 seam at image centre,
@@ -481,7 +495,12 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   dark tile: an fcvm place with no GPU has `phase` `waiting_capacity` and a null `slot`,
   `host` and `frame_url`; an EC2 tile without an instance keeps its `slot` and reports its
   own phase (`fleet.ec2_waiting` counts those, and the race's `relaunch_all` shows a
-  capacity wait). The fcvm side is cut into full-width bands, one per GPU host (hosts in
+  capacity wait), and so does a Lambda tile without an execution environment
+  (`fleet.lambda_waiting`). With Lambda tiles (`fleet.lambda_n`, present only then) the EC2
+  side is the AWS half: `fleet.ec2_n` EC2 tiles and then `fleet.lambda_n` Lambda tiles in
+  its one grid, tiles `lambda:<k>` with `half` `lambda` and slots `lam-<n>`;
+  `fleet.lambda_environments` counts the Lambda tiles holding an environment, and the
+  half's aggregator (`agg:ec2`) lists both kinds. The fcvm side is cut into full-width bands, one per GPU host (hosts in
   the order of their lowest slot number) and, below them, one for the places with no GPU,
   each as tall as its share of the side's tiles and cut into its own grid, row-major, so a
   host's tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is
@@ -526,12 +545,18 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`*_gpus` 0) has nothing to restart: its `*_done_at` is `started_at` and its `*_ms` null,
   so the race is over once the other half is. `ec2_capacity_wait_ms`
   is the capacity waits finished so far; `ec2_waiting_since` is when the half's current
-  wait began (null when none runs), so a page can draw the wait as it grows.
+  wait began (null when none runs), so a page can draw the wait as it grows. A race with
+  Lambda tiles also has the same fields for them, `lambda_done_at`, `lambda_pending`,
+  `lambda_gpus`, `lambda_ms`, `lambda_capacity_wait_ms` (waits Lambda named as capacity) and
+  `lambda_waiting_since`, and `lambda_warm_invoke_ms`, the slowest tile's warm invoke, shown
+  beside `lambda_ms` and not part of it; a race without them has none of these fields.
 - `scoreboard` holds only measured numbers; a half is null until one of its races has
   finished. `last_ms` is the latest finished race's time, `median_ms` the median of the
   last 20 finished, `races` how many that median is over, `measured_on` the tiles the last
   race timed, `last_capacity_wait_ms` its EC2 wait (left out of `last_ms`), `last_race`
-  its id. A race with no tiles in a half does not count for it.
+  its id. A race with no tiles in a half does not count for it. With Lambda tiles the
+  scoreboard has a third row, `lambda`, timed apart from `ec2` though both are on the AWS
+  half, with `last_warm_invoke_ms` beside its times; without them `lambda` is absent.
 - `races` keeps the last 10 races with every tile's phases; tiles whose host was
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
 - `nudges` is the directed camera: `targets` are the viewpoints the open vote is among,
@@ -606,6 +631,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   on-demand rate) and the state integrates that burn rate: `usd_today` is what the day
   cost through `at` (Unix ms of the last meter report, null before the first),
   `usd_per_hour` the current burn of `instances` instances, `ceiling_usd` the ceiling,
+  `by_backing` (present when the meter splits its rate) each backing's part, `hosts`, `ec2`
+  and `lambda`, with its own `usd_today` and `usd_per_hour` (the total alone trips the
+  ceiling),
   `day_start` and `resets_at` the day's 00:00 UTC and the next. The ledger is part of the
   stored state: a restart keeps the day's spend and charges the time it was down at the
   last burn it knew. When `usd_today` plus 15 minutes at the current burn reaches the

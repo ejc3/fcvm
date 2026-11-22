@@ -79,7 +79,8 @@ fn check_layout(state: &State) {
     for t in &v.tiles {
         let side = match t.half {
             Half::Fcvm => v.layout.fcvm,
-            Half::Ec2 => v.layout.ec2,
+            // Lambda tiles share the AWS half with the EC2 tiles.
+            Half::Ec2 | Half::Lambda => v.layout.ec2,
         }
         .expect("a side with tiles has a rectangle");
         assert!(inside(&t.rect, &side));

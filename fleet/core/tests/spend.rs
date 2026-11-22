@@ -21,6 +21,7 @@ fn burn(at: u64, usd_per_hour: f64) -> Event {
         at,
         usd_per_hour,
         instances: 3,
+        by_backing: Default::default(),
     }
 }
 
