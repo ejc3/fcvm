@@ -310,6 +310,24 @@ class Selection(unittest.TestCase):
         self.ecr.put("keep-stage-current", self.ecr.image(b))
         self.assertEqual(self.ecr.tagged("keep-stage-current").digest, b)
 
+    def test_a_build_two_commits_share_stays_recorded_against_an_older_one(self):
+        # One image under two rev- tags (a later commit whose build is the same image): recording
+        # a commit older than either of them leaves keep-built where it is.
+        old, mid, new = "a" * 40, "b" * 40, "c" * 40
+        order = [old, mid, new]
+        is_ancestor = lambda a, b: order.index(a) <= order.index(b)
+        shared = self.ecr.push("rev-" + mid)
+        self.ecr.put("rev-" + new, self.ecr.image(shared))
+        release.record(self.ecr, shared, new, is_ancestor)
+        earlier = self.ecr.push("rev-" + old, config="sha256:" + "1" * 64)
+        # old is behind both held commits.
+        self.assertEqual(release.record(self.ecr, earlier, old, is_ancestor)["status"], "kept")
+        # A commit after mid but before new is behind one held commit: kept as well.
+        order.insert(2, "d" * 40)
+        between = self.ecr.push("rev-" + "d" * 40, config="sha256:" + "2" * 64)
+        self.assertEqual(release.record(self.ecr, between, "d" * 40, is_ancestor)["status"], "kept")
+        self.assertEqual(self.ecr.tagged("keep-built").digest, shared)
+
     def test_ci_records_each_build_and_a_selection_takes_it_by_name(self):
         a = self.ecr.push("rev-a")
         release.record(self.ecr, a)
@@ -462,12 +480,17 @@ class Workflow(unittest.TestCase):
         return re.findall(r"^      - '([^']+)'", block, re.M)
 
     def test_a_change_to_anything_in_the_image_builds_it(self):
-        # What the lane image holds: the fcvm binary's tile runtime and what it calls, the renderer
-        # and its build contexts, and the lane image's own files.
-        inputs = ["src/fleet/lambda_tile.rs", "src/fleet/tunnel.rs", "src/fleet/coord/secrets.rs",
-                  "src/fleet/coord/aws.rs", "src/fleet/mod.rs", "src/cli/args.rs", "src/main.rs", "Cargo.lock",
+        # What the lane image holds: the fcvm binary (every source of the fcvm package and of each
+        # path dependency in Cargo.toml), the renderer and its build contexts, and the lane image's
+        # own files.
+        cargo = (HERE.parents[1] / "Cargo.toml").read_text().split("\n[dependencies]", 1)[1].split("\n[", 1)[0]
+        crates = re.findall(r'path = "([^"]+)"', cargo)
+        self.assertIn("fleet/core", crates)
+        inputs = ["src/paths.rs", "src/fleet/lambda_tile.rs", "src/cli/args.rs", "src/main.rs", "build.rs",
+                  "rootfs-config.toml", "Cargo.toml", "Cargo.lock",
                   "fleet/lambda/Containerfile", "fleet/renderer/src/server.cpp",
                   "fleet/core/tests/autopilot_lap.json", "fleet/web/core/layout.ts"]
+        inputs += [crate + "/src/lib.rs" for crate in crates]
         for event in ("push", "pull_request"):
             patterns = self.paths(event)
             for path in inputs:

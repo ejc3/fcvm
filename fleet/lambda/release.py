@@ -209,12 +209,13 @@ def record(ecr, built, commit=None, is_ancestor=None):
     """Move keep-built to `built` and read it back. With `commit` (CI's publish), keep-built moves
     only forward in commit order: two main pushes' builds can finish out of order and a run can be
     rerun, so the image pushed last is not always the newest commit's. When keep-built holds the
-    image of a commit that is not an ancestor of `commit`, it stays there ("kept")."""
+    image of any commit that is not an ancestor of `commit` (an image can carry several rev- tags),
+    it stays there ("kept")."""
     with locked("built"):
         now = ecr.tagged(BUILT)
         if commit is not None and now is not None and now.digest != built:
             held = [t[len("rev-"):] for t in ecr.tags(now.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
-            if held and not any(is_ancestor(h, commit) for h in held):
+            if held and not all(is_ancestor(h, commit) for h in held):
                 return {"status": "kept", BUILT: now.digest}
         ecr.put(BUILT, ecr.image(built))
         now = ecr.tagged(BUILT)
@@ -271,7 +272,10 @@ def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
         if found is None or found.digest != pushed:
             raise RuntimeError(f"{tag} does not hold the digest podman pushed")
     if json.loads(found.manifest).get("config", {}).get("digest") != built:
-        raise RuntimeError(f"{tag} holds an image that is not the image this run built")
+        # A full rerun after the build artifact expired rebuilds a different image; "Re-run failed
+        # jobs" within the artifact's 7 days reuses the image this tag holds.
+        raise RuntimeError(f"{tag} holds an image that is not the image this run built "
+                           "(a rebuild? re-run the failed publish job, which reuses the run's image)")
     result = record(ecr, digest(found.digest), commit, is_ancestor)
     return {"tag": tag, "digest": found.digest, "status": result["status"]}
 

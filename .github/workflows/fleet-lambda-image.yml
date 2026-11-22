@@ -9,31 +9,38 @@ on:
   push:
     branches: [main]
     paths:
-      - 'fleet/lambda/**'
-      - 'fleet/renderer/**'
-      # The renderer image's test-host reads the autopilot lap and the page's stream heights
-      # (its build contexts).
-      - 'fleet/core/tests/**'
-      - 'fleet/web/core/layout.ts'
-      # The fcvm binary's tile runtime and what it calls (the tunnel the coordinator speaks,
-      # the secret and AWS signing code, the CLI and its dispatch).
-      - 'src/fleet/**'
-      - 'src/cli/**'
-      - 'src/main.rs'
+      # The fcvm binary: the package's sources and every path dependency in Cargo.toml.
+      - 'src/**'
+      - 'build.rs'
+      - 'rootfs-config.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'fuse-pipe/**'
+      - 'exec-proto/**'
+      - 'failpoint/**'
+      - 'fleet/core/**'
+      - 'fleet/potato/**'
+      - 'fleet/lambda/**'
+      # The renderer and its build contexts (test-host reads fleet/core/tests and the page's
+      # stream heights).
+      - 'fleet/renderer/**'
+      - 'fleet/web/core/layout.ts'
       - '.github/workflows/fleet-lambda-image.yml'
   pull_request:
     paths:
-      - 'fleet/lambda/**'
-      - 'fleet/renderer/**'
-      - 'fleet/core/tests/**'
-      - 'fleet/web/core/layout.ts'
-      - 'src/fleet/**'
-      - 'src/cli/**'
-      - 'src/main.rs'
+      - 'src/**'
+      - 'build.rs'
+      - 'rootfs-config.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'fuse-pipe/**'
+      - 'exec-proto/**'
+      - 'failpoint/**'
+      - 'fleet/core/**'
+      - 'fleet/potato/**'
+      - 'fleet/lambda/**'
+      - 'fleet/renderer/**'
+      - 'fleet/web/core/layout.ts'
       - '.github/workflows/fleet-lambda-image.yml'
   workflow_dispatch:
 
@@ -81,7 +88,8 @@ jobs:
           name: fleet-lambda-image
           path: ${{ runner.temp }}/lane.tar
           compression-level: 0
-          retention-days: 1
+          # "Re-run failed jobs" reuses it: a publish that failed can be retried for a week.
+          retention-days: 7
 
   publish:
     needs: build
