@@ -43,3 +43,36 @@ make bench-start-rate-teardown PREP=/mnt/fcvm-btrfs/sr/prep/prep.json
 
 `python3 bench/start-rate/startrate.py report DIR...` prints summaries again. Stage times are the
 harness's receive times of the marker lines, so they include pipe and scheduling delay on a loaded host.
+
+## Restore timeline: resume to fc-agent ready
+
+`restore_timeline.py` reads one `run` directory and prints, per step of the guest's restore, the
+time between the clone's log lines (`VM resume completed`, fc-agent's console lines, the restore
+acknowledgement, `exec server ready`) and fc-agent's own phase record from the acknowledgement.
+
+```bash
+python3 bench/start-rate/restore_timeline.py /mnt/fcvm-btrfs/sr/run-c128
+```
+
+Two host-side records, taken while `run` runs, split each clone's resume to ready window by where
+its vCPU thread was:
+
+```bash
+python3 bench/start-rate/vcpustat.py $OUT.trace/vcpustat.jsonl 0.025 12 &     # SIGTERM to stop
+sudo BPFTRACE_MAX_MAP_KEYS=150000 bpftrace bench/start-rate/s2fault.bt > $OUT.trace/s2fault.txt &
+# wait for "attached" in s2fault.txt, run the cell, then SIGINT bpftrace
+python3 bench/start-rate/restore_timeline.py $OUT --trace $OUT.trace
+```
+
+- `vcpustat.py` reads `/proc/<vmm>/task/<vcpu>/schedstat` and `stat` of every Firecracker process
+  in its first 12 s, every 25 ms (4 ms for a C=1 cell): the vCPU thread's on-CPU time, its
+  runqueue wait, and its guest and system ticks.
+- `s2fault.bt` counts, per VMM in 100 ms buckets from its first stage-2 fault, the vCPU's stage-2
+  faults (`kvm:kvm_guest_fault`) and the time its threads spent in `handle_userfault`. It also
+  counts every exec and fork on the host.
+
+The joined table splits the window into `vcpu_run_ms` (on a CPU: guest code, and the host kernel
+working for it, stage-2 faults included), `vcpu_wait_ms` (runnable, no CPU), `userfault_ms`
+(blocked until the memory server answered) and `rest_ms` (the vCPU thread asleep otherwise: the
+guest idle). The tracers cost CPU themselves (one bpftrace probe per stage-2 fault), so rates come
+from cells run without them.
