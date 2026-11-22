@@ -285,6 +285,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-system-image phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-sni-front bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-start-rate-prep bench-start-rate-run bench-start-rate-teardown test-start-rate \
+	bench-start-pieces-build bench-start-pieces test-start-pieces \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-kitesurf-build bench-live-campaign bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -395,6 +396,7 @@ help:
 	@echo "  test-chromium-fault  Run the fault harness's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo "  bench-start-rate-prep/-run/-teardown  Snapshot clones reaching healthy per second (OUT=, PREP=, COUNT=, CONCURRENCY=, NETWORK=, UFFD=1)"
+	@echo "  bench-start-pieces[-build]            One piece of a clone start, N times at C (PIECE=, OUT=, COUNT=, CONCURRENCY=, ALIVE=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
 	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
@@ -1742,6 +1744,30 @@ bench-start-rate-teardown:
 test-start-rate:
 	python3 -m unittest discover -s bench/start-rate -p 'test_*.py' -v
 
+# Start pieces: one piece of a clone start, COUNT times at CONCURRENCY with ALIVE held,
+# through fcvm's own code (bench/start-rate/pieces/README.md).
+#   make bench-start-pieces-build
+#   make bench-start-pieces PIECE=rootless-net COUNT=1000 CONCURRENCY=128 ALIVE=1000 OUT=...
+# The run has no build dependency, so a matrix measures one binary. It runs in a systemd
+# scope of its own: CPU per op is read from that cgroup.
+START_PIECES := $(CURDIR)/target/release/start-pieces
+bench-start-pieces-build: private SHELL := $(TARGET_LEASE_SHELL)
+bench-start-pieces-build: cargo-target-link
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p start-pieces
+
+bench-start-pieces:
+	@test -n "$(PIECE)" -a -n "$(OUT)" || { echo "PIECE= OUT= are required"; exit 2; }
+	@test -x $(START_PIECES) || { echo "run make bench-start-pieces-build first"; exit 2; }
+	systemd-run --user --scope --quiet --collect -- $(START_PIECES) drive --piece $(PIECE) --out $(OUT) \
+		--count $(or $(COUNT),100) --concurrency $(or $(CONCURRENCY),1) --alive $(or $(ALIVE),0) \
+		$(if $(SNAPSHOT_DIR),--snapshot-dir $(SNAPSHOT_DIR)) $(if $(FIRECRACKER),--firecracker $(FIRECRACKER)) \
+		$(if $(UFFD_SOCKET),--uffd-socket $(UFFD_SOCKET)) $(if $(PERF_FREQ),--perf-freq $(PERF_FREQ)) \
+		$(if $(PERF_EVENTS),--perf-events $(PERF_EVENTS)) $(if $(COLD),--cold) $(ARGS)
+
+test-start-pieces: private SHELL := $(TARGET_LEASE_SHELL)
+test-start-pieces: cargo-target-link
+	CARGO_TARGET_DIR=target $(CARGO) test --release -p start-pieces
+
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest
 container-bench: check-disk container-build
@@ -1763,7 +1789,7 @@ setup-lint-tools: cargo-target-link
 	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && $(CARGO) install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
-	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core -p fleet-potato --check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core -p fleet-potato -p start-pieces --check
 	$(MAKE) clippy
 	$(CARGO) audit
 	$(CARGO) deny check

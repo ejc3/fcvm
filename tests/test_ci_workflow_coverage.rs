@@ -1492,6 +1492,8 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
     for (path, want_code, want_bench) in [
         ("bench/chromium/reqbench.py", false, true),
         ("bench/chromium/test_reqbench.py", false, true),
+        // A workspace member under bench/: lint builds and formats it.
+        ("bench/start-rate/pieces/src/drive.rs", true, true),
         // README.md and PERFORMANCE.md are LINTED by
         // tests/test_documented_make_targets.rs, so they must reach the matrix.
         ("README.md", true, false),

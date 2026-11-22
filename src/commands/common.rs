@@ -3586,6 +3586,56 @@ async fn cleanup_failed_clone_holder(holder: &mut Option<tokio::process::Child>,
     }
 }
 
+/// Run a rootless clone's pre-pasta network setup (`PastaNetwork::build_setup_script`) in the
+/// holder's namespaces: one nsenter+bash+ip for the whole phase, TAP verification included as
+/// the last batch step (`ip -batch` aborts at the first failure, so reaching it proves every
+/// step above applied). Retried while the namespace is not ready yet, up to
+/// [`NSENTER_MAX_WAIT`]. Public for the start-pieces bench (bench/start-rate/pieces).
+pub async fn run_namespace_setup_script(
+    holder_pid: u32,
+    nsenter_prefix: &[String],
+    setup_script: &crate::network::pasta::IpBatchScript,
+) -> Result<()> {
+    let ns_poll_start = std::time::Instant::now();
+    info!(holder_pid = holder_pid, "running network setup via nsenter");
+    loop {
+        if !crate::utils::is_process_alive(holder_pid) {
+            anyhow::bail!(
+                "holder process (PID {}) died before network setup could run",
+                holder_pid
+            );
+        }
+        let output = tokio::process::Command::new(&nsenter_prefix[0])
+            .args(&nsenter_prefix[1..])
+            .arg("bash")
+            .arg("-c")
+            .arg(setup_script.script())
+            .output()
+            .await
+            .context("running network setup via nsenter")?;
+        if output.status.success() {
+            debug!("namespace ready after {:?}", ns_poll_start.elapsed());
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Invalid argument") || stderr.contains("No such process") {
+            if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
+                anyhow::bail!(
+                    "namespace not ready after {:?}: {}",
+                    ns_poll_start.elapsed(),
+                    stderr
+                );
+            }
+            tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
+            continue;
+        }
+        anyhow::bail!(
+            "network setup failed: {}",
+            setup_script.describe_failure(&stderr)
+        );
+    }
+}
+
 /// Prepare the [`CloneSubstrate`]: per-network-mode namespace setup + CoW disk + extra-disk
 /// copy + mount-redirect. Shared by the Firecracker and Cloud Hypervisor restore paths.
 ///
@@ -3659,50 +3709,7 @@ async fn prepare_clone_substrate(
             Ok::<_, anyhow::Error>(rootfs_path)
         };
 
-        let network_task = async {
-            let ns_poll_start = std::time::Instant::now();
-            info!(holder_pid = holder_pid, "running network setup via nsenter");
-            // One nsenter+bash+ip for the whole phase, TAP verification included
-            // as the last batch step (ip -batch aborts at the first failure, so
-            // reaching it proves every step above applied).
-            loop {
-                if !crate::utils::is_process_alive(holder_pid) {
-                    anyhow::bail!(
-                        "holder process (PID {}) died before network setup could run",
-                        holder_pid
-                    );
-                }
-                let output = tokio::process::Command::new(&nsenter_prefix[0])
-                    .args(&nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(setup_script.script())
-                    .output()
-                    .await
-                    .context("running network setup via nsenter")?;
-                if output.status.success() {
-                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-                    break;
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
-                        anyhow::bail!(
-                            "namespace not ready after {:?}: {}",
-                            ns_poll_start.elapsed(),
-                            stderr
-                        );
-                    }
-                    tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
-                    continue;
-                }
-                anyhow::bail!(
-                    "network setup failed: {}",
-                    setup_script.describe_failure(&stderr)
-                );
-            }
-            Ok::<_, anyhow::Error>(())
-        };
+        let network_task = run_namespace_setup_script(holder_pid, &nsenter_prefix, &setup_script);
 
         let (disk_result, network_result) = tokio::join!(disk_task, network_task);
         if let Err(e) = &disk_result {

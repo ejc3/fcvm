@@ -2702,6 +2702,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "start-pieces"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fcvm",
+ "libc",
+ "nix 0.30.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

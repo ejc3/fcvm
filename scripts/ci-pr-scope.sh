@@ -160,6 +160,8 @@ while IFS= read -r f; do
     # It runs `make -pq` against this file, so a Makefile-only change
     # is exactly the class that can break it.
     Makefile) code=true; bench=true; echo "makefile: $f" ;;
+    # bench/start-rate/pieces is a workspace member: lint builds and formats it.
+    bench/start-rate/pieces/*) code=true; bench=true; echo "code path (workspace member): $f" ;;
     bench/*) bench=true; echo "bench path: $f" ;;
     # fleet/core is a workspace member that fcvm builds, so it is code.
     # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
