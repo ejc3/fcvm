@@ -345,10 +345,10 @@ mod tests {
         let paths = [path.clone()];
         assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 3);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut writer = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
+        // A block past a hole: a new extent on every filesystem (an appended block can join
+        // the last extent on ext4 and xfs, which CI's checkout is on).
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.seek(SeekFrom::Start(1 << 20)).unwrap();
         writer.write_all(&[1; 4096]).unwrap();
         writer.sync_all().unwrap();
         assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 4);
