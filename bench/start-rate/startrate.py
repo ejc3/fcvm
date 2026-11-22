@@ -33,6 +33,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+BASELINE_TIMEOUT_S = 600
+
 HEALTHY_MARKER = "VM healthy, switching to"
 
 # (stage name, marker that opens it, marker that closes it); times are the harness's
@@ -144,57 +146,61 @@ def cmd_prep(a):
         "--health-check", "http://localhost/",
         "--no-snapshot",
     ] + (["--ipv6-prefix", a.ipv6_prefix] if a.ipv6_prefix else []) + [a.image]
-    log = open(out / "baseline.log", "w")
-    base_proc = subprocess.Popen(run, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-    deadline = time.time() + 600
-    base_pid = None
-    while time.time() < deadline:
-        if base_proc.poll() is not None:
-            sys.exit(f"baseline exited early ({base_proc.returncode}); see {out/'baseline.log'}")
-        vms = list_vms(a.fcvm, a.sudo)
-        hit = [v for v in vms if v.get("name") == base and v.get("health_status") == "healthy"]
-        if hit:
-            base_pid = hit[0]["pid"]
-            break
-        time.sleep(0.5)
-    if base_pid is None:
-        sys.exit("baseline never became healthy in 600 s")
-    print(f"baseline healthy pid={base_pid}")
-    sh(fc + ["snapshot", "create", "--pid", str(base_pid), "--tag", snap], env=env)
-    print(f"snapshot {snap} created")
-    serve_pid = None
-    serve_proc = None
-    if a.uffd:
-        slog = open(out / "serve.log", "w")
-        # The serve admits 256 clones by default (uffd::server DEFAULT_MAX_CLONES_PER_SERVER);
-        # a start-rate run keeps every clone alive, so it raises the cap.
-        senv = dict(env, FCVM_UFFD_MAX_CLONES=str(a.max_clones))
-        sfc = (["sudo", "--preserve-env=RUST_LOG,FCVM_UFFD_MAX_CLONES", a.fcvm] if a.sudo and os.geteuid() != 0 else [a.fcvm])
-        serve_proc = subprocess.Popen(
-            sfc + ["snapshot", "serve", snap], stdout=slog, stderr=subprocess.STDOUT, env=senv, start_new_session=True
+    with ChildOwner(a.sudo) as own:
+        log = open(out / "baseline.log", "w")
+        base_proc = own.add(
+            subprocess.Popen(run, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         )
-        deadline = time.time() + 120
-        while time.time() < deadline and serve_pid is None:
-            for line in (out / "serve.log").read_text(errors="replace").splitlines():
-                if "Serve PID:" in line:
-                    serve_pid = int(line.split("Serve PID:")[1].split()[0])
-            if serve_proc.poll() is not None:
-                sys.exit(f"serve exited; see {out/'serve.log'}")
-            time.sleep(0.1)
-        if serve_pid is None:
-            sys.exit("serve never printed its PID")
-        print(f"serve pid={serve_pid}")
-    rec = {
-        "baseline": base, "baseline_pid": base_pid, "baseline_launcher_pid": base_proc.pid,
-        "snapshot": snap, "serve_pid": serve_pid,
-        "serve_launcher_pid": serve_proc.pid if serve_proc else None,
-        "max_clones": a.max_clones if a.uffd else None,
-        "network": a.network, "cpu": a.cpu, "mem_mib": a.mem, "image": a.image, "sudo": a.sudo,
-        "ipv6_prefix": a.ipv6_prefix,
-    }
-    (out / "prep.json").write_text(json.dumps(rec, indent=2) + "\n")
-    print(json.dumps(rec))
+        deadline = time.time() + BASELINE_TIMEOUT_S
+        base_pid = None
+        while time.time() < deadline:
+            if base_proc.poll() is not None:
+                sys.exit(f"baseline exited early ({base_proc.returncode}); see {out/'baseline.log'}")
+            vms = list_vms(a.fcvm, a.sudo)
+            hit = [v for v in vms if v.get("name") == base and v.get("health_status") == "healthy"]
+            if hit:
+                base_pid = hit[0]["pid"]
+                break
+            time.sleep(0.5)
+        if base_pid is None:
+            sys.exit(f"baseline never became healthy in {BASELINE_TIMEOUT_S} s")
+        print(f"baseline healthy pid={base_pid}")
+        sh(fc + ["snapshot", "create", "--pid", str(base_pid), "--tag", snap], env=env)
+        print(f"snapshot {snap} created")
+        serve_pid = None
+        serve_proc = None
+        if a.uffd:
+            slog = open(out / "serve.log", "w")
+            # The serve admits 256 clones by default (uffd::server DEFAULT_MAX_CLONES_PER_SERVER);
+            # a start-rate run keeps every clone alive, so it raises the cap.
+            senv = dict(env, FCVM_UFFD_MAX_CLONES=str(a.max_clones))
+            sfc = (["sudo", "--preserve-env=RUST_LOG,FCVM_UFFD_MAX_CLONES", a.fcvm] if a.sudo and os.geteuid() != 0 else [a.fcvm])
+            serve_proc = own.add(subprocess.Popen(
+                sfc + ["snapshot", "serve", snap], stdout=slog, stderr=subprocess.STDOUT, env=senv, start_new_session=True
+            ))
+            deadline = time.time() + 120
+            while time.time() < deadline and serve_pid is None:
+                for line in (out / "serve.log").read_text(errors="replace").splitlines():
+                    if "Serve PID:" in line:
+                        serve_pid = int(line.split("Serve PID:")[1].split()[0])
+                if serve_proc.poll() is not None:
+                    sys.exit(f"serve exited; see {out/'serve.log'}")
+                time.sleep(0.1)
+            if serve_pid is None:
+                sys.exit("serve never printed its PID")
+            print(f"serve pid={serve_pid}")
+        rec = {
+            "baseline": base, "baseline_pid": base_pid, "baseline_launcher_pid": base_proc.pid,
+            "snapshot": snap, "serve_pid": serve_pid,
+            "serve_launcher_pid": serve_proc.pid if serve_proc else None,
+            "max_clones": a.max_clones if a.uffd else None,
+            "network": a.network, "cpu": a.cpu, "mem_mib": a.mem, "image": a.image, "sudo": a.sudo,
+            "ipv6_prefix": a.ipv6_prefix,
+        }
+        (out / "prep.json").write_text(json.dumps(rec, indent=2) + "\n")
+        print(json.dumps(rec))
 
+        own.release_all()  # prep.json is published: baseline and serve are meant to outlive prep
 
 def list_vms(fcvm, sudo):
     """`fcvm ls --json`, or exit: a run that cannot read health renders no verdict."""
@@ -292,6 +298,75 @@ def ensure_fd_limit(count, rlimit=resource):
     return soft
 
 
+class ChildOwner:
+    """Owns every child a command starts and stops them on any exit path.
+
+    Leaving the `with` block, by return, exception, SystemExit, Ctrl-C or SIGTERM (turned into
+    KeyboardInterrupt), sends each child its stop signal, SIGKILLs what is left and reaps it.
+    A command releases only the children it means to leave running, after it has published
+    whatever lets a later command find them.
+    """
+
+    def __init__(self, sudo):
+        self.sudo = sudo
+        self.lock = threading.Lock()
+        self.children = []  # (proc, group, first signal, via sudo)
+        self.prev_term = None
+        self.installed = False
+        self.before_stop = None  # runs first on exit: end whatever still starts children
+        self.after_stop = None  # runs last on exit: end threads that read the children
+
+    def add(self, proc, group="", sig=signal.SIGTERM, sudo=None):
+        with self.lock:
+            self.children.append((proc, group, sig, self.sudo if sudo is None else sudo))
+        return proc
+
+    def release_all(self):
+        with self.lock:
+            self.children = []
+
+    def stop(self, group=None, limit_s=120):
+        """Stop the children of `group` (all when None); seconds taken. Safe to call twice."""
+        td0 = now_ns()
+        with self.lock:
+            mine = [(p, sg, su) for p, g, sg, su in self.children if group is None or g == group]
+        for p, sg, su in mine:
+            if p.poll() is None:
+                kill(p.pid, sg, su)
+        for p, _, su in mine:
+            try:
+                p.wait(timeout=max(1, limit_s - (now_ns() - td0) / 1e9))
+            except subprocess.TimeoutExpired:
+                kill(p.pid, signal.SIGKILL, su)
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+        return (now_ns() - td0) / 1e9
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            self.prev_term = signal.signal(signal.SIGTERM, _interrupt)
+            self.installed = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.installed:
+            signal.signal(signal.SIGTERM, self.prev_term)
+        try:
+            if self.before_stop:
+                self.before_stop()
+            self.stop()
+        finally:
+            if self.after_stop:
+                self.after_stop()
+        return False
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def positive_int(text):
     try:
         v = int(text)
@@ -370,42 +445,6 @@ class Progress:
     def counts(self):
         with self.cv:
             return self.healthy_n, self.failed_n
-
-
-def stop_clones(clones, sudo, limit_s=120):
-    """SIGTERM every live clone, wait, SIGKILL what is left, reap. Safe to call twice."""
-    td0 = now_ns()
-    for c in clones:
-        if c.proc is not None and c.proc.poll() is None:
-            kill(c.proc.pid, signal.SIGTERM, sudo)
-    for c in clones:
-        if c.proc is None:
-            continue
-        try:
-            c.proc.wait(timeout=max(1, limit_s - (now_ns() - td0) / 1e9))
-        except subprocess.TimeoutExpired:
-            kill(c.proc.pid, signal.SIGKILL, sudo)
-            try:
-                c.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-    return (now_ns() - td0) / 1e9
-
-
-def stop_pidstat(p):
-    if p is None:
-        return
-    if p.poll() is None:
-        p.send_signal(signal.SIGINT)
-    try:
-        p.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait()
-
-
-def _interrupt(signum, frame):
-    raise KeyboardInterrupt
 
 
 def cmd_run(a):
@@ -500,9 +539,12 @@ def cmd_run(a):
                 c.log = open(out / "clones" / f"{c.name}.log", "w")
                 r, w = os.pipe()
                 os.set_blocking(r, False)
-                c.proc = subprocess.Popen(
-                    base_cmd + ["--name", c.name], stdout=w, stderr=w, stdin=subprocess.DEVNULL,
-                    env=env, close_fds=True, start_new_session=True,
+                c.proc = own.add(
+                    subprocess.Popen(
+                        base_cmd + ["--name", c.name], stdout=w, stderr=w, stdin=subprocess.DEVNULL,
+                        env=env, close_fds=True, start_new_session=True,
+                    ),
+                    group="clones",
                 )
             except OSError as e:
                 # A launcher that dies here leaves the clone pending for ever, so the run
@@ -518,10 +560,9 @@ def cmd_run(a):
                 sel.register(r, selectors.EVENT_READ, c)
 
     sampler = HostSampler(out / "host.tsv")
-    pidstat = None
     rt = threading.Thread(target=reader, name="reader", daemon=True)
     launchers = [threading.Thread(target=launcher, name=f"launcher-{k}", daemon=True) for k in range(a.launchers)]
-    prev_term = signal.signal(signal.SIGTERM, _interrupt)
+    own = ChildOwner(prep["sudo"])
 
     def stop_launching():
         progress.stop()
@@ -529,12 +570,26 @@ def cmd_run(a):
             if th.is_alive():
                 th.join()
 
-    try:
+    def stop_threads():
+        reader_stop.set()
+        if rt.is_alive():
+            rt.join(timeout=5)
+        sampler.stop.set()
+        if sampler.is_alive():
+            sampler.join(timeout=3)
+
+    own.before_stop = stop_launching
+    own.after_stop = stop_threads
+
+    with own:
         sampler.start()
         with open(out / "pidstat.log", "w") as pidstat_log:
-            pidstat = subprocess.Popen(
-                ["pidstat", "-u", "-h", str(a.pidstat_interval)],
-                stdout=pidstat_log, stderr=subprocess.STDOUT, start_new_session=True,
+            own.add(
+                subprocess.Popen(
+                    ["pidstat", "-u", "-h", str(a.pidstat_interval)],
+                    stdout=pidstat_log, stderr=subprocess.STDOUT, start_new_session=True,
+                ),
+                group="pidstat", sig=signal.SIGINT, sudo=False,
             )
         rt.start()
         for th in launchers:
@@ -578,13 +633,13 @@ def cmd_run(a):
             time.sleep(a.hold)
         t_hold_end = now_ns()
 
-        teardown_s = stop_clones(clones, prep["sudo"])
+        teardown_s = own.stop("clones")
         time.sleep(0.5)
         reader_stop.set()
         rt.join(timeout=5)
         sampler.stop.set()
         sampler.join(timeout=3)
-        stop_pidstat(pidstat)
+        own.stop("pidstat")
 
         with open(out / "samples.jsonl", "w") as fh:
             for c in clones:
@@ -614,19 +669,6 @@ def cmd_run(a):
         if bad:
             print("FAILED: see summary.json (failures, or log/state health disagree)", file=sys.stderr)
             sys.exit(1)
-    finally:
-        # Every child this run started stops here whatever got us here: a failed verification,
-        # an exception, Ctrl-C or SIGTERM. Already-stopped children make each step a no-op.
-        signal.signal(signal.SIGTERM, prev_term)
-        stop_launching()
-        stop_clones(clones, prep["sudo"])
-        reader_stop.set()
-        if rt.is_alive():
-            rt.join(timeout=5)
-        sampler.stop.set()
-        if sampler.is_alive():
-            sampler.join(timeout=3)
-        stop_pidstat(pidstat)
 
 
 # --------------------------------------------------------------------------- report

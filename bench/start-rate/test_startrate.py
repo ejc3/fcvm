@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -203,8 +204,8 @@ class Midnight(unittest.TestCase):
         self.assertNotIn("other", out.getvalue())
 
 
-class FakeFcvm(unittest.TestCase):
-    """cmd_run against a fake fcvm and pidstat: real processes, no VMs."""
+class FakeBase(unittest.TestCase):
+    """A fake fcvm and pidstat on PATH: real processes, no VMs."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -276,6 +277,11 @@ class FakeFcvm(unittest.TestCase):
         )
         return argparse.Namespace(**{**base, **kw})
 
+
+
+class FakeFcvm(FakeBase):
+    """cmd_run against the fake fcvm."""
+
     def test_failing_final_ls_still_reaps_every_child(self):
         os.environ["FAIL_SECOND_LS"] = "1"
         with self.assertRaises(SystemExit) as e:
@@ -326,6 +332,93 @@ class FakeFcvm(unittest.TestCase):
             startrate.cmd_prep(a)
         self.assertIn("already exists", str(e.exception))
         self.assertEqual(list(out.iterdir()), [])
+
+
+
+PREP_FCVM = """#!/bin/sh
+cd "$STATE"
+case "$1" in
+podman)
+  echo $$ >> pids
+  while [ $# -gt 0 ]; do [ "$1" = --name ] && echo "$2" > name; shift; done
+  [ "$FAIL_AT" = baseline ] && exit 4
+  exec sleep 300;;
+ls)
+  case "$FAIL_AT" in
+    health) exit 3;;
+    timeout) echo '[]';;
+    *) echo "[{\\"name\\":\\"$(cat name)\\",\\"health_status\\":\\"healthy\\",\\"pid\\":4242}]";;
+  esac;;
+snapshot)
+  if [ "$2" = create ]; then [ "$FAIL_AT" = snapshot ] && exit 5; exit 0; fi
+  echo $$ >> pids
+  [ "$FAIL_AT" = serve ] && { echo boom; exit 1; }
+  echo "Serve PID: 4243"
+  exec sleep 300;;
+esac
+"""
+
+
+class PrepOwnsItsChildren(FakeBase):
+    def run_prep(self, fail_at):
+        (self.d / "bin" / "fcvm").write_text(PREP_FCVM)
+        os.environ["FAIL_AT"] = fail_at
+        out = self.d / "prepdir"
+        a = argparse.Namespace(
+            fcvm=self.fcvm, out=str(out), network="rootless", uffd=True, cpu=1, mem=256, image="i",
+            ipv6_prefix=None, sudo=False, max_clones=8,
+        )
+        with mock.patch.object(startrate, "BASELINE_TIMEOUT_S", 1, create=True):
+            try:
+                startrate.cmd_prep(a)
+            except (SystemExit, subprocess.CalledProcessError):
+                pass
+        return out
+
+    def wait_dead(self, pids):
+        deadline = time.time() + 5
+        while time.time() < deadline and any(self.alive(p) for p in pids):
+            time.sleep(0.05)
+        return [p for p in pids if self.alive(p)]
+
+    def failure_leaves_nothing(self, fail_at, started):
+        out = self.run_prep(fail_at)
+        pids = self.pids()
+        self.assertEqual(len(pids), started)
+        self.assertEqual(self.wait_dead(pids), [])
+        self.assertFalse((out / "prep.json").exists())
+
+    def test_health_poll_failure_leaves_no_child(self):
+        self.failure_leaves_nothing("health", 1)
+
+    def test_baseline_timeout_leaves_no_child(self):
+        self.failure_leaves_nothing("timeout", 1)
+
+    def test_snapshot_create_failure_leaves_no_child(self):
+        self.failure_leaves_nothing("snapshot", 1)
+
+    def test_serve_start_failure_leaves_no_child(self):
+        self.failure_leaves_nothing("serve", 2)
+
+    def test_interrupt_during_prep_leaves_no_child(self):
+        (self.d / "bin" / "fcvm").write_text(PREP_FCVM)
+        os.environ["FAIL_AT"] = "timeout"
+        a = argparse.Namespace(
+            fcvm=self.fcvm, out=str(self.d / "prepdir"), network="rootless", uffd=False, cpu=1, mem=256,
+            image="i", ipv6_prefix=None, sudo=False, max_clones=8,
+        )
+        threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()
+        with self.assertRaises(KeyboardInterrupt):
+            startrate.cmd_prep(a)
+        self.assertEqual(self.wait_dead(self.pids()), [])
+
+    def test_success_keeps_baseline_and_serve_and_writes_prep_json(self):
+        out = self.run_prep("")
+        pids = self.pids()
+        self.assertEqual(len(pids), 2)
+        self.assertTrue(all(self.alive(p) for p in pids))
+        rec = json.loads((out / "prep.json").read_text())
+        self.assertEqual((rec["baseline_pid"], rec["serve_pid"]), (4242, 4243))
 
 
 if __name__ == "__main__":
