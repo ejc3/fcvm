@@ -135,15 +135,15 @@ pub fn layout(state: &State) -> Option<Layout> {
             .host
             .as_ref()
             .is_some_and(|h| f.hosts.get(h).is_some_and(|h| h.region.is_some())),
-        fleet_core::tiling::Half::Ec2 => f.layout.ec2.is_some(),
-        // A Lambda tile is reached only over its tunnel to the coordinator, which the
-        // broadcast does not read yet; no coordinator runs a Lambda tile before it does.
-        fleet_core::tiling::Half::Lambda => false,
+        // The AWS half's grid holds both backings; a Lambda tile's published name reaches it
+        // through the coordinator's front and the tile's tunnel.
+        fleet_core::tiling::Half::Ec2 | fleet_core::tiling::Half::Lambda => f.layout.ec2.is_some(),
     };
     let tiles: Vec<TileSpec> = f
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.lambda.values())
         .filter(placed)
         .filter_map(|s| tile(state, s))
         .collect();

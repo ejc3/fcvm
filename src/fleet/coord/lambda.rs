@@ -15,9 +15,14 @@
 //!   publish, is one Lambda launched for it, and the time from the publish to that boot is
 //!   reported as the tile's `capacity_wait_ms` (kept out of the race time, as an EC2 tile's
 //!   capacity wait is), with `new_instance` 1.
-//! - Terminating a replaced version is Lambda's: publishing the next one retires it. Releasing
-//!   the tile (the fleet sleeps) deletes the function, and the sweep at start and at shutdown
-//!   deletes every function of this fleet's names.
+//! - Terminating a replaced version is Lambda's: publishing the next one retires it. A tile's
+//!   function name is reused by every task the reconciler runs for the tile (a tile that
+//!   leaves and comes back gets a new task while the old one may still be finishing), so the
+//!   function belongs to the newest task ([`Ec2Driver::claim`]), and configuring, publishing
+//!   and deleting it happen one at a time under its tile's lock. A task that ends deletes the
+//!   function, whether its launch ran or never served, unless a newer task owns the tile; an
+//!   older task's launch is refused. The sweep at start and at shutdown deletes every
+//!   function of this fleet's names, and the one at shutdown also refuses every later launch.
 //! - Scene, budget and health go over the tile's tunnel to the renderer's HTTP listener.
 
 use super::aws::{signed, CredentialChain};
@@ -399,7 +404,19 @@ pub struct LambdaDriver {
     /// Starts at the coordinator's start time, so no launch repeats an earlier coordinator's.
     launches: std::sync::atomic::AtomicU64,
     ready_timeout: Duration,
+    /// Per tile: the tile task that owns its function ([`Ec2Driver::claim`]), behind the lock
+    /// every change to the function is made under (configure and publish, delete), so those
+    /// happen one at a time per tile. A launch or a cleanup for any other task is refused: the
+    /// function's name is reused across tasks, and an earlier task's late cleanup would
+    /// otherwise delete a launch of the task that replaced it.
+    owners: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<u64>>>>>,
+    /// The coordinator is stopping: no task owns a tile again.
+    closed: std::sync::atomic::AtomicBool,
 }
+
+/// The owner used by direct calls ([`Ec2Driver::launch_generation`], [`Ec2Driver::release`]),
+/// which no reconciler task makes.
+const DIRECT: u64 = 0;
 
 impl LambdaDriver {
     pub fn new(
@@ -420,7 +437,63 @@ impl LambdaDriver {
             published: Mutex::default(),
             launches: std::sync::atomic::AtomicU64::new(crate::fleet::now_ms()),
             ready_timeout: READY_TIMEOUT,
+            owners: Mutex::default(),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `tile`'s owner and the lock its function's changes are made under.
+    fn owner(&self, tile: &str) -> Arc<tokio::sync::Mutex<Option<u64>>> {
+        self.owners
+            .lock()
+            .unwrap()
+            .entry(tile.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Delete `tile`'s function and end its tunnel, with its owner lock held (`owner`), so no
+    /// task owns the tile after.
+    async fn delete_locked(&self, tile: &str, owner: &mut Option<u64>) -> Result<bool> {
+        *owner = None;
+        self.endpoint.forget(tile);
+        self.seen.lock().unwrap().remove(tile);
+        self.api.delete(&self.plan.function(tile)).await
+    }
+
+    /// Configure and publish `tile`'s function for `generation`, with its owner lock held.
+    async fn launch_locked(&self, tile: &str, generation: u64) -> Result<Launched, LaunchError> {
+        let name = self.plan.function(tile);
+        let expires = crate::fleet::now_ms() + CREDENTIAL_LIFE.as_millis() as u64;
+        let credential = tunnel::mint(&self.key, tile, generation, expires);
+        let launch = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let vars = self.plan.environment(tile, generation, launch, &credential);
+        // From now on the endpoint takes this generation's tunnel only.
+        self.endpoint.want(tile, generation);
+        self.api
+            .put(&name, self.plan.create_body(&name, &vars), &vars)
+            .await
+            .map_err(LaunchError::Failed)?;
+        let before = self
+            .endpoint
+            .sessions()
+            .borrow()
+            .get(tile)
+            .map(|s| s.env.clone());
+        let published_ms = crate::fleet::now_ms();
+        self.api.publish(&name).await.map_err(LaunchError::Failed)?;
+        self.published
+            .lock()
+            .unwrap()
+            .insert(tile.to_string(), (generation, published_ms, before));
+        Ok(Launched {
+            instance: self.instance_name(tile, generation),
+            frame_url: Some(format!("wss://{tile}.{}/frames", self.plan.zone)),
+            ipv6: self.plan.ipv6.clone(),
+            ipv4: self.plan.ipv4.clone(),
+        })
     }
 
     pub fn with_ready_timeout(mut self, d: Duration) -> Self {
@@ -500,42 +573,40 @@ impl Ec2Driver for LambdaDriver {
         self.launch_generation(tile, 0).await
     }
 
+    /// A launch no reconciler task makes (a test, a tool): it takes the tile for itself.
     async fn launch_generation(
         &self,
         tile: &str,
         generation: u64,
     ) -> Result<Launched, LaunchError> {
-        let name = self.plan.function(tile);
-        let expires = crate::fleet::now_ms() + CREDENTIAL_LIFE.as_millis() as u64;
-        let credential = tunnel::mint(&self.key, tile, generation, expires);
-        let launch = self
-            .launches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let vars = self.plan.environment(tile, generation, launch, &credential);
-        // From now on the endpoint takes this generation's tunnel only.
-        self.endpoint.want(tile, generation);
-        self.api
-            .put(&name, self.plan.create_body(&name, &vars), &vars)
-            .await
-            .map_err(LaunchError::Failed)?;
-        let before = self
-            .endpoint
-            .sessions()
-            .borrow()
-            .get(tile)
-            .map(|s| s.env.clone());
-        let published_ms = crate::fleet::now_ms();
-        self.api.publish(&name).await.map_err(LaunchError::Failed)?;
-        self.published
-            .lock()
-            .unwrap()
-            .insert(tile.to_string(), (generation, published_ms, before));
-        Ok(Launched {
-            instance: self.instance_name(tile, generation),
-            frame_url: Some(format!("wss://{tile}.{}/frames", self.plan.zone)),
-            ipv6: self.plan.ipv6.clone(),
-            ipv4: self.plan.ipv4.clone(),
-        })
+        self.claim(tile, DIRECT).await;
+        self.launch_owned(tile, generation, DIRECT).await
+    }
+
+    async fn claim(&self, tile: &str, owner: u64) {
+        let lock = self.owner(tile);
+        let mut o = lock.lock().await;
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            *o = Some(owner);
+        }
+    }
+
+    async fn launch_owned(
+        &self,
+        tile: &str,
+        generation: u64,
+        owner: u64,
+    ) -> Result<Launched, LaunchError> {
+        let lock = self.owner(tile);
+        let o = lock.lock().await;
+        if *o != Some(owner) {
+            return Err(LaunchError::Failed(anyhow::anyhow!(
+                "{tile} belongs to another tile task, or the coordinator is stopping"
+            )));
+        }
+        let r = self.launch_locked(tile, generation).await;
+        drop(o);
+        r
     }
 
     async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched> {
@@ -639,16 +710,35 @@ impl Ec2Driver for LambdaDriver {
         Ok(())
     }
 
+    /// A release no reconciler task makes: deletes the tile's function whoever owns it.
     async fn release(&self, instance: &str) -> Result<()> {
         let name = instance
             .rsplit_once('#')
             .map(|(n, _)| n)
             .unwrap_or(instance);
-        if let Some(tile) = name.rsplit_once('-').map(|(_, n)| format!("lam-{n}")) {
-            self.endpoint.forget(&tile);
-            self.seen.lock().unwrap().remove(&tile);
+        let tile = name
+            .rsplit_once('-')
+            .map(|(_, n)| format!("lam-{n}"))
+            .with_context(|| format!("{instance:?} names no Lambda tile"))?;
+        let lock = self.owner(&tile);
+        let mut o = lock.lock().await;
+        self.delete_locked(&tile, &mut o).await.map(|_| ())
+    }
+
+    /// The tile task `owner` ended: delete the tile's function, whether a launch of it runs or
+    /// never served, unless another task owns the tile now (it rejoined the assignment, and
+    /// the function holds that task's launch).
+    async fn retire(&self, tile: &str, owner: u64, _current: Option<&str>) -> Result<()> {
+        let lock = self.owner(tile);
+        let mut o = lock.lock().await;
+        if *o != Some(owner) {
+            tracing::debug!(
+                tile,
+                "a retired tile task leaves the tile's function to its owner"
+            );
+            return Ok(());
         }
-        self.api.delete(name).await.map(|_| ())
+        self.delete_locked(tile, &mut o).await.map(|_| ())
     }
 
     async fn post_scene(&self, tile: &str, _l: &Launched, body: &RendererScene) -> Result<()> {
@@ -708,18 +798,24 @@ impl Ec2Driver for LambdaDriver {
         }
     }
 
+    /// Delete every function of this fleet's names, each under its tile's lock, so a launch
+    /// in progress finishes first and none is owned after.
     async fn sweep(&self) -> Result<usize> {
         let mut n = 0;
         for k in 1..=MAX_TILES {
-            if self
-                .api
-                .delete(&self.plan.function(&format!("lam-{k}")))
-                .await?
-            {
+            let tile = format!("lam-{k}");
+            let lock = self.owner(&tile);
+            let mut o = lock.lock().await;
+            if self.delete_locked(&tile, &mut o).await? {
                 n += 1;
             }
         }
         Ok(n)
+    }
+
+    async fn sweep_at_shutdown(&self) -> Result<usize> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.sweep().await
     }
 }
 
@@ -850,16 +946,26 @@ mod tests {
         publishes: Mutex<Vec<String>>,
         deleted: Mutex<Vec<String>>,
         stops: Mutex<Vec<watch::Sender<bool>>>,
+        /// While true, a publish starts no environment (its readiness never comes).
+        withhold: std::sync::atomic::AtomicBool,
+        /// A configuration waits for this before Lambda takes it.
+        put_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[async_trait]
     impl Functions for Fake {
         async fn put(&self, name: &str, _c: Value, vars: &BTreeMap<String, String>) -> Result<()> {
+            if let Some(g) = &self.put_gate {
+                g.acquire().await.unwrap().forget();
+            }
             self.vars.lock().unwrap().insert(name.into(), vars.clone());
             Ok(())
         }
         async fn publish(&self, name: &str) -> Result<()> {
             self.publishes.lock().unwrap().push(name.into());
+            if self.withhold.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
             let v = self.vars.lock().unwrap()[name].clone();
             let (instance, boot) = self.instance.lock().unwrap().clone();
             let id = Identity {
@@ -915,6 +1021,8 @@ mod tests {
             publishes: Mutex::default(),
             deleted: Mutex::default(),
             stops: Mutex::default(),
+            withhold: Default::default(),
+            put_gate: None,
         });
         let d = driver(fake.clone(), ep.clone());
         // A wake: the first launch lands on an instance Lambda launched after the publish.
@@ -983,6 +1091,8 @@ mod tests {
             publishes: Mutex::default(),
             deleted: Mutex::default(),
             stops: Mutex::default(),
+            withhold: Default::default(),
+            put_gate: None,
         });
         let d = driver(fake.clone(), ep.clone());
         let l = d
@@ -1029,10 +1139,234 @@ mod tests {
             publishes: Mutex::default(),
             deleted: Mutex::default(),
             stops: Mutex::default(),
+            withhold: Default::default(),
+            put_gate: None,
         });
         let d = driver(fake.clone(), ep);
         assert_eq!(d.sweep().await.unwrap(), 2);
         assert_eq!(fake.deleted.lock().unwrap().len(), MAX_TILES as usize);
         assert!(fake.vars.lock().unwrap().contains_key("fcvm-lam-other-1"));
+    }
+
+    /// A handle whose actor only answers, for the reconciler's reports.
+    fn quiet_handle() -> super::super::Handle {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::super::Cmd>(4096);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let super::super::Cmd::Apply {
+                    reply: Some(reply), ..
+                } = cmd
+                {
+                    let _ = reply.send(None);
+                }
+            }
+        });
+        super::super::Handle {
+            cmds: tx,
+            snapshot: watch::channel(Arc::new(super::super::Snapshot {
+                version: 0,
+                text: String::new(),
+            }))
+            .1,
+            lambda: watch::channel(Vec::new()).1,
+            ec2_layout: watch::channel(None).1,
+            broadcast_layout: watch::channel(None).1,
+        }
+    }
+
+    fn slot(id: &str, generation: u64) -> fleet_core::protocol::AssignSlot {
+        serde_json::from_value(json!({
+            "id": id, "sbdf": "", "generation": generation,
+            "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+        }))
+        .unwrap()
+    }
+
+    /// The Lambda tiles' reconciler over a stand-in Lambda: the fake, its assignment, and the
+    /// renderer's address.
+    async fn lane(
+        withhold: bool,
+        put_gate: Option<Arc<tokio::sync::Semaphore>>,
+        ready_timeout: Duration,
+    ) -> (
+        Arc<Fake>,
+        Arc<LambdaDriver>,
+        watch::Sender<Vec<fleet_core::protocol::AssignSlot>>,
+        Arc<Endpoint>,
+    ) {
+        let ep = Endpoint::new(tunnel::derive_key("token-for-tests"));
+        let r = renderer().await;
+        let fake = Arc::new(Fake {
+            ep: ep.clone(),
+            renderer: r.addr,
+            vars: Mutex::default(),
+            instance: Mutex::new(("i-a".into(), 1)),
+            publishes: Mutex::default(),
+            deleted: Mutex::default(),
+            stops: Mutex::default(),
+            withhold: std::sync::atomic::AtomicBool::new(withhold),
+            put_gate,
+        });
+        let d = Arc::new(driver(fake.clone(), ep.clone()).with_ready_timeout(ready_timeout));
+        let (assign_tx, assign_rx) = watch::channel(Vec::new());
+        let (_scene_tx, scene_rx) = watch::channel(None);
+        let (_budget_tx, budget_rx) = watch::channel(None);
+        std::mem::forget((_scene_tx, _budget_tx));
+        let driver: Arc<dyn Ec2Driver> = d.clone();
+        tokio::spawn(super::super::ec2::run(
+            driver,
+            assign_rx,
+            scene_rx,
+            budget_rx,
+            quiet_handle(),
+        ));
+        (fake, d, assign_tx, ep)
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ok() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn deletes_after_sweep(fake: &Fake) -> usize {
+        // The start sweep deletes every name once.
+        fake.deleted.lock().unwrap().len() - MAX_TILES as usize
+    }
+
+    fn stop_all(fake: &Fake) {
+        for s in fake.stops.lock().unwrap().iter() {
+            s.send_replace(true);
+        }
+    }
+
+    /// The tile leaves the assignment while it runs: its function is deleted.
+    #[tokio::test]
+    async fn a_running_tile_that_leaves_has_its_function_deleted() {
+        let (fake, _d, assign, ep) = lane(false, None, Duration::from_secs(10)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("the tile runs", || {
+            ep.sessions().borrow().contains_key("lam-1")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assign.send(Vec::new()).unwrap();
+        until("its function deleted", || deletes_after_sweep(&fake) == 1).await;
+        stop_all(&fake);
+    }
+
+    /// The tile leaves and comes back while its first task waits for its environment: the
+    /// returning task's launch runs, and the first task's late cleanup must not delete it.
+    #[tokio::test]
+    async fn a_retired_task_does_not_delete_the_launch_of_the_task_that_replaced_it() {
+        let (fake, _d, assign, ep) = lane(true, None, Duration::from_secs(10)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("the first launch published", || {
+            fake.publishes.lock().unwrap().len() == 1
+        })
+        .await;
+        // Leave, then come back, while the first task still waits for its environment.
+        assign.send(Vec::new()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fake.withhold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("the returning task published", || {
+            fake.publishes.lock().unwrap().len() == 2
+        })
+        .await;
+        until("the returning task's environment holds the tile", || {
+            ep.sessions().borrow().contains_key("lam-1")
+        })
+        .await;
+        // Both tasks see that environment ready; the first one then ends.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            deletes_after_sweep(&fake),
+            0,
+            "the retired task deleted the returning task's function"
+        );
+        assert!(
+            ep.sessions().borrow().contains_key("lam-1"),
+            "the retired task ended the returning task's tunnel"
+        );
+        stop_all(&fake);
+    }
+
+    /// The tile leaves while its launch waits for its environment, which then never comes:
+    /// the launch never served, and its function is deleted anyway.
+    #[tokio::test]
+    async fn a_launch_cancelled_while_it_starts_has_its_function_deleted() {
+        let (fake, _d, assign, _ep) = lane(true, None, Duration::from_secs(1)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("published", || fake.publishes.lock().unwrap().len() == 1).await;
+        assign.send(Vec::new()).unwrap();
+        until("the abandoned launch's function deleted", || {
+            deletes_after_sweep(&fake) == 1
+        })
+        .await;
+    }
+
+    /// The tile leaves during the backoff after its launch failed to become ready: the
+    /// function of that launch is deleted.
+    #[tokio::test]
+    async fn a_tile_that_leaves_during_the_backoff_has_its_function_deleted() {
+        let (fake, _d, assign, _ep) = lane(true, None, Duration::from_millis(300)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("published", || fake.publishes.lock().unwrap().len() == 1).await;
+        // Past the readiness timeout: the task reports the failure and backs off.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assign.send(Vec::new()).unwrap();
+        until("the failed launch's function deleted", || {
+            deletes_after_sweep(&fake) == 1
+        })
+        .await;
+    }
+
+    /// The fleet sleeps while a launch is still configuring its function: once Lambda takes
+    /// the configuration the launch publishes, and its function is deleted after it.
+    #[tokio::test]
+    async fn a_launch_the_fleet_slept_during_has_its_function_deleted() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (fake, _d, assign, _ep) = lane(true, Some(gate.clone()), Duration::from_secs(1)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assign.send(Vec::new()).unwrap();
+        gate.add_permits(1);
+        until("published", || fake.publishes.lock().unwrap().len() == 1).await;
+        until("the slept launch's function deleted", || {
+            deletes_after_sweep(&fake) == 1
+        })
+        .await;
+    }
+
+    /// The coordinator's shutdown sweep deletes every function and refuses any launch after
+    /// it, so no function is left published behind a stopped coordinator.
+    #[tokio::test]
+    async fn the_shutdown_sweep_refuses_later_launches() {
+        let (fake, d, assign, ep) = lane(false, None, Duration::from_secs(10)).await;
+        assign.send(vec![slot("lam-1", 1)]).unwrap();
+        until("the tile runs", || {
+            ep.sessions().borrow().contains_key("lam-1")
+        })
+        .await;
+        assert_eq!(d.sweep_at_shutdown().await.unwrap(), 1);
+        assert!(
+            d.launch_owned("lam-1", 2, 1).await.is_err(),
+            "a launch after the shutdown sweep"
+        );
+        // A tile task that starts after it cannot take the tile either.
+        d.claim("lam-1", 7).await;
+        assert!(
+            d.launch_owned("lam-1", 2, 7).await.is_err(),
+            "a launch by a task that claimed the tile after the shutdown sweep"
+        );
+        // The reconciler's task for the tile cannot launch it again either.
+        assign.send(vec![slot("lam-1", 2)]).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(fake.publishes.lock().unwrap().len(), 1);
+        stop_all(&fake);
     }
 }

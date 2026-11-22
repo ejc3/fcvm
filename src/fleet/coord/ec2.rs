@@ -94,6 +94,36 @@ pub trait Ec2Driver: Send + Sync {
     ) -> Result<Launched, LaunchError> {
         self.launch(tile).await
     }
+    /// A tile task `owner` starts for `tile`: from now on the tile is that task's. A driver
+    /// whose tiles reuse one resource across tasks (a Lambda tile's function name) refuses
+    /// the launches and the cleanup of any earlier task for the same tile; one where every
+    /// launch is a resource of its own (an EC2 instance) has nothing to do.
+    async fn claim(&self, _tile: &str, _owner: u64) {}
+    /// Launch `tile` for `generation` on behalf of the tile task `owner` ([`Ec2Driver::claim`]).
+    async fn launch_owned(
+        &self,
+        tile: &str,
+        generation: u64,
+        _owner: u64,
+    ) -> Result<Launched, LaunchError> {
+        self.launch_generation(tile, generation).await
+    }
+    /// The tile task `owner` ends (the tile left the assignment): clean up what it holds.
+    /// `current` is its running launch, if it has one; a task can also end holding a launch
+    /// that never served (it left while that launch started, or during the backoff after one
+    /// failed), which a driver that reuses one resource per tile must remove too. The EC2
+    /// driver releases `current` and has nothing else left (every failed instance was
+    /// terminated when it failed).
+    async fn retire(&self, _tile: &str, _owner: u64, current: Option<&str>) -> Result<()> {
+        match current {
+            Some(instance) => self.release(instance).await,
+            None => Ok(()),
+        }
+    }
+    /// [`Ec2Driver::sweep`] at the coordinator's shutdown: also refuse every later launch.
+    async fn sweep_at_shutdown(&self) -> Result<usize> {
+        self.sweep().await
+    }
     /// Timings the driver measured for a launch once it is ready (a Lambda tile's
     /// `new_instance` and the capacity wait it names), added to the tile's report.
     fn launch_timings(&self, _tile: &str, _launched: &Launched) -> BTreeMap<String, u64> {
@@ -543,6 +573,9 @@ async fn tile(
     ),
 ) {
     let token = task_token();
+    // Before any launch: the tile is this task's, and an earlier task's cleanup no longer
+    // touches it.
+    driver.claim(&id, token).await;
     let mut current: Option<(Launched, u64)> = None;
     let mut retry = Duration::from_secs(1);
     // The generation that is waiting for capacity, and since when.
@@ -587,7 +620,7 @@ async fn tile(
             }
             let launched = match resumed {
                 Some(l) => Ok(l),
-                None => driver.launch_generation(&id, generation).await,
+                None => driver.launch_owned(&id, generation, token).await,
             };
             match launched {
                 Ok(l) => {
@@ -807,10 +840,9 @@ async fn tile(
         }
     }
     remove_own(&running, &id, token);
-    if let Some((l, _)) = current {
-        if let Err(e) = driver.release(&l.instance).await {
-            tracing::warn!(instance = %l.instance, error = %e, "releasing the tile's instance failed");
-        }
+    let current = current.map(|(l, _)| l.instance);
+    if let Err(e) = driver.retire(&id, token, current.as_deref()).await {
+        tracing::warn!(tile = %id, instance = ?current, error = %e, "releasing the tile's instance failed");
     }
 }
 

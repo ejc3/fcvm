@@ -48,9 +48,10 @@ pub struct Billed {
     pub tile: bool,
 }
 
-/// The Lambda Managed Instances management fee, as a share of the instance's on-demand
-/// price (AWS's published rate for Lambda Managed Instances).
-pub const LAMBDA_FEE: f64 = 0.15;
+/// The Lambda Managed Instances management fee for a g4dn.xlarge, USD per hour: the AWS Price
+/// List's usage type `Lambda-Managed-Instances-g4dn.xlarge-Management-Hours` in us-east-1
+/// (9.75% of the type's $0.526 on-demand rate), charged on top of the instance itself.
+pub const LAMBDA_FEE_USD_PER_HOUR: f64 = 0.051285;
 /// The instance type a Lambda tile runs on.
 pub const LAMBDA_INSTANCE_TYPE: &str = "g4dn.xlarge";
 /// Instances a Lambda tile keeps while it is assigned: Lambda keeps the instance the previous
@@ -63,14 +64,14 @@ pub const LAMBDA_INSTANCES_PER_TILE: f64 = 2.0;
 /// 37 to 66 s (2026-11-22).
 pub const LAMBDA_DELETE_TAIL: Duration = Duration::from_secs(120);
 
-/// USD per hour of one Lambda instance: the type's on-demand rate plus the management fee
-/// (the highest rate known when the type has none).
+/// USD per hour of one Lambda instance: the type's on-demand rate (the highest rate known
+/// when the type has none) plus the management fee.
 pub fn lambda_instance_rate(on_demand: &BTreeMap<String, f64>) -> f64 {
     let od = on_demand
         .get(LAMBDA_INSTANCE_TYPE)
         .copied()
         .unwrap_or_else(|| on_demand.values().copied().fold(0.0, f64::max));
-    od * (1.0 + LAMBDA_FEE)
+    od + LAMBDA_FEE_USD_PER_HOUR
 }
 
 /// A spot price: instance type, availability zone, USD per hour.
@@ -314,9 +315,13 @@ pub fn burn_report(
     spot: &HashMap<(String, String), BTreeMap<String, f64>>,
     on_demand: &BTreeMap<String, f64>,
     cap: f64,
+    // What the listings do not show (the Lambda tiles): added to the listed rate, and so
+    // inside the launch cap, which already counts it.
+    extra: f64,
 ) -> std::result::Result<(f64, u32, Option<String>), String> {
     if !stale.is_empty() {
         let (rate, why) = burn_rate(listed, spot, on_demand);
+        let rate = rate + extra;
         let instances = listed.values().map(|l| l.len() as u32).sum();
         let mut reason = format!(
             "no listing of {} for {} s; charged at the fleet's launch cap",
@@ -341,7 +346,7 @@ pub fn burn_report(
     }
     let (rate, why) = burn_rate(listed, spot, on_demand);
     let instances = listed.values().map(|l| l.len() as u32).sum();
-    Ok((rate, instances, why))
+    Ok((rate + extra, instances, why))
 }
 
 /// The meter `--daily-spend-usd` asks for, or `None` without it. A ceiling needs a fleet that
@@ -459,6 +464,17 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
             Instant::now(),
             cfg.stale_after,
         );
+        // The Lambda tiles' instances are not listed: their charge is added to the listed
+        // rate before the launch cap is applied, never on top of the cap.
+        let lambda = cfg.lambda_usd_per_instance_hour.map(|rate| {
+            let assigned: Vec<String> = handle
+                .lambda
+                .borrow()
+                .iter()
+                .map(|a| a.id.clone())
+                .collect();
+            lambda_burn(&assigned, &mut lambda_seen, Instant::now(), rate)
+        });
         let burn = burn_report(
             &cfg.regions,
             &listed,
@@ -466,6 +482,7 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
             &spot,
             &cfg.on_demand,
             cfg.cap_usd_per_hour,
+            lambda.unwrap_or(0.0),
         );
         if handle.cmds.is_closed() {
             return;
@@ -473,29 +490,17 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
         match burn {
             Ok((usd_per_hour, instances, why)) => {
                 problems.extend(why);
-                let (usd_per_hour, by_backing) = match cfg.lambda_usd_per_instance_hour {
-                    None => (usd_per_hour, BTreeMap::new()),
-                    Some(rate) => {
-                        let assigned: Vec<String> = handle
-                            .lambda
-                            .borrow()
-                            .iter()
-                            .map(|a| a.id.clone())
-                            .collect();
-                        let lambda = lambda_burn(&assigned, &mut lambda_seen, Instant::now(), rate);
+                let by_backing = match lambda {
+                    // At the launch cap (an unknown inventory) the parts are not known.
+                    Some(lambda) if stale.is_empty() => {
                         let (hosts, tiles, _) = burn_rates(&listed, &spot, &cfg.on_demand);
-                        // At the launch cap (an unknown inventory) the parts are not known.
-                        let split = if stale.is_empty() {
-                            BTreeMap::from([
-                                ("hosts".to_string(), hosts),
-                                ("ec2".to_string(), tiles),
-                                ("lambda".to_string(), lambda),
-                            ])
-                        } else {
-                            BTreeMap::new()
-                        };
-                        (usd_per_hour + lambda, split)
+                        BTreeMap::from([
+                            ("hosts".to_string(), hosts),
+                            ("ec2".to_string(), tiles),
+                            ("lambda".to_string(), lambda),
+                        ])
                     }
+                    _ => BTreeMap::new(),
                 };
                 tracing::debug!(usd_per_hour, instances, "spend meter");
                 handle
@@ -770,7 +775,11 @@ mod tests {
     #[test]
     fn a_lambda_tile_is_charged_two_instances_until_its_delete_tail_ends() {
         let rate = lambda_instance_rate(&on_demand_rates(&[]).unwrap());
-        assert!((rate - 0.526 * 1.15).abs() < 1e-9, "{rate}");
+        assert!((rate - (0.526 + 0.051285)).abs() < 1e-9, "{rate}");
+        // One tile: two g4dn.xlarge with the management fee each.
+        let mut one_tile = HashMap::new();
+        let charge = lambda_burn(&["lam-1".to_string()], &mut one_tile, Instant::now(), rate);
+        assert!((charge - 1.15457).abs() < 1e-9, "{charge}");
         let mut seen = HashMap::new();
         let t0 = Instant::now();
         let both = vec!["lam-1".to_string(), "lam-2".to_string()];
@@ -888,7 +897,7 @@ mod tests {
         // A restart whose first listings failed: reporting 0 would overwrite the stored rate.
         let none = BTreeMap::new();
         assert_eq!(
-            burn_report(&regions, &none, &[], &spot, &on_demand, 0.0),
+            burn_report(&regions, &none, &[], &spot, &on_demand, 0.0, 0.0),
             Err(
                 "no listing yet of us-east-1, us-east-2; the last reported burn stays in use"
                     .into()
@@ -899,10 +908,10 @@ mod tests {
             "us-east-1".to_string(),
             vec![host("i-1", "g4dn.xlarge", false, "us-east-1a")],
         )]);
-        assert!(burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0).is_err());
+        assert!(burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0, 0.0).is_err());
         listed.insert("us-east-2".to_string(), Vec::new());
         assert_eq!(
-            burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0),
+            burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0, 0.0),
             Ok((0.526, 1, None))
         );
     }
@@ -923,15 +932,28 @@ mod tests {
         ]);
         let stale = vec!["us-east-1".to_string()];
         let (rate, instances, why) =
-            burn_report(&regions, &listed, &stale, &spot, &on_demand, cap).unwrap();
+            burn_report(&regions, &listed, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert_eq!((rate, instances), (cap, 1));
         assert!(why.unwrap().contains("us-east-1"));
         // Never listed at all, past the bound: no longer "keep the last rate", which on a first
         // start is none.
         let stale = regions.clone();
         let none = BTreeMap::new();
-        let (rate, _, _) = burn_report(&regions, &none, &stale, &spot, &on_demand, cap).unwrap();
+        let (rate, _, _) =
+            burn_report(&regions, &none, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert_eq!(rate, cap);
+        // The Lambda tiles' charge is inside the cap, which already counts them: an unknown
+        // inventory is charged the cap, not the cap and the Lambda tiles again.
+        let (rate, _, _) =
+            burn_report(&regions, &none, &stale, &spot, &on_demand, cap, 2.0).unwrap();
+        assert_eq!(rate, cap);
+        // A known inventory adds them to what it lists.
+        let fresh = BTreeMap::from([
+            ("us-east-1".to_string(), Vec::new()),
+            ("us-east-2".to_string(), Vec::new()),
+        ]);
+        let (rate, _, _) = burn_report(&regions, &fresh, &[], &spot, &on_demand, cap, 2.0).unwrap();
+        assert_eq!(rate, 2.0);
         // A known rate above the cap is kept.
         let big = BTreeMap::from([
             (
@@ -941,7 +963,8 @@ mod tests {
             ("us-east-2".to_string(), Vec::new()),
         ]);
         let stale = vec!["us-east-2".to_string()];
-        let (rate, _, _) = burn_report(&regions, &big, &stale, &spot, &on_demand, cap).unwrap();
+        let (rate, _, _) =
+            burn_report(&regions, &big, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert!(rate > cap);
     }
 

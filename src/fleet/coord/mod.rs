@@ -420,9 +420,12 @@ impl Actor {
             epoch_unix_ms: f.scene.epoch_unix_ms,
             image_aspect: self.state.config.image_aspect,
             region,
+            // The AWS half is one grid of both backings: a Lambda tile's published name
+            // reaches it through the coordinator's front and its tunnel.
             tiles: f
                 .ec2
                 .values()
+                .chain(f.lambda.values())
                 .filter_map(|s| {
                     Some(TileSpec {
                         id: s.id.clone(),
@@ -1740,7 +1743,13 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             dns,
         ));
     }
-    let ec2_sweep = ec2.clone();
+    // Both backings' tiles are swept at shutdown: the EC2 instances and the Lambda functions.
+    let sweeps: Vec<(&str, Arc<dyn ec2::Ec2Driver>)> = ec2
+        .clone()
+        .map(|d| ("EC2", d))
+        .into_iter()
+        .chain(lambda.clone().map(|d| ("Lambda", d)))
+        .collect();
     let (handle, _actor) = start_with_lambda(state, store_tx, ec2, lambda, ec2_local, power, names);
     if let Some(obj) = budget_drill {
         tokio::spawn(spend::watch_drill(obj, handle.clone()));
@@ -2004,20 +2013,21 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     // still owns the state object, which its stored last write confirms: a last write that
     // failed may have met another coordinator's object (a 412 whose check could not read
     // it), and that coordinator's tiles are the ones the sweep would terminate.
-    let ec2_sweep = ec2_sweep.filter(|_| {
-        let owns = owns_the_state(stored, &lost);
-        if !owns {
-            tracing::warn!(
-                "the last state was not stored, so this coordinator may not own the state object; the EC2 sweep is left to the next coordinator's start"
-            );
-        }
-        owns
-    });
-    if let Some(d) = ec2_sweep {
-        match tokio::time::timeout(Duration::from_secs(20), d.sweep()).await {
-            Ok(Ok(n)) => tracing::info!(instances = n, "EC2 tiles terminated"),
-            Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "EC2 tiles not terminated"),
-            Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
+    let owns = owns_the_state(stored, &lost);
+    if !owns && !sweeps.is_empty() {
+        tracing::warn!(
+            "the last state was not stored, so this coordinator may not own the state object; the tile sweep is left to the next coordinator's start"
+        );
+    }
+    let sweeps = if owns { sweeps } else { Vec::new() };
+    // Waited for before the process exits: a function or an instance left behind is billed
+    // and nothing manages it until another coordinator starts. A Lambda sweep also refuses
+    // every launch a tile task might still make.
+    for (backing, d) in sweeps {
+        match tokio::time::timeout(Duration::from_secs(20), d.sweep_at_shutdown()).await {
+            Ok(Ok(n)) => tracing::info!(backing, tiles = n, "tiles removed"),
+            Ok(Err(e)) => tracing::warn!(backing, error = %format!("{e:#}"), "tiles not removed"),
+            Err(_) => tracing::warn!(backing, "tiles not removed within 20 s"),
         }
     }
     anyhow::ensure!(
@@ -2147,10 +2157,16 @@ mod store_tests {
         let guard = body
             .find("owns_the_state(stored, &lost)")
             .expect("the ownership check");
-        let sweep = body.find("d.sweep()").expect("the sweep");
+        let sweep = body.find("d.sweep_at_shutdown()").expect("the sweep");
         assert!(
             shutdown < lost_check && shutdown < guard && guard < sweep,
             "the sweep is not guarded by the ownership check after the shutdown write"
+        );
+        // The Lambda tiles' functions are swept too, by the same guarded sweep.
+        let sweeps = body.find("let sweeps").expect("the drivers swept");
+        assert!(
+            body[sweeps..shutdown].contains("lambda.clone()"),
+            "the Lambda driver is not among the drivers swept at shutdown"
         );
         let (tx, rx) = watch::channel(false);
         let lost = Some(rx);
