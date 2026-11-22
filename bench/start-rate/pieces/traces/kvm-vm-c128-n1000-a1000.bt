@@ -61,7 +61,7 @@ Attaching 20 probes...
 @exec[/usr/local/sbin/grep]: 1
 @exec[/etc/update-motd.d/50-motd-news]: 1
 @exec[/usr/local/sbin/run-parts]: 1
-@exec[/mnt/fcvm-btrfs/work/fcvm/target/release/start-pieces]: 1
+@exec[$CHECKOUT/target/release/start-pieces]: 1
 @exec[/etc/update-motd.d/98-reboot-required]: 1
 @exec[/usr/bin/bc]: 1
 @exec[/usr/share/unattended-upgrades/update-motd-unattended-upgrades]: 1
@@ -115,7 +115,7 @@ Attaching 20 probes...
 @exec[/usr/bin/date]: 6
 @exec[/usr/bin/grep]: 7
 @exec[/bin/bash]: 11
-@exec[/mnt/fcvm-btrfs/cargo-target/fcvm-f43cabe9/release/start-pieces]: 1998
+@exec[$CARGO_TARGET/release/start-pieces]: 1998
 
 @kvm_create_vm_us: 
 [64, 128)            154 |@@@@@@@@@@@@@@@@                                    |

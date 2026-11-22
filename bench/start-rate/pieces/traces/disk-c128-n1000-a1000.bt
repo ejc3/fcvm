@@ -69,7 +69,7 @@ Attaching 20 probes...
 @exec[/etc/update-motd.d/95-hwe-eol]: 1
 @exec[/usr/local/sbin/run-parts]: 1
 @exec[/bin/date]: 1
-@exec[/mnt/fcvm-btrfs/work/fcvm/target/release/start-pieces]: 1
+@exec[$CHECKOUT/target/release/start-pieces]: 1
 @exec[/usr/sbin/ip]: 1
 @exec[/etc/update-motd.d/98-reboot-required]: 1
 @exec[/usr/bin/podman]: 1
@@ -123,7 +123,7 @@ Attaching 20 probes...
 @exec[/usr/bin/cat]: 7
 @exec[/bin/bash]: 11
 @exec[/usr/local/sbin/cp]: 2000
-@exec[/mnt/fcvm-btrfs/cargo-target/fcvm-f43cabe9/release/start-pieces]: 2000
+@exec[$CARGO_TARGET/release/start-pieces]: 2000
 @exec[$HOME/.cargo/bin/cp]: 2000
 @exec[/usr/bin/cp]: 2000
 @exec[/usr/local/bin/cp]: 2000

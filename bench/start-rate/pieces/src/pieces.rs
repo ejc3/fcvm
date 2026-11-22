@@ -127,9 +127,11 @@ pub async fn instance(args: PieceArgs) -> Result<()> {
         vm_id: fcvm::state::generate_vm_id(),
         ..Default::default()
     };
+    // A failure is reported after the teardown: the driver waits for this process to exit
+    // once it reads the error, and what was made must be gone by then.
     if let Err(error) = prepare(&args, &mut held).await {
-        say(&format!("error prepare: {error:#}"));
         let _ = teardown(&mut held).await;
+        say(&format!("error prepare: {error:#}"));
         return Err(error);
     }
     say("ready");
@@ -144,8 +146,8 @@ pub async fn instance(args: PieceArgs) -> Result<()> {
     match op(&args, &mut held).await {
         Ok(stages) => say(&format!("done {}", stages_json(ms(started), &stages))),
         Err(error) => {
-            say(&format!("error op: {error:#}"));
             let _ = teardown(&mut held).await;
+            say(&format!("error op: {error:#}"));
             return Err(error);
         }
     }
