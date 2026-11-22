@@ -43,6 +43,7 @@ pub fn facts(state: &State) -> Vec<Fact> {
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.lambda.values())
         .chain(f.phones.values())
         .chain(f.windows.values())
         .chain(f.minecraft.values())

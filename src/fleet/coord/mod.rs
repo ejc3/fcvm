@@ -19,6 +19,8 @@ pub mod ec2;
 pub mod ec2_aws;
 pub mod ecs;
 pub mod hosts;
+pub mod lambda;
+pub mod lambda_front;
 pub mod live;
 pub mod metrics;
 pub mod minecraft_log;
@@ -33,16 +35,19 @@ pub mod text_check;
 pub mod turnstile;
 pub mod wake_log;
 
-use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetTextCheck};
+use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetLambda, FleetTextCheck};
 use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
+use crate::fleet::tunnel;
 use anyhow::{bail, Context, Result};
 use fleet_core::protocol::{
     AgentMsg, AssignSlot, BudgetPlan, ClaimMsg, CoordMsg, ServerMsg, SharedScene,
 };
 use fleet_core::tiling::Rect;
-use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
+use fleet_core::view::{
+    ec2_assignment, host_assignments, host_regions, lambda_assignment, shared_scene,
+};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -148,6 +153,8 @@ struct AgentConn {
 pub struct Outputs {
     pub snapshot: watch::Sender<Arc<Snapshot>>,
     pub ec2: watch::Sender<Vec<AssignSlot>>,
+    /// The Lambda tiles the Lambda driver runs (`lambda_assignment`).
+    pub lambda: watch::Sender<Vec<AssignSlot>>,
     /// The EC2 half's aggregator layout.
     pub ec2_layout: watch::Sender<Option<Layout>>,
     /// The broadcast aggregator's layout: the whole image, or `None` when nothing shows.
@@ -413,9 +420,12 @@ impl Actor {
             epoch_unix_ms: f.scene.epoch_unix_ms,
             image_aspect: self.state.config.image_aspect,
             region,
+            // The AWS half is one grid of both backings: a Lambda tile's published name
+            // reaches it through the coordinator's front and its tunnel.
             tiles: f
                 .ec2
                 .values()
+                .chain(f.lambda.values())
                 .filter_map(|s| {
                     Some(TileSpec {
                         id: s.id.clone(),
@@ -464,6 +474,15 @@ impl Actor {
                 false
             } else {
                 *cur = ec2;
+                true
+            }
+        });
+        let lambda = lambda_assignment(&self.state);
+        self.out.lambda.send_if_modified(|cur| {
+            if *cur == lambda {
+                false
+            } else {
+                *cur = lambda;
                 true
             }
         });
@@ -1021,6 +1040,8 @@ fn set_at(event: &mut Event, t: u64) {
 pub struct Handle {
     pub cmds: mpsc::Sender<Cmd>,
     pub snapshot: watch::Receiver<Arc<Snapshot>>,
+    /// The Lambda tiles assigned (the spend meter charges them).
+    pub lambda: watch::Receiver<Vec<AssignSlot>>,
     pub ec2_layout: watch::Receiver<Option<Layout>>,
     pub broadcast_layout: watch::Receiver<Option<Layout>>,
 }
@@ -1175,12 +1196,27 @@ pub fn start(
     power: Option<hosts::HostConfig>,
     names: Option<Names>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
+    start_with_lambda(state, store, ec2, None, ec2_aggregate_local, power, names)
+}
+
+/// [`start`], also running the Lambda tiles with `lambda` (the EC2 reconciler over the
+/// Lambda driver, [`lambda::LambdaDriver`]).
+pub fn start_with_lambda(
+    state: State,
+    store: Option<store::StoreTx>,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+    lambda: Option<Arc<dyn ec2::Ec2Driver>>,
+    ec2_aggregate_local: Option<String>,
+    power: Option<hosts::HostConfig>,
+    names: Option<Names>,
+) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
         version: 0,
         text: String::new(),
     }));
     let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
+    let (lambda_tx, lambda_rx) = watch::channel(Vec::new());
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (broadcast_layout_tx, broadcast_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
@@ -1196,6 +1232,7 @@ pub fn start(
         Outputs {
             snapshot: snap_tx,
             ec2: ec2_tx,
+            lambda: lambda_tx,
             ec2_layout: ec2_layout_tx,
             broadcast_layout: broadcast_layout_tx,
             power: power_tx,
@@ -1216,6 +1253,7 @@ pub fn start(
     let handle = Handle {
         cmds,
         snapshot: snap_rx,
+        lambda: lambda_rx.clone(),
         ec2_layout: ec2_layout_rx,
         broadcast_layout: broadcast_layout_rx,
     };
@@ -1237,6 +1275,18 @@ pub fn start(
             }
         }
     });
+    if let Some(driver) = lambda {
+        let mut owned = owned_rx.clone();
+        let handle = handle.clone();
+        let (scene_rx, budget_rx) = (scene_rx.clone(), budget_rx.clone());
+        tokio::spawn(async move {
+            // As the EC2 tiles below: nothing is swept or launched before this
+            // coordinator owns the state object.
+            if wait_owned(&mut owned).await {
+                ec2::run(driver, lambda_rx, scene_rx, budget_rx, handle).await;
+            }
+        });
+    }
     if let Some(driver) = ec2 {
         let mut owned = owned_rx;
         let handle = handle.clone();
@@ -1337,6 +1387,33 @@ pub async fn admin_addresses(addr: &str) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
+/// `--lambda-tiles` as the state's `lambda_max`, checked against the flags it needs.
+pub fn lambda_tiles(args: &FleetCoordArgs) -> Result<usize> {
+    match args.lambda {
+        FleetLambda::None => {
+            anyhow::ensure!(args.lambda_tiles == 0, "--lambda-tiles needs --lambda aws");
+            Ok(0)
+        }
+        FleetLambda::Aws => {
+            anyhow::ensure!(
+                args.ec2 != FleetEc2::None,
+                "--lambda aws takes its tiles out of the AWS half's --ec2-tiles: it needs --ec2"
+            );
+            anyhow::ensure!(
+                args.lambda_tiles <= args.ec2_tiles,
+                "--lambda-tiles {} is more than the AWS half's --ec2-tiles {}",
+                args.lambda_tiles,
+                args.ec2_tiles
+            );
+            anyhow::ensure!(
+                args.ec2_aggregate_tls,
+                "--lambda aws serves its tiles on the coordinator task's port 443: it needs --ec2-aggregate-tls"
+            );
+            Ok(args.lambda_tiles.min(args.max_tiles))
+        }
+    }
+}
+
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
     // Before anything starts: a refused admin address stops the coordinator at once.
     let admin_addrs = match &args.admin_listen {
@@ -1365,7 +1442,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     } else {
         None
     };
+    let lambda_tiles = lambda_tiles(&args)?;
     let config = Config {
+        lambda_max: lambda_tiles,
         max_tiles: args.max_tiles,
         fcvm_tiles: args.fcvm_tiles.min(args.max_tiles),
         fill_from_serving_hosts: args.awake_hosts > 1,
@@ -1481,6 +1560,64 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             d.networks = ec2_aws::networks(&args.ec2_subnets, &args.ec2_security_group)?;
             d.scene_token = scene_token.clone();
             Some(Arc::new(d))
+        }
+    };
+    // The Lambda tiles' tunnel endpoint and driver (`--lambda aws`).
+    let lambda_endpoint = match args.lambda {
+        FleetLambda::None => None,
+        FleetLambda::Aws => {
+            let token = scene_token.get().context(
+                "--lambda aws keys the tiles' tunnel credentials with the scene token: it needs --tls-secret",
+            )?;
+            Some((
+                tunnel::Endpoint::new(tunnel::derive_key(&token)),
+                tunnel::derive_key(&token),
+            ))
+        }
+    };
+    let lambda: Option<Arc<dyn ec2::Ec2Driver>> = match &lambda_endpoint {
+        None => None,
+        Some((endpoint, key)) => {
+            let zone = args
+                .dns_subzone
+                .clone()
+                .context("--lambda aws names its tiles in --dns-subzone")?
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let public = ec2_public
+                .as_ref()
+                .context("--lambda aws serves its tiles on the task's addresses: it needs --ec2-aggregate-tls")?;
+            let plan = lambda::Plan {
+                fleet: args.fleet_name.clone(),
+                image: args
+                    .lambda_image
+                    .clone()
+                    .context("--lambda aws needs --lambda-image")?,
+                role: args
+                    .lambda_role
+                    .clone()
+                    .context("--lambda aws needs --lambda-role")?,
+                capacity_provider: args
+                    .lambda_capacity_provider
+                    .clone()
+                    .context("--lambda aws needs --lambda-capacity-provider")?,
+                tunnel: format!("{}.{zone}", lambda_front::TUNNEL_LABEL),
+                zone,
+                tls_secret: args
+                    .tls_secret
+                    .clone()
+                    .context("--lambda aws needs --tls-secret")?,
+                tls_secret_region: secrets_region()?,
+                ipv6: public.ipv6.clone(),
+                ipv4: public.ipv4.clone(),
+            };
+            Some(Arc::new(lambda::LambdaDriver::new(
+                plan,
+                Arc::new(lambda::LambdaApi::new(&args.lambda_region)?),
+                endpoint.clone(),
+                key.clone(),
+                scene_token.clone(),
+            )))
         }
     };
     let ec2_local = args.ec2_aggregate_listen.as_ref().map(|l| {
@@ -1606,8 +1743,14 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             dns,
         ));
     }
-    let ec2_sweep = ec2.clone();
-    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, names);
+    // Both backings' tiles are swept at shutdown: the EC2 instances and the Lambda functions.
+    let sweeps: Vec<(&str, Arc<dyn ec2::Ec2Driver>)> = ec2
+        .clone()
+        .map(|d| ("EC2", d))
+        .into_iter()
+        .chain(lambda.clone().map(|d| ("Lambda", d)))
+        .collect();
+    let (handle, _actor) = start_with_lambda(state, store_tx, ec2, lambda, ec2_local, power, names);
     if let Some(obj) = budget_drill {
         tokio::spawn(spend::watch_drill(obj, handle.clone()));
     }
@@ -1636,11 +1779,43 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 "--tls-file".into(),
                 dir.join(tls::FILE).to_string_lossy().into_owned(),
             ]);
+            let mut public: Vec<std::net::SocketAddr> = Vec::new();
             if a.ipv4.is_some() {
-                argv.extend(["--tls-listen".into(), format!("0.0.0.0:{}", tls::PORT)]);
+                public.push(format!("0.0.0.0:{}", tls::PORT).parse()?);
             }
             if let Some(v6) = &a.ipv6 {
-                argv.extend(["--tls-listen".into(), format!("[{v6}]:{}", tls::PORT)]);
+                public.push(format!("[{v6}]:{}", tls::PORT).parse()?);
+            }
+            match &lambda_endpoint {
+                // Port 443 is the front's, which routes the aggregator's names to it on
+                // loopback (`lambda_front`).
+                Some((endpoint, _)) => {
+                    let behind: std::net::SocketAddr =
+                        format!("127.0.0.1:{}", lambda_front::AGGREGATOR_BEHIND).parse()?;
+                    argv.extend(["--tls-listen".into(), behind.to_string()]);
+                    let cert = crate::fleet::aggregate::tls::CertFile::load(&dir.join(tls::FILE))?;
+                    tokio::spawn(cert.clone().watch(crate::fleet::aggregate::tls::RELOAD));
+                    let zone = args
+                        .dns_subzone
+                        .clone()
+                        .unwrap_or_default()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    let front =
+                        lambda_front::Front::new(zone, endpoint.clone(), cert, Some(behind));
+                    for addr in public {
+                        let l = tokio::net::TcpListener::bind(addr)
+                            .await
+                            .with_context(|| format!("the Lambda front cannot listen on {addr}"))?;
+                        tracing::info!(%addr, "the Lambda front listens");
+                        tokio::spawn(front.clone().serve(l));
+                    }
+                }
+                None => {
+                    for addr in public {
+                        argv.extend(["--tls-listen".into(), addr.to_string()]);
+                    }
+                }
             }
         }
         tokio::spawn(crate::fleet::aggregate::child::supervise(
@@ -1838,20 +2013,21 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     // still owns the state object, which its stored last write confirms: a last write that
     // failed may have met another coordinator's object (a 412 whose check could not read
     // it), and that coordinator's tiles are the ones the sweep would terminate.
-    let ec2_sweep = ec2_sweep.filter(|_| {
-        let owns = owns_the_state(stored, &lost);
-        if !owns {
-            tracing::warn!(
-                "the last state was not stored, so this coordinator may not own the state object; the EC2 sweep is left to the next coordinator's start"
-            );
-        }
-        owns
-    });
-    if let Some(d) = ec2_sweep {
-        match tokio::time::timeout(Duration::from_secs(20), d.sweep()).await {
-            Ok(Ok(n)) => tracing::info!(instances = n, "EC2 tiles terminated"),
-            Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "EC2 tiles not terminated"),
-            Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
+    let owns = owns_the_state(stored, &lost);
+    if !owns && !sweeps.is_empty() {
+        tracing::warn!(
+            "the last state was not stored, so this coordinator may not own the state object; the tile sweep is left to the next coordinator's start"
+        );
+    }
+    let sweeps = if owns { sweeps } else { Vec::new() };
+    // Waited for before the process exits: a function or an instance left behind is billed
+    // and nothing manages it until another coordinator starts. A Lambda sweep also refuses
+    // every launch a tile task might still make.
+    for (backing, d) in sweeps {
+        match tokio::time::timeout(Duration::from_secs(20), d.sweep_at_shutdown()).await {
+            Ok(Ok(n)) => tracing::info!(backing, tiles = n, "tiles removed"),
+            Ok(Err(e)) => tracing::warn!(backing, error = %format!("{e:#}"), "tiles not removed"),
+            Err(_) => tracing::warn!(backing, "tiles not removed within 20 s"),
         }
     }
     anyhow::ensure!(
@@ -1981,10 +2157,16 @@ mod store_tests {
         let guard = body
             .find("owns_the_state(stored, &lost)")
             .expect("the ownership check");
-        let sweep = body.find("d.sweep()").expect("the sweep");
+        let sweep = body.find("d.sweep_at_shutdown()").expect("the sweep");
         assert!(
             shutdown < lost_check && shutdown < guard && guard < sweep,
             "the sweep is not guarded by the ownership check after the shutdown write"
+        );
+        // The Lambda tiles' functions are swept too, by the same guarded sweep.
+        let sweeps = body.find("let sweeps").expect("the drivers swept");
+        assert!(
+            body[sweeps..shutdown].contains("lambda.clone()"),
+            "the Lambda driver is not among the drivers swept at shutdown"
         );
         let (tx, rx) = watch::channel(false);
         let lost = Some(rx);
@@ -2004,6 +2186,7 @@ mod store_tests {
         let out = Outputs {
             snapshot: watch::channel(snapshot_of(&State::new(Config::default(), 0))).0,
             ec2: watch::channel(Vec::new()).0,
+            lambda: watch::channel(Vec::new()).0,
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,
@@ -2059,6 +2242,7 @@ mod store_tests {
         let out = Outputs {
             snapshot: watch::channel(snapshot_of(&State::new(Config::default(), 0))).0,
             ec2: watch::channel(Vec::new()).0,
+            lambda: watch::channel(Vec::new()).0,
             ec2_layout: watch::channel(None).0,
             broadcast_layout: watch::channel(None).0,
             power: watch::channel(String::new()).0,

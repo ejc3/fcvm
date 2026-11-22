@@ -69,10 +69,66 @@ pub enum LaunchError {
     Failed(anyhow::Error),
 }
 
+/// Which half's tiles a driver runs, so the reconciler reports them as that half's
+/// (`Event::Ec2` or `Event::Lambda`, and their health events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backing {
+    Ec2,
+    Lambda,
+}
+
 #[async_trait]
 pub trait Ec2Driver: Send + Sync {
+    /// Which tiles these are. EC2 unless the driver says otherwise.
+    fn backing(&self) -> Backing {
+        Backing::Ec2
+    }
     /// Launch one instance for `tile` from its launch template.
     async fn launch(&self, tile: &str) -> Result<Launched, LaunchError>;
+    /// Launch `tile` for `generation`. A driver whose launch does not depend on the
+    /// generation (EC2: every launch is a new instance) launches as [`Ec2Driver::launch`].
+    async fn launch_generation(
+        &self,
+        tile: &str,
+        _generation: u64,
+    ) -> Result<Launched, LaunchError> {
+        self.launch(tile).await
+    }
+    /// A tile task `owner` starts for `tile`: from now on the tile is that task's. A driver
+    /// whose tiles reuse one resource across tasks (a Lambda tile's function name) refuses
+    /// the launches and the cleanup of any earlier task for the same tile; one where every
+    /// launch is a resource of its own (an EC2 instance) has nothing to do.
+    async fn claim(&self, _tile: &str, _owner: u64) {}
+    /// Launch `tile` for `generation` on behalf of the tile task `owner` ([`Ec2Driver::claim`]).
+    async fn launch_owned(
+        &self,
+        tile: &str,
+        generation: u64,
+        _owner: u64,
+    ) -> Result<Launched, LaunchError> {
+        self.launch_generation(tile, generation).await
+    }
+    /// The tile task `owner` ends (the tile left the assignment): clean up what it holds.
+    /// `current` is its running launch, if it has one; a task can also end holding a launch
+    /// that never served (it left while that launch started, or during the backoff after one
+    /// failed), which a driver that reuses one resource per tile must remove too. The EC2
+    /// driver releases `current` and has nothing else left (every failed instance was
+    /// terminated when it failed).
+    async fn retire(&self, _tile: &str, _owner: u64, current: Option<&str>) -> Result<()> {
+        match current {
+            Some(instance) => self.release(instance).await,
+            None => Ok(()),
+        }
+    }
+    /// [`Ec2Driver::sweep`] at the coordinator's shutdown: also refuse every later launch.
+    async fn sweep_at_shutdown(&self) -> Result<usize> {
+        self.sweep().await
+    }
+    /// Timings the driver measured for a launch once it is ready (a Lambda tile's
+    /// `new_instance` and the capacity wait it names), added to the tile's report.
+    fn launch_timings(&self, _tile: &str, _launched: &Launched) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
     /// Start a stopped instance kept from an earlier wake for `tile`, if the driver keeps a
     /// pool of them and one starts. A tile with no instance (a wake) asks for one before
     /// launching; the relaunch of a running tile (a race) always launches.
@@ -322,7 +378,11 @@ async fn post_scenes(
                             boots.insert(a.id.clone(), (l.instance.clone(), boot));
                             if read_health {
                                 let report = HealthReport::from_renderer(&a.id, &h);
-                                handle.send(Event::Ec2Health { at: 0, report }).await;
+                                let event = match driver.backing() {
+                                    Backing::Ec2 => Event::Ec2Health { at: 0, report },
+                                    Backing::Lambda => Event::LambdaHealth { at: 0, report },
+                                };
+                                handle.send(event).await;
                             }
                         }
                         // Unknown until a read succeeds: that read then counts as a
@@ -458,6 +518,7 @@ fn place_of(instance: &str) -> Option<String> {
 /// slot, and this task's report would overwrite it.
 #[allow(clippy::too_many_arguments)]
 async fn report(
+    backing: Backing,
     handle: &Handle,
     want: &watch::Receiver<u64>,
     id: &str,
@@ -475,28 +536,28 @@ async fn report(
         Some((e, r)) => (Some(e), r),
         None => (None, None),
     };
-    handle
-        .send(Event::Ec2 {
-            at: 0,
-            report: SlotReport {
-                id: id.to_string(),
-                phase: phase.into(),
-                generation,
-                vm: l.map(|l| l.instance.clone()),
-                frame_url: l.and_then(|l| l.frame_url.clone()),
-                timings: timings.clone(),
-                error,
-                retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
-                ipv6: l.and_then(|l| l.ipv6.clone()),
-                ipv4: l.and_then(|l| l.ipv4.clone()),
-                // A tile serves TLS on 443 at its own IPv4 address.
-                v4_port: None,
-                place: l.and_then(|l| place_of(&l.instance)),
-                desktop_at: None,
-                first_chunk_at: None,
-            },
-        })
-        .await;
+    let report = SlotReport {
+        id: id.to_string(),
+        phase: phase.into(),
+        generation,
+        vm: l.map(|l| l.instance.clone()),
+        frame_url: l.and_then(|l| l.frame_url.clone()),
+        timings: timings.clone(),
+        error,
+        retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
+        ipv6: l.and_then(|l| l.ipv6.clone()),
+        ipv4: l.and_then(|l| l.ipv4.clone()),
+        // A tile serves TLS on 443 at its own IPv4 address.
+        v4_port: None,
+        place: l.and_then(|l| place_of(&l.instance)),
+        desktop_at: None,
+        first_chunk_at: None,
+    };
+    let event = match backing {
+        Backing::Ec2 => Event::Ec2 { at: 0, report },
+        Backing::Lambda => Event::Lambda { at: 0, report },
+    };
+    handle.send(event).await;
 }
 
 async fn tile(
@@ -512,6 +573,9 @@ async fn tile(
     ),
 ) {
     let token = task_token();
+    // Before any launch: the tile is this task's, and an earlier task's cleanup no longer
+    // touches it.
+    driver.claim(&id, token).await;
     let mut current: Option<(Launched, u64)> = None;
     let mut retry = Duration::from_secs(1);
     // The generation that is waiting for capacity, and since when.
@@ -532,6 +596,7 @@ async fn tile(
                 );
             }
             report(
+                driver.backing(),
                 &handle,
                 &want,
                 &id,
@@ -555,7 +620,7 @@ async fn tile(
             }
             let launched = match resumed {
                 Some(l) => Ok(l),
-                None => driver.launch(&id).await,
+                None => driver.launch_owned(&id, generation, token).await,
             };
             match launched {
                 Ok(l) => {
@@ -570,6 +635,7 @@ async fn tile(
                         });
                     }
                     report(
+                        driver.backing(),
                         &handle,
                         &want,
                         &id,
@@ -604,8 +670,18 @@ async fn tile(
                                 .insert(id.clone(), (token, l.clone(), given));
                             timings
                                 .insert("ready_ms".into(), accepted.elapsed().as_millis() as u64);
+                            // The driver's own timings: a capacity wait it measured adds to
+                            // the one this task counted from refusals.
+                            for (k, v) in driver.launch_timings(&id, &l) {
+                                if k == "capacity_wait_ms" {
+                                    *timings.entry(k).or_insert(0) += v;
+                                } else {
+                                    timings.insert(k, v);
+                                }
+                            }
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);
                             report(
+                                driver.backing(),
                                 &handle,
                                 &want,
                                 &id,
@@ -633,6 +709,7 @@ async fn tile(
                             let wait = retry;
                             retry = (retry * 2).min(Duration::from_secs(30));
                             report(
+                                driver.backing(),
                                 &handle,
                                 &want,
                                 &id,
@@ -661,6 +738,7 @@ async fn tile(
                         since.elapsed().as_millis() as u64,
                     );
                     report(
+                        driver.backing(),
                         &handle,
                         &want,
                         &id,
@@ -680,6 +758,7 @@ async fn tile(
                     let wait = retry;
                     retry = (retry * 2).min(Duration::from_secs(30));
                     report(
+                        driver.backing(),
                         &handle,
                         &want,
                         &id,
@@ -740,6 +819,7 @@ async fn tile(
                 let wait = retry;
                 retry = (retry * 2).min(Duration::from_secs(30));
                 report(
+                    driver.backing(),
                     &handle,
                     &want,
                     &id,
@@ -760,10 +840,9 @@ async fn tile(
         }
     }
     remove_own(&running, &id, token);
-    if let Some((l, _)) = current {
-        if let Err(e) = driver.release(&l.instance).await {
-            tracing::warn!(instance = %l.instance, error = %e, "releasing the tile's instance failed");
-        }
+    let current = current.map(|(l, _)| l.instance);
+    if let Err(e) = driver.retire(&id, token, current.as_deref()).await {
+        tracing::warn!(tile = %id, instance = ?current, error = %e, "releasing the tile's instance failed");
     }
 }
 

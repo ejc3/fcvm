@@ -258,6 +258,15 @@ pub enum FleetEc2 {
     Aws,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetLambda {
+    /// No Lambda tiles: every AWS tile is an EC2 tile
+    None,
+    /// Lambda Managed Instances functions running the lane image (fleet/PROTOCOL.md,
+    /// "Lambda tile")
+    Aws,
+}
+
 #[derive(Args, Debug)]
 pub struct FleetCoordArgs {
     /// Address to serve the browser WebSocket (/live) and /healthz on, e.g. 127.0.0.1:20000
@@ -585,6 +594,32 @@ pub struct FleetCoordArgs {
     /// spaces)
     #[arg(long, env = "FLEET_EC2_SECURITY_GROUPS", value_delimiter = ' ')]
     pub ec2_security_group: Vec<String>,
+
+    /// Where Lambda tiles come from. With `aws`, --lambda-tiles of the AWS half's
+    /// --ec2-tiles places are Lambda tiles, and the coordinator's port 443 routes by server
+    /// name: their tunnel, their viewers, and the EC2 aggregator (needs --ec2-aggregate-tls)
+    #[arg(long, value_enum, default_value_t = FleetLambda::None)]
+    pub lambda: FleetLambda,
+
+    /// How many of the AWS half's --ec2-tiles places are Lambda tiles (at most all of them)
+    #[arg(long, default_value_t = 0)]
+    pub lambda_tiles: usize,
+
+    /// The region the Lambda tiles' functions run in
+    #[arg(long, env = "FLEET_LAMBDA_REGION", default_value = "us-east-1")]
+    pub lambda_region: String,
+
+    /// The lane image (an ECR image URI the functions run)
+    #[arg(long, env = "FLEET_LAMBDA_IMAGE")]
+    pub lambda_image: Option<String>,
+
+    /// The functions' execution role (ARN)
+    #[arg(long, env = "FLEET_LAMBDA_ROLE")]
+    pub lambda_role: Option<String>,
+
+    /// The Lambda Managed Instances capacity provider (ARN) the functions run on
+    #[arg(long, env = "FLEET_LAMBDA_CAPACITY_PROVIDER")]
+    pub lambda_capacity_provider: Option<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.

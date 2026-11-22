@@ -2705,6 +2705,7 @@ fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
         Handle {
             cmds: tx,
             snapshot,
+            lambda: tokio::sync::watch::channel(Vec::new()).1,
             ec2_layout,
             broadcast_layout: tokio::sync::watch::channel(None).1,
         },
@@ -3563,6 +3564,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     let outputs = fcvm::fleet::coord::Outputs {
         snapshot,
         ec2: tokio::sync::watch::channel(Vec::new()).0,
+        lambda: tokio::sync::watch::channel(Vec::new()).0,
         ec2_layout,
         broadcast_layout: tokio::sync::watch::channel(None).0,
         power: tokio::sync::watch::channel(String::new()).0,
@@ -3580,6 +3582,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     let handle = Handle {
         cmds,
         snapshot: snapshot_rx,
+        lambda: tokio::sync::watch::channel(Vec::new()).1,
         ec2_layout: ec2_layout_rx,
         broadcast_layout: tokio::sync::watch::channel(None).1,
     };
@@ -5074,11 +5077,71 @@ async fn an_inventory_that_stays_unknown_is_charged_at_the_launch_cap_and_trips(
             spot_ttl: Duration::from_secs(60),
             stale_after: Duration::from_millis(100),
             cap_usd_per_hour: 100.0,
+            lambda_usd_per_instance_hour: None,
         },
         handle.clone(),
     ));
     let s = v
         .until_within(|s| s["fleet"]["spend"]["reason"] == "budget")
+        .await;
+    assert_eq!(
+        s["fleet"]["spend"]["usd_per_hour"], 100.0,
+        "{}",
+        s["fleet"]["spend"]
+    );
+}
+
+/// The launch cap already counts the Lambda tiles: an inventory the meter cannot list is
+/// charged the cap, not the cap and the Lambda tiles a second time.
+#[tokio::test]
+async fn an_unknown_inventory_with_lambda_tiles_is_charged_the_cap_once() {
+    use fcvm::fleet::coord::spend::{self, Billed, MeterConfig, MeterDriver, SpotPrice};
+    struct Blind;
+    #[async_trait::async_trait]
+    impl MeterDriver for Blind {
+        async fn instances(&self, _: &str) -> anyhow::Result<Vec<Billed>> {
+            anyhow::bail!("DescribeInstances: UnauthorizedOperation")
+        }
+        async fn spot_prices(&self, _: &str, _: &[String]) -> anyhow::Result<Vec<SpotPrice>> {
+            Ok(Vec::new())
+        }
+    }
+    let config = Config {
+        power_managed: true,
+        fcvm_tiles: 4,
+        ec2_max: 2,
+        lambda_max: 2,
+        fill_from_serving_hosts: true,
+        daily_spend_usd: Some(1_000_000.0),
+        ..Config::default()
+    };
+    let (_fake, handle, _ids, _agents, mut v) = two_spread_hosts(config).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.lambda.clone().wait_for(|l| l.len() == 2),
+    )
+    .await
+    .expect("two Lambda tiles assigned")
+    .unwrap();
+    tokio::spawn(spend::run(
+        MeterConfig {
+            driver: Arc::new(Blind),
+            regions: vec!["us-east-1".into()],
+            on_demand: spend::on_demand_rates(&[]).unwrap(),
+            every: Duration::from_millis(50),
+            spot_ttl: Duration::from_secs(60),
+            stale_after: Duration::from_millis(100),
+            cap_usd_per_hour: 100.0,
+            lambda_usd_per_instance_hour: Some(1.0),
+        },
+        handle.clone(),
+    ));
+    let s = v
+        .until_within(|s| {
+            s["fleet"]["spend"]["usd_per_hour"]
+                .as_f64()
+                .is_some_and(|r| r >= 100.0)
+        })
         .await;
     assert_eq!(
         s["fleet"]["spend"]["usd_per_hour"], 100.0,
@@ -5105,6 +5168,7 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
                     instance_type: "g4dn.metal".into(),
                     spot: false,
                     zone: h.zone.unwrap_or_default(),
+                    tile: false,
                 })
                 .collect())
         }
@@ -5141,6 +5205,7 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
             spot_ttl: Duration::from_secs(60),
             stale_after: Duration::from_secs(300),
             cap_usd_per_hour: 0.0,
+            lambda_usd_per_instance_hour: None,
         },
         handle.clone(),
     ));
@@ -8697,6 +8762,69 @@ async fn the_broadcast_layout_is_the_whole_image_of_every_placed_tile() {
         .await
         .expect("no layout once the host is gone")
         .unwrap();
+}
+
+/// A Lambda tile is part of the AWS half's grid: both the AWS half's aggregate and the
+/// broadcast read it by its frame URL, which reaches it through the coordinator's front and
+/// its tunnel, so its rectangle is not left black in either.
+#[tokio::test]
+async fn the_aws_aggregate_and_the_broadcast_read_the_lambda_tiles_too() {
+    let config = Config {
+        max_tiles: 4,
+        fcvm_tiles: 2,
+        ec2_max: 2,
+        lambda_max: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let mut a = FakeAgent::connect(&handle, "gpu-a", 2);
+    a.assign().await;
+    a.report("slot-1", "running", 1);
+    a.report("slot-2", "running", 1);
+    let lambda = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.lambda.clone().wait_for(|l| !l.is_empty()),
+    )
+    .await
+    .expect("a Lambda tile assigned")
+    .unwrap()
+    .clone();
+    let id = lambda[0].id.clone();
+    handle
+        .send(Event::Lambda {
+            at: 0,
+            report: SlotReport {
+                id: id.clone(),
+                phase: "running".into(),
+                generation: lambda[0].generation,
+                vm: Some("environment-1".into()),
+                frame_url: Some(format!("wss://{id}.x.example/frames")),
+                ..SlotReport::default()
+            },
+        })
+        .await;
+    let url = format!("wss://{id}.x.example/frames");
+    let has_lambda = |l: &Option<fcvm::fleet::aggregate::Layout>| {
+        l.as_ref().is_some_and(|l| {
+            l.tiles
+                .iter()
+                .any(|t| t.id == id && t.url.as_deref() == Some(url.as_str()))
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.ec2_layout.clone().wait_for(|l| has_lambda(l)),
+    )
+    .await
+    .expect("the AWS half's aggregate reads the Lambda tile")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.broadcast_layout.clone().wait_for(|l| has_lambda(l)),
+    )
+    .await
+    .expect("the broadcast reads the Lambda tile")
+    .unwrap();
 }
 
 /// A gate of `seats` seats, a known key, an open playback URL, and short timers.

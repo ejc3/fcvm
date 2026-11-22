@@ -26,6 +26,8 @@ use tokio::sync::{watch, Mutex};
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a renderer that exited waits before it is started again.
 const RESTART_BACKOFF: Duration = Duration::from_secs(2);
+/// How long dialing the tunnel endpoint may take: the TCP connection, then the TLS handshake.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(args: FleetLambdaTileArgs) -> Result<()> {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API")
@@ -114,15 +116,39 @@ pub fn write_identity(dir: &Path, secret: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((tls_path, token_path))
 }
 
-/// The renderer process, started again when it exits.
+/// The renderer process, started again when it exits. Every change to it (a start, the
+/// supervisor's restart after an exit, an invocation's restart, the stop when the tunnel ends
+/// for good) is made holding `state`, so they happen one at a time; a stop is final, and the
+/// supervisor starts a replacement only for the very process it saw exit.
 struct Renderer {
     cmd: Vec<String>,
     envs: Vec<(String, String)>,
-    child: Mutex<Option<tokio::process::Child>>,
+    state: Mutex<RendererState>,
+}
+
+#[derive(Default)]
+struct RendererState {
+    child: Option<tokio::process::Child>,
+    /// Bumped by every start: the supervisor's restart is for the process it saw exit only.
+    epoch: u64,
+    /// The tunnel ended for good: nothing starts the renderer again.
+    stopped: bool,
 }
 
 impl Renderer {
-    async fn start(&self) -> Result<()> {
+    fn new(cmd: Vec<String>, envs: Vec<(String, String)>) -> Self {
+        Renderer {
+            cmd,
+            envs,
+            state: Mutex::new(RendererState::default()),
+        }
+    }
+
+    /// Start the process under `st`, unless the renderer was stopped.
+    fn start_locked(&self, st: &mut RendererState) -> Result<()> {
+        if st.stopped {
+            bail!("the renderer was stopped");
+        }
         let mut c = tokio::process::Command::new(&self.cmd[0]);
         c.args(&self.cmd[1..])
             .envs(self.envs.iter().cloned())
@@ -130,29 +156,48 @@ impl Renderer {
         let child = c
             .spawn()
             .with_context(|| format!("starting {}", self.cmd[0]))?;
-        *self.child.lock().await = Some(child);
+        st.child = Some(child);
+        st.epoch += 1;
         Ok(())
     }
 
-    /// Start it again whenever it exits, as the EC2 tile's unit does (`Restart=always`).
+    async fn start(&self) -> Result<()> {
+        let mut st = self.state.lock().await;
+        self.start_locked(&mut st)
+    }
+
+    /// Start it again whenever it exits, as the EC2 tile's unit does (`Restart=always`), or
+    /// when a start failed (a restart whose spawn failed leaves no process), every
+    /// [`RESTART_BACKOFF`] until one succeeds, until it is stopped.
     async fn supervise(self: Arc<Self>) {
         loop {
-            let status = {
-                let mut guard = self.child.lock().await;
-                match guard.as_mut() {
-                    // Waiting holds the lock only until the child exits or is taken.
-                    Some(c) => match c.try_wait() {
-                        Ok(Some(s)) => Some(s),
-                        _ => None,
-                    },
-                    None => None,
+            let down = {
+                let mut st = self.state.lock().await;
+                if st.stopped {
+                    return;
+                }
+                let epoch = st.epoch;
+                match st.child.as_mut().map(|c| c.try_wait()) {
+                    Some(Ok(Some(s))) => Some((Some(s), epoch)),
+                    None => Some((None, epoch)),
+                    _ => None,
                 }
             };
-            if let Some(s) = status {
-                tracing::warn!(%s, "the renderer exited; starting it again");
+            if let Some((status, epoch)) = down {
+                match status {
+                    Some(s) => tracing::warn!(%s, "the renderer exited; starting it again"),
+                    None => tracing::warn!("the renderer is not running; starting it again"),
+                }
                 tokio::time::sleep(RESTART_BACKOFF).await;
-                if let Err(e) = self.start().await {
-                    tracing::error!(error = %e, "the renderer did not start");
+                let mut st = self.state.lock().await;
+                if st.stopped {
+                    return;
+                }
+                // Started meanwhile (an invocation's restart): that process stays.
+                if st.epoch == epoch {
+                    if let Err(e) = self.start_locked(&mut st) {
+                        tracing::error!(error = %e, "the renderer did not start");
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -160,16 +205,27 @@ impl Renderer {
     }
 
     async fn restart(&self) -> Result<()> {
-        if let Some(mut c) = self.child.lock().await.take() {
+        let mut st = self.state.lock().await;
+        if st.stopped {
+            bail!("the renderer was stopped");
+        }
+        if let Some(mut c) = st.child.take() {
             let _ = c.kill().await;
         }
-        self.start().await
+        self.start_locked(&mut st)
     }
 
     async fn stop(&self) {
-        if let Some(mut c) = self.child.lock().await.take() {
+        let mut st = self.state.lock().await;
+        st.stopped = true;
+        if let Some(mut c) = st.child.take() {
             let _ = c.kill().await;
         }
+    }
+
+    #[cfg(test)]
+    async fn pid(&self) -> Option<u32> {
+        self.state.lock().await.child.as_ref().and_then(|c| c.id())
     }
 }
 
@@ -251,14 +307,18 @@ struct TlsDialer {
 impl Dialer for TlsDialer {
     async fn dial(&self) -> Result<Stream> {
         let tcp = tokio::time::timeout(
-            Duration::from_secs(10),
+            DIAL_TIMEOUT,
             tokio::net::TcpStream::connect((self.host.as_str(), self.port)),
         )
         .await
         .context("dialing the tunnel endpoint timed out")??;
         tcp.set_nodelay(true)?;
         let name = rustls::pki_types::ServerName::try_from(self.host.clone())?;
-        let tls = self.connector.connect(name, tcp).await?;
+        // An endpoint that takes the connection and never finishes TLS is a failed dial,
+        // so the client goes on to its next attempt.
+        let tls = tokio::time::timeout(DIAL_TIMEOUT, self.connector.connect(name, tcp))
+            .await
+            .context("the tunnel endpoint's TLS handshake timed out")??;
         Ok(Box::new(tls))
     }
 }
@@ -318,16 +378,15 @@ async fn init(args: &FleetLambdaTileArgs) -> Result<Tile> {
         .context("reading the certificate secret")?;
     let (tls_file, token_file) = write_identity(&args.state_dir, &secret)?;
     drop(secret);
-    let renderer = Arc::new(Renderer {
-        cmd: shell_words::split(&args.renderer).context("--renderer")?,
-        envs: vec![
+    let renderer = Arc::new(Renderer::new(
+        shell_words::split(&args.renderer).context("--renderer")?,
+        vec![
             ("PORT".into(), args.http_port.to_string()),
             ("TLS_PORT".into(), args.tls_port.to_string()),
             ("TLS_CERT_FILE".into(), tls_file.display().to_string()),
             ("SCENE_TOKEN_FILE".into(), token_file.display().to_string()),
         ],
-        child: Mutex::new(None),
-    });
+    ));
     if renderer.cmd.is_empty() {
         bail!("--renderer names no program");
     }
@@ -426,19 +485,25 @@ impl Runtime {
                         .context("an invocation without a request id")?
                         .to_string();
                     let event: Value = r.json().await.unwrap_or(Value::Null);
-                    match handler(event).await {
-                        Ok(v) => {
-                            http.post(format!("{base}/invocation/{id}/response"))
-                                .json(&v)
-                                .send()
-                                .await?;
-                        }
-                        Err(e) => {
-                            http.post(format!("{base}/invocation/{id}/error"))
-                                .json(&json!({"errorType": "InvokeError", "errorMessage": format!("{e:#}")}))
-                                .send()
-                                .await?;
-                        }
+                    let (kind, body) = match handler(event).await {
+                        Ok(v) => ("response", v),
+                        Err(e) => (
+                            "error",
+                            json!({"errorType": "InvokeError", "errorMessage": format!("{e:#}")}),
+                        ),
+                    };
+                    let r = http
+                        .post(format!("{base}/invocation/{id}/{kind}"))
+                        .json(&body)
+                        .send()
+                        .await?;
+                    // A refused result is not an answered invocation: stop, as a refused
+                    // `next` does, rather than take the next one as if Lambda had it.
+                    if !r.status().is_success() {
+                        bail!(
+                            "the Runtime API refused the invocation's {kind}: {}",
+                            r.status()
+                        );
                     }
                 }
             });
@@ -503,6 +568,110 @@ mod tests {
         let no_token = json!({"cert": "C", "key": "K"}).to_string();
         let e = write_identity(dir.path(), &no_token).unwrap_err();
         assert!(e.to_string().contains("scene_token"), "{e}");
+    }
+
+    /// A renderer that exits once (a marker file tells its second start to keep running).
+    fn exits_once(dir: &Path) -> Renderer {
+        let marker = dir.join("started");
+        Renderer::new(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "if [ -e {m} ]; then exec sleep 60; else touch {m}; exit 0; fi",
+                    m = marker.display()
+                ),
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// The tunnel ends for good while the supervisor waits out its backoff after an exit:
+    /// the renderer stays stopped, so the GPU stays idle until Lambda retires the environment.
+    #[tokio::test]
+    async fn a_stop_during_the_restart_backoff_is_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Arc::new(exits_once(dir.path()));
+        r.start().await.unwrap();
+        tokio::spawn(r.clone().supervise());
+        // The first process exits at once; the supervisor is now in its backoff.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        r.stop().await;
+        tokio::time::sleep(RESTART_BACKOFF + Duration::from_millis(800)).await;
+        assert_eq!(
+            r.pid().await,
+            None,
+            "the stopped renderer was started again"
+        );
+        assert!(r.restart().await.is_err(), "a restart after the stop");
+        assert_eq!(r.pid().await, None);
+    }
+
+    /// A start that failed (the program could not be spawned) leaves no process: the
+    /// supervisor tries again until one starts, while the renderer is not stopped.
+    #[tokio::test]
+    async fn a_renderer_that_failed_to_start_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("renderer.sh");
+        let r = Arc::new(Renderer::new(
+            vec![program.display().to_string()],
+            Vec::new(),
+        ));
+        assert!(r.start().await.is_err(), "no program yet");
+        tokio::spawn(r.clone().supervise());
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = Instant::now() + RESTART_BACKOFF * 4;
+        while r.pid().await.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the renderer was not started again"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        r.stop().await;
+    }
+
+    /// An invocation restarts the renderer while the supervisor waits out its backoff after
+    /// an exit: the supervisor leaves that process alone instead of replacing (and killing) it.
+    #[tokio::test]
+    async fn a_restart_during_the_restart_backoff_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Arc::new(exits_once(dir.path()));
+        r.start().await.unwrap();
+        tokio::spawn(r.clone().supervise());
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        r.restart().await.unwrap();
+        let restarted = r.pid().await.expect("the restarted process");
+        tokio::time::sleep(RESTART_BACKOFF + Duration::from_millis(800)).await;
+        assert_eq!(
+            r.pid().await,
+            Some(restarted),
+            "the supervisor replaced the process the restart started"
+        );
+        r.stop().await;
+    }
+
+    /// An endpoint that takes the TCP connection and never answers the TLS handshake is a
+    /// failed dial, so the client goes on to its next attempt.
+    #[tokio::test]
+    async fn a_dial_whose_tls_handshake_never_finishes_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let d = TlsDialer {
+            host: "localhost".into(),
+            port,
+            connector: connector(),
+        };
+        let r = tokio::time::timeout(DIAL_TIMEOUT * 3, d.dial())
+            .await
+            .expect("the dial gives up on its own");
+        assert!(r.is_err());
     }
 
     /// A Runtime API stand-in: hands out the queued events and records the answers.
@@ -581,5 +750,39 @@ mod tests {
             (got[1].0.clone(), "response".into(), json!({"answer": 42}))
         );
         assert!(got[1].0.starts_with("req-ok"));
+    }
+
+    /// The Runtime API refuses an invocation's result: the runtime stops serving with an
+    /// error, as for a refused `next`, instead of taking the next invocation as if Lambda had
+    /// the result.
+    #[tokio::test]
+    async fn a_refused_result_ends_the_runtime_loop() {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/2018-06-01/runtime/invocation/next",
+                get(|| async {
+                    (
+                        [("lambda-runtime-aws-request-id", "req-1")],
+                        axum::Json(json!({"action": "health"})),
+                    )
+                }),
+            )
+            .route(
+                "/2018-06-01/runtime/invocation/{id}/{kind}",
+                post(|| async { (axum::http::StatusCode::BAD_REQUEST, "payload too large") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rt = Runtime::new(&addr.to_string()).unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            rt.serve(1, |_ev: Value| async move { Ok(json!({"answer": 42})) }),
+        )
+        .await
+        .expect("the runtime stops on a refused result");
+        let e = r.unwrap_err();
+        assert!(e.to_string().contains("refused"), "{e}");
     }
 }

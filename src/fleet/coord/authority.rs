@@ -163,6 +163,7 @@ pub fn zone_of(state: &State, apex: &str) -> Zone {
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.lambda.values())
         .chain(f.phones.values())
         .chain(f.windows.values())
         .chain(f.minecraft.values())
@@ -179,6 +180,18 @@ pub fn zone_of(state: &State, apex: &str) -> Zone {
         }
         if let Some(v4) = p.ipv4.as_deref().and_then(|a| a.parse().ok()) {
             z.a.insert(format!("{label}-v4.{apex}"), vec![v4]);
+        }
+    }
+    // With Lambda tiles, their tunnel endpoint: the coordinator task's own addresses, where
+    // its front takes the tunnel (`lambda_front`).
+    if state.config.lambda_max > 0 {
+        let c = &state.config;
+        let name = format!("{}.{apex}", super::lambda_front::TUNNEL_LABEL);
+        if let Some(v6) = c.ec2_aggregate_ipv6.as_deref().and_then(|a| a.parse().ok()) {
+            z.aaaa.insert(name.clone(), vec![v6]);
+        }
+        if let Some(v4) = c.ec2_aggregate_ipv4.as_deref().and_then(|a| a.parse().ok()) {
+            z.a.insert(name, vec![v4]);
         }
     }
     z
@@ -975,6 +988,27 @@ mod tests {
         // Below a launch name there is nothing.
         let r = ask("x.slot-1-abcdefgh.tiles.fcvm.example", T_AAAA);
         assert_eq!(r.rcode, NXDOMAIN);
+    }
+
+    #[test]
+    fn with_lambda_tiles_the_tunnel_name_is_the_coordinators_addresses() {
+        let mut c = fleet_core::state::Config {
+            ec2_aggregate_ipv6: Some("2001:db8::9".into()),
+            ec2_aggregate_ipv4: Some("192.0.2.9".into()),
+            ..fleet_core::state::Config::default()
+        };
+        let none = zone_of(&State::new(c.clone(), 0), "tiles.fcvm.example");
+        assert!(!none.aaaa.contains_key("tunnel.tiles.fcvm.example"));
+        c.lambda_max = 2;
+        let z = zone_of(&State::new(c, 0), "tiles.fcvm.example");
+        assert_eq!(
+            z.aaaa["tunnel.tiles.fcvm.example"],
+            vec!["2001:db8::9".parse::<Ipv6Addr>().unwrap()]
+        );
+        assert_eq!(
+            z.a["tunnel.tiles.fcvm.example"],
+            vec!["192.0.2.9".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
     }
 
     #[test]

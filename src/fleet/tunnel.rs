@@ -208,6 +208,50 @@ pub async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> Result<
     String::from_utf8(buf).context("the line is not UTF-8")
 }
 
+/// Reads lines from a reader in a `select!` loop: the bytes of a line read so far stay in
+/// `buf` when another branch wins and the read is dropped, so the next read goes on from them.
+#[derive(Default)]
+pub struct Lines {
+    buf: Vec<u8>,
+}
+
+impl Lines {
+    /// The next line, without its newline. Cancel-safe: see [`Lines`].
+    pub async fn next<R: tokio::io::AsyncBufRead + Unpin>(&mut self, r: &mut R) -> Result<String> {
+        loop {
+            if let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
+                line.pop();
+                return String::from_utf8(line).context("the line is not UTF-8");
+            }
+            if self.buf.len() > MAX_LINE {
+                bail!("no line within {MAX_LINE} bytes");
+            }
+            // Bytes read by `read_until` are appended to `buf` as they arrive, so a read
+            // dropped mid-line loses nothing.
+            let room = (MAX_LINE + 1 - self.buf.len()) as u64;
+            let n = (&mut *r)
+                .take(room)
+                .read_until(b'\n', &mut self.buf)
+                .await?;
+            if n == 0 {
+                bail!("the connection closed");
+            }
+        }
+    }
+}
+
+/// How long one control message may take to write: a peer that stops reading ends its
+/// session, rather than stalling the loop (and its silence timer) behind a blocked write.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`write_line`], at most [`WRITE_TIMEOUT`].
+async fn write_control<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, v: &T) -> Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_line(w, v))
+        .await
+        .context("the peer did not take a control message in time")?
+}
+
 /// Write `v` as one JSON line.
 pub async fn write_line<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, v: &T) -> Result<()> {
     let mut line = serde_json::to_vec(v)?;
@@ -239,6 +283,23 @@ struct Live {
     info: Session,
     epoch: u64,
     to_tile: mpsc::Sender<ToTile>,
+}
+
+/// A stream waiting in [`Inner::pending`] for its data connection, removed when dropped.
+struct PendingEntry<'a> {
+    endpoint: &'a Endpoint,
+    stream: u64,
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        self.endpoint
+            .inner
+            .lock()
+            .unwrap()
+            .pending
+            .remove(&self.stream);
+    }
 }
 
 impl Inner {
@@ -358,6 +419,13 @@ impl Endpoint {
             inner.pending.insert(stream, (slot.to_string(), epoch, tx));
             (stream, to_tile)
         };
+        // The entry goes when this call ends, also when its caller drops it mid-wait: a
+        // cancelled open would otherwise hold one of the tile's MAX_PENDING_PER_TILE places
+        // for as long as its session lives.
+        let _pending = PendingEntry {
+            endpoint: self,
+            stream,
+        };
         let asked = to_tile.send(ToTile::Open { stream, port }).await.is_ok();
         let got = if asked {
             tokio::time::timeout(OPEN_TIMEOUT, rx)
@@ -367,7 +435,6 @@ impl Endpoint {
         } else {
             None
         };
-        self.inner.lock().unwrap().pending.remove(&stream);
         got.with_context(|| format!("tile {slot} did not connect stream {stream}"))
     }
 
@@ -559,21 +626,22 @@ impl Endpoint {
             let mut ping = tokio::time::interval(PING_EVERY);
             let mut n = 0u64;
             let mut silent = Box::pin(tokio::time::sleep(SILENCE));
+            let mut lines = Lines::default();
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
                         let Some(msg) = msg else { return Ok(()) };
                         let close = matches!(msg, ToTile::Close { .. });
-                        write_line(&mut write, &msg).await?;
+                        write_control(&mut write, &msg).await?;
                         if close {
                             return Ok(());
                         }
                     }
                     _ = ping.tick() => {
                         n += 1;
-                        write_line(&mut write, &ToTile::Ping { n }).await?;
+                        write_control(&mut write, &ToTile::Ping { n }).await?;
                     }
-                    line = read_line(&mut read) => {
+                    line = lines.next(&mut read) => {
                         let line = line?;
                         match serde_json::from_str::<FromTile>(&line) {
                             Ok(FromTile::Pong { .. }) => {}
@@ -725,7 +793,7 @@ async fn session(
             match serde_json::from_str::<ToTile>(&line)
                 .context("a line that is not a tunnel message")?
             {
-                ToTile::Ping { n } => write_line(&mut write, &FromTile::Pong { n }).await?,
+                ToTile::Ping { n } => write_control(&mut write, &FromTile::Pong { n }).await?,
                 ToTile::Open { stream, port } => {
                     tokio::spawn(carry(
                         id.clone(),
@@ -1126,7 +1194,7 @@ mod tests {
         // The stream is asked of env-a; then an environment that started later takes the tile.
         loop {
             let line = read_line(&mut a).await.unwrap();
-            if line.contains("\"open\"") {
+            if matches!(serde_json::from_str(&line), Ok(ToTile::Open { .. })) {
                 break;
             }
         }
@@ -1142,5 +1210,96 @@ mod tests {
             "it waited {took:?} instead of failing at once"
         );
         b.stop.send_replace(true);
+    }
+
+    /// A hand-driven control session on a duplex of `size` bytes: the hello is sent and the
+    /// endpoint's `ok` read, and the tile side is returned.
+    async fn manual_session(
+        ep: &Arc<Endpoint>,
+        id: &Identity,
+        size: usize,
+    ) -> BufReader<tokio::io::DuplexStream> {
+        let (a, b) = tokio::io::duplex(size);
+        let server = ep.clone();
+        tokio::spawn(async move {
+            let _ = server.serve(b).await;
+        });
+        let mut a = BufReader::new(a);
+        write_line(&mut a, &id.hello(Kind::Control, None))
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut a).await.unwrap(), r#"{"ok":true}"#);
+        session_of(ep, &id.slot, &id.env).await;
+        a
+    }
+
+    /// A pong that arrives in two pieces, with a stream asked of the tile between them: the
+    /// endpoint's read of the first piece is dropped when the open wins its `select!`, and the
+    /// line must still parse whole once the rest arrives.
+    #[tokio::test]
+    async fn a_control_line_split_across_reads_survives_another_branch_winning() {
+        let ep = endpoint();
+        let id = identity("lam-1", 1, "env-a", 5_000);
+        let mut a = manual_session(&ep, &id, 1 << 16).await;
+        a.get_mut().write_all(br#"{"pong":"#).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The open's message wins the endpoint's select! while it waits for the pong's rest.
+        let opener = ep.clone();
+        let open = tokio::spawn(async move { opener.open("lam-1", Port::Http).await.is_ok() });
+        loop {
+            let line = read_line(&mut a).await.unwrap();
+            if matches!(serde_json::from_str(&line), Ok(ToTile::Open { .. })) {
+                break;
+            }
+        }
+        a.get_mut().write_all(b"{\"n\":1}}\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            ep.sessions().borrow().contains_key("lam-1"),
+            "the split pong ended the tile's session"
+        );
+        open.abort();
+    }
+
+    /// An open whose caller gives up (its future dropped mid-wait) does not keep its place
+    /// among the tile's waiting streams.
+    #[tokio::test]
+    async fn a_cancelled_open_frees_its_place() {
+        let ep = endpoint();
+        let id = identity("lam-1", 1, "env-a", 5_000);
+        let _a = manual_session(&ep, &id, 1 << 16).await;
+        let opener = ep.clone();
+        let open = tokio::spawn(async move { opener.open("lam-1", Port::Http).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ep.inner.lock().unwrap().pending.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the open waits");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        open.abort();
+        let _ = open.await;
+        assert!(
+            ep.inner.lock().unwrap().pending.is_empty(),
+            "the cancelled open kept its place"
+        );
+    }
+
+    /// A tile that stops reading its control connection: the endpoint's writes back up, and
+    /// a blocked write must end the session instead of stalling the loop and its silence timer.
+    #[tokio::test(start_paused = true)]
+    async fn a_tile_that_stops_reading_loses_its_session() {
+        let ep = endpoint();
+        let id = identity("lam-1", 1, "env-a", 5_000);
+        // A 20-byte pipe: the reply (12 bytes) and the first ping (17) already fill it past
+        // what the tile reads with the reply, so the ping at 10 s blocks, well before the
+        // 30 s silence timer could end the session on its own.
+        let _a = manual_session(&ep, &id, 20).await;
+        let mut sessions = ep.sessions();
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            sessions.wait_for(|m| !m.contains_key("lam-1")),
+        )
+        .await
+        .expect("the session of a tile that stopped reading ends")
+        .unwrap();
     }
 }

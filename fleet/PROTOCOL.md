@@ -285,8 +285,8 @@ must fit the budget, so `--ec2-tiles` above 40 is refused when the coordinator s
 **Lambda tiles.** The state's `lambda_max` tiles of the AWS half (at most all of them) are
 Lambda tiles, each a T4 in a Lambda Managed Instances execution environment, and the rest of
 the half's `--ec2-tiles` places stay EC2 tiles: 8 with 4 Lambda tiles are 4 EC2 and 4 Lambda
-tiles. `lambda_max` is 0, and every AWS tile an EC2 tile, until the coordinator's Lambda
-driver and its `--lambda-tiles` flag land. The half keeps its places, so a race costs one
+tiles. `lambda_max` is the coordinator's `--lambda-tiles` with `--lambda aws` (0 otherwise:
+every AWS tile an EC2 tile). The half keeps its places, so a race costs one
 launch per AWS tile whichever its backing and the budget above is unchanged; a Lambda tile's
 relaunch counts one and waits 90 s after its last launch, as an EC2 tile's does
 (`lam-1 launched 13 s ago; it can be relaunched in 77 s`). A race times the EC2 tiles and the
@@ -633,7 +633,14 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `usd_per_hour` the current burn of `instances` instances, `ceiling_usd` the ceiling,
   `by_backing` (present when the meter splits its rate) each backing's part, `hosts`, `ec2`
   and `lambda`, with its own `usd_today` and `usd_per_hour` (the total alone trips the
-  ceiling),
+  ceiling). The meter splits it with `--lambda aws`. The Lambda tiles' instances are not
+  visible to the fleet's role, so each Lambda tile is charged two g4dn.xlarge instances at
+  the on-demand rate plus the Managed Instances management fee ($0.051285 an hour for a
+  g4dn.xlarge, the AWS Price List usage type
+  `Lambda-Managed-Instances-g4dn.xlarge-Management-Hours`) while it is assigned and for
+  120 s after (its function's delete took 37 to 66 s); Lambda keeps the instance the
+  previous version ran on beside the current one. An inventory the meter cannot list
+  charges the launch cap and reports no split,
   `day_start` and `resets_at` the day's 00:00 UTC and the next. The ledger is part of the
   stored state: a restart keeps the day's spend and charges the time it was down at the
   last burn it knew. When `usd_today` plus 15 minutes at the current burn reaches the
@@ -844,6 +851,42 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
   different `--fleet-name`) are left alone.
+- `--lambda aws` with `--lambda-tiles <n>` makes `n` of the AWS half's `--ec2-tiles` places
+  Lambda tiles ("Lambda tile" below); it needs `--ec2`, `--ec2-aggregate-tls`
+  (the task's addresses and the subzone certificate), `--dns-subzone`, `--tls-secret` (the
+  scene token keys the tiles' tunnel credentials), `--lambda-image`, `--lambda-role` and
+  `--lambda-capacity-provider`, and runs in `--lambda-region` (default us-east-1). Each tile
+  is one function, `fcvm-lam-<--fleet-name>-<n>`, created at its first launch and deleted
+  when it leaves the assignment (the fleet sleeps). A launch writes the tile's slot,
+  generation, a tunnel credential for that generation and a value that differs on every
+  launch (`FLEET_TILE_LAUNCH`) into the function's configuration and publishes it
+  (`PublishTo: LATEST_PUBLISHED`), so every launch, a relaunch of the same generation
+  included, starts a new environment; publishing the next version retires the previous
+  one's. The tile is ready when its environment's tunnel for that generation is up and its
+  renderer answers `/health` with `ready` true through it, within 300 s (else the launch
+  fails and is retried after the usual backoff). Its timings carry `new_instance`: 1 when
+  the environment runs on an instance the tile had not run on since the wake. On such an
+  instance booted after the publish, the time from the publish to the boot is the tile's
+  `capacity_wait_ms`, kept out of the race time as an EC2 tile's capacity wait is: bringing
+  up a managed instance is not what the race measures, a restart on the instance the tile
+  already had is (17.6 to 33.6 s to first frame, measured 2026-11-22). Lambda keeps the
+  previous instance running, so a race's version lands there. Scene, budget and health go
+  to the renderer over the tunnel; a tile whose tunnel for its generation is gone, or whose
+  renderer does not answer, three checks in a row is launched again. A tile that leaves the
+  assignment has its function deleted, also when its launch never served (it left while
+  the launch started, or during the backoff after one failed). The function's name is the
+  tile's for every wake, so a tile that leaves and comes back belongs to its newest launch
+  task: an older task's launch is refused and its cleanup leaves the function alone. At
+  start and stop the coordinator deletes the functions `fcvm-lam-<--fleet-name>-1` to
+  `-40`, and at stop it waits for those deletes (up to 20 s) and launches nothing after
+  them. Lambda tiles are part of the AWS half's aggregate and of the broadcast, read by
+  their launch names through the front below. Port 443 of the
+  task's addresses is then the coordinator's front, routed by TLS server name:
+  `tunnel.<subzone>` (A and AAAA: the task's addresses) is the tunnel endpoint, TLS ending
+  in the coordinator with the subzone certificate; a Lambda tile's launch name
+  (`lam-<n>-<token>[-v4].<subzone>`) goes byte for byte over that tile's tunnel to the
+  renderer's TLS listener; any other name to the EC2 aggregator, whose TLS listener moves to
+  127.0.0.1:9443 behind the front.
 - `--ec2-pool <n>` with `--ec2-pool-template <name>` keeps up to `n` tile instances stopped
   for the next wake. A tile that leaves the assignment (the fleet sleeps) has its instance
   tagged `FleetPool=<--fleet-name>` and stopped instead of terminated, while fewer than `n`
@@ -2136,8 +2179,9 @@ with one JSON line from the tile, its hello, answered by one line from the endpo
 A refusal is `{"ok":false,"error":"<reason>"}`: `bad_hello`, `unauthorized` (not minted for
 this slot and generation, or expired), `stale_generation` (the endpoint wants a newer
 generation), `superseded` (an environment of the same generation that started later holds the
-tile), `unknown_stream`. The first three end the environment's tunnel for good; the tile dials
-again after any other end, 1 s doubling to 30 s, from 1 s again after a session that came up.
+tile), `unknown_stream`. `unauthorized`, `stale_generation` and `superseded` end the
+environment's tunnel for good; the tile dials again after any other end (`bad_hello`,
+`unknown_stream`, a lost connection), 1 s doubling to 30 s, from 1 s again after a session that came up.
 
 The endpoint keeps one session per slot. Of two environments of one generation, the one that
 started later holds the tile, whatever order they dial in (Lambda replaces an environment on
