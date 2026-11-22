@@ -66,3 +66,27 @@ class FailClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeRlimit:
+    RLIMIT_NOFILE = 7
+
+    def __init__(self, soft, hard):
+        self.soft, self.hard = soft, hard
+
+    def getrlimit(self, which):
+        return (self.soft, self.hard)
+
+    def setrlimit(self, which, limits):
+        self.soft = min(limits[0], self.hard)
+
+
+class FdLimit(unittest.TestCase):
+    def test_raises_sudos_default_for_a_thousand_clones(self):
+        r = FakeRlimit(1024, 1048576)
+        self.assertGreaterEqual(startrate.ensure_fd_limit(1000, r), 2256)
+
+    def test_blocks_when_the_hard_limit_is_too_low(self):
+        with self.assertRaises(SystemExit) as e:
+            startrate.ensure_fd_limit(1000, FakeRlimit(1024, 1500))
+        self.assertIn("BLOCKED", str(e.exception))

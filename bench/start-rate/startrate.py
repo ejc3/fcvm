@@ -23,6 +23,7 @@ records (samples.jsonl, host.tsv), so a summary can be regenerated with `report`
 import argparse
 import json
 import os
+import resource
 import selectors
 import signal
 import subprocess
@@ -274,6 +275,23 @@ class Clone:
         self.error = None
 
 
+def ensure_fd_limit(count, rlimit=resource):
+    """Raise the soft descriptor limit to what `count` clones hold, or exit BLOCKED.
+
+    Each clone holds its log file and the read end of its output pipe for the whole run,
+    and sudo resets the soft limit to 1024: past about 500 clones os.pipe() failed with
+    EMFILE inside a launcher thread and the run hung (bridged, 2026-11-22).
+    """
+    need = 2 * count + 256
+    soft, hard = rlimit.getrlimit(rlimit.RLIMIT_NOFILE)
+    if soft < need:
+        rlimit.setrlimit(rlimit.RLIMIT_NOFILE, (min(need, hard), hard))
+        soft = rlimit.getrlimit(rlimit.RLIMIT_NOFILE)[0]
+    if soft < need:
+        sys.exit(f"BLOCKED: {count} clones need {need} file descriptors, the limit is {soft}")
+    return soft
+
+
 def cmd_run(a):
     prep = json.loads(Path(a.prep).read_text())
     out = Path(a.out)
@@ -290,6 +308,7 @@ def cmd_run(a):
     print(json.dumps(cfg))
 
     list_vms(a.fcvm, prep["sudo"])  # exits when health cannot be read
+    ensure_fd_limit(a.count)
     for tool in ("pidstat",):
         if subprocess.run(["sh", "-c", f"command -v {tool}"], capture_output=True).returncode:
             sys.exit(f"BLOCKED: {tool} missing (sysstat)")
@@ -394,18 +413,22 @@ def cmd_run(a):
                     c = clones[next_i]
                     next_i += 1
                 pending += 1
-            c.log = open(out / "clones" / f"{c.name}.log", "w")
-            r, w = os.pipe()
-            os.set_blocking(r, False)
             c.spawn_ns = now_ns()
+            r = w = None
             try:
+                c.log = open(out / "clones" / f"{c.name}.log", "w")
+                r, w = os.pipe()
+                os.set_blocking(r, False)
                 c.proc = subprocess.Popen(
                     base_cmd + ["--name", c.name], stdout=w, stderr=w, stdin=subprocess.DEVNULL,
                     env=env, close_fds=True, start_new_session=True,
                 )
             except OSError as e:
-                os.close(w)
-                os.close(r)
+                # A launcher that dies here leaves the clone pending for ever, so the run
+                # would wait on it instead of reporting it.
+                for fd in (w, r):
+                    if fd is not None:
+                        os.close(fd)
                 finish(c, f"spawn failed: {e}")
                 continue
             c.t_spawn = (now_ns() - c.spawn_ns) / 1e6
