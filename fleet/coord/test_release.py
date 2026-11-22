@@ -12,6 +12,7 @@ import json
 import re
 import os
 import socket
+import ssl
 import struct
 import base64
 import hashlib
@@ -342,7 +343,7 @@ class FailureTests(unittest.TestCase):
 class ReconnectTests(unittest.TestCase):
     def run_probe(self, at, *, failures=1, wire="eof", advance=0):
         clock, connections, intents, frames, seats, deadlines = [100.0], [], [], [], [], []
-        closed = [0]
+        closed, attempts, applied = [0], [], set()
         def tile(half, generation=1):
             name = f"{half}-{generation}"
             return {"id": half + ":1", "half": half, "slot": half + "-1", "generation": generation,
@@ -382,11 +383,25 @@ class ReconnectTests(unittest.TestCase):
                     return
                 if not hasattr(self, "first"):
                     raise AssertionError("an intent preceded the seat message")
+                attempts.append(message["id"])
+                if at == "send_eof" and self.number == 0:
+                    # The connection died while the probe was not reading: the intent never
+                    # leaves (run 44764745380).
+                    raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
                 intents.append(message)
+                if message["id"] in applied and at == "receipt_always":
+                    self.queue.append(None)
+                    return
+                if message["id"] in applied:
+                    # A repeated id gets its first receipt and changes nothing.
+                    self.queue.append({"type": "receipt", "id": message["id"], "outcome": "committed"})
+                    self.queue.append({"type": "snapshot", "state": copy.deepcopy(state)})
+                    return
+                applied.add(message["id"])
                 half = message["args"]["tile"].split(":")[0]
                 state["tiles"] = [tile(t["half"], 2 if t["half"] == half else t["generation"])
                                   for t in state["tiles"]]
-                if at == "receipt":
+                if (at == "receipt" and self.number == 0) or at == "receipt_always":
                     self.queue.append(None)
                     return
                 self.queue.append({"type": "receipt", "id": message["id"], "outcome": "committed"})
@@ -425,7 +440,7 @@ class ReconnectTests(unittest.TestCase):
             except Exception as caught:
                 error = caught
         return dict(error=error, connections=connections, intents=intents, frames=frames,
-                    seats=seats, deadlines=deadlines, output=output.getvalue())
+                    seats=seats, deadlines=deadlines, output=output.getvalue(), attempts=attempts)
 
     def test_cold_readiness_eof_reuses_the_seat_and_waits_for_a_new_token(self):
         result = self.run_probe("cold")
@@ -466,11 +481,34 @@ class ReconnectTests(unittest.TestCase):
         self.assertEqual(str(result["error"]), "masked server frame")
         self.assertEqual(len(result["connections"]), 1)
 
-    def test_a_close_before_the_receipt_fails_without_replaying_the_intent(self):
+    def test_a_close_before_the_receipt_reconnects_and_sends_the_same_intent_id(self):
+        # fleet/PROTOCOL.md: a page sends an intent again after it reconnects, and the coordinator
+        # answers an id it has seen with that id's first receipt and changes nothing.
         result = self.run_probe("receipt")
-        self.assertIsInstance(result["error"], RuntimeError)
-        self.assertEqual(len(result["connections"]), 1)
-        self.assertEqual(len(result["intents"]), 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["connections"]), 2)
+        self.assertEqual(result["seats"], [None, "synthetic-seat"])
+        fcvm = [i["id"] for i in result["intents"] if i["args"]["tile"] == "fcvm:1"]
+        self.assertEqual(len(fcvm), 2)
+        self.assertEqual(len(set(fcvm)), 1, "the replay reuses the intent's id")
+        self.assertEqual(json.loads(result["output"].splitlines()[0]), {"reconnect": 1})
+        self.assertTrue(all(c.closed for c in result["connections"]))
+
+    def test_an_intent_sent_on_a_dead_connection_is_sent_again_on_a_new_one(self):
+        # Run 44764745380: the probe sent the EC2 relaunch onto a /live connection that had
+        # closed while it was not reading, and stopped with SSLEOFError.
+        result = self.run_probe("send_eof")
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["connections"]), 2)
+        self.assertEqual(result["attempts"][0], result["attempts"][1], "the same intent id, sent again")
+        self.assertEqual([i["args"]["tile"] for i in result["intents"]], ["fcvm:1", "ec2:1"])
+        self.assertEqual(json.loads(result["output"].splitlines()[0]), {"reconnect": 1})
+
+    def test_intent_replays_share_the_three_reconnects(self):
+        result = self.run_probe("receipt_always")
+        self.assertIsInstance(result["error"], smoke.WebSocketClosed)
+        self.assertEqual(len(result["connections"]), 4)
+        self.assertEqual(len(set(result["attempts"])), 1)
 
     def test_a_renderer_close_is_not_a_coordinator_reconnect(self):
         result = self.run_probe("renderer")

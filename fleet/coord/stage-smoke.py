@@ -106,6 +106,12 @@ class WebSocketClosed(RuntimeError):
     """The peer closed the connection, distinct from a malformed WebSocket message."""
 
 
+# A /live connection that is gone: closed by its peer, or dropped under TLS (an SSLEOFError
+# from a send onto a connection that closed while the probe was not reading, run 44764745380)
+# or TCP. A malformed message is not one of these and is never retried.
+LOST = (WebSocketClosed, ConnectionError, ssl.SSLEOFError)
+
+
 class InvalidViewerPayload(AssertionError):
     """Invalid data sent after the expected application identified its stream or tile.
 
@@ -1164,6 +1170,20 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 seat = message.get("seat")
             elif message.get("type") == "hello":
                 viewer = message.get("viewer")
+        def reopen(limit):
+            """Replace a /live connection that closed or dropped with a new one that sends the
+            seat ticket first, at most three times in the run and only before `limit`; False
+            when neither is left."""
+            nonlocal connection, state, admission, reconnects
+            if reconnects >= 3 or time.monotonic() >= limit:
+                return False
+            connection.close()
+            state, admission = {}, {}
+            reconnects += 1
+            connection = live()
+            connection.send({"type": "seat", "ticket": seat})
+            print(json.dumps({"reconnect": reconnects}), flush=True)
+            return True
         def until(predicate, by=None):
             """Read /live until `predicate(state)`. With `by` (a monotonic time), the wait is
             bounded: at `by` it returns the state as it is, so the caller states its own
@@ -1179,16 +1199,9 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                     if limit < deadline:
                         break
                     raise
-                except WebSocketClosed:
-                    if reconnects >= 3 or time.monotonic() >= limit:
+                except LOST:
+                    if not reopen(limit):
                         raise
-                    # A readiness wait can resume; an intent awaiting its receipt cannot.
-                    connection.close()
-                    state, admission = {}, {}
-                    reconnects += 1
-                    connection = live()
-                    connection.send({"type": "seat", "ticket": seat})
-                    print(json.dumps({"reconnect": reconnects}), flush=True)
                     continue
                 if opcode != 1:
                     continue
@@ -1208,24 +1221,35 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         def commit(name, args, by=None):
             """Send an intent and wait for its receipt; whether it committed. With `by`, a
             receipt that has not come by then counts as not committed. A refusal's reason is
-            left in `refusal["reason"]`."""
+            left in `refusal["reason"]`. A connection that closes or drops before the receipt is
+            replaced (`reopen`) and the intent sent again with the same id: the coordinator
+            answers an id it has seen with that id's first receipt and changes nothing
+            (fleet/PROTOCOL.md, "receipt")."""
             refusal.clear()
-            intent = str(uuid.uuid4())
-            connection.send({"type": "intent", "id": intent, "name": name, "args": args})
+            intent = {"type": "intent", "id": str(uuid.uuid4()), "name": name, "args": args}
             limit = deadline if by is None else min(deadline, by)
+            sent = False
             # A refused intent must fail explicitly, rather than wait for an unrelated change.
             while True:
                 try:
+                    if not sent:
+                        connection.send(intent)
+                        sent = True
                     opcode, payload = connection.message(limit)
                 except TimeoutError:
                     if limit < deadline:
                         return False
                     raise
+                except LOST:
+                    if not reopen(limit):
+                        raise
+                    sent = False
+                    continue
                 if opcode != 1:
                     continue
                 message = json.loads(payload)
                 take(message)
-                if message.get("type") == "receipt" and message.get("id") == intent:
+                if message.get("type") == "receipt" and message.get("id") == intent["id"]:
                     refusal["reason"] = message.get("reason")
                     return message.get("outcome") == "committed"
         if agents:
