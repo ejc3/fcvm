@@ -273,6 +273,39 @@ impl VsockStream {
         Ok(())
     }
 
+    /// Wait for the peer to close the connection.
+    ///
+    /// A close raises no EPOLLERR, so [`Self::wait_for_error`] never sees it. It makes the
+    /// socket readable with nothing to read. Bytes the peer did send are read and dropped:
+    /// this is for connections the peer never writes to. An error from the read is
+    /// returned; the connection is over then too.
+    pub async fn wait_for_peer_close(&self) -> std::io::Result<()> {
+        let mut buf = [0u8; 256];
+        loop {
+            let mut guard = self.inner.readable().await?;
+            match guard.try_io(|inner| {
+                // SAFETY: buf is a live, writable buffer of the length passed.
+                let n = unsafe {
+                    libc::recv(
+                        inner.as_raw_fd(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n)
+                }
+            }) {
+                Ok(Ok(0)) => return Ok(()),
+                Ok(Ok(_)) | Err(_) => continue,
+                Ok(Err(error)) => return Err(error),
+            }
+        }
+    }
+
     /// Async write_all — waits for writability via epoll, then writes.
     pub async fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
         let mut pos = 0;
