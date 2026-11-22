@@ -56,6 +56,11 @@ archives = [
 # own disks and needs no mount namespace; its --version says so (+fcvm.drive-overrides).
 # It also takes --numa-balancing-after-secs, which keeps new guest memory out of NUMA
 # balancing for that long (+fcvm.drive-overrides.numa-window; fcvm passes 60).
+# fcvm builds it for the gnu target, which has no seccomp policy of its own, so the
+# default policy is upstream's unimplemented.json: every syscall of the native
+# architecture allowed, the same program for the API, vCPU and VMM threads. This build
+# installs that program once per process and its threads inherit it, where each thread
+# installed a copy (one kernel BPF program per thread to compile and to free).
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -72,8 +77,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-numa-window"
-commit = "9519100397df6a2035e8ceceacdf16481a475585"
+branch = "agent/uffd-minor-v1.17.0-seccomp-shared"
+commit = "3d58dfac3060c895e279cde7a7866f69121a3ccf"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
