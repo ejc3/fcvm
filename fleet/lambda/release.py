@@ -21,17 +21,17 @@ shutdown). `--running` is that digest. A selection moves `keep-<stack>-next` to 
 both carry a protected tag after every write, and after the coordinator is configured with the new
 digest the one it replaced is the rollback target. A rollback selects `keep-<stack>-previous` and
 keeps the digest it replaces as previous. An interrupted selection or rollback completes when run
-again.
+again. Selections of one stack run one at a time: this script takes a per-stack lock and fails when
+another holds it, and reads the tags back after moving them.
 
 CI (.github/workflows/fleet-lambda-image.yml) builds the lane image on x86_64 when its inputs
 change on main, pushes it as `rev-<commit>` (`publish`), and records the digest it pushed, which
-moves `keep-built` to it. `select --built` selects that digest, so nothing types one. `keep-built` is
-protected too, so the newest build stays selectable however many images follow it. Selections of one stack run one at a time: this script takes a
-per-stack lock and fails when another holds it, and reads both tags back after moving them.
+moves `keep-built` to it unless keep-built already holds a newer commit's build. `select --built`
+selects that digest, so nothing types one. `keep-built` is protected too, so the newest build
+stays selectable however many images follow it.
 """
 import argparse
 import contextlib
-import datetime
 import fcntl
 import json
 import os
@@ -135,13 +135,10 @@ class Ecr:
             raise LookupError(f"no image {digest} in {self.repository}")
         return found
 
-    def pushed(self, digest):
-        """When the image was pushed, in seconds since the epoch."""
+    def tags(self, digest):
+        """Every tag the image carries."""
         out = self.aws(["describe-images", "--repository-name", self.repository, "--image-ids", "imageDigest=" + digest])
-        at = out["imageDetails"][0]["imagePushedAt"]
-        if isinstance(at, (int, float)):
-            return float(at)
-        return datetime.datetime.fromisoformat(at).timestamp()
+        return sorted(out["imageDetails"][0].get("imageTags", []))
 
     def put(self, tag, image):
         body = json.dumps({**({"registryId": self.registry} if self.registry else {}),
@@ -208,19 +205,29 @@ def move(ecr, stack, new, running):
     return now
 
 
-def record(ecr, built):
-    """Move keep-built to the digest CI just pushed, and read it back. Pushes run in commit order (one
-    publish at a time), so a build pushed before the recorded one is an older commit's, from a rerun
-    of its workflow: keep-built stays on the newer build."""
+def record(ecr, built, commit=None, is_ancestor=None):
+    """Move keep-built to `built` and read it back. With `commit` (CI's publish), keep-built moves
+    only forward in commit order: two main pushes' builds can finish out of order and a run can be
+    rerun, so the image pushed last is not always the newest commit's. When keep-built holds the
+    image of a commit that is not an ancestor of `commit`, it stays there ("kept")."""
     with locked("built"):
         now = ecr.tagged(BUILT)
-        if now is not None and now.digest != built and ecr.pushed(now.digest) > ecr.pushed(built):
-            raise RuntimeError(f"keep-built holds a newer build than {built}: not moved back")
+        if commit is not None and now is not None and now.digest != built:
+            held = [t[len("rev-"):] for t in ecr.tags(now.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
+            if held and not any(is_ancestor(h, commit) for h in held):
+                return {"status": "kept", BUILT: now.digest}
         ecr.put(BUILT, ecr.image(built))
         now = ecr.tagged(BUILT)
         if now is None or now.digest != built:
             raise RuntimeError("keep-built changed during the record: another record ran")
-    return {BUILT: built}
+    return {"status": "recorded", BUILT: built}
+
+
+def git_is_ancestor(older, newer):
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"git cannot order {older} and {newer}: the checkout needs the full history")
+    return result.returncode == 0
 
 
 REPOSITORY_URL = re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(REPOSITORY))
@@ -235,19 +242,21 @@ def quiet(args, body=None, env=None):
     return result.stdout
 
 
-def publish(ecr, archive, commit, repository_url):
+def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
     """CI: push the lane image CI built for `commit` as rev-<commit> and record its digest.
 
-    The tag is immutable, so a rerun finds it and records the digest already there. The digest
-    podman pushed must be the one the repository holds under the tag, or nothing is recorded."""
+    The tag is immutable, so a rerun finds it. Whichever push put it there, the image under the tag
+    must be the one this run built and checked (the same config digest, which podman calls the
+    image ID), and after a push it must hold the digest podman pushed, or nothing is recorded."""
     if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
         raise ValueError("a full commit is required")
     if not REPOSITORY_URL.fullmatch(repository_url or ""):
         raise ValueError("not the lane repository")
-    tag = "rev-" + commit
+    tag, local = "rev-" + commit, f"{LOCAL}:{commit}"
+    quiet(["podman", "load", "-q", "-i", archive])
+    built = "sha256:" + quiet(["podman", "image", "inspect", "--format", "{{.Id}}", local]).strip()
     found = ecr.tagged(tag)
     if found is None:
-        quiet(["podman", "load", "-q", "-i", archive])
         with tempfile.TemporaryDirectory(prefix="lane-push-") as tmp:
             env = dict(os.environ, REGISTRY_AUTH_FILE=os.path.join(tmp, "auth.json"))
             password = quiet(["aws", "ecr", "get-login-password", "--region", REGION])
@@ -255,15 +264,16 @@ def publish(ecr, archive, commit, repository_url):
             quiet(["podman", "login", "--username", "AWS", "--password-stdin", registry], body=password, env=env)
             password = None
             digest_file = os.path.join(tmp, "digest")
-            quiet(["podman", "push", "--digestfile", digest_file, f"{LOCAL}:{commit}",
-                   f"docker://{repository_url}:{tag}"], env=env)
+            quiet(["podman", "push", "--digestfile", digest_file, local, f"docker://{repository_url}:{tag}"], env=env)
             with open(digest_file) as f:
                 pushed = f.read().strip()
         found = ecr.tagged(tag)
         if found is None or found.digest != pushed:
             raise RuntimeError(f"{tag} does not hold the digest podman pushed")
-    record(ecr, digest(found.digest))
-    return {"tag": tag, "digest": found.digest}
+    if json.loads(found.manifest).get("config", {}).get("digest") != built:
+        raise RuntimeError(f"{tag} holds an image that is not the image this run built")
+    result = record(ecr, digest(found.digest), commit, is_ancestor)
+    return {"tag": tag, "digest": found.digest, "status": result["status"]}
 
 
 def newest_build(ecr):

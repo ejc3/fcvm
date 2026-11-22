@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,8 +33,10 @@ class FakeEcr:
         self.images = {}  # digest -> {"tags": set, "pushed": int, "manifest": str}
         self.clock = 0
 
-    def push(self, tag):
-        manifest = json.dumps({"schemaVersion": 2, "config": {"digest": tag}})
+    def push(self, tag, config=None):
+        # The image's config digest is what podman calls its image ID: by default one per tag.
+        config = config or "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
+        manifest = json.dumps({"schemaVersion": 2, "config": {"digest": config}, "tag": tag})
         digest = "sha256:" + hashlib.sha256(manifest.encode()).hexdigest()
         self.clock += 1
         self.images[digest] = {"tags": set(), "pushed": self.clock, "manifest": manifest}
@@ -60,8 +63,8 @@ class FakeEcr:
             self.images[holder.digest]["tags"].discard(tag)
         self.images[image.digest]["tags"].add(tag)
 
-    def pushed(self, digest):
-        return self.images[digest]["pushed"]
+    def tags(self, digest):
+        return sorted(self.images[digest]["tags"])
 
     def tags_of(self, digest):
         return self.images[digest]["tags"]
@@ -319,16 +322,22 @@ class Selection(unittest.TestCase):
         with self.assertRaises(SystemExit):
             release.arguments(["select", "--stack", "stage", "--built", "--digest", a, "--running", "none"])
 
-    def test_a_rerun_of_an_older_build_does_not_move_the_record_back(self):
-        a = self.ecr.push("rev-a")
-        release.record(self.ecr, a)
-        b = self.ecr.push("rev-b")
-        release.record(self.ecr, b)
-        # A workflow rerun of a's run records a again: keep-built stays on the newer b.
-        with self.assertRaisesRegex(RuntimeError, "newer"):
-            release.record(self.ecr, a)
+    def test_an_older_commit_published_later_does_not_move_the_record_back(self):
+        # Builds of two main pushes finish out of order, or an older run is rerun: the older
+        # commit's image is pushed after the newer one's. Commit order decides, not push order.
+        older, newer = "a" * 40, "b" * 40
+        history = {(older, newer)}  # older is an ancestor of newer
+        is_ancestor = lambda a, b: a == b or (a, b) in history
+        b = self.ecr.push("rev-" + newer)
+        release.record(self.ecr, b, newer, is_ancestor)
+        a = self.ecr.push("rev-" + older)
+        self.assertEqual(release.record(self.ecr, a, older, is_ancestor)["status"], "kept")
         self.assertEqual(self.ecr.tagged("keep-built").digest, b)
-        release.record(self.ecr, b)  # recording the same build again is fine
+        c = self.ecr.push("rev-" + "c" * 40)
+        history |= {(newer, "c" * 40)}
+        self.assertEqual(release.record(self.ecr, c, "c" * 40, is_ancestor)["status"], "recorded")
+        self.assertEqual(self.ecr.tagged("keep-built").digest, c)
+        release.record(self.ecr, c, "c" * 40, is_ancestor)  # the same build again
 
     def test_the_newest_build_is_kept_and_an_older_unselected_one_is_not(self):
         a = self.ecr.push("rev-a")
@@ -382,14 +391,17 @@ class Publish(unittest.TestCase):
                     f.write(push_digest or digest)
             if args[:3] == ["aws", "ecr", "get-login-password"]:
                 out = "password"
-            return type("R", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+            if args[:3] == ["podman", "image", "inspect"]:
+                out = hashlib.sha256(("rev-" + args[-1].rsplit(":", 1)[1]).encode()).hexdigest() + "\n"
+            code = 1 if args[:2] == ["git", "merge-base"] else 0
+            return type("R", (), {"returncode": code, "stdout": out, "stderr": ""})()
         return patch.object(release.subprocess, "run", side_effect=run)
 
     def test_ci_pushes_rev_commit_and_records_its_digest(self):
         with self.commands():
             result = release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
         pushed = self.ecr.tagged("rev-" + self.COMMIT).digest
-        self.assertEqual(result, {"tag": "rev-" + self.COMMIT, "digest": pushed})
+        self.assertEqual(result, {"tag": "rev-" + self.COMMIT, "digest": pushed, "status": "recorded"})
         self.assertEqual(self.ecr.tagged("keep-built").digest, pushed)
         push = next(c for c in self.calls if c[:2] == ["podman", "push"])
         self.assertEqual(push[-2:], ["localhost/fcvm-lambda-tile:" + self.COMMIT,
@@ -405,6 +417,28 @@ class Publish(unittest.TestCase):
         self.assertFalse([c for c in self.calls if c[:2] == ["podman", "push"]])
         self.assertEqual(self.ecr.tagged("keep-built").digest, pushed)
 
+    def test_an_image_pushed_by_hand_under_the_tag_is_not_recorded(self):
+        # rev-<commit> holds an image another build pushed (by hand, from another tree): it is
+        # not the image this run built and checked, so nothing is recorded.
+        self.ecr.push("rev-" + self.COMMIT, config="sha256:" + "e" * 64)
+        with self.commands():
+            with self.assertRaisesRegex(RuntimeError, "not the image this run built"):
+                release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
+        self.assertIsNone(self.ecr.tagged("keep-built"))
+
+    def test_publish_takes_commit_order_from_git(self):
+        with self.commands():
+            release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
+        ancestry = [c for c in self.calls if c[:3] == ["git", "merge-base", "--is-ancestor"]]
+        self.assertEqual(ancestry, [])  # nothing recorded yet: nothing to order against
+        older = "d" * 40
+        self.ecr.push("rev-" + older)
+        with self.commands():
+            result = release.publish(self.ecr, "lane.tar", older, self.REPO)
+        self.assertEqual([c for c in self.calls if c[:3] == ["git", "merge-base", "--is-ancestor"]],
+                         [["git", "merge-base", "--is-ancestor", self.COMMIT, older]])
+        self.assertEqual(result["status"], "kept")  # the fake git answers "not an ancestor"
+
     def test_a_push_whose_digest_the_repository_disagrees_with_records_nothing(self):
         with self.commands(push_digest="sha256:" + "f" * 64):
             with self.assertRaisesRegex(RuntimeError, "digest"):
@@ -417,6 +451,36 @@ class Publish(unittest.TestCase):
             with self.commands(), self.assertRaises(ValueError):
                 release.publish(self.ecr, "lane.tar", commit, repo)
         self.assertEqual(self.calls, [])
+
+
+class Workflow(unittest.TestCase):
+    """.github/workflows/fleet-lambda-image.yml, as text (the runner's python has no YAML module)."""
+    text = (HERE.parents[1] / ".github/workflows/fleet-lambda-image.yml").read_text()
+
+    def paths(self, event):
+        block = self.text.split(f"\n  {event}:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0].split("\n  pull_request:", 1)[0]
+        return re.findall(r"^      - '([^']+)'", block, re.M)
+
+    def test_a_change_to_anything_in_the_image_builds_it(self):
+        # What the lane image holds: the fcvm binary's tile runtime and what it calls, the renderer
+        # and its build contexts, and the lane image's own files.
+        inputs = ["src/fleet/lambda_tile.rs", "src/fleet/tunnel.rs", "src/fleet/coord/secrets.rs",
+                  "src/fleet/coord/aws.rs", "src/fleet/mod.rs", "src/cli/args.rs", "src/main.rs", "Cargo.lock",
+                  "fleet/lambda/Containerfile", "fleet/renderer/src/server.cpp",
+                  "fleet/core/tests/autopilot_lap.json", "fleet/web/core/layout.ts"]
+        for event in ("push", "pull_request"):
+            patterns = self.paths(event)
+            for path in inputs:
+                self.assertTrue(any(fnmatch.fnmatchcase(path, p.replace("**", "*")) for p in patterns), (event, path))
+
+    def test_every_build_publishes_in_commit_order(self):
+        publish = self.text.split("\n  publish:\n", 1)[1]
+        # queue: max keeps every pending publish: GitHub's default of one pending job per group
+        # cancels the older pending one, which can be the newest commit's.
+        self.assertRegex(publish, r"concurrency:\n      group: fleet-lambda-image\n      cancel-in-progress: false\n"
+                                  r"(?:      #.*\n)*      queue: max\n")
+        # release.py publish orders builds with git merge-base: it needs the history.
+        self.assertRegex(publish, r"persist-credentials: false\n          fetch-depth: 0\n")
 
 
 class AwsCli(unittest.TestCase):
@@ -474,13 +538,11 @@ class AwsCli(unittest.TestCase):
                 release.run(["publish", "--archive", "a.tar", "--commit", "c" * 40])
         self.assertEqual(published.call_args.args[0].registry, "123456789012")
 
-    def test_push_time_reads_both_timestamp_forms(self):
-        iso = json.dumps({"imageDetails": [{"imagePushedAt": "2026-11-22T19:00:00+00:00"}]})
-        epoch = json.dumps({"imageDetails": [{"imagePushedAt": 1795374000.5}]})
-        calls, p = self.run_with([(0, iso, ""), (0, epoch, "")])
+    def test_an_images_tags_are_read_whole(self):
+        out = json.dumps({"imageDetails": [{"imageTags": ["rev-" + "a" * 40, "keep-built"]}]})
+        calls, p = self.run_with([(0, out, "")])
         with p:
-            self.assertEqual(release.Ecr().pushed("sha256:" + "4" * 64), 1795374000.0)
-            self.assertEqual(release.Ecr().pushed("sha256:" + "4" * 64), 1795374000.5)
+            self.assertEqual(release.Ecr().tags("sha256:" + "4" * 64), ["keep-built", "rev-" + "a" * 40])
         self.assertEqual(calls[0][0][:3], ["aws", "ecr", "describe-images"])
         self.assertIn("imageDigest=sha256:" + "4" * 64, calls[0][0])
 

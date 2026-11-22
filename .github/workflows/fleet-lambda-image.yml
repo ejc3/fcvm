@@ -15,9 +15,11 @@ on:
       # (its build contexts).
       - 'fleet/core/tests/**'
       - 'fleet/web/core/layout.ts'
-      # The tile runtime and its tunnel, which the coordinator speaks.
-      - 'src/fleet/lambda_tile.rs'
-      - 'src/fleet/tunnel.rs'
+      # The fcvm binary's tile runtime and what it calls (the tunnel the coordinator speaks,
+      # the secret and AWS signing code, the CLI and its dispatch).
+      - 'src/fleet/**'
+      - 'src/cli/**'
+      - 'src/main.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/fleet-lambda-image.yml'
@@ -27,8 +29,9 @@ on:
       - 'fleet/renderer/**'
       - 'fleet/core/tests/**'
       - 'fleet/web/core/layout.ts'
-      - 'src/fleet/lambda_tile.rs'
-      - 'src/fleet/tunnel.rs'
+      - 'src/fleet/**'
+      - 'src/cli/**'
+      - 'src/main.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/fleet-lambda-image.yml'
@@ -86,10 +89,13 @@ jobs:
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
     timeout-minutes: 30
-    # One record at a time, in push order, so keep-built ends on the newest build.
+    # One publish at a time. Builds can finish out of order, so release.py orders the record by
+    # commit (git merge-base). queue: max keeps every pending publish: GitHub's default of one
+    # pending job per group cancels the older pending one, which can be the newest commit's.
     concurrency:
       group: fleet-lambda-image
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write
@@ -97,6 +103,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fleet-lambda-image
