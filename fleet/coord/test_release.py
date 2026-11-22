@@ -1877,10 +1877,26 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIn("branches: [main]", trigger)
         for job in ("build", "deploy"):
             condition = workflow.split(f"\n  {job}:\n", 1)[1].split("\n    runs-on:", 1)[0]
-            self.assertIn("vars.FLEET_LAMBDA_LANE == 'on'", condition, job)
-            self.assertIn("github.event.workflow_run.conclusion == 'success'", condition, job)
-            self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", condition, job)
-            self.assertIn("github.event.workflow_run.event == 'push'", condition, job)
+            condition = " ".join(condition.split("if: >-", 1)[1].split())
+            self.assertEqual(condition,
+                             "github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
+                             "(github.event_name != 'workflow_run' || (vars.FLEET_LAMBDA_LANE == 'on' && "
+                             "github.event.workflow_run.conclusion == 'success' && "
+                             "github.event.workflow_run.event == 'push' && "
+                             "github.event.workflow_run.head_branch == 'main' && "
+                             "github.event.workflow_run.head_repository.full_name == github.repository))", job)
+        # A job-level `if:` reads only repository variables (the job's environment attaches after it), so the
+        # switch is documented as a repository variable and never as the environment's.
+        protocol = (HERE.parent.parent / "fleet/PROTOCOL.md").read_text()
+        switch = protocol.split("- With the repository variable `FLEET_LAMBDA_LANE` set to `on`", 1)
+        self.assertEqual(len(switch), 2, "PROTOCOL.md names FLEET_LAMBDA_LANE as a repository variable")
+        self.assertNotRegex(protocol, r"FLEET_LAMBDA_LANE[^\n]*\n?[^\n]*in `fleet-stage-deploy`")
+        # A run the lane build starts never shares the push deploys' group, so one whose jobs all skip
+        # (lane off, a failed lane run) cannot cancel a push's pending deploy. The releases themselves queue in
+        # the deploy job's fleet-viewer-smoke group.
+        group = workflow.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', "
+                      "github.event.workflow_run.id) || 'fleet-coordinator-stage' }}", group)
         deploy = workflow.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
         self.assertIn("fetch-depth: 0", deploy)
 

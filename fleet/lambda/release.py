@@ -347,20 +347,23 @@ def matches(path, patterns):
     return any(fnmatch.fnmatchcase(path, p.replace("**", "*")) for p in patterns)
 
 
-def git_changed(older, newer):
-    """The files that differ between two commits."""
-    result = subprocess.run(["git", "diff", "--name-only", older, newer], capture_output=True, text=True)
+def git_changed(older, newer, cwd=None):
+    """Every path that differs between two commits: a rename lists both its paths (--no-renames), and a path
+    git would quote comes back as it is (-z)."""
+    result = subprocess.run(["git", "diff", "--no-renames", "-z", "--name-only", older, newer],
+                            capture_output=True, cwd=cwd)
     if result.returncode:
-        raise RuntimeError(f"git diff failed ({result.returncode}): {result.stderr.strip()[:300]}")
-    return result.stdout.split()
+        raise RuntimeError(f"git diff failed ({result.returncode}): {result.stderr.decode(errors='replace').strip()[:300]}")
+    return [p for p in result.stdout.decode("utf-8", errors="surrogateescape").split("\0") if p]
 
 
 def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, clock=time.monotonic,
                  sleep=time.sleep, timeout=1500):
     """The keep-built digest whose lane image is the one `commit` builds: built from `commit`, or from a commit
     on the same line (an ancestor or a descendant) with no lane input changed in between. keep-built moves
-    only forward, so while it does not pair, wait (every 30 s, at most `timeout`) for this commit's lane build;
-    then refuse: a coordinator never runs beside a lane image built from other lane inputs."""
+    only forward: when it holds a later build with other lane inputs, refuse at once; when it holds an earlier
+    build, or none, wait (every 30 s, at most `timeout`) for this commit's lane build, then refuse. A coordinator
+    never runs beside a lane image built from other lane inputs."""
     if changed is None:
         patterns = inputs if inputs is not None else lane_inputs(
             (Path(__file__).resolve().parents[2] / ".github/workflows/fleet-lambda-image.yml").read_text())
@@ -370,12 +373,19 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
     while True:
         built = ecr.tagged(BUILT)
         if built is not None:
-            for held in (t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)):
-                if held == commit or ((is_ancestor(held, commit) or is_ancestor(commit, held))
-                                      and not changed(held, commit)):
+            held = [t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
+            for h in held:
+                if h == commit or ((is_ancestor(h, commit) or is_ancestor(commit, h)) and not changed(h, commit)):
                     return built.digest
+            # keep-built moves only forward: a build of a later commit (or of another line) with other lane
+            # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
+            if not held or not all(is_ancestor(h, commit) for h in held):
+                raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds a newer lane build "
+                                   "with other lane inputs")
         if clock() >= deadline:
-            raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds another commit's lane inputs")
+            if built is None:
+                raise RuntimeError(f"no lane build is recorded (keep-built) for {commit}")
+            raise RuntimeError(f"no lane build pairs with {commit}: this commit's lane build did not land in time")
         sleep(30)
 
 

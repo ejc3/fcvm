@@ -440,10 +440,11 @@ class Selection(unittest.TestCase):
         release.record(self.ecr, b1)
         self.assertEqual(pair(c1), b1)  # the commit's own build
         self.assertEqual(pair(c2), b1)  # c2 changed no lane input since c1
-        # c0 is behind a lane change: no build pairs with it, and keep-built only moves forward.
-        with self.assertRaisesRegex(RuntimeError, "no lane build pairs"):
+        # c0 is behind a lane change: keep-built already holds a newer build and only moves forward, so
+        # no build can pair with it and the release refuses at once.
+        with self.assertRaisesRegex(RuntimeError, "newer lane build"):
             pair(c0, timeout=90)
-        self.assertEqual(sleeps, [30, 30, 30])
+        self.assertEqual(sleeps, [])
         # A build that lands while the deploy waits is taken.
         changed_between.add((c1, c2))
         b2 = self.ecr.push("rev-" + c2)
@@ -452,6 +453,38 @@ class Selection(unittest.TestCase):
         self.assertEqual(release.paired_build(self.ecr, c2, is_ancestor=is_ancestor, changed=changed,
                                               clock=lambda: clock[0], sleep=real_sleep, timeout=600), b2)
         self.assertEqual(sleeps, [30])
+
+    def test_with_nothing_built_the_release_waits_then_says_so(self):
+        clock, sleeps = [0.0], []
+        with self.assertRaisesRegex(RuntimeError, "no lane build is recorded"):
+            release.paired_build(self.ecr, "3" * 40, is_ancestor=lambda a, b: True, changed=lambda a, b: True,
+                                 clock=lambda: clock[0], timeout=60,
+                                 sleep=lambda t: (sleeps.append(t), clock.__setitem__(0, clock[0] + t)))
+        self.assertEqual(sleeps, [30, 30])
+
+    def test_git_lists_every_changed_path_whole(self):
+        # A file renamed out of the lane inputs counts under its old path too, and a path git would quote
+        # (not ASCII) comes back as it is.
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as repo:
+            git = lambda *a: sp.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", *a],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q")
+            os.makedirs(os.path.join(repo, "src"))
+            Path(repo, "src", "moved.rs").write_text("fn a() {}\n" * 20)
+            git("add", "-A")
+            git("commit", "-q", "-m", "one")
+            first = git("rev-parse", "HEAD")
+            os.makedirs(os.path.join(repo, "docs"))
+            git("mv", "src/moved.rs", "docs/moved.rs")
+            Path(repo, "src", "caf\u00e9.rs").write_text("fn b() {}\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "two")
+            second = git("rev-parse", "HEAD")
+            changed = release.git_changed(first, second, cwd=repo)
+        self.assertIn("src/moved.rs", changed)
+        self.assertIn("src/caf\u00e9.rs", changed)
+        self.assertTrue(release.matches("src/moved.rs", ["src/**"]))
 
     def test_lane_inputs_are_the_workflows_push_paths(self):
         inputs = release.lane_inputs((HERE.parents[1] / ".github/workflows/fleet-lambda-image.yml").read_text())

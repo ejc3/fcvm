@@ -2174,7 +2174,9 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
   shutdown.
-- With `FLEET_LAMBDA_LANE=on` in `fleet-stage-deploy`, the staging coordinator release
+- With the repository variable `FLEET_LAMBDA_LANE` set to `on` (set on the repository, not on the
+  `fleet-stage-deploy` environment: the deploy workflow's job-level `if:` reads it, and a job's
+  environment attaches after its `if:`), the staging coordinator release
   (`fleet/coord/publish.py`) asks the release function which lane digest the coordinator runs (R),
   selects the lane build that pairs with the commit it deploys (below), keeping R as previous, and
   releases with that digest. The release function (ejc3/aws `fcvm-coordinator-release`) refuses a
@@ -2190,8 +2192,9 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   minutes for this commit's lane build, then fails without changing anything. With the lane on, a
   lane build main publishes starts a staging release (`workflow_run` in
   `fleet-coordinator-deploy.yml`), so a push that changes only the lane image's inputs reaches
-  staging. That release runs main's head in the same concurrency groups as a push's release; the
-  deploy job holds the smokes' group while it waits.
+  staging. That release runs main's head in a concurrency group of its own, so a run whose jobs all
+  skip cannot cancel a push's pending deploy; the releases queue in the deploy job's smokes' group,
+  which the deploy job holds while it waits.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of
