@@ -281,7 +281,9 @@ impl Plan {
                 "ExecutionEnvironmentMemoryGiBPerVCpu": 4,
             }},
             "AcceleratorConfig": {"AcceleratorMemorySize": 16},
-            "Tags": {"Project": "fcvm-fleet", "Fleet": self.fleet},
+            // The daily budgets and the capacity provider's propagated tags filter on Purpose
+            // and Fleet (ejc3/aws fcvm-fleet-lambda.tf).
+            "Tags": {"Project": "fcvm-fleet", "Purpose": "fcvm-fleet-tile", "Fleet": self.fleet},
         })
     }
 }
@@ -304,6 +306,29 @@ pub fn instance_timings(
         }
     }
     t
+}
+
+/// `--lambda-image`: the lane image by digest, `<repository>@sha256:<hex>`. Every function
+/// this coordinator creates runs that one digest, which fleet/lambda/release.py keeps in the
+/// shared repository while the stack runs it (fleet/PROTOCOL.md, "Which lane image a stack
+/// runs"). A tag is refused: the protected tags move, so a function created after a selection
+/// would run another image than one created before it.
+pub fn lane_image(image: &str) -> Result<String> {
+    let valid = image.split_once("@sha256:").is_some_and(|(name, hex)| {
+        !name.is_empty()
+            && !name.contains(|c: char| c.is_whitespace() || c == '@')
+            && !name
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| last.contains(':'))
+            && hex.len() == 64
+            && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    anyhow::ensure!(
+        valid,
+        "--lambda-image must name the lane image by digest: <repository>@sha256:<64 hex>"
+    );
+    Ok(image.to_string())
 }
 
 /// The parts of the Lambda API the driver calls, so tests can stand in for it.
@@ -859,6 +884,33 @@ mod tests {
         let body = plan.create_body("fcvm-lam-test-2", &a);
         assert_eq!(body["PackageType"], "Image");
         assert_eq!(body["AcceleratorConfig"]["AcceleratorMemorySize"], 16);
+    }
+
+    #[test]
+    fn a_function_carries_the_tags_its_budget_filters_on() {
+        let body = plan().create_body("fcvm-lam-test-2", &BTreeMap::new());
+        assert_eq!(
+            body["Tags"],
+            json!({"Project": "fcvm-fleet", "Purpose": "fcvm-fleet-tile", "Fleet": "test"})
+        );
+    }
+
+    #[test]
+    fn the_lane_image_is_named_by_digest() {
+        let digest = format!("sha256:{}", "0a".repeat(32));
+        let image = format!("example.invalid/fcvm-fleet/lambda-tile@{digest}");
+        assert_eq!(lane_image(&image).unwrap(), image);
+        for refused in [
+            "example.invalid/fcvm-fleet/lambda-tile:keep-stage-current".to_string(),
+            "example.invalid/fcvm-fleet/lambda-tile:rev-1".to_string(),
+            format!("@{digest}"),
+            format!("example.invalid/lane@sha256:{}", "0A".repeat(32)),
+            format!("example.invalid/lane@sha256:{}", "0a".repeat(31)),
+            format!("example.invalid/lane:1@{digest}"),
+            format!("example.invalid/la ne@{digest}"),
+        ] {
+            assert!(lane_image(&refused).is_err(), "{refused} was taken");
+        }
     }
 
     fn plan() -> Plan {

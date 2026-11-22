@@ -609,7 +609,8 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_LAMBDA_REGION", default_value = "us-east-1")]
     pub lambda_region: String,
 
-    /// The lane image (an ECR image URI the functions run)
+    /// The lane image the functions run, by digest: `<repository>@sha256:<hex>`. A tag is
+    /// refused; fleet/lambda/release.py keeps the selected digests in the repository
     #[arg(long, env = "FLEET_LAMBDA_IMAGE")]
     pub lambda_image: Option<String>,
 
