@@ -4303,6 +4303,84 @@ async fn a_refused_spot_launch_launches_on_demand_in_the_same_pass() {
     );
 }
 
+/// A launch the account's quota refuses keeps the coordinator's `scale` failure up for as
+/// long as the region stays short, through the polls between launch attempts (every 50 ms
+/// here, against a 300 ms capacity retry; 2 s against 10 s in production). A poll that asks
+/// EC2 nothing must not report the region healthy. Once the quota allows the launch, the
+/// failure clears.
+#[tokio::test]
+async fn a_quota_refused_launch_stays_degraded_between_attempts() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 600,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    for m in [Market::Spot, Market::OnDemand] {
+        fake.capacity
+            .lock()
+            .unwrap()
+            .insert(("us-east-1".into(), m), 0);
+    }
+    fake.refusal.lock().unwrap().insert(
+        Market::OnDemand,
+        "VcpuLimitExceeded: your current vCPU limit of 384".into(),
+    );
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let scale = |s: &Value| {
+        s["failures"].as_array().is_some_and(|f| {
+            f.iter()
+                .any(|f| f["kind"] == "coordinator_degraded" && f["component"] == "scale")
+        })
+    };
+    let mut v = page_viewer(&handle).await;
+    let first = v.until(scale).await;
+    let reason = first["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["component"] == "scale")
+        .unwrap()["reason"]
+        .clone();
+    assert!(
+        reason.as_str().unwrap().contains("VcpuLimitExceeded"),
+        "{reason}"
+    );
+    let since = v.latest().0;
+    let asked = launches(&fake).len();
+    // Five capacity retries, with about thirty polls between them.
+    let end = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while tokio::time::timeout_at(end, v.recv()).await.is_ok() {}
+    assert!(
+        launches(&fake).len() >= asked + 4,
+        "the launch was not asked again: {:?}",
+        fake.calls()
+    );
+    for (version, s) in v.snapshots.range(since..) {
+        assert!(
+            scale(s),
+            "snapshot {version} dropped the quota failure while the region was short: {}",
+            s["failures"]
+        );
+    }
+    // The quota allows the launch: the host comes and the failure goes.
+    fake.capacity.lock().unwrap().clear();
+    fake.refusal.lock().unwrap().clear();
+    until_hosts(&fake, "the launch the quota allows", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    v.until(|s| !scale(s)).await;
+}
+
 /// The fleet never runs more on-demand hosts than the cap, all regions together: with
 /// spot refused in two regions and a cap of 1, one region gets an on-demand host and the
 /// other waits for capacity (asking spot again, never on demand).
