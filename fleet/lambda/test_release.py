@@ -454,6 +454,13 @@ class Selection(unittest.TestCase):
                                               clock=lambda: clock[0], sleep=real_sleep, timeout=600), b2)
         self.assertEqual(sleeps, [30])
 
+    def test_a_recorded_image_without_a_commit_tag_is_named_so(self):
+        untagged = self.ecr.push("hand-pushed")
+        release.record(self.ecr, untagged)
+        with self.assertRaisesRegex(RuntimeError, "no rev-<commit> tag"):
+            release.paired_build(self.ecr, "3" * 40, is_ancestor=lambda a, b: True, changed=lambda a, b: False,
+                                 clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+
     def test_with_nothing_built_the_release_waits_then_says_so(self):
         clock, sleeps = [0.0], []
         with self.assertRaisesRegex(RuntimeError, "no lane build is recorded"):

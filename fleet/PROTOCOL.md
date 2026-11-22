@@ -2174,27 +2174,25 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
   shutdown.
-- With the repository variable `FLEET_LAMBDA_LANE` set to `on` (set on the repository, not on the
-  `fleet-stage-deploy` environment: the deploy workflow's job-level `if:` reads it, and a job's
-  environment attaches after its `if:`), the staging coordinator release
-  (`fleet/coord/publish.py`) asks the release function which lane digest the coordinator runs (R),
-  selects the lane build that pairs with the commit it deploys (below), keeping R as previous, and
-  releases with that digest. The release function (ejc3/aws `fcvm-coordinator-release`) refuses a
-  lane digest that `keep-stage-current` does not hold, and sets the coordinator's
-  `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks again what runs and, unless the new
-  lane image does, puts the stage's tags back as they were before the selection. Unset or `off`,
-  the release is the one without a lane. Prod's promote and rollback do not carry a lane digest
-  yet.
-- **Pairing.** A coordinator runs beside a lane image built from the same lane inputs: the
-  `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line (an ancestor
-  or a descendant) with no path of the lane workflow changed in between
-  (`release.py paired_build`). When `keep-built` does not pair yet, the release waits up to 25
-  minutes for this commit's lane build, then fails without changing anything. With the lane on, a
-  lane build main publishes starts a staging release (`workflow_run` in
-  `fleet-coordinator-deploy.yml`), so a push that changes only the lane image's inputs reaches
-  staging. That release runs main's head in a concurrency group of its own, so a run whose jobs all
-  skip cannot cancel a push's pending deploy; the releases queue in the deploy job's smokes' group,
-  which the deploy job holds while it waits.
+- With the repository variable `FLEET_LAMBDA_LANE` set to `on` (one switch, on the repository;
+  not also on the `fleet-stage-deploy` environment, whose variable of the same name would
+  override it for the step), the staging coordinator release (`fleet/coord/publish.py`) asks the release function which
+  lane digest the coordinator runs (R), selects the lane build that pairs with the commit it
+  deploys (below), keeping R as previous, and releases with that digest. The release function
+  (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current` does not
+  hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks
+  again what runs and, unless the new lane image does, puts the stage's tags back as they were
+  before the selection. Unset or `off`, the release is the one without a lane. Prod's promote and
+  rollback do not carry a lane digest yet.
+- **Pairing.** With the lane on, a coordinator deploy carries the lane build paired with its
+  commit: the `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line
+  (an ancestor or a descendant) with no path of the lane workflow changed in between
+  (`release.py paired_build`). When `keep-built` holds an earlier build, or none, the release
+  waits up to 25 minutes for this commit's lane build; when it holds a later build with other lane
+  inputs, or an image with no `rev-<commit>` tag, it refuses at once. Either refusal changes
+  nothing. A push that changes only lane inputs starts no coordinator deploy: it reaches staging
+  with the next coordinator deploy, or a manual `workflow_dispatch` of
+  `fleet-coordinator-deploy.yml`.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of

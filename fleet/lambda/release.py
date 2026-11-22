@@ -379,7 +379,10 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
                     return built.digest
             # keep-built moves only forward: a build of a later commit (or of another line) with other lane
             # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
-            if not held or not all(is_ancestor(h, commit) for h in held):
+            if not held:
+                raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds an image with no "
+                                   "rev-<commit> tag")
+            if not all(is_ancestor(h, commit) for h in held):
                 raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds a newer lane build "
                                    "with other lane inputs")
         if clock() >= deadline:

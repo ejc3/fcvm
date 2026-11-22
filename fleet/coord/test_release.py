@@ -1862,7 +1862,7 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()), {"status": "failed", "errorType": "CommandFailed",
                                                       "code": "AccessDeniedException"})
 
-    def test_the_staging_deploy_passes_the_lane_setting_and_follows_the_lane_build(self):
+    def test_the_staging_deploy_passes_the_lane_setting_and_runs_as_main_does(self):
         workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()
         step = workflow.split("- name: Publish and release the staging coordinator", 1)[1].split("\n\n", 1)[0]
         self.assertIn("FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}", step)
@@ -1871,34 +1871,20 @@ class LaneReleaseTests(unittest.TestCase):
         paths = re.findall(r"^      - '([^']+)'", workflow.split("\n  push:\n", 1)[1].split("\n  workflow_", 1)[0], re.M)
         for path in ("fleet/lambda/release.py", ".github/workflows/fleet-lambda-image.yml"):
             self.assertIn(path, paths)
-        # A finished lane publish starts a staging release, only with the lane on and only for main's own runs.
-        trigger = workflow.split("\n  workflow_run:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0]
-        self.assertIn('workflows: ["Fleet Lambda lane image"]', trigger)
-        self.assertIn("branches: [main]", trigger)
+        # Triggers, concurrency and job conditions are main's: a push or a dispatch, one group. A lane build
+        # does not start a deploy (the stacked trigger PR orders releases first).
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["push", "workflow_dispatch"])
+        self.assertIn("\nconcurrency:\n  group: fleet-coordinator-stage\n  cancel-in-progress: false\n", workflow)
         for job in ("build", "deploy"):
             condition = workflow.split(f"\n  {job}:\n", 1)[1].split("\n    runs-on:", 1)[0]
-            condition = " ".join(condition.split("if: >-", 1)[1].split())
-            self.assertEqual(condition,
-                             "github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
-                             "(github.event_name != 'workflow_run' || (vars.FLEET_LAMBDA_LANE == 'on' && "
-                             "github.event.workflow_run.conclusion == 'success' && "
-                             "github.event.workflow_run.event == 'push' && "
-                             "github.event.workflow_run.head_branch == 'main' && "
-                             "github.event.workflow_run.head_repository.full_name == github.repository))", job)
-        # A job-level `if:` reads only repository variables (the job's environment attaches after it), so the
-        # switch is documented as a repository variable and never as the environment's.
-        protocol = (HERE.parent.parent / "fleet/PROTOCOL.md").read_text()
-        switch = protocol.split("- With the repository variable `FLEET_LAMBDA_LANE` set to `on`", 1)
-        self.assertEqual(len(switch), 2, "PROTOCOL.md names FLEET_LAMBDA_LANE as a repository variable")
-        self.assertNotRegex(protocol, r"FLEET_LAMBDA_LANE[^\n]*\n?[^\n]*in `fleet-stage-deploy`")
-        # A run the lane build starts never shares the push deploys' group, so one whose jobs all skip
-        # (lane off, a failed lane run) cannot cancel a push's pending deploy. The releases themselves queue in
-        # the deploy job's fleet-viewer-smoke group.
-        group = workflow.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', "
-                      "github.event.workflow_run.id) || 'fleet-coordinator-stage' }}", group)
+            self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", condition + "\n", job)
         deploy = workflow.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
         self.assertIn("fetch-depth: 0", deploy)
+        # One place for the switch, which the step env reads: the repository variable.
+        protocol = (HERE.parent.parent / "fleet/PROTOCOL.md").read_text()
+        self.assertEqual(len(protocol.split("- With the repository variable `FLEET_LAMBDA_LANE` set to `on`", 1)), 2)
+        self.assertNotRegex(protocol, r"FLEET_LAMBDA_LANE[^\n]*\n?[^\n]*in `fleet-stage-deploy`")
 
 
 class ResolveRetransmitTests(unittest.TestCase):

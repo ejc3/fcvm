@@ -20,38 +20,18 @@ on:
       # With the Lambda lane on, the deploy job runs these (publish.py selects the lane image).
       - 'fleet/lambda/release.py'
       - '.github/workflows/fleet-lambda-image.yml'
-  # With the Lambda lane on (the repository variable FLEET_LAMBDA_LANE; a job-level `if:` cannot read an
-  # environment's variables), a lane image that main's lane workflow published starts a staging release, so
-  # a push that changes only the lane image's inputs reaches staging and the coordinator never stays beside
-  # an older lane build (fleet/PROTOCOL.md, "Which lane image a stack runs"). It runs this workflow from main
-  # at main's head.
-  workflow_run:
-    workflows: ["Fleet Lambda lane image"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A run the lane build starts has a group of its own (one per lane run): GitHub keeps one pending run per
-  # group and a newer one cancels it, and such a run (lane off, a failed lane run) can skip every job, so it
-  # must never displace a push's pending deploy. The releases queue in the deploy job's group.
-  group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', github.event.workflow_run.id) || 'fleet-coordinator-stage' }}
+  group: fleet-coordinator-stage
   cancel-in-progress: false
 
 jobs:
   build:
-    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
-    if: >-
-      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
-      (github.event_name != 'workflow_run' ||
-       (vars.FLEET_LAMBDA_LANE == 'on' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -96,15 +76,7 @@ jobs:
 
   deploy:
     needs: build
-    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
-    if: >-
-      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
-      (github.event_name != 'workflow_run' ||
-       (vars.FLEET_LAMBDA_LANE == 'on' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     environment: fleet-stage-deploy
     # With the lane on, publish.py may wait up to 25 minutes for this commit's lane build.
@@ -144,8 +116,9 @@ jobs:
           role-session-name: fcvm-stage-${{ github.run_id }}
           mask-aws-account-id: true
       - name: Publish and release the staging coordinator
-        # FLEET_LAMBDA_LANE (a repository variable) on: the release also selects the lane image for
-        # staging and passes it to the release function (fleet/coord/publish.py). Unset: as before.
+        # FLEET_LAMBDA_LANE (a repository variable) on: the release also selects the lane build paired
+        # with this commit for staging and passes it to the release function (fleet/coord/publish.py).
+        # Unset: as before.
         env:
           COORDINATOR_REPO: ${{ secrets.COORDINATOR_REPO }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
