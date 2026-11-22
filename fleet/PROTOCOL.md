@@ -2072,6 +2072,89 @@ IPv4 front's, which routes `agg-<host>-<token>-v4` to the aggregator's TLS port.
 aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the host's security
 group does not admit.
 
+## Lambda tile
+
+A Lambda tile is the renderer in a Lambda Managed Instances execution environment. An
+environment takes no inbound connection, so the tile dials out to the coordinator, and every
+stream the tile serves (viewers, the coordinator's scene and budget posts and health reads,
+the aggregators) runs over that tunnel to the renderer, which is the same image an EC2 tile
+runs. TLS for a viewer still ends in the renderer.
+
+### The lane image
+
+`fleet/lambda/Containerfile` is the renderer image with the fcvm binary, whose
+`fcvm fleet lambda-tile` is the image's entrypoint and the function's Lambda custom runtime
+(`make -C fleet/lambda image RENDERER=<renderer image>` after `make build`, on x86_64: the
+lane runs on g4dn). Lambda injects the NVIDIA devices and driver libraries. The coordinator
+sets everything in the function's configuration:
+
+| variable | |
+|---|---|
+| `FLEET_TILE_SLOT` | the slot, `lam-<n>` |
+| `FLEET_TILE_GENERATION` | the generation this version runs. A race changes it, so publishing creates a new version and a new environment (publishing an unchanged function returns the old version and starts nothing) |
+| `FLEET_TILE_CREDENTIAL` | the tunnel credential for this slot and generation (below) |
+| `FLEET_TILE_TUNNEL` | the endpoint, `host[:port]`, 443 by default |
+| `FLEET_TLS_SECRET`, `FLEET_SECRET_REGION` | the certificate secret an EC2 tile reads (`cert`, `key`, `scene_token`), default `fcvm-fleet/tls-wildcard` in us-east-2 |
+
+In the environment's init the runtime writes the secret's certificate as the renderer's
+`TLS_CERT_FILE` and its scene token as `SCENE_TOKEN_FILE` under `/tmp/fleet-tile` (mode
+0600), starts the renderer with HTTP on 127.0.0.1:8080 and TLS on 8443 (the environment's
+user binds no port below 1024), starts it again 2 s after it exits, and dials the tunnel.
+An init that cannot read the secret reports an init error to Lambda. Invocations
+(`{"action": ...}`, two served at once):
+
+- `health` (the default): the renderer's `GET /health` as `health`, with the tile's slot,
+  generation, environment, instance and whether its tunnel is up.
+- `restart`: stop the renderer process, start it again, and wait for `/health` with
+  `ready` true. `restart_ms` is that time: a process restart inside a running environment,
+  reported beside a race's time and never as it (fleet/core's `warm_invoke_ms`).
+
+When the endpoint ends the environment's tunnel for good (a newer generation is wanted, an
+environment that started later holds the tile, or the credential is refused), the runtime
+stops the renderer, so the GPU is idle until Lambda retires the environment.
+
+### The tunnel
+
+Every connection is TLS to the endpoint's name, verified against the public roots, and starts
+with one JSON line from the tile, its hello, answered by one line from the endpoint:
+
+```
+{"v":1,"kind":"control","slot":"lam-1","generation":7,"env":"9f3c2a71b0de","started_ms":1795300000000,
+ "credential":"<expires_ms>.<hex>","instance":"5d8e1b4c7a20","instance_boot_ms":1795299940000}
+{"ok":true}
+```
+
+- `env` is a random id the environment draws at start and `started_ms` when it started.
+- `instance` names the managed instance by a hash of its DMI board asset tag (never the
+  value), and `instance_boot_ms` is its kernel's boot time (`btime` in `/proc/stat`).
+  Environments on one instance share both, so the coordinator can tell an environment that
+  landed on an instance it already had from one that waited for Lambda to launch an instance.
+- `credential` is `<expires_ms>.<hex HMAC-SHA256>` over `v1`, the slot, the generation and
+  the expiry, one per line, keyed with a key derived from the fleet's scene token, so every
+  coordinator of the fleet accepts it across a restart.
+
+A refusal is `{"ok":false,"error":"<reason>"}`: `bad_hello`, `unauthorized` (not minted for
+this slot and generation, or expired), `stale_generation` (the endpoint wants a newer
+generation), `superseded` (an environment of the same generation that started later holds the
+tile), `unknown_stream`. The first three end the environment's tunnel for good; the tile dials
+again after any other end, 1 s doubling to 30 s, from 1 s again after a session that came up.
+
+The endpoint keeps one session per slot. Of two environments of one generation, the one that
+started later holds the tile, whatever order they dial in (Lambda replaces an environment on
+its own, and the old one keeps answering for a while). After the hello of a control
+connection, the endpoint sends one JSON line per message and the tile answers pings:
+
+| endpoint to tile | |
+|---|---|
+| `{"open":{"stream":3,"port":"tls"}}` | dial a data connection for stream 3 and join it to the renderer's `tls` (8443) or `http` (8080) listener |
+| `{"ping":{"n":1}}` | every 10 s; the tile answers `{"pong":{"n":1}}` |
+| `{"close":{"reason":"superseded"}}` | the session ends for good |
+
+Either side drops a control connection that delivers nothing for 30 s. A data connection is
+a hello with `"kind":"data"` and the `stream` id, then the stream's bytes unchanged in both
+directions; the endpoint takes it only from the environment holding the tile, for a stream it
+is waiting for, within 10 s of asking, and at most 256 streams per tile wait at once.
+
 ## Aggregator
 
 `fcvm fleet aggregate` joins one region's tiles into one stream: the agent runs one per

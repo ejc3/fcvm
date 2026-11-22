@@ -167,6 +167,8 @@ pub enum FleetCommand {
     Aggregate(Box<FleetAggregateArgs>),
     /// Serve the phones' web proxy: HTTPS CONNECT to the browser's allowed names only
     PhoneWebProxy(FleetPhoneWebProxyArgs),
+    /// Run a Lambda tile: the lane image's Lambda runtime, the renderer and its tunnel
+    LambdaTile(Box<FleetLambdaTileArgs>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -928,6 +930,64 @@ pub struct FleetPhoneWebProxyArgs {
     /// Address to listen on; phones reach it through `--forward-localhost`
     #[arg(long, default_value = "127.0.0.1:3128")]
     pub listen: std::net::SocketAddr,
+}
+
+/// `fcvm fleet lambda-tile`: a Lambda tile's runtime (fleet/PROTOCOL.md, "Lambda tile").
+/// The coordinator sets every value in the function's configuration.
+#[derive(Args, Debug)]
+pub struct FleetLambdaTileArgs {
+    /// The tile's slot, `lam-<n>`
+    #[arg(long, env = "FLEET_TILE_SLOT")]
+    pub slot: String,
+
+    /// The generation this function version runs
+    #[arg(long, env = "FLEET_TILE_GENERATION")]
+    pub generation: u64,
+
+    /// The tunnel credential the coordinator minted for this slot and generation
+    #[arg(long, env = "FLEET_TILE_CREDENTIAL", hide_env_values = true)]
+    pub credential: String,
+
+    /// The coordinator's tunnel endpoint, `host[:port]` (port 443 by default)
+    #[arg(long, env = "FLEET_TILE_TUNNEL")]
+    pub tunnel: String,
+
+    /// The certificate secret (JSON with `cert`, `key` and `scene_token`), as an EC2 tile reads it
+    #[arg(
+        long,
+        env = "FLEET_TLS_SECRET",
+        default_value = "fcvm-fleet/tls-wildcard"
+    )]
+    pub tls_secret: String,
+
+    /// The certificate secret's region
+    #[arg(long, env = "FLEET_SECRET_REGION", default_value = "us-east-2")]
+    pub tls_secret_region: String,
+
+    /// Where the certificate and scene token files are written (the environment's /tmp)
+    #[arg(long, env = "FLEET_TILE_STATE_DIR", default_value = "/tmp/fleet-tile")]
+    pub state_dir: std::path::PathBuf,
+
+    /// The renderer's command line
+    #[arg(
+        long,
+        env = "FLEET_TILE_RENDERER",
+        default_value = "/usr/local/bin/fleet-renderer"
+    )]
+    pub renderer: String,
+
+    /// The renderer's HTTP port on loopback
+    #[arg(long, default_value_t = 8080)]
+    pub http_port: u16,
+
+    /// The renderer's TLS port on loopback (above 1023: the environment's user binds no
+    /// privileged port)
+    #[arg(long, default_value_t = 8443)]
+    pub tls_port: u16,
+
+    /// Invocations served at once
+    #[arg(long, default_value_t = 2)]
+    pub workers: usize,
 }
 
 // ============================================================================
