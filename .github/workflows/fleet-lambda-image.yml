@@ -10,7 +10,8 @@ on:
     branches: [main]
     paths:
       # The fcvm binary: the package's sources and every path dependency in Cargo.toml, the files
-      # those sources include_str!/include_bytes! from elsewhere, and the build's own files.
+      # those sources include!/include_str!/include_bytes! from elsewhere, and the build's own files
+      # (the Makefile recipe and the cargo wrapper scripts it runs).
       # fleet/lambda/test_release.py derives this set and fails on any input missing here.
       - 'src/**'
       - 'build.rs'
@@ -18,6 +19,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - 'scripts/cargo-target-run.sh'
+      - 'scripts/cargo-target-link.sh'
+      - 'scripts/cargo-target-lib.sh'
       - 'rust-toolchain.toml'
       - '.cargo/config.toml'
       - 'fleet/published-ports.json'
@@ -48,6 +52,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - 'scripts/cargo-target-run.sh'
+      - 'scripts/cargo-target-link.sh'
+      - 'scripts/cargo-target-lib.sh'
       - 'rust-toolchain.toml'
       - '.cargo/config.toml'
       - 'fleet/published-ports.json'

@@ -219,15 +219,22 @@ def record(ecr, built, commit=None, is_ancestor=None):
         now = ecr.tagged(BUILT)
         if commit is not None and now is not None and now.digest != built:
             held = [t[len("rev-"):] for t in ecr.tags(now.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
-            try:
-                newer = all(is_ancestor(h, commit) for h in held)
-            except UnknownCommit as error:
-                raise RuntimeError(
-                    f"keep-built holds {now.digest}, built from {error.commit}, which this checkout's history "
-                    f"does not contain, so the builds cannot be ordered. If {built} should be the newest build, "
-                    f"record it by hand: release.py record --digest {built}") from None
-            if held and not newer:
+            # Every held commit is asked, so the tag order cannot matter: one known to be newer
+            # keeps keep-built; only when none is, a commit git cannot find stops the record.
+            unknown, behind = [], []
+            for h in held:
+                try:
+                    if not is_ancestor(h, commit):
+                        behind.append(h)
+                except UnknownCommit:
+                    unknown.append(h)
+            if behind:
                 return {"status": "kept", BUILT: now.digest}
+            if unknown:
+                raise RuntimeError(
+                    f"keep-built holds {now.digest}, built from {unknown[0]}, which this checkout's history "
+                    f"does not contain, so the builds cannot be ordered. If {built} should be the newest build, "
+                    f"record it by hand: release.py record --digest {built}")
         ecr.put(BUILT, ecr.image(built))
         now = ecr.tagged(BUILT)
         if now is None or now.digest != built:
@@ -242,12 +249,15 @@ class UnknownCommit(RuntimeError):
 
 
 def git_is_ancestor(older, newer):
-    """Whether `older` is an ancestor of `newer` (or the same commit). Exit status 128 means git does
-    not know a commit: `older`, the recorded one, since `newer` is the commit checked out."""
+    """Whether `older` is an ancestor of `newer` (or the same commit). When git cannot answer, it is
+    UnknownCommit only if git confirms it has no such commit as `older` (`newer` is the commit checked
+    out); any other failure (outside a checkout, a corrupt repository) is raised with git's message."""
     result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
-    if result.returncode not in (0, 1):
+    if result.returncode in (0, 1):
+        return result.returncode == 0
+    if subprocess.run(["git", "cat-file", "-e", older + "^{commit}"], capture_output=True, text=True).returncode:
         raise UnknownCommit(older)
-    return result.returncode == 0
+    raise RuntimeError(f"git merge-base failed ({result.returncode}): {result.stderr.strip()[:300]}")
 
 
 REPOSITORY_URL = re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(REPOSITORY))

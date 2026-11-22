@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import tomllib
 import tempfile
 import unittest
 from pathlib import Path
@@ -342,15 +343,53 @@ class Selection(unittest.TestCase):
         self.assertIn("release.py record --digest " + new, message)
         self.assertEqual(self.ecr.tagged("keep-built").digest, held)
 
+    def git(self, results):
+        """subprocess.run as git answers it: (returncode, stderr) per call, in order."""
+        calls, answers = [], iter(results)
+
+        def run(args, **kwargs):
+            calls.append(list(args))
+            code, err = next(answers)
+            return type("R", (), {"returncode": code, "stdout": "", "stderr": err})()
+        return calls, patch.object(release.subprocess, "run", side_effect=run)
+
     def test_git_reports_a_commit_it_cannot_find(self):
-        codes = iter([0, 1, 128])
-        run = lambda *a, **k: type("R", (), {"returncode": next(codes), "stdout": "", "stderr": ""})()
-        with patch.object(release.subprocess, "run", side_effect=run):
-            self.assertTrue(release.git_is_ancestor("a" * 40, "b" * 40))
-            self.assertFalse(release.git_is_ancestor("a" * 40, "b" * 40))
+        older, newer = "a" * 40, "b" * 40
+        calls, p = self.git([(0, ""), (1, ""), (128, "fatal: Not a valid commit name"), (1, "")])
+        with p:
+            self.assertTrue(release.git_is_ancestor(older, newer))
+            self.assertFalse(release.git_is_ancestor(older, newer))
             with self.assertRaises(release.UnknownCommit) as raised:
+                release.git_is_ancestor(older, newer)
+        self.assertEqual(raised.exception.commit, older)
+        self.assertEqual(calls[3], ["git", "cat-file", "-e", older + "^{commit}"])
+
+    def test_a_git_failure_with_the_commit_present_is_not_called_unknown(self):
+        # Outside a checkout, or a corrupt repository: git fails, but not because of the commit.
+        _, p = self.git([(128, "fatal: not a git repository"), (0, "")])
+        with p:
+            with self.assertRaises(RuntimeError) as raised:
                 release.git_is_ancestor("a" * 40, "b" * 40)
-        self.assertEqual(raised.exception.commit, "a" * 40)
+        self.assertNotIsInstance(raised.exception, release.UnknownCommit)
+        self.assertIn("not a git repository", str(raised.exception))
+
+    def test_a_known_newer_held_commit_decides_whatever_the_tag_order(self):
+        # keep-built's image carries two rev- tags: one of a commit git cannot find, and one of a
+        # commit newer than the build being recorded. The known one decides: kept, in either order.
+        for unknown, known in (("1" * 40, "f" * 40), ("f" * 40, "1" * 40)):
+            with self.subTest(first="unknown" if unknown < known else "known"):
+                self.ecr = FakeEcr()
+                held = self.ecr.push("rev-" + known)
+                self.ecr.put("rev-" + unknown, self.ecr.image(held))
+                release.record(self.ecr, held)
+                new = self.ecr.push("rev-" + "5" * 40)
+
+                def is_ancestor(older, newer):
+                    if older == unknown:
+                        raise release.UnknownCommit(older)
+                    return False  # known is newer than the recorded commit
+                self.assertEqual(release.record(self.ecr, new, "5" * 40, is_ancestor)["status"], "kept")
+                self.assertEqual(self.ecr.tagged("keep-built").digest, held)
 
     def test_ci_records_each_build_and_a_selection_takes_it_by_name(self):
         a = self.ecr.push("rev-a")
@@ -495,6 +534,50 @@ class Publish(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+# include!, include_str! and include_bytes!, with a literal path or one under CARGO_MANIFEST_DIR.
+INCLUDE = re.compile(r'\binclude(?:_str|_bytes)?!\s*\(\s*(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?'
+                     r'(?:"([^"]+)")?')
+
+
+def path_dependencies(manifest):
+    """The `path` of every dependency that builds into the package: [dependencies], [build-dependencies],
+    their target-specific forms, and [patch] entries. Dev-dependencies build only tests."""
+    data = tomllib.loads(manifest)
+    tables = [data.get("dependencies", {}), data.get("build-dependencies", {})]
+    for target in data.get("target", {}).values():
+        tables += [target.get("dependencies", {}), target.get("build-dependencies", {})]
+    tables += list(data.get("patch", {}).values())
+    return [dep["path"] for table in tables for dep in table.values() if isinstance(dep, dict) and "path" in dep]
+
+
+class Paths(unittest.TestCase):
+    def test_every_dependency_table_that_builds_into_the_package_is_read(self):
+        manifest = """
+[dependencies]
+a = { path = "a" }
+remote = "1"
+[dependencies.b]
+path = "b"
+[build-dependencies]
+c = { path = "c" }
+[target.'cfg(unix)'.dependencies]
+d = { path = "d" }
+[target.'cfg(unix)'.build-dependencies]
+e = { path = "e" }
+[dev-dependencies]
+tests-only = { path = "t" }
+[patch.crates-io]
+f = { path = "f" }
+"""
+        self.assertEqual(sorted(path_dependencies(manifest)), ["a", "b", "c", "d", "e", "f"])
+
+    def test_every_include_form_is_seen(self):
+        found = [m.group(2) for m in INCLUDE.finditer(
+            'include!("gen.rs"); include_str!("a.txt"); include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/b.bin"));'
+            ' include_str!(MACRO_PATH)')]
+        self.assertEqual(found, ["gen.rs", "a.txt", "/b.bin", None])
+
+
 class Workflow(unittest.TestCase):
     """.github/workflows/fleet-lambda-image.yml, as text (the runner's python has no YAML module)."""
     text = (HERE.parents[1] / ".github/workflows/fleet-lambda-image.yml").read_text()
@@ -504,12 +587,12 @@ class Workflow(unittest.TestCase):
         return re.findall(r"^      - '([^']+)'", block, re.M)
 
     # The build's own files: the manifests, the toolchain and cargo configuration, and the
-    # Makefile whose recipe (build-fleet-coordinator) builds the binary.
+    # Makefile whose recipe (build-fleet-coordinator) builds the binary through the cargo wrapper
+    # scripts below (and whatever they source).
     BUILD_FILES = ["Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rust-toolchain.toml", ".cargo/config.toml",
                    "rootfs-config.toml", "fleet/lambda/Makefile", "fleet/lambda/Containerfile",
                    "fleet/renderer/Makefile", "fleet/renderer/Containerfile"]
-    INCLUDE = re.compile(r'include_(?:str|bytes)!\s*\(\s*(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?'
-                         r'(?:"([^"]+)")?')
+    BUILD_SCRIPTS = ["scripts/cargo-target-run.sh", "scripts/cargo-target-link.sh"]
 
     @staticmethod
     def files(root):
@@ -522,14 +605,24 @@ class Workflow(unittest.TestCase):
         found, todo = [], ["."]
         while todo:
             here = todo.pop()
-            manifest = (repo / here / "Cargo.toml").read_text()
-            deps = manifest.split("\n[dependencies]", 1)[1].split("\n[", 1)[0] if "\n[dependencies]" in manifest else ""
-            for rel in re.findall(r'path = "([^"]+)"', deps):
+            for rel in path_dependencies((repo / here / "Cargo.toml").read_text()):
                 crate = os.path.normpath(os.path.join(here, rel))
                 if crate not in found:
                     found.append(crate)
                     todo.append(crate)
         return found
+
+    def sourced(self, repo, scripts):
+        """The scripts, and every script they source from their own directory."""
+        out, todo = set(), list(scripts)
+        while todo:
+            script = todo.pop()
+            if script in out:
+                continue
+            out.add(script)
+            for name in re.findall(r'^\s*\. "\$script_dir/([^"]+)"', (repo / script).read_text(), re.M):
+                todo.append(os.path.join(os.path.dirname(script), name))
+        return out
 
     def inputs(self):
         """Every file the lane image is built from, derived from the sources: each source file of the
@@ -539,7 +632,7 @@ class Workflow(unittest.TestCase):
         repo = HERE.parents[1]
         crates = self.crates(repo)
         self.assertIn("fleet/core", crates)
-        out = set(self.BUILD_FILES) | {c + "/Cargo.toml" for c in crates}
+        out = set(self.BUILD_FILES) | self.sourced(repo, self.BUILD_SCRIPTS) | {c + "/Cargo.toml" for c in crates}
         for root in ["src"] + crates:
             for path in self.files(repo / root):
                 rel = os.path.relpath(path, repo)
@@ -549,7 +642,7 @@ class Workflow(unittest.TestCase):
                 if not rel.endswith(".rs"):
                     continue
                 crate = next((c for c in crates if rel.startswith(c + "/")), ".")
-                for m in self.INCLUDE.finditer(Path(path).read_text()):
+                for m in INCLUDE.finditer(Path(path).read_text()):
                     self.assertIsNotNone(m.group(2), f"{rel}: an include this test cannot resolve")
                     base = crate if m.group(1) else os.path.dirname(rel)
                     target = os.path.normpath(os.path.join(base, m.group(2).lstrip("/") if m.group(1) else m.group(2)))
