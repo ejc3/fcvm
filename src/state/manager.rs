@@ -20,6 +20,63 @@ const PID_INDEX_DIR: &str = "pid";
 /// (`StateManager::maybe_sweep`).
 const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The prefix of an index directory being made, before it is renamed into place
+/// (`StateManager::index_dir`).
+const INDEX_STAGING_PREFIX: &str = ".index-staging.";
+
+/// Hand the directory `dir`, just made by root, to the owner of `state_dir`. Through a
+/// descriptor opened without following links, so a link planted at the path cannot have
+/// something else handed away. A refusal (a fuse-pipe mapped store refuses chown) is
+/// logged: the owner's next write then fails with a clear EACCES.
+fn hand_to_state_dir_owner(state_dir: &Path, dir: &Path) {
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::MetadataExt;
+    let handed = std::fs::metadata(state_dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|owner| {
+            let fd = nix::fcntl::open(
+                dir,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )?;
+            nix::unistd::fchown(
+                &fd,
+                Some(nix::unistd::Uid::from_raw(owner.uid())),
+                Some(nix::unistd::Gid::from_raw(owner.gid())),
+            )?;
+            Ok(())
+        });
+    if let Err(error) = handed {
+        tracing::warn!(
+            dir = %dir.display(),
+            %error,
+            "cannot hand an index directory to the state directory's owner"
+        );
+    }
+}
+
+/// `rename(from, to)` that fails with EEXIST instead of replacing what is at `to`.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both are NUL-terminated paths that outlive the call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// A name's entry in the name index.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct NameEntry {
@@ -42,13 +99,14 @@ fn read_name_entry(path: &Path) -> Result<Option<NameEntry>> {
     }
 }
 
-/// Publish a name entry by rename. The caller holds the name lock, so no other writer
-/// uses the temporary name.
+/// Publish a name entry by rename, into the name index (`StateManager::index_dir`). The
+/// caller holds the name lock, so no other writer uses the temporary name; one a claim
+/// that died left behind, maybe another user's (root's, in a user's state directory), is
+/// removed first rather than reopened.
 fn write_name_entry(path: &Path, entry: &NameEntry) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let dir = path.parent().context("a name entry has a directory")?;
-    std::fs::create_dir_all(dir).context("creating the name index")?;
     let temp = path.with_extension("json.tmp");
+    remove_if_exists(&temp).context("removing a temporary name entry a claim left")?;
     std::fs::write(&temp, serde_json::to_vec(entry)?).context("writing the name entry")?;
     std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644))
         .context("setting the name entry's permissions")?;
@@ -70,7 +128,7 @@ static LOOPBACK_LEASES: std::sync::Mutex<Vec<(String, std::os::unix::net::UnixDa
 /// process that bound it dies.
 fn lease_loopback_ip(ip: &str) -> Result<Option<std::os::unix::net::UnixDatagram>> {
     use std::os::linux::net::SocketAddrExt;
-    let name = format!("{LOOPBACK_LEASE_PREFIX}{ip}");
+    let name = format!("{}{ip}", lease_prefix());
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
         .with_context(|| format!("naming the lease of loopback address {ip}"))?;
     match std::os::unix::net::UnixDatagram::bind_addr(&addr) {
@@ -79,6 +137,27 @@ fn lease_loopback_ip(ip: &str) -> Result<Option<std::os::unix::net::UnixDatagram
         Err(e) => Err(e).with_context(|| format!("leasing loopback address {ip}")),
     }
 }
+
+/// The prefix of every lease name: `LOOPBACK_LEASE_PREFIX`. A unit test that must contend
+/// with nothing but its own child process sets a private one (`TEST_LEASE_PREFIX`, and
+/// `FCVM_TEST_LEASE_PREFIX` for the child); no other build reads either.
+fn lease_prefix() -> String {
+    #[cfg(test)]
+    {
+        let private = TEST_LEASE_PREFIX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .or_else(|| std::env::var("FCVM_TEST_LEASE_PREFIX").ok());
+        if let Some(prefix) = private {
+            return prefix;
+        }
+    }
+    LOOPBACK_LEASE_PREFIX.to_string()
+}
+
+#[cfg(test)]
+static TEST_LEASE_PREFIX: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Open or create a lock file with world-readable/writable permissions.
 /// Uses fchmod after creation to ensure permissions are set regardless of umask.
@@ -339,17 +418,18 @@ impl StateManager {
                 .await
                 .context("renaming temp state file")?;
 
+            // The state is published; the index only speeds up `load_state_by_pid`, which
+            // scans when it finds nothing, so a failure to index is logged and the save
+            // stands.
             if let Some(pid) = state.pid {
-                let entry = self.pid_entry(pid, &state.vm_id);
-                fs::create_dir_all(self.state_dir.join(PID_INDEX_DIR))
-                    .await
-                    .context("creating the PID index")?;
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&entry)
-                    .with_context(|| format!("entering {} in the PID index", entry.display()))?;
+                if let Err(error) = self.enter_pid_index(pid, &state.vm_id) {
+                    tracing::warn!(
+                        vm_id = %state.vm_id,
+                        pid,
+                        error = format!("{error:#}"),
+                        "save_state: cannot enter the VM in the PID index; lookups by PID scan"
+                    );
+                }
             }
 
             tracing::debug!(
@@ -461,6 +541,7 @@ impl StateManager {
         }
         after_check();
 
+        self.index_dir(NAME_INDEX_DIR)?;
         write_name_entry(
             &entry_path,
             &NameEntry {
@@ -514,6 +595,62 @@ impl StateManager {
             .join(format!("{pid}.{vm_id}"))
     }
 
+    /// Enter VM `vm_id` of process `pid` in the PID index. An entry that exists is never
+    /// reopened: it may be another user's file.
+    fn enter_pid_index(&self, pid: u32, vm_id: &str) -> Result<()> {
+        let entry = self.pid_entry(pid, vm_id);
+        self.index_dir(PID_INDEX_DIR)?;
+        if std::fs::symlink_metadata(&entry).is_err() {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&entry)
+                .with_context(|| format!("entering {} in the PID index", entry.display()))?;
+        }
+        Ok(())
+    }
+
+    /// The index directory `name` in the state directory, made when missing.
+    ///
+    /// Root and the state directory's owner share one state directory (CI runs the
+    /// privileged tests as root beside the unprivileged ones in one data directory), and
+    /// every launch writes into both indexes, so the directories must stay writable by the
+    /// owner whoever made them. One made by root is handed to the owner of the state
+    /// directory before it appears at its path: it is made under a name of its own, given
+    /// away, and renamed into place without replacing one another process made first. No
+    /// other file here is handed away, and nothing is made world-writable.
+    fn index_dir(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.state_dir.join(name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => return Ok(dir),
+            Ok(_) => bail!("{} is not a directory", dir.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", dir.display()))
+            }
+        }
+        let staging = self.state_dir.join(format!(
+            "{INDEX_STAGING_PREFIX}{name}.{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&staging)
+            .with_context(|| format!("making the index directory {}", dir.display()))?;
+        if nix::unistd::geteuid().is_root() {
+            hand_to_state_dir_owner(&self.state_dir, &staging);
+        }
+        let published = rename_noreplace(&staging, &dir);
+        // Gone after a rename; left when another process published the index first.
+        let _ = std::fs::remove_dir(&staging);
+        match published {
+            Ok(()) => Ok(dir),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => Ok(dir),
+            Err(error) => {
+                Err(error).with_context(|| format!("publishing the index {}", dir.display()))
+            }
+        }
+    }
+
     /// Remove `name`'s entry when it records `vm_id`. The caller holds the name lock.
     fn remove_name_entry_of(&self, name: &str, vm_id: &str) -> Result<()> {
         let path = self.name_entry(name);
@@ -525,8 +662,9 @@ impl StateManager {
         }
     }
 
-    /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY`,
-    /// host-wide. A claim no longer scans every state, so this is what removes the states
+    /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY` per
+    /// state directory, from the one launch that wins `sweep.lock`, after its claim has
+    /// released the name lock. A claim no longer scans every state, so this is what removes the states
     /// SIGKILLed VMs leave and the index entries that outlive them; until it runs they
     /// hold nothing (a dead owner is not live, and a stale index entry names a state that
     /// is gone). Best effort: a sweep that cannot take its lock leaves it to the next.
@@ -551,8 +689,14 @@ impl StateManager {
         if fresh(&stamp) {
             return;
         }
+        // Opened like a lock file (mode 0666), so root and the state directory's owner can
+        // each rewrite a stamp the other wrote.
         let now = jiff::Timestamp::now().to_string();
-        if let Err(error) = std::fs::write(&stamp, now.as_bytes()) {
+        let written = open_lock_file(&stamp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(now.as_bytes()).map_err(anyhow::Error::from)
+        });
+        if let Err(error) = written {
             tracing::warn!(%error, "maybe_sweep: cannot write the sweep stamp");
             return;
         }
@@ -639,9 +783,18 @@ impl StateManager {
             }
 
             remove_if_exists(&temp_file).context("deleting temporary VM state")?;
+            // Independent of what follows: a failure is logged and the sweep retries it,
+            // since the lock and the name entry must still go.
             if let Some(pid) = known.as_ref().and_then(|state| state.pid) {
-                remove_if_exists(&self.pid_entry(pid, vm_id))
-                    .context("removing the VM's PID index entry")?;
+                let entry = self.pid_entry(pid, vm_id);
+                if let Err(error) = remove_if_exists(&entry) {
+                    tracing::warn!(
+                        vm_id,
+                        path = %entry.display(),
+                        %error,
+                        "delete_state: cannot remove the VM's PID index entry"
+                    );
+                }
             }
             // Retire the lock while still holding it, after the last payload
             // operation. Waiters must validate their inode before proceeding.
@@ -775,6 +928,31 @@ impl StateManager {
         // VM that died between removing its state and its entries.
         self.sweep_pid_index();
         self.sweep_name_index();
+        self.sweep_index_staging();
+    }
+
+    /// Remove index directories a process died making (`index_dir`) before it renamed
+    /// them into place. Only ones older than a sweep interval: a younger one may be about
+    /// to be renamed. They are empty, and `remove_dir` removes nothing else.
+    fn sweep_index_staging(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.state_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let is_staging = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(INDEX_STAGING_PREFIX));
+            let old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > SWEEP_EVERY);
+            if is_staging && old {
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        }
     }
 
     /// Remove PID index entries whose state is gone or names another PID. Each is checked
@@ -853,12 +1031,22 @@ impl StateManager {
     }
 
     /// Load VM state by name
+    ///
+    /// A state whose owner is not live does not count when one proven live has the name: a
+    /// claim removes the dead holder its name entry names, but a dead state written before
+    /// the name index existed has no entry and stays until the next sweep.
     pub async fn load_state_by_name(&self, name: &str) -> Result<VmState> {
         let vms = self.list_vms().await?;
-        let matches: Vec<_> = vms
+        let mut matches: Vec<_> = vms
             .into_iter()
             .filter(|vm| vm.name.as_deref() == Some(name))
             .collect();
+        // Live here means proven live: a recorded start time that matches, which every
+        // claimed state has. A PID alone may be anyone's.
+        let proven_live = |vm: &VmState| vm.pid_start_time.is_some() && owner_is_live(vm);
+        if matches.len() > 1 && matches.iter().filter(|vm| proven_live(vm)).count() == 1 {
+            matches.retain(proven_live);
+        }
         match matches.len() {
             0 => anyhow::bail!("VM not found: {}", name),
             1 => Ok(matches.into_iter().next().unwrap()),
@@ -1609,6 +1797,10 @@ mod tests {
             return;
         };
         let step = std::env::var("FCVM_TEST_CLAIM_HOLDER_STEP").unwrap();
+        assert!(
+            lease_prefix().starts_with("fcvm-test-"),
+            "the holder's leases are not in the test's private namespace"
+        );
         let ready = |ip: &str| {
             use std::io::Write;
             println!("READY {ip}");
@@ -1643,9 +1835,22 @@ mod tests {
     /// A process SIGKILLed after each step of a claim, holding a leased loopback address,
     /// leaves nothing that blocks: the next claim of its name does not wait and succeeds,
     /// the killed VM's state is gone, and its address can be leased again.
+    ///
+    /// The holder and this test lease in a namespace of their own (a lease prefix named
+    /// after this process), so between the kill and the re-lease no other test on the host
+    /// can take the address: they contend only with each other, on one real socket.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claim_holder_killed_at_any_step_blocks_nothing() {
         use std::io::BufRead;
+        let private = format!("fcvm-test-{}-loopback-", std::process::id());
+        *TEST_LEASE_PREFIX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(private.clone());
+        assert_eq!(
+            lease_prefix(),
+            private,
+            "this test's leases are not private"
+        );
         for step in CLAIM_STEPS {
             let dir = tempfile::tempdir().unwrap();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1654,6 +1859,7 @@ mod tests {
                     "state::manager::tests::claim_holder_child",
                     "--nocapture",
                 ])
+                .env("FCVM_TEST_LEASE_PREFIX", &private)
                 .env("FCVM_TEST_CLAIM_HOLDER_DIR", dir.path())
                 .env("FCVM_TEST_CLAIM_HOLDER_STEP", step)
                 .stdout(std::process::Stdio::piped())

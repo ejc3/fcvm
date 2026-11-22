@@ -2483,14 +2483,16 @@ On serve process exit (SIGTERM/SIGINT):
    `load_state_by_pid()` and `cleanup_stale_state()` verify this: if the process
    at the recorded PID has a different start time, the state file is stale.
 
-2. **A periodic sweep, not one per start.** Starting a VM reads no other VM's state, so
-   its cost does not grow with the number of VMs (with every state read on every start,
-   a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). A claim runs
-   `cleanup_stale_state()` at most once a minute host-wide (`maybe_sweep`, `sweep.stamp`);
-   it removes the states of dead or replaced processes and the index entries that outlive
+2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
+   state, so its cost does not grow with the number of VMs (with every state read on every
+   start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
+   minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
+   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
+   `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
+   removes the states of dead or replaced processes and the index entries that outlive
    them. Until it runs a stale state holds nothing: its owner is not live.
 
-**Indexes** (`src/state/manager.rs`), so a start never scans:
+**Indexes** (`src/state/manager.rs`), so a start's fast path does not scan:
 - `name/<sha256 of name>.json` records which VM claimed the name last, written by
   `claim_name()` under `names.lock`. That VM holds the name while its state exists, names
   it, and its owner is live. A state written without a claim has no entry and holds no name.
@@ -2498,6 +2500,10 @@ On serve process exit (SIGTERM/SIGINT):
   `load_state_by_pid()` reads the states it names and scans everything only on a miss.
 - Lock order: `names.lock` before a VM's `<vm_id>.json.lock`, never the reverse.
   `delete_state()` removes both entries; the sweep removes any a crash left.
+- Root and the state directory's owner share one state directory (privileged tests run as
+  root beside unprivileged ones), so `name/` and `pid/` made by root are handed to the
+  state directory's owner before they appear (`index_dir`), and `sweep.stamp` is written
+  like a lock file (0666). Nothing is made world-writable.
 
 **State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
 ```
