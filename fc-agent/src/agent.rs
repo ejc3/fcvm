@@ -903,9 +903,11 @@ impl ChronydSystem for GuestChronyd {
 /// Serializes every change to which chronyd runs: the boot setup replacing
 /// systemd's daemon, and a restore replacing the snapshot's.
 ///
-/// The lock is held only across steps that end in milliseconds: writing the
-/// config, killing with SIGKILL, starting chronyd, and from a restore's kill to
-/// its clock step. The boot's stop of systemd's chrony unit runs without it.
+/// The boot holds the lock only across steps that end in milliseconds: writing
+/// the config and starting chronyd. A restore holds it from its kill, across its
+/// clock step, until it starts the daemon once the host has its acknowledgement
+/// (`restore::AfterReadiness`); a boot setup that reaches the lock meanwhile
+/// waits for that restore. The boot's stop of systemd's chrony unit runs without it.
 /// That stop waits for systemd's chronyd to exit, and a chronyd waiting on a DNS
 /// lookup (its helper resolving the rootfs's pool name with no nameserver
 /// answering) took 20 s to exit after SIGTERM; with the lock held across it, the
@@ -914,8 +916,8 @@ impl ChronydSystem for GuestChronyd {
 /// so the stop then returns at once.
 ///
 /// What the lock still guarantees:
-/// - no daemon starts between a restore's kill and its clock step, because the
-///   restore holds the lock across both;
+/// - no daemon starts between a restore's kill and its clock step, nor before
+///   that restore's own, because the restore holds the lock until it starts one;
 /// - one daemon at a time: every daemon fc-agent starts, it starts under the lock
 ///   after systemd's unit is stopped ([`Self::systemd_gone`]), and the boot's stop
 ///   ends daemons only before that, so it never ends one of ours;
@@ -945,7 +947,9 @@ static CHRONYD_LIFECYCLE: std::sync::LazyLock<ChronydLifecycle> =
 
 /// The snapshot's chronyd, gone. Holds the lifecycle so no daemon can start
 /// between the kill and the restore's clock step;
-/// [`restart_chronyd_after_restore`] consumes it once the step is done.
+/// [`restart_chronyd_after_restore`] consumes it after the step, once the
+/// restore is acknowledged. Dropped unconsumed, it frees the lifecycle and
+/// starts no daemon.
 pub(crate) struct RetiredChronyd {
     state: tokio::sync::OwnedMutexGuard<LifecycleState>,
     /// This restore's number in [`LifecycleState::restores`].

@@ -362,8 +362,9 @@ pub(crate) fn nfs_remounts(shares: &[crate::types::NfsMount]) -> Vec<crate::type
 /// external link the TCP boundary is manipulating) and AWAITED after the
 /// network phases, so the rebind proceeds concurrently with the boundary work
 /// instead of serializing behind it. Chrony re-convergence and the journald
-/// restart have no bearing on the readiness contract, so both run in the
-/// background, off the host's ACK path.
+/// restart have no bearing on the readiness contract, so neither starts here:
+/// both are returned as [`AfterReadiness`] and start once the host has this
+/// restore's acknowledgement.
 ///
 /// FUSE volumes are NOT remounted here. The reconnectable multiplexer
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
@@ -390,7 +391,7 @@ pub async fn handle_clone_restore(
     metadata: &crate::types::LatestMetadata,
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
-) -> anyhow::Result<RestorePhases> {
+) -> anyhow::Result<(RestorePhases, AfterReadiness)> {
     let clone_ipv6 = metadata.clone_ipv6.as_deref();
     let host_time = metadata.host_time_ns.as_str();
     let restore_hook = metadata.restore_hook.as_deref();
@@ -597,27 +598,20 @@ pub async fn handle_clone_restore(
         );
         crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
     }
-    // A fresh chronyd, whose every measurement is taken against the stepped
-    // clock. Its convergence is not part of the readiness contract (the clock
-    // is already stepped), so it must not hold the host's ACK.
-    match chronyd_retired {
-        Ok(retired) => spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(
-            retired,
-            restore_epoch.to_string(),
-        )),
-        Err(e) => eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}"),
-    }
+    // The fresh chronyd and the journald restart are left for after readiness
+    // (`AfterReadiness`). The retired chronyd keeps the daemon's lifecycle until
+    // then, so no chronyd starts before this restore's own.
+    let after_readiness = AfterReadiness {
+        chronyd: match chronyd_retired {
+            Ok(retired) => Some(retired),
+            Err(e) => {
+                eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}");
+                None
+            }
+        },
+        epoch: restore_epoch.to_string(),
+    };
     phases.clock_ms = elapsed_ms(clock_started);
-
-    // Restart journald in the background without ever holding the ACK. The
-    // journal file was mid-write when the snapshot was taken, so the restored
-    // journald finds a corrupted file and gets stuck; systemd's watchdog would
-    // kill it after 3 min. Nothing in the readiness contract reads journald
-    // (container output travels over vsock), so a synchronous restart, which is
-    // a full systemd job, would only add latency. After the clock step so the
-    // fresh journal opens with correct timestamps, and registered so the
-    // shutdown path can settle it rather than race it.
-    spawn_restore_side_job(restart_journald());
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
     // server died with the snapshot transport reset, and a hard NFS mount
@@ -830,7 +824,49 @@ pub async fn handle_clone_restore(
         "[fc-agent] restore phases complete (epoch={}): exec + egress ready elapsed_ms={:.3}",
         restore_epoch, phases.total_ms
     );
-    Ok(phases)
+    Ok((phases, after_readiness))
+}
+
+/// The system jobs a restore leaves until the clone is published and the host has its
+/// acknowledgement: a fresh chronyd and the journald restart.
+///
+/// Neither is part of the readiness contract. Each is process spawns and a daemon start
+/// on the guest's vCPUs, a single one in the smallest guests, and started inside
+/// [`handle_clone_restore`] they ran beside the NFS remount, the exec and egress waits,
+/// the publication and the acknowledgement.
+///
+/// chronyd: the snapshot's daemon is killed before the clock step, and its successor
+/// measures only the stepped clock, wherever after the step it starts. `chronyd` holds
+/// the daemon's lifecycle from the kill until [`Self::start`]
+/// (`agent::ChronydLifecycle`), so the boot setup of a clone restored before that setup
+/// ran writes its config after this restore, not during it.
+///
+/// journald: its journal file was mid-write when the snapshot was taken, so the restored
+/// daemon finds it corrupt and gets stuck, and systemd's watchdog would kill it after
+/// 3 min. The restart is a full systemd job. Nothing before readiness reads journald
+/// (container output travels over vsock). It runs after the clock step, so the fresh
+/// journal opens with correct timestamps. A restore hook now runs before the restart
+/// begins; it ran beside it before.
+///
+/// Dropped without [`Self::start`] (a restore that failed, whose guest shuts down), it
+/// starts nothing and frees the chronyd lifecycle.
+pub struct AfterReadiness {
+    /// None when retiring the snapshot's chronyd panicked; no daemon is started then.
+    chronyd: Option<crate::agent::RetiredChronyd>,
+    epoch: String,
+}
+
+impl AfterReadiness {
+    /// Start both jobs in the background, registered so the shutdown path settles them
+    /// rather than races them ([`settle_restore_side_jobs`]).
+    pub fn start(self) {
+        if let Some(retired) = self.chronyd {
+            spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(
+                retired, self.epoch,
+            ));
+        }
+        spawn_restore_side_job(restart_journald());
+    }
 }
 
 /// Background jobs a restore started that must not outlive the VM.
@@ -1563,13 +1599,22 @@ mod tests {
             .expect("the restore path no longer steps the clock");
         let restart = body
             .find(
-                "crate::agent::restart_chronyd_after_restore(\n            retired,\n            \
-                 restore_epoch.to_string(),",
+                "let after_readiness = AfterReadiness {\n        chronyd: match chronyd_retired {",
             )
-            .expect("the restore no longer starts a fresh chronyd that names its restore");
+            .expect("the restore no longer hands the retired chronyd to its restart");
         assert!(
             retire < retired && retired < clock && clock < restart,
             "retire={retire} retired={retired} clock={clock} restart={restart}"
+        );
+        let source = include_str!("restore.rs");
+        let start = &source[source
+            .find("    pub fn start(self) {")
+            .expect("AfterReadiness::start is in restore.rs")..];
+        let start = &start[..start.find("\n    }\n").unwrap()];
+        assert!(
+            start.contains("crate::agent::restart_chronyd_after_restore(")
+                && start.contains("self.epoch"),
+            "the restore no longer starts a fresh chronyd that names its restore"
         );
         assert!(
             !body.contains("\"makestep\""),

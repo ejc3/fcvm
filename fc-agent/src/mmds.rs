@@ -363,6 +363,9 @@ pub async fn watch_restore_epoch(
 ///    does not go through `RestoreStatus`, so ACKing first costs nothing:
 ///    there is no container output to miss, because there is no container yet.
 /// 5. `succeed()` — with the boundary acknowledged, the workload may start.
+/// 6. The container-started notice, for a container the snapshot held running.
+/// 7. `AfterReadiness::start()` — chronyd and journald, which no step above waits for
+///    and which would otherwise take the guest's CPU from steps 3 to 5.
 #[allow(clippy::too_many_arguments)]
 async fn apply_restore_epoch(
     current: &str,
@@ -403,7 +406,7 @@ async fn apply_restore_epoch(
             crate::system::shutdown_vm(1).await;
         }
     }
-    let phases = match crate::restore::handle_clone_restore(
+    let (phases, after_readiness) = match crate::restore::handle_clone_restore(
         signals,
         metadata,
         egress_gen_at_last_stable,
@@ -411,7 +414,7 @@ async fn apply_restore_epoch(
     )
     .await
     {
-        Ok(phases) => phases,
+        Ok(done) => done,
         Err(error) => {
             signals.restore_status.fail();
             eprintln!(
@@ -444,6 +447,9 @@ async fn apply_restore_epoch(
     // 6. A container that was running when the snapshot was taken is running in the
     //    clone, and the clone's host process has not been told.
     crate::container::resend_container_started_after_restore().await;
+    // 7. The restore's system jobs (a fresh chronyd, the journald restart), last: the
+    //    host has its acknowledgement and readiness is published.
+    after_readiness.start();
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -534,6 +540,47 @@ mod tests {
     use std::future::{poll_fn, Future};
     use std::pin::Pin;
     use std::task::Poll;
+
+    /// The restore's system jobs start after the host has its acknowledgement and
+    /// readiness is published, and the restore sequence itself starts none: a chronyd
+    /// start with its `chronyc` polls and a `systemctl restart systemd-journald` took the
+    /// guest's CPU from the NFS remount, the exec and egress waits, the publication and
+    /// the acknowledgement. The steps are system calls with no seam a runtime test can
+    /// hold, so this pins the source order.
+    ///
+    /// RED BEFORE THE FIX: `handle_clone_restore` called `spawn_restore_side_job(` twice.
+    #[test]
+    fn the_restores_system_jobs_start_after_readiness_is_published() {
+        let restore = crate::restore::handle_clone_restore_source();
+        for started in [
+            "spawn_restore_side_job(",
+            "restart_journald(",
+            "restart_chronyd_after_restore(",
+            ".start()",
+        ] {
+            assert!(
+                !restore.contains(started),
+                "handle_clone_restore starts a system job before the clone is acknowledged: {started}"
+            );
+        }
+        let source = include_str!("mmds.rs");
+        let apply = &source[source
+            .find("async fn apply_restore_epoch(")
+            .expect("apply_restore_epoch is in mmds.rs")..];
+        let apply = &apply[..apply.find("\n}\n").expect("apply_restore_epoch ends")];
+        let at = |needle: &str| {
+            apply
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in apply_restore_epoch"))
+        };
+        let ack = at("crate::vsock::notify_restore_complete(");
+        let ready = at("signals.restore_status.succeed()");
+        let jobs = at("after_readiness.start();");
+        assert!(
+            ack < ready && ready < jobs,
+            "ack={ack} ready={ready} jobs={jobs}"
+        );
+    }
 
     async fn assert_pending_once<F>(mut future: Pin<&mut F>)
     where
