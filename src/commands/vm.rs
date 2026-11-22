@@ -351,6 +351,11 @@ async fn relay_until_one_side_ends(
     drain: std::time::Duration,
 ) {
     use tokio::io::AsyncWriteExt;
+    // Each read from the client is written to the guest as it arrives.
+    crate::network::relay_socket::set_relay_nodelay(
+        &guest,
+        format_args!("rdp relay, guest socket"),
+    );
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut guest_rx, mut guest_tx) = guest.into_split();
     let to_guest = async {
@@ -1352,6 +1357,43 @@ mod tests {
         let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
         assert!(text.starts_with("vm-raw-b1 "), "{text}");
         server.abort();
+    }
+
+    /// A message the rdp client writes in two parts reaches the guest without waiting for
+    /// the guest to acknowledge the first: the relay's guest socket has TCP_NODELAY.
+    #[tokio::test]
+    async fn a_message_in_two_parts_reaches_the_guest_without_waiting_for_an_ack() {
+        use crate::network::relay_socket::two_part::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = guest.local_addr().unwrap();
+        let (mut client, relay_side) = tokio::net::UnixStream::pair().unwrap();
+        let relay = tokio::spawn(async move {
+            let guest = tokio::net::TcpStream::connect(target).await.unwrap();
+            relay_until_one_side_ends(relay_side, guest, RDP_RELAY_WRITE_STALL, RDP_RELAY_DRAIN)
+                .await
+        });
+        let (mut server, _) = guest.accept().await.unwrap();
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&server);
+            let started = std::time::Instant::now();
+            client.write_all(&[1u8; FIRST]).await.unwrap();
+            server.read_exact(&mut buf[..FIRST]).await.unwrap();
+            client.write_all(&[2u8; SECOND]).await.unwrap();
+            server.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        drop(client);
+        drop(server);
+        relay.await.unwrap();
+        let median = median(took);
+        assert!(
+            median < LIMIT,
+            "median {median:?} for a message in two parts to the guest"
+        );
     }
 
     /// Every connection to rdp.sock is relayed to the guest's port, both ways.

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Select the lane image a stack's Lambda tiles run, so the image and its rollback stay in the repository.
 
-    release.py select   --stack stage --digest sha256:<new> --running sha256:<now>|none
+    release.py select   --stack stage --digest sha256:<new>|--built --running sha256:<now>|none
     release.py promote  --running sha256:<now>|none     prod takes the digest staging selected
     release.py rollback --stack prod --running sha256:<now>
     release.py show
+    release.py record   --digest sha256:<built>         the newest lane image built from main
+    release.py publish  --archive lane.tar --commit C   CI: push rev-C (LAMBDA_TILE_REPO) and record it
 
 The lane repository (fcvm-fleet/lambda-tile in us-east-1, ejc3/aws fcvm-fleet-lambda.tf) is
 shared by both stacks. Its lifecycle policy expires every image outside the newest five unless the
 image carries a protected tag, `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next`
-(LIFECYCLE below). Those six tags are the only mutable tags in the repository, and this script is
-what moves them; a push names an image `rev-<commit>` or any other tag outside `keep-`.
+(LIFECYCLE below), and `keep-built`. Those seven tags are the only mutable tags in the repository,
+and this script is what moves them; a push names an image `rev-<commit>` or any other tag outside `keep-`.
 
 A stack's coordinator runs one digest, its `--lambda-image <repository>@<digest>`, and every
 function it creates runs that digest (the coordinator deletes its functions at start and at
@@ -19,8 +21,14 @@ shutdown). `--running` is that digest. A selection moves `keep-<stack>-next` to 
 both carry a protected tag after every write, and after the coordinator is configured with the new
 digest the one it replaced is the rollback target. A rollback selects `keep-<stack>-previous` and
 keeps the digest it replaces as previous. An interrupted selection or rollback completes when run
-again. Selections of one stack run one at a time: this script takes a
-per-stack lock and fails when another holds it, and reads both tags back after moving them.
+again. Selections of one stack run one at a time: this script takes a per-stack lock and fails when
+another holds it, and reads the tags back after moving them.
+
+CI (.github/workflows/fleet-lambda-image.yml) builds the lane image on x86_64 when its inputs
+change on main, pushes it as `rev-<commit>` (`publish`), and records the digest it pushed, which
+moves `keep-built` to it unless keep-built already holds a newer commit's build. `select --built`
+selects that digest, so nothing types one. `keep-built` is protected too, so the newest build
+stays selectable however many images follow it.
 """
 import argparse
 import contextlib
@@ -47,7 +55,7 @@ MEDIA_TYPES = [
 
 # The repository's lifecycle policy, as ejc3/aws fcvm-fleet-lambda.tf sets it. An image a rule's
 # tags select cannot be expired by a lower-priority rule, so rule 1 (which keeps up to 100 images,
-# and at most six carry a protected tag) keeps every protected image; rule 2 counts every image
+# and at most seven carry a protected tag) keeps every protected image; rule 2 counts every image
 # and expires the ones outside the newest five that no protected tag holds.
 LIFECYCLE = {"rules": [
     {"rulePriority": 1, "description": "never an image a stack runs or can roll back to",
@@ -66,6 +74,9 @@ def current(stack):
 
 def previous(stack):
     return f"keep-{stack}-previous"
+
+
+BUILT = "keep-built"
 
 
 def following(stack):
@@ -92,11 +103,13 @@ AWS_ERROR = re.compile(r"An error occurred \(([A-Za-z0-9]{1,64})\)")
 class Ecr:
     """The repository through the AWS CLI: read an image by tag or digest, put a tag on one."""
 
-    def __init__(self, repository=REPOSITORY, region=REGION):
-        self.repository, self.region = repository, region
+    def __init__(self, repository=REPOSITORY, region=REGION, registry=None):
+        # registry: the repository's account, for a caller in another one (CI's role).
+        self.repository, self.region, self.registry = repository, region, registry
 
     def aws(self, args, body=None):
-        result = subprocess.run(["aws", "ecr", *args, "--region", self.region, "--output", "json"],
+        account = [] if self.registry is None or body is not None else ["--registry-id", self.registry]
+        result = subprocess.run(["aws", "ecr", *args, *account, "--region", self.region, "--output", "json"],
                                 input=body, capture_output=True, text=True)
         if result.returncode:
             found = AWS_ERROR.search(result.stderr or "")
@@ -122,8 +135,14 @@ class Ecr:
             raise LookupError(f"no image {digest} in {self.repository}")
         return found
 
+    def tags(self, digest):
+        """Every tag the image carries."""
+        out = self.aws(["describe-images", "--repository-name", self.repository, "--image-ids", "imageDigest=" + digest])
+        return sorted(out["imageDetails"][0].get("imageTags", []))
+
     def put(self, tag, image):
-        body = json.dumps({"repositoryName": self.repository, "imageTag": tag, "imageDigest": image.digest,
+        body = json.dumps({**({"registryId": self.registry} if self.registry else {}),
+                           "repositoryName": self.repository, "imageTag": tag, "imageDigest": image.digest,
                            "imageManifest": image.manifest, "imageManifestMediaType": image.media_type})
         try:
             out = self.aws(["put-image", "--cli-input-json", "file:///dev/stdin"], body=body)
@@ -186,6 +205,107 @@ def move(ecr, stack, new, running):
     return now
 
 
+def record(ecr, built, commit=None, is_ancestor=None):
+    """Move keep-built to `built` and read it back. With `commit` (CI's publish), keep-built moves
+    only forward in commit order: two main pushes' builds can finish out of order and a run can be
+    rerun, so the image pushed last is not always the newest commit's. When keep-built holds the
+    image of any commit that is not an ancestor of `commit` (an image can carry several rev- tags),
+    it stays there ("kept").
+
+    The lock is a flock in this host's temp directory and orders nothing across runners: CI's
+    publishes are ordered by the workflow's concurrency group (fleet-lambda-image). A manual
+    `record` must not run while a publish does."""
+    with locked("built"):
+        now = ecr.tagged(BUILT)
+        if commit is not None and now is not None and now.digest != built:
+            held = [t[len("rev-"):] for t in ecr.tags(now.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
+            try:
+                newer = all(is_ancestor(h, commit) for h in held)
+            except UnknownCommit as error:
+                raise RuntimeError(
+                    f"keep-built holds {now.digest}, built from {error.commit}, which this checkout's history "
+                    f"does not contain, so the builds cannot be ordered. If {built} should be the newest build, "
+                    f"record it by hand: release.py record --digest {built}") from None
+            if held and not newer:
+                return {"status": "kept", BUILT: now.digest}
+        ecr.put(BUILT, ecr.image(built))
+        now = ecr.tagged(BUILT)
+        if now is None or now.digest != built:
+            raise RuntimeError("keep-built changed during the record: another record ran")
+    return {"status": "recorded", BUILT: built}
+
+
+class UnknownCommit(RuntimeError):
+    def __init__(self, commit):
+        super().__init__(f"git does not know {commit}")
+        self.commit = commit
+
+
+def git_is_ancestor(older, newer):
+    """Whether `older` is an ancestor of `newer` (or the same commit). Exit status 128 means git does
+    not know a commit: `older`, the recorded one, since `newer` is the commit checked out."""
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        raise UnknownCommit(older)
+    return result.returncode == 0
+
+
+REPOSITORY_URL = re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(REPOSITORY))
+LOCAL = "localhost/fcvm-lambda-tile"
+
+
+def quiet(args, body=None, env=None):
+    """Run a command whose output may name the registry: none of it is repeated."""
+    result = subprocess.run(args, input=body, capture_output=True, text=True, env=env)
+    if result.returncode:
+        raise RuntimeError(f"{args[0]} {args[1]} failed")
+    return result.stdout
+
+
+def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
+    """CI: push the lane image CI built for `commit` as rev-<commit> and record its digest.
+
+    The tag is immutable, so a rerun finds it. Whichever push put it there, the image under the tag
+    must be the one this run built and checked (the same config digest, which podman calls the
+    image ID), and after a push it must hold the digest podman pushed, or nothing is recorded."""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
+        raise ValueError("a full commit is required")
+    if not REPOSITORY_URL.fullmatch(repository_url or ""):
+        raise ValueError("not the lane repository")
+    tag, local = "rev-" + commit, f"{LOCAL}:{commit}"
+    quiet(["podman", "load", "-q", "-i", archive])
+    built = "sha256:" + quiet(["podman", "image", "inspect", "--format", "{{.Id}}", local]).strip()
+    found = ecr.tagged(tag)
+    if found is None:
+        with tempfile.TemporaryDirectory(prefix="lane-push-") as tmp:
+            env = dict(os.environ, REGISTRY_AUTH_FILE=os.path.join(tmp, "auth.json"))
+            password = quiet(["aws", "ecr", "get-login-password", "--region", REGION])
+            registry = repository_url.split("/", 1)[0]
+            quiet(["podman", "login", "--username", "AWS", "--password-stdin", registry], body=password, env=env)
+            password = None
+            digest_file = os.path.join(tmp, "digest")
+            quiet(["podman", "push", "--digestfile", digest_file, local, f"docker://{repository_url}:{tag}"], env=env)
+            with open(digest_file) as f:
+                pushed = f.read().strip()
+        found = ecr.tagged(tag)
+        if found is None or found.digest != pushed:
+            raise RuntimeError(f"{tag} does not hold the digest podman pushed")
+    if json.loads(found.manifest).get("config", {}).get("digest") != built:
+        # A full rerun after the build artifact expired rebuilds a different image; "Re-run failed
+        # jobs" within the artifact's 7 days reuses the image this tag holds.
+        raise RuntimeError(f"{tag} holds an image that is not the image this run built "
+                           "(a rebuild? re-run the failed publish job, which reuses the run's image)")
+    result = record(ecr, digest(found.digest), commit, is_ancestor)
+    return {"tag": tag, "digest": found.digest, "status": result["status"]}
+
+
+def newest_build(ecr):
+    built = ecr.tagged(BUILT)
+    if built is None:
+        raise LookupError("no lane image is recorded as built (keep-built): CI has not published one")
+    return built.digest
+
+
 def select(ecr, stack, new, running):
     with locked(stack):
         return move(ecr, stack, new, running)
@@ -215,7 +335,8 @@ def rollback(ecr, stack, running):
 
 
 def show(ecr):
-    return {stack: tags(ecr, stack) for stack in STACKS}
+    built = ecr.tagged(BUILT)
+    return {**{stack: tags(ecr, stack) for stack in STACKS}, BUILT: built.digest if built else None}
 
 
 def arguments(argv=None):
@@ -223,7 +344,9 @@ def arguments(argv=None):
     sub = parser.add_subparsers(dest="action", required=True)
     s = sub.add_parser("select")
     s.add_argument("--stack", choices=STACKS, required=True)
-    s.add_argument("--digest", required=True)
+    which = s.add_mutually_exclusive_group(required=True)
+    which.add_argument("--digest")
+    which.add_argument("--built", action="store_true", help="the newest lane image CI built (keep-built)")
     s.add_argument("--running", required=True, help="the digest the stack's coordinator runs now, or none")
     p = sub.add_parser("promote")
     p.add_argument("--running", required=True, help="the digest prod's coordinator runs now, or none")
@@ -231,14 +354,26 @@ def arguments(argv=None):
     r.add_argument("--stack", choices=STACKS, required=True)
     r.add_argument("--running", required=True, help="the digest the stack's coordinator runs now")
     sub.add_parser("show")
+    c = sub.add_parser("record")
+    c.add_argument("--digest", required=True)
+    u = sub.add_parser("publish", help="CI: push the image built for --commit and record it")
+    u.add_argument("--archive", required=True)
+    u.add_argument("--commit", required=True)
     return parser.parse_args(argv)
 
 
 def run(argv=None, ecr=None):
     args = arguments(argv)
-    ecr = ecr or Ecr()
+    url = os.environ.get("LAMBDA_TILE_REPO", "")
+    if ecr is None:
+        ecr = Ecr(registry=url.split(".", 1)[0]) if args.action == "publish" and REPOSITORY_URL.fullmatch(url) else Ecr()
     if args.action == "select":
-        result = select(ecr, args.stack, digest(args.digest), digest(args.running, none=True))
+        new = newest_build(ecr) if args.built else digest(args.digest)
+        result = select(ecr, args.stack, new, digest(args.running, none=True))
+    elif args.action == "record":
+        result = record(ecr, digest(args.digest))
+    elif args.action == "publish":
+        result = publish(ecr, args.archive, args.commit, url)
     elif args.action == "promote":
         result = promote(ecr, digest(args.running, none=True))
     elif args.action == "rollback":

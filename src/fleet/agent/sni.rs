@@ -374,7 +374,10 @@ impl Front {
         source: Source,
         hello: Held<Source>,
     ) -> Result<()> {
-        client.set_nodelay(true)?;
+        crate::network::relay_socket::set_relay_nodelay(
+            &client,
+            format_args!("SNI proxy, viewer socket"),
+        );
         // The place's listener is on the address the viewer reached (the host's private
         // address behind its public one), as a viewer connecting to its port directly would.
         let local = client.local_addr()?;
@@ -402,7 +405,10 @@ impl Front {
         .await
         .context("the place's listener did not accept in time")?
         .with_context(|| format!("connecting to the place's listener on port {port}"))?;
-        place.set_nodelay(true)?;
+        crate::network::relay_socket::set_relay_nodelay(
+            &place,
+            format_args!("SNI proxy, place socket"),
+        );
         place.write_all(&buf).await?;
         tokio::io::copy_bidirectional(&mut client, &mut place).await?;
         Ok(())

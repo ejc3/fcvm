@@ -4,6 +4,7 @@ pub mod names;
 pub mod namespace;
 pub mod pasta;
 pub mod portmap;
+pub mod relay_socket;
 pub mod routed;
 pub mod source_limit;
 pub mod tcp_proxy;
