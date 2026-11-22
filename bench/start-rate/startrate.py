@@ -278,7 +278,7 @@ def cmd_run(a):
         "count": a.count, "concurrency": a.concurrency, "backend": "uffd" if prep["serve_pid"] else "file",
         "network": prep["network"], "cpu": prep["cpu"], "mem_mib": prep["mem_mib"], "image": prep["image"],
         "snapshot": prep["snapshot"], "clone_timeout_s": a.timeout, "rust_log": a.rust_log,
-        "launchers": a.launchers,
+        "launchers": a.launchers, "pidstat_interval": a.pidstat_interval,
     }
     (out / "host.json").write_text(json.dumps({**facts, "config": cfg}, indent=2) + "\n")
     print(json.dumps(cfg))
