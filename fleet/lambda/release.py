@@ -8,17 +8,18 @@
 
 The lane repository (fcvm-fleet/lambda-tile in us-east-1, ejc3/aws fcvm-fleet-lambda.tf) is
 shared by both stacks. Its lifecycle policy expires every image outside the newest five unless the
-image carries a protected tag, `keep-<stack>-current` or `keep-<stack>-previous` (LIFECYCLE below).
-Those four tags are the only mutable tags in the repository, and this script is what moves them;
-a push names an image `rev-<commit>` or any other tag outside `keep-`.
+image carries a protected tag, `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next`
+(LIFECYCLE below). Those six tags are the only mutable tags in the repository, and this script is
+what moves them; a push names an image `rev-<commit>` or any other tag outside `keep-`.
 
 A stack's coordinator runs one digest, its `--lambda-image <repository>@<digest>`, and every
 function it creates runs that digest (the coordinator deletes its functions at start and at
-shutdown). `--running` is that digest. A selection moves `keep-<stack>-previous` to it, then
-`keep-<stack>-current` to the new one, so both the running digest and the selected one carry a
-protected tag at every moment, and after the coordinator is configured with the new digest the
-one it replaced is the rollback target. A rollback selects `keep-<stack>-previous` and keeps the
-digest it replaces as previous. Selections of one stack run one at a time: this script takes a
+shutdown). `--running` is that digest. A selection moves `keep-<stack>-next` to the new digest,
+`keep-<stack>-previous` to the running one, then `keep-<stack>-current` to the new one (move), so
+both carry a protected tag after every write, and after the coordinator is configured with the new
+digest the one it replaced is the rollback target. A rollback selects `keep-<stack>-previous` and
+keeps the digest it replaces as previous. An interrupted selection or rollback completes when run
+again. Selections of one stack run one at a time: this script takes a
 per-stack lock and fails when another holds it, and reads both tags back after moving them.
 """
 import argparse
@@ -46,7 +47,7 @@ MEDIA_TYPES = [
 
 # The repository's lifecycle policy, as ejc3/aws fcvm-fleet-lambda.tf sets it. An image a rule's
 # tags select cannot be expired by a lower-priority rule, so rule 1 (which keeps up to 100 images,
-# and at most four carry a protected tag) keeps every protected image; rule 2 counts every image
+# and at most six carry a protected tag) keeps every protected image; rule 2 counts every image
 # and expires the ones outside the newest five that no protected tag holds.
 LIFECYCLE = {"rules": [
     {"rulePriority": 1, "description": "never an image a stack runs or can roll back to",
@@ -65,6 +66,11 @@ def current(stack):
 
 def previous(stack):
     return f"keep-{stack}-previous"
+
+
+def following(stack):
+    """The image a selection is moving to: the third tag, so a swap never leaves an image unprotected."""
+    return f"keep-{stack}-next"
 
 
 @dataclass(frozen=True)
@@ -157,15 +163,25 @@ def tags(ecr, stack):
 
 
 def move(ecr, stack, new, running):
-    """Protect `running` as the stack's previous image, then make `new` its current one."""
+    """Make `new` the stack's current image and protect `running` as its previous one.
+
+    Each write moves a tag off one image, so the order keeps every image that must stay protected
+    holding a tag after every write: `next` takes the new image first, then `previous` the running
+    one, then `current` the new one. A rollback (the running image holds `current`, the target
+    `previous`) is a swap that two tags could not do without a moment where one image has none. An
+    interrupted move is finished by running it again. Selecting the image the stack already runs
+    leaves `previous`, its rollback target, where it is."""
     if stack not in STACKS:
         raise ValueError(f"unknown stack {stack!r}")
     image = ecr.image(new)
-    if running is not None:
+    ecr.put(following(stack), image)
+    if running is not None and running != new:
         ecr.put(previous(stack), ecr.image(running))
     ecr.put(current(stack), image)
     now = tags(ecr, stack)
-    if now[current(stack)] != new or (running is not None and now[previous(stack)] != running):
+    moved = ecr.tagged(following(stack))
+    if (now[current(stack)] != new or moved is None or moved.digest != new
+            or (running not in (None, new) and now[previous(stack)] != running)):
         raise RuntimeError(f"{stack}'s tags changed during the selection: another selection ran")
     return now
 
@@ -189,6 +205,10 @@ def rollback(ecr, stack, running):
         if now[current(stack)] != running:
             raise RuntimeError(f"{stack} does not run its selected image: roll back by selecting the one it should run")
         target = now[previous(stack)]
+        if target in (None, running):
+            # A move that stopped after its `previous` write: `next` holds the image it was moving to.
+            moved = ecr.tagged(following(stack))
+            target = moved.digest if moved else None
         if target is None or target == running:
             raise LookupError(f"{stack} has no other image to roll back to")
         return move(ecr, stack, target, running)

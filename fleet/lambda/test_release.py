@@ -168,6 +168,72 @@ class Selection(unittest.TestCase):
         self.assertIn(a, self.ecr.images)
         self.assertNotIn(b, self.ecr.images)
 
+    def protected(self, digest):
+        return any(t.startswith("keep-") for t in self.ecr.tags_of(digest))
+
+    def interrupted(self, k, action):
+        """Run action with the k-th tag write failing; True if it was interrupted."""
+        real_put, writes = self.ecr.put, []
+
+        def put(tag, image):
+            writes.append(tag)
+            if len(writes) == k:
+                raise OSError("interrupted")
+            real_put(tag, image)
+        self.ecr.put = put
+        try:
+            action()
+            return False
+        except OSError:
+            return True
+        finally:
+            self.ecr.put = real_put
+
+    def test_an_interrupted_rollback_keeps_both_images_and_completes_on_retry(self):
+        for k in range(1, 10):
+            with self.subTest(failing_write=k):
+                self.ecr = FakeEcr()
+                a, b = self.pushes(2)
+                release.select(self.ecr, "prod", a, None)
+                release.select(self.ecr, "prod", b, a)
+                if not self.interrupted(k, lambda: release.rollback(self.ecr, "prod", b)):
+                    break
+                self.assertTrue(self.protected(a), "the rollback target lost its last protected tag")
+                self.assertTrue(self.protected(b), "the running image lost its last protected tag")
+                release.rollback(self.ecr, "prod", b)
+                self.assertEqual(release.tags(self.ecr, "prod"),
+                                 {"keep-prod-current": a, "keep-prod-previous": b})
+        else:
+            self.fail("the rollback never completed")
+
+    def test_an_interrupted_selection_keeps_the_running_image_and_completes_on_retry(self):
+        for k in range(1, 10):
+            with self.subTest(failing_write=k):
+                self.ecr = FakeEcr()
+                a, b = self.pushes(2)
+                release.select(self.ecr, "stage", a, None)
+                if not self.interrupted(k, lambda: release.select(self.ecr, "stage", b, a)):
+                    break
+                self.assertTrue(self.protected(a))
+                release.select(self.ecr, "stage", b, a)
+                self.assertEqual(release.tags(self.ecr, "stage"),
+                                 {"keep-stage-current": b, "keep-stage-previous": a})
+        else:
+            self.fail("the selection never completed")
+
+    def test_selecting_the_running_image_again_keeps_the_rollback_target(self):
+        a, b = self.pushes(2)
+        release.select(self.ecr, "stage", a, None)
+        release.promote(self.ecr, None)
+        release.select(self.ecr, "stage", b, a)
+        release.promote(self.ecr, a)
+        # A retried promotion, and a retried selection, of the image prod already runs.
+        release.promote(self.ecr, b)
+        release.select(self.ecr, "prod", b, b)
+        self.assertEqual(release.tags(self.ecr, "prod"), {"keep-prod-current": b, "keep-prod-previous": a})
+        release.rollback(self.ecr, "prod", b)
+        self.assertEqual(release.tags(self.ecr, "prod")["keep-prod-current"], a)
+
     def test_every_step_of_a_selection_keeps_the_running_image_protected(self):
         a, b = self.pushes(2)
         release.select(self.ecr, "stage", a, None)
@@ -179,7 +245,7 @@ class Selection(unittest.TestCase):
             seen.append(any(t.startswith("keep-stage-") for t in self.ecr.tags_of(a)))
         self.ecr.put = put
         release.select(self.ecr, "stage", b, a)
-        self.assertEqual(seen, [True, True])
+        self.assertEqual(seen, [True, True, True])
 
     def test_promote_takes_stagings_selection_and_rollback_swaps(self):
         a, b = self.pushes(2)
