@@ -26,6 +26,18 @@ async fn guest_thp(pid: u32) -> Result<String> {
     Ok(out[start..end].to_string())
 }
 
+/// The guest's `vm.compaction_proactiveness`. fc-agent keeps it at 0 while the huge page
+/// mode is `never` and at the kernel's own value (20 unless the kernel says otherwise)
+/// in any other mode.
+async fn guest_compaction_proactiveness(pid: u32) -> Result<String> {
+    Ok(
+        common::exec_in_vm(pid, &["cat", "/proc/sys/vm/compaction_proactiveness"])
+            .await?
+            .trim()
+            .to_string(),
+    )
+}
+
 async fn wait_for_log(path: &std::path::Path, needle: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -57,6 +69,11 @@ async fn test_guest_thp_is_applied_at_boot_and_inherited_or_overridden_by_clones
     .await?;
     common::poll_health_by_pid(pid, 180).await?;
     assert_eq!(guest_thp(pid).await?, "never", "the booted VM");
+    assert_eq!(
+        guest_compaction_proactiveness(pid).await?,
+        "0",
+        "a guest without huge pages compacts memory ahead of demand"
+    );
 
     common::create_snapshot_by_pid(pid, &snapshot).await?;
     let (mut serve, serve_pid) = common::start_memory_server(&snapshot).await?;
@@ -68,6 +85,7 @@ async fn test_guest_thp_is_applied_at_boot_and_inherited_or_overridden_by_clones
         "never",
         "a clone inherits the snapshot's mode"
     );
+    assert_eq!(guest_compaction_proactiveness(a_pid).await?, "0");
 
     let serve_pid_str = serve_pid.to_string();
     let (mut b, b_pid) = common::spawn_fcvm(&[
@@ -86,6 +104,11 @@ async fn test_guest_thp_is_applied_at_boot_and_inherited_or_overridden_by_clones
         guest_thp(b_pid).await?,
         "madvise",
         "a clone's own mode wins"
+    );
+    assert_ne!(
+        guest_compaction_proactiveness(b_pid).await?,
+        "0",
+        "a clone that turned huge pages on did not get the kernel's proactive compaction back"
     );
 
     for (child, pid) in [

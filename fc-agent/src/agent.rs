@@ -1995,6 +1995,28 @@ fn guest_sysctls(cmdline: &str) -> Vec<&'static str> {
 }
 
 #[cfg(test)]
+mod proactive_compaction_tests {
+    /// The boot records the kernel's huge page mode, and with it turns proactive
+    /// compaction off for a guest without transparent huge pages, before it offers its
+    /// pre-start snapshot: that snapshot's clones carry no compaction pass either.
+    ///
+    /// RED BEFORE THE FIX: `record_boot_default` did not touch the compaction knob
+    /// (`thp::tests::a_guest_without_huge_pages_does_not_compact_ahead_of_demand`).
+    #[test]
+    fn the_boot_mode_is_recorded_before_any_snapshot_of_the_guest() {
+        let source = include_str!("agent.rs");
+        let run = &source[source.find("pub async fn run() -> Result<()> {").unwrap()..];
+        let record = run
+            .find("thp::record_boot_default();")
+            .expect("the boot no longer records the huge page mode");
+        let snapshot = run
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("the boot no longer offers the pre-start snapshot");
+        assert!(record < snapshot, "record={record} snapshot={snapshot}");
+    }
+}
+
+#[cfg(test)]
 mod guest_sysctl_tests {
     use super::guest_sysctls;
 
