@@ -1,0 +1,157 @@
+name: Fleet Lambda lane image
+
+# The Lambda tile's image (fleet/lambda): the renderer image with the fcvm binary as its Lambda
+# runtime, for g4dn (x86_64). A change to its inputs builds it on an x86_64 runner; on main the
+# image is pushed to the shared lane repository as rev-<commit> and its digest recorded as
+# keep-built (fleet/lambda/release.py record), where `release.py select --built` reads it.
+# fleet/PROTOCOL.md, "Which lane image a stack runs".
+on:
+  push:
+    branches: [main]
+    paths:
+      # The fcvm binary: the package's sources and every path dependency in Cargo.toml, the files
+      # those sources include_str!/include_bytes! from elsewhere, and the build's own files.
+      # fleet/lambda/test_release.py derives this set and fails on any input missing here.
+      - 'src/**'
+      - 'build.rs'
+      - 'rootfs-config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+      - 'rust-toolchain.toml'
+      - '.cargo/config.toml'
+      - 'fleet/published-ports.json'
+      - 'scripts/conmon-exec-console-race.patch'
+      - 'scripts/passt-udp-sock-errs-null-flow.patch'
+      - 'fleet/ami/host/bind-vfio.sh'
+      - 'fleet/ami/host/warm-phone.sh'
+      - 'fleet/windows/fcvm-agent.ps1'
+      - 'fc-agent/src/gpu.rs'
+      - 'fc-agent/src/types.rs'
+      - 'fc-mock/src/main.rs'
+      - 'fuse-pipe/**'
+      - 'exec-proto/**'
+      - 'failpoint/**'
+      - 'fleet/core/**'
+      - 'fleet/potato/**'
+      - 'fleet/lambda/**'
+      # The renderer and its build contexts (test-host reads fleet/core/tests and the page's
+      # stream heights).
+      - 'fleet/renderer/**'
+      - 'fleet/web/core/layout.ts'
+      - '.github/workflows/fleet-lambda-image.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'build.rs'
+      - 'rootfs-config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+      - 'rust-toolchain.toml'
+      - '.cargo/config.toml'
+      - 'fleet/published-ports.json'
+      - 'scripts/conmon-exec-console-race.patch'
+      - 'scripts/passt-udp-sock-errs-null-flow.patch'
+      - 'fleet/ami/host/bind-vfio.sh'
+      - 'fleet/ami/host/warm-phone.sh'
+      - 'fleet/windows/fcvm-agent.ps1'
+      - 'fc-agent/src/gpu.rs'
+      - 'fc-agent/src/types.rs'
+      - 'fc-mock/src/main.rs'
+      - 'fuse-pipe/**'
+      - 'exec-proto/**'
+      - 'failpoint/**'
+      - 'fleet/core/**'
+      - 'fleet/potato/**'
+      - 'fleet/lambda/**'
+      - 'fleet/renderer/**'
+      - 'fleet/web/core/layout.ts'
+      - '.github/workflows/fleet-lambda-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'ejc3/fcvm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: The lane runs on x86_64
+        run: test "$(uname -m)" = x86_64
+      # The CUDA devel image the renderer builds in is about 10 GB unpacked.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
+      - uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # 1.93.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: fleet-lambda-x86_64
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang podman
+      - name: Selection tests
+        run: python3 -B fleet/lambda/test_release.py
+      - name: Build the fcvm binary
+        run: make build-fleet-coordinator
+      - name: Build the renderer image
+        run: make -C fleet/renderer image TAG=fleet
+      - name: Build the lane image
+        run: make -C fleet/lambda image TAG="$GITHUB_SHA" IMAGE="localhost/fcvm-lambda-tile:$GITHUB_SHA" RENDERER=localhost/fcvm-renderer:fleet
+      - name: The runtime starts in the image
+        run: podman run --rm "localhost/fcvm-lambda-tile:$GITHUB_SHA" --help
+      - name: Save the image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: podman save --format oci-archive -o "$RUNNER_TEMP/lane.tar" "localhost/fcvm-lambda-tile:$GITHUB_SHA"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          name: fleet-lambda-image
+          path: ${{ runner.temp }}/lane.tar
+          compression-level: 0
+          # "Re-run failed jobs" reuses it: a publish that failed can be retried for a week.
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.repository == 'ejc3/fcvm' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: fleet-stage-deploy
+    timeout-minutes: 30
+    # One publish at a time. Builds can finish out of order, so release.py orders the record by
+    # commit (git merge-base). queue: max keeps every pending publish: GitHub's default of one
+    # pending job per group cancels the older pending one, which can be the newest commit's.
+    concurrency:
+      group: fleet-lambda-image
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fleet-lambda-image
+          path: ${{ runner.temp }}/lane
+      # The role and the repository carry account ids, so they are secrets (a step header prints
+      # vars.* unmasked). The role can push to the lane repository and read its images; it
+      # cannot delete one (ejc3/aws fcvm-fleet-ci.tf).
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: fcvm-lambda-image-${{ github.run_id }}
+          mask-aws-account-id: true
+      - name: Push by digest and record it
+        env:
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
+        run: python3 -B fleet/lambda/release.py publish --archive "$RUNNER_TEMP/lane/lane.tar" --commit "$GITHUB_SHA"

@@ -17,3 +17,6 @@ paths:
   .github/workflows/fleet-prod-smoke.yml:
     ignore:
       - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/fleet-lambda-image.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

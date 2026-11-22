@@ -2159,18 +2159,24 @@ stops the renderer, so the GPU is idle until Lambda retires the environment.
 ### Which lane image a stack runs
 
 Both stacks pull from one repository, `fcvm-fleet/lambda-tile` in us-east-1 (ejc3/aws
-`fcvm-fleet-lambda.tf`). A push names an image `rev-<commit>` or any other tag outside
-`keep-`; such tags are immutable. The repository's lifecycle policy expires every image outside
-the newest five unless it carries a protected tag, `keep-<stack>-current`,
-`keep-<stack>-previous` or `keep-<stack>-next` for `stage` and `prod`. Those six are the
-repository's only mutable tags, and `fleet/lambda/release.py` is what moves them:
+`fcvm-fleet-lambda.tf`). `.github/workflows/fleet-lambda-image.yml` builds the image on an
+x86_64 runner when any of its inputs changes (the workflow's `paths`, which
+`fleet/lambda/test_release.py` checks against the inputs it derives from the sources) and, on
+main, pushes it as `rev-<commit>` and records its digest as `keep-built` (`release.py publish`).
+`keep-built` moves only forward in commit order: a build of an older commit that finishes later,
+or a rerun, leaves it on the newer one. A tag outside `keep-` is immutable. The repository's
+lifecycle policy
+expires every image outside the newest five unless it carries a protected tag,
+`keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next` for `stage` and `prod`,
+or `keep-built`. Those seven are the repository's only mutable tags, and
+`fleet/lambda/release.py` is what moves them:
 
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
   shutdown.
-- `release.py select --stack S --digest D --running R` (R is the digest S's coordinator runs now,
-  or `none`) moves `keep-S-next` to D, `keep-S-previous` to R, then `keep-S-current` to D, and
-  reads them back. Both digests carry a protected tag after every write, a rollback (a swap of
+- `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
+  coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
+  `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of
   current and previous) included, and a selection that stopped part way completes when run again.
   Selecting the digest S already runs leaves `keep-S-previous` where it is. Configure the
   coordinator with D after the selection; R stays as the rollback target.
