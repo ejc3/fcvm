@@ -23,7 +23,7 @@ def failed(summary):
 
 def best_rate(cells):
     """The best rate measured with 1000 held, or in any cell when none had 1000 held."""
-    held = [s for (c, a), (s, _top) in cells.items() if a == 1000] or [s for s, _top in cells.values()]
+    held = [s for (c, a), (s, *_rest) in cells.items() if a == 1000] or [s for s, *_rest in cells.values()]
     return max(s["timed"]["ops_per_s"] for s in held)
 
 
@@ -43,7 +43,11 @@ def load(roots):
             top = []
             if (d / "perf-top.txt").exists():
                 top = [line.strip() for line in (d / "perf-top.txt").read_text().splitlines() if line.strip()][:3]
-            cells[label][(int(m["c"]), int(m["a"]))] = (s, top)
+            key = (int(m["c"]), int(m["a"]))
+            if key in cells[label]:
+                raise SystemExit(f"two cells of {label} at C={key[0]} with {key[1]} held: "
+                                 f"{cells[label][key][2]} and {d}")
+            cells[label][key] = (s, top, d)
     return cells
 
 
@@ -67,7 +71,7 @@ def main():
         ref = v.get((args.ref_c, 1000)) or v.get((args.ref_c, 0))
         if not ref:
             continue
-        s, top = ref
+        s, top, _dir = ref
         t = s["timed"]
         host = t["host_cpu_s_per_op_net"]
         cg = t["cgroup_cpu_s_per_op_net"]

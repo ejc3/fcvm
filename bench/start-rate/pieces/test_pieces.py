@@ -40,6 +40,25 @@ class TableTest(unittest.TestCase):
         self.assertEqual(table.best_rate({(1, 0): (summary(rate=5.0), [])}), 5.0)
 
 
+    def test_two_cells_at_one_concurrency_and_held_count_are_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in ["disk-c128-n100-a1000", "disk-c128-n1000-a1000"]:
+                (pathlib.Path(root) / name).mkdir()
+                (pathlib.Path(root) / name / "summary.json").write_text(json.dumps(summary()))
+            with self.assertRaises(SystemExit) as raised:
+                table.load([root])
+            self.assertIn("two cells of disk", str(raised.exception))
+
+
+class ScriptsTest(unittest.TestCase):
+    def test_every_script_measures_the_binary_it_was_given(self):
+        # The Makefile's START_PIECES replaces the environment's: a script must pass it to make.
+        for script in ["matrix.sh", "attribution.sh"]:
+            text = (HERE / script).read_text()
+            self.assertIn('START_PIECES="${START_PIECES:-$PWD/target/release/start-pieces}"', text,
+                          script)
+
+
 class MatrixTest(unittest.TestCase):
     def sh(self, script):
         return subprocess.run(["bash", "-c", f"source {HERE / 'matrix.sh'}; {script}"],
