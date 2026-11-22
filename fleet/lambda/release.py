@@ -32,13 +32,16 @@ stays selectable however many images follow it.
 """
 import argparse
 import contextlib
+import fnmatch
 import fcntl
 import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 REGION = "us-east-1"
 REPOSITORY = "fcvm-fleet/lambda-tile"
@@ -313,6 +316,88 @@ def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
                            "(a rebuild? re-run the failed publish job, which reuses the run's image)")
     result = record(ecr, digest(found.digest), commit, is_ancestor)
     return {"tag": tag, "digest": found.digest, "status": result["status"]}
+
+
+def snapshot(ecr, stack):
+    """The stack's protected tags as they stand: what reset() puts back."""
+    found = {name: ecr.tagged(tag) for name, tag in (("current", current(stack)), ("previous", previous(stack)),
+                                                       ("next", following(stack)))}
+    return {name: image.digest if image else None for name, image in found.items()}
+
+
+def reset(ecr, stack, before):
+    """Put the stack's tags back to `before` (a snapshot taken before a selection whose release failed). Current
+    first: the image the stack still runs held previous throughout the selection and holds current again before
+    previous moves back to the old rollback target; next last, which unprotects the image the failed release
+    selected. A tag that did not exist before is left where it is (nothing here deletes a tag)."""
+    with locked(stack):
+        for name, tag in (("current", current(stack)), ("previous", previous(stack)), ("next", following(stack))):
+            digest_ = before["current"] if name == "next" else before[name]
+            if digest_ is not None:
+                ecr.put(tag, ecr.image(digest_))
+
+
+def lane_inputs(workflow):
+    """The push paths of .github/workflows/fleet-lambda-image.yml: the lane image's inputs."""
+    block = workflow.split("\n  push:\n", 1)[1].split("\n  pull_request:", 1)[0]
+    return re.findall(r"^      - '([^']+)'", block, re.M)
+
+
+def matches(path, patterns):
+    return any(fnmatch.fnmatchcase(path, p.replace("**", "*")) for p in patterns)
+
+
+def git_changed(older, newer, cwd=None):
+    """Every path that differs between two commits: a rename lists both its paths (--no-renames), and a path
+    git would quote comes back as it is (-z)."""
+    result = subprocess.run(["git", "diff", "--no-renames", "-z", "--name-only", older, newer],
+                            capture_output=True, cwd=cwd)
+    if result.returncode:
+        raise RuntimeError(f"git diff failed ({result.returncode}): {result.stderr.decode(errors='replace').strip()[:300]}")
+    return [p for p in result.stdout.decode("utf-8", errors="surrogateescape").split("\0") if p]
+
+
+def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, clock=time.monotonic,
+                 sleep=time.sleep, timeout=1500):
+    """The keep-built digest whose lane image is the one `commit` builds: built from `commit`, or from a commit
+    on the same line (an ancestor or a descendant) with no lane input changed in between. keep-built moves
+    only forward: when it holds a later build with other lane inputs, refuse at once; when it holds an earlier
+    build, or none, wait (every 30 s, at most `timeout`) for this commit's lane build, then refuse. A coordinator
+    never runs beside a lane image built from other lane inputs."""
+    if changed is None:
+        patterns = inputs if inputs is not None else lane_inputs(
+            (Path(__file__).resolve().parents[2] / ".github/workflows/fleet-lambda-image.yml").read_text())
+        changed = lambda a, b: any(matches(f, patterns) for f in git_changed(a, b))
+    is_ancestor = is_ancestor or git_is_ancestor
+    deadline = clock() + timeout
+    while True:
+        built = ecr.tagged(BUILT)
+        if built is not None:
+            held = [t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
+            stranded = RuntimeError(
+                f"no lane build pairs with {commit}: keep-built holds a newer lane build with other lane inputs, "
+                "and it only moves forward, so a rerun of this run cannot succeed. Release staging with a "
+                "workflow_dispatch of fleet-coordinator-deploy.yml at main's head")
+            try:
+                for h in held:
+                    if h == commit or ((is_ancestor(h, commit) or is_ancestor(commit, h)) and not changed(h, commit)):
+                        return built.digest
+                behind = all(is_ancestor(h, commit) for h in held)
+            except UnknownCommit:
+                # keep-built's commit is not in this checkout: main moved past it after the run started.
+                raise stranded from None
+            # keep-built moves only forward: a build of a later commit (or of another line) with other lane
+            # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
+            if not held:
+                raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds an image with no "
+                                   "rev-<commit> tag")
+            if not behind:
+                raise stranded
+        if clock() >= deadline:
+            if built is None:
+                raise RuntimeError(f"no lane build is recorded (keep-built) for {commit}")
+            raise RuntimeError(f"no lane build pairs with {commit}: this commit's lane build did not land in time")
+        sleep(30)
 
 
 def newest_build(ecr):

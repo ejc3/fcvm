@@ -2174,6 +2174,32 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
   shutdown.
+- With the repository variable `FLEET_LAMBDA_LANE` set to `on` (one switch, on the repository;
+  not also on the `fleet-stage-deploy` environment, whose variable of the same name would
+  override it for the step), the staging coordinator release (`fleet/coord/publish.py`) asks the release function which
+  lane digest the coordinator runs (R), selects the lane build that pairs with the commit it
+  deploys (below), keeping R as previous, and releases with that digest. The release function
+  (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current` does not
+  hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks
+  again what runs and, unless the new lane image does, puts the stage's tags back as they were
+  before the selection. Unset or `off`, the release is the one without a lane. Prod's promote and
+  rollback do not carry a lane digest yet.
+- **Pairing.** With the lane on, a coordinator deploy carries the lane build paired with its
+  commit: the `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line
+  (an ancestor or a descendant) with no path of the lane workflow changed in between
+  (`release.py paired_build`). When `keep-built` holds an earlier build, or none, the release
+  waits up to 25 minutes for this commit's lane build; when it holds a later build with other lane
+  inputs, or an image with no `rev-<commit>` tag, it refuses at once. Either refusal changes
+  nothing. A push that changes only lane inputs starts no coordinator deploy: it reaches staging
+  with the next coordinator deploy, or a manual `workflow_dispatch` of
+  `fleet-coordinator-deploy.yml`.
+- **A deploy can be stranded.** Push A changes the coordinator and a lane input; push B, landing
+  while A's deploy waits, changes only lane inputs. B's lane build moves `keep-built` past A, so
+  A's deploy is refused, B starts no deploy, and a rerun of A's run is refused again: staging stays
+  on the coordinator before A. The refusal says so. Recovery: run `fleet-coordinator-deploy.yml`
+  by `workflow_dispatch` at main's head. Do not turn `FLEET_LAMBDA_LANE` on before the stacked
+  release-ordering PR lands; with releases ordered at the point of release, a lane build starts
+  the staging release itself and this case goes away.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of

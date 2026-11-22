@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Publish an immutable coordinator image and invoke a stack's image-only releaser.
 
-    publish.py                                  staging: push GITHUB_SHA's image, release it
+    publish.py                                  staging: push GITHUB_SHA's image, release it (with
+                                                FLEET_LAMBDA_LANE=on, and the lane build paired with
+                                                this commit)
     publish.py --stack prod --commit C --digest D [--force]
                                                 prod: release an image staging already published
                                                 (exit 3: held for viewers, nothing changed)
@@ -10,6 +12,8 @@ The prod releaser (ejc3/aws fcvm-fleet-prod-ci.tf) goes ahead only while the pro
 active viewer for 5 minutes; `--force` skips that, for a rollback to an image prod ran before.
 """
 import argparse
+import functools
+import importlib.util
 import json
 import os
 import re
@@ -85,6 +89,61 @@ def invoke(function, payload, *, attempts=11):
     raise RuntimeError("release function gave no result")
 
 
+@functools.cache
+def lane_release():
+    """fleet/lambda/release.py, which moves the lane image's protected tags (loaded once)."""
+    spec = importlib.util.spec_from_file_location("lane_release", Path(__file__).resolve().parent.parent / "lambda" / "release.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def lane_setting():
+    """FLEET_LAMBDA_LANE: "on" releases the staging coordinator with the lane image staging selects; unset, empty
+    or "off" releases exactly as without a lane."""
+    value = os.environ.get("FLEET_LAMBDA_LANE", "")
+    if value not in ("", "off", "on"):
+        raise ValueError("FLEET_LAMBDA_LANE is on, off or unset")
+    return value == "on"
+
+
+def lane_repository():
+    lane = lane_release()
+    url = os.environ.get("LAMBDA_TILE_REPO", "")
+    if not lane.REPOSITORY_URL.fullmatch(url):
+        raise ValueError("not the lane repository")
+    return lane, lane.Ecr(registry=url.split(".", 1)[0])
+
+
+def select_lane(stack, running, commit):
+    """Select for the stack the lane build that pairs with `commit` (fleet/lambda/release.py paired_build: built
+    from it, or from a commit on its line with the same lane inputs; it waits, bounded, for this commit's lane
+    build), keeping `running`, the digest its coordinator runs, as the rollback target. Returns the selected
+    digest and the stack's tags before the selection, which restore_lane puts back if the release fails."""
+    lane, ecr = lane_repository()
+    new = lane.paired_build(ecr, commit)
+    before = lane.snapshot(ecr, stack)
+    lane.select(ecr, stack, new, running)
+    return new, before
+
+
+def restore_lane(stack, before):
+    lane, ecr = lane_repository()
+    lane.reset(ecr, stack, before)
+
+
+def lane_running(function):
+    """The lane image digest the stack's coordinator runs (None before its first lane release), from the
+    release function, which reads it from the stack's lane pointer."""
+    result = invoke(function, {"action": "lane"})
+    running = result.get("lambda_digest", "")
+    if result.get("status") != "ok" or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running)):
+        if attribution(result):
+            print(json.dumps({"lane": attribution(result)}), flush=True)
+        raise RuntimeError("the release function did not report the running lane image")
+    return running
+
+
 def release(function, payload, digest, name):
     """Run one release to completion: busy (Terraform holds the lock) waits a minute and asks again."""
     for attempt in range(11):
@@ -98,7 +157,8 @@ def release(function, payload, digest, name):
             reason = result.get("reason") if isinstance(result.get("reason"), str) and TOKEN.fullmatch(result["reason"]) else None
             print(json.dumps({"status": "held", "reason": reason}), flush=True)
             raise Held("the release was held")
-        if status not in ("deployed", "unchanged") or result.get("digest") != digest:
+        if status not in ("deployed", "unchanged") or result.get("digest") != digest \
+                or "lambda_digest" in payload and result.get("lambda_digest") != payload["lambda_digest"]:
             if attribution(result):
                 print(json.dumps({"release": attribution(result)}), flush=True)
             raise RuntimeError(f"{name} release did not complete")
@@ -107,6 +167,7 @@ def release(function, payload, digest, name):
 
 
 def main():
+    lane = lane_setting()
     commit, repo = os.environ["GITHUB_SHA"], os.environ["COORDINATOR_REPO"]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("a full commit is required")
@@ -134,8 +195,30 @@ def main():
     if len(images) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", images[0]["imageDigest"]):
         raise ValueError("unexpected published digest")
     digest = images[0]["imageDigest"]
-    status = release(os.environ["COORDINATOR_RELEASE"], {"commit": commit, "digest": digest}, digest, "staging")
-    print(json.dumps({"status": status, "commit": commit, "digest": digest}))
+    payload = {"commit": commit, "digest": digest}
+    function = os.environ["COORDINATOR_RELEASE"]
+    if not lane:
+        status = release(function, payload, digest, "staging")
+    else:
+        # The function refuses a lane digest that keep-stage-current does not hold, so the selection
+        # comes first; the running digest stays protected as keep-stage-previous.
+        payload["lambda_digest"], before = select_lane("stage", lane_running(function), commit)
+        try:
+            status = release(function, payload, digest, "staging")
+        except Exception as failure:
+            # A release that failed leaves the coordinator on its old lane image, and the selection must say
+            # so (a promotion takes staging's selection). A call that ended without a result may still have
+            # released, so ask what runs; when nothing answers, leave the tags and report the release error.
+            try:
+                now = lane_running(function)
+            except Exception:
+                print(json.dumps({"lane": "selection left: the running lane image is unknown"}), flush=True)
+                raise failure from None
+            if now != payload["lambda_digest"]:
+                restore_lane("stage", before)
+            raise
+    print(json.dumps({"status": status, "commit": commit, "digest": digest,
+                      **({"lambda_digest": payload["lambda_digest"]} if lane else {})}))
 
 
 def main_prod(commit, digest, force):
@@ -174,8 +257,10 @@ def run(argv=None):
         raise SystemExit(HELD)
     except Exception as error:
         # Never repeat subprocess output, request headers or a credential-bearing environment.
+        # The lane repository's commands (fleet/lambda/release.py) raise their own CommandFailed, with the same code.
+        failed = isinstance(error, (CommandFailed, lane_release().CommandFailed))
         print(json.dumps({"status": "failed", "errorType": type(error).__name__,
-                          **({"code": error.code} if isinstance(error, CommandFailed) and error.code else {})}))
+                          **({"code": error.code} if failed and error.code else {})}))
         raise SystemExit(1)
 
 

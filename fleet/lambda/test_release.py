@@ -402,6 +402,123 @@ class Selection(unittest.TestCase):
                 self.assertEqual(release.record(self.ecr, new, "5" * 40, is_ancestor)["status"], "kept")
                 self.assertEqual(self.ecr.tagged("keep-built").digest, held)
 
+    def test_a_reset_puts_back_a_selection_and_keeps_what_runs_protected(self):
+        p, r, s_ = self.pushes(3)
+        release.select(self.ecr, "stage", p, None)
+        release.select(self.ecr, "stage", r, p)  # stage runs r, can roll back to p
+        before = release.snapshot(self.ecr, "stage")
+        release.select(self.ecr, "stage", s_, r)  # the release of s then fails: stage still runs r
+        seen, real_put = [], self.ecr.put
+
+        def put(tag, image):
+            real_put(tag, image)
+            seen.append((self.protected(r), self.protected(p)))
+        self.ecr.put = put
+        release.reset(self.ecr, "stage", before)
+        self.assertEqual(release.snapshot(self.ecr, "stage"), before)
+        # What runs stays protected at every write; the old rollback target is protected again.
+        self.assertTrue(seen and all(running for running, _ in seen), seen)
+        self.assertTrue(self.protected(p))
+        self.assertFalse(self.protected(s_))
+
+    def test_a_build_pairs_with_a_commit_whose_lane_inputs_it_has(self):
+        c0, c1, c2 = "0" * 40, "1" * 40, "2" * 40  # c0 <- c1 <- c2
+        order = [c0, c1, c2]
+        changed_between = {(c0, c1)}  # lane inputs changed in c1, not in c2
+
+        def is_ancestor(a, b):
+            return order.index(a) <= order.index(b)
+
+        def changed(a, b):
+            lo, hi = sorted((order.index(a), order.index(b)))
+            return any((order[i], order[i + 1]) in changed_between for i in range(lo, hi))
+        clock, sleeps = [0.0], []
+        pair = lambda commit, **kw: release.paired_build(self.ecr, commit, is_ancestor=is_ancestor, changed=changed,
+                                                         clock=lambda: clock[0], sleep=lambda t: (sleeps.append(t), clock.__setitem__(0, clock[0] + t)),
+                                                         timeout=kw.get("timeout", 600))
+        b1 = self.ecr.push("rev-" + c1)
+        release.record(self.ecr, b1)
+        self.assertEqual(pair(c1), b1)  # the commit's own build
+        self.assertEqual(pair(c2), b1)  # c2 changed no lane input since c1
+        # c0 is behind a lane change: keep-built already holds a newer build and only moves forward, so
+        # no build can pair with it and the release refuses at once.
+        with self.assertRaisesRegex(RuntimeError, "newer lane build"):
+            pair(c0, timeout=90)
+        self.assertEqual(sleeps, [])
+        # A build that lands while the deploy waits is taken.
+        changed_between.add((c1, c2))
+        b2 = self.ecr.push("rev-" + c2)
+        sleeps.clear()
+        real_sleep = lambda t: (sleeps.append(t), clock.__setitem__(0, clock[0] + t), release.record(self.ecr, b2))
+        self.assertEqual(release.paired_build(self.ecr, c2, is_ancestor=is_ancestor, changed=changed,
+                                              clock=lambda: clock[0], sleep=real_sleep, timeout=600), b2)
+        self.assertEqual(sleeps, [30])
+
+    def test_a_deploy_stranded_behind_a_newer_lane_build_names_the_recovery(self):
+        # Push A (coordinator and lane input), then push B (lane input only): B's lane build lands while A's
+        # deploy waits. A can never pair again, and a rerun of A's run runs A again.
+        a, b = "a" * 40, "b" * 40
+        built = self.ecr.push("rev-" + b)
+        release.record(self.ecr, built)
+        for case, is_ancestor in (
+                ("in history", lambda x, y: (x, y) in {(a, b), (a, a), (b, b)}),
+                ("after the checkout", lambda x, y: (_ for _ in ()).throw(release.UnknownCommit(b)) if b in (x, y) and x != y else x == y)):
+            with self.subTest(case):
+                with self.assertRaises(RuntimeError) as raised:
+                    release.paired_build(self.ecr, a, is_ancestor=is_ancestor, changed=lambda x, y: True,
+                                         clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+                self.assertNotIsInstance(raised.exception, release.UnknownCommit)
+                message = str(raised.exception)
+                self.assertIn("newer lane build", message)
+                self.assertIn("a rerun of this run cannot succeed", message)
+                self.assertIn("workflow_dispatch of fleet-coordinator-deploy.yml at main's head", message)
+
+    def test_a_recorded_image_without_a_commit_tag_is_named_so(self):
+        untagged = self.ecr.push("hand-pushed")
+        release.record(self.ecr, untagged)
+        with self.assertRaisesRegex(RuntimeError, "no rev-<commit> tag"):
+            release.paired_build(self.ecr, "3" * 40, is_ancestor=lambda a, b: True, changed=lambda a, b: False,
+                                 clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+
+    def test_with_nothing_built_the_release_waits_then_says_so(self):
+        clock, sleeps = [0.0], []
+        with self.assertRaisesRegex(RuntimeError, "no lane build is recorded"):
+            release.paired_build(self.ecr, "3" * 40, is_ancestor=lambda a, b: True, changed=lambda a, b: True,
+                                 clock=lambda: clock[0], timeout=60,
+                                 sleep=lambda t: (sleeps.append(t), clock.__setitem__(0, clock[0] + t)))
+        self.assertEqual(sleeps, [30, 30])
+
+    def test_git_lists_every_changed_path_whole(self):
+        # A file renamed out of the lane inputs counts under its old path too, and a path git would quote
+        # (not ASCII) comes back as it is.
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as repo:
+            git = lambda *a: sp.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", *a],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q")
+            os.makedirs(os.path.join(repo, "src"))
+            Path(repo, "src", "moved.rs").write_text("fn a() {}\n" * 20)
+            git("add", "-A")
+            git("commit", "-q", "-m", "one")
+            first = git("rev-parse", "HEAD")
+            os.makedirs(os.path.join(repo, "docs"))
+            git("mv", "src/moved.rs", "docs/moved.rs")
+            Path(repo, "src", "caf\u00e9.rs").write_text("fn b() {}\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "two")
+            second = git("rev-parse", "HEAD")
+            changed = release.git_changed(first, second, cwd=repo)
+        self.assertIn("src/moved.rs", changed)
+        self.assertIn("src/caf\u00e9.rs", changed)
+        self.assertTrue(release.matches("src/moved.rs", ["src/**"]))
+
+    def test_lane_inputs_are_the_workflows_push_paths(self):
+        inputs = release.lane_inputs((HERE.parents[1] / ".github/workflows/fleet-lambda-image.yml").read_text())
+        self.assertIn("src/**", inputs)
+        self.assertIn("fleet/renderer/**", inputs)
+        self.assertTrue(release.matches("src/fleet/tunnel.rs", inputs))
+        self.assertFalse(release.matches("fleet/coord/publish.py", inputs))
+
     def test_ci_records_each_build_and_a_selection_takes_it_by_name(self):
         a = self.ecr.push("rev-a")
         release.record(self.ecr, a)
@@ -555,14 +672,17 @@ def path_dependencies(manifest):
     their target-specific forms, and [patch] entries. Dev-dependencies build only tests.
 
     The checker supports exactly the dependency forms this tree uses and refuses the rest rather than
-    modelling them: a `workspace = true` dependency (resolved from [workspace.dependencies]) fails with a
-    ValueError, as does a [patch] table in .cargo/config.toml (cargo_config_patches). Extend the
+    modelling them: a `workspace = true` dependency (resolved from [workspace.dependencies]) or a [replace]
+    table fails with a ValueError, as do a [patch] table and `paths` overrides in .cargo/config.toml
+    (cargo_config_patches). Extend the
     checker when the tree starts using one."""
     data = tomllib.loads(manifest)
     tables = [data.get("dependencies", {}), data.get("build-dependencies", {})]
     for target in data.get("target", {}).values():
         tables += [target.get("dependencies", {}), target.get("build-dependencies", {})]
     tables += list(data.get("patch", {}).values())
+    if "replace" in data:
+        raise ValueError("a [replace] table: the lane image's input check does not model it")
     deps = [dep for table in tables for dep in table.values() if isinstance(dep, dict)]
     if any("workspace" in dep for dep in deps):
         raise ValueError("a dependency with workspace = true: the lane image's input check does not model it")
@@ -570,9 +690,12 @@ def path_dependencies(manifest):
 
 
 def cargo_config_patches(config):
-    """Refuse a [patch] table in .cargo/config.toml: the input check does not model one."""
-    if "patch" in tomllib.loads(config):
+    """Refuse a [patch] table or `paths` overrides in .cargo/config.toml: the input check models neither."""
+    data = tomllib.loads(config)
+    if "patch" in data:
         raise ValueError(".cargo/config.toml has a [patch] table: the lane image's input check does not model it")
+    if "paths" in data:
+        raise ValueError(".cargo/config.toml has paths overrides: the lane image's input check does not model them")
 
 
 class Paths(unittest.TestCase):
@@ -603,6 +726,10 @@ f = { path = "f" }
             path_dependencies("[target.'cfg(unix)'.build-dependencies]\nshared = { workspace = true }\n")
         with self.assertRaisesRegex(ValueError, r"\[patch\]"):
             cargo_config_patches('[patch.crates-io]\nfoo = { path = "foo" }\n')
+        with self.assertRaisesRegex(ValueError, "paths"):
+            cargo_config_patches('paths = ["../local-crate"]\n')
+        with self.assertRaisesRegex(ValueError, r"\[replace\]"):
+            path_dependencies('[replace]\n"foo:0.1.0" = { path = "foo" }\n')
         cargo_config_patches('[build]\njobs = 4\n')
         cargo_config_patches((HERE.parents[1] / ".cargo/config.toml").read_text())
 
