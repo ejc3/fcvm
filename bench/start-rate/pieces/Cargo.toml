@@ -1,0 +1,25 @@
+[package]
+name = "start-pieces"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Runs one piece of an fcvm clone start N times at concurrency C, through fcvm's own code"
+
+[[bin]]
+name = "start-pieces"
+path = "src/main.rs"
+
+[dependencies]
+# Without fcvm's default features (its integration-test tiers): this crate is a default
+# workspace member, and the default features would switch those tests on in `make test-unit`.
+fcvm = { path = "../../..", default-features = false }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.51.6", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+libc = "0.2"
+nix = { version = "0.30", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = "3"

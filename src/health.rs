@@ -1187,7 +1187,8 @@ pub async fn run_health_check_once(
 /// the guest directly. This bypasses the complexity of pasta port forwarding.
 ///
 /// The holder_pid is the PID of the namespace holder process (sleep infinity).
-async fn check_http_health_nsenter(
+/// Public for the start-pieces bench (bench/start-rate/pieces), which runs it alone.
+pub async fn check_http_health_nsenter(
     holder_pid: u32,
     guest_ip: &str,
     port: u16,

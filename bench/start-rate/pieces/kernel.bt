@@ -1,0 +1,53 @@
+// Kernel costs a piece run causes that perf samples attribute poorly: how long rtnl_mutex is
+// held and waited for, synchronous RCU grace periods, network namespace cleanup, copy-on-write
+// and userfaultfd faults, and KVM exits by exception class (arm64 esr_ec).
+// sudo bpftrace bench/start-rate/pieces/kernel.bt > kernel.txt   (Ctrl-C/SIGINT prints maps)
+
+kprobe:rtnl_lock { @rtnl_req[tid] = nsecs; }
+kretprobe:rtnl_lock /@rtnl_req[tid]/ {
+  @rtnl_wait_us = hist((nsecs - @rtnl_req[tid]) / 1000);
+  @rtnl_wait_us_total = sum((nsecs - @rtnl_req[tid]) / 1000);
+  delete(@rtnl_req[tid]);
+  @rtnl_held[tid] = nsecs;
+}
+kprobe:rtnl_unlock /@rtnl_held[tid]/ {
+  @rtnl_hold_us = hist((nsecs - @rtnl_held[tid]) / 1000);
+  @rtnl_hold_us_total = sum((nsecs - @rtnl_held[tid]) / 1000);
+  @rtnl_hold_us_by_comm[comm] = sum((nsecs - @rtnl_held[tid]) / 1000);
+  @rtnl_holds[comm] = count();
+  delete(@rtnl_held[tid]);
+}
+
+kprobe:synchronize_rcu_expedited {
+  @rcu_exp[comm] = count(); @rcu_exp_s[tid] = nsecs; @rcu_exp_stack[comm, kstack(12)] = count();
+}
+kretprobe:synchronize_rcu_expedited /@rcu_exp_s[tid]/ {
+  @rcu_exp_us = hist((nsecs - @rcu_exp_s[tid]) / 1000); delete(@rcu_exp_s[tid]);
+}
+kprobe:synchronize_rcu { @rcu_sync[comm] = count(); @rcu_sync_stack[comm, kstack(12)] = count(); }
+kprobe:synchronize_net { @sync_net[comm] = count(); }
+
+// copy_net_ns(flags, ...) returns the old namespace unless CLONE_NEWNET (0x40000000) is set.
+kprobe:copy_net_ns /arg0 & 0x40000000/ { @netns_new_requests = count(); }
+kprobe:kvm_create_vm { @kvm_create_s[tid] = nsecs; }
+kretprobe:kvm_create_vm /@kvm_create_s[tid]/ {
+  @kvm_create_vm_us = hist((nsecs - @kvm_create_s[tid]) / 1000); delete(@kvm_create_s[tid]);
+}
+kprobe:kvm_destroy_vm { @kvm_destroy_s[tid] = nsecs; }
+kretprobe:kvm_destroy_vm /@kvm_destroy_s[tid]/ {
+  @kvm_destroy_vm_us = hist((nsecs - @kvm_destroy_s[tid]) / 1000); delete(@kvm_destroy_s[tid]);
+}
+kprobe:cleanup_net { @cleanup_s[tid] = nsecs; }
+kretprobe:cleanup_net /@cleanup_s[tid]/ {
+  @cleanup_net_ms = hist((nsecs - @cleanup_s[tid]) / 1000000); delete(@cleanup_s[tid]);
+}
+
+kprobe:wp_page_copy { @cow[comm] = count(); }
+kprobe:handle_userfault { @uffd_fault[comm] = count(); }
+
+tracepoint:kvm:kvm_exit { @kvm_exit_ec[args->esr_ec] = count(); }
+tracepoint:kvm:kvm_userspace_exit { @kvm_uexit[args->reason] = count(); }
+tracepoint:kvm:kvm_guest_fault { @kvm_guest_fault = count(); }
+
+tracepoint:syscalls:sys_enter_execve { @exec[str(args->filename)] = count(); }
+
