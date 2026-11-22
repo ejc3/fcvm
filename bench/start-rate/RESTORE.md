@@ -62,7 +62,7 @@ Per clone, the 2 s that follow the first healthy check:
 
 That is five times the restore itself. The guest takes about 1,000 stage-2 faults and device
 aborts every 100 ms for one second after the restore, then drops to 60: fc-agent's restore-epoch
-watcher reads the vsock transport reset after it has already dispatched the restore (30 of 30
+watcher reads the vsock transport reset after it has already dispatched the restore (29 or 30 of 30
 clones in every cell), and the reset opens a one-second window of metadata fetches 2 ms apart.
 The chronyd start and the journald restart run in the same two seconds.
 
