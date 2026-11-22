@@ -166,29 +166,34 @@ impl Renderer {
         self.start_locked(&mut st)
     }
 
-    /// Start it again whenever it exits, as the EC2 tile's unit does (`Restart=always`),
-    /// until it is stopped.
+    /// Start it again whenever it exits, as the EC2 tile's unit does (`Restart=always`), or
+    /// when a start failed (a restart whose spawn failed leaves no process), every
+    /// [`RESTART_BACKOFF`] until one succeeds, until it is stopped.
     async fn supervise(self: Arc<Self>) {
         loop {
-            let exited = {
+            let down = {
                 let mut st = self.state.lock().await;
                 if st.stopped {
                     return;
                 }
                 let epoch = st.epoch;
                 match st.child.as_mut().map(|c| c.try_wait()) {
-                    Some(Ok(Some(s))) => Some((s, epoch)),
+                    Some(Ok(Some(s))) => Some((Some(s), epoch)),
+                    None => Some((None, epoch)),
                     _ => None,
                 }
             };
-            if let Some((s, epoch)) = exited {
-                tracing::warn!(%s, "the renderer exited; starting it again");
+            if let Some((status, epoch)) = down {
+                match status {
+                    Some(s) => tracing::warn!(%s, "the renderer exited; starting it again"),
+                    None => tracing::warn!("the renderer is not running; starting it again"),
+                }
                 tokio::time::sleep(RESTART_BACKOFF).await;
                 let mut st = self.state.lock().await;
                 if st.stopped {
                     return;
                 }
-                // Restarted meanwhile (an invocation's restart): that process stays.
+                // Started meanwhile (an invocation's restart): that process stays.
                 if st.epoch == epoch {
                     if let Err(e) = self.start_locked(&mut st) {
                         tracing::error!(error = %e, "the renderer did not start");
@@ -600,6 +605,32 @@ mod tests {
         );
         assert!(r.restart().await.is_err(), "a restart after the stop");
         assert_eq!(r.pid().await, None);
+    }
+
+    /// A start that failed (the program could not be spawned) leaves no process: the
+    /// supervisor tries again until one starts, while the renderer is not stopped.
+    #[tokio::test]
+    async fn a_renderer_that_failed_to_start_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("renderer.sh");
+        let r = Arc::new(Renderer::new(
+            vec![program.display().to_string()],
+            Vec::new(),
+        ));
+        assert!(r.start().await.is_err(), "no program yet");
+        tokio::spawn(r.clone().supervise());
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = Instant::now() + RESTART_BACKOFF * 4;
+        while r.pid().await.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the renderer was not started again"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        r.stop().await;
     }
 
     /// An invocation restarts the renderer while the supervisor waits out its backoff after
