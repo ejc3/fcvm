@@ -68,6 +68,56 @@ How each piece scales:
   2 ms of CPU. The first campaign capped it at 600/s; that was the driver forking from a
   192-thread process, fixed in the driver (posix_spawn, 8 workers) before these rows.
 
+## tap-attach: what a reused namespace still costs
+
+Not a row of the table above: `tap-attach` is the network work that would be left on a clone's
+start and stop if its namespace, pasta and bridge were reused (README, "tap-attach"). One
+on-demand c8g.metal-48xl, host kernel 7.0.0-1013-aws, one boot, 2026-11-22, this harness at the
+commit that added this section. Every cell holds its namespaces for the whole run; an op is
+one attach (Firecracker's three ioctls), 20 ms, and the close. The hold columns are
+microseconds of `rtnl_mutex` hold per cycle from the cell's traced twin (`tap.bt`): the
+helper's own calls, and the two link events the kernel's link watch worker handles for the
+carrier going up and down. `1 s / hold` is how many cycles fit in a second of that mutex. The
+cycles/s and wall columns are from the untraced cell, a burst of 200 to 1000 ops; a carrier-off
+is handled up to a second after its close, so a burst can run ahead of its link events and a
+sustained rate cannot. Rows marked "first attach" time a TAP's first cycle; the others made
+one cycle while preparing.
+
+| namespaces | C | cycles/s | attach+detach wall ms, p50 / p99 | TUNSETIFF | TUNSETOFFLOAD | close (its grace period) | carrier-on | carrier-off | hold per cycle, us | 1 s / hold |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2000 with pasta | 1 | 44 | 0.90 / 7.3 | 478 | 1 | 692 (264) | 363 | 268 | 1802 | 555 |
+| 2000 with pasta | 32 | 857 | 13.80 / 40.5 | 436 | 1 | 487 (126) | 269 | 288 | 1481 | 675 |
+| 2000 with pasta | 128 | 923 | 114.56 / 197.8 | 419 | 1 | 515 (114) | 271 | 289 | 1497 | 668 |
+| 2000 with pasta | 512 | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
+| 2000, no pasta | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
+| 2000, no pasta | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
+| 2000, no pasta | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
+| 2000, no pasta | 512 | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
+| 200 with pasta | 1 | 47 | 0.23 / 0.3 | 116 | 0 | 112 (34) | 82 | 102 | 413 | 2422 |
+| 2000 with pasta, first attach | 1 | 44 | 1.08 / 12.6 | 451 | 294 | 686 (372) | 432 | 283 | 2147 | 466 |
+| 2000 with pasta, first attach | 128 | 727 | 148.86 / 304.2 | 380 | 289 | 435 (105) | 359 | 281 | 1744 | 573 |
+| 2000, no pasta, first attach | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
+| 2000, no pasta, first attach | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
+
+- **A reused namespace costs 1.3 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
+  alive**, which caps attach and detach at 555 to 779 per second. The burst rate agrees: 752
+  to 923 cycles/s at C=32 to 512.
+- **Half of it is not the VMM's own calls.** `TUNSETIFF` holds 0.31 to 0.48 ms and the close
+  0.40 to 0.69 ms (0.11 to 0.26 ms of that an expedited RCU grace period under the mutex,
+  `__tun_detach` -> `synchronize_net`); each of the two carrier changes is then handled by the
+  link watch worker for another 0.27 to 0.36 ms. `TUNSETVNETHDRSZ` holds under a microsecond.
+- **`TUNSETOFFLOAD` is free after a TAP's first attach.** The first one changes the device's
+  features and the bridge above it follows (0.25 to 0.41 ms); later ones set what is already set.
+- **pasta's netlink listener is half the hold.** The same 2000 namespaces with no pasta hold
+  0.79 to 0.89 ms per cycle, and 200 namespaces with pasta 0.41 ms. Each pasta binds a
+  NETLINK_ROUTE socket to a multicast group (its neighbour listener, in the host's namespace),
+  and every link notification walks every such socket on the host under the mutex
+  (`do_one_broadcast`, 8% of the samples of the C=128 cell; `mutex_spin_on_owner`, the waiting,
+  22%). The rest grows with the namespaces themselves.
+- **No patch to pasta gets a cycle under 0.7 ms.** With no pasta at all a cycle still holds
+  0.8 ms, so the attach and detach have to go: the pool has to keep the TAP attached and hand
+  the VMM the descriptor.
+
 ## Changelog
 
 Each step is a same-session A/B with the piece's own program.

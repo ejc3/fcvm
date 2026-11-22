@@ -95,4 +95,32 @@ anything only on a quiet box.
 | `noop`, `state`, `holder`, `rootless-net`, `health`, `kvm-vm` | nothing |
 | `disk` | `SNAPSHOT_DIR=` a snapshot directory (`.../snapshots/<tag>`) |
 | `fc-spawn` | `FIRECRACKER=` the Firecracker binary fcvm restores with |
+| `tap-attach` | nothing; `tap-floor.sh` runs its campaign |
 | `vmm` | both; `UFFD_SOCKET=` a `snapshot serve` socket to load through UFFD |
+
+## tap-attach: what a reused namespace still costs
+
+`tap-attach` is not a piece of today's start. It measures what would be left of piece 9 and 10
+if a clone took a namespace that already had its TAP, pasta and bridge: the VMM's attach to
+the TAP when it loads the snapshot and its detach when it exits. Each instance prepares a full
+rootless network (untimed), a helper process inside the holder's namespaces, and
+`--tap-warm-cycles` attach and detach cycles (1 by default), because a reused namespace's TAP
+has had a VMM before and a TAP's first attach costs more (it changes the device's offload
+features, and the bridge follows). `--tap-no-pasta` prepares the same namespace with no pasta
+(`PastaNetwork::isolated`). The timed op is
+one clone life's worth: the helper opens `/dev/net/tun` and makes Firecracker's three ioctls
+(`TUNSETIFF`, `TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`), stays attached for `--tap-hold-ms` (20 by
+default, so the kernel handles the carrier-on before the carrier-off), and closes the
+descriptor. The op's stages are the helper's own timing of each call; `attach+detach` is their
+sum, and the op's latency also holds the 20 ms.
+
+Each of the four calls takes `rtnl_mutex`, and the two carrier changes are handled afterwards
+by the kernel's link watch worker under the same mutex. `tap.bt` attributes the hold time and
+the RCU grace periods to each call and to the link events of TAP devices. The driver runs it
+over the timed and steady phases when given `PERF_EVENTS=tap ARGS="--perf-cmd
+$PWD/bench/start-rate/pieces/tap-bt.sh"`, and `start-pieces tap-summary CELL` turns its two
+dumps into per-cycle numbers. A traced cell's timings are not measurements.
+
+```bash
+bash bench/start-rate/pieces/tap-floor.sh /mnt/fcvm-btrfs/pieces-out/tap   # every cell holds 2000 pastas
+```
