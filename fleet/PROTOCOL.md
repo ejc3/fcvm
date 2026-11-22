@@ -2162,7 +2162,7 @@ Both stacks pull from one repository, `fcvm-fleet/lambda-tile` in us-east-1 (ejc
 `fcvm-fleet-lambda.tf`). `.github/workflows/fleet-lambda-image.yml` builds the image on an
 x86_64 runner when its inputs change (`fleet/lambda`, `fleet/renderer`, the tile runtime and its
 tunnel) and, on main, pushes it as `rev-<commit>` and records its digest as `keep-built`
-(`release.py publish`). A tag outside `keep-` is immutable. The repository's lifecycle policy
+(`release.py publish`; a rerun of an older commit's workflow does not move `keep-built` back). A tag outside `keep-` is immutable. The repository's lifecycle policy
 expires every image outside the newest five unless it carries a protected tag,
 `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next` for `stage` and `prod`,
 or `keep-built`. Those seven are the repository's only mutable tags, and

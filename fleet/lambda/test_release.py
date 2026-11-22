@@ -60,6 +60,9 @@ class FakeEcr:
             self.images[holder.digest]["tags"].discard(tag)
         self.images[image.digest]["tags"].add(tag)
 
+    def pushed(self, digest):
+        return self.images[digest]["pushed"]
+
     def tags_of(self, digest):
         return self.images[digest]["tags"]
 
@@ -316,6 +319,17 @@ class Selection(unittest.TestCase):
         with self.assertRaises(SystemExit):
             release.arguments(["select", "--stack", "stage", "--built", "--digest", a, "--running", "none"])
 
+    def test_a_rerun_of_an_older_build_does_not_move_the_record_back(self):
+        a = self.ecr.push("rev-a")
+        release.record(self.ecr, a)
+        b = self.ecr.push("rev-b")
+        release.record(self.ecr, b)
+        # A workflow rerun of a's run records a again: keep-built stays on the newer b.
+        with self.assertRaisesRegex(RuntimeError, "newer"):
+            release.record(self.ecr, a)
+        self.assertEqual(self.ecr.tagged("keep-built").digest, b)
+        release.record(self.ecr, b)  # recording the same build again is fine
+
     def test_the_newest_build_is_kept_and_an_older_unselected_one_is_not(self):
         a = self.ecr.push("rev-a")
         release.record(self.ecr, a)
@@ -459,6 +473,16 @@ class AwsCli(unittest.TestCase):
             with patch.object(release, "publish", return_value={}) as published:
                 release.run(["publish", "--archive", "a.tar", "--commit", "c" * 40])
         self.assertEqual(published.call_args.args[0].registry, "123456789012")
+
+    def test_push_time_reads_both_timestamp_forms(self):
+        iso = json.dumps({"imageDetails": [{"imagePushedAt": "2026-11-22T19:00:00+00:00"}]})
+        epoch = json.dumps({"imageDetails": [{"imagePushedAt": 1795374000.5}]})
+        calls, p = self.run_with([(0, iso, ""), (0, epoch, "")])
+        with p:
+            self.assertEqual(release.Ecr().pushed("sha256:" + "4" * 64), 1795374000.0)
+            self.assertEqual(release.Ecr().pushed("sha256:" + "4" * 64), 1795374000.5)
+        self.assertEqual(calls[0][0][:3], ["aws", "ecr", "describe-images"])
+        self.assertIn("imageDigest=sha256:" + "4" * 64, calls[0][0])
 
     def test_a_missing_tag_reads_as_none(self):
         missing = json.dumps({"images": [], "failures": [{"failureCode": "ImageTagDoesNotExist"}]})

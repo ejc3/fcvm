@@ -31,6 +31,7 @@ per-stack lock and fails when another holds it, and reads both tags back after m
 """
 import argparse
 import contextlib
+import datetime
 import fcntl
 import json
 import os
@@ -134,6 +135,14 @@ class Ecr:
             raise LookupError(f"no image {digest} in {self.repository}")
         return found
 
+    def pushed(self, digest):
+        """When the image was pushed, in seconds since the epoch."""
+        out = self.aws(["describe-images", "--repository-name", self.repository, "--image-ids", "imageDigest=" + digest])
+        at = out["imageDetails"][0]["imagePushedAt"]
+        if isinstance(at, (int, float)):
+            return float(at)
+        return datetime.datetime.fromisoformat(at).timestamp()
+
     def put(self, tag, image):
         body = json.dumps({**({"registryId": self.registry} if self.registry else {}),
                            "repositoryName": self.repository, "imageTag": tag, "imageDigest": image.digest,
@@ -200,8 +209,13 @@ def move(ecr, stack, new, running):
 
 
 def record(ecr, built):
-    """Move keep-built to the digest CI just pushed, and read it back."""
+    """Move keep-built to the digest CI just pushed, and read it back. Pushes run in commit order (one
+    publish at a time), so a build pushed before the recorded one is an older commit's, from a rerun
+    of its workflow: keep-built stays on the newer build."""
     with locked("built"):
+        now = ecr.tagged(BUILT)
+        if now is not None and now.digest != built and ecr.pushed(now.digest) > ecr.pushed(built):
+            raise RuntimeError(f"keep-built holds a newer build than {built}: not moved back")
         ecr.put(BUILT, ecr.image(built))
         now = ecr.tagged(BUILT)
         if now is None or now.digest != built:
