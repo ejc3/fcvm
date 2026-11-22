@@ -62,6 +62,34 @@ pub const REFLINK_MAX_EXTENTS: u64 = 4096;
 /// that path reach it with a test VM's small disk.
 pub const REFLINK_MAX_EXTENTS_ENV: &str = "FCVM_REFLINK_MAX_EXTENTS";
 
+/// `ioctl(FICLONE)`: make the destination share the source's extents.
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// Make `dst`, which must not exist, a reflink of `src`, as `cp --reflink=always` did: created
+/// with `src`'s permission bits (less the umask), then cloned with FICLONE in this process. A
+/// `cp` exec per clone was about 1 ms of CPU and a fork of this process. A clone that fails
+/// leaves no `dst`.
+pub fn reflink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let source = std::fs::File::open(src)?;
+    let mode = source.metadata()?.permissions().mode() & 0o7777;
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(dst)?;
+    // SAFETY: both descriptors are open for the duration of the call.
+    let rc = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        drop(target);
+        let _ = std::fs::remove_file(dst);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// The extent limit in force, from the value of [`REFLINK_MAX_EXTENTS_ENV`] if any.
 fn reflink_max_extents(value: Option<&str>) -> u64 {
     value
@@ -658,16 +686,12 @@ impl DiskManager {
                 "creating instant reflink copy (btrfs CoW)"
             );
 
-            let reflink_output = crate::utils::helper_command("cp")
-                .arg("--reflink=always")
-                .arg(&self.base_rootfs)
-                .arg(&disk_path)
-                .output()
+            let (base, disk) = (self.base_rootfs.clone(), disk_path.clone());
+            let cloned = tokio::task::spawn_blocking(move || reflink_file(&base, &disk))
                 .await
-                .context("executing cp --reflink=always")?;
+                .context("reflink task panicked")?;
 
-            if !reflink_output.status.success() {
-                let stderr = String::from_utf8_lossy(&reflink_output.stderr);
+            if let Err(error) = cloned {
                 // No copy fallback. A reflink that silently becomes a copy is
                 // not a slower success, it is a different operation: O(1)
                 // becomes O(image size), per VM, and the only trace is a WARN.
@@ -675,14 +699,13 @@ impl DiskManager {
                 // (55ef6350), surfacing as nested tests timing out at 843s
                 // under load while passing on a quiet box. Fail loudly instead
                 // and name both causes, because the fix differs per cause.
-                let cross_device =
-                    stderr.contains("cross-device") || stderr.contains("Invalid cross-device link");
+                let cross_device = error.raw_os_error() == Some(libc::EXDEV);
                 anyhow::bail!(
                     "Reflink copy failed (required for CoW disk): {}\n\
                      base: {}\n\
                      disk: {}\n\
                      {}",
-                    stderr.trim(),
+                    error,
                     self.base_rootfs.display(),
                     disk_path.display(),
                     if cross_device {
@@ -1375,6 +1398,37 @@ mod snapshot_dir_tests {
         };
         assert_eq!(rc, 0);
         assert_eq!(snapshot_disks_extents(dir.path(), 10), Some(8));
+    }
+
+    /// The clone's disk is reflinked in this process: on a filesystem that clones it is made,
+    /// on one that does not the refusal is reported and nothing is left, and create_cow_disk
+    /// starts no `cp` (main ran one per clone).
+    #[tokio::test]
+    async fn the_disk_is_reflinked_without_cp() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let base = dir.path().join("base.raw");
+        std::fs::write(&base, [0x5a; 8192]).unwrap();
+        let vm_dir = dir.path().join("vm").join("disks");
+        let disk = DiskManager::new("vm-test".to_string(), base, vm_dir.clone());
+        match disk.create_cow_disk().await {
+            Ok(path) => assert_eq!(std::fs::read(path).unwrap(), vec![0x5a; 8192]),
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(text.contains("Reflink copy failed"), "{text}");
+                assert!(
+                    !vm_dir.join("rootfs.raw").exists(),
+                    "a failed clone left its file"
+                );
+            }
+        }
+        let source = include_str!("disk.rs");
+        let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
+        let create = &create[..create.find("\n    }\n").unwrap()];
+        assert!(create.contains("reflink_file(&base, &disk)"));
+        assert!(
+            !create.contains("helper_command(\"cp\")"),
+            "create_cow_disk runs cp"
+        );
     }
 
     /// A counted disk of at most REFLINK_MAX_EXTENTS extents is reflinked; a larger one, or

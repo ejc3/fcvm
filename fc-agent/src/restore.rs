@@ -133,16 +133,15 @@ pub struct RestoreSignals {
     pub exec_rebind_done: Arc<AtomicBool>,
     pub exec_rebind_done_notify: Arc<Notify>,
     pub egress_gen_rx: Option<watch::Receiver<u64>>,
-    /// Incremented by the output writer when it observes EPOLLERR on its
-    /// established vsock connection — the guest-visible edge of the device's
-    /// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET. The VMM queues that event at
-    /// snapshot SAVE, so it fires on a restored clone AND on a resumed source
-    /// (which is why it is only a wakeup, never a classification). The epoch
-    /// watcher uses it to fast-poll for a new restore-epoch instead of
-    /// finishing a frozen 50ms sleep; on a resumed source the fast poll finds
-    /// no new epoch and lapses. Accelerator only: the normal poll cadence
-    /// remains the correctness path.
-    pub vsock_reset_rx: watch::Receiver<u64>,
+    /// The output writer's view of its vsock connection. `reset_rx` is incremented when
+    /// the writer observes EPOLLERR on its established connection, the guest-visible edge
+    /// of the device's VIRTIO_VSOCK_EVENT_TRANSPORT_RESET. The VMM queues that event at
+    /// snapshot SAVE, so it fires on a restored clone AND on a resumed source (which is why
+    /// it is only a wakeup, never a classification). `armed_rx` says whether the writer
+    /// holds an established connection, so that such a reset would reach it. On Firecracker
+    /// the epoch watcher polls MMDS every 50 ms only while it does not; while it does, the
+    /// reset is the restore event and the watcher polls every 10 s as a backstop.
+    pub vsock_reset: crate::output::ResetWatch,
     /// The NFS shares fc-agent mounted at boot, each with the ID of its mount, kept for
     /// post-restore remounting. Set once, right after the boot mounted them, which comes
     /// before the cache-ready handshake and so before any snapshot. MMDS can't be

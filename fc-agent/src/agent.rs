@@ -150,7 +150,7 @@ pub async fn run() -> Result<()> {
     // Create output channel — the writer task handles all vsock writes. The
     // reset watch surfaces EPOLLERR on the output connection (vsock transport
     // reset = snapshot restore) to the restore-epoch watcher.
-    let (output, output_writer, vsock_reset_rx) = output::create();
+    let (output, output_writer, vsock_reset) = output::create();
     tokio::spawn(output_writer);
     // How the host's resume of a snapshotted source asks for the output to reconnect.
     output::spawn_reconnect_listener(output.clone())
@@ -198,7 +198,7 @@ pub async fn run() -> Result<()> {
             exec_rebind_done: exec_rebind_done.clone(),
             exec_rebind_done_notify: exec_rebind_done_notify.clone(),
             egress_gen_rx: egress_gen_rx.clone(),
-            vsock_reset_rx,
+            vsock_reset,
             nfs_mounts: nfs_mounts.clone(),
         };
         tokio::spawn(async move {

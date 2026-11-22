@@ -27,6 +27,7 @@ mod nftables;
 mod output;
 mod payload_freeze;
 mod proxy;
+mod relay_socket;
 mod restore;
 mod retired_address;
 mod snapshot_network;

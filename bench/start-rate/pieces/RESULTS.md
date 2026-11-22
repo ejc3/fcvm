@@ -77,7 +77,27 @@ Each step is a same-session A/B with the piece's own program.
 Not this work; measured here as a check. `state`, before (f3f155fa) and after (6faf3305):
 C=128 with 1000 held, 12.4 to 3,379 ops/s, 0.157 to 0.0009 CPU-s per op.
 
-### 2. disk: count a snapshot's disk extents once (branch disk-extents-once)
+### 2. idle clone: fc-agent's 50 ms MMDS poll (branch fc-agent-idle-poll)
+
+An idle clone's fc-agent fetched MMDS every 50 ms to notice a restore. With the output
+connection established, the vsock transport reset a restore raises now wakes the watcher, and
+the poll is a 10 s backstop. Not a piece program: 1000 File-backend clones of a snapshot made by
+each build (`bench-start-rate-prep`, `bench-start-rate-run COUNT=1000 CONCURRENCY=64 HOLD=120`),
+then 60 s of host busy CPU and `perf stat -a` from 30 s after the last clone was healthy. The
+main arm's fcvm carried the disk-extents-once change, which no idle clone runs.
+
+| arm | idle cores per 1000 clones | KVM exits /VM/s | exits to Firecracker /VM/s | context switches /VM/s |
+|---|---|---|---|---|
+| main | 26.78 | 1116 | 442 | 785 |
+| fc-agent fix | 9.30 | 183 | 26 | 307 |
+| main | 34.50 | 1362 | 436 | 775 |
+| fc-agent fix | 11.66 | 217 | 26 | 307 |
+
+
+Every arm's 1000 clones were healthy; resume to agent-ready p50 was 868 and 949 ms on main,
+933 and 924 ms with the change, so restores still find the reset.
+
+### 3. disk: count a snapshot's disk extents once (branch disk-extents-once)
 
 Every clone counted the snapshot disk's extents with FIEMAP to choose between a reflink and a
 subvolume snapshot; on btrfs FIEMAP walks each extent's back references, one per clone. The
