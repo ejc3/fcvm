@@ -9,6 +9,7 @@ import copy
 import errno
 import ipaddress
 import json
+import types
 import re
 import os
 import socket
@@ -1736,6 +1737,7 @@ class LaneReleaseTests(unittest.TestCase):
     RUNNING = "sha256:" + "1" * 64
     SELECTED = "sha256:" + "2" * 64
     BEFORE = {"current": RUNNING, "previous": "sha256:" + "0" * 64, "next": RUNNING}
+    OLDER, NEWER = "9" * 40, "e" * 40  # an ancestor and a descendant of the run's commit, "a" * 40
 
     def run_publish(self, results, lane=None):
         results, events = list(results), []
@@ -1753,6 +1755,9 @@ class LaneReleaseTests(unittest.TestCase):
             return self.SELECTED, dict(self.BEFORE)
         def restore_lane(stack, before):
             events.append(("restore", stack, before))
+        def is_ancestor(older, newer):
+            events.append(("ancestry", older, newer))
+            return (older, newer) in {("9" * 40, "a" * 40), ("a" * 40, "e" * 40), ("9" * 40, "e" * 40)} or older == newer
         env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
                "COORDINATOR_RELEASE": "fcvm-coordinator-release"}
         if lane is not None:
@@ -1760,6 +1765,7 @@ class LaneReleaseTests(unittest.TestCase):
         out = io.StringIO()
         with patch.dict(os.environ, env), patch.object(publish, "command", command), \
                 patch.object(publish, "select_lane", select_lane), patch.object(publish, "restore_lane", restore_lane), \
+                patch.object(publish, "commit_is_ancestor", is_ancestor), \
                 patch.object(publish.time, "sleep", lambda s: None), contextlib.redirect_stdout(out):
             if lane is None:
                 os.environ.pop("FLEET_LAMBDA_LANE", None)
@@ -1782,18 +1788,48 @@ class LaneReleaseTests(unittest.TestCase):
 
     def test_with_the_lane_on_the_release_carries_the_selected_build_in_order(self):
         events, error = self.run_publish([
-            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
             {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
         self.assertIsNone(error)
-        self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", "stage", self.RUNNING, "a" * 40),
-                                  ("invoke", self.release_payload())])
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.OLDER),
+                                  ("select", "stage", self.RUNNING, "a" * 40), ("invoke", self.release_payload())])
+
+    def test_a_release_of_an_ancestor_of_what_staging_runs_is_skipped(self):
+        # Invariant 1: staging runs a descendant (a newer commit's release landed first). Nothing is selected
+        # or released, and the run reports unchanged.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.NEWER]}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.NEWER)])
+
+    def test_a_running_commit_newer_than_the_checkout_is_fetched_before_ordering(self):
+        def git(codes):
+            calls, codes = [], iter(codes)
+            def run(args, **kwargs):
+                calls.append(args[:3])
+                return types.SimpleNamespace(returncode=next(codes), stdout="", stderr="")
+            return calls, patch.object(publish.subprocess, "run", side_effect=run)
+        calls, p = git([1, 0, 0, 0])  # not here, fetch, here now, an ancestor
+        with p:
+            self.assertTrue(publish.commit_is_ancestor("a" * 40, "e" * 40))
+        self.assertEqual(calls, [["git", "cat-file", "-e"], ["git", "fetch", "--quiet"], ["git", "cat-file", "-e"],
+                                 ["git", "merge-base", "--is-ancestor"]])
+        calls, p = git([1, 0, 1])  # main does not contain it: refused, not guessed
+        with p, self.assertRaisesRegex(RuntimeError, "main does not contain"):
+            publish.commit_is_ancestor("a" * 40, "e" * 40)
+
+    def test_a_lane_answer_without_the_running_commits_releases_nothing(self):
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events, [("invoke", {"action": "lane"})])
 
     def test_a_first_lane_release_selects_with_nothing_running(self):
         events, error = self.run_publish([
-            {"status": "ok", "lambda_digest": None},
+            {"status": "ok", "lambda_digest": None, "commits": [self.OLDER]},
             {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
         self.assertIsNone(error)
-        self.assertEqual(events[1], ("select", "stage", None, "a" * 40))
+        self.assertEqual(events[2], ("select", "stage", None, "a" * 40))
 
     def test_a_lane_query_that_fails_releases_nothing(self):
         events, error = self.run_publish([{"status": "failed", "errorType": "ValueError", "step": "input"}], "on")
@@ -1802,32 +1838,32 @@ class LaneReleaseTests(unittest.TestCase):
 
     def test_a_failed_release_puts_the_selection_back(self):
         events, error = self.run_publish([
-            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
             {"status": "failed", "errorType": "Refused", "step": "rollout", "code": "rollout-failed"},
-            {"status": "ok", "lambda_digest": self.RUNNING}], "on")
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}], "on")
         self.assertIsInstance(error, RuntimeError)
         self.assertEqual(events[-2:], [("invoke", {"action": "lane"}), ("restore", "stage", self.BEFORE)])
 
     def test_a_release_that_applied_despite_its_error_keeps_the_selection(self):
         # The call ended without a result each time, but the function had released: it runs the new lane image.
         events, error = self.run_publish(
-            [{"status": "ok", "lambda_digest": self.RUNNING}] + [publish.CommandFailed("aws", 255)] * 11
-            + [{"status": "ok", "lambda_digest": self.SELECTED}], "on")
+            [{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}] + [publish.CommandFailed("aws", 255)] * 11
+            + [{"status": "ok", "lambda_digest": self.SELECTED, "commits": ["a" * 40]}], "on")
         self.assertIsInstance(error, publish.CommandFailed)
         self.assertEqual(events[-1], ("invoke", {"action": "lane"}))
         self.assertNotIn("restore", [e[0] for e in events])
 
     def test_a_release_reporting_another_lane_image_puts_the_selection_back(self):
         events, error = self.run_publish([
-            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
             {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.RUNNING},
-            {"status": "ok", "lambda_digest": self.RUNNING}], "on")
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}], "on")
         self.assertIsInstance(error, RuntimeError)
         self.assertEqual(events[-1], ("restore", "stage", self.BEFORE))
 
     def test_when_nothing_says_what_runs_the_selection_is_left_and_the_release_error_raised(self):
         events, error = self.run_publish([
-            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
             {"status": "failed", "step": "rollout"},
             {"status": "failed", "step": "lane"}], "on")
         self.assertIsInstance(error, RuntimeError)

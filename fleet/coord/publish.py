@@ -132,16 +132,37 @@ def restore_lane(stack, before):
     lane.reset(ecr, stack, before)
 
 
-def lane_running(function):
-    """The lane image digest the stack's coordinator runs (None before its first lane release), from the
-    release function, which reads it from the stack's lane pointer."""
+def lane_state(function):
+    """What the stack's coordinator runs, from the release function's read-only `lane` action: the lane image
+    digest (None before its first lane release) and the commit tags of its coordinator image."""
     result = invoke(function, {"action": "lane"})
-    running = result.get("lambda_digest", "")
-    if result.get("status") != "ok" or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running)):
+    running, commits = result.get("lambda_digest", ""), result.get("commits")
+    if (result.get("status") != "ok"
+            or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running))
+            or not isinstance(commits, list) or not all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}", c) for c in commits)):
         if attribution(result):
             print(json.dumps({"lane": attribution(result)}), flush=True)
-        raise RuntimeError("the release function did not report the running lane image")
-    return running
+        raise RuntimeError("the release function did not report what the coordinator runs")
+    return running, commits
+
+
+def lane_running(function):
+    return lane_state(function)[0]
+
+
+def commit_is_ancestor(older, newer):
+    """Whether `older` is an ancestor of `newer`. `newer`, a commit staging runs, may be a main commit pushed after
+    this run's checkout: fetch main once before calling it unknown."""
+    def known(commit):
+        return subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], capture_output=True).returncode == 0
+    if not known(newer):
+        subprocess.run(["git", "fetch", "--quiet", "origin", "main"], capture_output=True)
+        if not known(newer):
+            raise RuntimeError(f"staging runs {newer}, which main does not contain: the release cannot be ordered")
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"git merge-base failed ({result.returncode})")
+    return result.returncode == 0
 
 
 def release(function, payload, digest, name):
@@ -200,9 +221,16 @@ def main():
     if not lane:
         status = release(function, payload, digest, "staging")
     else:
+        # Releases are ordered here, under the deploy job's fleet-viewer-smoke group (one release at a time):
+        # a commit that is a strict ancestor of one staging runs is not released over it.
+        running, commits = lane_state(function)
+        if any(c != commit and commit_is_ancestor(commit, c) for c in commits):
+            print(json.dumps({"status": "unchanged", "reason": "staging-runs-a-descendant", "commit": commit,
+                              "digest": digest}))
+            return
         # The function refuses a lane digest that keep-stage-current does not hold, so the selection
         # comes first; the running digest stays protected as keep-stage-previous.
-        payload["lambda_digest"], before = select_lane("stage", lane_running(function), commit)
+        payload["lambda_digest"], before = select_lane("stage", running, commit)
         try:
             status = release(function, payload, digest, "staging")
         except Exception as failure:
