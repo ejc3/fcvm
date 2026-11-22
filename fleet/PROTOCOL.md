@@ -851,7 +851,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 - `--lambda aws` with `--lambda-tiles <n>` makes `n` of the AWS half's `--ec2-tiles` places
   Lambda tiles ("Lambda tile" below); it needs `--ec2`, `--ec2-aggregate-tls`
   (the task's addresses and the subzone certificate), `--dns-subzone`, `--tls-secret` (the
-  scene token keys the tiles' tunnel credentials), `--lambda-image`, `--lambda-role` and
+  scene token keys the tiles' tunnel credentials), `--lambda-image` (by digest, "Which lane
+  image a stack runs" below), `--lambda-role` and
   `--lambda-capacity-provider`, and runs in `--lambda-region` (default us-east-1). Each tile
   is one function, `fcvm-lam-<--fleet-name>-<n>`, created at its first launch and deleted
   when it leaves the assignment (the fleet sleeps). A launch writes the tile's slot,
@@ -2154,6 +2155,31 @@ restart of a Lambda tile is a new published version, which is what a race times.
 When the endpoint ends the environment's tunnel for good (a newer generation is wanted, an
 environment that started later holds the tile, or the credential is refused), the runtime
 stops the renderer, so the GPU is idle until Lambda retires the environment.
+
+### Which lane image a stack runs
+
+Both stacks pull from one repository, `fcvm-fleet/lambda-tile` in us-east-1 (ejc3/aws
+`fcvm-fleet-lambda.tf`). A push names an image `rev-<commit>` or any other tag outside
+`keep-`; such tags are immutable. The repository's lifecycle policy expires every image outside
+the newest five unless it carries a protected tag, `keep-<stack>-current` or
+`keep-<stack>-previous` for `stage` and `prod`. Those four are the repository's only mutable
+tags, and `fleet/lambda/release.py` is what moves them:
+
+- A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
+  every function it creates runs that one digest, and it deletes its functions at start and at
+  shutdown.
+- `release.py select --stack S --digest D --running R` (R is the digest S's coordinator runs now,
+  or `none`) moves `keep-S-previous` to R, then `keep-S-current` to D, and reads both back. The
+  running digest carries a protected tag at every step. Configure the coordinator with D after the
+  selection; R stays as the rollback target.
+- `release.py promote --running R` selects staging's current digest for prod.
+- `release.py rollback --stack S --running R` needs R to be `keep-S-current`, selects
+  `keep-S-previous`, and keeps R as previous.
+- Selections of one stack run one at a time: the script fails when another holds that stack's
+  lock on the host, and a promote holds both stacks'.
+
+An image no stack runs or can roll back to keeps no protected tag and expires once five newer
+images exist. `fleet/lambda/test_release.py` checks both against a model of the policy.
 
 ### The tunnel
 
