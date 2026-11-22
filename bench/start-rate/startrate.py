@@ -111,7 +111,7 @@ def host_facts(repo):
         except OSError:
             backing = "unknown"
     mem_kb = int(
-        next(l for l in Path("/proc/meminfo").read_text().splitlines() if l.startswith("MemTotal")).split()[1]
+        next(ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemTotal")).split()[1]
     )
     rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, capture_output=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", str(repo), "diff", "--quiet"]).returncode != 0
@@ -249,7 +249,7 @@ class HostSampler(threading.Thread):
                     if k in ("procs_running", "procs_blocked"):
                         st[k] = v.strip()
                 ma = next(
-                    l for l in Path("/proc/meminfo").read_text().splitlines() if l.startswith("MemAvailable")
+                    ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemAvailable")
                 ).split()[1]
                 fh.write(
                     f"{now_ns()}\t{wall():.3f}\t{la[0]}\t{la[1]}\t{la[3]}\t{st.get('procs_running')}\t"
@@ -549,7 +549,7 @@ def mark(marks, key):
 
 def summarize(out, verify=None, teardown_s=None, t0_wall=None):
     out = Path(out)
-    rows = [json.loads(l) for l in (out / "samples.jsonl").read_text().splitlines() if l.strip()]
+    rows = [json.loads(ln) for ln in (out / "samples.jsonl").read_text().splitlines() if ln.strip()]
     host = json.loads((out / "host.json").read_text())
     ok = [r for r in rows if r["healthy_at_ms"] is not None]
     hs = sorted(r["healthy_at_ms"] for r in ok)
@@ -582,7 +582,7 @@ def summarize(out, verify=None, teardown_s=None, t0_wall=None):
     if hp.exists():
         lines = hp.read_text().splitlines()
         hdr = lines[0].split("\t")
-        host_rows = [dict(zip(hdr, l.split("\t"))) for l in lines[1:]]
+        host_rows = [dict(zip(hdr, ln.split("\t"))) for ln in lines[1:]]
     s = {
         "dir": str(out),
         "instance_type": host.get("instance_type"),
@@ -617,8 +617,8 @@ def print_summary(s):
     print(f"== {c.get('backend')}/{c.get('network')} N={c.get('count')} C={c.get('concurrency')} on {s['instance_type']}")
     print(f"   healthy {s['healthy']}/{s['launched']} failed {s['failed']} in {s['span_s']} s: "
           f"overall {s['overall_rate_per_s']}/s, best 1 s window {s['best_1s_window']}, best 5 s {s['best_5s_window_rate']}/s")
-    l = s["spawn_to_healthy_ms"]
-    print(f"   spawn->healthy p50 {l['p50']} p90 {l['p90']} p99 {l['p99']} max {l['max']} ms; popen p50 {s['popen_ms']['p50']} ms")
+    lat = s["spawn_to_healthy_ms"]
+    print(f"   spawn->healthy p50 {lat['p50']} p90 {lat['p90']} p99 {lat['p99']} max {lat['max']} ms; popen p50 {s['popen_ms']['p50']} ms")
     print(f"   peak load1 {s['peak_load1']} procs_running {s['peak_procs_running']} min MemAvailable {s['min_mem_avail_mib']} MiB")
     for k, v in s["stages_ms"].items():
         print(f"   {k:<16} p50 {v['p50']} p99 {v['p99']} (n={v['n']})")

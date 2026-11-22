@@ -41,7 +41,7 @@ def main():
         if len(f) < 10 or f[0].startswith("#") or not (f[1].isdigit() and f[2].isdigit()):
             continue
         try:
-            t, usr, syst, cpu = f[0], float(f[3]), float(f[4]), float(f[7])
+            t, syst, cpu = f[0], float(f[4]), float(f[7])
         except ValueError:
             continue
         if lo is not None and not (lo <= t <= hi):
