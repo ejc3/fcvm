@@ -387,7 +387,7 @@ impl NetworkManager for BridgedNetwork {
         // the chosen IP is not assigned until setup_host_veth() in step 3 below. Without
         // a cross-process lock, two concurrently starting VMs could both pass the check
         // for the same subnet (check-then-act race) and end up with duplicate host IPs
-        // and ambiguous DNAT/return routing. Same pattern as loopback-ip.lock.
+        // and ambiguous DNAT/return routing.
         // Lock ordering: this lock may be held while portmap takes bridged-nat.lock
         // (cleanup() on the error paths below); the reverse never happens.
         let subnet_lock = super::acquire_host_network_lock("bridged-subnet.lock")

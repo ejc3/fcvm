@@ -889,3 +889,160 @@ fn state_json_with_a_numeric_utc_offset_loads_with_the_same_instant() {
     assert_eq!(state.created_at.as_second(), 1_795_000_000);
     assert_eq!(state.created_at.subsec_nanosecond(), 123_456_789);
 }
+
+/// `count` state files of other VMs, all live (owned by PID 1, with its start time), as a
+/// host with that many VMs up has, and a sweep stamp saying the directory was just swept.
+fn many_other_vms(dir: &std::path::Path, count: usize) {
+    let init_start = fcvm::utils::process_start_time(1);
+    for i in 0..count {
+        let mut state = make_vm_state(&format!("other-{i:05}"), &format!("other-{i}"), 1);
+        state.pid_start_time = init_start;
+        let path = dir.join(format!("other-{i:05}.json"));
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(path.with_extension("json.lock"), b"").unwrap();
+    }
+    std::fs::write(dir.join("sweep.stamp"), b"now").unwrap();
+}
+
+/// Watch `dir` for opens of files in it; `opens` drains the events and counts the opened
+/// names that start with `other-`. A queue overflow counts as an open: it means more
+/// opens than the queue holds.
+struct OpenWatch(nix::sys::inotify::Inotify);
+
+impl OpenWatch {
+    fn new(dir: &std::path::Path) -> Self {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        inotify.add_watch(dir, AddWatchFlags::IN_OPEN).unwrap();
+        Self(inotify)
+    }
+
+    fn opens(&self) -> usize {
+        use nix::sys::inotify::AddWatchFlags;
+        let mut opened = 0;
+        loop {
+            match self.0.read_events() {
+                Ok(events) if !events.is_empty() => {
+                    for event in events {
+                        if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                            opened += 1;
+                        }
+                        if event
+                            .name
+                            .as_ref()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("other-"))
+                        {
+                            opened += 1;
+                        }
+                    }
+                }
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => return opened,
+                Err(error) => panic!("reading inotify events: {error}"),
+            }
+        }
+    }
+}
+
+/// Starting a VM (claim its name, lease a loopback address, save its state again) must
+/// read no other VM's state: each start used to read every state several times over, so
+/// with 800 VMs up a start waited about 25 s on the name lock (bench/start-rate).
+#[tokio::test]
+async fn starting_a_vm_reads_no_other_vms_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    many_other_vms(temp_dir.path(), 2000);
+
+    let watch = OpenWatch::new(temp_dir.path());
+    let mut vm = VmState::new("vm-start".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("start".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    vm.status = VmStatus::Running;
+    manager.save_state(&vm).await.unwrap();
+    let opened = watch.opens();
+    manager.delete_state("vm-start").await.unwrap();
+
+    assert_eq!(
+        opened, 0,
+        "starting one VM opened other VMs' state files {opened} times"
+    );
+}
+
+/// A clone finds its memory server by PID. That lookup must read the server's state and
+/// no other VM's.
+#[tokio::test]
+async fn finding_a_vm_by_pid_reads_no_other_vms_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut serve = VmState::new("vm-serve".to_string(), "alpine:latest".to_string(), 1, 512);
+    serve.name = Some("serve".to_string());
+    manager.claim_name(&mut serve).await.unwrap();
+    many_other_vms(temp_dir.path(), 2000);
+
+    let watch = OpenWatch::new(temp_dir.path());
+    let found = manager.load_state_by_pid(std::process::id()).await.unwrap();
+    let opened = watch.opens();
+    manager.delete_state("vm-serve").await.unwrap();
+
+    assert_eq!(found.vm_id, "vm-serve");
+    assert_eq!(
+        opened, 0,
+        "finding one VM by PID opened other VMs' state files {opened} times"
+    );
+}
+
+/// Many processes claiming one name at once, each with a state manager of its own (so
+/// its own lock descriptions): exactly one gets it. And addresses leased at once are all
+/// different.
+#[test]
+fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let threads: Vec<_> = (0..16)
+        .map(|i| {
+            let (dir, barrier) = (dir.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let manager = StateManager::new(dir);
+                    let mut contender = VmState::new(
+                        format!("vm-contender-{i}"),
+                        "alpine:latest".to_string(),
+                        1,
+                        512,
+                    );
+                    contender.name = Some("contested".to_string());
+                    let mut own =
+                        VmState::new(format!("vm-own-{i}"), "alpine:latest".to_string(), 1, 512);
+                    own.name = Some(format!("own-{i}"));
+                    barrier.wait();
+                    let won = manager.claim_name(&mut contender).await.is_ok();
+                    manager.claim_name(&mut own).await.unwrap();
+                    let ip = manager.allocate_loopback_ip(&mut own).await.unwrap();
+                    (won, ip)
+                })
+            })
+        })
+        .collect();
+    let results: Vec<(bool, String)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let winners = results.iter().filter(|(won, _)| *won).count();
+    let ips: std::collections::HashSet<&String> = results.iter().map(|(_, ip)| ip).collect();
+    let manager = StateManager::new(dir);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for i in 0..16 {
+        let _ = runtime.block_on(manager.delete_state(&format!("vm-contender-{i}")));
+        let _ = runtime.block_on(manager.delete_state(&format!("vm-own-{i}")));
+    }
+    assert_eq!(
+        winners, 1,
+        "{winners} of 16 concurrent claims of one name won"
+    );
+    assert_eq!(ips.len(), 16, "16 VMs leased only {} addresses", ips.len());
+}
