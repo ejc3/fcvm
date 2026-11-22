@@ -438,11 +438,16 @@ the EC2 tiles first, so a race still costs one launch per AWS tile and the viewe
 budget is unchanged. The EC2 tiles and the Lambda tiles are timed apart and the scoreboard
 has three rows, fcvm, EC2 and Lambda. A Lambda tile's race time ends, as every tile's does,
 when the coordinator sees its new environment's first frame (each race publishes a new
-version of the tile's function); the time of one invoke of an environment already running is
-shown beside it and never counted. The spend ledger keeps each backing's part of the day.
-The tiles follow the fleet's power: asleep there are none, and their functions are deleted.
-fleet/core has this; the coordinator's Lambda driver, the relay that carries a tile's frames
-(a Lambda environment accepts no inbound connection) and the page's third row come after it.
+version of the tile's function, which Lambda places on a GPU instance already running). A
+GPU instance Lambda has to start for it is that tile's capacity wait, drawn hatched and kept
+out of the time as EC2's spot wait is. Nothing restarts a renderer inside a running
+environment: that would be a process restart under the tile's viewers, not a restart of
+Lambda, so no warm number is shown beside the race time. The spend ledger keeps each
+backing's part of the day. The tiles follow the fleet's power: asleep there are none, and
+their functions are deleted. On the page the Lambda tiles sit on the AWS side with the EC2
+tiles, in their own colour, with their own clock over them during a race and their own
+scoreboard row; a Lambda tile without frames says what it waits for (a new version
+publishing, Lambda starting a GPU instance, its new environment).
 
 ### Web
 

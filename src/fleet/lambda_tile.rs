@@ -5,9 +5,8 @@
 //! reads them, starts the renderer (HTTP on 127.0.0.1, TLS on its own port), and dials the
 //! coordinator's tunnel endpoint, which carries every viewer, scene and health stream to the
 //! renderer ([`crate::fleet::tunnel`]). Then it serves invocations: `health` answers the
-//! renderer's `GET /health`, and `restart` restarts the renderer process in this environment
-//! and times it to its first ready health (the separate warm field; a race publishes a new
-//! version instead, which is a new environment).
+//! renderer's `GET /health`. A restart of a Lambda tile is a new published version (a new
+//! environment), never a restart of the renderer in this one.
 //!
 //! The environment only dials out. Nothing in it listens on an address another machine can
 //! reach.
@@ -22,8 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
-/// How long a renderer may take to answer `/health` with `ready` after it starts.
-const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a renderer that exited waits before it is started again.
 const RESTART_BACKOFF: Duration = Duration::from_secs(2);
 /// How long dialing the tunnel endpoint may take: the TCP connection, then the TLS handshake.
@@ -117,9 +114,8 @@ pub fn write_identity(dir: &Path, secret: &str) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// The renderer process, started again when it exits. Every change to it (a start, the
-/// supervisor's restart after an exit, an invocation's restart, the stop when the tunnel ends
-/// for good) is made holding `state`, so they happen one at a time; a stop is final, and the
-/// supervisor starts a replacement only for the very process it saw exit.
+/// supervisor's restart after an exit, the stop when the tunnel ends for good) is made holding
+/// `state`, so they happen one at a time; a stop is final.
 struct Renderer {
     cmd: Vec<String>,
     envs: Vec<(String, String)>,
@@ -129,8 +125,6 @@ struct Renderer {
 #[derive(Default)]
 struct RendererState {
     child: Option<tokio::process::Child>,
-    /// Bumped by every start: the supervisor's restart is for the process it saw exit only.
-    epoch: u64,
     /// The tunnel ended for good: nothing starts the renderer again.
     stopped: bool,
 }
@@ -157,7 +151,6 @@ impl Renderer {
             .spawn()
             .with_context(|| format!("starting {}", self.cmd[0]))?;
         st.child = Some(child);
-        st.epoch += 1;
         Ok(())
     }
 
@@ -176,14 +169,13 @@ impl Renderer {
                 if st.stopped {
                     return;
                 }
-                let epoch = st.epoch;
                 match st.child.as_mut().map(|c| c.try_wait()) {
-                    Some(Ok(Some(s))) => Some((Some(s), epoch)),
-                    None => Some((None, epoch)),
+                    Some(Ok(Some(s))) => Some(Some(s)),
+                    None => Some(None),
                     _ => None,
                 }
             };
-            if let Some((status, epoch)) = down {
+            if let Some(status) = down {
                 match status {
                     Some(s) => tracing::warn!(%s, "the renderer exited; starting it again"),
                     None => tracing::warn!("the renderer is not running; starting it again"),
@@ -193,26 +185,12 @@ impl Renderer {
                 if st.stopped {
                     return;
                 }
-                // Started meanwhile (an invocation's restart): that process stays.
-                if st.epoch == epoch {
-                    if let Err(e) = self.start_locked(&mut st) {
-                        tracing::error!(error = %e, "the renderer did not start");
-                    }
+                if let Err(e) = self.start_locked(&mut st) {
+                    tracing::error!(error = %e, "the renderer did not start");
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-    }
-
-    async fn restart(&self) -> Result<()> {
-        let mut st = self.state.lock().await;
-        if st.stopped {
-            bail!("the renderer was stopped");
-        }
-        if let Some(mut c) = st.child.take() {
-            let _ = c.kill().await;
-        }
-        self.start_locked(&mut st)
     }
 
     async fn stop(&self) {
@@ -233,7 +211,6 @@ struct Tile {
     id: Identity,
     http: reqwest::Client,
     health_url: String,
-    renderer: Arc<Renderer>,
     tunnel_up: watch::Receiver<bool>,
     ended: watch::Receiver<Option<Ended>>,
 }
@@ -245,21 +222,6 @@ impl Tile {
             bail!("the renderer's /health answered {}", r.status());
         }
         Ok(r.json().await?)
-    }
-
-    async fn wait_ready(&self) -> Result<Value> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            if let Ok(h) = self.health().await {
-                if h.get("ready").and_then(|r| r.as_bool()) == Some(true) {
-                    return Ok(h);
-                }
-            }
-            if Instant::now() > deadline {
-                bail!("the renderer was not ready within {READY_TIMEOUT:?}");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
     }
 
     fn about(&self) -> Value {
@@ -284,11 +246,6 @@ impl Tile {
         let mut out = self.about();
         match action {
             "health" => out["health"] = self.health().await?,
-            "restart" => {
-                self.renderer.restart().await?;
-                out["health"] = self.wait_ready().await?;
-                out["restart_ms"] = json!(t0.elapsed().as_millis() as u64);
-            }
             other => bail!("unknown action {other:?}"),
         }
         out["ms"] = json!(t0.elapsed().as_millis() as u64);
@@ -431,7 +388,6 @@ async fn init(args: &FleetLambdaTileArgs) -> Result<Tile> {
             .timeout(Duration::from_secs(5))
             .build()?,
         health_url: format!("http://127.0.0.1:{}/health", args.http_port),
-        renderer,
         tunnel_up,
         ended,
     })
@@ -603,7 +559,7 @@ mod tests {
             None,
             "the stopped renderer was started again"
         );
-        assert!(r.restart().await.is_err(), "a restart after the stop");
+        assert!(r.start().await.is_err(), "a start after the stop");
         assert_eq!(r.pid().await, None);
     }
 
@@ -630,26 +586,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        r.stop().await;
-    }
-
-    /// An invocation restarts the renderer while the supervisor waits out its backoff after
-    /// an exit: the supervisor leaves that process alone instead of replacing (and killing) it.
-    #[tokio::test]
-    async fn a_restart_during_the_restart_backoff_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let r = Arc::new(exits_once(dir.path()));
-        r.start().await.unwrap();
-        tokio::spawn(r.clone().supervise());
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        r.restart().await.unwrap();
-        let restarted = r.pid().await.expect("the restarted process");
-        tokio::time::sleep(RESTART_BACKOFF + Duration::from_millis(800)).await;
-        assert_eq!(
-            r.pid().await,
-            Some(restarted),
-            "the supervisor replaced the process the restart started"
-        );
         r.stop().await;
     }
 
