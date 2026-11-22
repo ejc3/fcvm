@@ -247,14 +247,16 @@ async fn output_writer(
     let mut pending: Option<String> = None;
 
     loop {
-        // Every path that drops or (re)makes the connection comes back here, so this is
-        // the one place the watcher learns whether a transport reset would reach us.
+        // Every path that drops or (re)makes the connection comes back here, so the watcher
+        // learns here whether a transport reset would reach us. The reconnect below also
+        // says so itself before it waits, since its retries can take seconds.
         publish_armed(&armed_tx, stream.is_some());
         // Check reconnect flag — the single source of truth for reconnection.
         // Both the flag-check path and the Notify-wakeup path converge here.
         if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
             eprintln!("[fc-agent] output vsock reconnect (flag)");
             drop(stream.take()); // close old connection before reconnecting
+            publish_armed(&armed_tx, false);
             stream = try_reconnect().await;
             if stream.is_some() {
                 ever_connected = true;
@@ -378,6 +380,22 @@ async fn output_writer(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The reconnect path says it holds no connection before it waits for a new one: its
+    /// retries take up to ~3 s, and a snapshot taken meanwhile would otherwise restore a
+    /// watcher on the 10 s backstop with nothing to report the restore's reset.
+    #[test]
+    fn the_reconnect_disarms_before_it_waits() {
+        let source = include_str!("output.rs");
+        let writer = &source[source.find("async fn output_writer(").unwrap()..];
+        let branch = &writer[writer.find("if reconnect_flag.swap(false").unwrap()..];
+        let drop_at = branch.find("drop(stream.take());").unwrap();
+        let disarm_at = branch
+            .find("publish_armed(&armed_tx, false);")
+            .expect("the reconnect branch publishes that it is disarmed");
+        let wait_at = branch.find("try_reconnect().await").unwrap();
+        assert!(drop_at < disarm_at && disarm_at < wait_at);
+    }
 
     #[test]
     fn armed_is_published_on_edges_only() {
