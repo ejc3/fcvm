@@ -29,8 +29,8 @@ import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type
 import { broadcastToggle, watchesBroadcast, type BroadcastToggle } from "./broadcast.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Nudges, type Rect, type Tile } from "./protocol.ts";
-import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type Backing, type FleetState, type Half, type IntentMsg, type Nudges, type Rect, type Tile } from "./protocol.ts";
+import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, resultLine, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
 import { ownAutopilot, type ClientState, type FrameStats, type GpuSample, type Notice, type StreamMode, type TileFrameStats } from "./store.ts";
@@ -44,18 +44,20 @@ export const SIDE_TAGS: Record<Half, { tag: string; text: string }> = {
   fcvm: { tag: "FCVM", text: "restored from a snapshot" },
   ec2: { tag: "EC2", text: "launched from an AMI" },
 };
-export const CAPTIONS: Record<Half, string> = {
+export const CAPTIONS: Record<Backing, string> = {
   fcvm: "a fresh VM restored from a snapshot on a running host, GPU reset",
   ec2: "a fresh EC2 instance launched from an AMI",
+  lambda: "a new Lambda environment on a GPU instance already running",
 };
 export const NO_FLEET = "FLEET_COORD_URL is not set, so this page has no fleet to show.";
 
 export const COLORS = {
   fcvm: { accent: "#7CC4FF", soft: "#CFE8FF", darkOutline: "#1E3A52" },
   ec2: { accent: "#F5A524", soft: "#FFE2B0", darkOutline: "#4A3410" },
+  lambda: { accent: "#C9A2FF", soft: "#EADCFF", darkOutline: "#3A2A55" },
 } as const;
 
-export const KIND_NAME: Record<Half, string> = { fcvm: "fcvm VM", ec2: "EC2 instance" };
+export const KIND_NAME: Record<Backing, string> = { fcvm: "fcvm VM", ec2: "EC2 instance", lambda: "Lambda environment" };
 
 /** A dark-out fades in over this long when the viewer asks for less motion (no flash). */
 export const REDUCED_MOTION_DARK_FADE_MS = 700;
@@ -112,12 +114,19 @@ export function relaunchParts(phases: Record<string, number>): [string, string, 
   return out;
 }
 
-export function phaseText(phase: string): string {
-  return PHASE_TEXT[phase] ?? phase.replace(/_/g, " ");
+/** A Lambda tile's phases in its own words: a restart publishes a new version of its function. */
+const LAMBDA_PHASE_TEXT: Record<string, string> = {
+  launching: "publishing a new version",
+  waiting_capacity: "Lambda is starting a GPU instance",
+  starting: "waiting for its new environment",
+};
+
+export function phaseText(phase: string, half: Backing = "fcvm"): string {
+  return (half === "lambda" ? LAMBDA_PHASE_TEXT[phase] : undefined) ?? PHASE_TEXT[phase] ?? phase.replace(/_/g, " ");
 }
 
-/** The name a viewer reads for a tile: "fcvm VM 3", "EC2 VM 3". */
-export function tileName(t: { id: string; half: Half }): string {
+/** The name a viewer reads for a tile: "fcvm VM 3", "EC2 VM 3", "Lambda VM 1". */
+export function tileName(t: { id: string; half: Backing }): string {
   const k = /:(\d+)$/.exec(t.id)?.[1];
   return k === undefined ? t.id : `${KIND_TAG[t.half]} VM ${k}`;
 }
@@ -217,7 +226,7 @@ export interface Glyph {
 export interface TileView {
   id: string;
   name: string;
-  half: Half;
+  half: Backing;
   box: Box | null;
   accent: string;
   /** Drawn dark, with its glyph and phase over it. */
@@ -251,11 +260,13 @@ export interface TileView {
 /** A relit tile's time stays big this long before it moves to the tile's corner. */
 export const CHIP_FRESH_MS = 3000;
 
-const STEPS: Record<Half, Record<string, number>> = {
+const STEPS: Record<Backing, Record<string, number>> = {
   fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
   ec2: { relaunching: 0, requested: 0, stopping: 0, waiting_capacity: 0, pending: 1, starting: 2 },
+  // A new version is published, Lambda places its environment, the renderer comes up.
+  lambda: { relaunching: 0, requested: 0, launching: 0, waiting_capacity: 1, starting: 2 },
 };
-const STEP_COUNT: Record<Half, number> = { fcvm: 4, ec2: 3 };
+const STEP_COUNT: Record<Backing, number> = { fcvm: 4, ec2: 3, lambda: 3 };
 
 function relaunchMs(t: Tile): number | null {
   const lr = t.last_relaunch;
@@ -276,7 +287,7 @@ function glyphFor(t: Tile, phase: string): Glyph {
   const steps = STEP_COUNT[t.half];
   if (phase === "borrowed" || (t.borrowed !== null && phase !== "running")) return { kind: "borrowed", steps, done: 0 };
   if (phase === "failed" || t.failure) return { kind: "failed", steps, done: 0 };
-  if (phase === "waiting_capacity") return { kind: t.half === "ec2" ? "capacity" : "empty", steps, done: 0 };
+  if (phase === "waiting_capacity") return { kind: t.half === "fcvm" ? "empty" : "capacity", steps, done: 0 };
   const step = STEPS[t.half][phase];
   return { kind: "progress", steps, done: step ?? 0 };
 }
@@ -298,6 +309,7 @@ export function awaitsAwsGpu(st: FleetState): boolean {
 
 /** What a tile that is not up is waiting for, in a phrase that follows "waiting for". */
 function waitingFor(t: Tile): string {
+  if (t.half === "lambda") return t.phase === "waiting_capacity" ? "Lambda to start a GPU instance" : "its new Lambda environment";
   if (t.phase === "waiting_capacity") return t.half === "ec2" ? "EC2 capacity" : "a free GPU";
   return t.half === "ec2" ? "the instance to launch" : "the VM to restore";
 }
@@ -365,7 +377,7 @@ function tileView(
   const glyph: Glyph = aws ? { ...base, kind: "capacity" } : base;
   const name = tileName(t);
 
-  let phaseLine = phaseText(phase);
+  let phaseLine = phaseText(phase, t.half);
   let detail = "";
   if (glyph.kind === "empty") phaseLine = "no GPU here yet";
   if (aws) phaseLine = NO_AWS_GPU;
@@ -977,7 +989,7 @@ function focusView(
     id: t.id,
     accent: tv.accent,
     title: tv.name,
-    kind: t.half === "fcvm" ? `fcvm: ${CAPTIONS.fcvm}` : `EC2: ${CAPTIONS.ec2}`,
+    kind: `${KIND_TAG[t.half]}: ${CAPTIONS[t.half]}`,
     state: tv.dark ? [tv.phase, tv.detail].filter(Boolean).join(", ") : "streaming",
     back: "Back to the wall",
     streamTag,
@@ -1172,7 +1184,7 @@ export interface ZoomDraw {
 /** A tile's own state, drawn the same way whatever stream its pixels came from. */
 export interface DrawTile {
   id: string;
-  half: Half;
+  half: Backing;
   box: Box | null;
   /** Drawn dark over any frame (a restart, no GPU, a failure). */
   dark: boolean;
@@ -1653,18 +1665,13 @@ export function outOfRotationLine(st: FleetState): string {
  */
 export function lastRaceLine(st: FleetState): string {
   const asleep = st.fleet.power.state !== "awake";
-  const line = (f: number | null, e: number | null, at: number | null): string => {
-    const parts: string[] = [];
-    if (f !== null) parts.push(`fcvm back in ${fmt.seconds(f)}`);
-    if (e !== null) parts.push(`EC2 back in ${fmt.seconds(e)}`);
-    if (f !== null && e !== null) parts.push(`${ratioText(f, e)} faster`);
-    return `Last race: ${parts.join(" · ")}${asleep && at !== null ? ` · measured ${fmt.utcDate(at)}` : ""}`;
-  };
-  const { fcvm, ec2 } = st.scoreboard;
-  if (fcvm !== null || ec2 !== null) return line(fcvm?.last_ms ?? null, ec2?.last_ms ?? null, st.relaunch_all?.started_at ?? null);
-  const race = [...st.races].reverse().find((r) => r.fcvm?.time_ms != null || r.ec2?.time_ms != null);
-  if (race) return line(race.fcvm?.time_ms ?? null, race.ec2?.time_ms ?? null, race.started_at);
-  const single = (h: Half): string | null => {
+  const line = (f: number | null, e: number | null, l: number | null, at: number | null): string =>
+    `Last race: ${resultLine(f, e, l) ?? ""}${asleep && at !== null ? ` · measured ${fmt.utcDate(at)}` : ""}`;
+  const { fcvm, ec2, lambda } = st.scoreboard;
+  if (fcvm !== null || ec2 !== null || lambda != null) return line(fcvm?.last_ms ?? null, ec2?.last_ms ?? null, lambda?.last_ms ?? null, st.relaunch_all?.started_at ?? null);
+  const race = [...st.races].reverse().find((r) => r.fcvm?.time_ms != null || r.ec2?.time_ms != null || r.lambda?.time_ms != null);
+  if (race) return line(race.fcvm?.time_ms ?? null, race.ec2?.time_ms ?? null, race.lambda?.time_ms ?? null, race.started_at);
+  const single = (h: Backing): string | null => {
     let best: Tile | null = null;
     for (const t of st.tiles) {
       if (t.half !== h || relaunchMs(t) === null) continue;
@@ -1672,7 +1679,7 @@ export function lastRaceLine(st: FleetState): string {
     }
     return best === null ? null : `${tileName(best)} back in ${fmt.seconds(relaunchMs(best)!)}`;
   };
-  const singles = [single("fcvm"), single("ec2")].filter((x): x is string => x !== null);
+  const singles = [single("fcvm"), single("ec2"), single("lambda")].filter((x): x is string => x !== null);
   return singles.length > 0 ? `Last single restarts: ${singles.join(" · ")}` : "";
 }
 

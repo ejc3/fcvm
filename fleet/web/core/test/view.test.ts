@@ -125,6 +125,102 @@ describe("the scoreboard at rest", () => {
   });
 });
 
+/** fleet(2, 2) with the AWS half's last two tiles running on Lambda (`lambda:1`, `lambda:2`). */
+function lambdaFleet(over: Partial<FleetState> = {}): FleetState {
+  const st = fleet(2, 2, over);
+  let k = 0;
+  for (const t of st.tiles.filter((x) => x.half === "ec2").slice(2)) {
+    k += 1;
+    Object.assign(t, { id: `lambda:${k}`, half: "lambda", side: "ec2", slot: `lam-${k}`, vm: `environment-${k}` });
+  }
+  return st;
+}
+
+describe("Lambda tiles on the AWS half", () => {
+  const LAMBDA_SCORES = { ...SCORES, lambda: { median_ms: 25_000, last_ms: 24_000, races: 3, measured_on: 2, last_capacity_wait_ms: 8000 } };
+
+  it("keeps them on the AWS side of the image, and names them", () => {
+    const v = view(stateWith(lambdaFleet()), EPOCH);
+    expect(v.layout!.split).toBeCloseTo(0.5, 6);
+    const tv = v.tiles.find((t) => t.id === "lambda:1")!;
+    expect(tv.name).toBe("Lambda VM 1");
+    expect(tv.half).toBe("lambda");
+  });
+
+  it("gives the scoreboard a Lambda row, its capacity wait apart, and the last race its time", () => {
+    const v = view(stateWith(lambdaFleet({ scoreboard: LAMBDA_SCORES })), EPOCH + 20_000);
+    const sc = v.score!;
+    expect(sc.lambda).toMatchObject({ half: "lambda", name: "Lambda", value: "25 s", line: "last restart 24 s", measured: "measured on 2 GPUs" });
+    expect(sc.lambda!.hatchLabel).toBe("last restart: Lambda started a new GPU instance for 8.0 s, not counted");
+    expect(v.lastRace).toBe("Last race: fcvm back in 2.9 s · EC2 back in 49 s · Lambda back in 24 s · 8.3× faster");
+  });
+
+  it("has no Lambda row in a fleet without Lambda tiles", () => {
+    expect(view(stateWith(fleet(2, 2, { scoreboard: SCORES })), EPOCH).score!.lambda).toBeNull();
+  });
+
+  it("times the Lambda tiles in a race apart, shows each dark one's phase, and announces them", () => {
+    const start = EPOCH + 10_000;
+    const lambda = { lambda_done_at: null, lambda_pending: 2, lambda_gpus: 2, lambda_capacity_wait_ms: 0, lambda_waiting_since: start + 1000, lambda_ms: null };
+    const st = lambdaFleet({ scoreboard: LAMBDA_SCORES, relaunch_all: race(start, { ec2_pending: 2, ec2_gpus: 2, ...lambda }) });
+    for (const t of st.tiles) {
+      t.last_relaunch = { clicked_at: start, first_frame_at: null, phases: {} };
+      t.phase = t.half === "fcvm" ? "restoring" : t.half === "ec2" ? "launching" : "waiting_capacity";
+      // A Lambda tile with no environment yet has no GPU to report.
+      if (t.half === "lambda") Object.assign(t, { gpu: null, place: null });
+    }
+    let v = view(stateWith(st), start + 5000);
+    expect(v.score!.lambda).toMatchObject({ live: true, line: "0 of 2 GPUs streaming again" });
+    expect(v.score!.lambda!.hatchLabel).toBe("Lambda is starting a GPU instance: 0:04, not counted");
+    const tv = v.tiles.find((t) => t.id === "lambda:2")!;
+    expect(tv.dark).toBe(true);
+    expect(tv.glyph).toEqual({ kind: "capacity", steps: 3, done: 0 });
+    expect(tv.phase).toBe("Lambda is starting a GPU instance");
+    expect(tv.hover.gpu).toBe("waiting for Lambda to start a GPU instance");
+    const clock = v.race!.clocks.find((c) => c.half === "lambda")!;
+    expect(clock.steps.map((x) => `${x.label}:${x.state}`)).toEqual(["version:done", "environment:now", "app:todo"]);
+    // Its clock is over its own tiles, the right quarter of the image.
+    const img = v.layout!.image;
+    expect(clock.x).toBeGreaterThan(img.x + img.w * 0.75 - 1);
+
+    const st2 = structuredClone(st);
+    st2.relaunch_all = race(start, {
+      fcvm_done_at: start + 2900,
+      ec2_done_at: start + 61_000,
+      fcvm_pending: 0,
+      ec2_pending: 0,
+      ec2_gpus: 2,
+      ec2_capacity_wait_ms: 12_000,
+      ...lambda,
+      lambda_pending: 0,
+      lambda_done_at: start + 33_000,
+      lambda_capacity_wait_ms: 8000,
+      lambda_waiting_since: null,
+      lambda_ms: 25_000,
+    });
+    for (const t of st2.tiles) {
+      t.phase = "running";
+      t.last_relaunch = { clicked_at: start, first_frame_at: start + 3000, phases: {} };
+    }
+    v = view(stateWith(st2, 2), start + 62_000);
+    expect(v.score!.racing).toBe(false);
+    expect(v.score!.announce).toBe(
+      "fcvm: all 4 GPUs streaming again 2.9 s after the restart. EC2: all 2 GPUs streaming again 49 s after the restart, not counting 12 s when AWS had no spot GPU. Lambda: all 2 GPUs streaming again 25 s after the restart, not counting 8.0 s when Lambda started a new GPU instance.",
+    );
+    expect(v.race!.end).toBe("fcvm back in 2.9 s · EC2 back in 49 s · Lambda back in 25 s · 8.6× faster");
+  });
+
+  it("keeps a race running until its Lambda tiles are back", () => {
+    const start = EPOCH + 10_000;
+    const st = lambdaFleet({
+      relaunch_all: race(start, { fcvm_done_at: start + 2900, ec2_done_at: start + 40_000, fcvm_pending: 0, ec2_pending: 0, lambda_done_at: null, lambda_pending: 1, lambda_gpus: 2, lambda_capacity_wait_ms: 0, lambda_waiting_since: null, lambda_ms: null }),
+    });
+    const v = view(stateWith(st), start + 45_000);
+    expect(v.score!.racing).toBe(true);
+    expect(v.score!.button.label).toBe("Restarting now");
+  });
+});
+
 describe("the race", () => {
   it("counts per half, freezes fcvm's bar once it is back while EC2's grows, and announces each half", () => {
     const start = EPOCH + 10_000;

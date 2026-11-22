@@ -4,7 +4,19 @@
 // browser's reading of them. core/test/contract.test.ts parses the coordinator's own
 // snapshot states (#1146, fleet/core/tests/vectors) with it.
 
+/** A side of the image: fcvm's GPUs on the left, AWS's on the right. */
 export type Half = "fcvm" | "ec2";
+
+/**
+ * What a tile runs on: an fcvm VM, an EC2 instance, or a Lambda execution environment. The
+ * AWS half holds both its EC2 tiles and its Lambda tiles, each timed apart in a race.
+ */
+export type Backing = Half | "lambda";
+
+/** The side of the image a tile of that backing is on. */
+export function sideOf(b: Backing): Half {
+  return b === "fcvm" ? "fcvm" : "ec2";
+}
 
 /** A rectangle of the whole image, in fractions of its width and height (0..1). */
 export interface Rect {
@@ -37,9 +49,12 @@ export interface Failure {
 }
 
 export interface Tile {
-  /** The tile's place, as the coordinator names it (`fcvm:3`). */
+  /** The tile's place, as the coordinator names it (`fcvm:3`, `ec2:2`, `lambda:1`). */
   id: string;
-  half: Half;
+  /** What it runs on, the coordinator's `half`. */
+  half: Backing;
+  /** The side of the image it is on (`sideOf(half)`), the page's reading. */
+  side: Half;
   rect: Rect;
   phase: string;
   /** The slot behind the place (`slot-3`, `ec2-2`), when the coordinator names one. */
@@ -131,6 +146,17 @@ export interface RelaunchAll {
   /** Each half's measured time once it is back (the coordinator's, capacity waits excluded per tile), or null. */
   fcvm_ms: number | null;
   ec2_ms: number | null;
+  /**
+   * The AWS half's Lambda tiles, timed apart from its EC2 tiles, in the same shape; all null
+   * (the wait 0) in a race without Lambda tiles. The capacity wait is a GPU instance Lambda
+   * had to launch, kept out of `lambda_ms` as EC2's spot wait is out of `ec2_ms`.
+   */
+  lambda_done_at?: number | null;
+  lambda_pending?: number | null;
+  lambda_gpus?: number | null;
+  lambda_capacity_wait_ms?: number;
+  lambda_waiting_since?: number | null;
+  lambda_ms?: number | null;
 }
 
 /** One half's measured restart times. Every number is the coordinator's. */
@@ -150,6 +176,8 @@ export interface HalfScore {
 export interface Scoreboard {
   fcvm: HalfScore | null;
   ec2: HalfScore | null;
+  /** The Lambda tiles' own row; null (or absent) until a race with Lambda tiles has timed them. */
+  lambda?: HalfScore | null;
 }
 
 /** A stop the open vote is among, with its votes. */
@@ -239,6 +267,7 @@ export interface RaceRecord {
   by: string;
   fcvm: RaceHalf | null;
   ec2: RaceHalf | null;
+  lambda?: RaceHalf | null;
 }
 
 function parseWake(v: unknown, where: string): Wake | null {
@@ -267,6 +296,7 @@ function parseRaces(v: unknown): RaceRecord[] {
         by: strOrNull(r, "by", where) ?? "",
         fcvm: parseRaceHalf(r["fcvm"], `${where}.fcvm`),
         ec2: parseRaceHalf(r["ec2"], `${where}.ec2`),
+        lambda: parseRaceHalf(r["lambda"], `${where}.lambda`),
       },
     ];
   });
@@ -899,10 +929,11 @@ function parseTile(v: unknown, i: number): Tile {
   const where = `tiles[${i}]`;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
   const half = str(v, "half", where);
-  if (half !== "fcvm" && half !== "ec2") throw new ProtocolError(`${where}.half is ${half}`);
+  if (half !== "fcvm" && half !== "ec2" && half !== "lambda") throw new ProtocolError(`${where}.half is ${half}`);
   return {
     id: str(v, "id", where),
     half,
+    side: sideOf(half),
     rect: parseRect(obj(v, "rect", where), `${where}.rect`),
     phase: str(v, "phase", where),
     slot: strOrNull(v, "slot", where),
@@ -1288,6 +1319,12 @@ function parseRelaunchAll(ra: unknown): RelaunchAll | null {
     ec2_waiting_since: numOrNull(ra, "ec2_waiting_since", w),
     fcvm_ms: numOrNull(ra, "fcvm_ms", w),
     ec2_ms: numOrNull(ra, "ec2_ms", w),
+    lambda_done_at: numOrNull(ra, "lambda_done_at", w),
+    lambda_pending: numOrNull(ra, "lambda_pending", w),
+    lambda_gpus: numOrNull(ra, "lambda_gpus", w),
+    lambda_capacity_wait_ms: numOrNull(ra, "lambda_capacity_wait_ms", w) ?? 0,
+    lambda_waiting_since: numOrNull(ra, "lambda_waiting_since", w),
+    lambda_ms: numOrNull(ra, "lambda_ms", w),
   };
 }
 
@@ -1363,7 +1400,11 @@ function parseState(o: Obj): FleetState {
     races: parseRaces(o["races"]),
     next_race_at: numOrNull(o, "next_race_at", "state"),
     cooldown_until: numOrNull(o, "cooldown_until", "state"),
-    scoreboard: { fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"), ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2") },
+    scoreboard: {
+      fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"),
+      ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2"),
+      lambda: parseHalfScore(sb["lambda"], "scoreboard.lambda"),
+    },
     nudges: parseNudges(o["nudges"]),
     viewers: {
       count: typeof viewers["count"] === "number" ? viewers["count"] : 0,

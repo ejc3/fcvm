@@ -95,7 +95,8 @@ export function FocusPanel({
   // A tap that ends a drag on the picture is not a pick.
   const down = useRef<{ x: number; y: number } | null>(null);
   const accent = { ["--accent" as string]: focus.accent } as CSSProperties;
-  const ec2 = focus.id.startsWith("ec2");
+  // An AWS tile, EC2 or Lambda: its timeline in the AWS side's colours.
+  const ec2 = !focus.id.startsWith("fcvm");
   const box = focus.placed?.box ?? null;
   // Over the opened VM a click zooms out, so the cursor says so; over the dimmed tiles a click opens one.
   const [overOpened, setOverOpened] = useState(false);

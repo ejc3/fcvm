@@ -384,7 +384,7 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     expect(st.scene.camera[0]).toEqual({ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 });
     expect(st.actions[0]).toMatchObject({ summary: "race 1", outcome: "committed", args: {} });
     // Fields the second design review adds are absent from this document: read as none.
-    expect(st.scoreboard).toEqual({ fcvm: null, ec2: null });
+    expect(st.scoreboard).toEqual({ fcvm: null, ec2: null, lambda: null });
     expect(st.next_race_at).toBeNull();
     expect(st.borrow).toBeNull();
     expect(st.counters).toBeNull();
