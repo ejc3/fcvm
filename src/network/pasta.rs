@@ -924,7 +924,7 @@ fn pasta_pid_file(vm_id: &str) -> PathBuf {
 /// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
 /// 2. Run pre-setup via nsenter: create Firecracker TAP only
 /// 3. Start pasta: creates pasta0 TAP in namespace with L2↔L4 translation
-/// 4. Run post-setup via nsenter: create bridge, add both TAPs, enable ip_forward
+/// 4. Run post-setup via nsenter: create bridge, add both TAPs
 /// 5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
 /// 6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
 pub struct PastaNetwork {
@@ -1223,8 +1223,15 @@ impl PastaNetwork {
     /// The caller (post_start) waits for pasta's TAP device to exist via
     /// wait_for_pasta_device() before running this script.
     ///
-    /// All six `ip` commands run in ONE `ip -batch` process; enabling IP
-    /// forwarding is a shell redirect (no extra process).
+    /// Every `ip` command runs in ONE `ip -batch` process. Nothing here forwards at L3
+    /// (pasta0 and the TAP are bridged; pasta reaches the guest from inside the
+    /// namespace), so the script leaves `ip_forward` alone and opens nothing under
+    /// /proc/sys: a /proc/sys lookup in one network namespace walks the cached entry
+    /// of every other namespace that looked the same name up, under one global
+    /// spinlock. Reading `ip_forward` in a fresh namespace took 14 us with no other
+    /// namespace, 69 to 111 us with 1000 clones up, and 10.7 to 38 ms while 700 to 1000
+    /// namespaces read it at once; at C=128 the setups' spinning on that lock cost each
+    /// start 1.1 to 1.5 host CPU-s.
     pub fn build_bridge_script(&self) -> IpBatchScript {
         if self.isolated {
             return self.build_isolated_bridge_script();
@@ -1281,8 +1288,7 @@ impl PastaNetwork {
                     format!("addr add {}/24 dev {}", NAMESPACE_IP, bridge),
                 ),
             ],
-            // Enable IP forwarding — a bash redirect, not another process.
-            &["echo 1 > /proc/sys/net/ipv4/ip_forward"],
+            &[],
         )
     }
 
@@ -4308,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_script_batches_every_ip_command_and_keeps_ip_forward() {
+    fn bridge_script_batches_every_ip_command_and_opens_nothing_under_proc_sys() {
         let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
         let script = net.build_bridge_script();
 
@@ -4329,12 +4335,14 @@ mod tests {
                 "addr add 10.0.2.1/24 dev br0",
             ]
         );
+        // A /proc/sys lookup costs O(namespaces that looked the name up) under the global
+        // sysctl lock; the per-clone setup must not make one (see build_bridge_script).
         assert!(
-            script
-                .script()
-                .contains("echo 1 > /proc/sys/net/ipv4/ip_forward"),
-            "ip_forward must still be enabled (as a shell redirect, not a process)"
+            !script.script().contains("/proc/sys"),
+            "the bridge script opens /proc/sys: {}",
+            script.script()
         );
+        assert!(!net.build_setup_script().script().contains("/proc/sys"));
         assert!(script.script().starts_with("set -e\n"));
     }
 
