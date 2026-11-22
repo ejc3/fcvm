@@ -32,13 +32,16 @@ stays selectable however many images follow it.
 """
 import argparse
 import contextlib
+import fnmatch
 import fcntl
 import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 REGION = "us-east-1"
 REPOSITORY = "fcvm-fleet/lambda-tile"
@@ -313,6 +316,67 @@ def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
                            "(a rebuild? re-run the failed publish job, which reuses the run's image)")
     result = record(ecr, digest(found.digest), commit, is_ancestor)
     return {"tag": tag, "digest": found.digest, "status": result["status"]}
+
+
+def snapshot(ecr, stack):
+    """The stack's protected tags as they stand: what reset() puts back."""
+    found = {name: ecr.tagged(tag) for name, tag in (("current", current(stack)), ("previous", previous(stack)),
+                                                       ("next", following(stack)))}
+    return {name: image.digest if image else None for name, image in found.items()}
+
+
+def reset(ecr, stack, before):
+    """Put the stack's tags back to `before` (a snapshot taken before a selection whose release failed). Current
+    first: the image the stack still runs held previous throughout the selection and holds current again before
+    previous moves back to the old rollback target; next last, which unprotects the image the failed release
+    selected. A tag that did not exist before is left where it is (nothing here deletes a tag)."""
+    with locked(stack):
+        for name, tag in (("current", current(stack)), ("previous", previous(stack)), ("next", following(stack))):
+            digest_ = before["current"] if name == "next" else before[name]
+            if digest_ is not None:
+                ecr.put(tag, ecr.image(digest_))
+
+
+def lane_inputs(workflow):
+    """The push paths of .github/workflows/fleet-lambda-image.yml: the lane image's inputs."""
+    block = workflow.split("\n  push:\n", 1)[1].split("\n  pull_request:", 1)[0]
+    return re.findall(r"^      - '([^']+)'", block, re.M)
+
+
+def matches(path, patterns):
+    return any(fnmatch.fnmatchcase(path, p.replace("**", "*")) for p in patterns)
+
+
+def git_changed(older, newer):
+    """The files that differ between two commits."""
+    result = subprocess.run(["git", "diff", "--name-only", older, newer], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"git diff failed ({result.returncode}): {result.stderr.strip()[:300]}")
+    return result.stdout.split()
+
+
+def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, clock=time.monotonic,
+                 sleep=time.sleep, timeout=1500):
+    """The keep-built digest whose lane image is the one `commit` builds: built from `commit`, or from a commit
+    on the same line (an ancestor or a descendant) with no lane input changed in between. keep-built moves
+    only forward, so while it does not pair, wait (every 30 s, at most `timeout`) for this commit's lane build;
+    then refuse: a coordinator never runs beside a lane image built from other lane inputs."""
+    if changed is None:
+        patterns = inputs if inputs is not None else lane_inputs(
+            (Path(__file__).resolve().parents[2] / ".github/workflows/fleet-lambda-image.yml").read_text())
+        changed = lambda a, b: any(matches(f, patterns) for f in git_changed(a, b))
+    is_ancestor = is_ancestor or git_is_ancestor
+    deadline = clock() + timeout
+    while True:
+        built = ecr.tagged(BUILT)
+        if built is not None:
+            for held in (t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)):
+                if held == commit or ((is_ancestor(held, commit) or is_ancestor(commit, held))
+                                      and not changed(held, commit)):
+                    return built.digest
+        if clock() >= deadline:
+            raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds another commit's lane inputs")
+        sleep(30)
 
 
 def newest_build(ecr):

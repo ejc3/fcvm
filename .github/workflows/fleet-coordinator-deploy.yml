@@ -17,6 +17,17 @@ on:
       - 'build.rs'
       - 'rootfs-config.toml'
       - '.github/workflows/fleet-coordinator-deploy.yml'
+      # With the Lambda lane on, the deploy job runs these (publish.py selects the lane image).
+      - 'fleet/lambda/release.py'
+      - '.github/workflows/fleet-lambda-image.yml'
+  # With the Lambda lane on (vars.FLEET_LAMBDA_LANE), a lane image that main's lane workflow published
+  # starts a staging release, so a push that changes only the lane image's inputs reaches staging and the
+  # coordinator never stays beside an older lane build (fleet/PROTOCOL.md, "Which lane image a stack runs").
+  # It runs this workflow from main at main's head, in the same concurrency group as a push's deploy.
+  workflow_run:
+    workflows: ["Fleet Lambda lane image"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -28,7 +39,15 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (vars.FLEET_LAMBDA_LANE == 'on' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -73,10 +92,19 @@ jobs:
 
   deploy:
     needs: build
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (vars.FLEET_LAMBDA_LANE == 'on' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04-arm
     environment: fleet-stage-deploy
-    timeout-minutes: 45
+    # With the lane on, publish.py may wait up to 25 minutes for this commit's lane build.
+    timeout-minutes: 75
     # The release replaces the one coordinator task, and a smoke that reads /live meanwhile
     # fails: a web deploy's IPv6 smoke got "WebSocket upgrade refused" while this job replaced
     # the task. The smokes' group (fleet-viewer-smoke.yml) holds the release until
@@ -93,6 +121,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # The lane pairing compares this commit with the lane build's (git merge-base, git diff).
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fleet-coordinator-arm64

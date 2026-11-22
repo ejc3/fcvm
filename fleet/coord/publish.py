@@ -106,17 +106,29 @@ def lane_setting():
     return value == "on"
 
 
-def select_lane(stack, running):
-    """Select the newest lane build (keep-built) for the stack, keeping `running`, the digest its coordinator
-    runs, as the rollback target (fleet/lambda/release.py select --built). Returns the selected digest."""
+def lane_repository():
     lane = lane_release()
     url = os.environ.get("LAMBDA_TILE_REPO", "")
     if not lane.REPOSITORY_URL.fullmatch(url):
         raise ValueError("not the lane repository")
-    ecr = lane.Ecr(registry=url.split(".", 1)[0])
-    new = lane.newest_build(ecr)
+    return lane, lane.Ecr(registry=url.split(".", 1)[0])
+
+
+def select_lane(stack, running, commit):
+    """Select for the stack the lane build that pairs with `commit` (fleet/lambda/release.py paired_build: built
+    from it, or from a commit on its line with the same lane inputs; it waits, bounded, for this commit's lane
+    build), keeping `running`, the digest its coordinator runs, as the rollback target. Returns the selected
+    digest and the stack's tags before the selection, which restore_lane puts back if the release fails."""
+    lane, ecr = lane_repository()
+    new = lane.paired_build(ecr, commit)
+    before = lane.snapshot(ecr, stack)
     lane.select(ecr, stack, new, running)
-    return new
+    return new, before
+
+
+def restore_lane(stack, before):
+    lane, ecr = lane_repository()
+    lane.reset(ecr, stack, before)
 
 
 def lane_running(function):
@@ -183,11 +195,27 @@ def main():
         raise ValueError("unexpected published digest")
     digest = images[0]["imageDigest"]
     payload = {"commit": commit, "digest": digest}
-    if lane:
+    function = os.environ["COORDINATOR_RELEASE"]
+    if not lane:
+        status = release(function, payload, digest, "staging")
+    else:
         # The function refuses a lane digest that keep-stage-current does not hold, so the selection
         # comes first; the running digest stays protected as keep-stage-previous.
-        payload["lambda_digest"] = select_lane("stage", lane_running(os.environ["COORDINATOR_RELEASE"]))
-    status = release(os.environ["COORDINATOR_RELEASE"], payload, digest, "staging")
+        payload["lambda_digest"], before = select_lane("stage", lane_running(function), commit)
+        try:
+            status = release(function, payload, digest, "staging")
+        except Exception as failure:
+            # A release that failed leaves the coordinator on its old lane image, and the selection must say
+            # so (a promotion takes staging's selection). A call that ended without a result may still have
+            # released, so ask what runs; when nothing answers, leave the tags and report the release error.
+            try:
+                now = lane_running(function)
+            except Exception:
+                print(json.dumps({"lane": "selection left: the running lane image is unknown"}), flush=True)
+                raise failure from None
+            if now != payload["lambda_digest"]:
+                restore_lane("stage", before)
+            raise
     print(json.dumps({"status": status, "commit": commit, "digest": digest,
                       **({"lambda_digest": payload["lambda_digest"]} if lane else {})}))
 
@@ -228,8 +256,10 @@ def run(argv=None):
         raise SystemExit(HELD)
     except Exception as error:
         # Never repeat subprocess output, request headers or a credential-bearing environment.
+        # The lane repository's commands (fleet/lambda/release.py) raise their own CommandFailed, with the same code.
+        failed = isinstance(error, (CommandFailed, lane_release().CommandFailed))
         print(json.dumps({"status": "failed", "errorType": type(error).__name__,
-                          **({"code": error.code} if isinstance(error, CommandFailed) and error.code else {})}))
+                          **({"code": error.code} if failed and error.code else {})}))
         raise SystemExit(1)
 
 
