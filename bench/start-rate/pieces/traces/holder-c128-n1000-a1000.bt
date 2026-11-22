@@ -85,7 +85,7 @@ Attaching 20 probes...
 @exec[/usr/sbin/sshd]: 1
 @exec[/usr/bin/awk]: 1
 @exec[/usr/local/bin/grep]: 1
-@exec[/mnt/fcvm-btrfs/work/fcvm/target/release/start-pieces]: 1
+@exec[$CHECKOUT/target/release/start-pieces]: 1
 @exec[/usr/share/unattended-upgrades/update-motd-unattended-upgrades]: 1
 @exec[/etc/update-motd.d/85-fwupd]: 1
 @exec[/usr/bin/tr]: 1
@@ -112,7 +112,7 @@ Attaching 20 probes...
 @exec[/bin/bash]: 11
 @exec[/usr/bin/nsenter]: 2000
 @exec[$HOME/.cargo/bin/nsenter]: 2000
-@exec[/mnt/fcvm-btrfs/cargo-target/fcvm-f43cabe9/release/start-pieces]: 2000
+@exec[$CARGO_TARGET/release/start-pieces]: 2000
 @exec[/usr/bin/sleep]: 2000
 @exec[$HOME/.cargo/bin/newuidmap]: 2000
 @exec[/usr/sbin/newuidmap]: 2000
