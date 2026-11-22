@@ -889,3 +889,368 @@ fn state_json_with_a_numeric_utc_offset_loads_with_the_same_instant() {
     assert_eq!(state.created_at.as_second(), 1_795_000_000);
     assert_eq!(state.created_at.subsec_nanosecond(), 123_456_789);
 }
+
+/// `count` state files of other VMs, all live (owned by PID 1, with its start time), as a
+/// host with that many VMs up has, and a sweep stamp saying the directory was just swept.
+fn many_other_vms(dir: &std::path::Path, count: usize) {
+    let init_start = fcvm::utils::process_start_time(1);
+    for i in 0..count {
+        let mut state = make_vm_state(&format!("other-{i:05}"), &format!("other-{i}"), 1);
+        state.pid_start_time = init_start;
+        let path = dir.join(format!("other-{i:05}.json"));
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(path.with_extension("json.lock"), b"").unwrap();
+    }
+    std::fs::write(dir.join("sweep.stamp"), b"now").unwrap();
+}
+
+/// Watch `dir` for opens of files in it; `opens` drains the events and counts the opened
+/// names that start with `other-`. A queue overflow counts as an open: it means more
+/// opens than the queue holds.
+struct OpenWatch(nix::sys::inotify::Inotify);
+
+impl OpenWatch {
+    fn new(dir: &std::path::Path) -> Self {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        inotify.add_watch(dir, AddWatchFlags::IN_OPEN).unwrap();
+        Self(inotify)
+    }
+
+    fn opens(&self) -> usize {
+        use nix::sys::inotify::AddWatchFlags;
+        let mut opened = 0;
+        loop {
+            match self.0.read_events() {
+                Ok(events) if !events.is_empty() => {
+                    for event in events {
+                        if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                            opened += 1;
+                        }
+                        if event
+                            .name
+                            .as_ref()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("other-"))
+                        {
+                            opened += 1;
+                        }
+                    }
+                }
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => return opened,
+                Err(error) => panic!("reading inotify events: {error}"),
+            }
+        }
+    }
+}
+
+/// Starting a VM (claim its name, lease a loopback address, save its state again) must
+/// read no other VM's state: each start used to read every state several times over, so
+/// with 800 VMs up a start waited about 25 s on the name lock (bench/start-rate).
+///
+/// The periodic sweep (`maybe_sweep`) is the one start that does read them, and only the
+/// start that takes `sweep.lock`. This test holds that lock across the start, with the
+/// stamp already expired, so whatever time passes the measured start cannot be the
+/// sweeping one.
+#[tokio::test]
+async fn starting_a_vm_reads_no_other_vms_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    many_other_vms(temp_dir.path(), 2000);
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(temp_dir.path().join("sweep.stamp"))
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    let _sweeping = nix::fcntl::Flock::lock(
+        std::fs::File::create(temp_dir.path().join("sweep.lock")).unwrap(),
+        nix::fcntl::FlockArg::LockExclusive,
+    )
+    .unwrap();
+
+    let watch = OpenWatch::new(temp_dir.path());
+    let mut vm = VmState::new("vm-start".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("start".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    vm.status = VmStatus::Running;
+    manager.save_state(&vm).await.unwrap();
+    let opened = watch.opens();
+    manager.delete_state("vm-start").await.unwrap();
+
+    assert_eq!(
+        opened, 0,
+        "starting one VM opened other VMs' state files {opened} times"
+    );
+}
+
+/// A clone finds its memory server by PID. That lookup must read the server's state and
+/// no other VM's.
+#[tokio::test]
+async fn finding_a_vm_by_pid_reads_no_other_vms_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut serve = VmState::new("vm-serve".to_string(), "alpine:latest".to_string(), 1, 512);
+    serve.name = Some("serve".to_string());
+    manager.claim_name(&mut serve).await.unwrap();
+    many_other_vms(temp_dir.path(), 2000);
+
+    let watch = OpenWatch::new(temp_dir.path());
+    let found = manager.load_state_by_pid(std::process::id()).await.unwrap();
+    let opened = watch.opens();
+    manager.delete_state("vm-serve").await.unwrap();
+
+    assert_eq!(found.vm_id, "vm-serve");
+    assert_eq!(
+        opened, 0,
+        "finding one VM by PID opened other VMs' state files {opened} times"
+    );
+}
+
+/// Many processes claiming one name at once, each with a state manager of its own (so
+/// its own lock descriptions): exactly one gets it. And addresses leased at once are all
+/// different, also for VMs whose search starts at the same address: each leases with the
+/// same vm_id in a data directory of its own, so only the host-wide lease tells them apart.
+#[test]
+fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let threads: Vec<_> = (0..16)
+        .map(|i| {
+            let (dir, barrier) = (dir.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let manager = StateManager::new(dir.clone());
+                    let mut contender = VmState::new(
+                        format!("vm-contender-{i}"),
+                        "alpine:latest".to_string(),
+                        1,
+                        512,
+                    );
+                    contender.name = Some("contested".to_string());
+                    let own_dir = dir.join(format!("own-{i}"));
+                    let own_manager = StateManager::new(own_dir);
+                    own_manager.init().await.unwrap();
+                    let mut own =
+                        VmState::new("vm-own".to_string(), "alpine:latest".to_string(), 1, 512);
+                    barrier.wait();
+                    let won = manager.claim_name(&mut contender).await.is_ok();
+                    let ip = own_manager.allocate_loopback_ip(&mut own).await.unwrap();
+                    (won, ip)
+                })
+            })
+        })
+        .collect();
+    let results: Vec<(bool, String)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let winners = results.iter().filter(|(won, _)| *won).count();
+    let ips: std::collections::HashSet<&String> = results.iter().map(|(_, ip)| ip).collect();
+    let manager = StateManager::new(dir.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for i in 0..16 {
+        let _ = runtime.block_on(manager.delete_state(&format!("vm-contender-{i}")));
+        // Every lease of this process under vm_id `vm-own` goes with the first delete.
+        let _ = runtime
+            .block_on(StateManager::new(dir.join(format!("own-{i}"))).delete_state("vm-own"));
+    }
+    assert_eq!(
+        winners, 1,
+        "{winners} of 16 concurrent claims of one name won"
+    );
+    assert_eq!(ips.len(), 16, "16 VMs leased only {} addresses", ips.len());
+}
+
+/// Not a test of its own: the rootless half of
+/// `a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_directory`, run as
+/// another uid through `setpriv`. With `FCVM_TEST_ROOTLESS_STATE_DIR` set it does a VM's
+/// start-path writes in that state directory; without it, it returns at once.
+#[tokio::test]
+async fn rootless_launch_child() {
+    let Ok(dir) = std::env::var("FCVM_TEST_ROOTLESS_STATE_DIR") else {
+        return;
+    };
+    let manager = StateManager::new(std::path::PathBuf::from(dir));
+    let mut vm = VmState::new(
+        "vm-rootless".to_string(),
+        "alpine:latest".to_string(),
+        1,
+        512,
+    );
+    vm.name = Some("rootless".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    vm.status = VmStatus::Running;
+    manager.save_state(&vm).await.unwrap();
+    assert_eq!(
+        manager
+            .load_state_by_pid(std::process::id())
+            .await
+            .unwrap()
+            .vm_id,
+        "vm-rootless"
+    );
+    manager.delete_state("vm-rootless").await.unwrap();
+}
+
+/// Root and rootless launches share one state directory (CI runs the privileged tests as
+/// root beside the unprivileged ones in one data directory). A root launch must leave
+/// nothing in a state directory another user owns that the owner's next launch cannot
+/// write: the index directories it made, a temporary name entry a crashed root claim left,
+/// or the sweep's stamp. The owner's launch runs as uid 65534 through `setpriv`, from a
+/// copy of this test binary that uid can read.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_directory() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = TempDir::new().unwrap();
+    std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state = base.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let nobody = Some(nix::unistd::Uid::from_raw(65534));
+    nix::unistd::chown(&state, nobody, Some(nix::unistd::Gid::from_raw(65534))).unwrap();
+
+    // The root launch: claim, lease, save; its VM stays up.
+    let manager = StateManager::new(state.clone());
+    let mut root_vm = VmState::new("vm-root".to_string(), "alpine:latest".to_string(), 1, 512);
+    root_vm.name = Some("root".to_string());
+    manager.claim_name(&mut root_vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut root_vm).await.unwrap();
+    manager.save_state(&root_vm).await.unwrap();
+    // A root claim of the owner's name that died between writing its temporary entry and
+    // publishing it.
+    let digest = hex::encode(sha2::Sha256::digest(b"rootless"));
+    std::fs::write(
+        state.join("name").join(format!("{digest}.json.tmp")),
+        b"{\"name\":\"rootless\",\"vm_id\":\"vm-crashed\"}",
+    )
+    .unwrap();
+    // The sweep is due, so the owner's claim rewrites the stamp root's claim wrote.
+    let stamp = state.join("sweep.stamp");
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stamp)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+
+    let binary = base.path().join("test_state_manager");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = std::process::Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups", "--"])
+        .arg(&binary)
+        .args(["--exact", "rootless_launch_child", "--nocapture"])
+        .env("FCVM_TEST_ROOTLESS_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    let swept_at = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+    manager.delete_state("vm-root").await.unwrap();
+
+    assert!(
+        output.status.success(),
+        "the owner's launch after a root launch failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        swept_at > long_ago + std::time::Duration::from_secs(60),
+        "the owner's claim could not rewrite the sweep stamp root wrote"
+    );
+}
+
+/// A state that is published stays saved when its PID index entry cannot be written (here
+/// `pid` is a file, not the index): the index only speeds up lookups by PID, which scan when
+/// it has nothing, so `save_state` must not fail a launch whose state is already on disk.
+#[tokio::test]
+async fn an_unwritable_pid_index_does_not_fail_a_save() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    std::fs::write(temp_dir.path().join("pid"), b"not the index").unwrap();
+    let state = make_vm_state("vm-unindexed", "unindexed", std::process::id());
+
+    manager.save_state(&state).await.unwrap();
+    assert_eq!(
+        manager
+            .load_state_by_pid(std::process::id())
+            .await
+            .unwrap()
+            .vm_id,
+        "vm-unindexed"
+    );
+    manager.delete_state("vm-unindexed").await.unwrap();
+}
+
+/// Deleting a VM whose PID index entry cannot be removed (here it is a directory with a
+/// file in it) still retires its lock and its name entry: the three are independent, and
+/// once the state is gone nothing would name the others again.
+#[tokio::test]
+async fn a_pid_entry_that_cannot_be_removed_does_not_stop_the_rest_of_a_delete() {
+    use sha2::Digest;
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path();
+    let manager = StateManager::new(dir.to_path_buf());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new("vm-stuck".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("stuck".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    let entry = dir
+        .join("pid")
+        .join(format!("{}.vm-stuck", std::process::id()));
+    std::fs::remove_file(&entry).unwrap();
+    std::fs::create_dir(&entry).unwrap();
+    std::fs::write(entry.join("keep"), b"").unwrap();
+
+    let deleted = manager.delete_state("vm-stuck").await;
+    let name_entry = dir.join("name").join(format!(
+        "{}.json",
+        hex::encode(sha2::Sha256::digest(b"stuck"))
+    ));
+    assert!(deleted.is_ok(), "{deleted:?}");
+    assert!(
+        !dir.join("vm-stuck.json.lock").exists(),
+        "the VM's lock was left behind"
+    );
+    assert!(!name_entry.exists(), "the VM's name entry was left behind");
+}
+
+/// A dead state written before the name index existed has no name entry, so a claim of its
+/// name does not remove it, and it stays until the next sweep. A lookup by that name must
+/// still find the one live VM, not report two.
+#[tokio::test]
+async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    // Above the kernel's PID_MAX_LIMIT, so no process has it.
+    let dead = make_vm_state("vm-before-index", "web", 4_000_000_000);
+    std::fs::write(
+        temp_dir.path().join("vm-before-index.json"),
+        serde_json::to_vec(&dead).unwrap(),
+    )
+    .unwrap();
+    // A sweep ran just now, so this claim does not sweep the dead state away.
+    std::fs::write(temp_dir.path().join("sweep.stamp"), b"now").unwrap();
+    let mut live = VmState::new("vm-live".to_string(), "alpine:latest".to_string(), 1, 512);
+    live.name = Some("web".to_string());
+    manager.claim_name(&mut live).await.unwrap();
+    assert!(
+        temp_dir.path().join("vm-before-index.json").exists(),
+        "the dead state is gone, so this test checks nothing"
+    );
+
+    let found = manager.load_state_by_name("web").await;
+    manager.delete_state("vm-live").await.unwrap();
+    assert_eq!(found.unwrap().vm_id, "vm-live");
+}

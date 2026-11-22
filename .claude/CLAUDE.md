@@ -2475,24 +2475,44 @@ On serve process exit (SIGTERM/SIGINT):
 
 **Problem**: State files persist when VMs crash (SIGKILL, test abort). When the OS reuses a PID, the old state file causes collisions when querying by PID.
 
-**Solution — two layers of defense:**
+**Solution:**
 
 1. **PID start-time identity** (`pid_start_time` field): `save_state()` records the
    process's start time from `/proc/<pid>/stat` (field 22, clock ticks since boot).
    A (pid, start_time) pair uniquely identifies a process even after PID reuse.
-   `load_state_by_pid()` and `cleanup_stale_state()` verify this — if the process
+   `load_state_by_pid()` and `cleanup_stale_state()` verify this: if the process
    at the recorded PID has a different start time, the state file is stale.
 
-2. **PID collision cleanup in `save_state()`**: Before saving, checks if any OTHER
-   state file claims the same PID. If found, that file is stale (process is dead,
-   PID was reused). Deletes the stale file with a warning log, then saves.
+2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
+   state, so its cost does not grow with the number of VMs (with every state read on every
+   start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
+   minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
+   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
+   `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
+   removes the states of dead or replaced processes and the index entries that outlive
+   them. Until it runs a stale state holds nothing: its owner is not live.
+
+**Indexes** (`src/state/manager.rs`), so a start's fast path does not scan:
+- `name/<sha256 of name>.json` records which VM claimed the name last, written by
+  `claim_name()` under `names.lock`. That VM holds the name while its state exists, names
+  it, and its owner is live. A state written without a claim has no entry and holds no name.
+- `pid/<pid>.<vm_id>` (empty) is written by `save_state()` under the VM's state lock;
+  `load_state_by_pid()` reads the states it names and scans everything only on a miss.
+- Lock order: `names.lock` before a VM's `<vm_id>.json.lock`, never the reverse.
+  `delete_state()` removes both entries; the sweep removes any a crash left.
+- Root and the state directory's owner share one state directory (privileged tests run as
+  root beside unprivileged ones), so `name/` and `pid/` made by root are handed to the
+  state directory's owner before they appear (`index_dir`), and `sweep.stamp` is written
+  like a lock file (0666). Nothing is made world-writable.
 
 **State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
 ```
 /mnt/fcvm-btrfs/state/
-├── vm-abc123.json    # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
-├── vm-def456.json    # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
-└── loopback-ip.lock  # Global lock for IP allocation
+├── vm-abc123.json      # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
+├── vm-def456.json      # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
+├── name/<sha256>.json  # { name, vm_id }: the VM that claimed the name last
+├── pid/5000.vm-abc123  # PID index entry
+└── names.lock          # Global lock for name claims
 ```
 
 No master state file - `list_vms()` globs all `.json` files.
@@ -2660,8 +2680,8 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - `--ipv6-prefix` is also read from `FCVM_IPV6_PREFIX`. On a host whose own addresses are not a routable /64, set it to the host's delegated subnet: the routed tests pass no prefix, so without it they stop at "routed mode preflight check failed" before a VM boots
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
-- Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
-- Lock-protected with persistence within a data directory, and leased host-wide with an abstract Unix socket (`fcvm-loopback-<address>`) so VMs of other data directories and other users skip it (#1882)
+- Leased host-wide with an abstract Unix socket (`fcvm-loopback-<address>`), which exactly one process wins and the kernel releases when that process dies, so VMs of other data directories and other users skip it (#1882)
+- The search starts at an address picked from the vm_id (127.0.0.2 to 127.0.255.254), so it takes no lock and reads no other VM's state
 
 ### btrfs CoW Reflinks
 

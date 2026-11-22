@@ -692,8 +692,8 @@ impl RoutedNetwork {
 
     /// Set a unique loopback IP for port forwarding (127.x.y.z)
     ///
-    /// Allocated by StateManager::allocate_loopback_ip() with lock-based
-    /// coordination to prevent collisions across concurrent VM starts.
+    /// Allocated by StateManager::allocate_loopback_ip(), whose host-wide lease keeps two
+    /// concurrently starting VMs from getting the same address.
     pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
         self.loopback_ip = Some(loopback_ip);
         self
