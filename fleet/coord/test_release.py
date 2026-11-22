@@ -1726,6 +1726,103 @@ class ReleaseInvocationTests(unittest.TestCase):
         self.assertEqual(len(sleeps), 10)
 
 
+class LaneReleaseTests(unittest.TestCase):
+    """The staging release with the Lambda lane: off (FLEET_LAMBDA_LANE unset or off) it is exactly the release
+    without a lane; on, it asks the release function which lane image the coordinator runs, selects the newest
+    build for staging (fleet/lambda/release.py), and releases with that digest."""
+
+    DIGEST = "sha256:" + "c" * 64
+    RUNNING = "sha256:" + "1" * 64
+    SELECTED = "sha256:" + "2" * 64
+
+    def run_publish(self, results, lane=None):
+        results, payloads, selected = list(results), [], []
+        def command(args, body=None, env=None, allow_missing=False):
+            if args[1] == "ecr":
+                return json.dumps({"imageDetails": [{"imageDigest": self.DIGEST}]})
+            payloads.append(json.loads(body))
+            Path(args[-1]).write_text(json.dumps(results.pop(0)))
+            return json.dumps({"StatusCode": 200})
+        def select_lane(stack, running):
+            selected.append((stack, running))
+            return self.SELECTED
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
+               "COORDINATOR_RELEASE": "fcvm-coordinator-release"}
+        if lane is not None:
+            env["FLEET_LAMBDA_LANE"] = lane
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(publish, "command", command), \
+                patch.object(publish, "select_lane", select_lane), patch.object(publish.time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(out):
+            if lane is None:
+                os.environ.pop("FLEET_LAMBDA_LANE", None)
+            try:
+                publish.main()
+                error = None
+            except Exception as caught:
+                error = caught
+        return payloads, selected, error
+
+    def test_with_the_lane_off_the_release_is_exactly_todays(self):
+        for lane in (None, "", "off"):
+            with self.subTest(lane=lane):
+                payloads, selected, error = self.run_publish([{"status": "deployed", "digest": self.DIGEST}], lane)
+                self.assertIsNone(error)
+                self.assertEqual(payloads, [{"commit": "a" * 40, "digest": self.DIGEST}])
+                self.assertEqual(selected, [])
+
+    def test_with_the_lane_on_the_release_carries_the_selected_build(self):
+        payloads, selected, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(payloads, [{"action": "lane"},
+                                    {"commit": "a" * 40, "digest": self.DIGEST, "lambda_digest": self.SELECTED}])
+        self.assertEqual(selected, [("stage", self.RUNNING)])
+
+    def test_a_first_lane_release_selects_with_nothing_running(self):
+        payloads, selected, error = self.run_publish([
+            {"status": "ok", "lambda_digest": None},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(selected, [("stage", None)])
+
+    def test_a_lane_query_that_fails_releases_nothing(self):
+        payloads, selected, error = self.run_publish([{"status": "failed", "errorType": "ValueError", "step": "input"}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(payloads, [{"action": "lane"}])
+        self.assertEqual(selected, [])
+
+    def test_a_release_that_reports_another_lane_image_fails(self):
+        _, _, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.RUNNING}], "on")
+        self.assertIsInstance(error, RuntimeError)
+
+    def test_an_unknown_lane_setting_is_refused_before_anything_runs(self):
+        payloads, selected, error = self.run_publish([], "yes")
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual((payloads, selected), ([], []))
+
+    def test_the_lane_selection_takes_the_newest_build_for_the_stack(self):
+        calls = []
+        lane = publish.lane_release()
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), \
+                patch.object(lane, "newest_build", lambda ecr: calls.append(("built", ecr.registry)) or self.SELECTED), \
+                patch.object(lane, "select", lambda ecr, stack, new, running: calls.append((stack, new, running)) or {}):
+            self.assertEqual(publish.select_lane("stage", self.RUNNING), self.SELECTED)
+        self.assertEqual(calls, [("built", "111122223333"), ("stage", self.SELECTED, self.RUNNING)])
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "registry.example/other"}):
+            with self.assertRaises(ValueError):
+                publish.select_lane("stage", self.RUNNING)
+
+    def test_the_staging_deploy_passes_the_lane_setting_and_repository(self):
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()
+        step = workflow.split("- name: Publish and release the staging coordinator", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}", step)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", step)
+
+
 class ResolveRetransmitTests(unittest.TestCase):
     """resolve() retransmits one query within its deadline, as a stub resolver does."""
 

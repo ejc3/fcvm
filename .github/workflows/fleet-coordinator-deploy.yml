@@ -110,9 +110,13 @@ jobs:
           role-session-name: fcvm-stage-${{ github.run_id }}
           mask-aws-account-id: true
       - name: Publish and release the staging coordinator
+        # FLEET_LAMBDA_LANE on: the release also selects the newest lane image (keep-built) for
+        # staging and passes it to the release function (fleet/coord/publish.py). Unset: as before.
         env:
           COORDINATOR_REPO: ${{ secrets.COORDINATOR_REPO }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: python3 -B fleet/coord/publish.py
 
   # The viewer-path smoke against the new coordinator: every mode's tiles from an IPv4-only

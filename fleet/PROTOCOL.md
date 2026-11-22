@@ -2174,6 +2174,12 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
   shutdown.
+- With `FLEET_LAMBDA_LANE=on` in `fleet-stage-deploy`, the staging coordinator release
+  (`fleet/coord/publish.py`) asks the release function which lane digest the coordinator runs (R),
+  runs the selection below with `--built --running R`, and releases with that digest. The release
+  function (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current`
+  does not hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. Unset or `off`, the release is
+  the one without a lane. Prod's promote and rollback do not carry a lane digest yet.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of
