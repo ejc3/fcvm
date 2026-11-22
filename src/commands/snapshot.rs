@@ -4397,6 +4397,18 @@ async fn cmd_snapshot_run_inner(
     drop(snapshot_shared_lock);
     failpoint::hit_async("restore.unlocked").await;
 
+    // A memory server that killed this clone's VMM during the load (a refusal at its
+    // concurrent-clone cap, a failed handshake) wrote why before the kill; the load itself
+    // reports only a closed connection. Read before the cleanup removes the directory.
+    let setup_result =
+        setup_result.map_err(
+            |error| match crate::uffd::failure::read_failure(&data_dir) {
+                Some(reason) => {
+                    error.context(format!("the memory server killed this clone: {reason}"))
+                }
+                None => error,
+            },
+        );
     let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
 
     // The VMM is now owned by the normal lifecycle. Move every companion out of

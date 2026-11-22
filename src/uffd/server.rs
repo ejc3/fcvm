@@ -1426,7 +1426,29 @@ impl UffdServer {
                                 // vCPUs parked in handle_userfault forever with no exit code
                                 // and no signal. A refused clone that merely hangs still holds
                                 // its memory, port and disk. Refusal means killing.
-                                peer.kill_now("server is at its concurrent-clone cap");
+                                //
+                                // The reason goes into the clone's runtime directory first
+                                // (`record_failure`), so the clone reports the cap instead of
+                                // a snapshot load that failed with "connection closed". The
+                                // record lists VM states, so it runs on a task of its own and
+                                // the accept loop goes on; the guard kills the VMM if the task
+                                // is dropped before it does. The stream stays open until the
+                                // kill: closed earlier, the clone's load could fail before the
+                                // reason is written.
+                                let reason = format!(
+                                    "the memory server is at its concurrent-clone cap of {} \
+                                     ({} clones running); start another `fcvm snapshot serve` \
+                                     or raise {}",
+                                    self.max_clones, in_flight, MAX_CLONES_ENV
+                                );
+                                let mut guard = PeerTaskGuard::new(peer, vm_id.clone());
+                                vm_tasks.spawn(async move {
+                                    guard.peer().record_failure(&reason).await;
+                                    guard.peer().kill_now(&reason);
+                                    guard.disarm();
+                                    drop(stream);
+                                    vm_id
+                                });
                                 continue;
                             }
                             admitted.fetch_add(1, Ordering::AcqRel);

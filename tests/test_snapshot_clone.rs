@@ -7016,6 +7016,129 @@ async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
     }
 }
 
+/// A clone refused at the memory server's concurrent-clone cap says so, naming the cap and
+/// `FCVM_UFFD_MAX_CLONES`. The server kills a refused clone's VMM, and the clone used to report
+/// only that its snapshot load failed ("connection closed"), which reads as a crash.
+#[tokio::test]
+async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
+    let (baseline_name, first_clone_name, snapshot_name, _) = common::unique_names("uffd-cap-name");
+    let refused_name = format!("{first_clone_name}-refused");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut refused: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        let (serve_child, serve_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &["snapshot", "serve", &snapshot_name],
+            &[("FCVM_UFFD_MAX_CLONES", "1")],
+        )
+        .await?;
+        serve = Some((serve_child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        let serve_pid_string = serve_pid.to_string();
+        first_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &first_clone_name,
+                ],
+                &first_clone_name,
+            )
+            .await?,
+        );
+        let (first_child, _) = first_clone.as_mut().unwrap();
+        common::poll_health(first_child, 120).await?;
+
+        let (refused_child, refused_pid, refused_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_string,
+                "--name",
+                &refused_name,
+            ],
+            &[],
+        )
+        .await?;
+        refused = Some((refused_child, refused_pid));
+        let (refused_child, _) = refused.as_mut().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(120), refused_child.wait())
+            .await
+            .context("the clone over the cap did not exit within 120 s")??;
+        refused = None;
+        anyhow::ensure!(!status.success(), "the clone over the cap exited 0");
+        let log = tokio::fs::read_to_string(&refused_log).await?;
+        anyhow::ensure!(
+            log.contains("concurrent-clone cap of 1") && log.contains("FCVM_UFFD_MAX_CLONES"),
+            "the refused clone's output does not name the cap; its last lines:\n{}",
+            log.lines()
+                .rev()
+                .take(25)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut refused, "refused clone"),
+        (&mut first_clone, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
+}
+
 /// A panicking clone handler must not permanently consume a concurrency slot.
 ///
 /// The server caps concurrent clones with an atomic counter. That counter was decremented
