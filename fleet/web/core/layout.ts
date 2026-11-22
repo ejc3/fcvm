@@ -108,8 +108,9 @@ export interface MosaicLayout {
  * line sits at the right edge of the fcvm tiles (0 with none, 1 with no EC2 tiles).
  */
 export function splitOf(tiles: readonly Tile[]): number {
-  const fcvm = tiles.filter((t) => t.half === "fcvm");
-  const ec2 = tiles.filter((t) => t.half === "ec2");
+  const fcvm = tiles.filter((t) => t.side === "fcvm");
+  // The AWS side: its EC2 tiles and its Lambda tiles.
+  const ec2 = tiles.filter((t) => t.side === "ec2");
   // No GPU on either side (asleep): nothing is placed, and the halves stay even.
   if (fcvm.length === 0 && ec2.length === 0) return 0.5;
   if (fcvm.length === 0) return 0;

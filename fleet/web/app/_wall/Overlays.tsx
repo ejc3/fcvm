@@ -200,7 +200,7 @@ export function Overlays({ view, phone, onWake }: { view: WallView; phone: boole
               </div>
             ) : null,
           )}
-          {phone ? null : view.race?.clocks.map((c) => <HalfClockView key={c.half} c={c} style={{ left: c.x, top: c.y, ["--clock-size" as string]: `${Math.round(c.size)}px` }} />)}
+          {phone ? null : view.race?.clocks.map((c) => <HalfClockView key={c.half} c={c} style={{ left: c.x, top: c.y, maxWidth: c.bounded ? Math.ceil(c.width) : undefined, ["--clock-size" as string]: `${Math.round(c.size)}px` }} />)}
           {view.race?.end && !phone ? (
             <div className="end-card" data-testid="end-card" style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.68 }}>
               {view.race.end}

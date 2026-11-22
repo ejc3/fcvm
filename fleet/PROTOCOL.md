@@ -292,9 +292,7 @@ relaunch counts one and waits 90 s after its last launch, as an EC2 tile's does
 (`lam-1 launched 13 s ago; it can be relaunched in 77 s`). A race times the EC2 tiles and the
 Lambda tiles apart, so the scoreboard has a row for each. A Lambda tile's relaunch is a new
 published version of its function, so a race times a new environment, and its time ends,
-like every tile's, when the coordinator sees the new generation's first frame. The time of
-one invoke of a running environment (`warm_invoke_ms` in the tile's phases) is shown beside
-the race number and never counted in it.
+like every tile's, when the coordinator sees the new generation's first frame.
 
 **The directed camera.** The coordinator flies the wall's camera along a program generated
 from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
@@ -548,15 +546,14 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   wait began (null when none runs), so a page can draw the wait as it grows. A race with
   Lambda tiles also has the same fields for them, `lambda_done_at`, `lambda_pending`,
   `lambda_gpus`, `lambda_ms`, `lambda_capacity_wait_ms` (waits Lambda named as capacity) and
-  `lambda_waiting_since`, and `lambda_warm_invoke_ms`, the slowest tile's warm invoke, shown
-  beside `lambda_ms` and not part of it; a race without them has none of these fields.
+  `lambda_waiting_since`; a race without them has none of these fields.
 - `scoreboard` holds only measured numbers; a half is null until one of its races has
   finished. `last_ms` is the latest finished race's time, `median_ms` the median of the
   last 20 finished, `races` how many that median is over, `measured_on` the tiles the last
   race timed, `last_capacity_wait_ms` its EC2 wait (left out of `last_ms`), `last_race`
   its id. A race with no tiles in a half does not count for it. With Lambda tiles the
   scoreboard has a third row, `lambda`, timed apart from `ec2` though both are on the AWS
-  half, with `last_warm_invoke_ms` beside its times; without them `lambda` is absent.
+  half; without them `lambda` is absent.
 - `races` keeps the last 10 races with every tile's phases; tiles whose host was
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
 - `nudges` is the directed camera: `targets` are the viewpoints the open vote is among,
@@ -2143,14 +2140,11 @@ In the environment's init the runtime writes the secret's certificate as the ren
 `TLS_CERT_FILE` and its scene token as `SCENE_TOKEN_FILE` under `/tmp/fleet-tile` (mode
 0600), starts the renderer with HTTP on 127.0.0.1:8080 and TLS on 8443 (the environment's
 user binds no port below 1024), starts it again 2 s after it exits, and dials the tunnel.
-An init that cannot read the secret reports an init error to Lambda. Invocations
-(`{"action": ...}`, two served at once):
-
-- `health` (the default): the renderer's `GET /health` as `health`, with the tile's slot,
-  generation, environment, instance and whether its tunnel is up.
-- `restart`: stop the renderer process, start it again, and wait for `/health` with
-  `ready` true. `restart_ms` is that time: a process restart inside a running environment,
-  reported beside a race's time and never as it (fleet/core's `warm_invoke_ms`).
+An init that cannot read the secret reports an init error to Lambda. An invocation
+(`{"action": "health"}`, the default, two served at once) answers the renderer's
+`GET /health` as `health`, with the tile's slot, generation, environment, instance and
+whether its tunnel is up. Nothing restarts the renderer inside a running environment: a
+restart of a Lambda tile is a new published version, which is what a race times.
 
 When the endpoint ends the environment's tunnel for good (a newer generation is wanted, an
 environment that started later holds the tile, or the credential is refused), the runtime

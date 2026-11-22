@@ -204,8 +204,7 @@ pub struct RelaunchAllView {
 
 /// The Lambda tiles of the latest race. `lambda_ms` is click to the coordinator seeing each
 /// tile's new execution environment's first frame, less capacity waits Lambda named: the
-/// same event that ends the fcvm and EC2 times. `lambda_warm_invoke_ms` is one invoke of
-/// a running environment, shown beside it and never as it.
+/// same event that ends the fcvm and EC2 times.
 #[derive(Debug, Clone, Serialize)]
 pub struct LambdaRaceView {
     pub lambda_done_at: Option<u64>,
@@ -214,7 +213,6 @@ pub struct LambdaRaceView {
     pub lambda_ms: Option<u64>,
     pub lambda_capacity_wait_ms: u64,
     pub lambda_waiting_since: Option<u64>,
-    pub lambda_warm_invoke_ms: Option<u64>,
 }
 
 /// One half of the scoreboard; null until a race of that half has finished. Only
@@ -230,10 +228,6 @@ pub struct HalfScore {
     pub measured_on: usize,
     pub last_capacity_wait_ms: u64,
     pub last_race: u64,
-    /// Lambda tiles: the last race's warm invoke (`HalfRace::warm_invoke_ms`), beside the
-    /// times and in none of them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_warm_invoke_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1122,7 +1116,6 @@ fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> Op
         measured_on: last.tiles.len(),
         last_capacity_wait_ms: last.capacity_wait_ms,
         last_race: last_id,
-        last_warm_invoke_ms: last.warm_invoke_ms,
     })
 }
 
@@ -1250,7 +1243,6 @@ fn relaunch_all(r: &Race) -> RelaunchAllView {
             lambda_ms: r.lambda.time_ms,
             lambda_capacity_wait_ms: capacity_wait(&r.lambda),
             lambda_waiting_since: waiting_since(&r.lambda),
-            lambda_warm_invoke_ms: r.lambda.warm_invoke_ms,
         }),
     }
 }

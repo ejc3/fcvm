@@ -12,6 +12,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
         tiles.push({
           id: `${half}:${n}`,
           half,
+          side: half,
           rect: { x: (half === "fcvm" ? 0 : 0.5) + (c * 0.5) / cols, y: r / rows, w: 0.5 / cols, h: 1 / rows },
           phase: "running",
           slot: half === "fcvm" ? `slot-${n}` : `ec2-${n}`,

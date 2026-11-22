@@ -543,11 +543,6 @@ pub struct HalfRace {
     /// Tiles lent to a visitor when the race started: they sit it out.
     #[serde(default)]
     pub sitting_out: Vec<String>,
-    /// Lambda tiles: the slowest tile's warm invoke (one `Invoke` of its running
-    /// environment, its report's `warm_invoke_ms`). Shown beside the race time, never as it:
-    /// the race time is click to the coordinator seeing the new environment's first frame.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warm_invoke_ms: Option<u64>,
 }
 
 impl HalfRace {

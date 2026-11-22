@@ -4,7 +4,7 @@
     "lambda_max": 2,
     "restart_cooldown_secs": 1
   },
-  "description": "With lambda_max, that many of the AWS half's ec2_max tiles are Lambda tiles (lam-<n>, tiles lambda:<k>) and the rest EC2 tiles. The half keeps its places and is one grid, its EC2 tiles first. A Lambda tile without an execution environment holds its place, dark, with its phase. A race relaunches every tile; the EC2 tiles and the Lambda tiles each get their own race number and scoreboard row. A Lambda tile's time ends when the coordinator sees its new environment's first frame, less a capacity wait Lambda named; its warm invoke time is kept beside it and never counted. A viewer's relaunch of a Lambda tile waits 90 s after its last launch, as an EC2 tile's does.",
+  "description": "With lambda_max, that many of the AWS half's ec2_max tiles are Lambda tiles (lam-<n>, tiles lambda:<k>) and the rest EC2 tiles. The half keeps its places and is one grid, its EC2 tiles first. A Lambda tile without an execution environment holds its place, dark, with its phase. A race relaunches every tile; the EC2 tiles and the Lambda tiles each get their own race number and scoreboard row. A Lambda tile's time ends when the coordinator sees its new environment's first frame, less a capacity wait Lambda named. A viewer's relaunch of a Lambda tile waits 90 s after its last launch, as an EC2 tile's does.",
   "events": [
     {
       "at": 1000,
@@ -161,8 +161,7 @@
         "id": "lam-1",
         "phase": "running",
         "timings": {
-          "publish_ms": 2000,
-          "warm_invoke_ms": 340
+          "publish_ms": 2000
         },
         "vm": "environment-3"
       },
@@ -207,8 +206,7 @@
         "phase": "running",
         "timings": {
           "capacity_wait_ms": 4000,
-          "publish_ms": 2500,
-          "warm_invoke_ms": 360
+          "publish_ms": 2500
         },
         "vm": "environment-4"
       },
@@ -223,21 +221,6 @@
       "name": "relaunch",
       "type": "intent",
       "viewer": "v1"
-    },
-    {
-      "at": 17000,
-      "report": {
-        "frame_url": "ws://lam-1.example:443/frames",
-        "generation": 2,
-        "id": "lam-1",
-        "phase": "running",
-        "timings": {
-          "publish_ms": 2000,
-          "warm_invoke_ms": 900
-        },
-        "vm": "environment-3"
-      },
-      "type": "lambda"
     }
   ],
   "expect": [
@@ -310,17 +293,14 @@
         "/view/relaunch_all/lambda_capacity_wait_ms": 4000,
         "/view/relaunch_all/lambda_done_at": 15000,
         "/view/relaunch_all/lambda_ms": 8000,
-        "/view/relaunch_all/lambda_warm_invoke_ms": 360,
-        "/view/scoreboard/ec2/last_warm_invoke_ms": null,
         "/view/scoreboard/ec2/median_ms": 7000,
         "/view/scoreboard/fcvm/median_ms": 2200,
         "/view/scoreboard/lambda/last_capacity_wait_ms": 4000,
         "/view/scoreboard/lambda/last_ms": 8000,
-        "/view/scoreboard/lambda/last_warm_invoke_ms": 360,
         "/view/scoreboard/lambda/measured_on": 2,
         "/view/scoreboard/lambda/median_ms": 8000
       },
-      "note": "the Lambda race number is click to the coordinator seeing the last new environment's first frame less the capacity wait Lambda named; the warm invoke is beside it, never it"
+      "note": "the Lambda race number is click to the coordinator seeing the last new environment's first frame less the capacity wait Lambda named"
     },
     {
       "after": 15,
@@ -329,17 +309,6 @@
         "/receipts/rl/reason": "lam-1 launched 13 s ago; it can be relaunched in 77 s"
       },
       "note": "a Lambda tile is relaunched no sooner than 90 s after its last launch, as an EC2 tile"
-    },
-    {
-      "after": 16,
-      "checks": {
-        "/view/relaunch_all/lambda_done_at": 15000,
-        "/view/relaunch_all/lambda_ms": 8000,
-        "/view/relaunch_all/lambda_warm_invoke_ms": 900,
-        "/view/scoreboard/lambda/last_ms": 8000,
-        "/view/scoreboard/lambda/last_warm_invoke_ms": 900
-      },
-      "note": "a warm invoke measured after the tile's first frame still reaches the finished race and the scoreboard, and changes neither the first frame nor the race time"
     }
   ],
   "final_view": {
@@ -576,8 +545,7 @@
               "first_frame_at": 5500,
               "generation": 2,
               "phases": {
-                "publish_ms": 2000,
-                "warm_invoke_ms": 900
+                "publish_ms": 2000
               },
               "tile": "lambda:1",
               "waiting_since": null
@@ -588,15 +556,13 @@
               "generation": 2,
               "phases": {
                 "capacity_wait_ms": 4000,
-                "publish_ms": 2500,
-                "warm_invoke_ms": 360
+                "publish_ms": 2500
               },
               "tile": "lambda:2",
               "waiting_since": 4000
             }
           },
-          "time_ms": 8000,
-          "warm_invoke_ms": 900
+          "time_ms": 8000
         },
         "started_at": 3000
       }
@@ -619,7 +585,6 @@
       "lambda_ms": 8000,
       "lambda_pending": 0,
       "lambda_waiting_since": null,
-      "lambda_warm_invoke_ms": 900,
       "race": 1,
       "started_at": 3000
     },
@@ -829,7 +794,6 @@
         "last_capacity_wait_ms": 4000,
         "last_ms": 8000,
         "last_race": 1,
-        "last_warm_invoke_ms": 900,
         "measured_on": 2,
         "median_ms": 8000,
         "races": 1
@@ -990,8 +954,7 @@
           "clicked_at": 3000,
           "first_frame_at": 5500,
           "phases": {
-            "publish_ms": 2000,
-            "warm_invoke_ms": 340
+            "publish_ms": 2000
           }
         },
         "phase": "running",
@@ -1025,8 +988,7 @@
           "first_frame_at": 15000,
           "phases": {
             "capacity_wait_ms": 4000,
-            "publish_ms": 2500,
-            "warm_invoke_ms": 360
+            "publish_ms": 2500
           }
         },
         "phase": "running",

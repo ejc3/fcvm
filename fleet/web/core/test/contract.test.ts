@@ -35,6 +35,11 @@ const PAGE_DERIVED: Record<string, string> = {
   "tiles[].gpu.util_pct": "a reading from gpu_stats",
   "scene.lights[].color": "linear RGB turned into a CSS colour",
   "relaunch_all.ec2_capacity_wait_ms": "0 when absent",
+  "relaunch_all.lambda_capacity_wait_ms": "0 when absent",
+  "tiles[].side": "the side of the image the tile's backing (half) is on",
+  "phones.tiles[].side": "as tiles[].side",
+  "windows.tiles[].side": "as tiles[].side",
+  "minecraft.tiles[].side": "as tiles[].side",
   "layout.generation": "0 when the coordinator sends no layout",
   "layout.from_frame": "0 when the coordinator sends no layout",
 };

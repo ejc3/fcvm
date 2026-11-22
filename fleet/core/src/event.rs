@@ -63,8 +63,7 @@ pub enum Event {
         report: SlotReport,
     },
     /// The Lambda driver's report about one Lambda tile (`lam-<n>`). `vm` names the
-    /// execution environment the tile runs in (none while it has none); a report's
-    /// `warm_invoke_ms` timing is the warm invoke, kept beside the race time, never in it.
+    /// execution environment the tile runs in (none while it has none).
     Lambda {
         at: u64,
         report: SlotReport,
