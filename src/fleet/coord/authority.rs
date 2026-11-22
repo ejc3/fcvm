@@ -16,6 +16,12 @@
 //! truncated (TC) with no records. Over UDP, responses per source prefix are limited
 //! ([`RateLimit`]) so the server cannot be used to amplify traffic at a forged address.
 //!
+//! What the server did is logged where a lost answer would need it: each launch name's first
+//! query ([`Asked`]: its type, transport, verdict and how long the name had been in the zone),
+//! every one-second window in which the rate limit truncated or withheld responses (at the
+//! first query after the window), and any rise in the kernel's UDP receive errors
+//! ([`udp_errors`] and [`udp6_errors`], `/proc/net/snmp` and `/proc/net/snmp6`).
+//!
 //! Parsing never follows a compression pointer: a name in a query must be written out, so a
 //! pointer loop cannot occur, and every read is bounded by the packet.
 
@@ -638,6 +644,9 @@ pub struct RateLimit {
     window: Option<Instant>,
     counts: HashMap<(bool, u128), u32>,
     slip: bool,
+    /// Responses of the current window sent truncated, and withheld.
+    slipped: u32,
+    dropped: u32,
 }
 
 impl RateLimit {
@@ -647,6 +656,8 @@ impl RateLimit {
             window: None,
             counts: HashMap::new(),
             slip: false,
+            slipped: 0,
+            dropped: 0,
         }
     }
 
@@ -667,8 +678,19 @@ impl RateLimit {
             .window
             .is_none_or(|w| now.duration_since(w) >= Duration::from_secs(1))
         {
+            if self.slipped + self.dropped > 0 {
+                tracing::warn!(
+                    slipped = self.slipped,
+                    dropped = self.dropped,
+                    prefixes = self.counts.len(),
+                    per_second = self.per_second,
+                    "DNS responses rate limited"
+                );
+            }
             self.window = Some(now);
             self.counts.clear();
+            self.slipped = 0;
+            self.dropped = 0;
         }
         let key = Self::prefix(ip);
         let full = self.counts.len() >= RATE_PREFIXES;
@@ -688,10 +710,201 @@ impl RateLimit {
     fn over(&mut self) -> Verdict {
         self.slip = !self.slip;
         if self.slip {
+            self.slipped = self.slipped.saturating_add(1);
             Verdict::Slip
         } else {
+            self.dropped = self.dropped.saturating_add(1);
             Verdict::Drop
         }
+    }
+}
+
+impl Verdict {
+    fn name(self) -> &'static str {
+        match self {
+            Verdict::Answer => "answer",
+            Verdict::Slip => "slip",
+            Verdict::Drop => "drop",
+        }
+    }
+}
+
+/// When each name of the zone appeared in the zone this server answers from, until its first
+/// query is logged. `serve` refreshes it whenever the zone changes, so the time is the name's
+/// publication; a name that leaves the zone is forgotten, so this holds at most the zone's
+/// names.
+#[derive(Default)]
+pub struct Asked {
+    serial: Option<u32>,
+    /// Name to (when this server first had it, whether its first query was logged).
+    names: HashMap<String, (Instant, bool)>,
+}
+
+impl Asked {
+    /// Take the zone's names: a new one appeared `now`, one no longer held is forgotten. A
+    /// zone no newer than the last one taken changes nothing: a query task can hold an older
+    /// zone than the watcher already recorded. The serial is the state version, which only
+    /// grows in one coordinator.
+    pub fn refresh(&mut self, zone: &Zone, now: Instant) {
+        if self.serial.is_some_and(|s| zone.serial <= s) {
+            return;
+        }
+        self.serial = Some(zone.serial);
+        let held: std::collections::HashSet<&String> =
+            zone.a.keys().chain(zone.aaaa.keys()).collect();
+        self.names.retain(|n, _| held.contains(n));
+        for n in held {
+            self.names.entry(n.clone()).or_insert((now, false));
+        }
+    }
+
+    /// Note a query for `name` (lower case, no trailing dot) of `qtype` and what was done with
+    /// it; logs the first one for each name the zone holds.
+    pub fn note(
+        &mut self,
+        zone: &Zone,
+        name: &str,
+        qtype: u16,
+        transport: &str,
+        verdict: Verdict,
+        now: Instant,
+    ) {
+        // The zone watcher in `serve` normally took this zone already; this covers a query
+        // that arrives before it runs.
+        self.refresh(zone, now);
+        let Some((since, logged)) = self.names.get_mut(name) else {
+            return;
+        };
+        if *logged {
+            return;
+        }
+        *logged = true;
+        tracing::info!(
+            name,
+            qtype,
+            transport,
+            verdict = verdict.name(),
+            in_zone_ms = now.duration_since(*since).as_millis() as u64,
+            "launch name first asked"
+        );
+    }
+}
+
+/// The question of a query, when it is one: its name (lower case, no trailing dot) and type.
+fn question_of(m: &[u8]) -> Option<(String, u16)> {
+    match parse(m) {
+        Parsed::Query(q) => Some((q.name, q.qtype)),
+        _ => None,
+    }
+}
+
+/// `InErrors` and `RcvbufErrors` of the `Udp:` lines of `/proc/net/snmp`: datagrams the kernel
+/// discarded before the server read them (a full receive buffer among them).
+pub fn udp_errors(snmp: &str) -> Option<(u64, u64)> {
+    let mut lines = snmp.lines().filter(|l| l.starts_with("Udp:"));
+    let names: Vec<&str> = lines.next()?.split_whitespace().collect();
+    let values: Vec<&str> = lines.next()?.split_whitespace().collect();
+    let get = |key: &str| -> Option<u64> {
+        let i = names.iter().position(|n| *n == key)?;
+        values.get(i)?.parse().ok()
+    };
+    Some((get("InErrors")?, get("RcvbufErrors")?))
+}
+
+/// `Udp6InErrors` and `Udp6RcvbufErrors` of `/proc/net/snmp6`: the same counts for IPv6
+/// sockets, which `/proc/net/snmp` leaves out.
+pub fn udp6_errors(snmp6: &str) -> Option<(u64, u64)> {
+    let get = |key: &str| -> Option<u64> {
+        snmp6.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next()? == key).then(|| f.next()?.parse().ok())?
+        })
+    };
+    Some((get("Udp6InErrors")?, get("Udp6RcvbufErrors")?))
+}
+
+/// One family's UDP receive error counters, as last read.
+struct UdpCounters {
+    family: &'static str,
+    path: &'static str,
+    parse: fn(&str) -> Option<(u64, u64)>,
+    last: Option<(u64, u64)>,
+    /// The last read or parse failed (and was logged).
+    failing: bool,
+}
+
+impl UdpCounters {
+    fn both() -> [UdpCounters; 2] {
+        [
+            UdpCounters {
+                family: "ipv4",
+                path: "/proc/net/snmp",
+                parse: udp_errors,
+                last: None,
+                failing: false,
+            },
+            UdpCounters {
+                family: "ipv6",
+                path: "/proc/net/snmp6",
+                parse: udp6_errors,
+                last: None,
+                failing: false,
+            },
+        ]
+    }
+
+    /// Read the counters once (`read` is `std::fs::read_to_string` outside tests): log a rise
+    /// since the last read, and log once when they cannot be read or parsed, since a watcher
+    /// that cannot see drops must not look like one that saw none.
+    fn step(&mut self, read: impl Fn(&str) -> std::io::Result<String>) {
+        let read = read(self.path);
+        let now = match &read {
+            Ok(text) => (self.parse)(text),
+            Err(_) => None,
+        };
+        let Some(now) = now else {
+            if !self.failing {
+                self.failing = true;
+                tracing::warn!(
+                    family = self.family,
+                    path = self.path,
+                    error = %match &read {
+                        Ok(_) => "no UDP receive error counters in it".to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                    "UDP receive errors cannot be read; drops on arrival will not be logged"
+                );
+            }
+            // A later good read starts a new baseline.
+            self.last = None;
+            return;
+        };
+        self.failing = false;
+        if let Some((in_errors, rcvbuf)) = self.last {
+            if now.0 > in_errors || now.1 > rcvbuf {
+                tracing::warn!(
+                    family = self.family,
+                    in_errors = now.0.saturating_sub(in_errors),
+                    rcvbuf_errors = now.1.saturating_sub(rcvbuf),
+                    "the kernel discarded received UDP datagrams in this network namespace"
+                );
+            }
+        }
+        self.last = Some(now);
+    }
+}
+
+/// Every 10 s, log a rise in the kernel's UDP receive errors, IPv4 and IPv6 each. The counters
+/// are the network namespace's (in the coordinator's task, also cloudflared's QUIC sockets),
+/// so a rise says datagrams were lost on arrival in this task, and the first-query lines say
+/// which names.
+async fn watch_udp_errors() {
+    let mut counters = UdpCounters::both();
+    loop {
+        for c in counters.iter_mut() {
+            c.step(|p| std::fs::read_to_string(p));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
@@ -737,12 +950,37 @@ impl Authority {
             udp: udp.local_addr()?,
             tcp: tcp.local_addr()?,
         };
-        tokio::spawn(self.clone().udp(udp, RateLimit::new(per_second)));
-        tokio::spawn(self.tcp(tcp));
+        let asked = Arc::new(std::sync::Mutex::new(Asked::default()));
+        asked
+            .lock()
+            .unwrap()
+            .refresh(&self.zone.borrow(), Instant::now());
+        {
+            // Each name's time in `Asked` is when this server got the zone that holds it.
+            let mut zone = self.zone.clone();
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while zone.changed().await.is_ok() {
+                    let z = zone.borrow_and_update().clone();
+                    asked.lock().unwrap().refresh(&z, Instant::now());
+                }
+            });
+        }
+        tokio::spawn(
+            self.clone()
+                .udp(udp, RateLimit::new(per_second), asked.clone()),
+        );
+        tokio::spawn(self.tcp(tcp, asked));
+        tokio::spawn(watch_udp_errors());
         Ok(served)
     }
 
-    async fn udp(self, sock: tokio::net::UdpSocket, mut limit: RateLimit) {
+    async fn udp(
+        self,
+        sock: tokio::net::UdpSocket,
+        mut limit: RateLimit,
+        asked: Arc<std::sync::Mutex<Asked>>,
+    ) {
         let mut buf = vec![0u8; MAX_QUERY + 1];
         loop {
             let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -755,7 +993,15 @@ impl Authority {
             };
             let zone = self.zone.borrow().clone();
             let m = &buf[..n];
-            let out = match limit.check(peer.ip(), Instant::now()) {
+            let now = Instant::now();
+            let verdict = limit.check(peer.ip(), now);
+            if let Some((name, qtype)) = question_of(m) {
+                asked
+                    .lock()
+                    .unwrap()
+                    .note(&zone, &name, qtype, "udp", verdict, now);
+            }
+            let out = match verdict {
                 Verdict::Answer => respond(&self.cfg, &zone, m, false),
                 Verdict::Slip => truncated(&self.cfg, &zone, m),
                 Verdict::Drop => None,
@@ -768,7 +1014,7 @@ impl Authority {
         }
     }
 
-    async fn tcp(self, listener: tokio::net::TcpListener) {
+    async fn tcp(self, listener: tokio::net::TcpListener, asked: Arc<std::sync::Mutex<Asked>>) {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP));
         loop {
             let (stream, _) = match listener.accept().await {
@@ -783,14 +1029,19 @@ impl Authority {
                 continue; // dropped: closed at once
             };
             let me = self.clone();
+            let asked = asked.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = me.connection(stream).await;
+                let _ = me.connection(stream, asked).await;
             });
         }
     }
 
-    async fn connection(&self, mut s: tokio::net::TcpStream) -> Result<()> {
+    async fn connection(
+        &self,
+        mut s: tokio::net::TcpStream,
+        asked: Arc<std::sync::Mutex<Asked>>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; MAX_QUERY];
         for _ in 0..TCP_QUERIES {
             let len = tokio::time::timeout(TCP_IDLE, s.read_u16()).await?? as usize;
@@ -799,6 +1050,16 @@ impl Authority {
             }
             tokio::time::timeout(TCP_IDLE, s.read_exact(&mut buf[..len])).await??;
             let zone = self.zone.borrow().clone();
+            if let Some((name, qtype)) = question_of(&buf[..len]) {
+                asked.lock().unwrap().note(
+                    &zone,
+                    &name,
+                    qtype,
+                    "tcp",
+                    Verdict::Answer,
+                    Instant::now(),
+                );
+            }
             let Some(out) = respond(&self.cfg, &zone, &buf[..len], true) else {
                 return Ok(());
             };
@@ -814,6 +1075,221 @@ impl Authority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Logs written while `f` runs on this thread (and by tasks a current-thread runtime runs
+    /// on it).
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Logs {
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            #[derive(Clone)]
+            struct W(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for W {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let w = W(buf.clone());
+            let sub = tracing_subscriber::fmt()
+                .with_writer(move || w.clone())
+                .with_ansi(false)
+                .finish();
+            (Logs(buf), tracing::subscriber::set_default(sub))
+        }
+        fn lines(&self, containing: &str) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains(containing))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// One UDP query to `server`; the answer, or None within 500 ms.
+    async fn ask_udp(server: SocketAddr, q: &[u8]) -> Option<Vec<u8>> {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.send_to(q, server).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_millis(500), s.recv(&mut buf))
+            .await
+            .ok()?
+            .unwrap();
+        Some(buf[..n].to_vec())
+    }
+
+    /// A launch name's first query is logged once: its name and type, the transport, what
+    /// the server did with it and how long the name had been in its zone. On 2026-11-15,
+    /// 11-20 and 11-22 a relaunched tile's fresh name got no answer from 1.1.1.1 within 2 s,
+    /// and nothing on the server said whether its query ever arrived.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_names_first_query_is_logged_once() {
+        let (logs, _guard) = Logs::capture();
+        let (tx, rx) = watch::channel(Arc::new(Zone::default()));
+        let served = Authority {
+            cfg: Arc::new(cfg()),
+            zone: rx,
+        }
+        .serve("127.0.0.1:0".parse().unwrap(), 1000)
+        .await
+        .unwrap();
+        // Published while nothing is asked: its time in the zone counts from here.
+        tx.send(Arc::new(zone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let name = "slot-1-abcdefgh.tiles.fcvm.example";
+        for _ in 0..2 {
+            assert!(ask_udp(served.udp, &query(name, T_AAAA, Some(1232)))
+                .await
+                .is_some());
+        }
+        // A name the zone does not hold is not a launch name.
+        ask_udp(
+            served.udp,
+            &query("slot-9-zzzzzzzz.tiles.fcvm.example", T_AAAA, Some(1232)),
+        )
+        .await;
+        let first = logs.lines("launch name first asked");
+        assert_eq!(first.len(), 1, "{first:?}");
+        for want in [name, "qtype=28", "transport=\"udp\"", "verdict=\"answer\""] {
+            assert!(first[0].contains(want), "{want} missing: {}", first[0]);
+        }
+        let in_zone: u64 = first[0]
+            .split("in_zone_ms=")
+            .nth(1)
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no in_zone_ms: {}", first[0]));
+        assert!(
+            in_zone >= 300,
+            "the name was published 300 ms before it was asked: {}",
+            first[0]
+        );
+    }
+
+    /// A query task can hold an older zone than the one the zone watcher already recorded
+    /// (Codex on #2005): refreshing with it must not forget a name the newer zone published,
+    /// or that name's first query is logged with the wrong time in the zone.
+    #[test]
+    fn an_older_zone_does_not_roll_back_publication_times() {
+        let (logs, _guard) = Logs::capture();
+        let old = Zone {
+            serial: 7,
+            ..Zone::default()
+        };
+        let new = Zone {
+            serial: 8,
+            ..zone()
+        };
+        let t0 = Instant::now();
+        let mut asked = Asked::default();
+        asked.refresh(&new, t0);
+        asked.refresh(&old, t0 + Duration::from_secs(1));
+        asked.note(
+            &new,
+            "slot-1-abcdefgh.tiles.fcvm.example",
+            T_AAAA,
+            "udp",
+            Verdict::Answer,
+            t0 + Duration::from_secs(2),
+        );
+        let first = logs.lines("launch name first asked");
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("in_zone_ms=2000"), "{}", first[0]);
+    }
+
+    /// Receive errors on IPv6 sockets are counted in `/proc/net/snmp6` (Codex on #2005).
+    #[test]
+    fn udp6_receive_errors_are_read_from_proc_net_snmp6() {
+        let snmp6 = "Udp6InDatagrams                 \t1000\n\
+                     Udp6NoPorts                     \t3\n\
+                     Udp6InErrors                    \t199\n\
+                     Udp6RcvbufErrors                \t198\n\
+                     UdpLite6InErrors                \t0\n";
+        assert_eq!(udp6_errors(snmp6), Some((199, 198)));
+        assert_eq!(udp6_errors("Ip6InReceives 1\n"), None);
+    }
+
+    /// A counter file that cannot be read or parsed is logged once, not skipped in silence
+    /// (Greptile on #2005); each family keeps its own baseline, so one file failing and
+    /// coming back is not a rise in the other (CodeRabbit on #2005).
+    #[test]
+    fn udp_counters_say_when_they_cannot_be_read_and_keep_per_family_baselines() {
+        let (logs, _guard) = Logs::capture();
+        let [mut v4, mut v6] = UdpCounters::both();
+        let snmp = |e: u64, r: u64| {
+            format!(
+                "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n\
+                 Udp: 100 0 {e} 90 {r} 0\n"
+            )
+        };
+        let snmp6 = |e: u64, r: u64| format!("Udp6InErrors {e}\nUdp6RcvbufErrors {r}\n");
+        let missing = |_: &str| -> std::io::Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        v4.step(|_| Ok(snmp(5, 5)));
+        v6.step(missing);
+        v6.step(missing);
+        assert_eq!(logs.lines("cannot be read").len(), 1, "logged once");
+        v6.step(|_| Ok(snmp6(40, 40)));
+        v4.step(|_| Ok(snmp(5, 5)));
+        assert!(
+            logs.lines("discarded").is_empty(),
+            "a first good read is a baseline"
+        );
+        v6.step(|_| Ok(snmp6(43, 41)));
+        let rise = logs.lines("discarded");
+        assert_eq!(rise.len(), 1, "{rise:?}");
+        for want in ["family=\"ipv6\"", "in_errors=3", "rcvbuf_errors=1"] {
+            assert!(rise[0].contains(want), "{want}: {}", rise[0]);
+        }
+        v4.step(|_| Ok("Udp: nothing\n".into()));
+        assert_eq!(
+            logs.lines("cannot be read").len(),
+            2,
+            "a parse failure is logged too"
+        );
+    }
+
+    #[test]
+    fn udp_receive_errors_are_read_from_proc_net_snmp() {
+        let snmp = "Ip: Forwarding DefaultTTL\nIp: 1 64\n\
+                    Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n\
+                    Udp: 1000 3 17 990 12 0\n\
+                    UdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n\
+                    UdpLite: 0 0 0 0 0 0\n";
+        assert_eq!(udp_errors(snmp), Some((17, 12)));
+        assert_eq!(udp_errors("Ip: Forwarding\nIp: 1\n"), None);
+    }
+
+    /// Responses the rate limit truncated or withheld are counted and logged once their
+    /// one-second window ends, so a resolver that got none can be checked against them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limited_responses_are_logged_per_window() {
+        let (logs, _guard) = Logs::capture();
+        let (_tx, rx) = watch::channel(Arc::new(zone()));
+        let served = Authority {
+            cfg: Arc::new(cfg()),
+            zone: rx,
+        }
+        .serve("127.0.0.1:0".parse().unwrap(), 1)
+        .await
+        .unwrap();
+        let q = query("slot-1-abcdefgh.tiles.fcvm.example", T_AAAA, Some(1232));
+        // Answered, slipped (TC), dropped.
+        for _ in 0..3 {
+            ask_udp(served.udp, &q).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        ask_udp(served.udp, &q).await;
+        let limited = logs.lines("DNS responses rate limited");
+        assert_eq!(limited.len(), 1, "{limited:?}");
+        assert!(limited[0].contains("slipped=1"), "{}", limited[0]);
+        assert!(limited[0].contains("dropped=1"), "{}", limited[0]);
+    }
 
     fn cfg() -> ZoneConfig {
         ZoneConfig::new(
