@@ -10,7 +10,9 @@ name = "start-pieces"
 path = "src/main.rs"
 
 [dependencies]
-fcvm = { path = "../../.." }
+# Without fcvm's default features (its integration-test tiers): this crate is a default
+# workspace member, and the default features would switch those tests on in `make test-unit`.
+fcvm = { path = "../../..", default-features = false }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
