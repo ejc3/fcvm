@@ -14,6 +14,8 @@ COPY tests ./tests
 # test-host checks the own-GPU autopilot's lap (fleet/core/tests), at the path it reads
 # relative to tests/test_host.cpp
 COPY --from=core-tests autopilot_lap.json /core/tests/autopilot_lap.json
+# and the page's stream heights it checks the renderer's cap against (fleet/web/core/layout.ts)
+COPY --from=web-core layout.ts /web/core/layout.ts
 RUN make -j"$(nproc)" all && ./build/test-host
 
 FROM docker.io/library/ubuntu:24.04

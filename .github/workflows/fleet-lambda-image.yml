@@ -11,8 +11,10 @@ on:
     paths:
       - 'fleet/lambda/**'
       - 'fleet/renderer/**'
-      # The renderer image's test-host reads the autopilot lap from here (its build context).
+      # The renderer image's test-host reads the autopilot lap and the page's stream heights
+      # (its build contexts).
       - 'fleet/core/tests/**'
+      - 'fleet/web/core/layout.ts'
       # The tile runtime and its tunnel, which the coordinator speaks.
       - 'src/fleet/lambda_tile.rs'
       - 'src/fleet/tunnel.rs'
@@ -24,6 +26,7 @@ on:
       - 'fleet/lambda/**'
       - 'fleet/renderer/**'
       - 'fleet/core/tests/**'
+      - 'fleet/web/core/layout.ts'
       - 'src/fleet/lambda_tile.rs'
       - 'src/fleet/tunnel.rs'
       - 'Cargo.toml'
@@ -51,8 +54,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           df -h /
       - uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # 1.93.0
-        with:
-          toolchain: 1.93.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fleet-lambda-x86_64
