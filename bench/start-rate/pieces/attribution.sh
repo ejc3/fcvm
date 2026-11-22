@@ -20,6 +20,7 @@ for piece in ${pieces//,/ }; do
   sleep 5
   echo "=== $(date -u +%H:%M:%S) attribution $piece C=$C N=$N ALIVE=$ALIVE"
   make --no-print-directory bench-start-pieces PIECE="$piece" OUT="$cell" COUNT="$N" \
+    START_PIECES="${START_PIECES:-$PWD/target/release/start-pieces}" \
     CONCURRENCY="$C" ALIVE="$ALIVE" SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" FIRECRACKER="${FIRECRACKER:-}" \
     UFFD_SOCKET="${UFFD_SOCKET:-}" ARGS="--steady-secs 5" > "$cell.log" 2>&1
   echo "exit=$?"

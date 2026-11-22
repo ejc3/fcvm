@@ -59,7 +59,7 @@ says `torn`. The driver:
 
 1. makes and starts ALIVE instances (untimed): the "already alive" load;
 2. prepares COUNT instances (untimed);
-3. samples 3 s of idle: the held set's own CPU;
+3. samples 3 s of idle: the CPU of the ALIVE and prepared instances, taken off each op;
 4. starts the COUNT instances, at most CONCURRENCY in flight (timed);
 5. samples 10 s with all ALIVE+COUNT held (`steady_per_s`, `steady_per_instance_per_s`);
 6. tears everything down at CONCURRENCY (timed, `teardown`).
@@ -70,7 +70,7 @@ says `torn`. The driver:
 | `timed.latency_ms` | per op, the driver's `go` to `done` (p50, p90, p99, max) |
 | `timed.op_ms`, `stages_ms` | the child's own timing of the piece and its stages |
 | `timed.per_op.cgroup_cpu_s` | the run's cgroup `usage_usec` delta / ops: every descendant, alive or reaped |
-| `timed.cgroup_cpu_s_per_op_net` | the same less the held set's idle CPU over the window |
+| `timed.cgroup_cpu_s_per_op_net` | the same less the idle CPU, over the window, of everything held before it: the ALIVE instances and the COUNT prepared ones (null without a cgroup of its own) |
 | `timed.per_op.host_busy_cpu_s`, `host_cpu_s_per_op_net` | `/proc/stat` busy time / ops, which also counts kernel threads outside the cgroup (netns cleanup, RCU, btrfs commits, kworkers) |
 | `timed.per_op.ctxt`, `ipi` | host-wide context switches and IPIs (`/proc/interrupts` IPI rows) per op |
 

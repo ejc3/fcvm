@@ -42,7 +42,8 @@ pub enum Prober {
 pub struct PieceArgs {
     #[arg(long, value_enum)]
     pub piece: Piece,
-    /// Where instances keep their state files and data directories.
+    /// Where the state piece keeps its state files. The other pieces put a clone's runtime
+    /// directory where fcvm does (`paths::vm_runtime_dir`).
     #[arg(long, default_value = "/mnt/fcvm-btrfs/pieces")]
     pub work_dir: PathBuf,
     /// A snapshot directory (`snapshots/<tag>`) for the disk and vmm pieces.
@@ -377,6 +378,24 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
     Ok(stages)
 }
 
+/// The vmm piece overrides only the `rootfs` drive. A snapshot with extra disks would load
+/// them from the source's own files, and a resumed guest could write to them, so it is
+/// refused (production overrides every drive).
+fn restorable_with_rootfs_override_only(config_json: &str) -> Result<()> {
+    let config: serde_json::Value = serde_json::from_str(config_json)?;
+    let extra = config["metadata"]["extra_disks"]
+        .as_array()
+        .context("the snapshot's config.json has no metadata.extra_disks")?;
+    if !extra.is_empty() {
+        bail!(
+            "the snapshot has {} extra disk(s); the vmm piece restores only snapshots whose \
+             one writable drive is rootfs",
+            extra.len()
+        );
+    }
+    Ok(())
+}
+
 /// Firecracker spawn, snapshot load with every path overridden, resume: what
 /// `restore_from_snapshot` does between its substrate and its state save.
 async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Result<()> {
@@ -385,6 +404,7 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
         VsockOverride,
     };
     let snapshot = snapshot_dir(args)?;
+    restorable_with_rootfs_override_only(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
     let pid = held.holder.as_ref().map(|(_, p)| *p).context("no holder")?;
     let firecracker = args.firecracker.as_ref().context("needs --firecracker")?;
     let disk = held.disk_path.clone().context("no disk")?;
@@ -502,4 +522,21 @@ pub fn http_serve(addr: &str) -> Result<()> {
         let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot with an extra disk is refused: the piece would load that disk from the
+    /// source's file and the resumed guest could write to it.
+    #[test]
+    fn a_snapshot_with_extra_disks_is_refused() {
+        assert!(restorable_with_rootfs_override_only(r#"{"metadata":{"extra_disks":[]}}"#).is_ok());
+        let refused = restorable_with_rootfs_override_only(
+            r#"{"metadata":{"extra_disks":[{"drive_id":"disk0","filename":"disk0.raw"}]}}"#,
+        );
+        assert!(format!("{:#}", refused.unwrap_err()).contains("1 extra disk"));
+        assert!(restorable_with_rootfs_override_only(r#"{"metadata":{}}"#).is_err());
+    }
 }
