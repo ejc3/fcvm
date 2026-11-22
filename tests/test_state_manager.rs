@@ -987,6 +987,58 @@ async fn starting_a_vm_reads_no_other_vms_state() {
     );
 }
 
+/// Starting and stopping a VM truncates no lock file. Lock files hold nothing, and opening one
+/// with O_TRUNC takes the inode lock for writing and changes the file: at the teardown of
+/// 1000 clones, 1,075 waiters queued on `names.lock` for 6 s each (bench/start-rate).
+/// A truncation of an existing file is an IN_MODIFY event; creating one is not.
+#[tokio::test]
+async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let start_and_stop = |id: &'static str| {
+        let manager = &manager;
+        async move {
+            let mut vm = VmState::new(id.to_string(), "alpine:latest".to_string(), 1, 512);
+            vm.name = Some("same-name".to_string());
+            manager.claim_name(&mut vm).await.unwrap();
+            manager.allocate_loopback_ip(&mut vm).await.unwrap();
+            vm.status = VmStatus::Running;
+            manager.save_state(&vm).await.unwrap();
+            manager.delete_state(id).await.unwrap();
+        }
+    };
+    // The first start creates the shared lock files; the second opens them again.
+    start_and_stop("vm-first").await;
+    let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+    inotify
+        .add_watch(temp_dir.path(), AddWatchFlags::IN_MODIFY)
+        .unwrap();
+    start_and_stop("vm-second").await;
+    let mut truncated = Vec::new();
+    loop {
+        match inotify.read_events() {
+            Ok(events) if !events.is_empty() => {
+                for event in events {
+                    let name = event.name.map(|n| n.to_string_lossy().into_owned());
+                    if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW)
+                        || name.as_deref().is_some_and(|n| n.ends_with(".lock"))
+                    {
+                        truncated.push(name.unwrap_or_else(|| "(queue overflow)".into()));
+                    }
+                }
+            }
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => break,
+            Err(error) => panic!("reading inotify events: {error}"),
+        }
+    }
+    assert!(
+        truncated.is_empty(),
+        "starting and stopping a VM modified lock files: {truncated:?}"
+    );
+}
+
 /// A clone finds its memory server by PID. That lookup must read the server's state and
 /// no other VM's.
 #[tokio::test]

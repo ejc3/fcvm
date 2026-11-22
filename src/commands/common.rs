@@ -5206,7 +5206,7 @@ async fn lock_vm_snapshots(
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
     let lock_path = vm_dir.join("snapshot.lock");
-    let lock_file = std::fs::File::create(&lock_path)
+    let lock_file = open_lock_file(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
     let mut noted_wait = false;
@@ -5288,9 +5288,20 @@ pub async fn acquire_snapshot_dir_lock(
     acquire_flock(&snapshot_sibling(snapshot_dir, "lock"), exclusive).await
 }
 
+/// Open `lock_path` for an flock, created if missing and never truncated: every clone takes
+/// its snapshot's lock, and an O_TRUNC open takes the inode lock for writing and changes the
+/// file each time.
+fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
 /// Take an flock on `lock_path`, created if missing, waiting for it.
 async fn acquire_flock(lock_path: &Path, exclusive: bool) -> Result<std::fs::File> {
-    let lock_file = std::fs::File::create(lock_path)
+    let lock_file = open_lock_file(lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
@@ -7819,6 +7830,48 @@ mod tests {
             a, b,
             "restore epochs minted back-to-back (same wall-clock second) must differ"
         );
+    }
+
+    /// Taking a snapshot's lock, or a VM's snapshot lock, again does not truncate the lock
+    /// file: every clone takes its snapshot's lock, and an O_TRUNC open takes the inode lock
+    /// for writing and modifies the file (an IN_MODIFY event; creating it is not one).
+    #[tokio::test]
+    async fn taking_a_snapshot_lock_again_truncates_nothing() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_dir = root.path().join("snap");
+        let disk = root.path().join("vm").join("disks").join("rootfs.raw");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        for dir in [root.path(), &root.path().join("vm")] {
+            inotify.add_watch(dir, AddWatchFlags::IN_MODIFY).unwrap();
+        }
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let modified: Vec<_> = match inotify.read_events() {
+            Ok(events) => events.into_iter().map(|e| e.name).collect(),
+            Err(nix::errno::Errno::EAGAIN) => Vec::new(),
+            Err(error) => panic!("reading inotify events: {error}"),
+        };
+        assert!(modified.is_empty(), "lock files modified: {modified:?}");
     }
 
     /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
