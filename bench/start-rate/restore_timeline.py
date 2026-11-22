@@ -6,13 +6,17 @@ from the clone's own log, the harness's receive time of each restore marker and 
 phase record in the restore acknowledgement. With `--trace DIR` it joins two host-side
 records taken during the run:
 
-  vcpustat.jsonl  (vcpustat.py)  the vCPU thread's on-CPU and runqueue-wait time
-  s2fault.txt     (s2fault.bt)   stage-2 faults, device aborts and time in handle_userfault,
-                                 100 ms buckets
+  vcpustat.jsonl  (vcpustat.py)  the vCPU thread's on-CPU and runqueue-wait time and ticks
+  s2fault.txt     (s2fault.bt)   the vCPU thread's stage-2 faults and the time each took to
+                                 return to the guest, device aborts, time in handle_userfault
 
 and splits resume -> ready into: vCPU on a CPU, vCPU runnable and waiting for one, vCPU
 blocked in a userfault, and the rest (the guest idle, or the vCPU thread asleep in the host
-for another reason).
+for another reason). A count or time from s2fault.txt is the part of its buckets inside the
+window: whole buckets, and the last one in proportion to its overlap (the buckets are 10 ms
+wide for the first second after the VMM's first stage-2 fault). Ticks are the scheduler's,
+10 ms each, so a single clone's tick figures mean little and the table gives their mean.
+A clone the sampler holds no usable record for is left out and counted by reason.
 """
 import argparse
 import datetime
@@ -46,7 +50,30 @@ STEPS = [
 ]
 STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z")
 FC_PID = re.compile(r"Firecracker Child\.id\(\) returned: Some\((\d+)\)")
-BUCKET_NS = 100_000_000
+FINE_NS, FINE_BUCKETS, COARSE_NS = 10_000_000, 100, 100_000_000
+TICK_MS = 10
+
+
+def bucket_span(index):
+    """The [start, end) of an s2fault.bt bucket, in ns after the VMM's first stage-2 fault:
+    100 buckets of 10 ms, then 100 ms each."""
+    if index < FINE_BUCKETS:
+        return index * FINE_NS, (index + 1) * FINE_NS
+    start = FINE_BUCKETS * FINE_NS + (index - FINE_BUCKETS) * COARSE_NS
+    return start, start + COARSE_NS
+
+
+def within(buckets, window_ns):
+    """The part of `buckets` ({index: value}) that lies in the first `window_ns`: whole
+    buckets, and a bucket the window ends in by the share of it the window covers."""
+    total = 0.0
+    for index, value in buckets.items():
+        start, end = bucket_span(index)
+        if window_ns >= end:
+            total += value
+        elif window_ns > start:
+            total += value * (window_ns - start) / (end - start)
+    return total
 
 
 def parse_clone(path):
@@ -85,7 +112,9 @@ def parse_clone(path):
 
 
 def load_vcpustat(path):
-    by_pid = {}
+    """{pid: [series]}; a series is the samples of one process, told apart from another
+    that had the same pid by its start time."""
+    by_process = {}
     with open(path) as f:
         lines = f.readlines()
     for line in lines:
@@ -93,8 +122,19 @@ def load_vcpustat(path):
             row = json.loads(line)
         except ValueError:
             continue
-        by_pid.setdefault(row["pid"], []).append(row)
+        by_process.setdefault((row["pid"], row.get("start")), []).append(row)
+    by_pid = {}
+    for (pid, _), series in by_process.items():
+        by_pid.setdefault(pid, []).append(series)
     return by_pid
+
+
+def series_for(by_pid, pid, resume_wall, ready_wall):
+    """The series of the process that had `pid` across the window, if the sampler saw one."""
+    for series in by_pid.get(pid, []):
+        if series[0]["w"] <= ready_wall and series[-1]["w"] >= resume_wall:
+            return series
+    return None
 
 
 def load_buckets(path):
@@ -126,36 +166,44 @@ def at(samples, wall, after):
 
 
 def join_clone(c, vs, maps):
-    """One clone's resume -> ready window split by the host-side records, or None when the
-    sampler holds nothing for its VMM."""
+    """One clone's resume -> ready window split by the host-side records: (row, None), or
+    (None, reason) when the records cannot give one."""
     pid, w = c["fc_pid"], c["wall"]
-    if pid not in vs or "resume" not in w or "ready" not in w:
-        return None
-    s1 = at(vs[pid], w["ready"], after=True)
+    if "resume" not in w or "ready" not in w:
+        return None, "no wall-clock stamp on its resume or ready line"
+    series = series_for(vs, pid, w["resume"], w["ready"])
+    if series is None:
+        return None, "the sampler never saw its VMM"
+    s1 = at(series, w["ready"], after=True)
     if s1 is None:
-        return None
-    s0 = at(vs[pid], w["resume"], after=False) or {"run": 0, "wait": 0, "gt": 0, "st": 0, "mrun": None}
+        return None, "ready after the sampler's last sample of its VMM"
+    s0 = at(series, w["resume"], after=False) or {"run": 0, "wait": 0, "gt": 0, "st": 0, "ut": 0, "mrun": None}
     window = (w["ready"] - w["resume"]) * 1000
+    window_ns = window * 1e6
     run = (s1["run"] - s0["run"]) / 1e6
     wait = (s1["wait"] - s0["wait"]) / 1e6
-    buckets = math.ceil(window * 1e6 / BUCKET_NS)
-    inside = lambda name: sum(v for b, v in maps.get(name, {}).get(pid, {}).items() if b < buckets)
+    inside = lambda name: within(maps.get(name, {}).get(pid, {}), window_ns)
     userfault = inside("ufns") / 1e6
+    faults, fault_ms = inside("s2"), inside("s2ns") / 1e6
     row = {"pid": pid, "window_ms": window, "vcpu_run_ms": run, "vcpu_wait_ms": wait,
-           "userfault_ms": userfault, "userfaults": inside("ufn"), "stage2_faults": inside("s2"),
-           "device_aborts": inside("mmio"),
-           "guest_ticks_ms": (s1["gt"] - s0["gt"]) * 10, "sys_ticks_ms": (s1["st"] - s0["st"]) * 10,
+           "userfault_ms": userfault, "userfaults": inside("ufn"), "stage2_faults": faults,
+           "stage2_fault_ms": fault_ms, "device_aborts": inside("mmio"),
+           "guest_ticks_ms": (s1["gt"] - s0["gt"]) * TICK_MS,
+           "sys_ticks_ms": (s1["st"] - s0["st"]) * TICK_MS,
+           "vmm_user_ticks_ms": ((s1["ut"] - s1["gt"]) - (s0["ut"] - s0["gt"])) * TICK_MS,
            "rest_ms": window - run - wait - userfault}
+    if faults >= 1:
+        row["us_per_stage2_fault"] = fault_ms * 1000 / faults
     if "healthy" in w:
-        h = at(vs[pid], w["healthy"], after=True)
+        h = at(series, w["healthy"], after=True)
         if h:
             row["ready_to_healthy_vcpu_run_ms"] = (h["run"] - s1["run"]) / 1e6
-        later = at(vs[pid], w["healthy"] + 2.0, after=True)
+        later = at(series, w["healthy"] + 2.0, after=True)
         if h and later:
             row["two_s_after_healthy_vcpu_run_ms"] = (later["run"] - h["run"]) / 1e6
             if later.get("mrun") is not None and h.get("mrun") is not None:
                 row["two_s_after_healthy_vmm_run_ms"] = (later["mrun"] - h["mrun"]) / 1e6
-    return row
+    return row, None
 
 
 def pct(vals, q):
@@ -163,12 +211,15 @@ def pct(vals, q):
     return vals[min(len(vals) - 1, int(q * len(vals)))] if vals else float("nan")
 
 
-def table(title, rows, unit="ms"):
+def table(title, rows, unit="ms", of=None):
+    """n is the clones the row has a value for; `of` the clones in the cell."""
     print(f"\n{title}")
-    print(f"  {'':34} {'n':>5} {'p50':>10} {'p90':>10} {'p99':>10}  {unit}")
+    count = "n" if of is None else f"n of {of}"
+    print(f"  {'':34} {count:>10} {'mean':>10} {'p50':>10} {'p90':>10} {'p99':>10}  {unit}")
     for name, vals in rows:
         if vals:
-            print(f"  {name:34} {len(vals):5} {pct(vals, .5):10.1f} {pct(vals, .9):10.1f} {pct(vals, .99):10.1f}")
+            print(f"  {name:34} {len(vals):10} {sum(vals) / len(vals):10.1f} {pct(vals, .5):10.1f} "
+                  f"{pct(vals, .9):10.1f} {pct(vals, .99):10.1f}")
 
 
 def main():
@@ -181,13 +232,15 @@ def main():
     a = ap.parse_args()
 
     names = sorted(os.listdir(os.path.join(a.run, "clones")))[a.first:a.last]
-    clones = [parse_clone(os.path.join(a.run, "clones", n)) for n in names]
-    clones = [c for c in clones if "ready" in c["t"] and "resume" in c["t"]]
-    print(f"{a.run}: {len(clones)} clones with resume and ready")
+    every = [parse_clone(os.path.join(a.run, "clones", n)) for n in names]
+    clones = [c for c in every if "ready" in c["t"] and "resume" in c["t"]]
+    cell = len(every)
+    print(f"{a.run}: {cell} clones, {len(clones)} with resume and ready, "
+          f"{cell - len(clones)} without (left out of every row)")
 
     table("steps, harness receive times of the clone's log lines",
           [(f"{x} -> {y}", [c["t"][y] - c["t"][x] for c in clones if x in c["t"] and y in c["t"]])
-           for x, y in STEPS])
+           for x, y in STEPS], of=cell)
     late = sum(1 for c in clones if "reset_wake" in c["t"] and c["t"]["reset_wake"] > c["t"].get("phases_done", 1e18))
     print(f"\n  transport reset read by the watcher after the restore finished: {late} of {len(clones)}")
 
@@ -195,7 +248,8 @@ def main():
                    if isinstance(v, (int, float)) and not isinstance(v, bool)})
     table("fc-agent's phase record (guest clock)",
           [(k, [c["phases"][k] for c in clones if c["phases"] and k in c["phases"]])
-           for k in keys if pct([c["phases"][k] for c in clones if c["phases"] and k in c["phases"]], .99) >= 0.05])
+           for k in keys if pct([c["phases"][k] for c in clones if c["phases"] and k in c["phases"]], .99) >= 0.05],
+          of=cell)
     netlink = [c["phases"].get("tcp_gate_netlink") for c in clones if c["phases"]]
     print(f"\n  gate over nfnetlink: {netlink.count(True)} of {len(netlink)}")
 
@@ -203,14 +257,27 @@ def main():
         return
     vs = load_vcpustat(os.path.join(a.trace, "vcpustat.jsonl"))
     maps = load_buckets(os.path.join(a.trace, "s2fault.txt"))
-    out = [row for row in (join_clone(c, vs, maps) for c in clones) if row]
-    print(f"\n{len(out)} clones joined with the host-side records")
-    table("resume -> ready, per clone (host clocks)",
+    out, dropped = [], {}
+    for c in clones:
+        row, reason = join_clone(c, vs, maps)
+        if row:
+            out.append(row)
+        else:
+            dropped[reason] = dropped.get(reason, 0) + 1
+    print(f"\n{len(out)} of {cell} clones joined with the host-side records")
+    for reason, count in sorted(dropped.items()):
+        print(f"  left out, {reason}: {count}")
+    table("resume -> ready, per clone (host clocks; ticks are 10 ms each, read their mean)",
           [(k, [r[k] for r in out if k in r]) for k in
-           ["window_ms", "vcpu_run_ms", "vcpu_wait_ms", "userfault_ms", "rest_ms",
-            "guest_ticks_ms", "sys_ticks_ms", "ready_to_healthy_vcpu_run_ms",
-            "two_s_after_healthy_vcpu_run_ms", "two_s_after_healthy_vmm_run_ms"]])
-    table("resume -> ready, per clone", [(k, [r[k] for r in out]) for k in ["stage2_faults", "device_aborts", "userfaults"]], unit="count")
+           ["window_ms", "vcpu_run_ms", "vcpu_wait_ms", "userfault_ms", "rest_ms", "stage2_fault_ms",
+            "guest_ticks_ms", "sys_ticks_ms", "vmm_user_ticks_ms", "ready_to_healthy_vcpu_run_ms",
+            "two_s_after_healthy_vcpu_run_ms", "two_s_after_healthy_vmm_run_ms"]], of=cell)
+    table("resume -> ready, per clone",
+          [(k, [r[k] for r in out if k in r]) for k in ["stage2_faults", "device_aborts", "userfaults"]],
+          unit="count", of=cell)
+    table("stage-2 fault on guest memory to the next guest entry, per clone's mean",
+          [("us_per_stage2_fault", [r["us_per_stage2_fault"] for r in out if "us_per_stage2_fault" in r])],
+          unit="us", of=cell)
     with open(os.path.join(a.trace, "s2fault.txt"), errors="replace") as f:
         for line in f:
             if line.startswith(("@execs:", "@forks:")):

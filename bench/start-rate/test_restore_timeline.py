@@ -44,42 +44,81 @@ class ParseClone(unittest.TestCase):
 
 
 class Join(unittest.TestCase):
-    def test_window_is_split_by_the_host_side_records(self):
-        t0 = wall("2026-01-01T00:00:10.100000")
+    def records(self, d, t0, start=77):
         samples = [
-            {"w": t0 - 0.01, "pid": 4242, "run": 1_000_000, "wait": 0, "gt": 0, "st": 0, "ut": 0, "mrun": 0},
-            {"w": t0 + 0.05, "pid": 4242, "run": 31_000_000, "wait": 10_000_000, "gt": 2, "st": 1, "ut": 2, "mrun": 0},
-            {"w": t0 + 0.13, "pid": 4242, "run": 61_000_000, "wait": 20_000_000, "gt": 4, "st": 2, "ut": 4, "mrun": 0},
+            {"w": t0 - 0.01, "pid": 4242, "start": start, "run": 1_000_000, "wait": 0, "gt": 0, "st": 0, "ut": 0, "mrun": 0},
+            {"w": t0 + 0.02, "pid": 4242, "start": start, "run": 21_000_000, "wait": 2_000_000, "gt": 1, "st": 1, "ut": 2, "mrun": 0},
+            {"w": t0 + 0.05, "pid": 4242, "start": start, "run": 41_000_000, "wait": 4_000_000, "gt": 1, "st": 2, "ut": 2, "mrun": 0},
         ]
+        (d / "vcpustat.jsonl").write_text("".join(json.dumps(s) + "\n" for s in samples))
+        # 10 ms buckets: 0..3 lie in a 35 ms window (the fourth by half), 4 and 50 do not;
+        # bucket 100 is the first 100 ms one (1.0 s to 1.1 s).
+        (d / "s2fault.txt").write_text(
+            "@s2[4242, 0]: 700\n@s2[4242, 1]: 200\n@s2[4242, 2]: 50\n@s2[4242, 3]: 40\n"
+            "@s2[4242, 4]: 1000\n@s2[4242, 50]: 9\n@s2[4242, 100]: 300\n"
+            "@s2ns[4242, 0]: 1400000\n@s2ns[4242, 3]: 600000\n@s2ns[4242, 4]: 9000000\n"
+            "@ufns[4242, 0]: 5000000\n@ufn[4242, 0]: 40\n@s2[7, 0]: 9\n@execs: 12\n"
+            "@mmio[4242, 1]: 300\n@mmio[4242, 5]: 1\n@device[1073750016]: 301\n")
+        return (restore_timeline.load_vcpustat(d / "vcpustat.jsonl"),
+                restore_timeline.load_buckets(d / "s2fault.txt"))
+
+    def test_a_short_window_counts_only_the_buckets_inside_it(self):
+        t0 = wall("2026-01-01T00:00:10.100000")
         with tempfile.TemporaryDirectory() as t:
-            d = Path(t)
-            (d / "vcpustat.jsonl").write_text("".join(json.dumps(s) + "\n" for s in samples))
-            (d / "s2fault.txt").write_text(
-                "@s2[4242, 0]: 700\n@s2[4242, 1]: 200\n@s2[4242, 2]: 50\n@s2[4242, 9]: 5\n"
-                "@ufns[4242, 0]: 5000000\n@ufn[4242, 0]: 40\n@s2[7, 0]: 9\n@execs: 12\n"
-                "@mmio[4242, 1]: 300\n@mmio[4242, 5]: 1\n@device[1073750016]: 301\n")
-            vs = restore_timeline.load_vcpustat(d / "vcpustat.jsonl")
-            maps = restore_timeline.load_buckets(d / "s2fault.txt")
+            vs, maps = self.records(Path(t), t0)
+        row, reason = restore_timeline.join_clone(
+            {"fc_pid": 4242, "wall": {"resume": t0, "ready": t0 + 0.035}}, vs, maps)
+        self.assertIsNone(reason)
+        self.assertAlmostEqual(row["window_ms"], 35.0, places=3)
         # resume: the last sample at or before it; ready: the first at or after it.
-        s0 = restore_timeline.at(vs[4242], t0, after=False)
-        s1 = restore_timeline.at(vs[4242], t0 + 0.12, after=True)
-        self.assertEqual((s0["run"], s1["run"]), (1_000_000, 61_000_000))
-        self.assertIsNone(restore_timeline.at(vs[4242], t0 + 1.0, after=True))
-        # A 120 ms window covers buckets 0 and 1 (100 ms each) and not buckets 2 and 9.
-        row = restore_timeline.join_clone(
-            {"fc_pid": 4242, "wall": {"resume": t0, "ready": t0 + 0.12}}, vs, maps)
-        self.assertAlmostEqual(row["window_ms"], 120.0, places=3)
-        self.assertEqual(row["vcpu_run_ms"], 60.0)
-        self.assertEqual(row["vcpu_wait_ms"], 20.0)
+        self.assertEqual(row["vcpu_run_ms"], 40.0)
+        self.assertEqual(row["vcpu_wait_ms"], 4.0)
+        # Buckets 0, 1 and 2 whole and half of bucket 3; nothing of the 1,000 faults of
+        # bucket 4, which a 100 ms bucket would have counted with the window's.
+        self.assertAlmostEqual(row["stage2_faults"], 700 + 200 + 50 + 20, places=1)
+        self.assertAlmostEqual(row["stage2_fault_ms"], 1.4 + 0.3, places=3)
+        self.assertAlmostEqual(row["us_per_stage2_fault"], 1700 / 970, places=3)
+        self.assertAlmostEqual(row["device_aborts"], 300, places=1)
         self.assertEqual(row["userfault_ms"], 5.0)
         self.assertEqual(row["userfaults"], 40)
-        self.assertEqual(row["stage2_faults"], 900)
-        self.assertEqual(row["device_aborts"], 300)
-        self.assertAlmostEqual(row["rest_ms"], 35.0, places=3)
+        self.assertEqual(row["guest_ticks_ms"], 10)
+        self.assertEqual(row["sys_ticks_ms"], 20)
+        self.assertEqual(row["vmm_user_ticks_ms"], 10)
 
-    def test_a_clone_the_sampler_never_saw_is_left_out(self):
-        self.assertIsNone(restore_timeline.join_clone(
-            {"fc_pid": 1, "wall": {"resume": 1.0, "ready": 2.0}}, {}, {}))
+    def test_buckets_are_ten_ms_for_a_second_then_a_hundred(self):
+        self.assertEqual(restore_timeline.bucket_span(0), (0, 10_000_000))
+        self.assertEqual(restore_timeline.bucket_span(99), (990_000_000, 1_000_000_000))
+        self.assertEqual(restore_timeline.bucket_span(100), (1_000_000_000, 1_100_000_000))
+        self.assertEqual(restore_timeline.bucket_span(109), (1_900_000_000, 2_000_000_000))
+        # A 1.05 s window: everything of the first second and half of bucket 100.
+        self.assertEqual(restore_timeline.within({0: 4, 99: 6, 100: 300, 101: 8}, 1_050_000_000), 160)
+
+    def test_a_clone_without_a_usable_record_is_left_out_with_its_reason(self):
+        t0 = wall("2026-01-01T00:00:10.100000")
+        with tempfile.TemporaryDirectory() as t:
+            vs, maps = self.records(Path(t), t0)
+        clone = lambda pid, ready: {"fc_pid": pid, "wall": {"resume": t0, "ready": ready}}
+        self.assertEqual(restore_timeline.join_clone(clone(1, t0 + 1), vs, maps),
+                         (None, "the sampler never saw its VMM"))
+        # Ready after the last sample: the sampler stopped watching the VMM first.
+        self.assertEqual(restore_timeline.join_clone(clone(4242, t0 + 1), vs, maps),
+                         (None, "ready after the sampler's last sample of its VMM"))
+        self.assertEqual(restore_timeline.join_clone({"fc_pid": 4242, "wall": {}}, vs, maps)[1],
+                         "no wall-clock stamp on its resume or ready line")
+
+    def test_a_reused_pid_is_two_processes(self):
+        t0 = wall("2026-01-01T00:00:10.100000")
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            self.records(d, t0)
+            old = [{"w": t0 - 60 + i, "pid": 4242, "start": 5, "run": 9_000_000_000, "wait": 0,
+                    "gt": 0, "st": 0, "ut": 0, "mrun": 0} for i in range(3)]
+            with open(d / "vcpustat.jsonl", "a") as f:
+                f.write("".join(json.dumps(s) + "\n" for s in old))
+            vs = restore_timeline.load_vcpustat(d / "vcpustat.jsonl")
+        self.assertEqual(len(vs[4242]), 2)
+        series = restore_timeline.series_for(vs, 4242, t0, t0 + 0.035)
+        self.assertEqual({s["start"] for s in series}, {77})
 
 
 if __name__ == "__main__":

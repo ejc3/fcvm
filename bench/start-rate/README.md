@@ -59,20 +59,26 @@ its vCPU thread was:
 
 ```bash
 python3 bench/start-rate/vcpustat.py $OUT.trace/vcpustat.jsonl 0.025 12 &     # SIGTERM to stop
-sudo BPFTRACE_MAX_MAP_KEYS=150000 bpftrace bench/start-rate/s2fault.bt > $OUT.trace/s2fault.txt &
+sudo BPFTRACE_MAX_MAP_KEYS=300000 bpftrace bench/start-rate/s2fault.bt > $OUT.trace/s2fault.txt &
 # wait for "attached" in s2fault.txt, run the cell, then SIGINT bpftrace
 python3 bench/start-rate/restore_timeline.py $OUT --trace $OUT.trace
 ```
 
 - `vcpustat.py` reads `/proc/<vmm>/task/<vcpu>/schedstat` and `stat` of every Firecracker process
-  in its first 12 s, every 25 ms (4 ms for a C=1 cell): the vCPU thread's on-CPU time, its
-  runqueue wait, and its guest and system ticks.
-- `s2fault.bt` counts, per VMM in 100 ms buckets from its first stage-2 fault, the vCPU's stage-2
-  faults (`kvm:kvm_guest_fault`) and the time its threads spent in `handle_userfault`. It also
-  counts every exec and fork on the host.
+  in its first 12 s, every 25 ms (give 0.004 for a C=1 cell): the vCPU thread's on-CPU time, its
+  runqueue wait, and its user, guest and system ticks (10 ms each). Samples carry the process's
+  start time, so a reused pid is a second process.
+- `s2fault.bt` records, per VMM in buckets from its first stage-2 fault (10 ms wide for the first
+  second, 100 ms after), the vCPU thread's stage-2 faults on guest memory (`kvm:kvm_guest_fault`),
+  the time from each to the vCPU's next entry into the guest (`kvm:kvm_entry`), its device aborts,
+  and its own time in `handle_userfault`. It also counts every exec and fork on the host.
 
 The joined table splits the window into `vcpu_run_ms` (on a CPU: guest code, and the host kernel
-working for it, stage-2 faults included), `vcpu_wait_ms` (runnable, no CPU), `userfault_ms`
-(blocked until the memory server answered) and `rest_ms` (the vCPU thread asleep otherwise: the
-guest idle). The tracers cost CPU themselves (one bpftrace probe per stage-2 fault), so rates come
-from cells run without them.
+working for it, stage-2 faults included), `vcpu_wait_ms` (runnable, no CPU), `userfault_ms` (the
+vCPU thread blocked until the memory server answered) and `rest_ms` (the vCPU thread asleep
+otherwise: the guest idle). `stage2_fault_ms` is the measured fault-to-entry time inside the
+window and `us_per_stage2_fault` its mean per fault. A bucket the window ends in counts by the
+share of it the window covers. Every row gives `n` against the cell's clones, and the clones
+left out are counted by reason (the sampler never saw the VMM; ready came after the sampler's
+12 s). The tracers cost CPU themselves (two probes per stage-2 fault), so rates come from cells
+run without them.

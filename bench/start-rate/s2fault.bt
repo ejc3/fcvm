@@ -1,29 +1,41 @@
 #!/usr/bin/env bpftrace
-// Per firecracker process, in 100 ms buckets from its vCPU's first stage-2 fault:
-// stage-2 faults on guest memory and device (MMIO) aborts taken by the vCPU thread, and
-// time any of its threads waited in handle_userfault. @device counts the device aborts
-// of every guest by page. Buckets past 12 s are dropped.
+// Per firecracker process, in buckets from its vCPU's first stage-2 fault (10 ms wide for
+// the first second, 100 ms wide after it, to 12 s; restore_timeline.py holds the same rule):
+//   @s2     stage-2 faults on guest memory taken by the vCPU thread
+//   @s2ns   time from each of those faults to the vCPU's next entry into the guest, which
+//           is the host's handling of the fault and any wait inside it
+//   @mmio   device (MMIO) aborts of the vCPU thread
+//   @ufns, @ufn  time and calls of the vCPU thread in handle_userfault
+// @device counts the device aborts of every guest by page; @execs and @forks count every
+// exec and fork on the host.
 //
-// Run with BPFTRACE_MAX_MAP_KEYS=150000 (1000 clones x 120 buckets fit). The maps are
+// Run with BPFTRACE_MAX_MAP_KEYS=300000 (1000 clones x 210 buckets fit). The maps are
 // per-CPU and preallocated, so on 192 CPUs each takes seconds to create: start the
 // workload only after this prints "attached".
 BEGIN { printf("attached\n"); }
 tracepoint:kvm:kvm_guest_fault /comm == "fc_vcpu 0"/ {
   if (@t0[pid] == 0) { @t0[pid] = nsecs; }
-  $b = (nsecs - @t0[pid]) / 100000000;
-  if ($b < 120) {
-    // Firecracker's arm64 guests have RAM from 2 GiB up; an abort below it is a device access.
-    if (args->ipa >= 0x80000000) { @s2[pid, $b] = count(); } else { @mmio[pid, $b] = count(); }
+  // Firecracker's arm64 guests have RAM from 2 GiB up; an abort below it is a device access.
+  if (args->ipa >= 0x80000000) { @fault[tid] = nsecs; }
+  else {
+    @device[args->ipa & 0xfffffffffffff000] = count();
+    $d = nsecs - @t0[pid];
+    $b = $d < 1000000000 ? $d / 10000000 : 100 + ($d - 1000000000) / 100000000;
+    if ($b < 210) { @mmio[pid, $b] = count(); }
   }
-  if (args->ipa < 0x80000000) { @device[args->ipa & 0xfffffffffffff000] = count(); }
 }
-kprobe:handle_userfault /comm == "fc_vcpu 0" || strncmp(comm, "firecracker", 11) == 0 || comm == "fc_api"/ {
-  @ufs[tid] = nsecs;
+tracepoint:kvm:kvm_entry /@fault[tid]/ {
+  $d = @fault[tid] - @t0[pid];
+  $b = $d < 1000000000 ? $d / 10000000 : 100 + ($d - 1000000000) / 100000000;
+  if ($b < 210) { @s2[pid, $b] = count(); @s2ns[pid, $b] = sum(nsecs - @fault[tid]); }
+  delete(@fault[tid]);
 }
+kprobe:handle_userfault /comm == "fc_vcpu 0"/ { @ufs[tid] = nsecs; }
 kretprobe:handle_userfault /@ufs[tid]/ {
   if (@t0[pid] != 0) {
-    $b = (nsecs - @t0[pid]) / 100000000;
-    if ($b < 120) { @ufns[pid, $b] = sum(nsecs - @ufs[tid]); @ufn[pid, $b] = count(); }
+    $d = @ufs[tid] - @t0[pid];
+    $b = $d < 1000000000 ? $d / 10000000 : 100 + ($d - 1000000000) / 100000000;
+    if ($b < 210) { @ufns[pid, $b] = sum(nsecs - @ufs[tid]); @ufn[pid, $b] = count(); }
   }
   delete(@ufs[tid]);
 }

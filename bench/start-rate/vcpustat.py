@@ -1,94 +1,115 @@
 #!/usr/bin/env python3
 """Sample each new firecracker process's vCPU thread while it is young.
 
-Every PERIOD it reads, for each firecracker pid first seen less than WINDOW ago:
+Every PERIOD it reads, for each firecracker process first seen less than WINDOW ago:
   /proc/<pid>/task/<vcpu tid>/schedstat  on-CPU ns, runqueue wait ns
   /proc/<pid>/task/<vcpu tid>/stat       utime, stime, guest_time (ticks), minflt, majflt
-and appends one JSON line per sample with the wall clock. Stop with SIGTERM.
+  /proc/<pid>/schedstat                  the main (VMM) thread's on-CPU ns
+and appends one JSON line per sample with the wall clock and the process's start time, which
+with the pid names one process across pid reuse. Stop with SIGTERM.
+
+usage: vcpustat.py OUT [PERIOD_S [WINDOW_S]]
 """
-import json, os, signal, sys, time
+import json
+import os
+import signal
+import sys
+import time
 
-OUT = sys.argv[1]
-PERIOD = float(sys.argv[2]) if len(sys.argv) > 2 else 0.025
-WINDOW = float(sys.argv[3]) if len(sys.argv) > 3 else 12.0
-stop = False
-def on_term(*_):
-    global stop
-    stop = True
-signal.signal(signal.SIGTERM, on_term)
-signal.signal(signal.SIGINT, on_term)
+# Names a child of fcvm carries between fork and its exec of firecracker.
+PRE_EXEC = ("fcvm", "tokio-runtime-w")
 
-seen = set()      # pids already classified
-pending = {}      # pid -> first seen with another comm (it may exec firecracker yet)
-young = {}        # pid -> (first_seen, vcpu tid)
 
-def comm(path):
+def parse_stat(text):
+    """Fields of a /proc/<pid>/[task/<tid>/]stat line. The comm can hold spaces and
+    parentheses, so fields are counted from the last ')': state is field 3 of proc(5)."""
+    f = text[text.rindex(")") + 2:].split()
+    return {"ppid": int(f[1]), "minflt": int(f[7]), "majflt": int(f[9]), "ut": int(f[11]),
+            "st": int(f[12]), "start": int(f[19]), "gt": int(f[40])}
+
+
+def read(path):
     try:
         with open(path) as f:
-            return f.read().strip()
+            return f.read()
     except OSError:
         return None
 
-def discover(now):
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        if pid in seen:
-            continue
-        c = comm(f"/proc/{pid}/comm")
-        if c is None:
-            continue
-        if not c.startswith("firecracker"):
-            # a child that has not exec'd firecracker yet keeps its parent's comm
-            if now - pending.setdefault(pid, now) > 2.0:
-                seen.add(pid)
-                del pending[pid]
-            continue
-        pending.pop(pid, None)
-        tid = None
-        try:
-            for t in os.listdir(f"/proc/{pid}/task"):
-                if (comm(f"/proc/{pid}/task/{t}/comm") or "").startswith("fc_vcpu"):
-                    tid = int(t)
-                    break
-        except OSError:
-            continue
-        if tid is None:
-            continue  # vCPU thread not created yet; look again
-        seen.add(pid)
-        young[pid] = (now, tid)
 
-def sample(out, now):
-    wall = time.time()
-    for pid, (first, tid) in list(young.items()):
-        if now - first > WINDOW:
-            del young[pid]
-            continue
-        try:
-            with open(f"/proc/{pid}/task/{tid}/schedstat") as f:
-                run, wait, _ = f.read().split()
-            with open(f"/proc/{pid}/task/{tid}/stat") as f:
-                s = f.read()
-            with open(f"/proc/{pid}/schedstat") as f:
-                mrun = f.read().split()[0]
-        except OSError:
-            del young[pid]
-            continue
-        f_ = s[s.rindex(")") + 2:].split()
-        # after comm: state=0 ... minflt=7 majflt=9 utime=11 stime=12 ... guest_time=40
-        out.write(json.dumps({"w": wall, "pid": pid, "run": int(run), "wait": int(wait),
-                              "minflt": int(f_[7]), "majflt": int(f_[9]), "ut": int(f_[11]),
-                              "st": int(f_[12]), "gt": int(f_[40]), "mrun": int(mrun)}) + "\n")
+class Sampler:
+    def __init__(self, window, proc="/proc"):
+        self.window, self.proc = window, proc
+        self.seen = set()   # pids classified: not a VMM, or a VMM already being sampled
+        self.young = {}     # pid -> (first seen, vcpu tid, start time)
 
-with open(OUT, "w") as out:
-    last_discover = 0.0
-    while not stop:
-        now = time.monotonic()
-        # A VMM is resumed tens of ms after it starts; find it before that.
-        if now - last_discover >= min(0.1, 2 * PERIOD):
-            discover(now)
-            last_discover = now
-        sample(out, now)
-        spent = time.monotonic() - now
-        time.sleep(max(0.0, PERIOD - spent))
+    def discover(self, now):
+        listed = {int(n) for n in os.listdir(self.proc) if n.isdigit()}
+        # A pid that left /proc can come back as another process.
+        self.seen &= listed
+        for pid in listed - self.seen:
+            comm = (read(f"{self.proc}/{pid}/comm") or "").strip()
+            if not comm.startswith("firecracker"):
+                # A single-threaded child of fcvm may still exec firecracker; look again.
+                try:
+                    threads = len(os.listdir(f"{self.proc}/{pid}/task"))
+                except OSError:
+                    threads = 0
+                if not (comm in PRE_EXEC and threads == 1):
+                    self.seen.add(pid)
+                continue
+            tid = None
+            try:
+                for t in os.listdir(f"{self.proc}/{pid}/task"):
+                    if (read(f"{self.proc}/{pid}/task/{t}/comm") or "").startswith("fc_vcpu"):
+                        tid = int(t)
+                        break
+            except OSError:
+                continue
+            stat = read(f"{self.proc}/{pid}/stat")
+            if tid is None or stat is None:
+                continue  # vCPU thread not created yet; look again
+            self.seen.add(pid)
+            self.young[pid] = (now, tid, parse_stat(stat)["start"])
+
+    def sample(self, out, now):
+        wall = time.time()
+        for pid, (first, tid, start) in list(self.young.items()):
+            if now - first > self.window:
+                del self.young[pid]
+                continue
+            sched = read(f"{self.proc}/{pid}/task/{tid}/schedstat")
+            stat = read(f"{self.proc}/{pid}/task/{tid}/stat")
+            main = read(f"{self.proc}/{pid}/schedstat")
+            if sched is None or stat is None or main is None:
+                del self.young[pid]
+                continue
+            run, wait, _ = sched.split()
+            s = parse_stat(stat)
+            out.write(json.dumps({"w": wall, "pid": pid, "start": start, "run": int(run),
+                                  "wait": int(wait), "minflt": s["minflt"], "majflt": s["majflt"],
+                                  "ut": s["ut"], "st": s["st"], "gt": s["gt"],
+                                  "mrun": int(main.split()[0])}) + "\n")
+
+
+def main(argv):
+    out_path = argv[1]
+    period = float(argv[2]) if len(argv) > 2 else 0.025
+    window = float(argv[3]) if len(argv) > 3 else 12.0
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    sampler = Sampler(window)
+    with open(out_path, "w") as out:
+        last_discover = 0.0
+        while not stop:
+            now = time.monotonic()
+            # A VMM is resumed tens of ms after it starts; find it before that.
+            if now - last_discover >= min(0.1, 2 * period):
+                sampler.discover(now)
+                last_discover = now
+            sampler.sample(out, now)
+            time.sleep(max(0.0, period - (time.monotonic() - now)))
+
+
+if __name__ == "__main__":
+    main(sys.argv)
