@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
@@ -208,6 +209,88 @@ describe("Lambda tiles on the AWS half", () => {
       "fcvm: all 4 GPUs streaming again 2.9 s after the restart. EC2: all 2 GPUs streaming again 49 s after the restart, not counting 12 s when AWS had no spot GPU. Lambda: all 2 GPUs streaming again 25 s after the restart, not counting 8.0 s when Lambda started a new GPU instance.",
     );
     expect(v.race!.end).toBe("fcvm back in 2.9 s · EC2 back in 49 s · Lambda back in 25 s · 8.6× faster");
+  });
+
+  /** Each clock's centre is over its own backing's tiles, and no two cards meet or leave the image. */
+  function expectClocksApart(st: FleetState, start: number) {
+    for (const area of [
+      { x: 0, y: 0, w: 1200, h: 675 },
+      { x: 0, y: 0, w: 1600, h: 930 },
+      { x: 0, y: 0, w: 640, h: 360 },
+    ]) {
+      const v = view(stateWith(st), start + 5000, { mosaicArea: area });
+      const img = v.layout!.image;
+      const clocks = v.race!.clocks;
+      expect(clocks.map((c) => c.half), `${area.w}x${area.h}`).toEqual(["fcvm", "ec2", "lambda"]);
+      for (const c of clocks) {
+        // The clock's centre is over its own backing's tiles.
+        const own = st.tiles.filter((t) => t.half === c.half);
+        const x0 = img.x + img.w * Math.min(...own.map((t) => t.rect.x));
+        const x1 = img.x + img.w * Math.max(...own.map((t) => t.rect.x + t.rect.w));
+        const y0 = img.y + img.h * Math.min(...own.map((t) => t.rect.y));
+        const y1 = img.y + img.h * Math.max(...own.map((t) => t.rect.y + t.rect.h));
+        expect(c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1, `${c.half} clock at (${c.x}, ${c.y}) on ${area.w}x${area.h}: its tiles span x ${x0}..${x1}, y ${y0}..${y1}`).toBe(true);
+      }
+      // No two cards overlap, nor leave the image.
+      const box = (c: (typeof clocks)[number]) => ({ l: c.x - c.width / 2, r: c.x + c.width / 2, t: c.y - c.height / 2, b: c.y + c.height / 2 });
+      for (const c of clocks) {
+        const b = box(c);
+        expect(b.l >= img.x - 0.5 && b.r <= img.x + img.w + 0.5 && b.t >= img.y - 0.5 && b.b <= img.y + img.h + 0.5, `${c.half} card off the ${area.w}x${area.h} image`).toBe(true);
+      }
+      for (let i = 0; i < clocks.length; i++) {
+        for (let j = i + 1; j < clocks.length; j++) {
+          const [a, b] = [box(clocks[i]!), box(clocks[j]!)];
+          const meet = a.l < b.r && b.l < a.r && a.t < b.b && b.t < a.b;
+          expect(meet, `${clocks[i]!.half} and ${clocks[j]!.half} cards overlap on ${area.w}x${area.h}`).toBe(false);
+        }
+      }
+    }
+  }
+
+  /** `st` in a running race: every tile restarting, Lambda's GPU instance being started. */
+  function racing(st: FleetState, start: number): FleetState {
+    const n = (h: string) => st.tiles.filter((t) => t.half === h).length;
+    st.scene.epoch_unix_ms = EPOCH;
+    st.relaunch_all = race(start, {
+      fcvm_pending: n("fcvm"),
+      fcvm_gpus: n("fcvm"),
+      ec2_pending: n("ec2"),
+      ec2_gpus: n("ec2"),
+      lambda_done_at: null,
+      lambda_pending: n("lambda"),
+      lambda_gpus: n("lambda"),
+      lambda_capacity_wait_ms: 0,
+      lambda_waiting_since: start + 500,
+      lambda_ms: null,
+    });
+    for (const t of st.tiles) {
+      t.last_relaunch = { clicked_at: start, first_frame_at: null, phases: {} };
+      t.phase = t.half === "fcvm" ? "restoring" : t.half === "ec2" ? "launching" : "waiting_capacity";
+    }
+    return st;
+  }
+
+  it("places each AWS backing's race clock over its own tiles, on vector 43's layout, without the clocks overlapping", () => {
+    // fleet/core's vector 43 as the coordinator sends it: the AWS half's EC2 tiles on the top
+    // row and its Lambda tiles on the bottom row of the same columns.
+    const vector = JSON.parse(readFileSync(new URL("../../../core/tests/vectors/43_lambda_tiles.json", import.meta.url), "utf8")) as { final_view: unknown };
+    const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state: vector.final_view }));
+    if (m.type !== "snapshot") throw new Error("not a snapshot");
+    const start = EPOCH + 10_000;
+    expectClocksApart(racing(structuredClone(m.state), start), start);
+  });
+
+  it("keeps the AWS clocks apart when one backing's tiles wrap into the other's row", () => {
+    // Five columns by two rows: six EC2 tiles (the top row and one more), then four Lambda
+    // tiles, so the EC2 tiles' bounds take in the Lambda tiles' row.
+    const st = fleet(5, 2);
+    let k = 0;
+    for (const t of st.tiles.filter((x) => x.half === "ec2").slice(6)) {
+      k += 1;
+      Object.assign(t, { id: `lambda:${k}`, half: "lambda", side: "ec2", slot: `lam-${k}`, vm: `environment-${k}` });
+    }
+    const start = EPOCH + 10_000;
+    expectClocksApart(racing(st, start), start);
   });
 
   it("keeps a race running until its Lambda tiles are back", () => {

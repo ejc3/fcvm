@@ -349,6 +349,10 @@ export interface HalfClock {
   y: number;
   /** The big figure's font size, px: 9% of the image width within 56 to 160, smaller to fit a narrow half. */
   size: number;
+  /** Drawn no wider than `width` (its hatch line wraps): a card over its own tiles, beside another backing's. */
+  bounded: boolean;
+  /** The card's height as drawn, px (estimated from the size and its lines: the sub line, the hatch line, the steps). */
+  height: number;
   /** The card's width as drawn, px (estimated from the size: a running clock is six monospace characters). */
   width: number;
   /** "0:04.9" while counting, "3.1 s" once the half is back. */
@@ -378,6 +382,17 @@ const CLOCK_PAD = 56;
 const CLOCK_MIN_PX = 24;
 /** The steps line ("instance → OS → driver → app") at 15 px is about this wide. */
 const STEPS_W = 260;
+/** The card's vertical padding, the gap between its lines, and each line under the figure at wall.css's sizes (body line-height 1.4). */
+const CARD_V_PAD = 24;
+const CARD_GAP = 4;
+const SUB_LINE_H = 26;
+const HATCH_LINE_H = 26;
+const STEPS_LINE_H = 22;
+/** The hatch line's text at 15 px is about this wide per character, and the line adds its own padding. */
+const HATCH_CHAR_W = 7.5;
+const HATCH_PAD_W = 20;
+/** Room a card leaves at each side of the tiles it sits over, px, so it never touches the next card. */
+const CARD_INSET = 6;
 
 /** Where an EC2 tile is in its restart: the four steps a viewer reads. */
 const EC2_STEPS = ["instance", "OS", "driver", "app"] as const;
@@ -405,11 +420,50 @@ const LAMBDA_STEP_OF: Record<string, number> = {
   starting: 1,
 };
 
-/** The horizontal span of some tiles, as fractions of the image width. */
-function spanOf(tiles: readonly Tile[]): { x: number; w: number } | null {
+/** The bounds of some tiles, as fractions of the image. */
+function boundsOf(tiles: readonly Tile[]): { x: number; y: number; w: number; h: number } | null {
   if (tiles.length === 0) return null;
   const x = Math.min(...tiles.map((t) => t.rect.x));
-  return { x, w: Math.max(...tiles.map((t) => t.rect.x + t.rect.w)) - x };
+  const y = Math.min(...tiles.map((t) => t.rect.y));
+  return { x, y, w: Math.max(...tiles.map((t) => t.rect.x + t.rect.w)) - x, h: Math.max(...tiles.map((t) => t.rect.y + t.rect.h)) - y };
+}
+
+/** A card's height for a figure of `size` px, with its hatch text on `hatchLines` lines, and with or without its steps. */
+function cardHeight(size: number, hatchLines: number, steps: boolean): number {
+  return CARD_V_PAD + size + CARD_GAP + SUB_LINE_H + (hatchLines > 0 ? CARD_GAP + HATCH_LINE_H * hatchLines : 0) + (steps ? CARD_GAP + STEPS_LINE_H : 0);
+}
+
+/** The hatch line's width unwrapped, px, and the lines it takes in a card at most `maxW` wide (drawn with that max-width). */
+function hatchFit(hatch: string, maxW: number): { w: number; lines: number } {
+  if (!hatch) return { w: 0, lines: 0 };
+  const w = hatch.length * HATCH_CHAR_W + HATCH_PAD_W;
+  return { w, lines: Math.max(1, Math.ceil(w / Math.max(1, maxW - CLOCK_PAD))) };
+}
+
+/** Two cards, centred at (x, y) with their width and height, share some of the image. */
+function cardsMeet(a: HalfClock, b: HalfClock): boolean {
+  return Math.abs(a.x - b.x) * 2 < a.width + b.width && Math.abs(a.y - b.y) * 2 < a.height + b.height;
+}
+
+/**
+ * The AWS half's two clocks, moved apart when their cards would still meet (tiles of one backing
+ * between the other's, or a card wider than its tiles): EC2's in the top half of the AWS side,
+ * Lambda's in the bottom half, each no taller than its lane.
+ */
+function apart(clocks: HalfClock[], image: { x: number; y: number; w: number; h: number }, split: number): HalfClock[] {
+  const e = clocks.find((c) => c.half === "ec2");
+  const l = clocks.find((c) => c.half === "lambda");
+  if (!e || !l || !cardsMeet(e, l)) return clocks;
+  const lane = image.h / 2;
+  const cx = image.x + image.w * (split + (1 - split) / 2);
+  const laneW = image.w * (1 - split) - 2 * CARD_INSET;
+  const place = (c: HalfClock, top: number): HalfClock => {
+    const ht = hatchFit(c.hatch, laneW);
+    const size = Math.max(CLOCK_MIN_PX, Math.min(c.size, (laneW - CLOCK_PAD) / CLOCK_EM, lane - 2 * CARD_INSET - cardHeight(0, ht.lines, false)));
+    const width = Math.min(laneW, Math.max(size * CLOCK_EM + CLOCK_PAD, ht.w > 0 ? ht.w + CLOCK_PAD : 0));
+    return { ...c, size, steps: [], bounded: true, height: cardHeight(size, ht.lines, false), width, x: cx, y: top + lane / 2 };
+  };
+  return clocks.map((c) => (c === e ? place(c, image.y) : c === l ? place(c, image.y + lane) : c));
 }
 
 /** How many times faster fcvm came back than EC2: "14×", "2.5×". */
@@ -464,11 +518,14 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
     const counted = total - wait;
     const done = doneAt !== null;
     const measured = halfTimeMs(st, ra, h);
-    // Its own tiles' span of the image: the AWS half holds EC2 tiles and Lambda tiles, each
-    // with its own clock over them; without Lambda tiles the EC2 clock keeps the whole half.
-    const span = h === "fcvm" || !hasLambda(ra) ? null : spanOf(halfTiles(st, h));
-    const x0 = span ? image.x + image.w * span.x : h === "fcvm" ? image.x : image.x + image.w * split;
-    const w = span ? image.w * span.w : h === "fcvm" ? image.w * split : image.w * (1 - split);
+    // Its own tiles' bounds: the AWS half holds EC2 tiles and Lambda tiles, each with its own
+    // clock over them, wherever the grid puts them (other columns, or other rows of the same
+    // ones); without Lambda tiles the EC2 clock keeps the whole half.
+    const own = h === "fcvm" || !hasLambda(ra) ? null : boundsOf(halfTiles(st, h));
+    const x0 = own ? image.x + image.w * own.x : h === "fcvm" ? image.x : image.x + image.w * split;
+    const w = own ? image.w * own.w : h === "fcvm" ? image.w * split : image.w * (1 - split);
+    const y0 = own ? image.y + image.h * own.y : image.y;
+    const boxH = own ? image.h * own.h : image.h;
     let sub = done ? (gpus === 1 ? "its GPU is back" : `all ${gpus} GPUs back`) : `${back} of ${fmt.count(gpus, "GPU", "GPUs")} back`;
     // Once fcvm is back and an AWS side's counted time has passed it: how far behind it is.
     if (h !== "fcvm" && !done && fcvmMs !== null && counted >= fcvmMs + 1000) sub = `+${Math.floor((counted - fcvmMs) / 1000)} s and counting`;
@@ -479,23 +536,37 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
       const at = dark.length === 0 ? names.length - 1 : Math.min(...dark.map((t) => of[t.phase] ?? 0));
       steps = names.map((label, i) => ({ label, state: i < at ? "done" : i === at ? "now" : "todo" }));
     }
-    // The design's clamp(56px, 9vw, 160px), and no wider than its own half.
-    const size = Math.max(CLOCK_MIN_PX, Math.min(Math.min(160, Math.max(56, image.w * 0.09)), (w - CLOCK_PAD) / CLOCK_EM));
-    const width = Math.max(size * CLOCK_EM + CLOCK_PAD, steps.length > 0 ? STEPS_W : 0);
+    const hatch = wait > 0 ? `not counting ${Math.round(wait / 1000)} s ${WAIT_SAID[h].clock}` : "";
+    // Over its own tiles, the steps go when they are wider than those tiles.
+    if (own && STEPS_W > w) steps = [];
+    // Over its own tiles the card is no wider than they are, and its hatch line wraps.
+    const maxW = own ? w - 2 * CARD_INSET : Infinity;
+    const ht = hatchFit(hatch, maxW);
+    // The design's clamp(56px, 9vw, 160px), no wider than its own half or tiles, and over its
+    // own tiles no taller than them.
+    let size = Math.max(CLOCK_MIN_PX, Math.min(Math.min(160, Math.max(56, image.w * 0.09)), (Math.min(w, maxW) - CLOCK_PAD) / CLOCK_EM));
+    if (own) size = Math.max(CLOCK_MIN_PX, Math.min(size, boxH - 2 * CARD_INSET - cardHeight(0, ht.lines, steps.length > 0)));
+    const height = cardHeight(size, ht.lines, steps.length > 0);
+    const width = Math.min(maxW, Math.max(size * CLOCK_EM + CLOCK_PAD, steps.length > 0 ? STEPS_W : 0, own && ht.w > 0 ? ht.w + CLOCK_PAD : 0));
     // A half narrower than the card: the card moves in from the image's edge rather than off it.
     const x = Math.min(Math.max(x0 + w / 2, image.x + width / 2), image.x + image.w - width / 2);
+    // Low in the half, or in the middle of its own tiles, and on the image.
+    const yc = own ? y0 + boxH / 2 : image.y + image.h * 0.62;
+    const y = Math.min(Math.max(yc, image.y + height / 2), image.y + image.h - height / 2);
     clocks.push({
       half: h,
       x,
-      y: image.y + image.h * 0.62,
+      y,
       size,
+      bounded: own !== null,
+      height,
       width,
       value: measured !== null ? fmt.seconds(measured) : fmt.raceClock(counted),
       state: done ? "done" : "counting",
       sub,
-      hatch: wait > 0 ? `not counting ${Math.round(wait / 1000)} s ${WAIT_SAID[h].clock}` : "",
+      hatch,
       steps,
     });
   }
-  return { label, clocks, end: null };
+  return { label, clocks: image ? apart(clocks, image, split) : clocks, end: null };
 }
