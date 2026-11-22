@@ -1018,7 +1018,11 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
   `on-demand`, or `spot and on-demand`) and `since_wake_ms`; a region still short logs the
   last refusal (`reason`). A call that fails marks the
-  coordinator degraded (`scale`) and is retried at the next poll.
+  coordinator degraded (`scale`) and is retried at the next poll. A region left short by
+  the account's quota (the last market refused with `VcpuLimitExceeded` or
+  `MaxSpotInstanceCountExceeded`) also marks `scale` degraded and logs `EC2 refused a GPU
+  host launch`, the line the coordinator's degraded alarm matches; it still asks again
+  10 s later.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication, so the coordinator refuses to start when the address

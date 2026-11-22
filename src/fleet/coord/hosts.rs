@@ -9,8 +9,10 @@
 //! this fleet runs fewer than `on_demand_max` on-demand hosts in all regions together. So the
 //! fallback costs one more API call, not a wait. A region still short after both (no
 //! capacity in either market, or the on-demand cap reached) asks again after
-//! `capacity_retry`, spot first. Asleep, every host of the fleet is terminated; the next wake
-//! tries spot first again.
+//! `capacity_retry`, spot first. A region left short by the account's quota
+//! (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) also marks the coordinator degraded
+//! (`scale`). Asleep, every host of the fleet is terminated; the next wake tries spot first
+//! again.
 //!
 //! This replaced Auto Scaling groups whose desired capacity the coordinator set: Auto
 //! Scaling took 6 to 14 s to start a launch after the desired capacity was raised, recorded a
@@ -755,6 +757,8 @@ async fn launch_shortfall(
     let mut placed: Vec<Option<String>> = Vec::new();
     let mut launched = 0;
     let mut refused = Vec::new();
+    // The market `refused` is from.
+    let mut last = Market::Spot;
     let mut failed = false;
     for market in [Market::Spot, Market::OnDemand] {
         let ask = short - launched;
@@ -839,11 +843,29 @@ async fn launch_shortfall(
             ));
         }
         refused = got.refused;
+        last = market;
     }
     if launched < short {
         // `refused` is the last market's: on demand's, when spot fell back to it.
         tracing::warn!(%region, launched, short, zones = ?zones, reason = %refused.join("; "),
             "GPU hosts still short; asking again after the capacity retry");
+        // A quota refusal is this account's limit, not EC2's capacity: it holds until the
+        // quota is raised or the account's other hosts finish shutting down. It is reported
+        // (the `scale` failure, and the line the degraded alarms match), and the region still
+        // asks again after the capacity retry.
+        let quota: Vec<&str> = refused
+            .iter()
+            .map(String::as_str)
+            .filter(|r| QUOTA_CODES.iter().any(|c| r.split(':').next() == Some(*c)))
+            .collect();
+        if !quota.is_empty() {
+            let why = quota.join("; ");
+            tracing::warn!(%region, market = last.name(), error = %why, "EC2 refused a GPU host launch");
+            let line = format!("{region} {}: {why}", last.name());
+            if !errors.contains(&line) {
+                errors.push(line);
+            }
+        }
     }
     (placed, !failed)
 }
@@ -966,6 +988,10 @@ pub const CAPACITY_CODES: &[&str] = &[
     "VcpuLimitExceeded",
     "Unsupported",
 ];
+
+/// The [`CAPACITY_CODES`] that are this account's quotas rather than EC2's capacity: a pass
+/// left short by one of them marks the coordinator degraded.
+pub const QUOTA_CODES: &[&str] = &["VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"];
 
 /// EC2 on AWS: `CreateFleet` (type `instant`) over the region's host templates and
 /// subnets, `DescribeInstances` by tag, `TerminateInstances`.
@@ -1488,7 +1514,8 @@ impl HostDriver for AwsHosts {
 }
 
 /// Hosts in memory. Each region's spot and on-demand capacity is set by the test (`None`:
-/// unlimited); a launch beyond it is refused with `InsufficientInstanceCapacity`. Launched
+/// unlimited); a launch beyond it is refused with `InsufficientInstanceCapacity`, or with the
+/// market's entry in `refusal` (e.g. `VcpuLimitExceeded: ...`) when it has one. Launched
 /// hosts start in `launch_state` (default `pending`); `set_state` moves them. Every call is
 /// recorded in `calls`, in order: `list <region>`, `launch <region> <market> <count>`,
 /// `terminate <region> <ids>`. `fail_lists` makes that many next lists of a region fail.
@@ -1516,6 +1543,7 @@ pub struct FakeHosts {
     pub ambiguous: Mutex<u32>,
     pub hide_new: Mutex<Option<(u32, u32)>>,
     pub stuck: Mutex<u32>,
+    pub refusal: Mutex<HashMap<Market, String>>,
     stuck_tokens: Mutex<std::collections::HashSet<String>>,
     by_token: Mutex<HashMap<String, Launch>>,
     visibility: Mutex<HashMap<String, (u32, u32)>>,
@@ -1722,10 +1750,13 @@ impl HostDriver for FakeHosts {
             }
         }
         if placed < count {
-            out.refused.push(format!(
-                "InsufficientInstanceCapacity: no {} capacity",
-                market.name()
-            ));
+            let why = self.refusal.lock().unwrap().get(&market).cloned();
+            out.refused.push(why.unwrap_or_else(|| {
+                format!(
+                    "InsufficientInstanceCapacity: no {} capacity",
+                    market.name()
+                )
+            }));
         }
         self.by_token
             .lock()
@@ -1784,13 +1815,10 @@ mod tests {
         }
     }
 
-    /// Every region listed and at its capacity: its live hosts less the excess. A region
-    /// unlisted or short, or asleep, says nothing.
-    /// A pass that leaves a region short says why its last market refused: on 2026-11-05
-    /// the wall's host waited 13 minutes and the log named only spot's refusal, while on
-    /// demand was refused with VcpuLimitExceeded (#1257).
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_region_still_short_logs_the_on_demand_refusal() {
+    /// One launch pass for one host in a region where both markets have no room, on demand
+    /// refused with `od_refusal` (EC2's capacity refusal when `None`): what it logged, the
+    /// errors it reported for the `scale` component, and whether the rest waits for capacity.
+    async fn short_pass(od_refusal: Option<&str>) -> (String, Vec<String>, bool) {
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -1813,6 +1841,12 @@ mod tests {
         for m in [Market::Spot, Market::OnDemand] {
             fake.capacity.lock().unwrap().insert(("r".into(), m), 0);
         }
+        if let Some(r) = od_refusal {
+            fake.refusal
+                .lock()
+                .unwrap()
+                .insert(Market::OnDemand, r.into());
+        }
         let cfg = HostConfig {
             driver: fake.clone(),
             regions: vec!["r".into()],
@@ -1832,16 +1866,58 @@ mod tests {
             tokens: &mut tokens,
             errors: &mut errors,
         };
-        let (launched, _) = launch_shortfall(&cfg, "r", 1, &[], &mut pass).await;
+        let (launched, retry) = launch_shortfall(&cfg, "r", 1, &[], &mut pass).await;
         assert!(launched.is_empty());
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, errors, retry)
+    }
+
+    /// A pass that leaves a region short says why its last market refused: on 2026-11-05
+    /// the wall's host waited 13 minutes and the log named only spot's refusal, while on
+    /// demand was refused with VcpuLimitExceeded (#1257).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_region_still_short_logs_the_on_demand_refusal() {
+        let (out, errors, retry) = short_pass(None).await;
         let line = out
             .lines()
             .find(|l| l.contains("GPU hosts still short"))
             .unwrap_or_else(|| panic!("{out}"));
         assert!(line.contains("no on-demand capacity"), "{line}");
+        // EC2 had no capacity: the region waits for it, and nothing is degraded.
+        assert!(retry);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!out.contains("EC2 refused a GPU host launch"), "{out}");
     }
 
+    /// A launch that the account's vCPU quota refuses is reported, not only retried. On
+    /// 2026-11-22 staging's wake was refused on demand with VcpuLimitExceeded every 10 s for
+    /// 15 minutes (the G quota was 384 vCPUs, production held two hosts and terminated hosts
+    /// were still shutting down), and nothing but a WARN line said so: no `scale` failure in
+    /// the state and no match for the coordinator's degraded alarm, which matches
+    /// "EC2 refused a GPU host launch". The same refusal had blocked staging's wakes for
+    /// 12 to 27 minutes at a time on 2026-11-07.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_on_demand_quota_refusal_marks_the_scale_degraded() {
+        let quota = "VcpuLimitExceeded: You have requested more vCPU capacity than your \
+                     current vCPU limit of 384 allows";
+        let (out, errors, retry) = short_pass(Some(quota)).await;
+        // The quota can free (a terminated host finishes shutting down): ask again after the
+        // capacity retry, as for capacity.
+        assert!(retry);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("r on-demand: VcpuLimitExceeded"),
+            "{errors:?}"
+        );
+        let line = out
+            .lines()
+            .find(|l| l.contains("EC2 refused a GPU host launch"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains("VcpuLimitExceeded"), "{line}");
+    }
+
+    /// Every region listed and at its capacity: its live hosts less the excess. A region
+    /// unlisted or short, or asleep, says nothing.
     #[test]
     fn expected_hosts_are_the_kept_hosts_of_full_regions_only() {
         let a = vec![
