@@ -1002,6 +1002,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::Agent { at, .. }
         | Event::AgentGone { at, .. }
         | Event::Ec2 { at, .. }
+        | Event::Lambda { at, .. }
         | Event::Degraded { at, .. }
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
@@ -1010,6 +1011,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::BudgetDrill { at, .. }
         | Event::HostsExpected { at, .. }
         | Event::Ec2Health { at, .. }
+        | Event::LambdaHealth { at, .. }
         | Event::Published { at, .. } => *at = t,
     }
 }

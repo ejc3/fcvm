@@ -136,6 +136,9 @@ pub fn layout(state: &State) -> Option<Layout> {
             .as_ref()
             .is_some_and(|h| f.hosts.get(h).is_some_and(|h| h.region.is_some())),
         fleet_core::tiling::Half::Ec2 => f.layout.ec2.is_some(),
+        // A Lambda tile is reached only over its tunnel to the coordinator, which the
+        // broadcast does not read yet; no coordinator runs a Lambda tile before it does.
+        fleet_core::tiling::Half::Lambda => false,
     };
     let tiles: Vec<TileSpec> = f
         .slots

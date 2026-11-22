@@ -430,6 +430,20 @@ screen until every new tile's first frame has arrived, then swaps them all at on
 keeps its slot and addresses; only its rectangle changes. Every viewer sees the same
 tiling, because the tiling is part of the shared state (fleet/PROTOCOL.md, `layout`).
 
+**Lambda tiles share the AWS half. DECIDED (2026-11-22).** The owner added AWS GPU Lambda
+(Lambda Managed Instances, one T4 execution environment per tile) to the race without a
+third side: `--lambda-tiles N` makes N of the AWS half's `--ec2-tiles` places Lambda tiles,
+so 8 become 4 EC2 and 4 Lambda tiles. The half keeps its width and its places, one grid with
+the EC2 tiles first, so a race still costs one launch per AWS tile and the viewers' launch
+budget is unchanged. The EC2 tiles and the Lambda tiles are timed apart and the scoreboard
+has three rows, fcvm, EC2 and Lambda. A Lambda tile's race time ends, as every tile's does,
+when the coordinator sees its new environment's first frame (each race publishes a new
+version of the tile's function); the time of one invoke of an environment already running is
+shown beside it and never counted. The spend ledger keeps each backing's part of the day.
+The tiles follow the fleet's power: asleep there are none, and their functions are deleted.
+fleet/core has this; the coordinator's Lambda driver, the relay that carries a tile's frames
+(a Lambda environment accepts no inbound connection) and the page's third row come after it.
+
 ### Web
 
 Next.js on Cloudflare Workers (OpenNext), following the house style: the rules live in a

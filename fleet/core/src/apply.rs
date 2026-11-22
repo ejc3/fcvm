@@ -10,6 +10,17 @@ use crate::state::*;
 use crate::tiling::{bands, grid_in, sides, Half, Rect};
 use std::collections::BTreeMap;
 
+/// The slots of one backing. A macro, so it borrows only that field of the fleet.
+macro_rules! side_mut {
+    ($f:expr, $half:expr) => {
+        match $half {
+            Half::Fcvm => &mut $f.slots,
+            Half::Ec2 => &mut $f.ec2,
+            Half::Lambda => &mut $f.lambda,
+        }
+    };
+}
+
 /// How long a reclaimed host stays in the failure list after it is gone.
 pub const RECLAIMED_KEEP_MS: u64 = 60_000;
 /// Races counted in the scoreboard's medians.
@@ -22,9 +33,10 @@ pub const SCOREBOARD_RACES: usize = 20;
 pub const EC2_RELAUNCH_COOLDOWN_MS: u64 = 90_000;
 /// The window of the viewers' EC2 launch budget.
 pub const EC2_LAUNCH_WINDOW_MS: u64 = 600_000;
-/// EC2 instance launches viewers may cause in [`EC2_LAUNCH_WINDOW_MS`], counting a `relaunch`
-/// of an EC2 tile as one and a `restart_now` race as one per EC2 tile. Each launch bills at
-/// least 60 s of an instance that, relaunched again at once, would serve nothing: at the
+/// Launches viewers may cause in [`EC2_LAUNCH_WINDOW_MS`] on the AWS half, counting a
+/// `relaunch` of an EC2 or a Lambda tile as one and a `restart_now` race as one per AWS tile,
+/// whichever its backing (a Lambda tile is a g4dn.xlarge too). Each launch bills at least
+/// 60 s of an instance that, relaunched again at once, would serve nothing: at the
 /// g4dn.xlarge on-demand price ($0.526 an hour, us-east-1) that is $0.0088, so 40 launches in
 /// 10 minutes bound the waste viewers can cause to about $2.10 an hour. 40 is five races of the default 8 EC2 tiles
 /// (`--ec2-tiles`) in 10 minutes, one every two minutes, or 40 single relaunches. The owner's
@@ -135,7 +147,7 @@ fn word_rate(state: &State, client: &str, at: u64) -> Result<(), String> {
     )
 }
 
-/// Refuse `launches` more viewer-caused EC2 launches when they would pass
+/// Refuse `launches` more viewer-caused EC2 or Lambda launches when they would pass
 /// [`EC2_LAUNCH_BUDGET`] in the window ending at `at`, saying when enough of the budget frees.
 fn ec2_budget(
     recent: &std::collections::VecDeque<u64>,
@@ -315,6 +327,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .slots
                 .values_mut()
                 .chain(f.ec2.values_mut())
+                .chain(f.lambda.values_mut())
                 .chain(f.phones.values_mut())
                 .chain(f.windows.values_mut())
                 .chain(f.minecraft.values_mut())
@@ -339,17 +352,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::Burn {
             usd_per_hour,
             instances,
+            by_backing,
             ..
         } => {
             let s = &mut state.fleet.spend;
             let rate = usd_per_hour.max(0.0);
             // Nothing running and nothing changed (an asleep fleet's reports): the state stays
             // as it is, so no snapshot or stored state is sent for it.
-            let idle = s.usd_per_hour == 0.0 && rate == 0.0 && s.instances == *instances;
+            let idle = s.usd_per_hour == 0.0
+                && rate == 0.0
+                && s.instances == *instances
+                && s.by_backing.values().all(|b| b.usd_per_hour == 0.0)
+                && by_backing.values().all(|r| *r <= 0.0);
             if !idle || s.at == 0 || s.day != at / crate::spend::DAY_MS {
                 s.bring_forward(at);
                 s.usd_per_hour = rate;
                 s.instances = *instances;
+                s.set_backing_rates(by_backing);
             }
             None
         }
@@ -425,7 +444,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             state.fleet.potato.tick(at, awake, &cfg);
             None
         }
-        Event::Ec2Health { report, .. } => {
+        Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
             health(&mut state.fleet, None, report);
             None
         }
@@ -586,6 +605,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::Lambda { report, .. } => {
+            if let Some(n) = lambda_number(&report.id) {
+                observe_slot(&mut state.fleet, Half::Lambda, n, None, report, at);
+            }
+            None
+        }
         Event::Degraded {
             component, reason, ..
         } => {
@@ -612,18 +637,18 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
 }
 
 /// A tile on the wall with a renderer behind it: a placed fcvm slot, or a placed EC2 tile
-/// with an instance. An EC2 tile without one holds its place, dark, and is no GPU of the
-/// wall's: not counted, not waited on.
+/// with an instance (a Lambda tile with an environment). An EC2 or Lambda tile without one
+/// holds its place, dark, and is no GPU of the wall's: not counted, not waited on.
 pub fn renders_on_wall(s: &Slot) -> bool {
     s.position.is_some() && (s.half == Half::Fcvm || s.observed.vm.is_some())
 }
 
 /// A race whose halves are not all done.
 pub fn race_running(f: &Fleet) -> bool {
-    f.races.back().is_some_and(|r| {
-        r.fcvm.done_at.is_none() && !r.fcvm.tiles.is_empty()
-            || r.ec2.done_at.is_none() && !r.ec2.tiles.is_empty()
-    })
+    let running = |h: &HalfRace| h.done_at.is_none() && !h.tiles.is_empty();
+    f.races
+        .back()
+        .is_some_and(|r| running(&r.fcvm) || running(&r.ec2) || running(&r.lambda))
 }
 
 /// Whether the image shows what it will keep showing: no race is running and no placed
@@ -639,17 +664,28 @@ pub fn image_settled(f: &Fleet) -> bool {
                     "pending" | "launching" | "stopping" | "restoring" | "starting"
                 ))
     };
-    !race_running(f) && !f.slots.values().chain(f.ec2.values()).any(starting)
+    !race_running(f)
+        && !f
+            .slots
+            .values()
+            .chain(f.ec2.values())
+            .chain(f.lambda.values())
+            .any(starting)
 }
 
-/// Every placed fcvm tile runs its current generation, and every EC2 tile does too or is
-/// waiting for capacity (a wait the EC2 side shows on its own).
+/// Every placed fcvm tile runs its current generation, and every EC2 and Lambda tile does
+/// too or is waiting for capacity (a wait its side shows on its own).
 fn image_complete(f: &Fleet) -> bool {
     let running = |s: &Slot| s.observed.phase == "running" && s.observed.generation >= s.generation;
-    f.slots.values().chain(f.ec2.values()).any(renders_on_wall)
+    f.slots
+        .values()
+        .chain(f.ec2.values())
+        .chain(f.lambda.values())
+        .any(renders_on_wall)
         && f.slots.values().all(|s| s.position.is_none() || running(s))
         && f.ec2
             .values()
+            .chain(f.lambda.values())
             .all(|s| running(s) || s.observed.phase == "waiting_capacity")
 }
 
@@ -734,6 +770,7 @@ fn power_step(state: &mut State, at: u64) {
             .slots
             .values()
             .chain(f.ec2.values())
+            .chain(f.lambda.values())
             .filter(|s| renders_on_wall(s))
             .count();
         f.power.wakes.push_back(Wake {
@@ -821,7 +858,8 @@ fn budget_step(state: &mut State, at: u64) {
     // A running race ends: tiles still to reach their first frame leave it, so each half is
     // done with the tiles that finished, or holds none.
     for race in f.races.iter_mut() {
-        for h in [&mut race.fcvm, &mut race.ec2] {
+        let started_at = race.started_at;
+        for h in race.halves_mut() {
             if h.done_at.is_some() {
                 continue;
             }
@@ -829,7 +867,7 @@ fn budget_step(state: &mut State, at: u64) {
             h.tiles.retain(|_, t| t.first_frame_at.is_some());
             h.dropped += before - h.tiles.len();
             let last = h.last.clone();
-            finish_half(h, race.started_at, last, at);
+            finish_half(h, started_at, last, at);
         }
     }
     if f.power.state != "asleep" {
@@ -955,18 +993,18 @@ fn intent_effect(
                 "relaunch",
             )?;
             let f = &mut state.fleet;
-            let slot = match half {
-                Half::Fcvm => f.slots.get_mut(&n),
-                Half::Ec2 => f.ec2.get_mut(&n),
-            }
-            .expect("find_slot returned a live slot");
+            let slot = side_mut!(f, half)
+                .get_mut(&n)
+                .expect("find_slot returned a live slot");
             if half == Half::Fcvm && host_draining(&f.hosts, slot) {
                 return Err(format!("{} is on a draining host", slot.id));
             }
             if slot.claim.is_some() {
                 return Err(format!("{} is a viewer's own GPU right now", slot.id));
             }
-            if half == Half::Ec2 {
+            // An EC2 tile's launch is an instance and a Lambda tile's an environment on one:
+            // the same spacing and the same budget.
+            if half != Half::Fcvm {
                 // Its last launch: a relaunch, or, before the first running report fills
                 // that in, the launch that created the slot.
                 let launched = slot
@@ -986,7 +1024,7 @@ fn intent_effect(
             bump(slot, &by, at);
             let summary = format!("relaunch {}", slot.id);
             f.last_relaunch_at.insert(c.client.to_string(), at);
-            if half == Half::Ec2 {
+            if half != Half::Fcvm {
                 f.ec2_viewer_launches.push_back(at);
             }
             Ok(summary)
@@ -1011,14 +1049,14 @@ fn intent_effect(
                     (until - at).div_ceil(1000)
                 ));
             }
-            // Every EC2 tile races (`start_race`), each with a launch.
-            let ec2 = state.fleet.ec2.len();
-            if ec2 > 0 {
-                ec2_budget(&state.fleet.ec2_viewer_launches, ec2, at)?;
+            // Every EC2 and Lambda tile races (`start_race`), each with a launch.
+            let launches = state.fleet.ec2.len() + state.fleet.lambda.len();
+            if launches > 0 {
+                ec2_budget(&state.fleet.ec2_viewer_launches, launches, at)?;
                 state
                     .fleet
                     .ec2_viewer_launches
-                    .extend(std::iter::repeat_n(at, ec2));
+                    .extend(std::iter::repeat_n(at, launches));
             }
             let id = start_race(state, &by, at);
             Ok(format!("race {id}"))
@@ -1498,6 +1536,7 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
         by: by.to_string(),
         fcvm: HalfRace::default(),
         ec2: HalfRace::default(),
+        lambda: HalfRace::default(),
     };
     for slot in f.slots.values_mut() {
         if let (Some(c), Some(k)) = (&slot.claim, slot.position) {
@@ -1523,17 +1562,18 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
             );
         }
     }
-    // Every EC2 tile races, also one still waiting for capacity (that wait is kept out of
-    // the half's time); a tile without an instance has no place yet and names its slot.
-    for slot in f.ec2.values_mut() {
-        bump(slot, by, at);
-        {
-            race.ec2.tiles.insert(
+    // Every EC2 and Lambda tile races, also one still waiting for capacity (that wait is
+    // kept out of the half's time); a tile without a place names its slot. A Lambda tile's
+    // new generation is a new published version, so the race times a fresh environment.
+    for (half, slots) in [(Half::Ec2, &mut f.ec2), (Half::Lambda, &mut f.lambda)] {
+        for slot in slots.values_mut() {
+            bump(slot, by, at);
+            race.half_mut(half).tiles.insert(
                 slot.id.clone(),
                 RaceTile {
                     tile: slot
                         .position
-                        .map(|k| format!("ec2:{}", k + 1))
+                        .map(|k| format!("{}:{}", half.as_str(), k + 1))
                         .unwrap_or_else(|| slot.id.clone()),
                     generation: slot.generation,
                     first_frame_at: None,
@@ -1861,7 +1901,8 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
     }
 }
 
-/// What a slot report says about the slot's launch, for a wall slot, an EC2 tile or a phone.
+/// What a slot report says about the slot's launch, for a wall slot, an EC2 or Lambda tile or
+/// a phone.
 fn note_report(slot: &mut Slot, r: &SlotReport, at: u64) {
     slot.observed.phase = r.phase.clone();
     slot.observed.generation = r.generation;
@@ -1924,11 +1965,9 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             count_restore(&mut f.counters, at);
         }
     }
-    let slot = match half {
-        Half::Fcvm => f.slots.get_mut(&n),
-        Half::Ec2 => f.ec2.get_mut(&n),
+    let Some(slot) = side_mut!(f, half).get_mut(&n) else {
+        return;
     };
-    let Some(slot) = slot else { return };
     if host.is_some() && slot.host.as_deref() != host {
         return;
     }
@@ -1942,10 +1981,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
         for race in f.races.iter_mut() {
-            let h = match half {
-                Half::Fcvm => &mut race.fcvm,
-                Half::Ec2 => &mut race.ec2,
-            };
+            let h = race.half_mut(half);
             if let Some(t) = h.tiles.get_mut(&id) {
                 if h.done_at.is_none() && t.first_frame_at.is_none() && r.generation >= t.generation
                 {
@@ -1954,10 +1990,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             }
         }
     }
-    let Some(slot) = (match half {
-        Half::Fcvm => f.slots.get_mut(&n),
-        Half::Ec2 => f.ec2.get_mut(&n),
-    }) else {
+    let Some(slot) = side_mut!(f, half).get_mut(&n) else {
         return;
     };
     if !note_running(slot, r, at) {
@@ -1973,23 +2006,32 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     let id = slot.id.clone();
     // The running report finishes this tile in every race still waiting for it.
     for race in f.races.iter_mut() {
-        let h = match half {
-            Half::Fcvm => &mut race.fcvm,
-            Half::Ec2 => &mut race.ec2,
-        };
-        if h.done_at.is_some() {
-            continue;
-        }
+        let started_at = race.started_at;
+        let h = race.half_mut(half);
         let Some(t) = h.tiles.get_mut(&id) else {
             continue;
         };
-        if t.first_frame_at.is_some() || r.generation < t.generation {
+        if t.first_frame_at.is_some() {
+            // A warm invoke is measured on the running environment, so its timing can
+            // arrive after the first frame: keep it beside the race time, and change neither
+            // the first frame nor the time.
+            if let Some(w) = r.timings.get("warm_invoke_ms").copied() {
+                if r.generation == t.generation {
+                    t.phases.insert("warm_invoke_ms".into(), w);
+                    if h.done_at.is_some() {
+                        h.warm_invoke_ms = warm_invoke_max(h);
+                    }
+                }
+            }
+            continue;
+        }
+        if h.done_at.is_some() || r.generation < t.generation {
             continue;
         }
         t.first_frame_at = Some(at);
         t.phases = r.timings.clone();
         t.capacity_wait_ms = r.timings.get("capacity_wait_ms").copied().unwrap_or(0);
-        finish_half(h, race.started_at, Some(id.clone()), at);
+        finish_half(h, started_at, Some(id.clone()), at);
     }
 }
 
@@ -2015,6 +2057,16 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .map(|t| t.capacity_wait_ms)
         .max()
         .unwrap_or(0);
+    // Reported beside the time, never part of it.
+    h.warm_invoke_ms = warm_invoke_max(h);
+}
+
+/// The slowest tile's warm invoke, of the tiles that have reported one.
+fn warm_invoke_max(h: &HalfRace) -> Option<u64> {
+    h.tiles
+        .values()
+        .filter_map(|t| t.phases.get("warm_invoke_ms").copied())
+        .max()
 }
 
 fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
@@ -2023,7 +2075,11 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
             phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
         }
         Some(_) => slot_number(&h.id).and_then(|n| f.slots.get_mut(&n)),
-        None => ec2_number(&h.id).and_then(|n| f.ec2.get_mut(&n)),
+        None => match (ec2_number(&h.id), lambda_number(&h.id)) {
+            (Some(n), _) => f.ec2.get_mut(&n),
+            (None, Some(n)) => f.lambda.get_mut(&n),
+            (None, None) => None,
+        },
     };
     let Some(slot) = slot else {
         return;
@@ -2032,7 +2088,8 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
         return;
     }
     slot.observed.fps = h.fps.is_finite().then_some(h.fps);
-    // An EC2 tile has no inventory to name its GPU: the renderer says which one it drew on.
+    // An EC2 or Lambda tile has no inventory to name its GPU: the renderer says which one it
+    // drew on.
     if host.is_none() {
         if let Some(name) = h
             .gpu
@@ -2069,6 +2126,7 @@ fn budget_round(f: &mut Fleet, at: u64) {
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.lambda.values())
         .filter(|s| renders_on_wall(s) && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
@@ -2129,8 +2187,10 @@ fn drop_from_races(f: &mut Fleet, leaving: impl Fn(&Slot) -> bool, at: u64) {
 fn drop_missing_from_races(f: &mut Fleet, at: u64) {
     let slots: Vec<String> = f.slots.values().map(|s| s.id.clone()).collect();
     let ec2: Vec<String> = f.ec2.values().map(|s| s.id.clone()).collect();
+    let lambda: Vec<String> = f.lambda.values().map(|s| s.id.clone()).collect();
     for race in f.races.iter_mut() {
-        for (h, live) in [(&mut race.fcvm, &slots), (&mut race.ec2, &ec2)] {
+        let started_at = race.started_at;
+        for (h, live) in race.halves_mut().into_iter().zip([&slots, &ec2, &lambda]) {
             if h.done_at.is_some() {
                 continue;
             }
@@ -2139,7 +2199,7 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
                 .retain(|id, t| live.contains(id) || t.first_frame_at.is_some());
             h.dropped += before - h.tiles.len();
             let last = h.last.clone();
-            finish_half(h, race.started_at, last, at);
+            finish_half(h, started_at, last, at);
         }
     }
 }
@@ -2150,8 +2210,11 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 /// - fcvm GPUs: slots whose host is present and not draining, in slot-number order, at
 ///   most `max_tiles`; a GPU claimed from standby is left out, a borrowed wall tile keeps
 ///   its place. fcvm slots beyond `max_tiles` are standby.
-/// - EC2 tiles wanted: `min(ec2_max, max_tiles)`; `ec2-1..ec2-D` exist, higher ones are
-///   dropped (the driver terminates their instances). Each has a place, instance or not.
+/// - Each AWS tile has a place, with an instance (an environment) or not.
+/// - The AWS half's tiles: `min(ec2_max, max_tiles)`, of which `min(lambda_max, that)` are
+///   Lambda tiles (`lam-1..lam-L`) and the rest EC2 tiles (`ec2-1..ec2-E`); one is dropped
+///   when its count falls (the driver terminates its instance, or deletes its function). The
+///   half is one grid: the EC2 tiles' places first, then the Lambda tiles'.
 /// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs - quarantined GPUs, fcvm
 ///   GPUs)`, where phone GPUs are those connected hosts run phones on and quarantined GPUs
 ///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. Once
@@ -2162,7 +2225,7 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   place. The
 ///   GPUs are grouped into one band per host and the places left over are one dark band
 ///   below them.
-/// - Asleep, neither side has a place.
+/// - Asleep, no side has a place.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
     // EC2 side's tiles go away, whether or not their hosts scale down with them.
@@ -2210,16 +2273,25 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     let was_warming = std::mem::replace(&mut f.warming, warming.into_iter().collect());
     // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
     // the GPUs it has live); asleep it has none.
-    let want_ec2 = if asleep {
+    let aws = if asleep {
         0
     } else {
-        c.ec2_max.min(c.max_tiles) as u32
+        c.ec2_max.min(c.max_tiles)
     };
+    let want_lambda = c.lambda_max.min(aws) as u32;
+    let want_ec2 = aws as u32 - want_lambda;
     f.ec2.retain(|n, _| *n <= want_ec2);
     for n in 1..=want_ec2 {
         f.ec2
             .entry(n)
             .or_insert_with(|| new_slot(ec2_name(n), Half::Ec2, None, None, at));
+    }
+    // The Lambda tiles likewise: asleep there are none, so their functions are deleted.
+    f.lambda.retain(|n, _| *n <= want_lambda);
+    for n in 1..=want_lambda {
+        f.lambda
+            .entry(n)
+            .or_insert_with(|| new_slot(lambda_name(n), Half::Lambda, None, None, at));
     }
     // Each side is as wide as its share of the configured places, so a tile going dark (a
     // race replacing the EC2 instances, a capacity wait, a host not yet connected or
@@ -2229,6 +2301,8 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // until an operator releases them), or one per live GPU when there are more. A place
     // kept for either would stay dark for as long as its host runs.
     let ec2_places: Vec<u32> = f.ec2.keys().copied().take(c.max_tiles).collect();
+    // At most `max_tiles` with the EC2 tiles (`aws` above).
+    let lambda_places: Vec<u32> = f.lambda.keys().copied().collect();
     let quarantined = f
         .slots
         .values()
@@ -2264,7 +2338,8 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     };
     f.n = active.len();
     f.ec2_n = ec2_places.len();
-    let (fcvm_side, ec2_side) = sides(fcvm_places, f.ec2_n);
+    f.lambda_n = lambda_places.len();
+    let (fcvm_side, ec2_side) = sides(fcvm_places, f.ec2_n + f.lambda_n);
     // fcvm: one band per host, hosts ordered by their lowest placed slot.
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
     for num in &active {
@@ -2290,7 +2365,13 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     } else {
         Vec::new()
     };
-    let ec2_rects = grid_in(ec2_side, f.ec2_n, c.image_aspect, c.tile_aspect);
+    // One grid for the AWS half: its EC2 tiles' places, then its Lambda tiles'.
+    let aws_rects = grid_in(
+        ec2_side,
+        f.ec2_n + f.lambda_n,
+        c.image_aspect,
+        c.tile_aspect,
+    );
     // The new place of every slot, then compare with the old.
     let mut placed: BTreeMap<(Half, u32), (usize, Rect)> = BTreeMap::new();
     for h in f.hosts.values_mut() {
@@ -2307,18 +2388,22 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         }
     }
     for (i, num) in ec2_places.iter().enumerate() {
-        placed.insert((Half::Ec2, *num), (i, ec2_rects[i]));
+        placed.insert((Half::Ec2, *num), (i, aws_rects[i]));
+    }
+    for (i, num) in lambda_places.iter().enumerate() {
+        placed.insert((Half::Lambda, *num), (i, aws_rects[f.ec2_n + i]));
     }
     let changed = f
         .slots
         .iter()
         .map(|(n, s)| ((Half::Fcvm, *n), s))
         .chain(f.ec2.iter().map(|(n, s)| ((Half::Ec2, *n), s)))
+        .chain(f.lambda.iter().map(|(n, s)| ((Half::Lambda, *n), s)))
         .any(|(key, s)| placed.get(&key).map(|p| (p.0, p.1)) != s.position.zip(s.rect))
         // A slot that left moved nothing still here, but the sides changed.
         || f.fcvm_dark != fcvm_dark
         || f.layout.fcvm != (fcvm_places > 0).then_some(fcvm_side)
-        || f.layout.ec2 != (f.ec2_n > 0).then_some(ec2_side);
+        || f.layout.ec2 != (f.ec2_n + f.lambda_n > 0).then_some(ec2_side);
     f.fcvm_dark = fcvm_dark;
     let generation = if changed {
         f.layout.generation + 1
@@ -2330,10 +2415,14 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             generation,
             from_frame: crate::state::layout_from_frame(f.scene.t_at(at)),
             fcvm: (fcvm_places > 0).then_some(fcvm_side),
-            ec2: (f.ec2_n > 0).then_some(ec2_side),
+            ec2: (f.ec2_n + f.lambda_n > 0).then_some(ec2_side),
         };
     }
-    for (half, slots) in [(Half::Fcvm, &mut f.slots), (Half::Ec2, &mut f.ec2)] {
+    for (half, slots) in [
+        (Half::Fcvm, &mut f.slots),
+        (Half::Ec2, &mut f.ec2),
+        (Half::Lambda, &mut f.lambda),
+    ] {
         for (n, s) in slots.iter_mut() {
             let new = placed.get(&(half, *n)).copied();
             let (pos, rect) = (new.map(|p| p.0), new.map(|p| p.1));

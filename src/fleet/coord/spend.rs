@@ -395,6 +395,7 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
                         at: 0,
                         usd_per_hour,
                         instances,
+                        by_backing: Default::default(),
                     })
                     .await;
             }
