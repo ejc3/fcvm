@@ -8,10 +8,23 @@ perf-top.txt (from perftop.sh) whose first lines are "pct comm symbol".
 import argparse
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 CELL = re.compile(r"^(?P<piece>[a-z-]+)-c(?P<c>\d+)-n(?P<n>\d+)-a(?P<a>\d+)$")
+
+
+def failed(summary):
+    """Whether a cell's run had a failed op, a failed teardown or a perf collector that failed."""
+    return bool(summary["timed"]["failed"] or summary["teardown"]["failed"]
+                or summary.get("perf_errors"))
+
+
+def best_rate(cells):
+    """The best rate measured with 1000 held, or in any cell when none had 1000 held."""
+    held = [s for (c, a), (s, _top) in cells.items() if a == 1000] or [s for s, _top in cells.values()]
+    return max(s["timed"]["ops_per_s"] for s in held)
 
 
 def load(roots):
@@ -23,6 +36,9 @@ def load(roots):
             if not m or not (d / "summary.json").exists():
                 continue
             s = json.loads((d / "summary.json").read_text())
+            if failed(s):
+                print(f"skipping {d}: it has failures", file=sys.stderr)
+                continue
             label = m["piece"] + ("+uffd" if s.get("uffd") else "") + (" cold" if s.get("cold") else "")
             top = []
             if (d / "perf-top.txt").exists():
@@ -56,23 +72,23 @@ def main():
         host = t["host_cpu_s_per_op_net"]
         cg = t["cgroup_cpu_s_per_op_net"]
         cpu = max(host, cg)
-        best = max(x[0]["timed"]["ops_per_s"] for x in v.values())
-        ceiling = min(best, args.cores / cpu) if cpu > 0 else best
+        best = best_rate(v)
+        limit = min(best, args.cores / cpu) if cpu > 0 else best
         rates = {}
         for a in (0, 1000):
             rates[a] = [v[(c, a)][0]["timed"]["ops_per_s"] if (c, a) in v else None for c in cs]
         lat = {k: v[k][0]["timed"]["latency_ms"]["p50"] for k in v}
         lat99 = {k: v[k][0]["timed"]["latency_ms"]["p99"] for k in v}
         steady = s["steady_per_instance_per_s"]["host_busy_cpu_s"]
-        rows.append((ceiling, label, rates, cg, host, lat, lat99, steady, top, t))
+        rows.append((limit, label, rates, cg, host, lat, lat99, steady, top, t))
     rows.sort(key=lambda r: r[0])
     hdr = ["piece", "ceiling/s"] + [f"ops/s C={c} a0/a1000" for c in cs] + [
         f"CPU-s/op cgroup (C={args.ref_c})", "CPU-s/op host", "p50/p99 ms C=1 a0", f"p50/p99 ms C={args.ref_c} a1000",
         "held instance, cores", "ctxt/op", "IPI/op", "top 3 frames"]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "---|" * len(hdr))
-    for ceiling, label, rates, cg, host, lat, lat99, steady, top, t in rows:
-        cols = [label, fmt(ceiling)]
+    for limit, label, rates, cg, host, lat, lat99, steady, top, t in rows:
+        cols = [label, fmt(limit)]
         for i, _c in enumerate(cs):
             cols.append(f"{fmt(rates[0][i])} / {fmt(rates[1000][i])}")
         k1 = (1, 0)

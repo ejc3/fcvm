@@ -79,7 +79,7 @@ Attaching 20 probes...
 @exec[/usr/bin/sed]: 1
 @exec[/usr/bin/nproc]: 1
 @exec[/usr/bin/systemd-run]: 1
-@exec[/mnt/fcvm-btrfs/work/fcvm/target/release/start-pieces]: 1
+@exec[$CHECKOUT/target/release/start-pieces]: 1
 @exec[/usr/bin/ps]: 1
 @exec[/usr/bin/uptime]: 1
 @exec[/usr/sbin/tail]: 1
@@ -141,7 +141,7 @@ Attaching 20 probes...
 @exec[$HOME/.cargo/bin/unshare]: 1999
 @exec[/usr/local/sbin/unshare]: 1999
 @exec[/usr/local/bin/newuidmap]: 1999
-@exec[/mnt/fcvm-btrfs/cargo-target/fcvm-f43cabe9/release/start-pieces]: 1999
+@exec[$CARGO_TARGET/release/start-pieces]: 1999
 @exec[/usr/bin/newuidmap]: 1999
 @exec[/usr/bin/unshare]: 1999
 @exec[/usr/sbin/ldd]: 2000

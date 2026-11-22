@@ -1767,6 +1767,7 @@ bench-start-pieces:
 test-start-pieces: private SHELL := $(TARGET_LEASE_SHELL)
 test-start-pieces: cargo-target-link
 	CARGO_TARGET_DIR=target $(CARGO) test --release -p start-pieces
+	python3 -m unittest discover -s bench/start-rate/pieces -p 'test_*.py' -v
 
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest

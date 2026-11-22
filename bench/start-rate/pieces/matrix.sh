@@ -5,13 +5,10 @@
 #        measure instead of the built one, for an A/B), ARGS)
 # A rung is C:COUNT. A cell whose summary.json exists is skipped, so a rerun resumes.
 set -uo pipefail
-out_root=$1
-pieces=$2
 RUNGS=${RUNGS:-"1:100 32:400 128:1000 512:1000"}
 ALIVES=${ALIVES:-"0 1000"}
 LOAD_MAX=${LOAD_MAX:-2}  # busy CPUs (from /proc/stat over 1 s) below which the host is quiet
-cd "$(dirname "$0")/../../.."
-mkdir -p "$out_root"
+QUIET_TRIES=${QUIET_TRIES:-600}  # one-second samples quiet() takes before it gives up
 
 # The previous cell's teardown has settled and nothing else is loading the host. Network
 # namespaces are destroyed after their last process exits, by the kernel's netns workqueue,
@@ -26,7 +23,7 @@ busy_cores() {  # host busy CPUs over one second, from /proc/stat
 }
 quiet() {
   local l n start=$SECONDS
-  for _ in $(seq 1 600); do
+  for _ in $(seq 1 "$QUIET_TRIES"); do
     l=$(busy_cores)
     n=$(ps -eo comm= | grep -c '+netns')
     if [ "$l" -lt "$LOAD_MAX" ] && [ "$n" -eq 0 ] \
@@ -35,17 +32,33 @@ quiet() {
       return 0
     fi
   done
-  echo "WARN: host not quiet before $1: $l CPUs busy, netns workers busy $n"
+  echo "host not quiet before $1: $l CPUs busy, netns workers busy $n"
+  return 1
 }
+
+# A cell counts once its summary says nothing failed; any other cell is run again.
+cell_done() {
+  [ -f "$1/summary.json" ] &&
+    jq -e '.timed.failed == 0 and .teardown.failed == 0 and ((.perf_errors // []) | length) == 0' \
+      "$1/summary.json" > /dev/null
+}
+
+# Sourced (by test_pieces.py) for its functions only.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+out_root=$1
+pieces=$2
+cd "$(dirname "$0")/../../.."
+mkdir -p "$out_root"
 
 for piece in ${pieces//,/ }; do
   for alive in $ALIVES; do
     for rung in $RUNGS; do
       c=${rung%%:*}; n=${rung##*:}
       cell="$out_root/$piece-c$c-n$n-a$alive"
-      [ -f "$cell/summary.json" ] && continue
+      cell_done "$cell" && continue
       rm -rf "$cell"
-      quiet "$cell"
+      quiet "$cell" || { echo "SKIPPED $cell"; continue; }
       echo "=== $(date -u +%H:%M:%S) $piece C=$c N=$n ALIVE=$alive"
       make --no-print-directory bench-start-pieces PIECE="$piece" OUT="$cell" COUNT="$n" COLD="${COLD:-}" \
         START_PIECES="${START_PIECES:-$PWD/target/release/start-pieces}" ARGS="${ARGS:-}" \

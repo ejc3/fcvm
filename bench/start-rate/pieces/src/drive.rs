@@ -196,12 +196,16 @@ fn piece_argv(p: &PieceArgs) -> Vec<String> {
 
 async fn spawn(argv: &[String], log: &std::fs::File) -> Result<Inst> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(argv)
-        .env(
-            crate::pieces::DRIVER_PID_ENV,
-            std::process::id().to_string(),
-        )
-        .stdin(Stdio::piped())
+    cmd.args(argv).env(
+        crate::pieces::DRIVER_PID_ENV,
+        std::process::id().to_string(),
+    );
+    spawn_command(cmd, log)
+}
+
+/// Start `cmd` as an instance: its stdin and stdout are the protocol, its stderr the log.
+fn spawn_command(mut cmd: std::process::Command, log: &std::fs::File) -> Result<Inst> {
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log.try_clone()?));
     // No pre_exec: without one the standard library spawns with posix_spawn (a vfork), where
@@ -217,7 +221,23 @@ async fn spawn(argv: &[String], log: &std::fs::File) -> Result<Inst> {
     })
 }
 
+/// How long an instance that reported an error gets to tear down what it made and exit.
+const TEARDOWN_AFTER_ERROR: Duration = Duration::from_secs(120);
+
 impl Inst {
+    /// Let an instance that failed finish its teardown and exit (it tears down before it
+    /// reports the error, and exits after); kill it only if it does not within
+    /// [`TEARDOWN_AFTER_ERROR`]. Killing it at once would leave its disk or network behind.
+    async fn reap_after_error(&mut self) {
+        if tokio::time::timeout(TEARDOWN_AFTER_ERROR, self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
+    }
+
     /// The next protocol line; an `error` line or EOF fails.
     async fn expect(&mut self, word: &str) -> Result<Value> {
         let line = self
@@ -257,10 +277,18 @@ async fn make(
         set.spawn(async move {
             let _permit = sem.acquire_owned().await?;
             let mut inst = spawn(&argv, &log).await?;
-            inst.expect("ready").await?;
-            if run {
-                inst.send("go").await?;
-                inst.expect("done").await?;
+            let made = async {
+                inst.expect("ready").await?;
+                if run {
+                    inst.send("go").await?;
+                    inst.expect("done").await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = made {
+                inst.reap_after_error().await;
+                return Err(error);
             }
             Ok::<_, anyhow::Error>(inst)
         });
@@ -310,7 +338,7 @@ async fn phase(
                     error: None,
                 },
                 Err(e) => {
-                    let _ = inst.child.start_kill();
+                    inst.reap_after_error().await;
                     OpResult {
                         inst: None,
                         latency_ms,
@@ -361,7 +389,7 @@ async fn cold_phase(
                 },
                 Err(e) => {
                     if let Some(mut inst) = made {
-                        let _ = inst.child.start_kill();
+                        inst.reap_after_error().await;
                     }
                     OpResult {
                         inst: None,
@@ -425,29 +453,48 @@ fn summarize(results: &[OpResult], wall: f64, a: &Counters, b: &Counters, idle: 
     })
 }
 
-struct Perf(Option<std::process::Child>);
+/// A perf collector over a phase. Its stderr goes to `err`; a perf that exits on its own
+/// before it is stopped, or exits non-zero when stopped, fails the run: a collector that
+/// cannot run must say so.
+struct Perf(Option<(std::process::Child, PathBuf)>);
 
 impl Perf {
-    fn start(cmd: &str, args: &[String]) -> Result<Self> {
+    fn start(cmd: &str, args: &[String], err: &Path) -> Result<Self> {
         use std::os::unix::process::CommandExt as _;
         let mut words = cmd.split_whitespace();
         let mut c = std::process::Command::new(words.next().context("empty perf command")?);
         c.args(words)
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(std::fs::File::create(err)?));
         // Its own process group: SIGINT reaches perf through sudo without reaching us.
         c.process_group(0);
-        Ok(Perf(Some(c.spawn()?)))
+        Ok(Perf(Some((c.spawn()?, err.to_path_buf()))))
     }
-    fn stop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+    fn stop(&mut self) -> Result<()> {
+        let Some((mut child, err)) = self.0.take() else {
+            return Ok(());
+        };
+        let exited_early = child.try_wait()?;
+        if exited_early.is_none() {
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(child.id() as i32),
                 nix::sys::signal::Signal::SIGINT,
             );
-            let _ = child.wait();
         }
+        let status = child.wait()?;
+        if exited_early.is_some() || !status.success() {
+            bail!(
+                "the perf collector {} ({status}): {}",
+                if exited_early.is_some() {
+                    "exited before it was stopped"
+                } else {
+                    "failed"
+                },
+                std::fs::read_to_string(&err).unwrap_or_default().trim()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -467,6 +514,7 @@ fn perf_stat(args: &DriveArgs, out: &Path, name: &str) -> Result<Perf> {
             "-e".into(),
             args.perf_events.clone(),
         ],
+        &out.join(format!("{name}.err")),
     )
 }
 
@@ -532,6 +580,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
                 "-o".into(),
                 args.out.join("perf.data").display().to_string(),
             ],
+            &args.out.join("perf-record.err"),
         )?
     } else {
         Perf(None)
@@ -550,8 +599,12 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     };
     let wall = t.elapsed().as_secs_f64();
     let b = read_counters(&cgroup)?;
-    record.stop();
-    stat.stop();
+    let mut perf_errors: Vec<String> = Vec::new();
+    for collector in [&mut record, &mut stat] {
+        if let Err(error) = collector.stop() {
+            perf_errors.push(format!("{error:#}"));
+        }
+    }
     let timed = summarize(&results, wall, &a, &b, &idle);
     let mut ops = String::new();
     for r in &results {
@@ -567,7 +620,9 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     let s0 = read_counters(&cgroup)?;
     tokio::time::sleep(Duration::from_secs(args.steady_secs)).await;
     let s1 = read_counters(&cgroup)?;
-    stat.stop();
+    if let Err(error) = stat.stop() {
+        perf_errors.push(format!("{error:#}"));
+    }
     let steady_secs = s1.at.unwrap().duration_since(s0.at.unwrap()).as_secs_f64();
     let steady = delta(&s0, &s1, steady_secs);
 
@@ -595,6 +650,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
         "steady_per_s": steady,
         "steady_per_instance_per_s": delta(&s0, &s1, steady_secs * held_n.max(1) as f64),
         "teardown": teardown,
+        "perf_errors": perf_errors,
     });
     std::fs::write(
         args.out.join("summary.json"),
@@ -638,6 +694,66 @@ mod tests {
             "RES:  1  2  Rescheduling interrupts\nCAL: 3 4 Function call interrupts\nNMI: 9 9 x\n";
         let got = parse_ipis(x86);
         assert_eq!((got["RES"], got["CAL"], got.len()), (3, 7, 2));
+    }
+
+    /// An instance that reports an error is given time to finish its teardown and exit: the
+    /// driver must not kill it mid-teardown, which left clone disks behind.
+    #[tokio::test]
+    async fn a_failed_instance_finishes_its_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let torn = dir.path().join("torn");
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "echo ready; read go; echo 'error op: boom'; sleep 0.3; touch {}; exit 1",
+            torn.display()
+        ));
+        let inst = spawn_command(cmd, &log).unwrap();
+        let mut inst = inst;
+        inst.expect("ready").await.unwrap();
+        let results = phase(vec![inst], 1, "go", "done").await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.as_deref().unwrap().contains("boom"));
+        assert!(
+            torn.exists(),
+            "the driver killed the instance before its teardown ended"
+        );
+    }
+
+    /// A perf that cannot run fails the run with what it printed; one that runs until it is
+    /// stopped and exits cleanly does not.
+    #[test]
+    fn a_perf_collector_that_fails_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = dir.path().join("perf.err");
+        let mut failing = Perf::start(
+            "sh",
+            &["-c".into(), "echo no such event >&2; exit 3".into()],
+            &err,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let error = failing
+            .stop()
+            .expect_err("a perf that exited 3 is not a collector");
+        assert!(format!("{error:#}").contains("no such event"), "{error:#}");
+
+        // A handler set by the program itself: a shell cannot trap a SIGINT it inherited
+        // ignored, which a test run from a background job does.
+        let mut running = Perf::start(
+            "python3",
+            &[
+                "-c".into(),
+                "import signal, sys, time\n\
+                 signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n\
+                 time.sleep(60)"
+                    .into(),
+            ],
+            &err,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        running.stop().unwrap();
     }
 
     #[derive(clap::Parser)]
