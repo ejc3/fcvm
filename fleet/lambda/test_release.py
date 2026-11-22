@@ -328,6 +328,30 @@ class Selection(unittest.TestCase):
         self.assertEqual(release.record(self.ecr, between, "d" * 40, is_ancestor)["status"], "kept")
         self.assertEqual(self.ecr.tagged("keep-built").digest, shared)
 
+    def test_a_recorded_commit_git_cannot_find_names_itself_and_the_remedy(self):
+        held = self.ecr.push("rev-" + "a" * 40)
+        release.record(self.ecr, held)
+        new = self.ecr.push("rev-" + "b" * 40)
+
+        def unknown(older, newer):
+            raise release.UnknownCommit(older)
+        with self.assertRaises(RuntimeError) as raised:
+            release.record(self.ecr, new, "b" * 40, unknown)
+        message = str(raised.exception)
+        self.assertIn("a" * 40, message)
+        self.assertIn("release.py record --digest " + new, message)
+        self.assertEqual(self.ecr.tagged("keep-built").digest, held)
+
+    def test_git_reports_a_commit_it_cannot_find(self):
+        codes = iter([0, 1, 128])
+        run = lambda *a, **k: type("R", (), {"returncode": next(codes), "stdout": "", "stderr": ""})()
+        with patch.object(release.subprocess, "run", side_effect=run):
+            self.assertTrue(release.git_is_ancestor("a" * 40, "b" * 40))
+            self.assertFalse(release.git_is_ancestor("a" * 40, "b" * 40))
+            with self.assertRaises(release.UnknownCommit) as raised:
+                release.git_is_ancestor("a" * 40, "b" * 40)
+        self.assertEqual(raised.exception.commit, "a" * 40)
+
     def test_ci_records_each_build_and_a_selection_takes_it_by_name(self):
         a = self.ecr.push("rev-a")
         release.record(self.ecr, a)
@@ -479,22 +503,77 @@ class Workflow(unittest.TestCase):
         block = self.text.split(f"\n  {event}:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0].split("\n  pull_request:", 1)[0]
         return re.findall(r"^      - '([^']+)'", block, re.M)
 
-    def test_a_change_to_anything_in_the_image_builds_it(self):
-        # What the lane image holds: the fcvm binary (every source of the fcvm package and of each
-        # path dependency in Cargo.toml), the renderer and its build contexts, and the lane image's
-        # own files.
-        cargo = (HERE.parents[1] / "Cargo.toml").read_text().split("\n[dependencies]", 1)[1].split("\n[", 1)[0]
-        crates = re.findall(r'path = "([^"]+)"', cargo)
+    # The build's own files: the manifests, the toolchain and cargo configuration, and the
+    # Makefile whose recipe (build-fleet-coordinator) builds the binary.
+    BUILD_FILES = ["Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rust-toolchain.toml", ".cargo/config.toml",
+                   "rootfs-config.toml", "fleet/lambda/Makefile", "fleet/lambda/Containerfile",
+                   "fleet/renderer/Makefile", "fleet/renderer/Containerfile"]
+    INCLUDE = re.compile(r'include_(?:str|bytes)!\s*\(\s*(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?'
+                         r'(?:"([^"]+)")?')
+
+    @staticmethod
+    def files(root):
+        for parent, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in ("target", ".git", "node_modules")]
+            yield from (os.path.join(parent, n) for n in names)
+
+    def crates(self, repo):
+        """The fcvm package's path dependencies, and theirs."""
+        found, todo = [], ["."]
+        while todo:
+            here = todo.pop()
+            manifest = (repo / here / "Cargo.toml").read_text()
+            deps = manifest.split("\n[dependencies]", 1)[1].split("\n[", 1)[0] if "\n[dependencies]" in manifest else ""
+            for rel in re.findall(r'path = "([^"]+)"', deps):
+                crate = os.path.normpath(os.path.join(here, rel))
+                if crate not in found:
+                    found.append(crate)
+                    todo.append(crate)
+        return found
+
+    def inputs(self):
+        """Every file the lane image is built from, derived from the sources: each source file of the
+        fcvm package and of its path dependencies, every file those sources include_str!/include_bytes!,
+        the build files, the renderer's directory and the files its Containerfile copies from the build
+        contexts its Makefile passes."""
+        repo = HERE.parents[1]
+        crates = self.crates(repo)
         self.assertIn("fleet/core", crates)
-        inputs = ["src/paths.rs", "src/fleet/lambda_tile.rs", "src/cli/args.rs", "src/main.rs", "build.rs",
-                  "rootfs-config.toml", "Cargo.toml", "Cargo.lock",
-                  "fleet/lambda/Containerfile", "fleet/renderer/src/server.cpp",
-                  "fleet/core/tests/autopilot_lap.json", "fleet/web/core/layout.ts"]
-        inputs += [crate + "/src/lib.rs" for crate in crates]
+        out = set(self.BUILD_FILES) | {c + "/Cargo.toml" for c in crates}
+        for root in ["src"] + crates:
+            for path in self.files(repo / root):
+                rel = os.path.relpath(path, repo)
+                if rel.startswith(tuple(c + "/" for c in crates if c != root and c.startswith(root + "/"))):
+                    continue
+                out.add(rel)
+                if not rel.endswith(".rs"):
+                    continue
+                crate = next((c for c in crates if rel.startswith(c + "/")), ".")
+                for m in self.INCLUDE.finditer(Path(path).read_text()):
+                    self.assertIsNotNone(m.group(2), f"{rel}: an include this test cannot resolve")
+                    base = crate if m.group(1) else os.path.dirname(rel)
+                    target = os.path.normpath(os.path.join(base, m.group(2).lstrip("/") if m.group(1) else m.group(2)))
+                    self.assertTrue((repo / target).exists(), f"{rel} includes {target}, which does not exist")
+                    out.add(target)
+        out |= {os.path.relpath(p, repo) for p in self.files(repo / "fleet/renderer")}
+        makefile = (repo / "fleet/renderer/Makefile").read_text()
+        contexts = dict(re.findall(r"--build-context (\S+)=(\S+)", makefile))
+        self.assertTrue(contexts)
+        for ctx, name in re.findall(r"^COPY --from=(\S+) (\S+) ", (repo / "fleet/renderer/Containerfile").read_text(), re.M):
+            if ctx in contexts:
+                out.add(os.path.normpath(os.path.join("fleet/renderer", contexts[ctx], name)))
+        return out
+
+    def test_a_change_to_anything_in_the_image_builds_it(self):
+        inputs = self.inputs()
+        # The derivation finds what a hand-written list missed.
+        for known in ("fleet/published-ports.json", "scripts/passt-udp-sock-errs-null-flow.patch",
+                      "fleet/core/tests/autopilot_lap.json", "fleet/web/core/layout.ts", "src/paths.rs"):
+            self.assertIn(known, inputs)
         for event in ("push", "pull_request"):
             patterns = self.paths(event)
-            for path in inputs:
-                self.assertTrue(any(fnmatch.fnmatchcase(path, p.replace("**", "*")) for p in patterns), (event, path))
+            missing = sorted(p for p in inputs if not any(fnmatch.fnmatchcase(p, g.replace("**", "*")) for g in patterns))
+            self.assertEqual(missing, [], f"{event}: inputs of the lane image that start no build")
 
     def test_every_build_publishes_in_commit_order(self):
         publish = self.text.split("\n  publish:\n", 1)[1]

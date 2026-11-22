@@ -2160,10 +2160,12 @@ stops the renderer, so the GPU is idle until Lambda retires the environment.
 
 Both stacks pull from one repository, `fcvm-fleet/lambda-tile` in us-east-1 (ejc3/aws
 `fcvm-fleet-lambda.tf`). `.github/workflows/fleet-lambda-image.yml` builds the image on an
-x86_64 runner when its inputs change (`fleet/lambda`, `fleet/renderer`, `src/fleet`, `src/cli`)
-and, on main, pushes it as `rev-<commit>` and records its digest as `keep-built`
-(`release.py publish`). `keep-built` moves only forward in commit order: a build of an older
-commit that finishes later, or a rerun, leaves it on the newer one. A tag outside `keep-` is immutable. The repository's lifecycle policy
+x86_64 runner when any of its inputs changes (the workflow's `paths`, which
+`fleet/lambda/test_release.py` checks against the inputs it derives from the sources) and, on
+main, pushes it as `rev-<commit>` and records its digest as `keep-built` (`release.py publish`).
+`keep-built` moves only forward in commit order: a build of an older commit that finishes later,
+or a rerun, leaves it on the newer one. A tag outside `keep-` is immutable. The repository's
+lifecycle policy
 expires every image outside the newest five unless it carries a protected tag,
 `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next` for `stage` and `prod`,
 or `keep-built`. Those seven are the repository's only mutable tags, and

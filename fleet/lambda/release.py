@@ -210,12 +210,23 @@ def record(ecr, built, commit=None, is_ancestor=None):
     only forward in commit order: two main pushes' builds can finish out of order and a run can be
     rerun, so the image pushed last is not always the newest commit's. When keep-built holds the
     image of any commit that is not an ancestor of `commit` (an image can carry several rev- tags),
-    it stays there ("kept")."""
+    it stays there ("kept").
+
+    The lock is a flock in this host's temp directory and orders nothing across runners: CI's
+    publishes are ordered by the workflow's concurrency group (fleet-lambda-image). A manual
+    `record` must not run while a publish does."""
     with locked("built"):
         now = ecr.tagged(BUILT)
         if commit is not None and now is not None and now.digest != built:
             held = [t[len("rev-"):] for t in ecr.tags(now.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
-            if held and not all(is_ancestor(h, commit) for h in held):
+            try:
+                newer = all(is_ancestor(h, commit) for h in held)
+            except UnknownCommit as error:
+                raise RuntimeError(
+                    f"keep-built holds {now.digest}, built from {error.commit}, which this checkout's history "
+                    f"does not contain, so the builds cannot be ordered. If {built} should be the newest build, "
+                    f"record it by hand: release.py record --digest {built}") from None
+            if held and not newer:
                 return {"status": "kept", BUILT: now.digest}
         ecr.put(BUILT, ecr.image(built))
         now = ecr.tagged(BUILT)
@@ -224,10 +235,18 @@ def record(ecr, built, commit=None, is_ancestor=None):
     return {"status": "recorded", BUILT: built}
 
 
+class UnknownCommit(RuntimeError):
+    def __init__(self, commit):
+        super().__init__(f"git does not know {commit}")
+        self.commit = commit
+
+
 def git_is_ancestor(older, newer):
+    """Whether `older` is an ancestor of `newer` (or the same commit). Exit status 128 means git does
+    not know a commit: `older`, the recorded one, since `newer` is the commit checked out."""
     result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
     if result.returncode not in (0, 1):
-        raise RuntimeError(f"git cannot order {older} and {newer}: the checkout needs the full history")
+        raise UnknownCommit(older)
     return result.returncode == 0
 
 
