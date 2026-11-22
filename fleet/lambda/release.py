@@ -249,15 +249,21 @@ class UnknownCommit(RuntimeError):
 
 
 def git_is_ancestor(older, newer):
-    """Whether `older` is an ancestor of `newer` (or the same commit). When git cannot answer, it is
-    UnknownCommit only if git confirms it has no such commit as `older` (`newer` is the commit checked
-    out); any other failure (outside a checkout, a corrupt repository) is raised with git's message."""
+    """Whether `older` is an ancestor of `newer` (or the same commit). When merge-base cannot answer,
+    it is UnknownCommit only when git can read the checked-out commit `newer` and not `older`; git
+    that cannot read `newer` (outside a checkout, a corrupt repository) is an error with git's message,
+    never a statement about the recorded commit."""
     result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
     if result.returncode in (0, 1):
         return result.returncode == 0
-    if subprocess.run(["git", "cat-file", "-e", older + "^{commit}"], capture_output=True, text=True).returncode:
+    failure = RuntimeError(f"git merge-base failed ({result.returncode}): {result.stderr.strip()[:300]}")
+    def present(commit):
+        return subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], capture_output=True, text=True).returncode == 0
+    if not present(newer):
+        raise failure
+    if not present(older):
         raise UnknownCommit(older)
-    raise RuntimeError(f"git merge-base failed ({result.returncode}): {result.stderr.strip()[:300]}")
+    raise failure
 
 
 REPOSITORY_URL = re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(REPOSITORY))

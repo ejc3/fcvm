@@ -354,24 +354,35 @@ class Selection(unittest.TestCase):
         return calls, patch.object(release.subprocess, "run", side_effect=run)
 
     def test_git_reports_a_commit_it_cannot_find(self):
+        # merge-base cannot answer, git finds the checked-out commit and not the recorded one.
         older, newer = "a" * 40, "b" * 40
-        calls, p = self.git([(0, ""), (1, ""), (128, "fatal: Not a valid commit name"), (1, "")])
+        calls, p = self.git([(0, ""), (1, ""), (128, "fatal: Not a valid commit name"), (0, ""), (128, "")])
         with p:
             self.assertTrue(release.git_is_ancestor(older, newer))
             self.assertFalse(release.git_is_ancestor(older, newer))
             with self.assertRaises(release.UnknownCommit) as raised:
                 release.git_is_ancestor(older, newer)
         self.assertEqual(raised.exception.commit, older)
-        self.assertEqual(calls[3], ["git", "cat-file", "-e", older + "^{commit}"])
+        self.assertEqual(calls[3:], [["git", "cat-file", "-e", newer + "^{commit}"],
+                                     ["git", "cat-file", "-e", older + "^{commit}"]])
 
-    def test_a_git_failure_with_the_commit_present_is_not_called_unknown(self):
-        # Outside a checkout, or a corrupt repository: git fails, but not because of the commit.
-        _, p = self.git([(128, "fatal: not a git repository"), (0, "")])
+    def test_git_that_cannot_answer_at_all_is_not_an_unknown_commit(self):
+        # Outside a checkout every git command exits 128: not a statement about the recorded commit.
+        _, p = self.git([(128, "fatal: not a git repository"), (128, "fatal: not a git repository"),
+                         (128, "fatal: not a git repository")])
         with p:
             with self.assertRaises(RuntimeError) as raised:
                 release.git_is_ancestor("a" * 40, "b" * 40)
         self.assertNotIsInstance(raised.exception, release.UnknownCommit)
         self.assertIn("not a git repository", str(raised.exception))
+
+    def test_a_git_failure_with_both_commits_present_is_not_called_unknown(self):
+        _, p = self.git([(128, "fatal: bad object"), (0, ""), (0, "")])
+        with p:
+            with self.assertRaises(RuntimeError) as raised:
+                release.git_is_ancestor("a" * 40, "b" * 40)
+        self.assertNotIsInstance(raised.exception, release.UnknownCommit)
+        self.assertIn("bad object", str(raised.exception))
 
     def test_a_known_newer_held_commit_decides_whatever_the_tag_order(self):
         # keep-built's image carries two rev- tags: one of a commit git cannot find, and one of a
@@ -541,13 +552,27 @@ INCLUDE = re.compile(r'\binclude(?:_str|_bytes)?!\s*\(\s*(concat!\s*\(\s*env!\s*
 
 def path_dependencies(manifest):
     """The `path` of every dependency that builds into the package: [dependencies], [build-dependencies],
-    their target-specific forms, and [patch] entries. Dev-dependencies build only tests."""
+    their target-specific forms, and [patch] entries. Dev-dependencies build only tests.
+
+    The checker supports exactly the dependency forms this tree uses and refuses the rest rather than
+    modelling them: a `workspace = true` dependency (resolved from [workspace.dependencies]) fails with a
+    ValueError, as does a [patch] table in .cargo/config.toml (cargo_config_patches). Extend the
+    checker when the tree starts using one."""
     data = tomllib.loads(manifest)
     tables = [data.get("dependencies", {}), data.get("build-dependencies", {})]
     for target in data.get("target", {}).values():
         tables += [target.get("dependencies", {}), target.get("build-dependencies", {})]
     tables += list(data.get("patch", {}).values())
-    return [dep["path"] for table in tables for dep in table.values() if isinstance(dep, dict) and "path" in dep]
+    deps = [dep for table in tables for dep in table.values() if isinstance(dep, dict)]
+    if any("workspace" in dep for dep in deps):
+        raise ValueError("a dependency with workspace = true: the lane image's input check does not model it")
+    return [dep["path"] for dep in deps if "path" in dep]
+
+
+def cargo_config_patches(config):
+    """Refuse a [patch] table in .cargo/config.toml: the input check does not model one."""
+    if "patch" in tomllib.loads(config):
+        raise ValueError(".cargo/config.toml has a [patch] table: the lane image's input check does not model it")
 
 
 class Paths(unittest.TestCase):
@@ -570,6 +595,16 @@ tests-only = { path = "t" }
 f = { path = "f" }
 """
         self.assertEqual(sorted(path_dependencies(manifest)), ["a", "b", "c", "d", "e", "f"])
+
+    def test_a_dependency_form_the_checker_does_not_model_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "workspace = true"):
+            path_dependencies('[dependencies]\nshared = { workspace = true }\n')
+        with self.assertRaisesRegex(ValueError, "workspace = true"):
+            path_dependencies("[target.'cfg(unix)'.build-dependencies]\nshared = { workspace = true }\n")
+        with self.assertRaisesRegex(ValueError, r"\[patch\]"):
+            cargo_config_patches('[patch.crates-io]\nfoo = { path = "foo" }\n')
+        cargo_config_patches('[build]\njobs = 4\n')
+        cargo_config_patches((HERE.parents[1] / ".cargo/config.toml").read_text())
 
     def test_every_include_form_is_seen(self):
         found = [m.group(2) for m in INCLUDE.finditer(
@@ -632,6 +667,7 @@ class Workflow(unittest.TestCase):
         repo = HERE.parents[1]
         crates = self.crates(repo)
         self.assertIn("fleet/core", crates)
+        cargo_config_patches((repo / ".cargo/config.toml").read_text())
         out = set(self.BUILD_FILES) | self.sourced(repo, self.BUILD_SCRIPTS) | {c + "/Cargo.toml" for c in crates}
         for root in ["src"] + crates:
             for path in self.files(repo / root):
