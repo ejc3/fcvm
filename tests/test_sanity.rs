@@ -115,6 +115,67 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     result
 }
 
+/// A VM's guest memory starts out of automatic NUMA balancing: fcvm asks Firecracker to bind
+/// it MPOL_LOCAL for `NUMA_BALANCING_AFTER_SECS` after creating or restoring it
+/// (`--numa-balancing-after-secs`), so `/proc/<firecracker>/numa_maps` reports the guest
+/// memory's policy as `local` right after the VM turns healthy, and `default` without it.
+#[tokio::test]
+async fn a_new_vms_guest_memory_starts_out_of_numa_balancing() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("numa-window");
+    let (_child, fcvm_pid) =
+        common::spawn_fcvm(&["podman", "run", "--name", &vm_name, common::TEST_IMAGE])
+            .await
+            .context("spawning fcvm podman run")?;
+    let result = async {
+        common::poll_health_by_pid(fcvm_pid, 300).await?;
+        let children = std::fs::read_dir(format!("/proc/{fcvm_pid}/task"))?
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("children")).ok())
+            .flat_map(|list| {
+                list.split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let firecracker = children
+            .into_iter()
+            .find(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|comm| comm.starts_with("firecracker"))
+            })
+            .context("no Firecracker child of the fcvm process")?;
+        // The guest memory is the VMM's largest mapping.
+        let maps = std::fs::read_to_string(format!("/proc/{firecracker}/maps"))?;
+        let (start, _) = maps
+            .lines()
+            .filter_map(|line| {
+                let (range, _) = line.split_once(' ')?;
+                let (lo, hi) = range.split_once('-')?;
+                let (lo, hi) = (
+                    u64::from_str_radix(lo, 16).ok()?,
+                    u64::from_str_radix(hi, 16).ok()?,
+                );
+                Some((lo, hi - lo))
+            })
+            .max_by_key(|&(_, len)| len)
+            .context("Firecracker has no mappings")?;
+        let numa_maps = std::fs::read_to_string(format!("/proc/{firecracker}/numa_maps"))?;
+        let policy = numa_maps
+            .lines()
+            .find(|line| line.starts_with(&format!("{start:x} ")))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .context("the guest memory mapping is not in numa_maps")?
+            .to_string();
+        anyhow::ensure!(
+            policy == "local",
+            "the guest memory's policy is {policy:?}, so NUMA balancing scans it from the start"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    result
+}
+
 /// Test that VM exits gracefully when container finishes (PSCI shutdown)
 /// This tests the full shutdown path: container exit → fc-agent poweroff -f → PSCI SYSTEM_OFF → KVM exit
 #[tokio::test]
