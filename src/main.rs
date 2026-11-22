@@ -81,19 +81,20 @@ fn main() -> Result<()> {
     // break with a bare ENOENT that names no tool.
     fcvm::utils::ensure_sbin_on_path();
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    // Parsed before the runtime exists, because the command decides the runtime's size.
+    let cli = cli::Cli::parse();
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = fcvm::cli::runtime_workers(&cli.cmd) {
+        runtime.worker_threads(workers);
+    }
+    runtime.enable_all().build()?.block_on(run(cli))
 }
 
-async fn run() -> Result<()> {
+async fn run(cli: cli::Cli) -> Result<()> {
     // Arm deterministic lifecycle failpoints from FCVM_FAILPOINT (test-only
     // instrumentation; no-op when unset). Once, before any command runs.
     failpoint::arm_from_env();
-
-    // Parse CLI arguments
-    let cli = cli::Cli::parse();
 
     // A value of FCVM_FIRECRACKER_LOG_LEVEL that names no level stops the command here, before
     // it prepares a disk or a namespace for a VM that could not start.

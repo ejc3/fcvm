@@ -18,6 +18,101 @@ pub fn default_log_filter(cmd: &Commands) -> &'static str {
     }
 }
 
+/// Worker threads for the tokio runtime of a command that runs one VM, or a short query.
+///
+/// Tokio's default is one worker per CPU, 192 on a c8g.metal-48xl. A `snapshot run` clone
+/// needs a few: its tasks are its health monitor, its VM's console and its signal handlers, and
+/// its blocking work goes to the blocking pool, which this does not size. Every fork it makes
+/// (a `pre_exec` spawn) then copies the page tables and write-protects the pages of every
+/// worker's stack, and each later write by any of those threads is a copy-on-write fault with
+/// a broadcast TLB invalidation: `ptep_clear_flush` was 15.3% of all host samples while 128
+/// clones started at once (bench/start-rate). The memory server, the fleet commands and setup
+/// keep the default: they serve many peers or run parallel work.
+pub const VM_COMMAND_WORKERS: usize = 2;
+
+/// The worker count for `cmd`'s runtime, or `None` for tokio's default. `FCVM_RUNTIME_WORKERS`
+/// overrides it for any command (a positive integer; anything else is ignored), for measuring.
+pub fn runtime_workers(cmd: &Commands) -> Option<usize> {
+    runtime_workers_with(cmd, std::env::var("FCVM_RUNTIME_WORKERS").ok().as_deref())
+}
+
+fn runtime_workers_with(cmd: &Commands, env: Option<&str>) -> Option<usize> {
+    if let Some(n) = env
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return Some(n);
+    }
+    match cmd {
+        Commands::Snapshot(SnapshotArgs {
+            cmd: SnapshotCommands::Run(_),
+        })
+        | Commands::Exec(_)
+        | Commands::Ls(_)
+        | Commands::Snapshots(_)
+        | Commands::Balloon(_) => Some(VM_COMMAND_WORKERS),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod runtime_workers_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn workers(args: &[&str], env: Option<&str>) -> Option<usize> {
+        let cli = Cli::try_parse_from(args).expect("parses");
+        runtime_workers_with(&cli.cmd, env)
+    }
+
+    /// A clone's process, and the short queries run beside it, get a runtime of
+    /// VM_COMMAND_WORKERS workers, not one per CPU.
+    #[test]
+    fn a_clone_gets_a_small_runtime() {
+        let run = ["fcvm", "snapshot", "run", "--pid", "1", "--name", "c"];
+        assert_eq!(workers(&run, None), Some(VM_COMMAND_WORKERS));
+        assert_eq!(
+            workers(&["fcvm", "ls", "--json"], None),
+            Some(VM_COMMAND_WORKERS)
+        );
+        assert_eq!(
+            workers(&["fcvm", "exec", "--pid", "1", "--", "true"], None),
+            Some(VM_COMMAND_WORKERS)
+        );
+    }
+
+    /// The memory server serves every clone's faults, so it keeps one worker per CPU.
+    #[test]
+    fn the_memory_server_keeps_the_default() {
+        assert_eq!(workers(&["fcvm", "snapshot", "serve", "tag"], None), None);
+    }
+
+    #[test]
+    fn the_environment_overrides_any_command() {
+        assert_eq!(
+            workers(&["fcvm", "snapshot", "serve", "tag"], Some("8")),
+            Some(8)
+        );
+        let run = ["fcvm", "snapshot", "run", "--pid", "1", "--name", "c"];
+        assert_eq!(workers(&run, Some("0")), Some(VM_COMMAND_WORKERS));
+        assert_eq!(workers(&run, Some("many")), Some(VM_COMMAND_WORKERS));
+    }
+
+    /// main builds its runtime from runtime_workers, after parsing the command line.
+    #[test]
+    fn main_sizes_its_runtime_from_the_command() {
+        let main = include_str!("../main.rs");
+        let parse = main
+            .find("let cli = cli::Cli::parse();")
+            .expect("main parses first");
+        let sized = main
+            .find("fcvm::cli::runtime_workers(&cli.cmd)")
+            .expect("main asks runtime_workers");
+        let built = main.find(".build()?").expect("main builds the runtime");
+        assert!(parse < sized && sized < built);
+    }
+}
+
 #[cfg(test)]
 mod log_filter_tests {
     use super::*;
