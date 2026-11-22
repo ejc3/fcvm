@@ -2705,6 +2705,7 @@ fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
         Handle {
             cmds: tx,
             snapshot,
+            lambda: tokio::sync::watch::channel(Vec::new()).1,
             ec2_layout,
             broadcast_layout: tokio::sync::watch::channel(None).1,
         },
@@ -3563,6 +3564,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     let outputs = fcvm::fleet::coord::Outputs {
         snapshot,
         ec2: tokio::sync::watch::channel(Vec::new()).0,
+        lambda: tokio::sync::watch::channel(Vec::new()).0,
         ec2_layout,
         broadcast_layout: tokio::sync::watch::channel(None).0,
         power: tokio::sync::watch::channel(String::new()).0,
@@ -3580,6 +3582,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
     let handle = Handle {
         cmds,
         snapshot: snapshot_rx,
+        lambda: tokio::sync::watch::channel(Vec::new()).1,
         ec2_layout: ec2_layout_rx,
         broadcast_layout: tokio::sync::watch::channel(None).1,
     };
@@ -5074,6 +5077,7 @@ async fn an_inventory_that_stays_unknown_is_charged_at_the_launch_cap_and_trips(
             spot_ttl: Duration::from_secs(60),
             stale_after: Duration::from_millis(100),
             cap_usd_per_hour: 100.0,
+            lambda_usd_per_instance_hour: None,
         },
         handle.clone(),
     ));
@@ -5105,6 +5109,7 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
                     instance_type: "g4dn.metal".into(),
                     spot: false,
                     zone: h.zone.unwrap_or_default(),
+                    tile: false,
                 })
                 .collect())
         }
@@ -5141,6 +5146,7 @@ async fn a_budget_trip_stops_every_awake_host_and_a_replacement() {
             spot_ttl: Duration::from_secs(60),
             stale_after: Duration::from_secs(300),
             cap_usd_per_hour: 0.0,
+            lambda_usd_per_instance_hour: None,
         },
         handle.clone(),
     ));

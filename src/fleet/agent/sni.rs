@@ -410,7 +410,7 @@ impl Front {
 }
 
 /// Read until `buf` holds a whole ClientHello, and give its server name.
-async fn read_hello(client: &mut TcpStream, buf: &mut Vec<u8>) -> Result<String> {
+pub async fn read_hello(client: &mut TcpStream, buf: &mut Vec<u8>) -> Result<String> {
     loop {
         match parse_hello(buf) {
             Hello::Name(n) => return Ok(n),
