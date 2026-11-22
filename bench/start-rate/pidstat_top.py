@@ -25,7 +25,7 @@ def main():
     per_sample = defaultdict(lambda: defaultdict(float))
     for line in (d / "pidstat.log").read_text(errors="replace").splitlines():
         f = line.split()
-        if len(f) < 10 or f[0].startswith("#") or not f[0].isdigit():
+        if len(f) < 10 or f[0].startswith("#") or not (f[1].isdigit() and f[2].isdigit()):
             continue
         try:
             t, usr, syst, cpu = f[0], float(f[3]), float(f[4]), float(f[7])

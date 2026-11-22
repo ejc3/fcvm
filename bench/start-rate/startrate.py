@@ -36,9 +36,10 @@ HEALTHY_MARKER = "VM healthy, switching to"
 
 # (stage name, marker that opens it, marker that closes it); times are the harness's
 # receive times of the clone's log lines, relative to its spawn.
+CLONE_START = ("Cloning VM from serve PID", "Cloning VM directly from snapshot")
 STAGES = [
-    ("pre-log", None, "Cloning VM from serve PID"),
-    ("state+listeners", "Cloning VM from serve PID", "spawning namespace holder"),
+    ("pre-log", None, CLONE_START),
+    ("state+listeners", CLONE_START, "spawning namespace holder"),
     ("netns+pasta", "spawning namespace holder", "pasta + bridge setup complete"),
     ("net->load", "pasta + bridge setup complete", "loading snapshot with"),
     ("snapshot-load", "loading snapshot with", "VM resume completed"),
@@ -48,7 +49,7 @@ STAGES = [
 # Markers recorded whenever they appear, for stages that differ by network mode.
 EXTRA_MARKERS = [
     "Cloning VM from serve PID",
-    "Cloning VM from snapshot",
+    "Cloning VM directly from snapshot",
     "connecting to memory server",
     "spawning namespace holder",
     "pasta + bridge setup complete",
@@ -501,6 +502,13 @@ def pct(vals, q):
     return round(vals[k], 1)
 
 
+def mark(marks, key):
+    """A marker's time; a tuple names alternatives (the UFFD and File paths log differently)."""
+    if isinstance(key, tuple):
+        return next((marks[k] for k in key if k in marks), None)
+    return marks.get(key)
+
+
 def summarize(out, verify=None, teardown_s=None, t0_wall=None):
     out = Path(out)
     rows = [json.loads(l) for l in (out / "samples.jsonl").read_text().splitlines() if l.strip()]
@@ -526,8 +534,8 @@ def summarize(out, verify=None, teardown_s=None, t0_wall=None):
         vals = []
         for r in ok:
             m = r["marks_ms"]
-            a = 0.0 if start is None else m.get(start)
-            b = m.get(end)
+            a = 0.0 if start is None else mark(m, start)
+            b = mark(m, end)
             if a is not None and b is not None:
                 vals.append(b - a)
         stages[name] = {"p50": pct(vals, 0.5), "p99": pct(vals, 0.99), "n": len(vals)}
