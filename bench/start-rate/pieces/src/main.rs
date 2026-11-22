@@ -56,3 +56,20 @@ fn main() -> anyhow::Result<()> {
         Cmd::HttpServe { addr } => pieces::http_serve(&addr),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// fcvm's default features are its integration-test tiers. This crate is a default
+    /// workspace member, so depending on fcvm with them switched those tests on in
+    /// `make test-unit`, which runs `--no-default-features` on a runner with no VM setup:
+    /// 207 of them failed on the first CI run of #2006.
+    #[test]
+    fn fcvm_is_used_without_its_default_features() {
+        let manifest = include_str!("../Cargo.toml");
+        let line = manifest
+            .lines()
+            .find(|l| l.starts_with("fcvm = "))
+            .expect("an fcvm dependency");
+        assert!(line.contains("default-features = false"), "{line}");
+    }
+}
