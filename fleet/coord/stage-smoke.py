@@ -89,16 +89,29 @@ def ipv4(host, port):
 
 def public(host, port, family):
     """A TLS socket to host over one family only, through the system resolver; private
-    endpoints are refused. For the coordinator's own names, which are not launch names."""
+    endpoints are refused. For the coordinator's own names, which are not launch names. When
+    no address answers it raises what the last one did, as `opener` does, so the failure says
+    whether TCP was refused, TCP timed out or the TLS handshake failed."""
     addresses = socket.getaddrinfo(host, port, FAMILIES[family][0], socket.SOCK_STREAM)
+    last, handshake_timed_out = None, False
     for _, _, _, _, address in addresses:
         if not ipaddress.ip_address(address[0]).is_global:
             continue
         try:
             raw = socket.create_connection(address[:2], timeout=20)
-            return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
-        except OSError:
+        except OSError as error:
+            last, handshake_timed_out = error, False
             continue
+        try:
+            return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        except OSError as error:
+            raw.close()
+            # A handshake timeout is a TimeoutError like a connect timeout: say which.
+            last, handshake_timed_out = error, isinstance(error, (TimeoutError, socket.timeout))
+    if handshake_timed_out:
+        raise RuntimeError("the TLS handshake did not finish in time") from last
+    if last is not None:
+        raise last
     raise RuntimeError("no reachable public endpoint in this family")
 
 
@@ -1521,8 +1534,9 @@ def run(argv=None):
             step("viewer path")
             raise AssertionError("a tile failed the viewer path")
     except Exception as error:
+        # fixed(): describe(), plus "timed out" for a timeout and TLS's reason code.
         print(json.dumps({"status": "failed", "step": STEP, "errorType": type(error).__name__,
-                          "error": describe(error)}))
+                          "error": fixed(error)[1]}))
         raise SystemExit(1)
 
 

@@ -36,10 +36,43 @@ smoke, publish = load("smoke", "stage-smoke.py"), load("publish", "publish.py")
 prod = load("prod_release", "prod_release.py")
 
 
+def ssl_context_raising(error):
+    """A TLS context whose handshake raises `error`."""
+    class Context:
+        def wrap_socket(self, raw, server_hostname=None):
+            raise error
+    return Context()
+
+
 class ProbeTests(unittest.TestCase):
     def tile(self):
         return dict(id="fcvm:1", half="fcvm", slot="slot-1", generation=1, phase="running",
                     frame_url="wss://old.fcvm.dev/frames", frame_url_v4="wss://old-v4.fcvm.dev:20200/frames")
+
+    def test_an_unreachable_endpoint_says_whether_tcp_or_tls_failed(self):
+        # Run 45032617135: a relaunched EC2 tile's IPv4 frame socket failed after about 20 s with
+        # "no reachable public endpoint in this family", which said nothing of whether TCP was
+        # refused, TCP timed out or TLS failed. The probe opener (`opener`) re-raises its last
+        # error; the relaunch checks' `public` must too.
+        host = "x-v4.tiles.fcvm.dev"
+        found = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.0.0.1", 443))]
+        with patch.object(smoke.socket, "getaddrinfo", return_value=found):
+            for error in (TimeoutError("timed out"), ConnectionRefusedError(errno.ECONNREFUSED, "refused")):
+                with self.subTest(error=type(error).__name__), \
+                        patch.object(smoke.socket, "create_connection", side_effect=error), \
+                        self.assertRaises(type(error)) as caught:
+                    smoke.public(host, 443, "v4")
+                self.assertIn(smoke.fixed(caught.exception)[1], ("timed out", "ECONNREFUSED"))
+            # TCP answered and the TLS handshake did not finish.
+            near, far = socket.socketpair()
+            self.addCleanup(far.close)
+            context = ssl_context_raising(socket.timeout("_ssl.c: The handshake operation timed out"))
+            with patch.object(smoke.socket, "create_connection", return_value=near), \
+                    patch.object(smoke.ssl, "create_default_context", return_value=context), \
+                    self.assertRaises(RuntimeError) as caught:
+                smoke.public(host, 443, "v4")
+            self.assertEqual(smoke.describe(caught.exception), "the TLS handshake did not finish in time")
+            self.assertEqual(near.fileno(), -1, "the TCP socket is closed")
 
     def test_a_running_tile_without_ipv4_never_passes(self):
         tile = self.tile()
