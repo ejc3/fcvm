@@ -34,7 +34,8 @@ it (`table.py`). Revision: main at f3f155fa for the rows marked 1, main at
 How each piece scales:
 
 - **rootless-net** degrades with C and with alive namespaces. CPU per op rises from 0.022 s at
-  C=1 to 0.090 s at C=128 and 0.39 s at C=512 with 1000 held. Under `kernel.bt` (C=128, 1000
+  C=1 to 0.090 s at C=128 with none held, and to 0.177 s at C=128 and 0.39 s at C=512 with
+  1000 held. Under `kernel.bt` (C=128, 1000
   held, start and teardown in one window) rtnl_mutex was held 21.1 s and waited for 2,280 s in
   total, 1.14 s of wait per namespace. Of the hold, 14.4 s was the netns cleanup worker
   (`cleanup_net`, which tears down a batch of dying namespaces under one hold: one batch held it

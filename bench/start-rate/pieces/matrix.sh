@@ -22,12 +22,17 @@ busy_cores() {  # host busy CPUs over one second, from /proc/stat
   echo $(( (b - a) / $(getconf CLK_TCK) ))
 }
 quiet() {
-  local l n start=$SECONDS
+  local l n procs fc pieces start=$SECONDS
   for _ in $(seq 1 "$QUIET_TRIES"); do
     l=$(busy_cores)
-    n=$(ps -eo comm= | grep -c '+netns')
-    if [ "$l" -lt "$LOAD_MAX" ] && [ "$n" -eq 0 ] \
-        && ! pgrep firecracker >/dev/null && ! pgrep -f '[s]tart-pieces instance' >/dev/null; then
+    # A sample counts only when every inspection ran: pgrep exits 1 for no match and
+    # above 1 when it could not look.
+    procs=$(ps -eo comm=) || { echo "ps failed"; continue; }
+    n=$(grep -c '+netns' <<< "$procs")
+    pgrep firecracker > /dev/null; fc=$?
+    pgrep -f '[s]tart-pieces instance' > /dev/null; pieces=$?
+    if [ "$fc" -gt 1 ] || [ "$pieces" -gt 1 ]; then echo "pgrep failed"; continue; fi
+    if [ "$l" -lt "$LOAD_MAX" ] && [ "$n" -eq 0 ] && [ "$fc" -eq 1 ] && [ "$pieces" -eq 1 ]; then
       echo "quiet after $((SECONDS - start)) s"
       return 0
     fi
@@ -36,15 +41,23 @@ quiet() {
   return 1
 }
 
-# A cell counts once its summary says nothing failed; any other cell is run again.
+# A cell counts once its summary says nothing failed and it ran in this run's mode (COLD,
+# UFFD_SOCKET); any other cell is run again.
 cell_done() {
+  local cold=false uffd=false
+  [ -n "${COLD:-}" ] && cold=true
+  [ -n "${UFFD_SOCKET:-}" ] && uffd=true
   [ -f "$1/summary.json" ] &&
-    jq -e '.timed.failed == 0 and .teardown.failed == 0 and ((.perf_errors // []) | length) == 0' \
-      "$1/summary.json" > /dev/null
+    jq -e --argjson cold "$cold" --argjson uffd "$uffd" \
+      '.timed.failed == 0 and .teardown.failed == 0 and ((.perf_errors // []) | length) == 0
+       and .cold == $cold and .uffd == $uffd' "$1/summary.json" > /dev/null
 }
 
 # Sourced (by test_pieces.py) for its functions only.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+# Without jq every cell would read as unfinished and be deleted below.
+command -v jq > /dev/null || { echo "matrix.sh needs jq" >&2; exit 2; }
 
 out_root=$1
 pieces=$2

@@ -328,6 +328,8 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
             let t = Instant::now();
             manager.claim_name(&mut vm_state).await?;
             stages.push(("claim", ms(t)));
+            // Held from the claim on, so teardown deletes the record if a later step fails.
+            let manager = held.state.insert(manager);
             let t = Instant::now();
             manager.allocate_loopback_ip(&mut vm_state).await?;
             stages.push(("loopback", ms(t)));
@@ -336,7 +338,6 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 .update_state(&held.vm_id, |s| s.holder_pid = Some(std::process::id()))
                 .await?;
             stages.push(("update", ms(t)));
-            held.state = Some(manager);
         }
         Piece::Disk => {
             clone_disk(args, held).await?;
@@ -538,5 +539,22 @@ mod tests {
         );
         assert!(format!("{:#}", refused.unwrap_err()).contains("1 extra disk"));
         assert!(restorable_with_rootfs_override_only(r#"{"metadata":{}}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod state_order_tests {
+    /// The state piece keeps its manager from the name claim on: a failed loopback
+    /// allocation or update would otherwise leave the claimed record behind.
+    #[test]
+    fn the_state_piece_holds_its_record_before_the_steps_that_can_fail() {
+        let source = include_str!("pieces.rs");
+        let arm = &source[source.find("Piece::State => {").unwrap()..];
+        let held = arm
+            .find("held.state.insert(manager)")
+            .expect("held after the claim");
+        assert!(arm.find("claim_name").unwrap() < held);
+        assert!(held < arm.find("allocate_loopback_ip").unwrap());
+        assert!(held < arm.find("update_state").unwrap());
     }
 }
