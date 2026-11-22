@@ -1,0 +1,14 @@
+# The Lambda tile (fleet/PROTOCOL.md, "Lambda tile"): the fleet renderer's image, unchanged,
+# with `fcvm fleet lambda-tile` as its Lambda custom runtime. Build: make -C fleet/lambda image
+# RENDERER=<renderer image> on an x86_64 host after `make build` (Lambda Managed Instances run
+# the lane on g4dn, x86_64). The fcvm binary needs only glibc, which the renderer's Ubuntu 24.04
+# base has.
+#
+# Lambda injects the NVIDIA devices and driver libraries into the environment (measured in the
+# lane spike, 2026-11-22), as fcvm's CDI injection does for a VM, so the image carries none.
+ARG RENDERER=localhost/fcvm-renderer:fleet
+FROM ${RENDERER}
+COPY fcvm /usr/local/bin/fcvm
+# Lambda runs a container image's entrypoint as the runtime when no handler is given.
+ENTRYPOINT ["/usr/local/bin/fcvm", "fleet", "lambda-tile"]
+CMD []

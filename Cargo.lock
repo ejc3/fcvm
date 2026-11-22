@@ -870,6 +870,7 @@ dependencies = [
  "userfaultfd",
  "uuid",
  "vmm-sys-util",
+ "webpki-roots 1.0.10",
  "which",
  "x509-parser",
 ]

@@ -10,7 +10,9 @@
 pub mod agent;
 pub mod aggregate;
 pub mod coord;
+pub mod lambda_tile;
 pub mod lines;
+pub mod tunnel;
 
 use crate::cli::{FleetArgs, FleetCommand};
 use anyhow::Result;
@@ -24,6 +26,7 @@ pub async fn cmd_fleet(args: FleetArgs) -> Result<()> {
             agent::webproxy::spawn(a.listen).await?.await?;
             Ok(())
         }
+        FleetCommand::LambdaTile(a) => lambda_tile::run(*a).await,
     }
 }
 
