@@ -1589,10 +1589,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 .context("--lambda aws serves its tiles on the task's addresses: it needs --ec2-aggregate-tls")?;
             let plan = lambda::Plan {
                 fleet: args.fleet_name.clone(),
-                image: args
-                    .lambda_image
-                    .clone()
-                    .context("--lambda aws needs --lambda-image")?,
+                image: lambda::lane_image(
+                    args.lambda_image
+                        .as_deref()
+                        .context("--lambda aws needs --lambda-image")?,
+                )?,
                 role: args
                     .lambda_role
                     .clone()
