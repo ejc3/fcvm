@@ -823,43 +823,86 @@ pub fn udp6_errors(snmp6: &str) -> Option<(u64, u64)> {
     Some((get("Udp6InErrors")?, get("Udp6RcvbufErrors")?))
 }
 
-/// IPv4 and IPv6 UDP receive errors together, from whichever of the two files can be read.
-fn receive_errors() -> Option<(u64, u64)> {
-    let v4 = std::fs::read_to_string("/proc/net/snmp")
-        .ok()
-        .as_deref()
-        .and_then(udp_errors);
-    let v6 = std::fs::read_to_string("/proc/net/snmp6")
-        .ok()
-        .as_deref()
-        .and_then(udp6_errors);
-    match (v4, v6) {
-        (None, None) => None,
-        (a, b) => {
-            let (a, b) = (a.unwrap_or((0, 0)), b.unwrap_or((0, 0)));
-            Some((a.0 + b.0, a.1 + b.1))
+/// One family's UDP receive error counters, as last read.
+struct UdpCounters {
+    family: &'static str,
+    path: &'static str,
+    parse: fn(&str) -> Option<(u64, u64)>,
+    last: Option<(u64, u64)>,
+    /// The last read or parse failed (and was logged).
+    failing: bool,
+}
+
+impl UdpCounters {
+    fn both() -> [UdpCounters; 2] {
+        [
+            UdpCounters {
+                family: "ipv4",
+                path: "/proc/net/snmp",
+                parse: udp_errors,
+                last: None,
+                failing: false,
+            },
+            UdpCounters {
+                family: "ipv6",
+                path: "/proc/net/snmp6",
+                parse: udp6_errors,
+                last: None,
+                failing: false,
+            },
+        ]
+    }
+
+    /// Read the counters once (`read` is `std::fs::read_to_string` outside tests): log a rise
+    /// since the last read, and log once when they cannot be read or parsed, since a watcher
+    /// that cannot see drops must not look like one that saw none.
+    fn step(&mut self, read: impl Fn(&str) -> std::io::Result<String>) {
+        let read = read(self.path);
+        let now = match &read {
+            Ok(text) => (self.parse)(text),
+            Err(_) => None,
+        };
+        let Some(now) = now else {
+            if !self.failing {
+                self.failing = true;
+                tracing::warn!(
+                    family = self.family,
+                    path = self.path,
+                    error = %match &read {
+                        Ok(_) => "no UDP receive error counters in it".to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                    "UDP receive errors cannot be read; drops on arrival will not be logged"
+                );
+            }
+            // A later good read starts a new baseline.
+            self.last = None;
+            return;
+        };
+        self.failing = false;
+        if let Some((in_errors, rcvbuf)) = self.last {
+            if now.0 > in_errors || now.1 > rcvbuf {
+                tracing::warn!(
+                    family = self.family,
+                    in_errors = now.0.saturating_sub(in_errors),
+                    rcvbuf_errors = now.1.saturating_sub(rcvbuf),
+                    "the kernel discarded received UDP datagrams in this network namespace"
+                );
+            }
         }
+        self.last = Some(now);
     }
 }
 
-/// Every 10 s, log a rise in the kernel's UDP receive errors, IPv4 and IPv6. The counters are
-/// the network namespace's (in the coordinator's task, also cloudflared's QUIC sockets), so a
-/// rise says datagrams were lost on arrival in this task, and the first-query lines say which
-/// names.
+/// Every 10 s, log a rise in the kernel's UDP receive errors, IPv4 and IPv6 each. The counters
+/// are the network namespace's (in the coordinator's task, also cloudflared's QUIC sockets),
+/// so a rise says datagrams were lost on arrival in this task, and the first-query lines say
+/// which names.
 async fn watch_udp_errors() {
-    let mut last: Option<(u64, u64)> = None;
+    let mut counters = UdpCounters::both();
     loop {
-        if let Some(now) = receive_errors() {
-            if let Some((in_errors, rcvbuf)) = last {
-                if now.0 > in_errors || now.1 > rcvbuf {
-                    tracing::warn!(
-                        in_errors = now.0.saturating_sub(in_errors),
-                        rcvbuf_errors = now.1.saturating_sub(rcvbuf),
-                        "the kernel discarded received UDP datagrams in this network namespace"
-                    );
-                }
-            }
-            last = Some(now);
+        for c in counters.iter_mut() {
+            c.step(|p| std::fs::read_to_string(p));
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
@@ -1168,6 +1211,47 @@ mod tests {
                      UdpLite6InErrors                \t0\n";
         assert_eq!(udp6_errors(snmp6), Some((199, 198)));
         assert_eq!(udp6_errors("Ip6InReceives 1\n"), None);
+    }
+
+    /// A counter file that cannot be read or parsed is logged once, not skipped in silence
+    /// (Greptile on #2005); each family keeps its own baseline, so one file failing and
+    /// coming back is not a rise in the other (CodeRabbit on #2005).
+    #[test]
+    fn udp_counters_say_when_they_cannot_be_read_and_keep_per_family_baselines() {
+        let (logs, _guard) = Logs::capture();
+        let [mut v4, mut v6] = UdpCounters::both();
+        let snmp = |e: u64, r: u64| {
+            format!(
+                "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n\
+                 Udp: 100 0 {e} 90 {r} 0\n"
+            )
+        };
+        let snmp6 = |e: u64, r: u64| format!("Udp6InErrors {e}\nUdp6RcvbufErrors {r}\n");
+        let missing = |_: &str| -> std::io::Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        v4.step(|_| Ok(snmp(5, 5)));
+        v6.step(missing);
+        v6.step(missing);
+        assert_eq!(logs.lines("cannot be read").len(), 1, "logged once");
+        v6.step(|_| Ok(snmp6(40, 40)));
+        v4.step(|_| Ok(snmp(5, 5)));
+        assert!(
+            logs.lines("discarded").is_empty(),
+            "a first good read is a baseline"
+        );
+        v6.step(|_| Ok(snmp6(43, 41)));
+        let rise = logs.lines("discarded");
+        assert_eq!(rise.len(), 1, "{rise:?}");
+        for want in ["family=\"ipv6\"", "in_errors=3", "rcvbuf_errors=1"] {
+            assert!(rise[0].contains(want), "{want}: {}", rise[0]);
+        }
+        v4.step(|_| Ok("Udp: nothing\n".into()));
+        assert_eq!(
+            logs.lines("cannot be read").len(),
+            2,
+            "a parse failure is logged too"
+        );
     }
 
     #[test]
