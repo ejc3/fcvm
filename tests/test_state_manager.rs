@@ -996,7 +996,8 @@ async fn finding_a_vm_by_pid_reads_no_other_vms_state() {
 
 /// Many processes claiming one name at once, each with a state manager of its own (so
 /// its own lock descriptions): exactly one gets it. And addresses leased at once are all
-/// different.
+/// different, also for VMs whose search starts at the same address: each leases with the
+/// same vm_id in a data directory of its own, so only the host-wide lease tells them apart.
 #[test]
 fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ() {
     let temp_dir = TempDir::new().unwrap();
@@ -1011,7 +1012,7 @@ fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ()
                     .build()
                     .unwrap();
                 runtime.block_on(async {
-                    let manager = StateManager::new(dir);
+                    let manager = StateManager::new(dir.clone());
                     let mut contender = VmState::new(
                         format!("vm-contender-{i}"),
                         "alpine:latest".to_string(),
@@ -1019,13 +1020,14 @@ fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ()
                         512,
                     );
                     contender.name = Some("contested".to_string());
+                    let own_dir = dir.join(format!("own-{i}"));
+                    let own_manager = StateManager::new(own_dir);
+                    own_manager.init().await.unwrap();
                     let mut own =
-                        VmState::new(format!("vm-own-{i}"), "alpine:latest".to_string(), 1, 512);
-                    own.name = Some(format!("own-{i}"));
+                        VmState::new("vm-own".to_string(), "alpine:latest".to_string(), 1, 512);
                     barrier.wait();
                     let won = manager.claim_name(&mut contender).await.is_ok();
-                    manager.claim_name(&mut own).await.unwrap();
-                    let ip = manager.allocate_loopback_ip(&mut own).await.unwrap();
+                    let ip = own_manager.allocate_loopback_ip(&mut own).await.unwrap();
                     (won, ip)
                 })
             })
@@ -1034,11 +1036,13 @@ fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ()
     let results: Vec<(bool, String)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     let winners = results.iter().filter(|(won, _)| *won).count();
     let ips: std::collections::HashSet<&String> = results.iter().map(|(_, ip)| ip).collect();
-    let manager = StateManager::new(dir);
+    let manager = StateManager::new(dir.clone());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for i in 0..16 {
         let _ = runtime.block_on(manager.delete_state(&format!("vm-contender-{i}")));
-        let _ = runtime.block_on(manager.delete_state(&format!("vm-own-{i}")));
+        // Every lease of this process under vm_id `vm-own` goes with the first delete.
+        let _ = runtime
+            .block_on(StateManager::new(dir.join(format!("own-{i}"))).delete_state("vm-own"));
     }
     assert_eq!(
         winners, 1,

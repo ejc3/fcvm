@@ -1563,7 +1563,8 @@ mod tests {
     async fn an_exited_vm_frees_its_name() {
         let dir = tempfile::tempdir().unwrap();
         let manager = StateManager::new(dir.path().to_path_buf());
-        let cases: [(&str, fn(&mut VmState)); 3] = [
+        type MakeStale = fn(&mut VmState);
+        let cases: [(&str, MakeStale); 3] = [
             // Above the kernel's PID_MAX_LIMIT (4194304), so no process has it.
             ("vm-exited", |state| state.pid = Some(4_000_000_000)),
             ("vm-replaced", |state| {
