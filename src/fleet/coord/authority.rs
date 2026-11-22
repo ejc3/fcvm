@@ -20,7 +20,7 @@
 //! query ([`Asked`]: its type, transport, verdict and how long the name had been in the zone),
 //! every one-second window in which the rate limit truncated or withheld responses (at the
 //! first query after the window), and any rise in the kernel's UDP receive errors
-//! ([`udp_errors`], `/proc/net/snmp`).
+//! ([`udp_errors`] and [`udp6_errors`], `/proc/net/snmp` and `/proc/net/snmp6`).
 //!
 //! Parsing never follows a compression pointer: a name in a query must be written out, so a
 //! pointer loop cannot occur, and every read is bounded by the packet.
@@ -741,9 +741,12 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// Take the zone's names: a new one appeared `now`, one no longer held is forgotten.
+    /// Take the zone's names: a new one appeared `now`, one no longer held is forgotten. A
+    /// zone no newer than the last one taken changes nothing: a query task can hold an older
+    /// zone than the watcher already recorded. The serial is the state version, which only
+    /// grows in one coordinator.
     pub fn refresh(&mut self, zone: &Zone, now: Instant) {
-        if self.serial == Some(zone.serial) {
+        if self.serial.is_some_and(|s| zone.serial <= s) {
             return;
         }
         self.serial = Some(zone.serial);
@@ -808,17 +811,45 @@ pub fn udp_errors(snmp: &str) -> Option<(u64, u64)> {
     Some((get("InErrors")?, get("RcvbufErrors")?))
 }
 
-/// Every 10 s, log a rise in the kernel's UDP receive errors. The counters are the network
-/// namespace's (in the coordinator's task, also cloudflared's QUIC sockets), so a rise says
-/// datagrams were lost on arrival in this task, and the first-query lines say which names.
+/// `Udp6InErrors` and `Udp6RcvbufErrors` of `/proc/net/snmp6`: the same counts for IPv6
+/// sockets, which `/proc/net/snmp` leaves out.
+pub fn udp6_errors(snmp6: &str) -> Option<(u64, u64)> {
+    let get = |key: &str| -> Option<u64> {
+        snmp6.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next()? == key).then(|| f.next()?.parse().ok())?
+        })
+    };
+    Some((get("Udp6InErrors")?, get("Udp6RcvbufErrors")?))
+}
+
+/// IPv4 and IPv6 UDP receive errors together, from whichever of the two files can be read.
+fn receive_errors() -> Option<(u64, u64)> {
+    let v4 = std::fs::read_to_string("/proc/net/snmp")
+        .ok()
+        .as_deref()
+        .and_then(udp_errors);
+    let v6 = std::fs::read_to_string("/proc/net/snmp6")
+        .ok()
+        .as_deref()
+        .and_then(udp6_errors);
+    match (v4, v6) {
+        (None, None) => None,
+        (a, b) => {
+            let (a, b) = (a.unwrap_or((0, 0)), b.unwrap_or((0, 0)));
+            Some((a.0 + b.0, a.1 + b.1))
+        }
+    }
+}
+
+/// Every 10 s, log a rise in the kernel's UDP receive errors, IPv4 and IPv6. The counters are
+/// the network namespace's (in the coordinator's task, also cloudflared's QUIC sockets), so a
+/// rise says datagrams were lost on arrival in this task, and the first-query lines say which
+/// names.
 async fn watch_udp_errors() {
     let mut last: Option<(u64, u64)> = None;
     loop {
-        if let Some(now) = std::fs::read_to_string("/proc/net/snmp")
-            .ok()
-            .as_deref()
-            .and_then(udp_errors)
-        {
+        if let Some(now) = receive_errors() {
             if let Some((in_errors, rcvbuf)) = last {
                 if now.0 > in_errors || now.1 > rcvbuf {
                     tracing::warn!(
@@ -1094,6 +1125,49 @@ mod tests {
             "the name was published 300 ms before it was asked: {}",
             first[0]
         );
+    }
+
+    /// A query task can hold an older zone than the one the zone watcher already recorded
+    /// (Codex on #2005): refreshing with it must not forget a name the newer zone published,
+    /// or that name's first query is logged with the wrong time in the zone.
+    #[test]
+    fn an_older_zone_does_not_roll_back_publication_times() {
+        let (logs, _guard) = Logs::capture();
+        let old = Zone {
+            serial: 7,
+            ..Zone::default()
+        };
+        let new = Zone {
+            serial: 8,
+            ..zone()
+        };
+        let t0 = Instant::now();
+        let mut asked = Asked::default();
+        asked.refresh(&new, t0);
+        asked.refresh(&old, t0 + Duration::from_secs(1));
+        asked.note(
+            &new,
+            "slot-1-abcdefgh.tiles.fcvm.example",
+            T_AAAA,
+            "udp",
+            Verdict::Answer,
+            t0 + Duration::from_secs(2),
+        );
+        let first = logs.lines("launch name first asked");
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("in_zone_ms=2000"), "{}", first[0]);
+    }
+
+    /// Receive errors on IPv6 sockets are counted in `/proc/net/snmp6` (Codex on #2005).
+    #[test]
+    fn udp6_receive_errors_are_read_from_proc_net_snmp6() {
+        let snmp6 = "Udp6InDatagrams                 \t1000\n\
+                     Udp6NoPorts                     \t3\n\
+                     Udp6InErrors                    \t199\n\
+                     Udp6RcvbufErrors                \t198\n\
+                     UdpLite6InErrors                \t0\n";
+        assert_eq!(udp6_errors(snmp6), Some((199, 198)));
+        assert_eq!(udp6_errors("Ip6InReceives 1\n"), None);
     }
 
     #[test]
