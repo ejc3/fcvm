@@ -2008,13 +2008,24 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     for race in f.races.iter_mut() {
         let started_at = race.started_at;
         let h = race.half_mut(half);
-        if h.done_at.is_some() {
-            continue;
-        }
         let Some(t) = h.tiles.get_mut(&id) else {
             continue;
         };
-        if t.first_frame_at.is_some() || r.generation < t.generation {
+        if t.first_frame_at.is_some() {
+            // A warm invoke is measured on the running environment, so its timing can
+            // arrive after the first frame: keep it beside the race time, and change neither
+            // the first frame nor the time.
+            if let Some(w) = r.timings.get("warm_invoke_ms").copied() {
+                if r.generation == t.generation {
+                    t.phases.insert("warm_invoke_ms".into(), w);
+                    if h.done_at.is_some() {
+                        h.warm_invoke_ms = warm_invoke_max(h);
+                    }
+                }
+            }
+            continue;
+        }
+        if h.done_at.is_some() || r.generation < t.generation {
             continue;
         }
         t.first_frame_at = Some(at);
@@ -2047,11 +2058,15 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .max()
         .unwrap_or(0);
     // Reported beside the time, never part of it.
-    h.warm_invoke_ms = h
-        .tiles
+    h.warm_invoke_ms = warm_invoke_max(h);
+}
+
+/// The slowest tile's warm invoke, of the tiles that have reported one.
+fn warm_invoke_max(h: &HalfRace) -> Option<u64> {
+    h.tiles
         .values()
         .filter_map(|t| t.phases.get("warm_invoke_ms").copied())
-        .max();
+        .max()
 }
 
 fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
