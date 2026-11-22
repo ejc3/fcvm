@@ -241,13 +241,24 @@ struct Live {
     to_tile: mpsc::Sender<ToTile>,
 }
 
+impl Inner {
+    /// Fail the streams `slot`'s session `epoch` was asked for (every epoch: `None`): that
+    /// session no longer holds the tile, so its data connections would be refused, and an
+    /// opener would otherwise wait out [`OPEN_TIMEOUT`] for a stream that cannot come.
+    fn drop_pending(&mut self, slot: &str, epoch: Option<u64>) {
+        self.pending
+            .retain(|_, (s, e, _)| s != slot || epoch.is_some_and(|ep| *e != ep));
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     live: HashMap<String, Live>,
     /// The lowest generation the endpoint accepts per slot.
     want: HashMap<String, u64>,
-    /// Streams waiting for their data connection: stream id to (slot, opener).
-    pending: HashMap<u64, (String, oneshot::Sender<Stream>)>,
+    /// Streams waiting for their data connection: stream id to the slot, the epoch of the
+    /// session asked for it, and the opener.
+    pending: HashMap<u64, (String, u64, oneshot::Sender<Stream>)>,
     next_stream: u64,
     next_epoch: u64,
 }
@@ -306,6 +317,7 @@ impl Endpoint {
         let w = *w;
         if inner.live.get(slot).is_some_and(|l| l.info.generation < w) {
             let old = inner.live.remove(slot).unwrap();
+            inner.drop_pending(slot, Some(old.epoch));
             let _ = old.to_tile.try_send(ToTile::Close {
                 reason: Refusal::StaleGeneration,
             });
@@ -317,6 +329,7 @@ impl Endpoint {
     pub fn forget(&self, slot: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.want.remove(slot);
+        inner.drop_pending(slot, None);
         if let Some(old) = inner.live.remove(slot) {
             let _ = old.to_tile.try_send(ToTile::Close {
                 reason: Refusal::StaleGeneration,
@@ -335,13 +348,14 @@ impl Endpoint {
                 bail!("tile {slot} has no tunnel");
             };
             let to_tile = live.to_tile.clone();
-            let waiting = inner.pending.values().filter(|(s, _)| s == slot).count();
+            let epoch = live.epoch;
+            let waiting = inner.pending.values().filter(|(s, _, _)| s == slot).count();
             if waiting >= MAX_PENDING_PER_TILE {
                 bail!("tile {slot} has {waiting} streams waiting for their connection");
             }
             let stream = inner.next_stream;
             inner.next_stream += 1;
-            inner.pending.insert(stream, (slot.to_string(), tx));
+            inner.pending.insert(stream, (slot.to_string(), epoch, tx));
             (stream, to_tile)
         };
         let asked = to_tile.send(ToTile::Open { stream, port }).await.is_ok();
@@ -415,16 +429,16 @@ impl Endpoint {
             let holds = inner
                 .live
                 .get(&hello.slot)
-                .is_some_and(|l| l.info.env == hello.env && l.info.generation == hello.generation);
-            match hello.stream {
-                Some(id)
-                    if holds
-                        && inner
-                            .pending
-                            .get(&id)
-                            .is_some_and(|(s, _)| *s == hello.slot) =>
+                .filter(|l| l.info.env == hello.env && l.info.generation == hello.generation)
+                .map(|l| l.epoch);
+            match (hello.stream, holds) {
+                (Some(id), Some(epoch))
+                    if inner
+                        .pending
+                        .get(&id)
+                        .is_some_and(|(s, e, _)| *s == hello.slot && *e == epoch) =>
                 {
-                    inner.pending.remove(&id).map(|(_, tx)| tx)
+                    inner.pending.remove(&id).map(|(_, _, tx)| tx)
                 }
                 _ => None,
             }
@@ -493,6 +507,9 @@ impl Endpoint {
                 to_tile: tx,
             },
         );
+        if let Some(old) = &replaced {
+            inner.drop_pending(&hello.slot, Some(old.epoch));
+        }
         self.publish(&inner);
         Ok((epoch, replaced))
     }
@@ -576,6 +593,7 @@ impl Endpoint {
             .is_some_and(|l| l.epoch == epoch)
         {
             inner.live.remove(&hello.slot);
+            inner.drop_pending(&hello.slot, Some(epoch));
             self.publish(&inner);
             tracing::info!(slot = %hello.slot, generation = hello.generation, env = %hello.env, "a Lambda tile's environment disconnected");
         }
@@ -1081,5 +1099,48 @@ mod tests {
         let ep = endpoint();
         let err = ep.open("lam-9", Port::Tls).await.err().unwrap();
         assert!(err.to_string().contains("has no tunnel"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_waiting_on_a_replaced_environment_fails_at_once() {
+        // An environment that holds the tile but never connects the streams it is asked for.
+        let ep = endpoint();
+        let id = identity("lam-1", 1, "env-a", 5_000);
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let server = ep.clone();
+        tokio::spawn(async move {
+            let _ = server.serve(b).await;
+        });
+        let mut a = BufReader::new(a);
+        write_line(&mut a, &id.hello(Kind::Control, None))
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut a).await.unwrap(), r#"{"ok":true}"#);
+        session_of(&ep, "lam-1", "env-a").await;
+        let opener = ep.clone();
+        let open = tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let r = opener.open("lam-1", Port::Tls).await;
+            (r.is_err(), t0.elapsed())
+        });
+        // The stream is asked of env-a; then an environment that started later takes the tile.
+        loop {
+            let line = read_line(&mut a).await.unwrap();
+            if line.contains("\"open\"") {
+                break;
+            }
+        }
+        let b = start(&ep, identity("lam-1", 1, "env-b", 9_000), 0);
+        session_of(&ep, "lam-1", "env-b").await;
+        let (failed, took) = open.await.unwrap();
+        assert!(
+            failed,
+            "the stream was asked of an environment that no longer holds the tile"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "it waited {took:?} instead of failing at once"
+        );
+        b.stop.send_replace(true);
     }
 }
