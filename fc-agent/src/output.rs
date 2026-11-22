@@ -131,22 +131,40 @@ fn request_reconnect_at(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn create() -> (
-    OutputHandle,
-    impl Future<Output = ()>,
-    tokio::sync::watch::Receiver<u64>,
-) {
+/// The output connection as the restore-epoch watcher sees it.
+#[derive(Clone)]
+pub struct ResetWatch {
+    /// Incremented when the writer sees EPOLLERR on its idle established connection: the
+    /// guest-visible edge of the device's VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.
+    pub reset_rx: tokio::sync::watch::Receiver<u64>,
+    /// True while the writer holds an established connection and so will see that reset.
+    /// The writer clears it whenever it drops the connection, for whatever reason.
+    pub armed_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+pub fn create() -> (OutputHandle, impl Future<Output = ()>, ResetWatch) {
     let (tx, rx) = mpsc::channel(4096);
     let reconnect = Arc::new(Notify::new());
     let reconnect_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+    let (armed_tx, armed_rx) = tokio::sync::watch::channel(false);
     let handle = OutputHandle {
         tx,
         reconnect: reconnect.clone(),
         reconnect_flag: reconnect_flag.clone(),
     };
-    let writer = output_writer(rx, reconnect, reconnect_flag, reset_tx);
-    (handle, writer, reset_rx)
+    let writer = output_writer(rx, reconnect, reconnect_flag, reset_tx, armed_tx);
+    (handle, writer, ResetWatch { reset_rx, armed_rx })
+}
+
+/// Publish whether the writer holds an established connection. Only a change is sent, so a
+/// watcher waiting on the channel wakes for edges, not for every loop of the writer.
+fn publish_armed(armed_tx: &tokio::sync::watch::Sender<bool>, connected: bool) {
+    armed_tx.send_if_modified(|armed| {
+        let changed = *armed != connected;
+        *armed = connected;
+        changed
+    });
 }
 
 /// Try to reconnect the vsock stream, retrying up to 30 times.
@@ -202,6 +220,7 @@ async fn output_writer(
     reconnect_signal: Arc<Notify>,
     reconnect_flag: Arc<std::sync::atomic::AtomicBool>,
     reset_tx: tokio::sync::watch::Sender<u64>,
+    armed_tx: tokio::sync::watch::Sender<bool>,
 ) {
     let mut stream: Option<VsockStream> =
         match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
@@ -228,6 +247,9 @@ async fn output_writer(
     let mut pending: Option<String> = None;
 
     loop {
+        // Every path that drops or (re)makes the connection comes back here, so this is
+        // the one place the watcher learns whether a transport reset would reach us.
+        publish_armed(&armed_tx, stream.is_some());
         // Check reconnect flag — the single source of truth for reconnection.
         // Both the flag-check path and the Notify-wakeup path converge here.
         if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
@@ -356,6 +378,20 @@ async fn output_writer(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn armed_is_published_on_edges_only() {
+        let (armed_tx, mut armed_rx) = tokio::sync::watch::channel(false);
+        publish_armed(&armed_tx, false);
+        assert!(!armed_rx.has_changed().unwrap(), "no edge, no wakeup");
+        publish_armed(&armed_tx, true);
+        assert!(armed_rx.has_changed().unwrap());
+        assert!(*armed_rx.borrow_and_update());
+        publish_armed(&armed_tx, true);
+        assert!(!armed_rx.has_changed().unwrap(), "no edge, no wakeup");
+        publish_armed(&armed_tx, false);
+        assert!(!*armed_rx.borrow_and_update());
+    }
 
     /// The resume one-shot's request reaches the running agent's output writer as a
     /// reconnect, and other datagrams do not.
