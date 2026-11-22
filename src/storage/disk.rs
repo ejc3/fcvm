@@ -1354,31 +1354,35 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod snapshot_dir_tests {
     use super::*;
 
-    /// The clone's disk is reflinked in this process: with nothing on PATH it is made (on a
-    /// filesystem that clones) or the filesystem's refusal is reported and nothing is left
-    /// (on one that does not), and either way no `cp` is needed.
+    /// The clone's disk is reflinked in this process: on a filesystem that clones it is made,
+    /// on one that does not the refusal is reported and nothing is left, and create_cow_disk
+    /// starts no `cp` (main ran one per clone).
     #[tokio::test]
     async fn the_disk_is_reflinked_without_cp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let base = dir.path().join("base.raw");
         std::fs::write(&base, [0x5a; 8192]).unwrap();
         let vm_dir = dir.path().join("vm").join("disks");
         let disk = DiskManager::new("vm-test".to_string(), base, vm_dir.clone());
-        let empty = tempfile::tempdir().unwrap();
-        // SAFETY: nextest runs each test in its own process, so no other thread reads PATH.
-        unsafe { std::env::set_var("PATH", empty.path()) };
         match disk.create_cow_disk().await {
             Ok(path) => assert_eq!(std::fs::read(path).unwrap(), vec![0x5a; 8192]),
             Err(error) => {
                 let text = format!("{error:#}");
                 assert!(text.contains("Reflink copy failed"), "{text}");
-                assert!(!text.contains("executing cp"), "a cp was needed: {text}");
                 assert!(
                     !vm_dir.join("rootfs.raw").exists(),
                     "a failed clone left its file"
                 );
             }
         }
+        let source = include_str!("disk.rs");
+        let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
+        let create = &create[..create.find("\n    }\n").unwrap()];
+        assert!(create.contains("reflink_file(&base, &disk)"));
+        assert!(
+            !create.contains("helper_command(\"cp\")"),
+            "create_cow_disk runs cp"
+        );
     }
 
     /// A counted disk of at most REFLINK_MAX_EXTENTS extents is reflinked; a larger one, or
