@@ -403,8 +403,9 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 /// The permission bits an entry contributes to the hash. A symlink contributes none:
 /// Linux ignores a symlink's own permission bits (symlink(7)), and filesystems report
 /// different ones for the same link. EdenFS reports 0770 where the btrfs staging copy
-/// has 0777, so a tree holding a symlink never hashed the same in place and staged, and
-/// every launch from an EdenFS checkout was refused as changed during the launch.
+/// has 0777, so a tree holding a symlink never hashed the same in place and staged, and a
+/// launch from an EdenFS checkout with a symlink in the tree was refused as changed during
+/// the launch. A tree with no symlink was not affected.
 fn hashed_mode(kind: u8, mode: u32) -> u32 {
     if kind == b'l' {
         0
