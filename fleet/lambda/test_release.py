@@ -304,6 +304,33 @@ class Selection(unittest.TestCase):
         self.ecr.put("keep-stage-current", self.ecr.image(b))
         self.assertEqual(self.ecr.tagged("keep-stage-current").digest, b)
 
+    def test_ci_records_each_build_and_a_selection_takes_it_by_name(self):
+        a = self.ecr.push("rev-a")
+        release.record(self.ecr, a)
+        release.run(["select", "--stack", "stage", "--built", "--running", "none"], ecr=self.ecr)
+        b = self.ecr.push("rev-b")
+        release.record(self.ecr, b)
+        self.assertEqual(self.ecr.tagged("keep-built").digest, b)
+        release.run(["select", "--stack", "stage", "--built", "--running", a], ecr=self.ecr)
+        self.assertEqual(release.tags(self.ecr, "stage"), {"keep-stage-current": b, "keep-stage-previous": a})
+        with self.assertRaises(SystemExit):
+            release.arguments(["select", "--stack", "stage", "--built", "--digest", a, "--running", "none"])
+
+    def test_the_newest_build_is_kept_and_an_older_unselected_one_is_not(self):
+        a = self.ecr.push("rev-a")
+        release.record(self.ecr, a)
+        b = self.ecr.push("rev-b")
+        release.record(self.ecr, b)
+        later = self.pushes(6, start=10)
+        self.ecr.lifecycle()
+        self.assertNotIn(a, self.ecr.images)
+        self.assertIn(b, self.ecr.images)
+        self.assertTrue(set(later[1:]) <= set(self.ecr.images))
+
+    def test_a_selection_of_nothing_built_is_refused(self):
+        with self.assertRaisesRegex(LookupError, "no lane image"):
+            release.run(["select", "--stack", "stage", "--built", "--running", "none"], ecr=self.ecr)
+
     def test_arguments_are_digests(self):
         for bad in ["latest", "sha256:" + "A" * 64, "sha256:" + "a" * 63, ""]:
             with self.assertRaises(ValueError):
@@ -313,6 +340,69 @@ class Selection(unittest.TestCase):
             release.digest("none")
         with self.assertRaises(SystemExit):
             release.arguments(["select", "--stack", "other", "--digest", "x", "--running", "none"])
+
+
+class Publish(unittest.TestCase):
+    """CI's push: rev-<commit> by digest, then keep-built, against a fake repository and fake commands."""
+
+    COMMIT = "c" * 40
+    REPO = "123456789012.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"
+
+    def setUp(self):
+        self.ecr = FakeEcr()
+        self.calls = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(release.tempfile, "gettempdir", return_value=self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def commands(self, push_digest=None):
+        """podman and aws as the runner has them: a push lands rev-<commit> in the fake repository."""
+        def run(args, input=None, capture_output=None, text=None, env=None, check=None):
+            self.calls.append(list(args))
+            out = ""
+            if args[:2] == ["podman", "push"]:
+                digest = self.ecr.push(args[-1].rsplit(":", 1)[1])
+                with open(args[args.index("--digestfile") + 1], "w") as f:
+                    f.write(push_digest or digest)
+            if args[:3] == ["aws", "ecr", "get-login-password"]:
+                out = "password"
+            return type("R", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+        return patch.object(release.subprocess, "run", side_effect=run)
+
+    def test_ci_pushes_rev_commit_and_records_its_digest(self):
+        with self.commands():
+            result = release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
+        pushed = self.ecr.tagged("rev-" + self.COMMIT).digest
+        self.assertEqual(result, {"tag": "rev-" + self.COMMIT, "digest": pushed})
+        self.assertEqual(self.ecr.tagged("keep-built").digest, pushed)
+        push = next(c for c in self.calls if c[:2] == ["podman", "push"])
+        self.assertEqual(push[-2:], ["localhost/fcvm-lambda-tile:" + self.COMMIT,
+                                     "docker://" + self.REPO + ":rev-" + self.COMMIT])
+        login = next(c for c in self.calls if c[:2] == ["podman", "login"])
+        self.assertIn("--password-stdin", login)
+        self.assertNotIn("password", login)
+
+    def test_a_rerun_records_the_digest_already_pushed(self):
+        pushed = self.ecr.push("rev-" + self.COMMIT)
+        with self.commands():
+            release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
+        self.assertFalse([c for c in self.calls if c[:2] == ["podman", "push"]])
+        self.assertEqual(self.ecr.tagged("keep-built").digest, pushed)
+
+    def test_a_push_whose_digest_the_repository_disagrees_with_records_nothing(self):
+        with self.commands(push_digest="sha256:" + "f" * 64):
+            with self.assertRaisesRegex(RuntimeError, "digest"):
+                release.publish(self.ecr, "lane.tar", self.COMMIT, self.REPO)
+        self.assertIsNone(self.ecr.tagged("keep-built"))
+
+    def test_publish_refuses_another_repository_or_a_short_commit(self):
+        for commit, repo in [(self.COMMIT, self.REPO.replace("us-east-1", "us-west-2")),
+                             (self.COMMIT, self.REPO + "x"), ("c" * 7, self.REPO)]:
+            with self.commands(), self.assertRaises(ValueError):
+                release.publish(self.ecr, "lane.tar", commit, repo)
+        self.assertEqual(self.calls, [])
 
 
 class AwsCli(unittest.TestCase):
@@ -352,6 +442,23 @@ class AwsCli(unittest.TestCase):
                 release.Ecr().put("keep-stage-current", image)
             with self.assertRaises(release.CommandFailed):
                 release.Ecr().put("keep-stage-current", image)
+
+    def test_a_caller_in_another_account_names_the_repositorys(self):
+        found = json.dumps({"images": [{"imageId": {"imageDigest": "sha256:" + "3" * 64},
+                                        "imageManifest": "{}", "imageManifestMediaType": release.MEDIA_TYPES[0]}]})
+        image = release.Image("sha256:" + "3" * 64, "{}", release.MEDIA_TYPES[0])
+        ok = json.dumps({"image": {"imageId": {"imageDigest": image.digest}}})
+        calls, p = self.run_with([(0, found, ""), (0, ok, "")])
+        with p:
+            ecr = release.Ecr(registry="123456789012")
+            ecr.tagged("keep-built")
+            ecr.put("keep-built", image)
+        self.assertEqual(calls[0][0][calls[0][0].index("--registry-id") + 1], "123456789012")
+        self.assertEqual(json.loads(calls[1][1])["registryId"], "123456789012")
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": Publish.REPO}):
+            with patch.object(release, "publish", return_value={}) as published:
+                release.run(["publish", "--archive", "a.tar", "--commit", "c" * 40])
+        self.assertEqual(published.call_args.args[0].registry, "123456789012")
 
     def test_a_missing_tag_reads_as_none(self):
         missing = json.dumps({"images": [], "failures": [{"failureCode": "ImageTagDoesNotExist"}]})
