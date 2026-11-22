@@ -374,17 +374,25 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
         built = ecr.tagged(BUILT)
         if built is not None:
             held = [t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
-            for h in held:
-                if h == commit or ((is_ancestor(h, commit) or is_ancestor(commit, h)) and not changed(h, commit)):
-                    return built.digest
+            stranded = RuntimeError(
+                f"no lane build pairs with {commit}: keep-built holds a newer lane build with other lane inputs, "
+                "and it only moves forward, so a rerun of this run cannot succeed. Release staging with a "
+                "workflow_dispatch of fleet-coordinator-deploy.yml at main's head")
+            try:
+                for h in held:
+                    if h == commit or ((is_ancestor(h, commit) or is_ancestor(commit, h)) and not changed(h, commit)):
+                        return built.digest
+                behind = all(is_ancestor(h, commit) for h in held)
+            except UnknownCommit:
+                # keep-built's commit is not in this checkout: main moved past it after the run started.
+                raise stranded from None
             # keep-built moves only forward: a build of a later commit (or of another line) with other lane
             # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
             if not held:
                 raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds an image with no "
                                    "rev-<commit> tag")
-            if not all(is_ancestor(h, commit) for h in held):
-                raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds a newer lane build "
-                                   "with other lane inputs")
+            if not behind:
+                raise stranded
         if clock() >= deadline:
             if built is None:
                 raise RuntimeError(f"no lane build is recorded (keep-built) for {commit}")

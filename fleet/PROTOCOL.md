@@ -2193,6 +2193,13 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   nothing. A push that changes only lane inputs starts no coordinator deploy: it reaches staging
   with the next coordinator deploy, or a manual `workflow_dispatch` of
   `fleet-coordinator-deploy.yml`.
+- **A deploy can be stranded.** Push A changes the coordinator and a lane input; push B, landing
+  while A's deploy waits, changes only lane inputs. B's lane build moves `keep-built` past A, so
+  A's deploy is refused, B starts no deploy, and a rerun of A's run is refused again: staging stays
+  on the coordinator before A. The refusal says so. Recovery: run `fleet-coordinator-deploy.yml`
+  by `workflow_dispatch` at main's head. Do not turn `FLEET_LAMBDA_LANE` on before the stacked
+  release-ordering PR lands; with releases ordered at the point of release, a lane build starts
+  the staging release itself and this case goes away.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of

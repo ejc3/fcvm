@@ -1872,7 +1872,7 @@ class LaneReleaseTests(unittest.TestCase):
         for path in ("fleet/lambda/release.py", ".github/workflows/fleet-lambda-image.yml"):
             self.assertIn(path, paths)
         # Triggers, concurrency and job conditions are main's: a push or a dispatch, one group. A lane build
-        # does not start a deploy (the stacked trigger PR orders releases first).
+        # does not start a deploy.
         triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["push", "workflow_dispatch"])
         self.assertIn("\nconcurrency:\n  group: fleet-coordinator-stage\n  cancel-in-progress: false\n", workflow)

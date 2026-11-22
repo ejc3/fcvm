@@ -2,7 +2,8 @@
 """Publish an immutable coordinator image and invoke a stack's image-only releaser.
 
     publish.py                                  staging: push GITHUB_SHA's image, release it (with
-                                                FLEET_LAMBDA_LANE=on, and the newest lane image)
+                                                FLEET_LAMBDA_LANE=on, and the lane build paired with
+                                                this commit)
     publish.py --stack prod --commit C --digest D [--force]
                                                 prod: release an image staging already published
                                                 (exit 3: held for viewers, nothing changed)

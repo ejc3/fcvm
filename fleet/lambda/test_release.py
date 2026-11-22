@@ -454,6 +454,25 @@ class Selection(unittest.TestCase):
                                               clock=lambda: clock[0], sleep=real_sleep, timeout=600), b2)
         self.assertEqual(sleeps, [30])
 
+    def test_a_deploy_stranded_behind_a_newer_lane_build_names_the_recovery(self):
+        # Push A (coordinator and lane input), then push B (lane input only): B's lane build lands while A's
+        # deploy waits. A can never pair again, and a rerun of A's run runs A again.
+        a, b = "a" * 40, "b" * 40
+        built = self.ecr.push("rev-" + b)
+        release.record(self.ecr, built)
+        for case, is_ancestor in (
+                ("in history", lambda x, y: (x, y) in {(a, b), (a, a), (b, b)}),
+                ("after the checkout", lambda x, y: (_ for _ in ()).throw(release.UnknownCommit(b)) if b in (x, y) and x != y else x == y)):
+            with self.subTest(case):
+                with self.assertRaises(RuntimeError) as raised:
+                    release.paired_build(self.ecr, a, is_ancestor=is_ancestor, changed=lambda x, y: True,
+                                         clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+                self.assertNotIsInstance(raised.exception, release.UnknownCommit)
+                message = str(raised.exception)
+                self.assertIn("newer lane build", message)
+                self.assertIn("a rerun of this run cannot succeed", message)
+                self.assertIn("workflow_dispatch of fleet-coordinator-deploy.yml at main's head", message)
+
     def test_a_recorded_image_without_a_commit_tag_is_named_so(self):
         untagged = self.ecr.push("hand-pushed")
         release.record(self.ecr, untagged)
