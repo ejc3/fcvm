@@ -59,17 +59,6 @@ impl OutputHandle {
     }
 }
 
-/// Create an (OutputHandle, writer future, transport-reset watch) triple. Spawn
-/// the future as a tokio task.
-///
-/// The `watch::Receiver<u64>` increments whenever the writer observes EPOLLERR
-/// on its established vsock connection — the kernel's reaction to
-/// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, which the device raises at snapshot
-/// restore. It is the guest's earliest "you were just restored" signal: the
-/// restore-epoch watcher uses it to poll for the new epoch immediately instead
-/// of finishing a frozen 50ms sleep first. It is an ACCELERATOR only — every
-/// consumer must keep working (just slower) if it never fires (e.g. TTY-mode
-/// VMs, where no output connection exists).
 /// Where `fc-agent --resume-snapshot-network` asks the running agent to reconnect its
 /// output after a snapshot of this VM.
 ///
@@ -132,16 +121,55 @@ fn request_reconnect_at(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// The output connection as the restore-epoch watcher sees it.
+///
+/// Invariant: any path that loses the connection must clear `armed`. While `armed` is true
+/// the watcher polls only every 10 s and relies on the writer to report a restore's
+/// transport reset, which only a live connection receives. A connection the writer still
+/// holds but the kernel has already ended (the host closed it, a write failed) would leave
+/// a restored clone waiting out the backstop. The writer publishes `armed` from whether it
+/// holds a stream at the top of every turn of its loop, so losing the connection means
+/// dropping the stream and going round: the idle wait does that for a transport reset and
+/// for a close by the host ([`connection_lost`]), the write paths for a failed write, and
+/// the reconnect before it waits for a new connection.
 #[derive(Clone)]
 pub struct ResetWatch {
     /// Incremented when the writer sees EPOLLERR on its idle established connection: the
-    /// guest-visible edge of the device's VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.
+    /// guest-visible edge of the device's VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, which the
+    /// VMM raises for a snapshot. A wakeup only: every consumer keeps working, slower,
+    /// if it never fires (a TTY VM has no output connection).
     pub reset_rx: tokio::sync::watch::Receiver<u64>,
-    /// True while the writer holds an established connection and so will see that reset.
-    /// The writer clears it whenever it drops the connection, for whatever reason.
+    /// True while the writer holds a connection that would see that reset.
     pub armed_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+/// How an idle output connection ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Lost {
+    /// EPOLLERR: the vsock transport was reset, which for a connection fc-agent holds
+    /// means a snapshot was restored (or its source resumed).
+    Reset,
+    /// The host closed the connection. No snapshot is implied.
+    PeerClosed,
+}
+
+/// Wait until the idle connection `s` is lost. A transport reset wins over the close it
+/// can come with, so a restore is always reported as one. A close by the host raises no
+/// EPOLLERR: the idle writer waited on that alone, kept the dead stream, and stayed
+/// `armed` on a connection no reset could reach.
+async fn connection_lost(s: &VsockStream) -> Lost {
+    tokio::select! {
+        biased;
+        _ = s.wait_for_error() => Lost::Reset,
+        closed = s.wait_for_peer_close() => match closed {
+            Ok(()) => Lost::PeerClosed,
+            // The read failed: the connection ended by an error, as a reset ends it.
+            Err(_) => Lost::Reset,
+        },
+    }
+}
+
+/// Create an (OutputHandle, writer future, [`ResetWatch`]) triple. Spawn the future as a
+/// tokio task.
 pub fn create() -> (OutputHandle, impl Future<Output = ()>, ResetWatch) {
     let (tx, rx) = mpsc::channel(4096);
     let reconnect = Arc::new(Notify::new());
@@ -307,20 +335,27 @@ async fn output_writer(
                     stream = None;
                     continue;
                 }
-                _ = s.wait_for_error() => {
-                    // EPOLLERR on the idle connection: the vsock transport was
-                    // reset — for an fc-agent-held connection that means a
-                    // snapshot restore just happened. Publish the earliest
-                    // restore hint (the epoch watcher fast-polls on it), drop
-                    // the dead stream, and wait for the explicit reconnect from
-                    // handle_clone_restore exactly like the write-failure path.
-                    // The snapshot is virtually always taken with output idle,
-                    // so this arm is where a restored writer wakes up; a reset
-                    // mid-write lands in the write-error path instead, which
-                    // doesn't bump the hint — the watcher's normal poll covers
-                    // that case.
-                    eprintln!("[fc-agent] output vsock EPOLLERR (transport reset)");
-                    reset_tx.send_modify(|gen| *gen += 1);
+                lost = connection_lost(s) => {
+                    // The idle connection is gone. Either way the stream is dropped
+                    // here, which clears `armed` at the top of the loop (the
+                    // invariant on `ResetWatch`), and the writer waits for an
+                    // explicit reconnect, as after a failed write.
+                    match lost {
+                        // A snapshot is virtually always taken with the output
+                        // idle, so this is where a restored writer wakes: publish
+                        // the restore hint (the epoch watcher fetches on it). A
+                        // reset mid-write lands in the write-error path instead,
+                        // which publishes none; the watcher's poll covers it, since
+                        // that path drops the stream too.
+                        Lost::Reset => {
+                            eprintln!("[fc-agent] output vsock EPOLLERR (transport reset)");
+                            reset_tx.send_modify(|gen| *gen += 1);
+                        }
+                        // Nothing was restored, so no hint.
+                        Lost::PeerClosed => {
+                            eprintln!("[fc-agent] output vsock closed by the host");
+                        }
+                    }
                     stream = None;
                     continue;
                 }
@@ -395,6 +430,71 @@ mod tests {
             .expect("the reconnect branch publishes that it is disarmed");
         let wait_at = branch.find("try_reconnect().await").unwrap();
         assert!(drop_at < disarm_at && disarm_at < wait_at);
+    }
+
+    fn pair() -> (VsockStream, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        (VsockStream::from_connected(ours.into()).unwrap(), theirs)
+    }
+
+    /// A connection the host closed is lost, with no restore hint. The idle writer waited
+    /// for EPOLLERR alone, which a close does not raise, so it kept the stream and `armed`
+    /// stayed true: a clone of a snapshot taken then found its restore only at the 10 s
+    /// backstop.
+    ///
+    /// RED BEFORE THE FIX: with the idle wait on `wait_for_error` alone this timed out.
+    #[tokio::test]
+    async fn a_connection_the_host_closed_is_lost_without_a_reset() {
+        let (stream, host) = pair();
+        drop(host);
+        let lost =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connection_lost(&stream))
+                .await
+                .expect("the idle wait never noticed the host's close");
+        assert_eq!(lost, Lost::PeerClosed);
+    }
+
+    /// A live connection is not lost, and neither is one the host wrote to: its bytes are
+    /// read and dropped, and the close after them is still seen.
+    #[tokio::test]
+    async fn a_live_connection_is_kept_whatever_the_host_sends() {
+        use std::io::Write;
+        let (stream, mut host) = pair();
+        let idle = std::time::Duration::from_millis(100);
+        assert!(tokio::time::timeout(idle, connection_lost(&stream))
+            .await
+            .is_err());
+        host.write_all(b"unexpected").unwrap();
+        assert!(tokio::time::timeout(idle, connection_lost(&stream))
+            .await
+            .is_err());
+        drop(host);
+        let lost =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connection_lost(&stream))
+                .await
+                .expect("the close after the host's bytes was missed");
+        assert_eq!(lost, Lost::PeerClosed);
+    }
+
+    /// Every way the idle wait loses the connection drops the stream and goes round, so
+    /// the top of the loop clears `armed` (the invariant on `ResetWatch`).
+    #[test]
+    fn a_lost_idle_connection_drops_the_stream_whichever_way_it_was_lost() {
+        let source = include_str!("output.rs");
+        let writer = &source[source.find("async fn output_writer(").unwrap()..];
+        let arm = &writer[writer
+            .find("lost = connection_lost(s) => {")
+            .expect("the idle wait")..];
+        let arm = &arm[..arm.find("            };\n").unwrap()];
+        let outcome = arm.find("match lost {").unwrap();
+        let dropped = arm
+            .rfind("stream = None;\n                    continue;")
+            .unwrap();
+        assert!(
+            outcome < dropped,
+            "the stream is dropped inside one outcome only"
+        );
+        assert!(writer.contains("publish_armed(&armed_tx, stream.is_some());"));
     }
 
     #[test]

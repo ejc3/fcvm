@@ -163,6 +163,16 @@ enum RestoreEpochWake {
 /// (`ResetWatch::armed_rx`), a restore resets it and wakes this schedule, so the fetch backs
 /// off to [`Self::ARMED_POLL`]. An idle guest polled MMDS every 50 ms before, 20 local HTTP
 /// requests a second through virtio-net and the VMM for the guest's whole life.
+///
+/// A reset wakes the watcher for one fetch and changes no interval. The host binds the
+/// restore-only vsock listener, with the new epoch in its document, before it resumes the
+/// guest, and a guest restored behind the snapshot boundary reads that document
+/// (`RestoreMetadataControl::select_transport`), so the first fetch after the reset finds
+/// the epoch. The reset used to open a one-second window of fetches 2 ms apart, meant for
+/// an epoch that reached MMDS only after the resume. The window closed when a restore was
+/// dispatched inside it, so a reset the watcher read after it had dispatched that restore
+/// (the poll, or the connection edge, had woken it first) and the reset on a resumed
+/// snapshot source each ran the full second: about 500 token and document requests.
 struct RestoreEpochSchedule {
     reset_rx: tokio::sync::watch::Receiver<u64>,
     reset_armed: bool,
@@ -172,12 +182,9 @@ struct RestoreEpochSchedule {
     /// once the writer has gone.
     armed_interval: Option<Duration>,
     poll_interval: Duration,
-    fast_interval: Duration,
-    fast_until: Option<tokio::time::Instant>,
 }
 
 impl RestoreEpochSchedule {
-    const FAST_WINDOW: Duration = Duration::from_secs(1);
     /// The backstop poll while a transport reset would wake the watcher.
     const ARMED_POLL: Duration = Duration::from_secs(10);
 
@@ -185,12 +192,6 @@ impl RestoreEpochSchedule {
         let poll_interval = match transport {
             crate::bootplan::Transport::Mmds => Duration::from_millis(50),
             crate::bootplan::Transport::Vsock => Duration::from_millis(250),
-        };
-        // Post-reset fast cadence: MMDS gets are cheap local HTTP; vsock polls
-        // reopen the boot-plan connection, so keep them a bit gentler.
-        let fast_interval = match transport {
-            crate::bootplan::Transport::Mmds => Duration::from_millis(2),
-            crate::bootplan::Transport::Vsock => Duration::from_millis(10),
         };
         // Firecracker queues the transport reset in the device state it saves, so every
         // restore of it raises one. Cloud Hypervisor keeps its poll as it was.
@@ -204,34 +205,21 @@ impl RestoreEpochSchedule {
             armed_rx: reset.armed_rx,
             armed_interval,
             poll_interval,
-            fast_interval,
-            fast_until: None,
         }
     }
 
     async fn wait(&mut self) -> RestoreEpochWake {
         let armed = *self.armed_rx.borrow_and_update();
-        let interval = match self.fast_until {
-            Some(t) if tokio::time::Instant::now() < t => self.fast_interval,
-            _ => {
-                self.fast_until = None;
-                match self.armed_interval {
-                    Some(armed_interval) if armed => armed_interval,
-                    _ => self.poll_interval,
-                }
-            }
+        let interval = match self.armed_interval {
+            Some(armed_interval) if armed => armed_interval,
+            _ => self.poll_interval,
         };
 
         tokio::select! {
             _ = sleep(interval) => RestoreEpochWake::PollInterval,
             changed = self.reset_rx.changed(), if self.reset_armed => {
                 match changed {
-                    Ok(()) => {
-                        self.fast_until = Some(
-                            tokio::time::Instant::now() + Self::FAST_WINDOW
-                        );
-                        RestoreEpochWake::TransportReset
-                    }
+                    Ok(()) => RestoreEpochWake::TransportReset,
                     Err(_) => {
                         self.reset_armed = false;
                         RestoreEpochWake::ResetSenderClosed
@@ -247,10 +235,6 @@ impl RestoreEpochSchedule {
             }
         }
     }
-
-    fn clear_fast_window(&mut self) {
-        self.fast_until = None;
-    }
 }
 
 /// Watch for restore-epoch changes and handle clone restore, over either transport.
@@ -264,11 +248,13 @@ impl RestoreEpochSchedule {
 /// (surfaced by the output writer as `vsock_reset.reset_rx`): a snapshot freezes this
 /// loop mid-`sleep`, so with a poll alone a restored clone waits out the frozen sleep's
 /// remainder before even looking for its epoch. On a reset event the loop fetches
-/// immediately and polls at a tight cadence for a bounded window — the host PUTs the
-/// epoch right after resume, so this races only a few ms ahead of it. While the output
+/// once, at once: the restore document is on the host's vsock listener before the guest
+/// resumes ([`RestoreEpochSchedule`]). While the output
 /// connection that would see the reset is established, the steady poll is only a
 /// backstop ([`RestoreEpochSchedule::ARMED_POLL`]); while it is not (TTY VMs, a writer
 /// that has dropped its connection, Cloud Hypervisor) the loop polls as it always did.
+/// The writer drops its connection on the reset it reports, so a fetch that fails right
+/// after a reset is followed by the 50 ms poll until the restore has reconnected it.
 pub async fn watch_restore_epoch(
     signals: crate::restore::RestoreSignals,
     transport: crate::bootplan::Transport,
@@ -285,7 +271,7 @@ pub async fn watch_restore_epoch(
 
     loop {
         if schedule.wait().await == RestoreEpochWake::TransportReset {
-            eprintln!("[fc-agent] vsock transport reset observed; fast-polling restore-epoch");
+            eprintln!("[fc-agent] vsock transport reset observed; reading the restore document");
         }
 
         let boundary_is_armed = crate::snapshot_network::boundary_is_armed();
@@ -345,11 +331,10 @@ pub async fn watch_restore_epoch(
                     last_epoch = Some(current.clone());
                     apply_restore_epoch(current, &signals, egress_gen_at_last_stable, &metadata)
                         .await;
-                    // Update the stable generation and stop fast-polling only
-                    // after the whole sequence succeeded.
+                    // Update the stable generation only after the whole sequence
+                    // succeeded.
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    schedule.clear_fast_window();
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
@@ -361,11 +346,10 @@ pub async fn watch_restore_epoch(
                     last_epoch = Some(current.clone());
                     apply_restore_epoch(current, &signals, egress_gen_at_last_stable, &metadata)
                         .await;
-                    // Update the stable generation and stop fast-polling only
-                    // after the whole sequence succeeded.
+                    // Update the stable generation only after the whole sequence
+                    // succeeded.
                     egress_gen_at_last_stable =
                         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
-                    schedule.clear_fast_window();
                 }
                 _ => {}
             }
@@ -592,7 +576,6 @@ mod tests {
         // A restore's transport reset still wakes it at once.
         reset_tx.send(1).unwrap();
         assert_eq!(wait.await, RestoreEpochWake::TransportReset);
-        schedule.clear_fast_window();
 
         // The writer dropping its connection wakes it too, and from then the 50 ms poll
         // is back: nothing would report the next reset.
@@ -609,6 +592,58 @@ mod tests {
             tokio::time::Instant::now() - before,
             Duration::from_millis(50)
         );
+    }
+
+    /// A transport reset is one wakeup. The watcher that takes it after its restore was
+    /// already dispatched (the poll or the connection edge woke it first), and the one on
+    /// a resumed snapshot source, have no epoch to find, and each used to fetch every 2 ms
+    /// for the next second.
+    ///
+    /// RED BEFORE THE FIX: the wait after the reset returned PollInterval 2 ms later.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_reset_is_one_fetch_and_no_fast_poll() {
+        for transport in [
+            crate::bootplan::Transport::Mmds,
+            crate::bootplan::Transport::Vsock,
+        ] {
+            let steady = match transport {
+                crate::bootplan::Transport::Mmds => Duration::from_millis(50),
+                crate::bootplan::Transport::Vsock => Duration::from_millis(250),
+            };
+            let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+            let mut schedule = RestoreEpochSchedule::new(transport, unarmed(reset_rx));
+            reset_tx.send(1).unwrap();
+            assert_eq!(schedule.wait().await, RestoreEpochWake::TransportReset);
+
+            let before = tokio::time::Instant::now();
+            let mut wait = Box::pin(schedule.wait());
+            assert_pending_once(wait.as_mut()).await;
+            tokio::time::advance(steady - Duration::from_millis(1)).await;
+            assert_pending_once(wait.as_mut()).await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(wait.await, RestoreEpochWake::PollInterval);
+            assert_eq!(tokio::time::Instant::now() - before, steady);
+        }
+    }
+
+    /// With the output connection established, a reset leaves the 10 s backstop in place.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_reset_leaves_the_armed_backstop() {
+        let (reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let (_armed_tx, armed_rx) = tokio::sync::watch::channel(true);
+        let mut schedule = RestoreEpochSchedule::new(
+            crate::bootplan::Transport::Mmds,
+            crate::output::ResetWatch { reset_rx, armed_rx },
+        );
+        reset_tx.send(1).unwrap();
+        assert_eq!(schedule.wait().await, RestoreEpochWake::TransportReset);
+
+        let mut wait = Box::pin(schedule.wait());
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(RestoreEpochSchedule::ARMED_POLL - Duration::from_millis(1)).await;
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(wait.await, RestoreEpochWake::PollInterval);
     }
 
     #[tokio::test(start_paused = true)]
