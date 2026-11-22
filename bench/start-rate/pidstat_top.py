@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Sum `pidstat -u -h` CPU by command over a run: which processes the host's cores went to.
 
-Usage: pidstat_top.py RUN_DIR [N]
+Usage: pidstat_top.py RUN_DIR [N] [start|hold]
+
+With `start`, only samples from the run's start to its last healthy clone; with `hold`, only the
+hold phase after it (phases.json; pidstat prints local clock time to the second).
 Prints, per command, total CPU-seconds, its share of all CPU used, and the peak cores in one
 sample. pidstat -h rows: Time UID PID %usr %system %guest %wait %CPU CPU Command.
 """
@@ -20,6 +23,16 @@ def main():
         import json
 
         interval = float(json.loads(hj.read_text()).get("config", {}).get("pidstat_interval", 2))
+    window = sys.argv[3] if len(sys.argv) > 3 else None
+    lo = hi = None
+    if window:
+        import json
+        import time as _t
+
+        ph = json.loads((d / "phases.json").read_text())
+        a, b = {"start": ("t0_wall", "all_done_wall"), "hold": ("all_done_wall", "hold_end_wall")}[window]
+        lo = _t.strftime("%H:%M:%S", _t.localtime(ph[a]))
+        hi = _t.strftime("%H:%M:%S", _t.localtime(ph[b]))
     tot = defaultdict(float)
     sysv = defaultdict(float)
     per_sample = defaultdict(lambda: defaultdict(float))
@@ -30,6 +43,8 @@ def main():
         try:
             t, usr, syst, cpu = f[0], float(f[3]), float(f[4]), float(f[7])
         except ValueError:
+            continue
+        if lo is not None and not (lo <= t <= hi):
             continue
         cmd = f[9]
         tot[cmd] += cpu / 100 * interval

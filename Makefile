@@ -1733,7 +1733,7 @@ bench-start-rate-prep: build setup-default
 bench-start-rate-run:
 	@test -n "$(PREP)" -a -n "$(OUT)" -a -n "$(COUNT)" -a -n "$(CONCURRENCY)" || { echo "PREP= OUT= COUNT= CONCURRENCY= are required"; exit 2; }
 	$$(jq -e .sudo $(PREP) >/dev/null && echo sudo -E) $(START_RATE) run --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --count $(COUNT) \
-		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180)
+		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0)
 
 bench-start-rate-teardown:
 	@test -n "$(PREP)" || { echo "PREP= is required"; exit 2; }

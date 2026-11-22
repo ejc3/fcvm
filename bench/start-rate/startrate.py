@@ -284,7 +284,7 @@ def cmd_run(a):
         "count": a.count, "concurrency": a.concurrency, "backend": "uffd" if prep["serve_pid"] else "file",
         "network": prep["network"], "cpu": prep["cpu"], "mem_mib": prep["mem_mib"], "image": prep["image"],
         "snapshot": prep["snapshot"], "clone_timeout_s": a.timeout, "rust_log": a.rust_log,
-        "launchers": a.launchers, "pidstat_interval": a.pidstat_interval,
+        "launchers": a.launchers, "pidstat_interval": a.pidstat_interval, "hold_s": a.hold,
     }
     (out / "host.json").write_text(json.dumps({**facts, "config": cfg}, indent=2) + "\n")
     print(json.dumps(cfg))
@@ -448,6 +448,11 @@ def cmd_run(a):
         "alive_at_end": alive,
     }
     print(json.dumps(verify))
+    if a.hold:
+        # Keep every clone up so host.tsv and pidstat record what the idle clones cost.
+        print(f"holding {alive} clones for {a.hold}s")
+        time.sleep(a.hold)
+    t_hold_end = now_ns()
 
     # Teardown: SIGTERM every clone, then wait.
     td0 = now_ns()
@@ -484,6 +489,11 @@ def cmd_run(a):
                 "spawn_to_healthy_ms": (c.t_healthy - c.spawn_ns) / 1e6 if c.t_healthy else None,
                 "marks_ms": c.marks, "error": c.error, "exit": c.exit,
             }) + "\n")
+    (out / "phases.json").write_text(json.dumps({
+        "t0_mono_ns": t0, "all_done_mono_ns": t_all, "hold_end_mono_ns": t_hold_end, "teardown_end_mono_ns": now_ns(),
+        "t0_wall": t0_wall, "all_done_wall": t0_wall + (t_all - t0) / 1e9,
+        "hold_end_wall": t0_wall + (t_hold_end - t0) / 1e9,
+    }) + "\n")
     summary = summarize(out, verify=verify, teardown_s=teardown_s, t0_wall=t0_wall)
     print_summary(summary)
     bad = (
@@ -626,6 +636,7 @@ def main():
     r.add_argument("--rust-log", default="fcvm=info,health-monitor=info")
     r.add_argument("--pidstat-interval", type=int, default=2)
     r.add_argument("--fail-fast", action="store_true")
+    r.add_argument("--hold", type=float, default=0, help="seconds to keep the clones up after the last is healthy")
     r.set_defaults(fn=cmd_run)
     t = sub.add_parser("teardown")
     t.add_argument("--prep", required=True)
