@@ -24,13 +24,13 @@ pub struct DriveArgs {
     #[arg(long, default_value_t = 100)]
     pub count: usize,
     /// Most ops in flight at once.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, value_parser = concurrency_in_range)]
     pub concurrency: usize,
     /// Instances of the piece made and held before the timed phase.
     #[arg(long, default_value_t = 0)]
     pub alive: usize,
     /// Concurrency for making the held and prepared instances (untimed).
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, value_parser = concurrency_in_range)]
     pub prep_concurrency: usize,
     /// Results directory (created; must not exist).
     #[arg(long)]
@@ -58,6 +58,15 @@ pub struct DriveArgs {
     pub shared_cgroup: bool,
 }
 
+/// A concurrency from 1 to 100,000: zero would run nothing (the semaphore was clamped to one
+/// while the summary said zero), and the semaphore refuses more than `MAX_PERMITS`.
+fn concurrency_in_range(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(n) if (1..=100_000).contains(&n) => Ok(n),
+        _ => Err(format!("'{text}' is not a concurrency from 1 to 100000")),
+    }
+}
+
 struct Inst {
     child: Child,
     stdin: ChildStdin,
@@ -67,7 +76,8 @@ struct Inst {
 #[derive(Default, Clone)]
 struct Counters {
     at: Option<Instant>,
-    cgroup_usec: u64,
+    /// None when the run has no cgroup of its own (`--shared-cgroup`).
+    cgroup_usec: Option<u64>,
     busy_ticks: u64,
     ctxt: u64,
     irqs: BTreeMap<String, u64>,
@@ -80,12 +90,13 @@ fn read_counters(cgroup: &Option<PathBuf>) -> Result<Counters> {
     };
     if let Some(dir) = cgroup {
         let stat = std::fs::read_to_string(dir.join("cpu.stat"))?;
-        c.cgroup_usec = stat
-            .lines()
-            .find_map(|l| l.strip_prefix("usage_usec "))
-            .context("cpu.stat has no usage_usec")?
-            .trim()
-            .parse()?;
+        c.cgroup_usec = Some(
+            stat.lines()
+                .find_map(|l| l.strip_prefix("usage_usec "))
+                .context("cpu.stat has no usage_usec")?
+                .trim()
+                .parse()?,
+        );
     }
     (c.busy_ticks, c.ctxt) = parse_stat(&std::fs::read_to_string("/proc/stat")?)?;
     c.irqs = parse_ipis(&std::fs::read_to_string("/proc/interrupts")?);
@@ -145,7 +156,10 @@ fn delta(a: &Counters, b: &Counters, per: f64) -> Value {
         .collect();
     json!({
         "secs": secs,
-        "cgroup_cpu_s": (b.cgroup_usec - a.cgroup_usec) as f64 / 1e6 / per,
+        "cgroup_cpu_s": match (a.cgroup_usec, b.cgroup_usec) {
+            (Some(a), Some(b)) => json!((b - a) as f64 / 1e6 / per),
+            _ => Value::Null,
+        },
         "host_busy_cpu_s": (b.busy_ticks - a.busy_ticks) as f64 / ticks_per_sec() / per,
         "ctxt": (b.ctxt - a.ctxt) as f64 / per,
         "ipi_total": irqs.values().sum::<f64>(),
@@ -194,7 +208,7 @@ fn piece_argv(p: &PieceArgs) -> Vec<String> {
     v
 }
 
-async fn spawn(argv: &[String], log: &std::fs::File) -> Result<Inst> {
+fn spawn(argv: &[String], log: &std::fs::File) -> Result<Inst> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(argv).env(
         crate::pieces::DRIVER_PID_ENV,
@@ -270,13 +284,23 @@ async fn make(
     argv: &Arc<Vec<String>>,
     log: &Arc<std::fs::File>,
 ) -> Result<Vec<Inst>> {
-    let sem = Arc::new(Semaphore::new(conc.max(1)));
+    let (argv, log) = (argv.clone(), log.clone());
+    make_with(n, conc, run, Arc::new(move || spawn(&argv, &log))).await
+}
+
+type Spawner = Arc<dyn Fn() -> Result<Inst> + Send + Sync>;
+
+/// [`make`] with the instance process given by `spawner`. When any instance fails, every
+/// other one that was made is told to tear down and waited for before the error returns:
+/// the driver exiting at once would SIGKILL them (their parent-death signal) mid-teardown.
+async fn make_with(n: usize, conc: usize, run: bool, spawner: Spawner) -> Result<Vec<Inst>> {
+    let sem = Arc::new(Semaphore::new(conc));
     let mut set = JoinSet::new();
     for _ in 0..n {
-        let (sem, argv, log) = (sem.clone(), argv.clone(), log.clone());
+        let (sem, spawner) = (sem.clone(), spawner.clone());
         set.spawn(async move {
             let _permit = sem.acquire_owned().await?;
-            let mut inst = spawn(&argv, &log).await?;
+            let mut inst = spawner()?;
             let made = async {
                 inst.expect("ready").await?;
                 if run {
@@ -294,10 +318,29 @@ async fn make(
         });
     }
     let mut out = Vec::with_capacity(n);
+    let mut first_error = None;
     while let Some(r) = set.join_next().await {
-        out.push(r??);
+        match r.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(inst) => out.push(inst),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        release(out).await;
+        return Err(error);
     }
     Ok(out)
+}
+
+/// Tear `insts` down and wait for them (a failed run's cleanup).
+async fn release(insts: Vec<Inst>) {
+    for r in phase(insts, 64, "exit", "torn").await {
+        if let Some(error) = r.error {
+            eprintln!("an instance did not tear down cleanly: {error}");
+        }
+    }
 }
 
 struct OpResult {
@@ -314,7 +357,7 @@ async fn phase(
     word: &'static str,
     reply: &'static str,
 ) -> Vec<OpResult> {
-    let sem = Arc::new(Semaphore::new(conc.max(1)));
+    let sem = Arc::new(Semaphore::new(conc));
     let mut set = JoinSet::new();
     for mut inst in insts {
         let sem = sem.clone();
@@ -364,7 +407,7 @@ async fn cold_phase(
     argv: &Arc<Vec<String>>,
     log: &Arc<std::fs::File>,
 ) -> Vec<OpResult> {
-    let sem = Arc::new(Semaphore::new(conc.max(1)));
+    let sem = Arc::new(Semaphore::new(conc));
     let mut set = JoinSet::new();
     for _ in 0..n {
         let (sem, argv, log) = (sem.clone(), argv.clone(), log.clone());
@@ -373,7 +416,7 @@ async fn cold_phase(
             let t = Instant::now();
             let mut made = None;
             let r = async {
-                let inst = made.insert(spawn(&argv, &log).await?);
+                let inst = made.insert(spawn(&argv, &log)?);
                 inst.expect("ready").await?;
                 inst.send("go").await?;
                 inst.expect("done").await
@@ -448,9 +491,23 @@ fn summarize(results: &[OpResult], wall: f64, a: &Counters, b: &Counters, idle: 
         "op_ms": dist(ok.iter().filter_map(|r| r.child["ms"].as_f64()).collect()),
         "stages_ms": stages.into_iter().map(|(k, v)| (k, dist(v))).collect::<BTreeMap<_, _>>(),
         "per_op": per_op,
-        "cgroup_cpu_s_per_op_net": per_op["cgroup_cpu_s"].as_f64().unwrap() - idle_cg * wall / n,
+        "cgroup_cpu_s_per_op_net": per_op["cgroup_cpu_s"].as_f64().map(|cg| cg - idle_cg * wall / n),
         "host_cpu_s_per_op_net": per_op["host_busy_cpu_s"].as_f64().unwrap() - idle_host * wall / n,
     })
+}
+
+impl Drop for Perf {
+    /// A collector the run did not stop (it failed before the phase ended) is stopped and
+    /// reaped here, so it does not keep recording after the cell.
+    fn drop(&mut self) {
+        if let Some((mut child, _)) = self.0.take() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGINT,
+            );
+            let _ = child.wait();
+        }
+    }
 }
 
 /// A perf collector over a phase. Its stderr goes to `err`; a perf that exits on its own
@@ -469,6 +526,19 @@ impl Perf {
             .stderr(Stdio::from(std::fs::File::create(err)?));
         // Its own process group: SIGINT reaches perf through sudo without reaching us.
         c.process_group(0);
+        // SIGINT is how it is stopped, so it must not inherit the signal ignored, as a
+        // command started from a background job does.
+        // SAFETY: the hook only calls sigaction, which is async-signal-safe.
+        unsafe {
+            c.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_DFL;
+                if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         Ok(Perf(Some((c.spawn()?, err.to_path_buf()))))
     }
     fn stop(&mut self) -> Result<()> {
@@ -483,7 +553,12 @@ impl Perf {
             );
         }
         let status = child.wait()?;
-        if exited_early.is_some() || !status.success() {
+        // perf exits 0 on SIGINT, and `sudo` reports a child the signal ended by ending
+        // itself with the same signal: both are a collector that was stopped as asked.
+        let stopped_as_asked = exited_early.is_none()
+            && (status.success()
+                || std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGINT));
+        if !stopped_as_asked {
             bail!(
                 "the perf collector {} ({status}): {}",
                 if exited_early.is_some() {
@@ -555,7 +630,13 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     let prepared = if args.cold {
         Vec::new()
     } else {
-        make(args.count, args.prep_concurrency, false, &argv, &log).await?
+        match make(args.count, args.prep_concurrency, false, &argv, &log).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                release(held).await;
+                return Err(error);
+            }
+        }
     };
     let prep_s = t.elapsed().as_secs_f64();
 
@@ -720,6 +801,80 @@ mod tests {
         );
     }
 
+    /// When one instance fails to prepare, the others that were made are torn down and
+    /// waited for before the error returns, not left to be killed with the driver.
+    #[tokio::test]
+    async fn a_failed_make_tears_down_the_instances_it_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(std::fs::File::create(dir.path().join("log")).unwrap());
+        let torn = dir.path().to_path_buf();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawner: Spawner = Arc::new(move || {
+            let i = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cmd = std::process::Command::new("sh");
+            if i == 0 {
+                cmd.arg("-c").arg("echo 'error prepare: no disk'; exit 1");
+            } else {
+                cmd.arg("-c").arg(format!(
+                    "echo ready; read word; sleep 0.3; touch {}/torn-{i}; echo torn; exit 0",
+                    torn.display()
+                ));
+            }
+            spawn_command(cmd, &log)
+        });
+        let error = match make_with(3, 3, false, spawner).await {
+            Err(error) => error,
+            Ok(_) => panic!("one instance failed"),
+        };
+        assert!(format!("{error:#}").contains("no disk"), "{error:#}");
+        for i in 1..3 {
+            assert!(
+                dir.path().join(format!("torn-{i}")).exists(),
+                "instance {i} was not torn down"
+            );
+        }
+    }
+
+    /// Dropping a collector the run did not stop stops it: it does not keep recording.
+    #[test]
+    fn a_dropped_perf_collector_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let perf = Perf::start(
+            "python3",
+            &["-c".into(), "import time\ntime.sleep(60)".into()],
+            &dir.path().join("perf.err"),
+        )
+        .unwrap();
+        let pid = perf.0.as_ref().unwrap().0.id() as i32;
+        drop(perf);
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "the collector outlived its Perf"
+        );
+    }
+
+    #[test]
+    fn concurrency_is_from_1_to_100000() {
+        assert_eq!(concurrency_in_range("1"), Ok(1));
+        assert_eq!(concurrency_in_range("100000"), Ok(100_000));
+        assert!(concurrency_in_range("0").is_err());
+        assert!(concurrency_in_range("100001").is_err());
+        assert!(concurrency_in_range("x").is_err());
+    }
+
+    /// Without a cgroup of its own the run has no cgroup CPU, and says so with a null.
+    #[test]
+    fn a_run_without_its_own_cgroup_reports_no_cgroup_cpu() {
+        let read = |usec| Counters {
+            at: Some(Instant::now()),
+            cgroup_usec: usec,
+            ..Default::default()
+        };
+        assert!(delta(&read(None), &read(None), 1.0)["cgroup_cpu_s"].is_null());
+        let measured = delta(&read(Some(1_000_000)), &read(Some(3_000_000)), 2.0);
+        assert_eq!(measured["cgroup_cpu_s"].as_f64(), Some(1.0));
+    }
+
     /// A perf that cannot run fails the run with what it printed; one that runs until it is
     /// stopped and exits cleanly does not.
     #[test]
@@ -754,6 +909,13 @@ mod tests {
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         running.stop().unwrap();
+
+        // One that the SIGINT ends, as `sudo perf record` reports a stopped perf, is fine too.
+        let mut interrupted = Perf::start("sleep", &["60".into()], &err).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        interrupted
+            .stop()
+            .expect("a collector ended by the SIGINT that stops it was stopped as asked");
     }
 
     #[derive(clap::Parser)]
