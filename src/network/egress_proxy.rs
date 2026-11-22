@@ -471,6 +471,11 @@ async fn handle_stream(
         }
     };
 
+    // DATA frames from the guest are written to the destination as they arrive.
+    crate::network::relay_socket::set_relay_nodelay(
+        &tcp,
+        format_args!("egress proxy, destination socket"),
+    );
     activity.connected.store(true, Ordering::Relaxed);
     // Send OPEN_OK
     send_frame(&writer_tx, stream_id, FRAME_OPEN_OK, &[]).await;
@@ -503,6 +508,12 @@ async fn handle_stream(
         while let Some((frame_type, payload)) = stream_rx.recv().await {
             match frame_type {
                 FRAME_DATA => {
+                    let (payload, end) = crate::network::relay_socket::take_queued_data(
+                        payload,
+                        &mut stream_rx,
+                        FRAME_DATA,
+                        &[FRAME_CLOSE, FRAME_RST],
+                    );
                     // Pending before the write and sent after it, so a write the destination
                     // stops taking reads as pending, and the bytes it has read are counted
                     // by the time the write returns.
@@ -511,6 +522,9 @@ async fn handle_stream(
                         break;
                     }
                     up.end_write(payload.len());
+                    if end.is_some() {
+                        break;
+                    }
                 }
                 FRAME_CLOSE | FRAME_RST => break,
                 _ => {}
@@ -559,6 +573,49 @@ mod tests {
         let mut payload = vec![0u8; len];
         guest.read_exact(&mut payload).await.unwrap();
         (header[4], payload)
+    }
+
+    /// A request the guest sends in two DATA frames reaches the destination without waiting
+    /// for the destination to acknowledge the first: each frame is written to the
+    /// destination's socket as it arrives.
+    #[tokio::test]
+    async fn a_request_in_two_frames_reaches_the_destination_without_waiting_for_an_ack() {
+        use crate::network::relay_socket::two_part::*;
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = destination.local_addr().unwrap().port();
+        let (mut guest, host) = UnixStream::pair().unwrap();
+        let session = tokio::spawn(relay_mux_session(host, ActivityRegistry::default()));
+        let mut open = vec![AF_INET, 127, 0, 0, 1];
+        open.extend(port.to_be_bytes());
+        guest.write_all(&frame(9, FRAME_OPEN, &open)).await.unwrap();
+        let (mut server, _) = destination.accept().await.unwrap();
+        assert_eq!(read_frame(&mut guest).await.0, FRAME_OPEN_OK);
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&server);
+            let started = std::time::Instant::now();
+            guest
+                .write_all(&frame(9, FRAME_DATA, &[1u8; FIRST]))
+                .await
+                .unwrap();
+            server.read_exact(&mut buf[..FIRST]).await.unwrap();
+            guest
+                .write_all(&frame(9, FRAME_DATA, &[2u8; SECOND]))
+                .await
+                .unwrap();
+            server.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        drop(guest);
+        drop(server);
+        let _ = session.await;
+        let median = median(took);
+        assert!(
+            median < LIMIT,
+            "median {median:?} for a request in two frames"
+        );
     }
 
     /// A request the destination never answers is reported once, with the bytes written
