@@ -13,7 +13,7 @@ use crate::state::{truncate_id, HealthStatus, StateManager};
 /// Health check polling intervals.
 /// During startup, the interval adapts to match how long each check takes
 /// (minimum 100ms). Fast checks (reading the container-ready file) poll fast; slow
-/// checks (nsenter+curl ~1-3s) poll slower to avoid hammering.
+/// checks (an exec into the guest, a curl process) poll slower to avoid hammering.
 const HEALTH_POLL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_POLL_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
@@ -257,7 +257,7 @@ pub fn spawn_health_monitor_full(
 
             // Adaptive polling: once healthy use 10s. During startup, wait as
             // long as the check took (min 100ms) — fast checks poll fast, slow
-            // checks (nsenter+curl) poll slower to avoid hammering.
+            // checks poll slower to avoid hammering.
             if health_status == HealthStatus::Healthy {
                 if !is_healthy {
                     is_healthy = true;
@@ -853,8 +853,9 @@ async fn check_health_once(
                     let url_host = url.host_str();
                     let health_timeout = state.config.health_check_timeout.max(1);
 
-                    // Rootless mode with holder_pid: use nsenter to curl guest directly
-                    // This bypasses the complexity of pasta port forwarding
+                    // Rootless mode with holder_pid: connect to the guest directly, from a
+                    // socket the holder made in its namespace. This bypasses pasta's port
+                    // forwarding.
                     if let Some(holder_pid) = state.holder_pid {
                         // Extract guest IP without CIDR suffix
                         let guest_ip = net
@@ -862,9 +863,9 @@ async fn check_health_once(
                             .as_ref()
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("192.168.1.2");
-                        debug!(target: "health-monitor", holder_pid, guest_ip = %guest_ip, port, host = ?url_host, "HTTP health check via nsenter");
+                        debug!(target: "health-monitor", holder_pid, guest_ip = %guest_ip, port, host = ?url_host, "HTTP health check through the namespace holder");
 
-                        match check_http_health_nsenter(
+                        match check_http_health_holder(
                             holder_pid,
                             guest_ip,
                             port,
@@ -874,14 +875,10 @@ async fn check_health_once(
                         )
                         .await
                         {
-                            Ok(true) => {
+                            Ok(()) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
                                 HealthStatus::Healthy
-                            }
-                            Ok(false) => {
-                                warn!(target: "health-monitor", "health check returned false");
-                                HealthStatus::Unhealthy
                             }
                             Err(e) => {
                                 let should_log = match last_failure_log {
@@ -891,7 +888,7 @@ async fn check_health_once(
                                     }
                                 };
                                 if should_log {
-                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed (nsenter)");
+                                    warn!(target: "health-monitor", error = %format!("{e:#}"), "HTTP health check failed (holder)");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
@@ -1181,71 +1178,143 @@ pub async fn run_health_check_once(
     Ok(status)
 }
 
-/// Check if HTTP service is responding via nsenter into the network namespace (rootless mode)
+/// Check that the guest's HTTP service answers, from inside a rootless VM's namespace.
 ///
-/// For rootless VMs, we use nsenter to enter the network namespace and curl
-/// the guest directly. This bypasses the complexity of pasta port forwarding.
-///
-/// The holder_pid is the PID of the namespace holder process (sleep infinity).
-/// Public for the start-pieces bench (bench/start-rate/pieces), which runs it alone.
-pub async fn check_http_health_nsenter(
+/// The connection starts from a TCP socket the namespace holder made
+/// ([`crate::network::netns_agent`]), so it reaches the guest's address over the namespace's
+/// bridge with no process started. `holder_pid` names the holder this process started.
+pub async fn check_http_health_holder(
     holder_pid: u32,
     guest_ip: &str,
     port: u16,
     health_path: &str,
     host_header: Option<&str>,
     timeout_secs: u64,
-) -> Result<bool> {
-    let url = format!("http://{}:{}{}", guest_ip, port, health_path);
+) -> Result<()> {
+    let agent = crate::network::netns_agent::client(holder_pid).with_context(|| {
+        format!(
+            "this process holds no channel to the namespace holder (PID {holder_pid}); only \
+             the fcvm that started a rootless VM can probe it"
+        )
+    })?;
+    check_http_health_agent(
+        &agent,
+        guest_ip,
+        port,
+        health_path,
+        host_header,
+        timeout_secs,
+    )
+    .await
+}
 
+/// [`check_http_health_holder`] with the holder's channel in hand. Public for the
+/// start-pieces bench (bench/start-rate/pieces), which runs it alone.
+///
+/// Healthy is a 2xx or 3xx status with the whole response read inside `timeout_secs`, the
+/// same rule the routed and bridged probes get from `curl --max-time`. A redirect is not
+/// followed.
+pub async fn check_http_health_agent(
+    agent: &crate::network::netns_agent::Client,
+    guest_ip: &str,
+    port: u16,
+    health_path: &str,
+    host_header: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let target = format!("{guest_ip}:{port}");
+    let address: std::net::IpAddr = guest_ip
+        .parse()
+        .with_context(|| format!("the guest address {guest_ip} is not an IP address"))?;
     let start = Instant::now();
-
-    // Use nsenter to enter the namespace and curl the guest directly
-    // --preserve-credentials keeps UID/GID mapping
-    let nsenter_args = build_nsenter_curl_args(holder_pid, &url, host_header, timeout_secs);
-
-    let output = tokio::process::Command::new("nsenter")
-        .args(&nsenter_args)
-        .output()
-        .await
-        .context("failed to run nsenter curl")?;
-
-    let elapsed = start.elapsed();
-
-    if output.status.success() {
-        let status_code = String::from_utf8_lossy(&output.stdout);
-        let status_code = status_code.trim();
-
-        if status_code.starts_with('2') || status_code.starts_with('3') {
-            debug!(
-                target: "health-monitor",
-                holder_pid = holder_pid,
-                guest_ip = guest_ip,
-                port = port,
-                status = status_code,
-                elapsed_ms = elapsed.as_millis(),
-                "health check succeeded (nsenter)"
-            );
-            Ok(true)
-        } else {
-            anyhow::bail!(
-                "Health check failed with status {} via nsenter to {}:{} ({}ms)",
-                status_code,
-                guest_ip,
-                port,
-                elapsed.as_millis()
-            )
+    let probe = async {
+        let socket = agent.tcp_socket(&address).await?;
+        let stream = socket
+            .connect(std::net::SocketAddr::new(address, port))
+            .await
+            .context("connecting")?;
+        http_get_status(stream, &target, health_path, host_header).await
+    };
+    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), probe).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            anyhow::bail!("Health check of {target} from the namespace failed: {error:#}")
         }
+        Err(_) => anyhow::bail!(
+            "Health check of {target} from the namespace timed out after {timeout_secs}s"
+        ),
+    };
+    let elapsed = start.elapsed();
+    if status.is_success() || status.is_redirection() {
+        debug!(
+            target: "health-monitor",
+            guest_ip = guest_ip,
+            port = port,
+            status = status.as_u16(),
+            elapsed_ms = elapsed.as_millis(),
+            "health check succeeded (holder)"
+        );
+        Ok(())
     } else {
         anyhow::bail!(
-            "{}",
-            curl_probe_failure(
-                &format!("{}:{}", guest_ip, port),
-                "nsenter",
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stderr),
-            )
+            "Health check failed with status {} from the namespace to {target} ({}ms)",
+            status.as_u16(),
+            elapsed.as_millis()
         )
+    }
+}
+
+/// One `GET` of `path` over `stream`, with the response read to its end, and its status.
+/// `target` is the `host:port` the stream is connected to, sent as the Host header unless
+/// the health check URL named a virtual host.
+async fn http_get_status<S>(
+    stream: S,
+    target: &str,
+    path: &str,
+    host_header: Option<&str>,
+) -> Result<hyper::StatusCode>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use http_body_util::BodyExt;
+
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .context("starting HTTP")?;
+    let request = hyper::Request::get(path)
+        .header(hyper::header::HOST, host_header.unwrap_or(target))
+        .header(
+            hyper::header::USER_AGENT,
+            concat!("fcvm/", env!("CARGO_PKG_VERSION")),
+        )
+        .header(hyper::header::ACCEPT, "*/*")
+        .header(hyper::header::CONNECTION, "close")
+        .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+        .context("building the request")?;
+    let exchange = async {
+        let response = sender
+            .send_request(request)
+            .await
+            .context("sending the request")?;
+        let status = response.status();
+        // To the end, as curl reads it: a response that breaks off is not a healthy one.
+        let mut body = response.into_body();
+        while let Some(frame) = body.frame().await {
+            frame.context("reading the response")?;
+        }
+        Ok::<_, anyhow::Error>(status)
+    };
+    // The connection is what moves bytes; it runs beside the exchange and is dropped with it.
+    tokio::pin!(connection);
+    tokio::pin!(exchange);
+    tokio::select! {
+        status = &mut exchange => status,
+        closed = &mut connection => {
+            closed.context("the connection failed")?;
+            // The connection ended cleanly: the exchange has everything it will get.
+            exchange.await
+        }
     }
 }
 
@@ -1458,7 +1527,7 @@ fn bridged_probe_url(net: &crate::network::NetworkConfig, url: &url::Url) -> Res
 /// What a failed curl probe reports: what the probe command printed, and its exit status,
 /// which still says something when nothing was printed.
 ///
-/// The status belongs to the outermost command (`nsenter`, `ip netns exec` or `sudo`). It
+/// The status belongs to the outermost command (`ip netns exec` or `sudo`). It
 /// is curl's when curl ran, and the wrapper's own when the wrapper could not start curl, so
 /// the message does not call it curl's.
 fn curl_probe_failure(target: &str, via: &str, exit_code: Option<i32>, stderr: &str) -> String {
@@ -1517,26 +1586,6 @@ fn build_netns_curl_args(
         .iter()
         .map(|arg| arg.to_string())
         .collect();
-    args.extend(curl_probe_args(url, host_header, timeout_secs));
-    args
-}
-
-/// The rootless probe's arguments to `nsenter`: the holder's user and network namespaces in
-/// front of the shared curl. `--preserve-credentials` keeps the UID/GID mapping.
-fn build_nsenter_curl_args(
-    holder_pid: u32,
-    url: &str,
-    host_header: Option<&str>,
-    timeout_secs: u64,
-) -> Vec<String> {
-    let mut args = vec![
-        "-t".to_string(),
-        holder_pid.to_string(),
-        "-U".to_string(),
-        "-n".to_string(),
-        "--preserve-credentials".to_string(),
-        "--".to_string(),
-    ];
     args.extend(curl_probe_args(url, host_header, timeout_secs));
     args
 }
@@ -1896,19 +1945,152 @@ mod tests {
         );
     }
 
-    /// The rootless probe runs the shared curl in the holder's user and network namespaces.
-    #[test]
-    fn nsenter_probe_wraps_the_shared_curl() {
-        let args =
-            build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"), 5);
-        let (wrapper, curl) = args.split_at(6);
-        assert_eq!(
-            wrapper,
-            ["-t", "12345", "-U", "-n", "--preserve-credentials", "--"]
+    /// A namespace agent's serve loop on a thread, in this process's own namespaces, and a
+    /// one-connection HTTP server that answers with `response` and returns what it was sent.
+    async fn probe_fixture(
+        response: &'static [u8],
+    ) -> (
+        crate::network::netns_agent::Client,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (owner, agent) = crate::network::netns_agent::channel().unwrap();
+        std::thread::spawn(move || crate::network::netns_agent::serve(&agent));
+        let client = crate::network::netns_agent::Client::new(owner).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            stream.write_all(response).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (client, address, server)
+    }
+
+    async fn probe(
+        client: &crate::network::netns_agent::Client,
+        address: std::net::SocketAddr,
+        host: Option<&str>,
+    ) -> Result<()> {
+        check_http_health_agent(
+            client,
+            "127.0.0.1",
+            address.port(),
+            "/health?deep=1",
+            host,
+            2,
+        )
+        .await
+    }
+
+    /// The rootless probe is one GET from a socket the namespace agent made: the path and
+    /// query as given, the guest's own address as Host, and a 2xx answer is healthy.
+    #[tokio::test]
+    async fn the_holder_probe_gets_the_path_from_the_guest_address() {
+        let (client, address, server) =
+            probe_fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        probe(&client, address, None).await.unwrap();
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /health?deep=1 http/1.1\r\n"),
+            "{request}"
         );
-        assert_eq!(
-            curl,
-            curl_probe_args("http://10.0.2.100:80/health", Some("myapp.local"), 5)
+        assert!(
+            request.contains(&format!("\r\nhost: 127.0.0.1:{}\r\n", address.port())),
+            "{request}"
+        );
+    }
+
+    /// A health check URL with a hostname sends it as the Host header, for servers that
+    /// route by virtual host.
+    #[tokio::test]
+    async fn the_holder_probe_sends_the_urls_host() {
+        let (client, address, server) = probe_fixture(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+        probe(&client, address, Some("myapp.local")).await.unwrap();
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("\r\nhost: myapp.local\r\n"), "{request}");
+    }
+
+    /// A redirect is healthy and is not followed; a 5xx is not healthy and the error names
+    /// the status.
+    #[tokio::test]
+    async fn the_holder_probe_judges_by_status() {
+        let (client, address, _server) = probe_fixture(
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: http://192.0.2.1/\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        probe(&client, address, None).await.unwrap();
+
+        let (client, address, _server) =
+            probe_fixture(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
+        let error = probe(&client, address, None).await.unwrap_err();
+        assert!(format!("{error:#}").contains("status 503"), "{error:#}");
+    }
+
+    /// A response that ends before its declared length is a failed probe, as it is for
+    /// curl (`--max-time` aside, exit 18).
+    #[tokio::test]
+    async fn the_holder_probe_fails_on_a_response_cut_short() {
+        let (client, address, _server) =
+            probe_fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort").await;
+        let error = probe(&client, address, None).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading the response"),
+            "{error:#}"
+        );
+    }
+
+    /// Nothing listening is a refused connection, reported with the target.
+    #[tokio::test]
+    async fn the_holder_probe_reports_a_refused_connection() {
+        let (client, address, server) = probe_fixture(b"").await;
+        server.abort();
+        let _ = server.await;
+        let error = probe(&client, address, None).await.unwrap_err();
+        let said = format!("{error:#}");
+        assert!(
+            said.contains(&format!("127.0.0.1:{}", address.port())) && said.contains("connecting"),
+            "{said}"
+        );
+    }
+
+    /// A server that accepts and never answers runs into the probe's own deadline.
+    #[tokio::test]
+    async fn the_holder_probe_times_out_on_a_silent_server() {
+        let (owner, agent) = crate::network::netns_agent::channel().unwrap();
+        std::thread::spawn(move || crate::network::netns_agent::serve(&agent));
+        let client = crate::network::netns_agent::Client::new(owner).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = check_http_health_agent(&client, "127.0.0.1", port, "/", None, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timed out after 1s"),
+            "{error:#}"
+        );
+        drop(listener);
+    }
+
+    /// A probe of a holder this process did not start says so; it does not fall back to
+    /// another way in.
+    #[tokio::test]
+    async fn a_holder_this_process_did_not_start_cannot_be_probed() {
+        let error = check_http_health_holder(u32::MAX, "10.0.2.100", 80, "/", None, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("holds no channel"),
+            "{error:#}"
         );
     }
 
@@ -1953,26 +2135,27 @@ mod tests {
     fn a_failed_curl_probe_reports_the_commands_output_and_exit_status() {
         let said = curl_probe_failure(
             "10.0.2.100:80",
-            "nsenter",
+            "netns fcvm-vm-abc12",
             Some(7),
             "curl: (7) Failed to connect to 10.0.2.100 port 80 after 0 ms: Couldn't connect to server\n",
         );
         assert_eq!(
             said,
-            "Health check of 10.0.2.100:80 via nsenter failed: probe command exit 7: curl: (7) \
-             Failed to connect to 10.0.2.100 port 80 after 0 ms: Couldn't connect to server"
+            "Health check of 10.0.2.100:80 via netns fcvm-vm-abc12 failed: probe command exit 7: \
+             curl: (7) Failed to connect to 10.0.2.100 port 80 after 0 ms: Couldn't connect to \
+             server"
         );
 
         let wrapper = curl_probe_failure(
             "10.0.2.100:80",
-            "nsenter",
+            "netns fcvm-vm-abc12",
             Some(1),
-            "nsenter: cannot open /proc/12345/ns/user: No such file or directory\n",
+            "Cannot open network namespace \"fcvm-vm-abc12\": No such file or directory\n",
         );
         assert_eq!(
             wrapper,
-            "Health check of 10.0.2.100:80 via nsenter failed: probe command exit 1: nsenter: \
-             cannot open /proc/12345/ns/user: No such file or directory"
+            "Health check of 10.0.2.100:80 via netns fcvm-vm-abc12 failed: probe command exit \
+             1: Cannot open network namespace \"fcvm-vm-abc12\": No such file or directory"
         );
 
         let silent = curl_probe_failure("10.0.2.100:80", "netns fcvm-vm-abc12", Some(28), " \n");
@@ -1982,7 +2165,7 @@ mod tests {
              28, and it printed nothing"
         );
 
-        let killed = curl_probe_failure("10.0.2.100:80", "nsenter", None, "");
+        let killed = curl_probe_failure("10.0.2.100:80", "netns fcvm-vm-abc12", None, "");
         assert!(killed.contains("killed by a signal"), "{killed}");
     }
 

@@ -309,30 +309,9 @@ fn write_id_map_with_invoker(
 /// Without that check, a file the container creates as one of its ids 1-65535 would be
 /// owned on the host by whichever user those files give 100000-165534.
 async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
     let pid_s = pid.to_string();
-
-    // Wait for unshare(2) to create the new user namespace.
-    // The namespace exists once /proc/PID/ns/user has a different inode than ours.
-    let self_ino = std::fs::metadata("/proc/self/ns/user")
-        .context("reading own user namespace inode")?
-        .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if std::fs::metadata(format!("/proc/{pid}/ns/user"))
-            .map(|m| m.ino() != self_ino)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        if std::time::Instant::now() >= ns_deadline {
-            anyhow::bail!("timed out waiting for user namespace (PID {pid})");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
 
     // Only a root run has a sudo invoker (`sudo_invoker` is None otherwise).
     let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
@@ -411,125 +390,119 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One attempt at a namespace holder: the agent process, its PID, and this process's end of
+/// its channel once the agent has said it is ready.
+async fn start_namespace_agent(
+    executable: &Path,
+    deadline: tokio::time::Instant,
+    attempt: u32,
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    use crate::network::netns_agent;
+    use std::os::fd::AsRawFd;
+
+    let (owner_end, agent_end) = netns_agent::channel().context("creating the agent channel")?;
+    let agent_fd = agent_end.as_raw_fd();
+    let mut cmd = tokio::process::Command::new(executable);
+    cmd.arg(netns_agent::SUBCOMMAND)
+        .arg(agent_fd.to_string())
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
+    crate::utils::own_process_group(&mut cmd);
+    // The agent's end of the channel stays open across the exec, in the child alone: the
+    // flag is cleared after the fork, so no other child this process starts inherits it.
+    // The agent arms its own parent-death signal once it has unshared (`netns_agent::run`).
+    // SAFETY: fcntl is async-signal-safe and the closure captures one integer.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(agent_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning the namespace agent (attempt {attempt})"))?;
+    // Only the agent holds its end now, so its exit reads as end-of-file on ours.
+    drop(agent_end);
+    let holder_pid = child.id().context("getting holder process PID")?;
+    // Its stderr from the first instant: a holder that dies later is
+    // reported with what it printed (#852).
+    crate::companion::register(
+        &mut child,
+        |line| tracing::warn!(target: "fcvm::holder", "{}", line),
+    );
+    if attempt > 1 {
+        info!(holder_pid, attempt, "namespace holder started (retry)");
+    } else {
+        info!(holder_pid, "namespace holder started");
+    }
+
+    let start = async {
+        let client =
+            netns_agent::Client::new(owner_end).context("registering the agent channel")?;
+        client.unshared().await?;
+        // The agent is in its new user namespace and waits: the maps can be written.
+        setup_namespace_mappings(holder_pid)
+            .await
+            .context("setting up namespace mappings")?;
+        client.mapped().await?;
+        Ok::<_, anyhow::Error>(client)
+    };
+    let started = match tokio::time::timeout_at(deadline, start).await {
+        Ok(Ok(client)) => {
+            netns_agent::register(holder_pid, std::sync::Arc::new(client));
+            return Ok((child, holder_pid));
+        }
+        Ok(Err(error)) => error,
+        Err(_) => anyhow::anyhow!(
+            "namespace not ready within {HOLDER_RETRY_TIMEOUT:?} (holder PID {holder_pid}; \
+             likely CPU scheduling pressure with many concurrent VMs)"
+        ),
+    };
+    // The channel is closed by now (`start` owned it), which is the agent's order to exit;
+    // the kill covers an agent that is not reading it.
+    let _ = child.start_kill();
+    let status = child.wait().await;
+    let report =
+        crate::companion::describe_registered("namespace holder", Some(holder_pid), status).await;
+    Err(started.context(report))
+}
+
 /// Spawn a namespace holder process and wait for it to be ready.
 ///
-/// Spawns `unshare --user --net -- sleep infinity`, writes UID/GID mappings
-/// (extended if possible, single otherwise), and waits for nsenter to work.
+/// The holder is `fcvm __netns-agent` ([`crate::network::netns_agent`]): it unshares its
+/// user and network namespaces and says so, this process writes the UID/GID mappings
+/// (extended if possible, single otherwise), and the agent confirms it is ready. Nothing is
+/// polled. This process's end of the agent's channel is registered under the holder's PID
+/// (`netns_agent::client`).
 ///
-/// Key design: gives the first holder the FULL retry deadline. Only spawns a new
-/// holder if the current one dies. Under heavy load, mapping setup may be slow
-/// due to CPU scheduling pressure — killing and respawning wastes time since
-/// the new holder faces the same pressure.
-pub async fn spawn_namespace_holder(
-    holder_cmd: &[String],
-) -> anyhow::Result<(tokio::process::Child, u32)> {
-    let deadline = std::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
+/// A holder that fails before it is ready is replaced, every [`HOLDER_RETRY_INTERVAL`],
+/// until [`HOLDER_RETRY_TIMEOUT`] has passed since the first attempt.
+pub async fn spawn_namespace_holder() -> anyhow::Result<(tokio::process::Child, u32)> {
+    let executable = crate::network::netns_agent::executable()?;
+    let deadline = tokio::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
     let mut attempt = 0u32;
-
     loop {
         attempt += 1;
-
-        let mut cmd = tokio::process::Command::new(&holder_cmd[0]);
-        cmd.args(&holder_cmd[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
-        crate::utils::own_process_group(&mut cmd);
-
-        // Kill holder if parent (fcvm) dies. Without this, holders orphan to init
-        // and accumulate when fcvm is SIGKILL'd or crashes.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        let error = match start_namespace_agent(&executable, deadline, attempt).await {
+            Ok(holder) => return Ok(holder),
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() + HOLDER_RETRY_INTERVAL >= deadline {
+            let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                .unwrap_or_else(|_| "unknown".to_string());
+            return Err(error.context(format!(
+                "no namespace holder after {attempt} attempt(s) \
+                 (max_user_namespaces={})",
+                max_user_ns.trim()
+            )));
         }
-
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "spawning namespace holder (attempt {}): {:?}",
-                attempt, holder_cmd
-            )
-        })?;
-
-        let holder_pid = child.id().context("getting holder process PID")?;
-        // Its stderr from the first instant: a holder that dies later is
-        // reported with what it printed (#852).
-        crate::companion::register(
-            &mut child,
-            |line| tracing::warn!(target: "fcvm::holder", "{}", line),
-        );
-        if attempt > 1 {
-            info!(holder_pid, attempt, "namespace holder started (retry)");
-        } else {
-            info!(holder_pid, "namespace holder started");
-        }
-
-        // Write UID/GID mappings for the new user namespace.
-        // Must happen before wait_for_namespace_ready which checks uid_map.
-        if let Err(e) = setup_namespace_mappings(holder_pid).await {
-            warn!(holder_pid, error = %e, "failed to set up namespace mappings");
-            crate::companion::forget(holder_pid);
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(holder_pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if std::time::Instant::now() < deadline {
-                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
-                continue;
-            }
-            return Err(e).context("setting up namespace mappings");
-        }
-
-        // Give this holder the FULL remaining time to become ready.
-        // Don't kill on timeout — if it times out, the deadline is exceeded anyway.
-        let result = crate::utils::wait_for_namespace_ready(holder_pid, deadline).await;
-
-        match result {
-            crate::utils::NamespaceReadyResult::Ready => {
-                return Ok((child, holder_pid));
-            }
-            crate::utils::NamespaceReadyResult::HolderDied => {
-                crate::companion::forget(holder_pid);
-                if std::time::Instant::now() < deadline {
-                    warn!(
-                        holder_pid,
-                        attempt, "holder died before namespace ready, retrying..."
-                    );
-                    tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
-                    continue;
-                } else {
-                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    anyhow::bail!(
-                        "namespace holder died and no time remaining to retry \
-                         (attempt {}, holder PID {}, max_user_namespaces={})",
-                        attempt,
-                        holder_pid,
-                        max_user_ns.trim()
-                    );
-                }
-            }
-            crate::utils::NamespaceReadyResult::TimedOut => {
-                // Holder is alive but maps not written within deadline.
-                // No point killing and retrying — deadline is exceeded.
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(holder_pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                anyhow::bail!(
-                    "namespace not ready within {:?} (holder PID {} alive, \
-                     uid_map not written — likely CPU scheduling pressure \
-                     with many concurrent VMs). Attempt {}.",
-                    HOLDER_RETRY_TIMEOUT,
-                    holder_pid,
-                    attempt
-                );
-            }
-        }
+        warn!(attempt, error = %format!("{error:#}"), "namespace holder failed to start, retrying");
+        tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
     }
 }
 
@@ -2411,6 +2384,7 @@ async fn cleanup_vm_inner(
                 .context("waiting for namespace holder process")?;
             if let Some(pid) = pid {
                 crate::companion::forget(pid);
+                crate::network::netns_agent::forget(pid);
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -3686,9 +3660,8 @@ async fn prepare_clone_substrate(
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process, then run disk creation and network setup
         // in parallel via nsenter.
-        let holder_cmd = pasta_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-        let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
+        info!("spawning namespace holder for rootless networking");
+        let (mut child, holder_pid) = spawn_namespace_holder().await?;
 
         let setup_script = pasta_net.build_setup_script();
         let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
@@ -7199,16 +7172,132 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_terminal_interrupt_does_not_reach_the_namespace_holder() {
         let interrupt = crate::utils::TerminalInterrupt::arm();
-        let holder_cmd =
-            crate::network::PastaNetwork::new("vm-test".to_string(), "tap-fc".to_string(), vec![])
-                .build_holder_command();
-        let (mut holder, holder_pid) = super::spawn_namespace_holder(&holder_cmd)
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
             .await
             .expect("spawning the namespace holder");
         interrupt
             .assert_misses(&mut holder, "the namespace holder")
             .await;
         crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// `SO_NETNS_COOKIE` of a socket: the identity of the network namespace it was made in.
+    fn netns_cookie(socket: &impl std::os::fd::AsRawFd) -> u64 {
+        let mut cookie = 0u64;
+        let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+        // SAFETY: `cookie` is 8 bytes, which is what SO_NETNS_COOKIE writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NETNS_COOKIE,
+                (&mut cookie as *mut u64).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "SO_NETNS_COOKIE: {}",
+            std::io::Error::last_os_error()
+        );
+        cookie
+    }
+
+    /// Kill and reap a holder a test started.
+    async fn stop_holder(mut holder: tokio::process::Child, holder_pid: u32) {
+        let _ = holder.start_kill();
+        let _ = holder.wait().await;
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// The holder is the agent, named as such, in namespaces of its own with the id maps
+    /// written, and the sockets it hands out belong to its network namespace, not this
+    /// process's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_namespace_holder_hands_out_sockets_made_in_its_namespace() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let comm = std::fs::read_to_string(format!("/proc/{holder_pid}/comm")).unwrap();
+        assert_eq!(
+            comm.trim(),
+            crate::network::netns_agent::COMM.to_str().unwrap()
+        );
+        for ns in ["user", "net"] {
+            assert_ne!(
+                std::fs::read_link(format!("/proc/{holder_pid}/ns/{ns}")).unwrap(),
+                std::fs::read_link(format!("/proc/self/ns/{ns}")).unwrap(),
+                "the holder shares this process's {ns} namespace"
+            );
+        }
+        let uid_map = std::fs::read_to_string(format!("/proc/{holder_pid}/uid_map")).unwrap();
+        assert!(
+            uid_map.split_whitespace().next() == Some("0") && !uid_map.contains("4294967295"),
+            "uid_map: {uid_map}"
+        );
+
+        let agent = crate::network::netns_agent::client(holder_pid)
+            .expect("the holder's channel is registered under its pid");
+        let here = tokio::net::TcpSocket::new_v4().unwrap();
+        for address in ["10.0.2.100", "fd00::100"] {
+            let socket = agent.tcp_socket(&address.parse().unwrap()).await.unwrap();
+            assert_ne!(
+                netns_cookie(&socket),
+                netns_cookie(&here),
+                "a {address} socket from the holder is in this process's network namespace"
+            );
+        }
+        let first = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .unwrap();
+        let second = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(netns_cookie(&first), netns_cookie(&second));
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// Dropping this process's end of the channel is the holder's order to exit: nothing
+    /// signals it here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_namespace_holder_exits_when_its_channel_closes() {
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        crate::network::netns_agent::forget(holder_pid);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), holder.wait())
+            .await
+            .expect("the holder is still running 10 s after its channel closed")
+            .unwrap();
+        assert!(status.success(), "the holder exited with {status}");
+        crate::companion::forget(holder_pid);
+    }
+
+    /// The holder's end of the channel is open in the holder alone: this process closed its
+    /// copy once the holder had started. So a request to a holder that has died fails at once
+    /// instead of waiting on a channel nothing will answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_namespace_holder_reads_as_a_closed_channel() {
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.tcp_socket(&"10.0.2.100".parse().unwrap()),
+        )
+        .await
+        .expect("a request to a dead holder was still waiting after 10 s");
+        assert!(refused.is_err(), "a dead holder handed out a socket");
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
     }
 
     /// The restore document carries the restoring host's identity in the shape

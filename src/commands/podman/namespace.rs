@@ -19,11 +19,9 @@ pub(crate) async fn setup_rootless_namespace(
     // Step 1: Spawn holder process (keeps namespace alive)
     // Uses shared function that gives the holder the full retry deadline,
     // only respawning if the holder actually dies (not on timeout).
-    let holder_cmd = pasta_net.build_holder_command();
-    info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
+    info!("spawning namespace holder for rootless networking");
 
-    let (mut child, mut holder_pid) =
-        crate::commands::common::spawn_namespace_holder(&holder_cmd).await?;
+    let (mut child, mut holder_pid) = crate::commands::common::spawn_namespace_holder().await?;
 
     // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
     // This is also inside retry logic - if holder dies during nsenter, retry everything
@@ -96,7 +94,7 @@ pub(crate) async fn setup_rootless_namespace(
             // Use spawn_namespace_holder for the retry — it handles its own
             // deadline and readiness waiting
             let (retry_child, retry_holder_pid) =
-                crate::commands::common::spawn_namespace_holder(&holder_cmd).await?;
+                crate::commands::common::spawn_namespace_holder().await?;
 
             // Retry nsenter with new holder
             let retry_nsenter_prefix = pasta_net.build_nsenter_prefix(retry_holder_pid);

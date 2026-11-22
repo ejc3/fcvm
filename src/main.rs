@@ -64,6 +64,13 @@ fn raise_resource_limits() {
 }
 
 fn main() -> Result<()> {
+    // A rootless namespace holder is this binary started as `fcvm __netns-agent`. It must
+    // stay on one thread (it unshares its user namespace), so it runs before anything else
+    // here and never reaches the runtime.
+    if let Some(result) = fcvm::network::netns_agent::main_if_agent() {
+        return result;
+    }
+
     // Everything that mutates PROCESS-WIDE state runs here, on the one thread
     // that exists, before the tokio runtime is built.
     //

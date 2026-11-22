@@ -50,6 +50,10 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The namespace holder fcvm's library starts is this binary run as its agent.
+    if let Some(result) = fcvm::network::netns_agent::main_if_agent() {
+        return result;
+    }
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Drive(args) => {

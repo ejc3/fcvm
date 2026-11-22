@@ -17,7 +17,8 @@ pub enum Piece {
     State,
     /// The clone's disk directory from the snapshot's (`DiskManager::create_cow_disk`).
     Disk,
-    /// The rootless namespace holder (`spawn_namespace_holder`: unshare, uid/gid maps).
+    /// The rootless namespace holder (`spawn_namespace_holder`: the agent process, uid/gid
+    /// maps).
     Holder,
     /// The rootless network: holder, TAP setup script, pasta and the bridge.
     RootlessNet,
@@ -37,8 +38,9 @@ pub enum Piece {
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prober {
-    /// fcvm's probe: `nsenter -U -n -- curl` (`health::check_http_health_nsenter`).
-    Nsenter,
+    /// fcvm's probe: one GET from a socket the namespace holder made
+    /// (`health::check_http_health_holder`).
+    Holder,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -65,7 +67,7 @@ pub struct PieceArgs {
     /// Dirty page tracking on the load (fcvm clones default to on).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub track_dirty_pages: bool,
-    #[arg(long, value_enum, default_value = "nsenter")]
+    #[arg(long, value_enum, default_value = "holder")]
     pub prober: Prober,
     /// The tap-attach piece stays attached this long between its attach and its detach, so
     /// the kernel handles the carrier-on as a link event of its own.
@@ -190,8 +192,7 @@ fn pasta_network(vm_id: &str) -> PastaNetwork {
 }
 
 async fn spawn_holder(held: &mut Held) -> Result<u32> {
-    let cmd = pasta_network(&held.vm_id).build_holder_command();
-    let (child, pid) = fcvm::commands::common::spawn_namespace_holder(&cmd).await?;
+    let (child, pid) = fcvm::commands::common::spawn_namespace_holder().await?;
     held.holder = Some((child, pid));
     Ok(pid)
 }
@@ -354,9 +355,10 @@ async fn prepare(args: &PieceArgs, held: &mut Held) -> Result<()> {
 
 async fn probe(args: &PieceArgs, holder_pid: u32) -> Result<bool> {
     match args.prober {
-        Prober::Nsenter => {
-            fcvm::health::check_http_health_nsenter(holder_pid, PROBE_IP, PROBE_PORT, "/", None, 5)
-                .await
+        Prober::Holder => {
+            fcvm::health::check_http_health_holder(holder_pid, PROBE_IP, PROBE_PORT, "/", None, 5)
+                .await?;
+            Ok(true)
         }
     }
 }
