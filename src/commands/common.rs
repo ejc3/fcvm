@@ -107,12 +107,6 @@ const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 14, 0);
 /// Timeout for namespace holder creation retries
 pub const HOLDER_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Maximum wait time for namespace setup via nsenter
-pub const NSENTER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
-
-/// Poll interval for namespace setup retries
-pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// Retry interval between holder creation attempts (only used when holder dies)
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -3560,56 +3554,6 @@ async fn cleanup_failed_clone_holder(holder: &mut Option<tokio::process::Child>,
     }
 }
 
-/// Run a rootless clone's pre-pasta network setup (`PastaNetwork::build_setup_script`) in the
-/// holder's namespaces: one nsenter+bash+ip for the whole phase, TAP verification included as
-/// the last batch step (`ip -batch` aborts at the first failure, so reaching it proves every
-/// step above applied). Retried while the namespace is not ready yet, up to
-/// [`NSENTER_MAX_WAIT`]. Public for the start-pieces bench (bench/start-rate/pieces).
-pub async fn run_namespace_setup_script(
-    holder_pid: u32,
-    nsenter_prefix: &[String],
-    setup_script: &crate::network::pasta::IpBatchScript,
-) -> Result<()> {
-    let ns_poll_start = std::time::Instant::now();
-    info!(holder_pid = holder_pid, "running network setup via nsenter");
-    loop {
-        if !crate::utils::is_process_alive(holder_pid) {
-            anyhow::bail!(
-                "holder process (PID {}) died before network setup could run",
-                holder_pid
-            );
-        }
-        let output = tokio::process::Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(setup_script.script())
-            .output()
-            .await
-            .context("running network setup via nsenter")?;
-        if output.status.success() {
-            debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-            if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
-                anyhow::bail!(
-                    "namespace not ready after {:?}: {}",
-                    ns_poll_start.elapsed(),
-                    stderr
-                );
-            }
-            tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
-            continue;
-        }
-        anyhow::bail!(
-            "network setup failed: {}",
-            setup_script.describe_failure(&stderr)
-        );
-    }
-}
-
 /// Prepare the [`CloneSubstrate`]: per-network-mode namespace setup + CoW disk + extra-disk
 /// copy + mount-redirect. Shared by the Firecracker and Cloud Hypervisor restore paths.
 ///
@@ -3659,12 +3603,9 @@ async fn prepare_clone_substrate(
         );
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process, then run disk creation and network setup
-        // in parallel via nsenter.
+        // in parallel.
         info!("spawning namespace holder for rootless networking");
         let (mut child, holder_pid) = spawn_namespace_holder().await?;
-
-        let setup_script = pasta_net.build_setup_script();
-        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
 
         let source_disk = restore_config.source_disk_path.clone();
         let disk_task = async {
@@ -3682,7 +3623,7 @@ async fn prepare_clone_substrate(
             Ok::<_, anyhow::Error>(rootfs_path)
         };
 
-        let network_task = run_namespace_setup_script(holder_pid, &nsenter_prefix, &setup_script);
+        let network_task = pasta_net.build_namespace(holder_pid);
 
         let (disk_result, network_result) = tokio::join!(disk_task, network_task);
         if let Err(e) = &disk_result {
@@ -3691,7 +3632,7 @@ async fn prepare_clone_substrate(
         }
         if let Err(e) = &network_result {
             let _ = child.kill().await;
-            return Err(anyhow::anyhow!("network setup failed: {}", e));
+            return Err(anyhow::anyhow!("network setup failed: {:#}", e));
         }
         rootfs_path = disk_result?;
         network_result?;
@@ -7259,6 +7200,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(netns_cookie(&first), netns_cookie(&second));
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// `ip -j ARGS` in the holder's namespaces, parsed. `ip` is the second instrument here:
+    /// the links are made over netlink by the holder and read back by iproute2.
+    fn ip_json(holder_pid: u32, args: &[&str]) -> serde_json::Value {
+        let output = std::process::Command::new("nsenter")
+            .args(["--preserve-credentials", "-U", "-n", "-t"])
+            .arg(holder_pid.to_string())
+            .args(["--", "ip", "-j", "-d"])
+            .args(args)
+            .output()
+            .expect("running ip in the holder's namespaces");
+        assert!(
+            output.status.success(),
+            "ip {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ip -j prints JSON")
+    }
+
+    fn link<'a>(links: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        links
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["ifname"] == name)
+            .unwrap_or_else(|| panic!("no link {name} in {links}"))
+    }
+
+    fn is_up(link: &serde_json::Value) -> bool {
+        link["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|flag| flag == "UP")
+    }
+
+    /// The holder builds what a rootless VM's namespace needs in one request: the VMM's TAP
+    /// and pasta's, both persistent and on `br0`, every link up at the guest's MTU, the
+    /// bridge under the pinned MAC with 10.0.2.1/24, loopback up, and no automatic IPv6
+    /// link-local address on any of the three.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_holder_builds_the_links_a_rootless_vm_needs() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network =
+            crate::network::PastaNetwork::new("vm-build".to_string(), "tap-fc".to_string(), vec![]);
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+
+        let links = ip_json(holder_pid, &["link", "show"]);
+        let mtu = crate::network::pasta::GUEST_MTU;
+        for tap in ["tap-fc", "pasta0"] {
+            let tap_link = link(&links, tap);
+            assert_eq!(tap_link["master"], "br0", "{tap_link}");
+            assert_eq!(tap_link["mtu"], mtu, "{tap_link}");
+            assert!(is_up(tap_link), "{tap_link}");
+            assert_eq!(tap_link["linkinfo"]["info_kind"], "tun", "{tap_link}");
+            assert_eq!(
+                tap_link["linkinfo"]["info_data"]["type"], "tap",
+                "{tap_link}"
+            );
+            assert_eq!(
+                tap_link["linkinfo"]["info_data"]["persist"], true,
+                "{tap_link}"
+            );
+            assert_eq!(tap_link["linkinfo"]["info_data"]["pi"], false, "{tap_link}");
+            assert_eq!(tap_link["inet6_addr_gen_mode"], "none", "{tap_link}");
+        }
+        let bridge = link(&links, "br0");
+        assert_eq!(bridge["address"], crate::network::pasta::NAMESPACE_MAC);
+        assert_eq!(bridge["mtu"], mtu);
+        assert!(is_up(bridge), "{bridge}");
+        assert_eq!(bridge["linkinfo"]["info_kind"], "bridge");
+        assert_eq!(bridge["inet6_addr_gen_mode"], "none", "{bridge}");
+        assert!(is_up(link(&links, "lo")));
+        assert_eq!(links.as_array().unwrap().len(), 4, "{links}");
+
+        let addresses = ip_json(holder_pid, &["-4", "addr", "show", "dev", "br0"]);
+        let info = &addresses[0]["addr_info"];
+        assert_eq!(info.as_array().unwrap().len(), 1, "{addresses}");
+        assert_eq!(info[0]["local"], "10.0.2.1");
+        assert_eq!(info[0]["prefixlen"], 24);
+        assert!(info[0].get("broadcast").is_none(), "{addresses}");
+        let routes = ip_json(holder_pid, &["-4", "route", "show"]);
+        assert_eq!(routes.as_array().unwrap().len(), 1, "{routes}");
+        assert_eq!(routes[0]["dst"], "10.0.2.0/24");
+        assert_eq!(routes[0]["dev"], "br0");
+        let v6 = ip_json(holder_pid, &["-6", "addr", "show"]);
+        let v6_devices: Vec<&str> = v6
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|link| link["addr_info"].as_array().is_some_and(|a| !a.is_empty()))
+            .map(|link| link["ifname"].as_str().unwrap())
+            .collect();
+        assert_eq!(v6_devices, ["lo"], "{v6}");
+
+        // The shape is built once, into an empty namespace. A second build stops at the
+        // first thing that exists and is not a TAP, and says which step that was.
+        let again = network.build_namespace(holder_pid).await.unwrap_err();
+        let said = format!("{again:#}");
+        assert!(
+            said.contains("creating bridge br0") && said.contains("exists"),
+            "{said}"
+        );
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// An isolated namespace (a raw VM's) gets the VM's TAP on the bridge and nothing that
+    /// leads out: no pasta TAP, the default MTU, one route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_holder_builds_an_isolated_namespace_with_no_way_out() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network =
+            crate::network::PastaNetwork::isolated("vm-raw".to_string(), "tap-fc".to_string());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let links = ip_json(holder_pid, &["link", "show"]);
+        let names: Vec<&str> = links
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| link["ifname"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(!names.contains(&"pasta0"), "{names:?}");
+        let tap = link(&links, "tap-fc");
+        assert_eq!(tap["master"], "br0");
+        assert_eq!(tap["mtu"], 1500);
+        assert_eq!(
+            link(&links, "br0")["address"],
+            crate::network::pasta::NAMESPACE_MAC
+        );
+        let routes = ip_json(holder_pid, &["route", "show"]);
+        assert_eq!(routes.as_array().unwrap().len(), 1, "{routes}");
         stop_holder(holder, holder_pid).await;
     }
 

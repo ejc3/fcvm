@@ -32,6 +32,15 @@ const NAMESPACE_IP: &str = "10.0.2.1";
 /// uses a fixed MAC (9a:55:9a:55:9a:55) for the same kind of reason.
 pub const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
 
+/// [`NAMESPACE_MAC`] as bytes.
+fn namespace_mac() -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    for (byte, text) in mac.iter_mut().zip(NAMESPACE_MAC.split(':')) {
+        *byte = u8::from_str_radix(text, 16).expect("NAMESPACE_MAC is six hex bytes");
+    }
+    mac
+}
+
 /// Guest IPv6 addressing (pasta copies host IPv6 with fd00::/64 fallback)
 const GUEST_IPV6: &str = "fd00::100";
 const GUEST_IPV6_GATEWAY: &str = "fd00::2";
@@ -59,9 +68,6 @@ const PASTA_DEVICE_NAME: &str = "pasta0";
 
 /// Timeout for waiting for pasta PID file (readiness signal)
 const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Timeout for waiting for pasta's TAP device to appear in the namespace
-const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Budget for the post-restore readiness check: the guest must answer, and its
 /// published ports must accept, within this window.
@@ -790,110 +796,14 @@ fn guest_unanswered_error(
     }
 }
 
-/// Heredoc delimiter separating the batched `ip` commands from the shell script.
-const IP_BATCH_DELIMITER: &str = "FCVM_IP_BATCH";
-
-/// A list of `ip` commands rendered as a single shell script.
-///
-/// Configuring one VM's namespace takes ~10 `ip` invocations, and each one is a
-/// fork+exec. `ip -batch` reads commands from a stream and applies them all in
-/// ONE process, so a whole phase costs `nsenter` + `bash` + `ip` instead of a
-/// process per command.
-///
-/// Semantics are unchanged: `ip -batch` runs the commands in order and, without
-/// `-force`, **aborts at the first failure** — nothing after it is applied, just
-/// as `set -e` did for the one-command-per-line form. On failure it prints
-/// `Command failed -:<line>`, and [`IpBatchScript::describe_failure`] maps that
-/// line back to the step's description so an error still names the step that
-/// failed.
-#[derive(Debug, Clone)]
-pub struct IpBatchScript {
-    /// (human description, `ip` arguments) — one entry per batch line, in order.
-    steps: Vec<(String, String)>,
-    script: String,
-}
-
-impl IpBatchScript {
-    /// Render `steps` as one `ip -batch` invocation, followed by `trailing_shell`
-    /// lines (for things `ip` cannot do, e.g. writing a sysctl — those are shell
-    /// builtins and cost no extra process).
-    fn new(steps: Vec<(String, String)>, trailing_shell: &[&str]) -> Self {
-        // One step per physical line, no blanks or comments inside the heredoc:
-        // `ip -batch` reports the physical line number, so line N is step N.
-        let batch: String = steps
-            .iter()
-            .map(|(_, args)| format!("{}\n", args))
-            .collect();
-        let mut script = format!(
-            "set -e\nip -batch - <<'{delim}'\n{batch}{delim}\n",
-            delim = IP_BATCH_DELIMITER,
-            batch = batch,
-        );
-        for line in trailing_shell {
-            script.push_str(line);
-            script.push('\n');
-        }
-        Self { steps, script }
-    }
-
-    /// The shell script to run under `bash -c` inside the namespace.
-    pub fn script(&self) -> &str {
-        &self.script
-    }
-
-    /// One-line summary of the steps, for debug logging.
-    pub fn summary(&self) -> String {
-        self.steps
-            .iter()
-            .map(|(_, args)| format!("ip {}", args))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    /// Turn a failed run's stderr into a message naming the step that failed.
-    ///
-    /// `ip -batch` prints `Command failed -:<line>` for the aborting command;
-    /// anything else (nsenter/bash failures, or an `ip` too old to report a
-    /// line) falls back to the raw stderr so no diagnostic is ever swallowed.
-    pub fn describe_failure(&self, stderr: &str) -> String {
-        let stderr = stderr.trim();
-        for token in stderr.split_whitespace() {
-            let Some(line_no) = token.strip_prefix("-:") else {
-                continue;
-            };
-            let Ok(line_no) = line_no.trim_end_matches(':').parse::<usize>() else {
-                continue;
-            };
-            if let Some((desc, args)) = line_no.checked_sub(1).and_then(|i| self.steps.get(i)) {
-                return format!(
-                    "step {}/{} ({}) failed running `ip {}`: {}",
-                    line_no,
-                    self.steps.len(),
-                    desc,
-                    args,
-                    if stderr.is_empty() {
-                        "(no stderr)"
-                    } else {
-                        stderr
-                    }
-                );
-            }
-        }
-        if stderr.is_empty() {
-            "(no stderr)".to_string()
-        } else {
-            stderr.to_string()
-        }
-    }
-}
-
-/// The PID file pasta signals readiness through, in the VM's runtime directory.
-///
-/// One directory per `vm_id`, so two VMs never share the file (#888), and the file goes
-/// with the directory when teardown removes it or when the next launch reclaims the
-/// directory of a VM whose fcvm was killed (`crate::reclaim`).
 fn pasta_pid_file(vm_id: &str) -> PathBuf {
     paths::vm_runtime_dir(vm_id).join("pasta.pid")
+}
+
+/// Whether pasta has written its PID into `pid_file`: a decimal number and a newline.
+fn pid_file_is_written(pid_file: &Path) -> bool {
+    std::fs::read_to_string(pid_file)
+        .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
 /// Rootless networking using pasta with bridge architecture
@@ -921,12 +831,13 @@ fn pasta_pid_file(vm_id: &str) -> PathBuf {
 /// routes to the VM via br0 → tap-fc.
 ///
 /// Setup sequence:
-/// 1. Spawn holder process: `fcvm __netns-agent` (`netns_agent`), which unshares both namespaces
-/// 2. Run pre-setup via nsenter: create Firecracker TAP only
-/// 3. Start pasta: creates pasta0 TAP in namespace with L2↔L4 translation
-/// 4. Run post-setup via nsenter: create bridge, add both TAPs, enable ip_forward
-/// 5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-/// 6. Health checks connect to guest_ip:80 from a socket the holder made in the namespace
+/// 1. Spawn the holder: `fcvm __netns-agent` (`netns_agent`), which unshares both namespaces
+/// 2. The holder builds every link in one request (`build_namespace`, `netns_agent::build`):
+///    both TAPs as persistent devices, the bridge, its MAC and address
+/// 3. Start pasta, which attaches to its TAP
+/// 4. Start the VMM in the holder's namespaces (`install_namespace_pre_exec`); it attaches
+///    to its TAP
+/// 5. Health checks connect to guest_ip:80 from a socket the holder made in the namespace
 pub struct PastaNetwork {
     vm_id: String,
     tap_device: String,   // TAP device for Firecracker (tap-fc)
@@ -1140,50 +1051,61 @@ impl PastaNetwork {
         self.loopback_ip.as_deref()
     }
 
-    /// Build the pre-pasta setup script to run inside the namespace via nsenter.
-    ///
-    /// Creates the Firecracker TAP device, brings loopback up, and verifies the
-    /// TAP exists — every `ip` command in ONE `ip -batch` process (see
-    /// [`IpBatchScript`]). The bridge and pasta0 TAP are set up after pasta
-    /// starts (pasta creates its own TAP).
-    ///
-    /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<script()>'
-    pub fn build_setup_script(&self) -> IpBatchScript {
-        let mut steps = vec![(
-            format!("create TAP device {} for Firecracker", self.tap_device),
-            format!("tuntap add {} mode tap", self.tap_device),
-        )];
-        if let Some(mtu) = self.links_mtu() {
-            steps.push((
-                format!("set TAP device {} MTU to {}", self.tap_device, mtu),
-                format!("link set {} mtu {}", self.tap_device, mtu),
-            ));
+    /// The links of this VM's namespace: its TAP and, unless isolated, pasta's TAP on `br0`,
+    /// which holds 10.0.2.1/24 under the pinned [`NAMESPACE_MAC`]. An isolated namespace
+    /// ([`Self::isolated`]) has no pasta TAP and the kernel's default MTU.
+    pub fn shape(&self) -> super::netns_agent::Shape {
+        super::netns_agent::Shape {
+            tap: self.tap_device.clone(),
+            pasta_tap: (!self.isolated).then(|| self.pasta_device.clone()),
+            bridge: BRIDGE_DEVICE.to_string(),
+            bridge_mac: namespace_mac(),
+            bridge_address: NAMESPACE_IP
+                .parse()
+                .expect("NAMESPACE_IP is an IPv4 address"),
+            bridge_prefix: 24,
+            mtu: self.links_mtu(),
         }
-        steps.extend([
-            (
-                format!("bring TAP device {} up", self.tap_device),
-                format!("link set {} up", self.tap_device),
-            ),
-            (
-                "bring loopback up".to_string(),
-                "link set lo up".to_string(),
-            ),
-            // Verification is the last batch step rather than a second
-            // nsenter+ip process: `ip -batch` already stops at the first
-            // failure, so reaching this line means every step above applied.
-            (
-                format!("verify TAP device {} exists", self.tap_device),
-                format!("link show {}", self.tap_device),
-            ),
-        ]);
-        IpBatchScript::new(steps, &[&self.restore_udp_gate_script()])
     }
 
-    /// In restore mode, the `tc` lines that drop datagrams to the published UDP guest
+    /// Build this VM's namespace through its holder: every link of [`Self::shape`] in one
+    /// request, with no process started. pasta is started afterwards ([`Self::post_start`])
+    /// and attaches to the TAP made for it here.
+    ///
+    /// In restore mode with a published UDP port, the gate that drops datagrams to those
+    /// guest ports until the restore is acknowledged ([`super::udp_gate`]) goes onto the TAP
+    /// here too. No pasta exists yet, so no forwarded datagram can reach the TAP ahead of it.
+    pub async fn build_namespace(&self, holder_pid: u32) -> Result<()> {
+        let agent = super::netns_agent::client(holder_pid).with_context(|| {
+            format!("this process holds no channel to the namespace holder (PID {holder_pid})")
+        })?;
+        agent
+            .build(&self.shape())
+            .await
+            .context("building the namespace's links")?;
+        let gate = self.restore_udp_gate_script();
+        if !gate.is_empty() {
+            let prefix = self.build_nsenter_prefix(holder_pid);
+            let output = Command::new(&prefix[0])
+                .args(&prefix[1..])
+                .args(["sh", "-c", &gate])
+                .output()
+                .await
+                .context("running tc to close the clone's UDP gate")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "closing the clone's UDP gate on {} failed: {}",
+                    self.tap_device,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// In restore mode, the shell lines that drop datagrams to the published UDP guest
     /// ports on the clone's TAP until the restore is acknowledged
-    /// ([`super::udp_gate`]). They run in the setup script, before pasta starts and
-    /// before the TAP joins the bridge, so no forwarded datagram can reach the TAP
-    /// ahead of them. Empty outside restore mode or without a UDP mapping.
+    /// ([`super::udp_gate`]). Empty outside restore mode or without a UDP mapping.
     fn restore_udp_gate_script(&self) -> String {
         if !self.restore_mode {
             return String::new();
@@ -1191,113 +1113,6 @@ impl PastaNetwork {
         super::udp_gate::close_script(
             &self.tap_device,
             &super::udp_gate::published_udp_guest_ports(&self.port_mappings),
-        )
-    }
-
-    /// Build the post-pasta setup script that creates the bridge after pasta is ready
-    ///
-    /// Connects pasta's TAP and Firecracker's TAP via an L2 bridge.
-    /// Port forwarding: pasta splices inbound loopback connections directly into the
-    /// namespace, where they route via br0 → tap-fc → VM. Outbound traffic goes
-    /// through pasta's L2 translation: tap-fc → br0 → pasta0 → pasta → host.
-    ///
-    /// The caller (post_start) waits for pasta's TAP device to exist via
-    /// wait_for_pasta_device() before running this script.
-    ///
-    /// All six `ip` commands run in ONE `ip -batch` process; enabling IP
-    /// forwarding is a shell redirect (no extra process).
-    pub fn build_bridge_script(&self) -> IpBatchScript {
-        if self.isolated {
-            return self.build_isolated_bridge_script();
-        }
-        let bridge = BRIDGE_DEVICE;
-        IpBatchScript::new(
-            vec![
-                (
-                    format!("set pasta TAP {} MTU to {}", self.pasta_device, GUEST_MTU),
-                    format!("link set {} mtu {}", self.pasta_device, GUEST_MTU),
-                ),
-                (
-                    format!(
-                        "bring {} up (pasta creates it but leaves it down without --config-net)",
-                        self.pasta_device
-                    ),
-                    format!("link set {} up", self.pasta_device),
-                ),
-                (
-                    format!("create L2 bridge {}", bridge),
-                    format!("link add {} type bridge", bridge),
-                ),
-                (
-                    format!("pin bridge {} MAC to {}", bridge, NAMESPACE_MAC),
-                    format!("link set {} address {}", bridge, NAMESPACE_MAC),
-                ),
-                (
-                    format!("bring bridge {} up", bridge),
-                    format!("link set {} up", bridge),
-                ),
-                (
-                    format!("add pasta TAP {} to bridge {}", self.pasta_device, bridge),
-                    format!("link set {} master {}", self.pasta_device, bridge),
-                ),
-                (
-                    format!(
-                        "add Firecracker TAP {} to bridge {}",
-                        self.tap_device, bridge
-                    ),
-                    format!("link set {} master {}", self.tap_device, bridge),
-                ),
-                // Explicit, though the bridge would take its ports' smallest MTU: a
-                // bridge whose MTU was set no longer follows its ports, so this is
-                // the value whatever joins it later.
-                (
-                    format!("set bridge {} MTU to {}", bridge, GUEST_MTU),
-                    format!("link set {} mtu {}", bridge, GUEST_MTU),
-                ),
-                (
-                    format!(
-                        "add health-check IP {}/24 to bridge {}",
-                        NAMESPACE_IP, bridge
-                    ),
-                    format!("addr add {}/24 dev {}", NAMESPACE_IP, bridge),
-                ),
-            ],
-            // Enable IP forwarding — a bash redirect, not another process.
-            &["echo 1 > /proc/sys/net/ipv4/ip_forward"],
-        )
-    }
-
-    /// The bridge of an isolated namespace ([`Self::isolated`]): the VM's TAP on `br0` with
-    /// the pinned MAC and 10.0.2.1/24, no pasta device, no route and no IP forwarding.
-    fn build_isolated_bridge_script(&self) -> IpBatchScript {
-        let bridge = BRIDGE_DEVICE;
-        IpBatchScript::new(
-            vec![
-                (
-                    format!("create L2 bridge {}", bridge),
-                    format!("link add {} type bridge", bridge),
-                ),
-                (
-                    format!("pin bridge {} MAC to {}", bridge, NAMESPACE_MAC),
-                    format!("link set {} address {}", bridge, NAMESPACE_MAC),
-                ),
-                (
-                    format!("bring bridge {} up", bridge),
-                    format!("link set {} up", bridge),
-                ),
-                (
-                    format!("add the VM's TAP {} to bridge {}", self.tap_device, bridge),
-                    format!("link set {} master {}", self.tap_device, bridge),
-                ),
-                (
-                    format!(
-                        "add the namespace address {}/24 to {}",
-                        NAMESPACE_IP, bridge
-                    ),
-                    format!("addr add {}/24 dev {}", NAMESPACE_IP, bridge),
-                ),
-            ],
-            &[],
         )
     }
 
@@ -1326,34 +1141,54 @@ impl PastaNetwork {
     /// Detect host's global IPv6 address for pasta outbound traffic.
     ///
     /// Memoised for the process lifetime: `setup()` and `start_pasta()` both need
-    /// it, so without this every VM launch pays two `ip -6 addr show` execs for
-    /// an answer that cannot change during one launch.
+    /// it, and the answer cannot change during one launch.
     fn detect_host_ipv6() -> Option<String> {
         static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         HOST_IPV6.get_or_init(Self::probe_host_ipv6).clone()
     }
 
+    /// The first global-scope IPv6 address of this network namespace's interfaces that is
+    /// not a unique local one (fd00::/8), from one netlink dump of the IPv6 addresses: no
+    /// process is started. Only addresses are asked for. A dump of the links as well, which
+    /// getifaddrs makes, waits for `rtnl_mutex` on a host that is starting many VMs.
     fn probe_host_ipv6() -> Option<String> {
-        let output = std::process::Command::new("ip")
-            .args(["-6", "addr", "show", "scope", "global"])
-            .output()
-            .ok()?;
+        let mut rtnl = super::rtnl::Rtnl::open().ok()?;
+        // struct ifaddrmsg: family, prefix length, flags, scope, index.
+        let mut header = [0u8; 8];
+        header[0] = libc::AF_INET6 as u8;
+        let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header).ok()?;
+        const IFA_ADDRESS: u16 = 1;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
+        Self::first_global_ipv6(
+            entries
+                .iter()
+                .filter(|entry| entry.payload.get(3) == Some(&RT_SCOPE_UNIVERSE))
+                .filter_map(|entry| {
+                    let (_, value) = entry
+                        .attrs(8)
+                        .into_iter()
+                        .find(|(kind, _)| *kind == IFA_ADDRESS)?;
+                    <[u8; 16]>::try_from(value)
+                        .ok()
+                        .map(std::net::Ipv6Addr::from)
+                }),
+        )
+        .map(|address| address.to_string())
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.starts_with("inet6 ") {
-                if let Some(addr_part) = line.strip_prefix("inet6 ") {
-                    if let Some(addr) = addr_part.split('/').next() {
-                        // Skip link-local (fe80::) and ULA (fd00::)
-                        if !addr.starts_with("fe80:") && !addr.starts_with("fd") {
-                            return Some(addr.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        None
+    /// The first of `addresses` that `ip -6 addr show scope global` would list and that is
+    /// not in fd00::/8: not loopback, link-local (fe80::/10) or site-local (fec0::/10).
+    fn first_global_ipv6(
+        addresses: impl IntoIterator<Item = std::net::Ipv6Addr>,
+    ) -> Option<std::net::Ipv6Addr> {
+        addresses.into_iter().find(|address| {
+            let first = address.segments()[0];
+            !address.is_loopback()
+                && !address.is_unspecified()
+                && first & 0xffc0 != 0xfe80
+                && first & 0xffc0 != 0xfec0
+                && first & 0xff00 != 0xfd00
+        })
     }
 
     /// Detect the host's proxy for one scheme: the first of `names` that is set.
@@ -1441,7 +1276,7 @@ impl PastaNetwork {
         // Don't use --config-net: it sets an IP on pasta0's kernel interface, which
         // conflicts with the bridge (kernel responds to ARP for that IP via bridge's
         // weak host model, stealing traffic from pasta's userspace L2 handler).
-        // Instead, pasta creates the TAP but we bring it up in build_bridge_script().
+        // Instead, the holder makes the TAP and brings it up (`netns_agent::build`).
         //
         // -a must be the VM's actual IP (GUEST_IP), not the gateway. pasta uses -a
         // as the "guest address" and ignores ARP requests for it (don't resolve self).
@@ -1612,8 +1447,8 @@ impl PastaNetwork {
 
     /// Start pasta process attached to the namespace
     ///
-    /// pasta creates its own TAP device (pasta0) in the namespace and provides
-    /// L2↔L4 translation to the host. Uses PID file for readiness signaling.
+    /// pasta attaches to the TAP the holder made for it ([`Self::build_namespace`]) and
+    /// provides L2↔L4 translation to the host. Its PID file signals readiness.
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
         let pid_file = pasta_pid_file(&self.vm_id);
         let pid_dir = pid_file
@@ -1770,7 +1605,11 @@ impl PastaNetwork {
         // event can only add latency, never hang.
         let deadline = tokio::time::Instant::now() + PASTA_READY_TIMEOUT;
         loop {
-            if pid_file.exists() {
+            // pasta creates the file while it reads its options and writes its PID into it
+            // last, after it has attached to its TAP and opened its sockets. The PID is the
+            // readiness signal; the empty file is not.
+            if pid_file_is_written(pid_file) {
+                // bench/chromium/reqstages.py reads this line.
                 info!("pasta ready (PID file created)");
                 return Ok(());
             }
@@ -1823,45 +1662,12 @@ impl PastaNetwork {
         }
     }
 
-    /// Run the bridge script ([`Self::build_bridge_script`]) in the holder's namespaces.
-    async fn run_bridge_script(&mut self, holder_pid: u32) -> Result<()> {
-        let bridge_script = self.build_bridge_script();
-        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
-
-        debug!(
-            holder_pid = holder_pid,
-            script = %bridge_script.summary(),
-            "running bridge setup script"
-        );
-
-        let output = Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(bridge_script.script())
-            .output()
-            .await
-            .context("running bridge setup via nsenter")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "bridge setup failed: {}{}",
-                bridge_script.describe_failure(&stderr),
-                self.pasta_exit_context().await
-            );
-        }
-        Ok(())
-    }
-
     /// pasta's exit status and captured stderr, for appending to
     /// network-setup errors.
     ///
-    /// pasta creates its TAP and writes its PID file before binding forwarded
-    /// ports, so a port conflict kills it after both readiness signals. The
-    /// next setup step then fails with "Cannot find device pasta0" while the
-    /// real cause ("Listen failed ...: Address already in use") is only in
-    /// pasta's stderr. A dying pasta drops its TAP before it becomes
+    /// A pasta that cannot bind a forwarded port exits, and the real cause
+    /// ("Listen failed ...: Address already in use") is only in its stderr.
+    /// A dying pasta drops its TAP's carrier before it becomes
     /// reapable, so a single `try_wait` sample can race the exit; wait a
     /// bounded moment for it, and when pasta is genuinely still running,
     /// still report any stderr it produced rather than nothing.
@@ -1899,81 +1705,6 @@ impl PastaNetwork {
     /// Render the captured pasta stderr tail for error messages.
     fn stderr_tail_message(&self) -> String {
         self.stderr_tail.render("pasta")
-    }
-
-    /// Wait for pasta's TAP device to appear in the namespace, supervising pasta itself.
-    ///
-    /// pasta writes its PID file before the device is visible in the namespace,
-    /// and under load that window can stretch out — or pasta can die right after
-    /// startup, in which case the device never appears at all. Polling here
-    /// (instead of inside the bridge script) lets every iteration also check the
-    /// pasta child, so a dead pasta fails fast with its own exit status and
-    /// stderr instead of a generic "Cannot find device" from the bridge setup.
-    async fn wait_for_pasta_device(&mut self, holder_pid: u32) -> Result<()> {
-        let deadline = std::time::Instant::now() + PASTA_DEVICE_TIMEOUT;
-        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
-
-        // Fine-grained backoff, not a fixed 100ms: pasta creates the TAP within
-        // a few ms of writing its PID file, and now that the PID file is
-        // noticed event-driven (+2ms instead of +52ms) this probe regularly
-        // arrives BEFORE the device exists — a fixed 100ms retry put a +100ms
-        // mode on 4/10 benched clones. Each probe is a full nsenter+ip exec
-        // (~1-3ms), so short gaps just keep probing continuously through the
-        // handful of ms until the device appears; the deadline still bounds it.
-        let mut retry_delay = std::time::Duration::from_millis(1);
-
-        loop {
-            let output = Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .args(["ip", "link", "show", &self.pasta_device])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .await
-                .context("checking for pasta TAP device via nsenter")?;
-
-            if output.status.success() {
-                debug!(device = %self.pasta_device, "pasta TAP device present in namespace");
-                return Ok(());
-            }
-
-            // Device not visible yet — if pasta has exited, attribute the failure
-            // to pasta instead of letting the bridge setup fail later.
-            let pasta_exit = match self.pasta_process.as_mut() {
-                Some(process) => process
-                    .try_wait()
-                    .context("checking pasta process status")?,
-                None => None,
-            };
-            if let Some(status) = pasta_exit {
-                self.pasta_process = None;
-                // Wait for the stderr reader to hit EOF so the error includes what
-                // pasta actually printed before dying.
-                crate::utils::wait_for_stderr_eof(
-                    &mut self.stderr_reader,
-                    PASTA_STDERR_EOF_TIMEOUT,
-                )
-                .await;
-                anyhow::bail!(
-                    "pasta exited (status: {}) before its TAP device {} appeared in the namespace{}",
-                    status,
-                    self.pasta_device,
-                    self.stderr_tail_message()
-                );
-            }
-
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!(
-                    "pasta is still running but its TAP device {} did not appear in the namespace within {:?}{}",
-                    self.pasta_device,
-                    PASTA_DEVICE_TIMEOUT,
-                    self.stderr_tail_message()
-                );
-            }
-
-            tokio::time::sleep(retry_delay).await;
-            retry_delay = (retry_delay * 2).min(std::time::Duration::from_millis(50));
-        }
     }
 
     /// Get guest IP address for kernel boot args
@@ -2251,7 +1982,9 @@ impl NetworkManager for PastaNetwork {
     async fn post_start(&mut self, holder_pid: u32) -> Result<()> {
         self.holder_pid = Some(holder_pid);
         if self.isolated {
-            return self.run_bridge_script(holder_pid).await;
+            // An isolated namespace is its links, which the holder has built
+            // (`build_namespace`); there is no pasta to start.
+            return Ok(());
         }
 
         info!(
@@ -2259,8 +1992,7 @@ impl NetworkManager for PastaNetwork {
             "starting pasta for rootless networking"
         );
 
-        // Phases 1+2: start pasta and wait for its TAP device, with a bounded
-        // retry on a transient startup failure.
+        // Start pasta, with a bounded retry on a transient startup failure.
         //
         // pasta has a netlink startup race: it subscribes to route/neighbour
         // notifications and then issues request/response netlink calls during
@@ -2275,11 +2007,7 @@ impl NetworkManager for PastaNetwork {
         const PASTA_START_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=PASTA_START_ATTEMPTS {
-            let result = match self.start_pasta(holder_pid).await {
-                Ok(()) => self.wait_for_pasta_device(holder_pid).await,
-                Err(e) => Err(e),
-            };
-            match result {
+            match self.start_pasta(holder_pid).await {
                 Ok(()) => {
                     last_err = None;
                     break;
@@ -2310,13 +2038,9 @@ impl NetworkManager for PastaNetwork {
             )));
         }
 
-        // Phase 3: Create bridge connecting pasta0 and Firecracker's TAP
-        self.run_bridge_script(holder_pid).await?;
-
-        // Phase 4: Verify port forwarding is actually working
-        // The PID file only means pasta spawned, not that ports are bound.
-        // Health checks use nsenter (bridge path), so without this check
-        // "healthy" doesn't mean port forwarding works.
+        // Verify port forwarding is actually working. The health checks reach the guest
+        // over the bridge, so without this check "healthy" doesn't mean port forwarding
+        // works.
         //
         // Skip in restore mode: during snapshot restore, post_start() runs BEFORE
         // the VM snapshot is loaded. Probing ports now forces pasta to attempt L2
@@ -2329,6 +2053,8 @@ impl NetworkManager for PastaNetwork {
             }
         }
 
+        // The marker bench/start-rate/startrate.py and bench/clone-latency-report.py split a
+        // start's stages on.
         info!(holder_pid = holder_pid, "pasta + bridge setup complete");
         Ok(())
     }
@@ -4243,109 +3969,42 @@ mod tests {
         assert!(!error.to_string().contains("5s"));
     }
 
-    /// Batch lines are exactly the heredoc body, in order, one per line.
-    fn batch_lines(script: &str) -> Vec<&str> {
-        let open = format!("<<'{}'\n", IP_BATCH_DELIMITER);
-        let body = script
-            .split_once(&open)
-            .expect("script must open a batch heredoc")
-            .1;
-        let body = body
-            .split_once(&format!("\n{}\n", IP_BATCH_DELIMITER))
-            .expect("script must close the batch heredoc")
-            .0;
-        body.lines().collect()
-    }
-
+    /// Behind pasta the namespace is both TAPs on `br0`, every link at the guest's MTU, and
+    /// the bridge under the pinned MAC with 10.0.2.1/24.
     #[test]
-    fn setup_script_batches_every_ip_command_into_one_process() {
+    fn the_shape_puts_both_taps_on_the_pinned_bridge() {
         let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
-        let script = net.build_setup_script();
-
-        // Exactly one `ip` process for the whole phase: the only shell line that
-        // invokes `ip` is the batch itself.
-        let ip_lines: Vec<&str> = script
-            .script()
-            .lines()
-            .filter(|l| l.trim_start().starts_with("ip "))
-            .collect();
         assert_eq!(
-            ip_lines,
-            vec![format!("ip -batch - <<'{}'", IP_BATCH_DELIMITER)],
-            "no per-command `ip` invocations should remain outside the batch"
+            net.shape(),
+            crate::network::netns_agent::Shape {
+                tap: "tap-fc".to_string(),
+                pasta_tap: Some("pasta0".to_string()),
+                bridge: "br0".to_string(),
+                bridge_mac: [0x02, 0xfc, 0x00, 0x00, 0x02, 0x01],
+                bridge_address: "10.0.2.1".parse().unwrap(),
+                bridge_prefix: 24,
+                mtu: Some(GUEST_MTU),
+            }
         );
-
-        assert_eq!(
-            batch_lines(script.script()),
-            vec![
-                "tuntap add tap-fc mode tap",
-                "link set tap-fc mtu 65520",
-                "link set tap-fc up",
-                "link set lo up",
-                "link show tap-fc",
-            ],
-            "TAP verification must be the last batch step, not a second exec"
-        );
-    }
-
-    #[test]
-    fn bridge_script_batches_every_ip_command_and_keeps_ip_forward() {
-        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
-        let script = net.build_bridge_script();
-
-        assert_eq!(script.script().matches("ip -batch -").count(), 1);
-        assert_eq!(
-            batch_lines(script.script()),
-            vec![
-                "link set pasta0 mtu 65520",
-                "link set pasta0 up",
-                "link add br0 type bridge",
-                // Pinned so the guest can hold an authoritative neighbour entry
-                // for the health-check address instead of racing pasta for one.
-                "link set br0 address 02:fc:00:00:02:01",
-                "link set br0 up",
-                "link set pasta0 master br0",
-                "link set tap-fc master br0",
-                "link set br0 mtu 65520",
-                "addr add 10.0.2.1/24 dev br0",
-            ]
-        );
-        assert!(
-            script
-                .script()
-                .contains("echo 1 > /proc/sys/net/ipv4/ip_forward"),
-            "ip_forward must still be enabled (as a shell redirect, not a process)"
-        );
-        assert!(script.script().starts_with("set -e\n"));
     }
 
     /// An isolated namespace (a raw VM) has the VM's TAP on the bridge with the pinned MAC
-    /// and 10.0.2.1, and nothing that leads out: no pasta device, no route, no forwarding,
-    /// no gateway or resolver handed to the guest, no published port.
+    /// and 10.0.2.1, and nothing that leads out: no pasta device, no gateway or resolver
+    /// handed to the guest, no published port.
     #[tokio::test]
     async fn an_isolated_namespace_has_no_way_out() {
         let mut net = PastaNetwork::isolated("vm-raw123".to_string(), "tap-fc".to_string());
         assert!(net.is_isolated());
-        let script = net.build_bridge_script();
+        let shape = net.shape();
+        assert_eq!(shape.pasta_tap, None);
+        assert_eq!(shape.mtu, None, "an isolated namespace's links keep 1500");
         assert_eq!(
-            batch_lines(script.script()),
-            vec![
-                "link add br0 type bridge",
-                "link set br0 address 02:fc:00:00:02:01",
-                "link set br0 up",
-                "link set tap-fc master br0",
-                "addr add 10.0.2.1/24 dev br0",
-            ]
+            (shape.tap.as_str(), shape.bridge.as_str()),
+            ("tap-fc", "br0")
         );
-        for absent in ["pasta0", "route", "ip_forward"] {
-            assert!(
-                !script.script().contains(absent),
-                "{absent} in {}",
-                script.script()
-            );
-        }
-        assert!(!net.build_setup_script().script().contains("route"));
-        assert!(!net.build_setup_script().script().contains("mtu"));
+        assert_eq!(shape.bridge_mac, namespace_mac());
+        assert_eq!(shape.bridge_address.to_string(), NAMESPACE_IP);
+
         let config = net.setup().await.unwrap();
         assert_eq!(config.guest_mtu, None, "an isolated guest keeps 1500");
         assert_eq!(config.guest_ip.as_deref(), Some("10.0.2.100/24"));
@@ -4354,7 +4013,7 @@ mod tests {
         assert_eq!(config.guest_ipv6, None);
         assert_eq!(config.loopback_ip, None);
         assert!(net.port_mappings.is_empty());
-        // post_start runs the bridge script and returns before anything starts pasta.
+        // post_start returns before anything starts pasta.
         let source = include_str!("pasta.rs");
         let start = source
             .find("    async fn post_start(&mut self, holder_pid: u32)")
@@ -4363,127 +4022,66 @@ mod tests {
         let isolated = body.find("if self.isolated {").unwrap();
         let pasta = body.find("self.start_pasta(holder_pid)").unwrap();
         assert!(isolated < pasta);
-        assert!(body[isolated..pasta].contains("return self.run_bridge_script(holder_pid).await;"));
+        assert!(body[isolated..pasta].contains("return Ok(());"));
     }
 
-    /// The guest is told to take the namespace links' MTU, the one the setup and
-    /// bridge scripts give the TAP, pasta0 and br0.
+    /// The guest is told to take the namespace links' MTU, the one the holder gives the
+    /// TAP, pasta0 and br0.
     #[tokio::test]
     async fn a_rootless_guest_takes_the_namespace_link_mtu() {
         let mut net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
         assert_eq!(net.setup().await.unwrap().guest_mtu, Some(GUEST_MTU));
-        let mtu_line = format!("mtu {GUEST_MTU}");
-        assert!(net
-            .build_setup_script()
-            .script()
-            .contains(&format!("link set tap-fc {mtu_line}")));
-        let bridge = net.build_bridge_script();
-        assert!(bridge
-            .script()
-            .contains(&format!("link set pasta0 {mtu_line}")));
-        assert!(bridge
-            .script()
-            .contains(&format!("link set br0 {mtu_line}")));
+        assert_eq!(net.shape().mtu, Some(GUEST_MTU));
     }
 
+    /// The host address pasta sends IPv6 from is the first global one that is not unique
+    /// local, as `ip -6 addr show scope global` listed them.
     #[test]
-    fn batch_failure_names_the_failing_step() {
-        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
-        let script = net.build_bridge_script();
-
-        // `ip -batch` aborts at the first failing line and reports `-:<line>`.
-        let msg = script.describe_failure("RTNETLINK answers: File exists\nCommand failed -:3\n");
-        assert!(msg.contains("step 3/9"), "missing step index: {msg}");
-        assert!(
-            msg.contains("create L2 bridge br0"),
-            "missing step name: {msg}"
-        );
-        assert!(
-            msg.contains("ip link add br0 type bridge"),
-            "missing command: {msg}"
-        );
-        assert!(
-            msg.contains("RTNETLINK answers: File exists"),
-            "lost stderr: {msg}"
-        );
-    }
-
-    #[test]
-    fn batch_failure_falls_back_to_raw_stderr() {
-        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
-        let script = net.build_setup_script();
-
-        // nsenter-level failure: no `-:<line>` marker, so nothing may be swallowed.
-        let msg = script.describe_failure("nsenter: cannot open /proc/123/ns/net: No such process");
+    fn the_host_ipv6_is_the_first_global_address_that_is_not_unique_local() {
+        let pick = |list: &[&str]| {
+            PastaNetwork::first_global_ipv6(list.iter().map(|a| a.parse().unwrap()))
+                .map(|a| a.to_string())
+        };
         assert_eq!(
-            msg,
-            "nsenter: cannot open /proc/123/ns/net: No such process"
+            pick(&[
+                "::1",
+                "fe80::1",
+                "fd00::5",
+                "fec0::1",
+                "2001:db8::7",
+                "2001:db8::8"
+            ]),
+            Some("2001:db8::7".to_string())
         );
-
-        // Out-of-range line numbers must not panic or invent a step.
-        assert_eq!(
-            script.describe_failure("Command failed -:99"),
-            "Command failed -:99"
-        );
-        assert_eq!(script.describe_failure("   "), "(no stderr)");
+        assert_eq!(pick(&["::1", "fe80::1", "febf::1", "fdff::1"]), None);
+        assert_eq!(pick(&[]), None);
     }
 
-    /// The batch really does run under `bash -c` and really does abort at the
-    /// first failure, verified against the host's actual `ip` binary, in the
-    /// current namespace, using read-only `link show` commands. The script
-    /// resolves `ip` through PATH, which is safe to rely on because no test in
-    /// this crate changes it.
+    /// The netlink dump finds the address getifaddrs finds on this host.
     #[test]
-    fn ip_batch_script_runs_and_aborts_on_first_failure() {
-        let ok = IpBatchScript::new(
-            vec![
-                ("show loopback".to_string(), "link show lo".to_string()),
-                (
-                    "show loopback again".to_string(),
-                    "link show lo".to_string(),
-                ),
-            ],
-            &["echo TRAILING_RAN"],
+    fn the_host_ipv6_probe_agrees_with_getifaddrs() {
+        let listed = nix::ifaddrs::getifaddrs()
+            .unwrap()
+            .filter_map(|interface| Some(interface.address?.as_sockaddr_in6()?.ip()));
+        assert_eq!(
+            PastaNetwork::probe_host_ipv6(),
+            PastaNetwork::first_global_ipv6(listed).map(|address| address.to_string())
         );
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(ok.script())
-            .output()
-            .expect("running batch script");
-        assert!(
-            out.status.success(),
-            "batch failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(String::from_utf8_lossy(&out.stdout).contains("TRAILING_RAN"));
+    }
 
-        let bad = IpBatchScript::new(
-            vec![
-                ("show loopback".to_string(), "link show lo".to_string()),
-                (
-                    "show a device that cannot exist".to_string(),
-                    "link show fcvm-no-such-dev".to_string(),
-                ),
-                ("never reached".to_string(), "link show lo".to_string()),
-            ],
-            &["echo TRAILING_RAN"],
-        );
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(bad.script())
-            .output()
-            .expect("running batch script");
-        assert!(!out.status.success(), "batch should have failed");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let msg = bad.describe_failure(&stderr);
-        assert!(
-            msg.contains("step 2/3") && msg.contains("show a device that cannot exist"),
-            "failure not attributed to step 2: stderr={stderr:?} msg={msg}"
-        );
-        assert!(
-            !String::from_utf8_lossy(&out.stdout).contains("TRAILING_RAN"),
-            "set -e must stop the script when the batch aborts"
-        );
+    /// pasta creates its PID file while it reads its options and writes the PID last, so
+    /// only a written file means pasta is ready.
+    #[test]
+    fn an_empty_pid_file_is_not_a_ready_pasta() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pasta.pid");
+        assert!(!pid_file_is_written(&pid_file), "no file");
+        std::fs::write(&pid_file, "").unwrap();
+        assert!(!pid_file_is_written(&pid_file), "created, not written");
+        std::fs::write(&pid_file, "4242").unwrap();
+        assert!(!pid_file_is_written(&pid_file), "half written");
+        std::fs::write(&pid_file, "4242\n").unwrap();
+        assert!(pid_file_is_written(&pid_file));
     }
 
     #[test]
@@ -4874,6 +4472,161 @@ mod tests {
                 .filter_map(|host_ipv6| who_answers_arp_for_the_guest(&pasta_bin, host_ipv6))
                 .collect();
             assert!(answered.is_empty(), "{}", answered.join("\n\n"));
+        }
+
+        /// A loopback address and a port on it that nothing listens on, for one test.
+        fn free_loopback_port() -> (String, u16) {
+            let address = format!("127.88.{}.7", std::process::id() % 250 + 1);
+            let port = std::net::TcpListener::bind((address.as_str(), 0))
+                .expect("binding a loopback port")
+                .local_addr()
+                .unwrap()
+                .port();
+            (address, port)
+        }
+
+        fn link_state(holder_pid: u32, name: &str) -> serde_json::Value {
+            let output = Command::new("nsenter")
+                .args(["--preserve-credentials", "-U", "-n", "-t"])
+                .arg(holder_pid.to_string())
+                .args(["--", "ip", "-j", "-d", "link", "show", "dev", name])
+                .output()
+                .expect("running ip in the holder's namespaces");
+            assert!(
+                output.status.success(),
+                "ip link show {name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("ip -j prints JSON")
+                [0]
+            .clone()
+        }
+
+        fn has_carrier(link: &serde_json::Value) -> bool {
+            link["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|flag| flag == "LOWER_UP")
+        }
+
+        /// A namespace built by the holder, with pasta started in it and `mappings`
+        /// published, and what is needed to take it down.
+        struct Running {
+            network: PastaNetwork,
+            holder: tokio::process::Child,
+            holder_pid: u32,
+            runtime_dir: std::path::PathBuf,
+        }
+
+        impl Running {
+            async fn start(
+                name: &str,
+                loopback: &str,
+                mappings: Vec<crate::network::PortMapping>,
+            ) -> (Self, anyhow::Result<()>) {
+                let vm_id = format!("{name}-{}", std::process::id());
+                let runtime_dir = crate::paths::vm_runtime_dir(&vm_id);
+                std::fs::create_dir_all(&runtime_dir).expect("creating the runtime directory");
+                let (holder, holder_pid) = crate::commands::common::spawn_namespace_holder()
+                    .await
+                    .expect("spawning the namespace holder");
+                let mut network = PastaNetwork::new(vm_id, "tap-fc".into(), mappings)
+                    .with_loopback_ip(loopback.to_string())
+                    // No guest exists here, so nothing may probe through the forward.
+                    .with_restore_mode();
+                network
+                    .build_namespace(holder_pid)
+                    .await
+                    .expect("building the namespace");
+                let started =
+                    crate::network::NetworkManager::post_start(&mut network, holder_pid).await;
+                (
+                    Self {
+                        network,
+                        holder,
+                        holder_pid,
+                        runtime_dir,
+                    },
+                    started,
+                )
+            }
+
+            async fn stop(mut self) {
+                let _ = crate::network::NetworkManager::cleanup(&mut self.network).await;
+                let _ = self.holder.start_kill();
+                let _ = self.holder.wait().await;
+                crate::companion::forget(self.holder_pid);
+                crate::network::netns_agent::forget(self.holder_pid);
+                let _ = std::fs::remove_dir_all(&self.runtime_dir);
+            }
+        }
+
+        fn mapping(
+            host_port: u16,
+            guest_port: u16,
+            proto: crate::network::Protocol,
+        ) -> crate::network::PortMapping {
+            crate::network::PortMapping {
+                host_ip: None,
+                host_port,
+                guest_port,
+                proto,
+                loopback_client: false,
+            }
+        }
+
+        /// pasta attaches to the TAP the holder made for it, so the device is the same one
+        /// before pasta, under it and after it: only its carrier follows pasta.
+        #[tokio::test]
+        async fn pasta_attaches_to_the_holders_tap_and_leaves_it_behind() {
+            use crate::network::Protocol;
+            let (loopback, port) = free_loopback_port();
+            let mappings = vec![
+                mapping(port, 80, Protocol::Tcp),
+                mapping(port, 53, Protocol::Udp),
+            ];
+            let (running, started) = Running::start("pasta-attach", &loopback, mappings).await;
+            started.expect("starting pasta");
+
+            let under = link_state(running.holder_pid, PASTA_DEVICE_NAME);
+            assert!(has_carrier(&under), "pasta is not attached: {under}");
+            assert_eq!(under["master"], "br0");
+            assert_eq!(under["linkinfo"]["info_data"]["persist"], true);
+
+            let address: std::net::SocketAddr = format!("{loopback}:{port}").parse().unwrap();
+            assert!(super::super::listening_on_exactly(address));
+
+            let holder_pid = running.holder_pid;
+            let ifindex = under["ifindex"].clone();
+            let Running {
+                mut network,
+                holder,
+                runtime_dir,
+                ..
+            } = running;
+            crate::network::NetworkManager::cleanup(&mut network)
+                .await
+                .expect("stopping pasta");
+            let after = link_state(holder_pid, PASTA_DEVICE_NAME);
+            assert_eq!(after["ifindex"], ifindex, "pasta's exit replaced its TAP");
+            assert_eq!(
+                after["master"], "br0",
+                "pasta's exit took its TAP off the bridge"
+            );
+            assert!(
+                !has_carrier(&after),
+                "pasta0 has carrier with no pasta: {after}"
+            );
+            assert!(!super::super::listening_on_exactly(address));
+            Running {
+                network,
+                holder,
+                holder_pid,
+                runtime_dir,
+            }
+            .stop()
+            .await;
         }
     }
 }

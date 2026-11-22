@@ -2662,6 +2662,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Namespace IP (10.0.2.1) on bridge is the source of health checks, which connect from a socket the holder made
 - Guest uses pasta network (10.0.2.100)
 - Port forwarding via pasta CLI flags (-t/-u)
+- The holder builds every link over netlink in one request (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
 
 **Routed Architecture** (`src/network/routed.rs`):

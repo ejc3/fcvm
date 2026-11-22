@@ -623,40 +623,39 @@ pasta <──────────────────┼── pasta0 �
 - IP forwarding rewrites source MAC, breaking pasta's connection tracking
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
-**Setup Sequence** (3-phase with nsenter):
+**Setup Sequence**:
 1. Spawn holder process: `fcvm __netns-agent`, which unshares its user and network namespaces (UID/GID mappings written externally)
-2. Pre-pasta setup via nsenter: create Firecracker TAP device only
-3. Start pasta attached to holder's namespace (creates pasta0 TAP)
-4. Post-pasta setup via nsenter: create bridge, attach pasta0 + tap-fc, add namespace IP
-5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-6. Health checks: an HTTP GET to 10.0.2.100:80 from a socket the holder made in the namespace
+2. The holder builds every link in one request, over netlink in its own namespace (`netns_agent::build`): the Firecracker TAP and pasta's TAP as persistent devices, the bridge with its MAC and address, the MTUs, loopback up
+3. Start pasta attached to the holder's namespace; it attaches to the pasta0 the holder made
+4. Start Firecracker in the holder's namespaces (`setns` in `pre_exec`); it attaches to its TAP
+5. Health checks: an HTTP GET to 10.0.2.100:80 from a socket the holder made in the namespace
 
-**Pre-Pasta Setup Script** (Phase 2, executed via nsenter):
+**What the holder builds** (step 2), as the `ip` commands it replaces:
 ```bash
-# Create TAP device for Firecracker (pasta creates its own TAP separately)
-ip tuntap add tap-fc mode tap
-ip link set tap-fc up
 ip link set lo up
-```
+# Persistent TAPs: the VMM and pasta attach to devices that already exist
+ip tuntap add tap-fc mode tap
+ip link set tap-fc mtu 65520 && ip link set tap-fc up
+ip tuntap add pasta0 mode tap
+ip link set pasta0 mtu 65520 && ip link set pasta0 up
 
-**Post-Pasta Bridge Script** (Phase 4, executed via nsenter after pasta starts):
-```bash
-# Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
-ip link set pasta0 up
-
-# Create L2 bridge — connects pasta0 and Firecracker TAP
+# L2 bridge — connects pasta0 and Firecracker TAP
 ip link add br0 type bridge
+ip link set br0 address 02:fc:00:00:02:01
 ip link set br0 up
 ip link set pasta0 master br0
 ip link set tap-fc master br0
+ip link set br0 mtu 65520
 
 # Add IP to bridge for health checks
 # A socket made in the namespace then routes to the guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
-
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
 ```
+Each link's changes go in one netlink request (one `rtnl_mutex` hold per link), and the two
+TAPs and the bridge get `addrgenmode none`: nothing in the namespace's own stack speaks IPv6.
+Nothing forwards at L3 there either (the TAPs are bridged, and pasta reaches the guest from
+inside the namespace), so `ip_forward` is not set and nothing under /proc/sys is opened: a
+lookup there walks an entry for every other network namespace under one global lock.
 
 **Port Forwarding** (unique loopback IPs):
 ```bash

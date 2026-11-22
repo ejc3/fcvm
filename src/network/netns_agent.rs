@@ -22,6 +22,7 @@
 //! | request | reply |
 //! |---|---|
 //! | `tcp4`, `tcp6` | `ok` with a non-blocking, unconnected TCP socket made in the namespace |
+//! | `build` and a [`Shape`] as JSON | `ok` once the namespace's links exist as the shape says |
 //!
 //! A socket belongs to the network namespace it was made in for its whole life, so the
 //! owner connects it to a guest address without entering the namespace.
@@ -50,9 +51,11 @@ const OK: &[u8] = b"ok";
 const TCP4: &[u8] = b"tcp4";
 const TCP6: &[u8] = b"tcp6";
 
+const BUILD: &[u8] = b"build ";
+
 /// The longest message either side sends. Every message is one `sendmsg` of fewer bytes
 /// than this on a `SOCK_SEQPACKET` socket, so one `recvmsg` returns exactly one message.
-const MAX_MESSAGE: usize = 256;
+const MAX_MESSAGE: usize = 4096;
 
 /// A connected pair of `SOCK_SEQPACKET` sockets, both close-on-exec: the owner's end and
 /// the agent's. Sequenced packets keep message boundaries, and a closed peer reads as
@@ -126,6 +129,83 @@ fn tcp_socket(family: libc::c_int) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// The links of a rootless VM's namespace: the VMM's TAP and, behind pasta, pasta's TAP, on
+/// one bridge that holds the namespace's address.
+///
+/// Both TAPs are persistent: the VMM and pasta attach to devices that already exist and are
+/// already on the bridge, and their exit detaches them without removing a device or a
+/// bridge port.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    /// The VMM's TAP.
+    pub tap: String,
+    /// pasta's TAP. `None` in a namespace with no pasta and no route out.
+    pub pasta_tap: Option<String>,
+    pub bridge: String,
+    /// The bridge's MAC, pinned so every namespace answers for its address with the same one.
+    pub bridge_mac: [u8; 6],
+    pub bridge_address: std::net::Ipv4Addr,
+    pub bridge_prefix: u8,
+    /// The MTU of every link. `None` leaves each at the kernel's default.
+    pub mtu: Option<u32>,
+}
+
+/// Build `shape` in the calling process's network namespace, which must hold nothing but
+/// its loopback. The first step that fails is the error, named as the step.
+///
+/// One netlink request per link, each one `rtnl_mutex` hold: the bridge with its MAC, each
+/// TAP with its MTU, its place on the bridge and its up flag, then the bridge's MTU and up
+/// flag, then the address. Nothing under /proc/sys is opened: a lookup there walks an entry
+/// for every other network namespace under one global lock. Nothing in the namespace
+/// forwards at L3 (the TAPs are bridged, and pasta reaches the guest from inside the
+/// namespace), so `ip_forward` stays as it is.
+pub fn build(shape: &Shape) -> Result<()> {
+    use super::rtnl::{add_tap, link_index, LinkChange, Rtnl};
+    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
+    let index = |name: &str| link_index(name).with_context(|| format!("finding {name}"));
+
+    let up = LinkChange {
+        up: true,
+        ..Default::default()
+    };
+    rtnl.set_link(index("lo")?, &up)
+        .context("bringing loopback up")?;
+    let bridge = &shape.bridge;
+    rtnl.add_bridge(bridge, shape.bridge_mac)
+        .with_context(|| format!("creating bridge {bridge}"))?;
+    let bridge_index = index(bridge)?;
+    // pasta's TAP first, then the VMM's, as the ports were added when pasta made its own.
+    for tap in shape.pasta_tap.iter().chain(std::iter::once(&shape.tap)) {
+        add_tap(tap).with_context(|| format!("creating TAP device {tap}"))?;
+        let port = LinkChange {
+            mtu: shape.mtu,
+            master: Some(bridge_index),
+            up: true,
+            no_ipv6_link_local: true,
+        };
+        rtnl.set_link(index(tap)?, &port)
+            .with_context(|| format!("putting {tap} on bridge {bridge}"))?;
+    }
+    // The MTU is explicit, though the bridge would take its ports' smallest: a bridge whose
+    // MTU was set no longer follows its ports, so this is the value whatever joins it later.
+    let bridge_up = LinkChange {
+        mtu: shape.mtu,
+        master: None,
+        up: true,
+        no_ipv6_link_local: true,
+    };
+    rtnl.set_link(bridge_index, &bridge_up)
+        .with_context(|| format!("bringing bridge {bridge} up"))?;
+    rtnl.add_address(bridge_index, shape.bridge_address, shape.bridge_prefix)
+        .with_context(|| {
+            format!(
+                "adding {}/{} to bridge {bridge}",
+                shape.bridge_address, shape.bridge_prefix
+            )
+        })?;
+    Ok(())
+}
+
 /// Answer the owner's requests until its end of the channel closes.
 ///
 /// A request the agent cannot serve is answered with `err <reason>` and the agent keeps
@@ -135,6 +215,18 @@ pub fn serve(channel: &UnixStream) -> Result<()> {
         let family = match request.as_slice() {
             TCP4 => libc::AF_INET,
             TCP6 => libc::AF_INET6,
+            request if request.starts_with(BUILD) => {
+                let built = serde_json::from_slice::<Shape>(&request[BUILD.len()..])
+                    .context("reading the shape")
+                    .and_then(|shape| build(&shape));
+                let reply = match built {
+                    Ok(()) => OK.to_vec(),
+                    Err(error) => format!("err {error:#}").into_bytes(),
+                };
+                send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
+                    .context("answering a build")?;
+                continue;
+            }
             other => {
                 let reply = format!("err unknown request {:?}", String::from_utf8_lossy(other));
                 send(channel, reply.as_bytes()).context("answering an unknown request")?;
@@ -220,11 +312,8 @@ pub fn run(channel: RawFd, owner: u32) -> Result<()> {
     // SAFETY: unshare takes no pointers.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
         bail!(
-            "unshare(CLONE_NEWUSER | CLONE_NEWNET): {} (max_user_namespaces={})",
-            std::io::Error::last_os_error(),
-            std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                .unwrap_or_default()
-                .trim()
+            "unshare(CLONE_NEWUSER | CLONE_NEWNET): {}",
+            std::io::Error::last_os_error()
         );
     }
     // After the unshare, so no credential change can clear it, and checked against the
@@ -335,6 +424,27 @@ impl Client {
         Ok(())
     }
 
+    /// Have the agent build `shape` in its namespace ([`build`]).
+    pub async fn build(&self, shape: &Shape) -> Result<()> {
+        let mut request = BUILD.to_vec();
+        serde_json::to_writer(&mut request, shape).context("encoding the shape")?;
+        anyhow::ensure!(
+            request.len() <= MAX_MESSAGE,
+            "the shape is too long to send"
+        );
+        let _turn = self.turn.lock().await;
+        self.send(&request).await.context("asking for a build")?;
+        let (reply, _) = self.receive().await.context("waiting for the build")?;
+        match reply.strip_prefix(b"err ") {
+            Some(reason) => bail!("{}", String::from_utf8_lossy(reason)),
+            None if reply == OK => Ok(()),
+            None => bail!(
+                "the namespace agent answered a build with {:?}",
+                String::from_utf8_lossy(&reply)
+            ),
+        }
+    }
+
     /// An unconnected TCP socket made inside the agent's network namespace, for `address`'s
     /// family.
     pub async fn tcp_socket(&self, address: &std::net::IpAddr) -> Result<tokio::net::TcpSocket> {
@@ -392,6 +502,27 @@ pub fn forget(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing the agent or its netlink code runs opens a path under /proc/sys: a lookup
+    /// there costs time in proportion to the network namespaces alive, under one global
+    /// lock, and the agent runs once per namespace on the start path.
+    #[test]
+    fn the_agent_opens_nothing_under_proc_sys() {
+        for (file, source) in [
+            ("netns_agent.rs", include_str!("netns_agent.rs")),
+            ("rtnl.rs", include_str!("rtnl.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            for (number, line) in code.lines().enumerate() {
+                let line = line.trim_start();
+                assert!(
+                    line.starts_with("//") || !line.contains("/proc/sys"),
+                    "{file}:{}: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
 
     /// The serve loop on a thread, in this process's own namespaces: the protocol without
     /// the unshare.
