@@ -14,6 +14,13 @@ from collections import defaultdict
 from pathlib import Path
 
 
+def in_window(t, lo, hi):
+    """Whether pidstat's HH:MM:SS stamp t lies in [lo, hi]; a window that crosses midnight has lo > hi."""
+    if lo <= hi:
+        return lo <= t <= hi
+    return t >= lo or t <= hi
+
+
 def main():
     d = Path(sys.argv[1])
     top_n = int(sys.argv[2]) if len(sys.argv) > 2 else 15
@@ -44,7 +51,7 @@ def main():
             t, syst, cpu = f[0], float(f[4]), float(f[7])
         except ValueError:
             continue
-        if lo is not None and not (lo <= t <= hi):
+        if lo is not None and not in_window(t, lo, hi):
             continue
         cmd = f[9]
         tot[cmd] += cpu / 100 * interval

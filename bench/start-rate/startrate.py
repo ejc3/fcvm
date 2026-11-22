@@ -132,8 +132,7 @@ def host_facts(repo):
 
 
 def cmd_prep(a):
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
+    out = claim_dir(a.out)
     stamp = int(wall())
     base = f"sr-base-{stamp}"
     snap = f"sr-snap-{a.network}-{stamp}"
@@ -260,7 +259,7 @@ class HostSampler(threading.Thread):
 
 
 class Clone:
-    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "marks", "t_healthy", "exit", "buf", "error")
+    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "marks", "t_healthy", "exit", "buf", "error", "done")
 
     def __init__(self, i, name):
         self.i, self.name = i, name
@@ -273,6 +272,7 @@ class Clone:
         self.exit = None
         self.buf = b""
         self.error = None
+        self.done = False
 
 
 def ensure_fd_limit(count, rlimit=resource):
@@ -292,10 +292,126 @@ def ensure_fd_limit(count, rlimit=resource):
     return soft
 
 
+def positive_int(text):
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {v}")
+    return v
+
+
+def claim_dir(path):
+    """Create the run's output directory, or exit when it exists: a run never reuses one.
+
+    os.mkdir is the atomic claim, so two runs given one OUT cannot both win, and a stale
+    summary.json from an earlier run is never presented as the current one.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(p)
+    except FileExistsError:
+        sys.exit(f"BLOCKED: {p} already exists; a run needs a fresh output directory")
+    return p
+
+
+class Progress:
+    """Run-wide completion state. Every read-modify-write of it happens under one lock.
+
+    A clone finishes exactly once: the first of healthy, failed or timed out wins and later
+    events for it are ignored, so pending never goes negative and no clone counts twice.
+    """
+
+    def __init__(self, count, concurrency):
+        self.cv = threading.Condition()
+        self.count = count
+        self.concurrency = concurrency
+        self.pending = 0  # spawned (or being spawned), not yet healthy and not failed
+        self.healthy_n = 0
+        self.failed_n = 0
+        self.next_i = 0
+        self.stopping = False
+
+    def complete(self, c, t=None, err=None):
+        """Publish c's terminal outcome; False when c already has one."""
+        with self.cv:
+            if c.done:
+                return False
+            c.done = True
+            if err is None:
+                c.t_healthy = t
+                self.healthy_n += 1
+            else:
+                c.error = err
+                self.failed_n += 1
+            self.pending -= 1
+            self.cv.notify_all()
+            return True
+
+    def claim(self):
+        """A launcher's next clone index once a slot is free, or None when the run is over or stopped."""
+        with self.cv:
+            while self.pending >= self.concurrency and not self.stopping:
+                self.cv.wait(0.5)
+            if self.stopping or self.next_i >= self.count:
+                return None
+            i = self.next_i
+            self.next_i += 1
+            self.pending += 1
+            return i
+
+    def stop(self):
+        with self.cv:
+            self.stopping = True
+            self.cv.notify_all()
+
+    def counts(self):
+        with self.cv:
+            return self.healthy_n, self.failed_n
+
+
+def stop_clones(clones, sudo, limit_s=120):
+    """SIGTERM every live clone, wait, SIGKILL what is left, reap. Safe to call twice."""
+    td0 = now_ns()
+    for c in clones:
+        if c.proc is not None and c.proc.poll() is None:
+            kill(c.proc.pid, signal.SIGTERM, sudo)
+    for c in clones:
+        if c.proc is None:
+            continue
+        try:
+            c.proc.wait(timeout=max(1, limit_s - (now_ns() - td0) / 1e9))
+        except subprocess.TimeoutExpired:
+            kill(c.proc.pid, signal.SIGKILL, sudo)
+            try:
+                c.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+    return (now_ns() - td0) / 1e9
+
+
+def stop_pidstat(p):
+    if p is None:
+        return
+    if p.poll() is None:
+        p.send_signal(signal.SIGINT)
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def cmd_run(a):
     prep = json.loads(Path(a.prep).read_text())
-    out = Path(a.out)
-    (out / "clones").mkdir(parents=True, exist_ok=True)
+    out = claim_dir(a.out)
+    (out / "clones").mkdir()
     repo = Path(__file__).resolve().parents[2]
     facts = host_facts(repo)
     cfg = {
@@ -322,34 +438,12 @@ def cmd_run(a):
     env = dict(os.environ, RUST_LOG=a.rust_log, NO_COLOR="1")
     run_id = f"sr{int(wall()) % 100000}"
 
-    sampler = HostSampler(out / "host.tsv")
-    sampler.start()
-    pidstat = subprocess.Popen(
-        ["pidstat", "-u", "-h", str(a.pidstat_interval)],
-        stdout=open(out / "pidstat.log", "w"), stderr=subprocess.STDOUT, start_new_session=True,
-    )
-
     sel = selectors.DefaultSelector()
     sel_lock = threading.Lock()
     clones = [Clone(i, f"{run_id}-c{i:05d}") for i in range(a.count)]
-    pending = 0  # spawned, not yet healthy and not failed
-    cv = threading.Condition()
-    healthy_n = 0
-    failed_n = 0
+    progress = Progress(a.count, a.concurrency)
     t0 = now_ns()
     t0_wall = wall()
-
-    def finish(c, err=None):
-        nonlocal pending, failed_n, healthy_n
-        with cv:
-            if err is not None and c.error is None and c.t_healthy is None:
-                c.error = err
-                failed_n += 1
-                pending -= 1
-            elif err is None:
-                healthy_n += 1
-                pending -= 1
-            cv.notify_all()
 
     def on_line(c, line, t):
         text = line.decode(errors="replace")
@@ -357,9 +451,8 @@ def cmd_run(a):
         for m in EXTRA_MARKERS:
             if m in text and m not in c.marks:
                 c.marks[m] = (t - c.spawn_ns) / 1e6
-        if c.t_healthy is None and HEALTHY_MARKER in text:
-            c.t_healthy = t
-            finish(c)
+        if HEALTHY_MARKER in text:
+            progress.complete(c, t=t)
 
     reader_stop = threading.Event()
 
@@ -385,34 +478,22 @@ def cmd_run(a):
                         on_line(c, c.buf, t)
                         c.buf = b""
                     c.log.flush()
-                    if c.t_healthy is None:
+                    if not c.done:
                         rc = c.proc.wait()
                         c.exit = rc
-                        finish(c, f"exited {rc} before healthy")
+                        progress.complete(c, err=f"exited {rc} before healthy")
                     continue
                 c.buf += chunk
                 while b"\n" in c.buf:
                     line, _, c.buf = c.buf.partition(b"\n")
                     on_line(c, line, t)
 
-    rt = threading.Thread(target=reader, name="reader", daemon=True)
-    rt.start()
-
-    next_i = 0
-    next_lock = threading.Lock()
-
     def launcher():
-        nonlocal next_i, pending
         while True:
-            with cv:
-                while pending >= a.concurrency:
-                    cv.wait(0.5)
-                with next_lock:
-                    if next_i >= a.count:
-                        return
-                    c = clones[next_i]
-                    next_i += 1
-                pending += 1
+            i = progress.claim()
+            if i is None:
+                return
+            c = clones[i]
             c.spawn_ns = now_ns()
             r = w = None
             try:
@@ -429,104 +510,123 @@ def cmd_run(a):
                 for fd in (w, r):
                     if fd is not None:
                         os.close(fd)
-                finish(c, f"spawn failed: {e}")
+                progress.complete(c, err=f"spawn failed: {e}")
                 continue
             c.t_spawn = (now_ns() - c.spawn_ns) / 1e6
             os.close(w)
             with sel_lock:
                 sel.register(r, selectors.EVENT_READ, c)
 
+    sampler = HostSampler(out / "host.tsv")
+    pidstat = None
+    rt = threading.Thread(target=reader, name="reader", daemon=True)
     launchers = [threading.Thread(target=launcher, name=f"launcher-{k}", daemon=True) for k in range(a.launchers)]
-    for th in launchers:
-        th.start()
+    prev_term = signal.signal(signal.SIGTERM, _interrupt)
 
-    deadline_extra = a.timeout * 1e9
-    while True:
-        with cv:
-            done = healthy_n + failed_n
-            if done >= a.count:
-                break
-            cv.wait(0.5)
-        t = now_ns()
-        for c in clones:
-            if c.spawn_ns and c.t_healthy is None and c.error is None and t - c.spawn_ns > deadline_extra:
-                finish(c, f"not healthy within {a.timeout}s")
-        if a.fail_fast and failed_n:
-            break
-    for th in launchers:
-        th.join(timeout=1)
-    t_all = now_ns()
-    print(f"healthy={healthy_n} failed={failed_n} in {(t_all - t0)/1e9:.2f}s")
+    def stop_launching():
+        progress.stop()
+        for th in launchers:
+            if th.is_alive():
+                th.join()
 
-    # Verify against the state files: every clone the log calls healthy must be healthy there.
-    vms = list_vms(a.fcvm, prep["sudo"])
-    by_name = {v.get("name"): v for v in vms}
-    ok_names = [c.name for c in clones if c.t_healthy is not None]
-    state_healthy = [n for n in ok_names if by_name.get(n, {}).get("health_status") == "healthy"]
-    alive = sum(1 for c in clones if c.proc is not None and c.proc.poll() is None)
-    verify = {
-        "log_healthy": len(ok_names),
-        "state_healthy": len(state_healthy),
-        "ls_entries_for_run": sum(1 for n in by_name if n and n.startswith(run_id)),
-        "alive_at_end": alive,
-    }
-    print(json.dumps(verify))
-    if a.hold:
-        # Keep every clone up so host.tsv and pidstat record what the idle clones cost.
-        print(f"holding {alive} clones for {a.hold}s")
-        time.sleep(a.hold)
-    t_hold_end = now_ns()
-
-    # Teardown: SIGTERM every clone, then wait.
-    td0 = now_ns()
-    for c in clones:
-        if c.proc is not None and c.proc.poll() is None:
-            kill(c.proc.pid, signal.SIGTERM, prep["sudo"])
-    for c in clones:
-        if c.proc is not None:
-            try:
-                c.proc.wait(timeout=max(1, 120 - (now_ns() - td0) / 1e9))
-            except subprocess.TimeoutExpired:
-                kill(c.proc.pid, signal.SIGKILL, prep["sudo"])
-    teardown_s = (now_ns() - td0) / 1e9
-    time.sleep(0.5)
-    reader_stop.set()
-    rt.join(timeout=5)
-    sampler.stop.set()
-    sampler.join(timeout=3)
-    pidstat.send_signal(signal.SIGINT)
     try:
-        pidstat.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pidstat.kill()
+        sampler.start()
+        with open(out / "pidstat.log", "w") as pidstat_log:
+            pidstat = subprocess.Popen(
+                ["pidstat", "-u", "-h", str(a.pidstat_interval)],
+                stdout=pidstat_log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        rt.start()
+        for th in launchers:
+            th.start()
 
-    with open(out / "samples.jsonl", "w") as fh:
-        for c in clones:
-            if c.log:
-                c.log.close()
-            fh.write(json.dumps({
-                "i": c.i, "name": c.name,
-                "spawn_at_ms": (c.spawn_ns - t0) / 1e6 if c.spawn_ns else None,
-                "popen_ms": c.t_spawn,
-                "healthy_at_ms": (c.t_healthy - t0) / 1e6 if c.t_healthy else None,
-                "spawn_to_healthy_ms": (c.t_healthy - c.spawn_ns) / 1e6 if c.t_healthy else None,
-                "marks_ms": c.marks, "error": c.error, "exit": c.exit,
-            }) + "\n")
-    (out / "phases.json").write_text(json.dumps({
-        "t0_mono_ns": t0, "all_done_mono_ns": t_all, "hold_end_mono_ns": t_hold_end, "teardown_end_mono_ns": now_ns(),
-        "t0_wall": t0_wall, "all_done_wall": t0_wall + (t_all - t0) / 1e9,
-        "hold_end_wall": t0_wall + (t_hold_end - t0) / 1e9,
-    }) + "\n")
-    summary = summarize(out, verify=verify, teardown_s=teardown_s, t0_wall=t0_wall)
-    print_summary(summary)
-    bad = (
-        verify["state_healthy"] != verify["log_healthy"]
-        or verify["log_healthy"] == 0
-        or failed_n > 0
-    )
-    if bad:
-        print("FAILED: see summary.json (failures, or log/state health disagree)", file=sys.stderr)
-        sys.exit(1)
+        deadline_extra = a.timeout * 1e9
+        while True:
+            with progress.cv:
+                healthy_n, failed_n = progress.healthy_n, progress.failed_n
+                if healthy_n + failed_n >= a.count:
+                    break
+                progress.cv.wait(0.5)
+            t = now_ns()
+            for c in clones:
+                if c.spawn_ns and not c.done and t - c.spawn_ns > deadline_extra:
+                    progress.complete(c, err=f"not healthy within {a.timeout}s")
+            if a.fail_fast and progress.counts()[1]:
+                break
+        # No launcher may start a clone after this point: the sweeps below must see every child.
+        stop_launching()
+        healthy_n, failed_n = progress.counts()
+        t_all = now_ns()
+        print(f"healthy={healthy_n} failed={failed_n} in {(t_all - t0)/1e9:.2f}s")
+
+        # Verify against the state files: every clone the log calls healthy must be healthy there.
+        vms = list_vms(a.fcvm, prep["sudo"])
+        by_name = {v.get("name"): v for v in vms}
+        ok_names = [c.name for c in clones if c.t_healthy is not None]
+        state_healthy = [n for n in ok_names if by_name.get(n, {}).get("health_status") == "healthy"]
+        alive = sum(1 for c in clones if c.proc is not None and c.proc.poll() is None)
+        verify = {
+            "log_healthy": len(ok_names),
+            "state_healthy": len(state_healthy),
+            "ls_entries_for_run": sum(1 for n in by_name if n and n.startswith(run_id)),
+            "alive_at_end": alive,
+        }
+        print(json.dumps(verify))
+        if a.hold:
+            # Keep every clone up so host.tsv and pidstat record what the idle clones cost.
+            print(f"holding {alive} clones for {a.hold}s")
+            time.sleep(a.hold)
+        t_hold_end = now_ns()
+
+        teardown_s = stop_clones(clones, prep["sudo"])
+        time.sleep(0.5)
+        reader_stop.set()
+        rt.join(timeout=5)
+        sampler.stop.set()
+        sampler.join(timeout=3)
+        stop_pidstat(pidstat)
+
+        with open(out / "samples.jsonl", "w") as fh:
+            for c in clones:
+                if c.log:
+                    c.log.close()
+                fh.write(json.dumps({
+                    "i": c.i, "name": c.name,
+                    "spawn_at_ms": (c.spawn_ns - t0) / 1e6 if c.spawn_ns else None,
+                    "popen_ms": c.t_spawn,
+                    "healthy_at_ms": (c.t_healthy - t0) / 1e6 if c.t_healthy else None,
+                    "spawn_to_healthy_ms": (c.t_healthy - c.spawn_ns) / 1e6 if c.t_healthy else None,
+                    "marks_ms": c.marks, "error": c.error, "exit": c.exit,
+                }) + "\n")
+        (out / "phases.json").write_text(json.dumps({
+            "t0_mono_ns": t0, "all_done_mono_ns": t_all, "hold_end_mono_ns": t_hold_end,
+            "teardown_end_mono_ns": now_ns(),
+            "t0_wall": t0_wall, "all_done_wall": t0_wall + (t_all - t0) / 1e9,
+            "hold_end_wall": t0_wall + (t_hold_end - t0) / 1e9,
+        }) + "\n")
+        summary = summarize(out, verify=verify, teardown_s=teardown_s, t0_wall=t0_wall)
+        print_summary(summary)
+        bad = (
+            verify["state_healthy"] != verify["log_healthy"]
+            or verify["log_healthy"] == 0
+            or failed_n > 0
+        )
+        if bad:
+            print("FAILED: see summary.json (failures, or log/state health disagree)", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        # Every child this run started stops here whatever got us here: a failed verification,
+        # an exception, Ctrl-C or SIGTERM. Already-stopped children make each step a no-op.
+        signal.signal(signal.SIGTERM, prev_term)
+        stop_launching()
+        stop_clones(clones, prep["sudo"])
+        reader_stop.set()
+        if rt.is_alive():
+            rt.join(timeout=5)
+        sampler.stop.set()
+        if sampler.is_alive():
+            sampler.join(timeout=3)
+        stop_pidstat(pidstat)
 
 
 # --------------------------------------------------------------------------- report
@@ -633,7 +733,7 @@ def cmd_report(a):
         print_summary(s)
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prep")
@@ -653,8 +753,8 @@ def main():
     r.add_argument("--prep", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--count", type=int, required=True)
-    r.add_argument("--concurrency", type=int, required=True)
-    r.add_argument("--launchers", type=int, default=4)
+    r.add_argument("--concurrency", type=positive_int, required=True)
+    r.add_argument("--launchers", type=positive_int, default=4)
     r.add_argument("--timeout", type=float, default=180)
     r.add_argument("--rust-log", default="fcvm=info,health-monitor=info")
     r.add_argument("--pidstat-interval", type=int, default=2)
@@ -667,7 +767,11 @@ def main():
     q = sub.add_parser("report")
     q.add_argument("dirs", nargs="+")
     q.set_defaults(fn=cmd_report)
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
     a.fn(a)
 
 
