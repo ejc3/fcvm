@@ -10334,11 +10334,20 @@ class NoHostIdentifiersInTree(unittest.TestCase):
         "i-" + "1234567890abcdef0",
         "i-" + "0123456789abcdef0",
         "vol-" + "1234567890abcdef0",
+        # tests/test_fleet_coord.rs's made-up hosts: one repeated letter.
+        "i-" + "0aaaaaaaaaaaaaaa1",
+        "i-" + "0aaaaaaaaaaaaaaa2",
+        "i-" + "0bbbbbbbbbbbbbbb1",
     }
     # Spelled in pieces so this file does not contain the forbidden keys.
     FIELDS = ("instance" + "_id", "host_" + "ipv4", "host_" + "ipv6")
     # Captured third-party pages and dependency locks are not our records.
-    SKIP_PREFIXES = ("bench/chromium/corpus-live/", "tests/package-lock.json")
+    SKIP_PREFIXES = (
+        "bench/chromium/corpus-live/",
+        "tests/package-lock.json",
+        # The vendored Amazon IVS player (minified); its identifiers are its own.
+        "fleet/web/public/ivs/",
+    )
 
     def offenders(self, pathspec, with_fields):
         root = os.path.dirname(os.path.dirname(HERE))
