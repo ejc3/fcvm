@@ -1244,6 +1244,12 @@ class AttributionTests(unittest.TestCase):
                         # region/instance (test_an_ec2_tile_is_attributed_to_its_bare_instance_id
                         # pins that format): only the field is checked here.
                         self.assertTrue(isinstance(tile.get("vm"), str) and tile["vm"], "an EC2 tile names no vm")
+                    elif tile.get("half") == "lambda":
+                        # A Lambda tile runs in a Lambda environment (`vm`) on an instance the
+                        # fleet cannot see, not on a host image the release gate judges: it names
+                        # an environment and is attributed to nothing.
+                        self.assertTrue(isinstance(tile.get("vm"), str) and tile["vm"], "a Lambda tile names no vm")
+                        self.assertEqual(smoke.tile_attribution(tile), ([], []))
                     else:
                         hosts, instances = smoke.tile_attribution(tile)
                         self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
@@ -1258,8 +1264,8 @@ class AttributionTests(unittest.TestCase):
         # Every kind of probe the smoke attributes from a tile appears in some vector. The potato
         # game's host is pinned by 33_potato.json's /view/potato/host checks: its final view is
         # after the host has gone.
-        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("phones", "fcvm"), ("windows", "fcvm"),
-                     ("minecraft", "fcvm"), ("aggregate", "fcvm")):
+        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("wall", "lambda"), ("phones", "fcvm"),
+                     ("windows", "fcvm"), ("minecraft", "fcvm"), ("aggregate", "fcvm")):
             self.assertIn(kind, seen)
 
     def test_the_summary_line_holds_digests_and_no_line_holds_an_id(self):
