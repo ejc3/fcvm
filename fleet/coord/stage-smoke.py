@@ -585,7 +585,8 @@ def tile_attribution(tile):
     """The (host instance ids, tile instance ids) /live reports serving a tile: a GPU host's tile,
     phone, sandbox, server or aggregate names its host; an EC2 tile names the instance it runs on
     (`vm`); the EC2 half's aggregate relays its tiles' frames (`sweep_jobs` lists their instances
-    under `_instances`). Empty when /live names none."""
+    under `_instances`). Empty when /live names none, as for a Lambda tile, whose `vm` is a Lambda
+    environment on an instance the fleet cannot see."""
     if tile.get("_instances") is not None:
         return [], list(tile["_instances"])
     if tile.get("half") == "ec2":
