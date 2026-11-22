@@ -1233,6 +1233,12 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
             while True:
                 try:
                     if not sent:
+                        # Opening a replacement connection can use up the wait: no intent goes
+                        # out after it.
+                        if time.monotonic() >= limit:
+                            if limit < deadline:
+                                return False
+                            raise TimeoutError("staging did not reach the required state")
                         connection.send(intent)
                         sent = True
                     opcode, payload = connection.message(limit)
@@ -1472,19 +1478,25 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
     """Borrow a server, drive it once through its view socket, give it back."""
     p = Probe("minecraft", None, family)
     p.step = "take over"
+    def current():
+        """This probe's viewer and direct token now. A /live connection that was replaced is a
+        new viewer with its own token, and a claim sent again on it is that viewer's."""
+        _, admission, viewer_now = now()
+        return viewer_now or viewer, ((admission or {}).get("direct") or {}).get("value") or token
     if not commit("claim_minecraft", {}):
         p.error = ("AssertionError", "the coordinator refused the take-over")
         return p
     try:
         held_by = time.monotonic() + 30
         def held(s):
-            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or [])
+            return any(mine(t, current()[0]) for _, t in tiles_of(s, "minecraft") or [])
         until(held, by=held_by)
-        tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, viewer)), None)
+        holder, admit = current()
+        tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, holder)), None)
         if tile is None:
             p.error = ("AssertionError", "the borrowed server never showed as this viewer's")
             return p
-        p = probe_tile("minecraft", "fcvm", tile, family, token, viewer, resolvers, takeover=True)
+        p = probe_tile("minecraft", "fcvm", tile, family, admit, holder, resolvers, takeover=True)
         p.tile = (p.tile or "") + " take-over"
         return p
     finally:
