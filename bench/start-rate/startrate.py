@@ -73,7 +73,9 @@ def sh(cmd, **kw):
 
 
 def fcvm_cmd(fcvm, sudo):
-    return (["sudo", "-E", fcvm] if sudo else [fcvm])
+    # A harness already running as root (make runs it under sudo for bridged and routed)
+    # spawns fcvm directly, so no clone pays for a sudo process.
+    return ["sudo", "-E", fcvm] if sudo and os.geteuid() != 0 else [fcvm]
 
 
 def imds(path):
@@ -209,7 +211,7 @@ def cmd_teardown(a):
 
 
 def kill(pid, sig, sudo):
-    if sudo:
+    if sudo and os.geteuid() != 0:
         subprocess.run(["sudo", "kill", f"-{sig.name[3:]}", str(pid)], capture_output=True)
     else:
         try:
