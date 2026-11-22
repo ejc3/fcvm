@@ -1706,26 +1706,20 @@ async fn proxy_connection(client: tokio::net::TcpStream, port: u16) {
 
 /// Copy one relayed connection both ways until both directions have ended.
 ///
-/// Both sockets get TCP_NODELAY. The copy writes each read as it arrives, so a message
-/// one end sends in two writes (a short frame, then the payload) leaves the relay as two
-/// small writes, and without TCP_NODELAY Nagle holds the second until the receiver's
-/// delayed ACK of the first: 40 ms on loopback, per message. The buffers are 64 KiB each
-/// way, so with TCP_NODELAY a bulk transfer still leaves the relay in large writes.
+/// Both sockets get TCP_NODELAY (`relay_socket`). The buffers are 64 KiB each way, so a
+/// bulk transfer still leaves the relay in large writes.
 async fn relay_localhost_connection(
     mut client: tokio::net::TcpStream,
     mut upstream: tokio::net::TcpStream,
     port: u16,
 ) {
     for (side, stream) in [("client", &client), ("upstream", &upstream)] {
-        if let Err(e) = stream.set_nodelay(true) {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[fc-agent] WARNING: localhost proxy port {port}: TCP_NODELAY on the {side} socket: {e} (logged once)"
-                );
-            }
-        }
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::relay_socket::set_relay_nodelay(
+            stream,
+            &WARNED,
+            format_args!("localhost proxy port {port}, {side} socket"),
+        );
     }
     const RELAY_BUFFER: usize = 64 * 1024;
     if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
@@ -2532,10 +2526,8 @@ mod forward_localhost_tests {
     /// the first part only when its delayed-ACK timer fires (40 ms). A relay socket without
     /// TCP_NODELAY holds the second part until then.
     async fn two_part_message_median(toward_client: bool) -> std::time::Duration {
+        use crate::relay_socket::two_part::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        const ROUNDS: usize = 30;
-        const FIRST: usize = 28;
-        const SECOND: usize = 1_300;
         let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let service_addr = service.local_addr().unwrap();
         let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2556,23 +2548,6 @@ mod forward_localhost_tests {
         } else {
             (client, server)
         };
-        // Loopback starts in quick-ACK mode, and the kernel turns it back on, so it is
-        // turned off before every message.
-        let quickack_off = |s: &tokio::net::TcpStream| {
-            use std::os::fd::AsRawFd;
-            let off: libc::c_int = 0;
-            // SAFETY: a valid socket fd and a c_int option value that outlives the call.
-            let rc = unsafe {
-                libc::setsockopt(
-                    s.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    libc::TCP_QUICKACK,
-                    &off as *const libc::c_int as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            assert_eq!(rc, 0, "TCP_QUICKACK: {}", std::io::Error::last_os_error());
-        };
         let mut took = Vec::with_capacity(ROUNDS);
         let mut buf = vec![0u8; SECOND];
         for _ in 0..ROUNDS {
@@ -2583,15 +2558,12 @@ mod forward_localhost_tests {
             writer.write_all(&[2u8; SECOND]).await.unwrap();
             reader.read_exact(&mut buf[..SECOND]).await.unwrap();
             took.push(started.elapsed());
-            // Longer than the delayed-ACK timer, so the next round starts with nothing
-            // unacknowledged on the relay's sockets.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
         }
         drop(writer);
         drop(reader);
         relay_task.await.unwrap();
-        took.sort();
-        took[ROUNDS / 2]
+        median(took)
     }
 
     /// A reply the host service writes in two parts reaches the guest client without
@@ -2600,7 +2572,7 @@ mod forward_localhost_tests {
     async fn a_reply_written_in_two_parts_crosses_the_relay_without_waiting_for_an_ack() {
         let median = two_part_message_median(true).await;
         assert!(
-            median < std::time::Duration::from_millis(20),
+            median < crate::relay_socket::two_part::LIMIT,
             "median {median:?} for a reply in two parts through the relay"
         );
     }
@@ -2611,7 +2583,7 @@ mod forward_localhost_tests {
     async fn a_request_written_in_two_parts_crosses_the_relay_without_waiting_for_an_ack() {
         let median = two_part_message_median(false).await;
         assert!(
-            median < std::time::Duration::from_millis(20),
+            median < crate::relay_socket::two_part::LIMIT,
             "median {median:?} for a request in two parts through the relay"
         );
     }
