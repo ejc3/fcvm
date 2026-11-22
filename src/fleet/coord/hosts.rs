@@ -211,6 +211,10 @@ struct Watch {
     since: Option<u64>,
     /// No launch before this (both markets refused).
     next_launch: Option<Instant>,
+    /// The account's quota refused the last launch attempt: reported as degraded on every
+    /// pass, including the polls between attempts, until an attempt is refused for something
+    /// else or the region holds its awake hosts.
+    quota: Option<String>,
 }
 
 /// The hosts of `listed` plus the instances `recent` launched in `region` that this list
@@ -388,6 +392,7 @@ pub async fn run(
                     coming_up: want > 0,
                     since: (want > 0).then_some(since),
                     next_launch: None,
+                    quota: None,
                 };
             }
             last_want = Some(want);
@@ -565,11 +570,13 @@ pub async fn run(
                     busy |= found > 0;
                     if live < want {
                         let short = want - live;
+                        let mut quota = None;
                         let mut pass = Pass {
                             on_demand: &mut on_demand,
                             recent: &mut recent,
                             tokens: &mut tokens,
                             errors: &mut errors,
+                            quota: &mut quota,
                         };
                         let (launched, retry) = match cfg.spread {
                             HostSpread::None => {
@@ -583,8 +590,16 @@ pub async fn run(
                         };
                         watch[i].next_launch =
                             (launched < short && retry).then(|| now + cfg.capacity_retry);
+                        // This attempt's answer replaces the last one's.
+                        watch[i].quota = quota;
                     }
                 }
+            }
+            if live >= want {
+                watch[i].quota = None;
+            }
+            if let Some(q) = &watch[i].quota {
+                errors.push(q.clone());
             }
             let running = |m: Market| {
                 kept.iter()
@@ -735,6 +750,8 @@ struct Pass<'a> {
     recent: &'a mut HashMap<String, Recent>,
     tokens: &'a mut Tokens,
     errors: &'a mut Vec<String>,
+    /// Set when a launch is left short by the account's quota (see [`QUOTA_CODES`]).
+    quota: &'a mut Option<String>,
 }
 
 /// Launch `short` hosts in `region`, in the subnets of `zones` (every subnet when empty):
@@ -753,7 +770,10 @@ async fn launch_shortfall(
         recent,
         tokens,
         errors,
+        quota: quota_refusal,
     } = pass;
+    // Only this attempt's answer counts.
+    **quota_refusal = None;
     let mut placed: Vec<Option<String>> = Vec::new();
     let mut launched = 0;
     let mut refused = Vec::new();
@@ -851,8 +871,9 @@ async fn launch_shortfall(
             "GPU hosts still short; asking again after the capacity retry");
         // A quota refusal is this account's limit, not EC2's capacity: it holds until the
         // quota is raised or the account's other hosts finish shutting down. It is reported
-        // (the `scale` failure, and the line the degraded alarms match), and the region still
-        // asks again after the capacity retry.
+        // (the `scale` failure, kept by `run` until an attempt is not refused for quota, and
+        // the line the degraded alarms match), and the region still asks again after the
+        // capacity retry.
         let quota: Vec<&str> = refused
             .iter()
             .map(String::as_str)
@@ -861,10 +882,7 @@ async fn launch_shortfall(
         if !quota.is_empty() {
             let why = quota.join("; ");
             tracing::warn!(%region, market = last.name(), error = %why, "EC2 refused a GPU host launch");
-            let line = format!("{region} {}: {why}", last.name());
-            if !errors.contains(&line) {
-                errors.push(line);
-            }
+            **quota_refusal = Some(format!("{region} {}: {why}", last.name()));
         }
     }
     (placed, !failed)
@@ -1817,8 +1835,9 @@ mod tests {
 
     /// One launch pass for one host in a region where both markets have no room, on demand
     /// refused with `od_refusal` (EC2's capacity refusal when `None`): what it logged, the
-    /// errors it reported for the `scale` component, and whether the rest waits for capacity.
-    async fn short_pass(od_refusal: Option<&str>) -> (String, Vec<String>, bool) {
+    /// errors it reported, the quota refusal it reported, and whether the rest waits for
+    /// capacity.
+    async fn short_pass(od_refusal: Option<&str>) -> (String, Vec<String>, Option<String>, bool) {
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -1858,18 +1877,19 @@ mod tests {
             capacity_retry: Duration::from_millis(50),
             lost_launch_ttl: Duration::from_secs(120),
         };
-        let (mut on_demand, mut recent, mut tokens, mut errors) =
-            (Some(0), HashMap::new(), HashMap::new(), Vec::new());
+        let (mut on_demand, mut recent, mut tokens, mut errors, mut quota) =
+            (Some(0), HashMap::new(), HashMap::new(), Vec::new(), None);
         let mut pass = Pass {
             on_demand: &mut on_demand,
             recent: &mut recent,
             tokens: &mut tokens,
             errors: &mut errors,
+            quota: &mut quota,
         };
         let (launched, retry) = launch_shortfall(&cfg, "r", 1, &[], &mut pass).await;
         assert!(launched.is_empty());
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (out, errors, retry)
+        (out, errors, quota, retry)
     }
 
     /// A pass that leaves a region short says why its last market refused: on 2026-11-05
@@ -1877,7 +1897,7 @@ mod tests {
     /// demand was refused with VcpuLimitExceeded (#1257).
     #[tokio::test(flavor = "current_thread")]
     async fn a_region_still_short_logs_the_on_demand_refusal() {
-        let (out, errors, retry) = short_pass(None).await;
+        let (out, errors, quota, retry) = short_pass(None).await;
         let line = out
             .lines()
             .find(|l| l.contains("GPU hosts still short"))
@@ -1886,6 +1906,7 @@ mod tests {
         // EC2 had no capacity: the region waits for it, and nothing is degraded.
         assert!(retry);
         assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(quota, None);
         assert!(!out.contains("EC2 refused a GPU host launch"), "{out}");
     }
 
@@ -1900,14 +1921,16 @@ mod tests {
     async fn an_on_demand_quota_refusal_marks_the_scale_degraded() {
         let quota = "VcpuLimitExceeded: You have requested more vCPU capacity than your \
                      current vCPU limit of 384 allows";
-        let (out, errors, retry) = short_pass(Some(quota)).await;
+        let (out, errors, reported, retry) = short_pass(Some(quota)).await;
         // The quota can free (a terminated host finishes shutting down): ask again after the
-        // capacity retry, as for capacity.
+        // capacity retry, as for capacity. `run` reports it as degraded
+        // (a_quota_refused_launch_stays_degraded_between_attempts).
         assert!(retry);
-        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        let reported = reported.expect("the quota refusal is reported");
         assert!(
-            errors[0].starts_with("r on-demand: VcpuLimitExceeded"),
-            "{errors:?}"
+            reported.starts_with("r on-demand: VcpuLimitExceeded"),
+            "{reported}"
         );
         let line = out
             .lines()
