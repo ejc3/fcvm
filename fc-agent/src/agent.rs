@@ -824,16 +824,22 @@ async fn start_chronyd(host_servers: Vec<String>) {
 
     // The swap takes the lifecycle; the readiness wait below does not, because
     // a restore must never queue behind it.
-    if !CHRONYD_LIFECYCLE.boot_swap(&GuestChronyd, &config).await {
+    let Some(started_under) = CHRONYD_LIFECYCLE.boot_swap(&GuestChronyd, &config).await else {
         return;
-    }
+    };
 
     // Positive verification. Waiting for chronyc to answer proves the daemon is
     // up; counting its sources proves the config we wrote was actually loaded.
     // Zero sources is a REAL failure — the clock will drift with nothing to
     // correct it — so it is reported as an error rather than passed over.
-    match wait_for_chrony_sources().await {
-        Ok(count) => eprintln!("[fc-agent] chronyd started with {count} NTP source(s)"),
+    match wait_for_chrony_sources(started_under).await {
+        Ok(ChronySources::Ready(count)) => {
+            eprintln!("[fc-agent] chronyd started with {count} NTP source(s)")
+        }
+        Ok(ChronySources::Superseded) => eprintln!(
+            "[fc-agent] chronyd: a restore retired the boot's daemon before it reported its \
+             sources; the restore starts its own"
+        ),
         Err(e) => eprintln!("[fc-agent] ERROR: chronyd is not usable: {e}"),
     }
 }
@@ -928,6 +934,10 @@ impl ChronydSystem for GuestChronyd {
 ///   clone) has moved the count again.
 struct ChronydLifecycle {
     state: std::sync::Arc<tokio::sync::Mutex<LifecycleState>>,
+    /// [`LifecycleState::restores`], published for readers that must not wait for the
+    /// lock: a restore holds it from its kill until it starts its daemon. Written only
+    /// with the lock held, in [`Self::retire_for_restore`].
+    latest_restore: std::sync::atomic::AtomicU64,
     /// Set once the boot setup has stopped systemd's chrony unit and ended every
     /// chronyd it left running.
     systemd_gone: tokio::sync::watch::Sender<bool>,
@@ -960,18 +970,28 @@ impl ChronydLifecycle {
     fn new() -> Self {
         Self {
             state: std::sync::Arc::new(tokio::sync::Mutex::new(LifecycleState::default())),
+            latest_restore: std::sync::atomic::AtomicU64::new(0),
             systemd_gone: tokio::sync::watch::Sender::new(false),
         }
     }
 
+    /// Whether a restore after number `restore` has retired the daemons: a daemon
+    /// started under `restore` is then gone, and whoever waits for it waits for nothing.
+    fn superseded(&self, restore: u64) -> bool {
+        self.latest_restore
+            .load(std::sync::atomic::Ordering::Acquire)
+            != restore
+    }
+
     /// The boot's half: write the config, replace systemd's chronyd with ours.
-    /// Returns whether it started the daemon.
-    async fn boot_swap(&self, system: &impl ChronydSystem, config: &str) -> bool {
+    /// Returns the restore count it started the daemon under, None when it started
+    /// none.
+    async fn boot_swap(&self, system: &impl ChronydSystem, config: &str) -> Option<u64> {
         let restores = {
             let mut state = self.state.lock().await;
             if let Err(e) = system.write_config(config).await {
                 eprintln!("[fc-agent] ERROR: cannot write {CHRONY_CONF}: {e}; no NTP time sync");
-                return false;
+                return None;
             }
             state.config_written = true;
             state.restores
@@ -989,11 +1009,11 @@ impl ChronydLifecycle {
                 "[fc-agent] chronyd: a restore landed while systemd's chronyd was being \
                  stopped; the restore starts the daemon"
             );
-            return false;
+            return None;
         }
         let spawned = system.spawn_chronyd().await;
         drop(state);
-        spawned
+        spawned.then_some(restores)
     }
 
     /// The restore's first half: end every chronyd before the clock step.
@@ -1001,6 +1021,10 @@ impl ChronydLifecycle {
         let mut state = self.state.clone().lock_owned().await;
         state.restores += 1;
         let restore = state.restores;
+        // Before the kill: a poll waiting for a daemon this restore is about to end
+        // stops asking for it ([`wait_for_chrony_sources`]).
+        self.latest_restore
+            .store(restore, std::sync::atomic::Ordering::Release);
         system.kill_chronyds_for_restore().await;
         RetiredChronyd { state, restore }
     }
@@ -1093,15 +1117,20 @@ async fn kill_chronyds_for_restore() {
 /// waits for sources carries the task into every clone, where it finishes and logs for the
 /// restore that started it, not for the clone's own.
 pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd, epoch: String) {
+    let restore = retired.restore;
     if !CHRONYD_LIFECYCLE
         .restart_after_restore(&GuestChronyd, retired, &epoch)
         .await
     {
         return;
     }
-    match wait_for_chrony_sources().await {
-        Ok(count) => eprintln!(
+    match wait_for_chrony_sources(restore).await {
+        Ok(ChronySources::Ready(count)) => eprintln!(
             "[fc-agent] chronyd restarted after restore (epoch={epoch}) with {count} NTP source(s)"
+        ),
+        Ok(ChronySources::Superseded) => eprintln!(
+            "[fc-agent] chronyd: a later restore retired the daemon started after restore \
+             (epoch={epoch}) before it reported its sources"
         ),
         Err(e) => {
             eprintln!("[fc-agent] ERROR: chronyd is not usable after restore (epoch={epoch}): {e}")
@@ -1331,6 +1360,15 @@ impl PidFd {
     }
 }
 
+/// How a wait for chronyd's sources ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+enum ChronySources {
+    /// The daemon answered with this many sources.
+    Ready(usize),
+    /// A later restore retired the daemon before it answered with any.
+    Superseded,
+}
+
 /// Wait for chronyd's command socket to answer, then report how many NTP
 /// sources it has configured.
 ///
@@ -1338,14 +1376,43 @@ impl PidFd {
 /// being reachable — not on elapsed time. Sources are counted afterwards and
 /// re-checked until at least one appears, because a `pool` directive only
 /// materializes its sources once the pool name resolves.
-async fn wait_for_chrony_sources() -> Result<usize> {
-    let deadline = tokio::time::Instant::now() + CHRONYD_READY_TIMEOUT;
+///
+/// `started_under` is the restore count the awaited daemon was started under
+/// (for the boot's daemon, the count when the boot started it). A snapshot
+/// taken during this wait carries it into every clone, where the restore kills
+/// the awaited daemon and starts its own only once readiness is published: the
+/// carried wait would fork `chronyc` every 20 ms through the clone's whole
+/// restore, for a daemon that is gone. It ends as soon as a later restore has
+/// retired the daemons.
+async fn wait_for_chrony_sources(started_under: u64) -> Result<ChronySources> {
+    wait_for_sources(
+        chronyc_sources,
+        || CHRONYD_LIFECYCLE.superseded(started_under),
+        CHRONYD_READY_TIMEOUT,
+    )
+    .await
+}
+
+/// [`wait_for_chrony_sources`] over a given probe and a given end-of-daemon check.
+async fn wait_for_sources<Probe, Asked>(
+    mut probe: Probe,
+    superseded: impl Fn() -> bool,
+    timeout: Duration,
+) -> Result<ChronySources>
+where
+    Probe: FnMut() -> Asked,
+    Asked: std::future::Future<Output = std::result::Result<usize, String>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
+        if superseded() {
+            return Ok(ChronySources::Superseded);
+        }
         // Whatever went wrong on THIS attempt — reported if the deadline lands
         // next, so the error describes the state we actually gave up in.
-        let failure = match chronyc_sources().await {
-            Ok(count) if count > 0 => return Ok(count),
+        let failure = match probe().await {
+            Ok(count) if count > 0 => return Ok(ChronySources::Ready(count)),
             Ok(_) => "chronyd is running but has 0 NTP sources — its config was not \
                       loaded, or its pool did not resolve"
                 .to_string(),
@@ -1353,7 +1420,7 @@ async fn wait_for_chrony_sources() -> Result<usize> {
         };
 
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("{failure} (after {CHRONYD_READY_TIMEOUT:?})");
+            anyhow::bail!("{failure} (after {timeout:?})");
         }
         // chronyc is a fork+exec per attempt (~2ms); this keeps the retries from
         // becoming a spin without materially delaying the answer.
@@ -1897,7 +1964,7 @@ mod tests {
 
         system.stop_released.notify_one();
         assert!(
-            !boot.await.unwrap(),
+            boot.await.unwrap().is_none(),
             "the boot started a daemon after a restore took the swap over"
         );
         assert!(restart.await.unwrap(), "the restore started no daemon");
@@ -1911,6 +1978,85 @@ mod tests {
                 Step::Spawn
             ]
         );
+    }
+
+    /// A wait for a daemon's sources ends when a later restore retires that daemon.
+    /// A snapshot taken during the wait carries it into every clone, whose restore
+    /// kills the daemon and starts its own only after readiness: the carried wait
+    /// forked `chronyc` every 20 ms through the whole restore.
+    ///
+    /// RED BEFORE THE FIX: the wait ended only on an answer or at its timeout, so it
+    /// went on asking (here: 50 more times in the second after the restore's kill).
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_for_sources_ends_when_a_later_restore_retires_its_daemon() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let system = std::sync::Arc::new(FakeChronyd::default());
+        let lifecycle = std::sync::Arc::new(super::ChronydLifecycle::new());
+        // The boot's daemon, started under restore count 0.
+        let boot = tokio::spawn({
+            let (system, lifecycle) = (system.clone(), lifecycle.clone());
+            async move { lifecycle.boot_swap(&*system, "config").await }
+        });
+        system.stop_entered.notified().await;
+        system.stop_released.notify_one();
+        let started_under = boot.await.unwrap().expect("the boot started its daemon");
+        assert_eq!(started_under, 0);
+        assert!(!lifecycle.superseded(started_under));
+
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let wait = tokio::spawn({
+            let (asked, lifecycle) = (asked.clone(), lifecycle.clone());
+            async move {
+                super::wait_for_sources(
+                    || {
+                        asked.fetch_add(1, Ordering::SeqCst);
+                        async { Err::<usize, String>("no daemon answers".to_string()) }
+                    },
+                    || lifecycle.superseded(started_under),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+        assert!(!wait.is_finished());
+        assert_eq!(asked.load(Ordering::SeqCst), 6, "one probe every 20 ms");
+
+        // The snapshot is restored: the clone's restore retires the daemons, and holds
+        // the lifecycle until its own start after readiness.
+        let retired = lifecycle.retire_for_restore(&*system).await;
+        assert!(lifecycle.superseded(started_under));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            wait.is_finished(),
+            "the carried wait is still asking for the dead daemon"
+        );
+        assert_eq!(
+            wait.await.unwrap().unwrap(),
+            super::ChronySources::Superseded
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            6,
+            "the wait asked again after the restore retired its daemon"
+        );
+
+        // The restore's own wait, for the daemon it starts, is not superseded by itself.
+        let restore = retired.restore;
+        assert!(
+            lifecycle
+                .restart_after_restore(&*system, retired, "test")
+                .await
+        );
+        assert!(!lifecycle.superseded(restore));
+        let ready = super::wait_for_sources(
+            || async { Ok::<usize, String>(2) },
+            || lifecycle.superseded(restore),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready, super::ChronySources::Ready(2));
     }
 
     /// A clone of a clone taken while the first restore's restart waited for the
@@ -1945,7 +2091,7 @@ mod tests {
         }
 
         system.stop_released.notify_one();
-        assert!(!boot.await.unwrap(), "the boot started a daemon");
+        assert!(boot.await.unwrap().is_none(), "the boot started a daemon");
         let mut started = Vec::new();
         for restart in restarts {
             started.push(restart.await.unwrap());

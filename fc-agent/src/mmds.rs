@@ -363,9 +363,13 @@ pub async fn watch_restore_epoch(
 ///    does not go through `RestoreStatus`, so ACKing first costs nothing:
 ///    there is no container output to miss, because there is no container yet.
 /// 5. `succeed()` — with the boundary acknowledged, the workload may start.
-/// 6. The container-started notice, for a container the snapshot held running.
-/// 7. `AfterReadiness::start()` — chronyd and journald, which no step above waits for
-///    and which would otherwise take the guest's CPU from steps 3 to 5.
+/// 6. `AfterReadiness::start()` — the fresh chronyd, which no step above waits for and
+///    which would otherwise take the guest's CPU from steps 3 to 5. Straight after
+///    `succeed()`, with no await between: readiness lets the host take the next
+///    snapshot, and one taken while the start is still pending carries the retired
+///    chronyd, and the daemon's lifecycle with it, into every clone, whose restore then
+///    waits for the carried start before its own clock step.
+/// 7. The container-started notice, for a container the snapshot held running.
 #[allow(clippy::too_many_arguments)]
 async fn apply_restore_epoch(
     current: &str,
@@ -444,12 +448,12 @@ async fn apply_restore_epoch(
         );
         crate::system::shutdown_vm(1).await;
     }
-    // 6. A container that was running when the snapshot was taken is running in the
+    // 6. The fresh chronyd: the host has its acknowledgement and readiness is published.
+    //    No await between `succeed()` and this.
+    after_readiness.start();
+    // 7. A container that was running when the snapshot was taken is running in the
     //    clone, and the clone's host process has not been told.
     crate::container::resend_container_started_after_restore().await;
-    // 7. The restore's system jobs (a fresh chronyd, the journald restart), last: the
-    //    host has its acknowledgement and readiness is published.
-    after_readiness.start();
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -541,28 +545,55 @@ mod tests {
     use std::pin::Pin;
     use std::task::Poll;
 
-    /// The restore's system jobs start after the host has its acknowledgement and
-    /// readiness is published, and the restore sequence itself starts none: a chronyd
-    /// start with its `chronyc` polls and a `systemctl restart systemd-journald` took the
-    /// guest's CPU from the NFS remount, the exec and egress waits, the publication and
-    /// the acknowledgement. The steps are system calls with no seam a runtime test can
-    /// hold, so this pins the source order.
+    /// The restore's fresh chronyd starts once readiness is published, and its journald
+    /// restart starts inside the restore, after the clock step and before the hook.
     ///
-    /// RED BEFORE THE FIX: `handle_clone_restore` called `spawn_restore_side_job(` twice.
+    /// chronyd: its start and the `chronyc` poll every 20 ms after it took the guest's CPU
+    /// from the NFS remount, the exec and egress waits, the publication and the
+    /// acknowledgement, so the restore sequence starts no chronyd. It is started straight
+    /// after readiness is published: an await between the two (the container-started
+    /// notice's round trip) is a window in which the host can snapshot a published clone
+    /// that still holds the retired chronyd, and every clone of that waits for the carried
+    /// start before its own clock step.
+    ///
+    /// journald: the restore hook runs the caller's commands against the clone's daemons,
+    /// and a restart held until readiness could not begin before the hook returned.
+    ///
+    /// The steps are system calls with no seam a runtime test can hold, so this pins the
+    /// source order.
+    ///
+    /// RED BEFORE THE FIX: `handle_clone_restore` spawned the chronyd restart itself; then
+    /// (with both jobs moved out) it spawned no journald restart ahead of the hook, and
+    /// `apply_restore_epoch` awaited the container-started notice between publishing
+    /// readiness and starting the jobs.
     #[test]
-    fn the_restores_system_jobs_start_after_readiness_is_published() {
+    fn the_restores_chronyd_starts_at_readiness_and_its_journald_restart_before_the_hook() {
         let restore = crate::restore::handle_clone_restore_source();
-        for started in [
-            "spawn_restore_side_job(",
-            "restart_journald(",
-            "restart_chronyd_after_restore(",
-            ".start()",
-        ] {
+        for started in ["restart_chronyd_after_restore(", ".start()"] {
             assert!(
                 !restore.contains(started),
-                "handle_clone_restore starts a system job before the clone is acknowledged: {started}"
+                "handle_clone_restore starts chronyd before the clone is acknowledged: {started}"
             );
         }
+        let journald = "spawn_restore_side_job(restart_journald());";
+        assert_eq!(
+            restore.matches("spawn_restore_side_job(").count(),
+            1,
+            "handle_clone_restore starts one side job, the journald restart"
+        );
+        let in_restore = |needle: &str| {
+            restore
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        let clock = in_restore("phases.clock_ms = elapsed_ms(clock_started);");
+        let journald = in_restore(journald);
+        let hook = in_restore(".publish(restore_hook,");
+        assert!(
+            clock < journald && journald < hook,
+            "clock={clock} journald={journald} hook={hook}"
+        );
+
         let source = include_str!("mmds.rs");
         let apply = &source[source
             .find("async fn apply_restore_epoch(")
@@ -576,9 +607,26 @@ mod tests {
         let ack = at("crate::vsock::notify_restore_complete(");
         let ready = at("signals.restore_status.succeed()");
         let jobs = at("after_readiness.start();");
+        let notice = at("crate::container::resend_container_started_after_restore().await;");
         assert!(
-            ack < ready && ready < jobs,
-            "ack={ack} ready={ready} jobs={jobs}"
+            ack < ready && ready < jobs && jobs < notice,
+            "ack={ack} ready={ready} jobs={jobs} notice={notice}"
+        );
+        // Past the failure branch of `succeed()` (which shuts the clone down), nothing
+        // awaits before the start.
+        let published = ready
+            + apply[ready..]
+                .find("\n    }\n")
+                .expect("the failure branch ends");
+        assert!(published < jobs);
+        assert!(
+            !apply[published..jobs].contains(".await"),
+            "an await between publishing readiness and starting chronyd:\n{}",
+            &apply[published..jobs]
+        );
+        assert!(
+            !apply.contains("restart_journald"),
+            "the journald restart belongs to handle_clone_restore"
         );
     }
 
