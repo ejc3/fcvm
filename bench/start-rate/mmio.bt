@@ -1,0 +1,27 @@
+#!/usr/bin/env bpftrace
+// Device accesses of each restored guest in its first second, by device.
+//
+// Per firecracker pid, in the second after its vCPU thread's first stage-2 fault (its first
+// exit from the guest after the resume, as in s2fault.bt):
+//   @abort[pid, page]  device (MMIO) aborts, by the page of the guest address. A page is one
+//                      device: the guest's /proc/iomem names it (the serial console, each
+//                      virtio-mmio device) and /sys/bus/virtio/devices/*/device its kind.
+//   @to_vmm[pid]       of those, the ones KVM returned to the VMM for (KVM_EXIT_MMIO). A
+//                      write the VMM asked for as an eventfd (a virtio queue notify) and an
+//                      access the kernel emulates (the interrupt controller) are not in it.
+//
+// Keyed by pid and nothing is deleted, like s2fault.bt: start the workload after "attached",
+// stop with SIGINT, and leave out a pid two VMMs had.
+BEGIN { printf("attached\n"); }
+tracepoint:kvm:kvm_guest_fault /comm == "fc_vcpu 0"/ {
+  if (@t0[pid] == 0) { @t0[pid] = nsecs; }
+  // Firecracker's arm64 guests have RAM from 2 GiB up; an abort below it is a device access.
+  if (args->ipa < 0x80000000 && nsecs - @t0[pid] < 1000000000) {
+    @abort[pid, args->ipa & 0xfffffffffffff000] = count();
+  }
+}
+// 6 is KVM_EXIT_MMIO.
+tracepoint:kvm:kvm_userspace_exit /comm == "fc_vcpu 0" && args->reason == 6 && @t0[pid] != 0/ {
+  if (nsecs - @t0[pid] < 1000000000) { @to_vmm[pid] = count(); }
+}
+END { clear(@t0); }

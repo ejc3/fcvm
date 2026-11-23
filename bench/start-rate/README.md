@@ -47,8 +47,13 @@ harness's receive times of the marker lines, so they include pipe and scheduling
 ## Restore timeline: resume to fc-agent ready
 
 `restore_timeline.py` reads one `run` directory and prints, per step of the guest's restore, the
-time between the clone's log lines (`VM resume completed`, fc-agent's console lines, the restore
+time between the clone's log lines (`VM resume completed`, fc-agent's lines, the restore
 acknowledgement, `exec server ready`) and fc-agent's own phase record from the acknowledgement.
+fc-agent sends a restore's progress lines on the output connection after the acknowledgement, each
+with `logged=`, the guest's clock when fc-agent's console writer thread took the line off its pipe,
+and the steps use that time. Lines the thread took in one read share a time, so a step between two
+of them can read 0. A held line that went to the serial console carries how long it was held
+(`held_ms=`) and is placed the same way.
 
 ```bash
 python3 bench/start-rate/restore_timeline.py /mnt/fcvm-btrfs/sr/run-c128
@@ -109,6 +114,21 @@ fault-to-entry time inside the window and `us_per_stage2_fault` its mean per fau
 
 The tracers cost CPU themselves (two probes per stage-2 fault), so rates come from cells run
 without them.
+
+## Device accesses per clone, by device
+
+`mmio.bt` counts each restored guest's device (MMIO) aborts in the second after its vCPU's first
+stage-2 fault, by the page of the guest address, and how many of them KVM returned to the VMM for:
+
+```bash
+sudo BPFTRACE_MAX_MAP_KEYS=100000 bpftrace bench/start-rate/mmio.bt > $OUT.trace/mmio.txt &
+# wait for "attached" in mmio.txt, run the cell, then SIGINT bpftrace
+```
+
+A page is one device. In a guest of the same snapshot, `/proc/iomem` (as root) names the serial
+console and each `virtio_mmio` device by address, and `/sys/bus/virtio/devices/virtioN/device`
+gives each one's kind (1 net, 2 block, 5 balloon, 19 vsock). A byte written to the serial console
+is one abort that returns to the VMM, plus the driver's status reads around each burst.
 
 ## Fault path: time per kernel function
 

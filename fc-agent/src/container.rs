@@ -1341,12 +1341,18 @@ pub fn notify_cache_ready_and_wait(
         }
     };
 
-    run_cache_handshake(
+    let result = run_cache_handshake(
         &mut VsockStatusConnector,
         digest,
         restore_flag,
         Some(console_quiesce),
-    )
+    );
+    // A severed session opened the restore log window, in case this guest is a restored
+    // clone. Any verdict but that one ends it: the held lines go to the console.
+    if result != CacheResult::WarmStart {
+        crate::console::end_restore_log();
+    }
+    result
 }
 
 /// The cache handshake protocol: ask the host what this VM is, and keep
@@ -1390,7 +1396,13 @@ fn run_cache_handshake<G>(
     use nix::unistd::write;
 
     let mut release_console = |why: &str| {
-        if console_gate.take().is_some() {
+        if let Some(gate) = console_gate.take() {
+            // The boundary is behind this guest, and it may be a restored clone: its
+            // progress lines, the ones held behind the gate first, are kept off the
+            // console for a bounded time (`console::hold_restore_log`). Before the
+            // gate goes, so none of them reaches the console in between.
+            crate::console::hold_restore_log();
+            drop(gate);
             eprintln!("[fc-agent] cache handshake: {why}; console released");
         }
     };

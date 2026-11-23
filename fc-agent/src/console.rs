@@ -47,6 +47,23 @@
 //! which inherits the hold in the snapshot) releases it. The gate is a count, so this
 //! hold and the cache handshake's can overlap.
 //!
+//! Restore log: every byte the writer puts on the 8250 is an MMIO write the VMM handles
+//! in userspace, and a restore's progress lines were about 2.7 KB of them per clone. From
+//! the snapshot boundary until [`RESTORE_LOG_WINDOW`] later, the writer keeps fc-agent's
+//! progress lines ([`Route::Progress`]) off the console and queues them for the host on
+//! the output vsock connection once the host has acknowledged the restore and the
+//! connection is re-established ([`ProgressSink`]), each with the time it was logged. One
+//! console line says so, which is also what the host's dead-serial check reads. Only
+//! for a host whose restore document says it takes them (`agent-log`): otherwise the
+//! window ends when the document is read. The
+//! console still gets, at once and in order, everything held so far plus the line itself
+//! when a line is not a progress line (an error, a warning, a panic, a child's output),
+//! and everything held when the window ends first: no acknowledgement or no connection
+//! within the window, a refused hand-off, a new snapshot's quiesce, a shutdown. A held
+//! line that goes to the console ends in ` held_ms=<n>`, how long ago it was logged. A guest
+//! that stops running inside the window without printing any such line takes its held
+//! progress lines with it; the host then has no acknowledgement for that restore.
+//!
 //! Scope: this covers fc-agent's OWN console writes — the only userspace console
 //! writer at the cache-ready point in this rootfs (no getty on ttyS0; journald
 //! console forwarding is not enabled; systemd is idle between boot and the
@@ -81,6 +98,292 @@ use nix::unistd::{read, write};
 /// bounded memory against a wedged console beats unbounded growth, and drops
 /// are counted and summarized rather than silent.
 const PENDING_CAP: usize = 1024 * 1024;
+
+/// How long after a snapshot boundary a restore's progress lines are kept off the console
+/// (see the module doc). A restore that has not been acknowledged and reconnected by then
+/// gets its lines on the console, so a restore that hangs shows where within this bound.
+/// Resume to ready takes tens of milliseconds alone. In 128-way ramps to 1000 clones on
+/// the File backend its 99th percentile was 4 to 8 s, and 2 of 6,000 clones took over 10 s.
+/// The host waits 15 minutes for the acknowledgement.
+const RESTORE_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// Upper bound on progress lines held for the host. Past it the window ends and they go to
+/// the console, which has its own bound ([`PENDING_CAP`]).
+const HELD_CAP: usize = 256 * 1024;
+
+/// Where one line of the agent's output goes while a restore log window is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// fc-agent's own line on the success path: held, then sent to the host over the
+    /// output connection.
+    Progress,
+    /// A `[fcvm-vitals]` sample: to the console now, and the window stays open. The
+    /// samples exist for a guest that can no longer reach the host any other way.
+    Sample,
+    /// Everything else: to the console now, after every line held so far, and the window
+    /// ends. fc-agent's errors and warnings, a `VITALS` block, and any line that is not
+    /// fc-agent's own (a panic message, a child's output, a failpoint).
+    Urgent,
+}
+
+/// What a line of fc-agent's that reports a failure starts with, after `[fc-agent] `. The
+/// first four are the host's list (`console_line_is_an_agent_error` in src/utils.rs), which
+/// logs those lines at WARN; `VITALS` opens the resource block printed at a failure site.
+const URGENT_WORDS: [&str; 5] = ["FATAL", "ERROR", "Error: ", "WARNING", "VITALS"];
+
+/// Route one line (with or without its newline). A line is a progress line only when it is
+/// provably fc-agent's own and names no failure; anything unrecognised is urgent.
+fn classify(line: &[u8]) -> Route {
+    if line.starts_with(b"[fcvm-vitals]") {
+        return Route::Sample;
+    }
+    let Some(message) = line.strip_prefix(b"[fc-agent] ") else {
+        return Route::Urgent;
+    };
+    if URGENT_WORDS
+        .iter()
+        .any(|word| message.starts_with(word.as_bytes()))
+    {
+        Route::Urgent
+    } else {
+        Route::Progress
+    }
+}
+
+/// One progress line held for the host.
+pub struct ProgressLine {
+    /// When the writer thread routed the line: as it took it out of the pipe, or, for a
+    /// line that waited behind a snapshot's quiesce guard, when the window opened.
+    pub logged: Instant,
+    /// The line as it was written, without its newline.
+    pub bytes: Vec<u8>,
+}
+
+/// A [`ProgressSink`] took none of the lines it was handed.
+#[derive(Debug)]
+pub struct Refused;
+
+/// The connection that carries a restore's progress lines to the host.
+pub trait ProgressSink: Send + Sync {
+    /// Whether the connection is established now.
+    fn connected(&self) -> bool;
+    /// Hand `lines` over, in order: all of them or, refused, none.
+    fn send(&self, lines: &[ProgressLine]) -> Result<(), Refused>;
+}
+
+/// What the callers ask of the writer thread about the restore log. Guarded by
+/// [`ConsoleShared::write_lock`], which the writer holds while it routes and writes, so a
+/// caller that sets the window and then drops a quiesce guard knows the writer routes the
+/// bytes held behind that guard as the window's.
+#[derive(Default)]
+struct LogCtl {
+    /// When the open window ends; None when none is open.
+    window: Option<Instant>,
+    /// Counts the windows opened, so the writer tells a new one from the one it knew.
+    generation: u64,
+    /// The host acknowledged the restore the open window belongs to.
+    acknowledged: bool,
+    /// None until the agent registers its output connection; without it no window opens.
+    sink: Option<Arc<dyn ProgressSink>>,
+}
+
+/// The writer thread's side of the restore log.
+#[derive(Default)]
+struct RestoreLog {
+    /// The generation of the window the fields below belong to; None outside a window.
+    generation: Option<u64>,
+    /// Bytes of the window not routed yet: a line whose newline has not arrived.
+    inbox: Vec<u8>,
+    /// Progress lines held for the host.
+    held: Vec<ProgressLine>,
+    held_bytes: usize,
+    /// The first hand-off happened; later progress lines follow it.
+    forwarding: bool,
+}
+
+/// Append console-bound bytes to the writer's backlog, dropping (and counting) what does
+/// not fit under [`PENDING_CAP`].
+fn push_console(state: &ConsoleShared, pending: &mut VecDeque<u8>, bytes: &[u8]) {
+    let room = PENDING_CAP.saturating_sub(pending.len());
+    let keep = bytes.len().min(room);
+    pending.extend(&bytes[..keep]);
+    if keep < bytes.len() {
+        let over = (bytes.len() - keep) as u64;
+        // Dropped bytes are disposed: the enqueued/disposed invariant tracks what the
+        // writer still holds, not the console.
+        state.dropped.fetch_add(over, Ordering::SeqCst);
+        state.disposed.fetch_add(over, Ordering::SeqCst);
+    }
+}
+
+/// What [`RestoreLog::spill`] appends to a held line it puts on the console.
+const HELD_SUFFIX: &[u8] = b" held_ms=";
+
+/// `line` (no newline) without a ` held_ms=<n>` at its end, if it has one.
+fn without_held_suffix(line: &[u8]) -> &[u8] {
+    let Some(at) = line
+        .windows(HELD_SUFFIX.len())
+        .rposition(|window| window == HELD_SUFFIX)
+    else {
+        return line;
+    };
+    let number = &line[at + HELD_SUFFIX.len()..];
+    let is_number = !number.is_empty()
+        && number
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'.');
+    if is_number {
+        &line[..at]
+    } else {
+        line
+    }
+}
+
+impl RestoreLog {
+    /// Route `fresh`, the bytes just read from the pipe. Called with `write_lock` held.
+    fn route(
+        &mut self,
+        state: &ConsoleShared,
+        ctl: &mut LogCtl,
+        fresh: &[u8],
+        pending: &mut VecDeque<u8>,
+        cursor: &mut LineCursor,
+        now: Instant,
+    ) {
+        match (self.generation, ctl.window) {
+            // A caller ended the window this thread was in.
+            (Some(_), None) => self.spill(state, pending, now),
+            // A caller ended it and another opened before this thread looked. The lines
+            // held for the first stay held for the second, with the times they were
+            // logged at. Spilled, they would be taken back off the backlog below and
+            // held again with ` held_ms=` in their text.
+            (Some(mine), Some(_)) if mine != ctl.generation => {
+                self.generation = Some(ctl.generation);
+                self.forwarding = false;
+            }
+            _ => {}
+        }
+        let Some(deadline) = ctl.window else {
+            push_console(state, pending, fresh);
+            return;
+        };
+        if self.generation.is_none() {
+            // The window opens. What the console has not taken yet (the lines held behind
+            // a snapshot's quiesce guard) is routed with what follows.
+            self.generation = Some(ctl.generation);
+            self.inbox.extend(pending.drain(..));
+            cursor.cleared();
+        }
+        self.inbox.extend_from_slice(fresh);
+        if now >= deadline {
+            return self.end(state, ctl, pending, now);
+        }
+
+        let mut routed = 0;
+        while let Some(at) = self.inbox[routed..].iter().position(|&b| b == b'\n') {
+            let start = routed;
+            routed += at + 1;
+            let line = &self.inbox[start..routed];
+            match classify(line) {
+                Route::Sample => push_console(state, pending, line),
+                Route::Progress => {
+                    // A line spilled while the console was held quiet is still in the
+                    // backlog a later window takes over, with the suffix the spill gave
+                    // it. It is held as it was logged.
+                    let text = without_held_suffix(&line[..line.len() - 1]);
+                    // The bytes dropped with the suffix are accounted for now.
+                    state
+                        .disposed
+                        .fetch_add((line.len() - 1 - text.len()) as u64, Ordering::SeqCst);
+                    self.held_bytes += text.len() + 1;
+                    self.held.push(ProgressLine {
+                        logged: now,
+                        bytes: text.to_vec(),
+                    });
+                }
+                Route::Urgent => {
+                    // The held lines first, then this one and whatever follows it.
+                    let rest = self.inbox.split_off(start);
+                    self.inbox.clear();
+                    self.end(state, ctl, pending, now);
+                    push_console(state, pending, &rest);
+                    return;
+                }
+            }
+        }
+        self.inbox.drain(..routed);
+        if self.held_bytes + self.inbox.len() > HELD_CAP {
+            return self.end(state, ctl, pending, now);
+        }
+
+        if self.held.is_empty() || !(self.forwarding || ctl.acknowledged) {
+            return;
+        }
+        let Some(sink) = ctl.sink.as_ref().filter(|sink| sink.connected()) else {
+            return;
+        };
+        if sink.send(&self.held).is_err() {
+            return self.end(state, ctl, pending, now);
+        }
+        state
+            .disposed
+            .fetch_add(self.held_bytes as u64, Ordering::SeqCst);
+        if !self.forwarding {
+            self.forwarding = true;
+            // The one console line of a restore. The host's dead-serial check counts it.
+            // Queued, not sent: the output writer has them and a connection made after
+            // the restore's reconnect request, and writes them in its turn.
+            let line = format!(
+                "[fc-agent] restore: {} progress lines queued for the host over vsock\n",
+                self.held.len()
+            );
+            state
+                .enqueued
+                .fetch_add(line.len() as u64, Ordering::SeqCst);
+            push_console(state, pending, line.as_bytes());
+        }
+        self.held.clear();
+        self.held_bytes = 0;
+    }
+
+    /// End the window from the writer's side: close it for the callers and put what it
+    /// holds on the console.
+    fn end(
+        &mut self,
+        state: &ConsoleShared,
+        ctl: &mut LogCtl,
+        pending: &mut VecDeque<u8>,
+        now: Instant,
+    ) {
+        ctl.window = None;
+        ctl.acknowledged = false;
+        self.spill(state, pending, now);
+    }
+
+    /// Everything held goes to the console, in the order it was logged, and the thread is
+    /// outside any window. The host stamps a console line when it arrives, which for a
+    /// held line is later than it was logged, so each carries how long it was held.
+    fn spill(&mut self, state: &ConsoleShared, pending: &mut VecDeque<u8>, now: Instant) {
+        for line in self.held.drain(..) {
+            let held = format!(
+                "{}{:.3}\n",
+                String::from_utf8_lossy(HELD_SUFFIX),
+                now.saturating_duration_since(line.logged).as_secs_f64() * 1000.0
+            );
+            // The suffix is the writer's own bytes, counted in as the pipe's are.
+            state
+                .enqueued
+                .fetch_add(held.len() as u64 - 1, Ordering::SeqCst);
+            push_console(state, pending, &line.bytes);
+            push_console(state, pending, held.as_bytes());
+        }
+        push_console(state, pending, &self.inbox);
+        self.inbox.clear();
+        self.held_bytes = 0;
+        self.forwarding = false;
+        self.generation = None;
+    }
+}
 
 /// Where the next console write of `pending` ends: after its first newline, or at its end
 /// when it holds none.
@@ -194,8 +497,10 @@ pub struct ConsoleShared {
     pipe_wr: OwnedFd,
     /// Bytes the writer thread has taken out of the pipe (responsibility taken).
     enqueued: AtomicU64,
-    /// Bytes written to the console or deliberately dropped.
-    /// Invariant: `enqueued - disposed == pending buffer length`.
+    /// Bytes written to the console, handed to the host as restore progress, or
+    /// deliberately dropped.
+    /// Invariant: `enqueued - disposed` is what the writer still holds: its pending
+    /// buffer and, in a restore log window, the lines held for the host.
     disposed: AtomicU64,
     /// Bytes dropped since the last recovery summary.
     dropped: AtomicU64,
@@ -207,7 +512,12 @@ pub struct ConsoleShared {
     gate: AtomicUsize,
     /// Held around every console `write()`; `quiesce` locks it once after
     /// setting `gate` so no console write is in flight or can start afterwards.
-    write_lock: Mutex<()>,
+    /// It also guards the restore log's control state, which the writer reads in the
+    /// same critical section as it writes.
+    write_lock: Mutex<LogCtl>,
+    /// An eventfd the writer polls: a caller that changed [`LogCtl`] writes it, so the
+    /// writer acts on the change now and not at its next tick.
+    wake: OwnedFd,
 }
 
 /// RAII guard for the console gate. Dropping it re-enables console writes
@@ -302,6 +612,16 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
         FcntlArg::F_SETFL(OFlag::from_bits_truncate(cflags) | OFlag::O_NONBLOCK),
     )?;
 
+    // SAFETY: eventfd takes no pointers; a non-negative return is a new descriptor that
+    // nothing else owns.
+    let wake = unsafe {
+        let fd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    };
+
     let state = Arc::new(ConsoleShared {
         console_fd,
         pipe_rd,
@@ -310,7 +630,8 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
         disposed: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
         gate: AtomicUsize::new(0),
-        write_lock: Mutex::new(()),
+        write_lock: Mutex::new(LogCtl::default()),
+        wake,
     });
 
     let thread_state = state.clone();
@@ -328,17 +649,21 @@ fn writer_loop(state: Arc<ConsoleShared>) {
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut buf = [0u8; 8192];
     let mut cursor = LineCursor::default();
+    let mut restore_log = RestoreLog::default();
+    let mut fresh: Vec<u8> = Vec::new();
 
     loop {
-        // Poll: always watch the pipe; watch the console for writability only
-        // when there is something to flush and the gate is open.
+        // Poll: always watch the pipe and the wake; watch the console for writability
+        // only when there is something to flush and the gate is open. The tick also
+        // bounds how late the writer sees a restore log window's deadline.
         let want_write = !pending.is_empty() && state.gate.load(Ordering::SeqCst) == 0;
         {
             let mut fds = [
                 PollFd::new(state.pipe_rd.as_fd(), PollFlags::POLLIN),
+                PollFd::new(state.wake.as_fd(), PollFlags::POLLIN),
                 PollFd::new(state.console_fd.as_fd(), PollFlags::POLLOUT),
             ];
-            let nfds = if want_write { 2 } else { 1 };
+            let nfds = if want_write { 3 } else { 2 };
             match poll(&mut fds[..nfds], PollTimeout::from(POLL_TICK_MS)) {
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
@@ -351,24 +676,21 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                 }
             }
         }
+        // The wake carries no data: what changed is read under the lock below.
+        let mut woken = [0u8; 8];
+        let _ = read(&state.wake, &mut woken);
 
         // 1) Drain the pipe (non-blocking) so producers can never wedge on it.
+        fresh.clear();
         loop {
             match read(&state.pipe_rd, &mut buf) {
                 Ok(0) => break, // all write ends closed (cannot happen: we hold one)
                 Ok(n) => {
                     state.enqueued.fetch_add(n as u64, Ordering::SeqCst);
-                    let room = PENDING_CAP.saturating_sub(pending.len());
-                    let keep = n.min(room);
-                    pending.extend(&buf[..keep]);
-                    if keep < n {
-                        let over = (n - keep) as u64;
-                        // Dropped bytes are disposed: the enqueued/disposed
-                        // invariant tracks the pending buffer, not the console.
-                        state.dropped.fetch_add(over, Ordering::SeqCst);
-                        state.disposed.fetch_add(over, Ordering::SeqCst);
-                    }
-                    if n < buf.len() {
+                    fresh.extend_from_slice(&buf[..n]);
+                    // Route what was read before reading on, so a flood is bounded by
+                    // the caps the routing applies and not held here.
+                    if n < buf.len() || fresh.len() >= 8 * buf.len() {
                         break;
                     }
                 }
@@ -378,10 +700,19 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             }
         }
 
-        // 2) Flush pending to the console — never while gated, never blocking.
+        // 2) Route what was read, then flush pending to the console, never while
+        // gated and never blocking.
         let mut wrote_any = false;
-        if !pending.is_empty() {
-            let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut ctl = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            restore_log.route(
+                &state,
+                &mut ctl,
+                &fresh,
+                &mut pending,
+                &mut cursor,
+                Instant::now(),
+            );
             // Checked under the lock: after quiesce() sets the gate and cycles
             // this lock, no write can start here.
             if state.gate.load(Ordering::SeqCst) == 0 {
@@ -441,6 +772,63 @@ fn writer_loop(state: Arc<ConsoleShared>) {
 }
 
 impl ConsoleShared {
+    fn ctl(&self) -> std::sync::MutexGuard<'_, LogCtl> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Have the writer thread read [`LogCtl`] now.
+    fn wake_writer(&self) {
+        // A full counter already has the writer's wakeup pending.
+        let _ = write(&self.wake, &1u64.to_ne_bytes());
+    }
+
+    /// See [`hold_restore_log`].
+    fn hold_restore_log(&self, window: Duration) {
+        {
+            let mut ctl = self.ctl();
+            if ctl.sink.is_none() || ctl.window.is_some() {
+                return;
+            }
+            ctl.window = Some(Instant::now() + window);
+            ctl.generation += 1;
+            ctl.acknowledged = false;
+        }
+        self.wake_writer();
+    }
+
+    /// See [`release_source_snapshot_hold`].
+    fn begin_restore(&self, host_takes_agent_lines: bool, window: Duration) {
+        if host_takes_agent_lines {
+            self.hold_restore_log(window);
+        } else {
+            self.end_restore_log();
+        }
+    }
+
+    /// See [`restore_log_acknowledged`].
+    fn restore_log_acknowledged(&self) {
+        {
+            let mut ctl = self.ctl();
+            if ctl.window.is_none() {
+                return;
+            }
+            ctl.acknowledged = true;
+        }
+        self.wake_writer();
+    }
+
+    /// See [`end_restore_log`].
+    fn end_restore_log(&self) {
+        {
+            let mut ctl = self.ctl();
+            if ctl.window.take().is_none() {
+                return;
+            }
+            ctl.acknowledged = false;
+        }
+        self.wake_writer();
+    }
+
     /// Bytes currently readable from the pipe (written by producers, not yet
     /// picked up by the writer thread).
     fn pipe_backlog(&self) -> i64 {
@@ -497,6 +885,11 @@ impl ConsoleShared {
         self: &Arc<Self>,
         phase_timeout: Duration,
     ) -> Result<QuiesceGuard, QuiesceError> {
+        // A restore log window ends here: the lines it holds go to the console and
+        // drain with the rest below, so the snapshot holds none of them and its
+        // clones start without a window.
+        self.end_restore_log();
+
         // Phase 1 (politeness): let already-logged lines reach the console so
         // the quiesce announcement lands before the host pauses the VM. Purely
         // cosmetic for safety — phases 2+3 provide the guarantee.
@@ -578,6 +971,50 @@ pub fn quiesce_for_snapshot() -> Result<QuiesceGuard, QuiesceError> {
     }
 }
 
+/// Register the connection that carries a restore's progress lines to the host. Without
+/// one (a TTY VM has no output connection) no restore log window opens and every line
+/// goes to the console.
+pub fn set_progress_sink(sink: Arc<dyn ProgressSink>) {
+    if let Some(state) = CONSOLE.get() {
+        state.ctl().sink = Some(sink);
+    }
+}
+
+/// A snapshot boundary is behind this guest and a restore of it may be under way: from
+/// now until [`RESTORE_LOG_WINDOW`] later, progress lines are kept off the console (see
+/// the module doc). Called BEFORE the quiesce guard that held the console across the
+/// boundary is dropped, so the lines held behind that guard are the window's first. A
+/// window that is already open keeps its deadline.
+pub fn hold_restore_log() {
+    if let Some(state) = CONSOLE.get() {
+        state.hold_restore_log(RESTORE_LOG_WINDOW);
+    }
+}
+
+/// The host acknowledged the restore: the held progress lines go to it once the output
+/// connection is established, and those that follow in the window follow them.
+pub fn restore_log_acknowledged() {
+    if let Some(state) = CONSOLE.get() {
+        state.restore_log_acknowledged();
+    }
+}
+
+/// End the restore log window, if one is open: the lines it holds, and every later line,
+/// go to the console. For a guest that turns out not to be restoring, and before a shutdown.
+pub fn end_restore_log() {
+    if let Some(state) = CONSOLE.get() {
+        state.end_restore_log();
+    }
+}
+
+/// Have the writer thread look at the restore log again, for the output connection to say
+/// it was just established.
+pub fn wake_writer() {
+    if let Some(state) = CONSOLE.get() {
+        state.wake_writer();
+    }
+}
+
 /// Where the source snapshot boundary asks the running agent to hold its console
 /// quiet (see [`request_source_quiesce`]).
 pub const SOURCE_GATE_SOCKET: &str = "/run/fc-agent-console-gate.sock";
@@ -642,10 +1079,23 @@ fn release_source_hold(only: Option<u64>) -> bool {
 
 /// Release the console hold the source boundary took before a snapshot, from a
 /// restored clone. The snapshot holds the gate closed, so a clone of it would
-/// otherwise keep its console quiet until the cap.
-pub fn release_source_snapshot_hold() {
+/// otherwise keep its console quiet until the cap. The lines held behind it are the
+/// restore's first, so the restore log window opens before the hold goes.
+///
+/// `host_takes_agent_lines` is the restore document's `agent-log`: whether the fcvm
+/// that restored this guest takes fc-agent's lines on the output connection. One that
+/// does not say so (an fcvm older than the stream, restoring a snapshot that carries
+/// this agent) would print them as the container's stderr. For it no window opens, and
+/// one the cache handshake opened before the document was read ends: every line of
+/// the restore goes to the console.
+pub fn release_source_snapshot_hold(host_takes_agent_lines: bool) {
+    if let Some(state) = CONSOLE.get() {
+        state.begin_restore(host_takes_agent_lines, RESTORE_LOG_WINDOW);
+    }
     if release_source_hold(None) {
-        eprintln!("[fc-agent] console reopened after restore (held since the snapshot boundary)");
+        eprintln!(
+            "[fc-agent] console hold released after restore (held since the snapshot boundary)"
+        );
     }
 }
 
@@ -1325,5 +1775,735 @@ mod tests {
         // Must not panic or block when /dev/console was never opened.
         let guard = QuiesceGuard { state: None };
         drop(guard);
+    }
+
+    /// The routing decision of the restore log. A line is a progress line only when it is
+    /// fc-agent's own and names no failure. Everything the console is the only channel
+    /// for goes to it: fc-agent's errors and warnings, a failure site's `VITALS` block, a
+    /// panic message, a child's output, a failpoint's line, a line with no prefix.
+    #[test]
+    fn only_fc_agents_plain_lines_are_restore_progress() {
+        for line in [
+            "[fc-agent] handling restore (epoch=e)\n",
+            "[fc-agent] restore phase=tcp-cleanup epoch=e begin\n",
+            "[fc-agent] snapshot network published: destroyed=23 already_gone=0\n",
+            "[fc-agent] exec re-registered after restore",
+            "[fc-agent] reader[reconnectable]: socket read failed, notifying writer\n",
+        ] {
+            assert_eq!(classify(line.as_bytes()), Route::Progress, "{line:?}");
+        }
+        for line in [
+            "[fc-agent] FATAL: clone restore failed closed (epoch=e): boom\n",
+            "[fc-agent] FATAL ERROR: Container failed to start\n",
+            "[fc-agent] ERROR: retiring the snapshot's chronyd panicked: x\n",
+            "[fc-agent] Error: mounting FUSE volumes: x\n",
+            "[fc-agent] WARNING: journald restart failed: x\n",
+            "[fc-agent] VITALS guest begin (container failed to start)\n",
+            "MemAvailable: 12 kB\n",
+            "thread 'main' panicked at fc-agent/src/restore.rs:1:1:\n",
+            "FAILPOINT restore.post_epoch_read reached action=sleep\n",
+            "ip: RTNETLINK answers: File exists\n",
+            "[fc-agent]\n",
+            "[fc-agent]handling restore\n",
+            " [fc-agent] handling restore\n",
+            "[ctr:out] [fc-agent] handling restore\n",
+            "\n",
+            "",
+        ] {
+            assert_eq!(classify(line.as_bytes()), Route::Urgent, "{line:?}");
+        }
+        for line in [
+            "[fcvm-vitals] mem_available_kb=1 pty=0/4096\n",
+            "[fcvm-vitals] pileup runnable=12 [fc-agent] FATAL\n",
+        ] {
+            assert_eq!(classify(line.as_bytes()), Route::Sample, "{line:?}");
+        }
+    }
+
+    /// The words that make an agent line urgent hold every word the host logs an agent
+    /// line at WARN for (`console_line_is_an_agent_error`, src/utils.rs). A word the host
+    /// has and the agent lacks would be an error line held back as progress.
+    #[test]
+    fn the_urgent_words_hold_every_word_the_host_warns_for() {
+        let host = include_str!("../../src/utils.rs");
+        let function = &host[host
+            .find("fn console_line_is_an_agent_error(")
+            .expect("the host no longer has console_line_is_an_agent_error")..];
+        let function = &function[..function.find("\n}\n").expect("the function ends")];
+        let list = &function[function.rfind('[').expect("the word list")..];
+        let list = &list[..list.find(']').expect("the word list ends")];
+        let words: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert!(
+            words.contains(&"FATAL") && words.contains(&"WARNING"),
+            "this is not the host's word list: {words:?}"
+        );
+        for word in words {
+            assert!(
+                URGENT_WORDS.contains(&word),
+                "the host warns for {word:?} and the agent holds such a line back"
+            );
+        }
+    }
+
+    /// A stand-in for the output connection.
+    #[derive(Default)]
+    struct FakeSink {
+        connected: std::sync::atomic::AtomicBool,
+        refuse: std::sync::atomic::AtomicBool,
+        /// One entry per hand-off: the lines it carried.
+        taken: Mutex<Vec<Vec<String>>>,
+        /// When each line handed over says it was logged.
+        logged: Mutex<Vec<Instant>>,
+    }
+
+    impl ProgressSink for FakeSink {
+        fn connected(&self) -> bool {
+            self.connected.load(Ordering::SeqCst)
+        }
+        fn send(&self, lines: &[ProgressLine]) -> Result<(), Refused> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(Refused);
+            }
+            self.taken.lock().unwrap().push(
+                lines
+                    .iter()
+                    .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+                    .collect(),
+            );
+            self.logged
+                .lock()
+                .unwrap()
+                .extend(lines.iter().map(|line| line.logged));
+            Ok(())
+        }
+    }
+
+    impl FakeSink {
+        fn connect(&self, state: &ConsoleShared) {
+            self.connected.store(true, Ordering::SeqCst);
+            state.wake_writer();
+        }
+        fn lines(&self) -> Vec<String> {
+            self.taken.lock().unwrap().concat()
+        }
+    }
+
+    /// A console whose agent has an output connection, and the fake ends of both.
+    fn console_with_sink() -> (Arc<ConsoleShared>, std::fs::File, Arc<FakeSink>) {
+        let (console_wr, console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        let sink = Arc::new(FakeSink::default());
+        state.ctl().sink = Some(sink.clone());
+        (state, console_rd, sink)
+    }
+
+    /// Everything the writer was handed has left it, and this is what the console got.
+    fn settled_console(state: &Arc<ConsoleShared>, console_rd: &mut std::fs::File) -> String {
+        assert!(
+            wait_until(|| state.flushed(), Duration::from_secs(5)),
+            "the writer still holds bytes"
+        );
+        let mut seen = Vec::new();
+        drain_console(console_rd, &mut seen);
+        String::from_utf8(seen).unwrap()
+    }
+
+    /// `console` without the ` held_ms=<n>` each held line ends in on the console, and how
+    /// many lines had one.
+    fn without_held(console: &str) -> (String, usize) {
+        let mut held = 0;
+        let lines: Vec<&str> = console
+            .split('\n')
+            .map(|line| match line.rsplit_once(" held_ms=") {
+                Some((text, ms)) if ms.parse::<f64>().is_ok() => {
+                    held += 1;
+                    text
+                }
+                _ => line,
+            })
+            .collect();
+        (lines.join("\n"), held)
+    }
+
+    const RESTORE_LINES: [&str; 4] = [
+        "[fc-agent] detected restore-epoch: e",
+        "[fc-agent] handling restore (epoch=e)",
+        "[fc-agent] restore phase=tcp-cleanup epoch=e begin",
+        "[fc-agent] restore phases complete (epoch=e): exec + egress ready elapsed_ms=22.6",
+    ];
+
+    /// Put the open window's deadline in the past, as time passing would. The tests open
+    /// their windows for a minute, so none ends because the test itself was slow.
+    fn pass_the_deadline(state: &Arc<ConsoleShared>) {
+        let mut ctl = state.ctl();
+        assert!(ctl.window.is_some(), "no window is open");
+        ctl.window = Some(Instant::now());
+        drop(ctl);
+        state.wake_writer();
+    }
+
+    fn write_lines(state: &Arc<ConsoleShared>, lines: &[&str]) {
+        for line in lines {
+            write_pipe(state, format!("{line}\n").as_bytes());
+        }
+    }
+
+    /// A restore's progress lines do not reach the console: the lines held behind the
+    /// snapshot's quiesce guard and those logged after it are handed to the output
+    /// connection, in order and in one hand-off, once the host has acknowledged and the
+    /// connection is up. The console gets one line.
+    ///
+    /// RED WITHOUT THE WINDOW (`hold_restore_log` returning at once): the console got all
+    /// four lines and the output connection none.
+    #[test]
+    fn a_restores_progress_lines_go_to_the_host_and_one_line_to_the_console() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        // The snapshot was taken under a hold, and the clone logs behind it.
+        let guard = state.quiesce().expect("a pipe console drains");
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        state.hold_restore_log(Duration::from_secs(60));
+        drop(guard);
+        write_lines(&state, &RESTORE_LINES[2..]);
+
+        // Neither the acknowledgement alone nor the connection alone hands them over.
+        state.restore_log_acknowledged();
+        std::thread::sleep(Duration::from_millis(3 * POLL_TICK_MS as u64));
+        assert!(sink.lines().is_empty(), "handed over with no connection");
+        sink.connect(&state);
+        assert!(
+            wait_until(|| !sink.lines().is_empty(), Duration::from_secs(5)),
+            "the lines never reached the output connection"
+        );
+        assert_eq!(sink.lines(), RESTORE_LINES);
+        assert_eq!(
+            sink.taken.lock().unwrap().len(),
+            1,
+            "more than one hand-off"
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
+        );
+    }
+
+    /// Progress lines wait for the acknowledgement even with the connection up: a restore
+    /// that fails after them must find them still here, for the console.
+    #[test]
+    fn nothing_is_handed_over_before_the_host_acknowledged() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        std::thread::sleep(Duration::from_millis(3 * POLL_TICK_MS as u64));
+        assert!(sink.lines().is_empty(), "handed over unacknowledged");
+        write_lines(
+            &state,
+            &["[fc-agent] FATAL: clone restore failed closed (epoch=e): boom"],
+        );
+        assert_eq!(
+            without_held(&settled_console(&state, &mut console_rd)),
+            (
+                format!(
+                    "{}\n{}\n[fc-agent] FATAL: clone restore failed closed (epoch=e): boom\n",
+                    RESTORE_LINES[0], RESTORE_LINES[1]
+                ),
+                2
+            )
+        );
+        assert!(sink.lines().is_empty());
+    }
+
+    /// A line that is not a progress line puts the held lines on the console before
+    /// itself, and the window is over: the lines after it go to the console as well,
+    /// acknowledged and connected or not.
+    #[test]
+    fn an_urgent_line_puts_the_held_lines_on_the_console_before_itself() {
+        for urgent in [
+            "[fc-agent] WARNING: could not give the clone its own NFS client identity: x",
+            "thread 'tokio-runtime-worker' panicked at fc-agent/src/restore.rs:1:1:",
+        ] {
+            let (state, mut console_rd, sink) = console_with_sink();
+            state.hold_restore_log(Duration::from_secs(60));
+            write_lines(&state, &RESTORE_LINES[..2]);
+            write_lines(&state, &[urgent]);
+            write_lines(&state, &RESTORE_LINES[2..]);
+            state.restore_log_acknowledged();
+            sink.connect(&state);
+            // The two lines held before it say how long they were held; the lines after
+            // it were never held.
+            assert_eq!(
+                without_held(&settled_console(&state, &mut console_rd)),
+                (
+                    format!(
+                        "{}\n{}\n{urgent}\n{}\n{}\n",
+                        RESTORE_LINES[0], RESTORE_LINES[1], RESTORE_LINES[2], RESTORE_LINES[3]
+                    ),
+                    2
+                )
+            );
+            assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+        }
+    }
+
+    /// A restore that is not acknowledged, or whose output connection is not up, when the
+    /// window ends gets its lines on the console then, an unfinished line included, and
+    /// later lines go straight there. A hang shows where it stopped within the window.
+    #[test]
+    fn a_restore_that_does_not_finish_in_the_window_gets_its_lines_on_the_console() {
+        for acknowledged in [false, true] {
+            let (state, mut console_rd, sink) = console_with_sink();
+            state.hold_restore_log(Duration::from_secs(60));
+            write_lines(&state, &RESTORE_LINES[..3]);
+            write_pipe(&state, b"[fc-agent] an unfinished");
+            if acknowledged {
+                state.restore_log_acknowledged();
+            }
+            // The writer has taken every byte, and a tick later the console has none.
+            let written: usize = RESTORE_LINES[..3]
+                .iter()
+                .map(|l| l.len() + 1)
+                .sum::<usize>()
+                + "[fc-agent] an unfinished".len();
+            assert!(wait_until(
+                || state.enqueued.load(Ordering::SeqCst) == written as u64,
+                Duration::from_secs(5)
+            ));
+            std::thread::sleep(Duration::from_millis(POLL_TICK_MS as u64));
+            let mut seen = Vec::new();
+            drain_console(&mut console_rd, &mut seen);
+            assert!(seen.is_empty(), "the console got lines inside the window");
+            std::thread::sleep(Duration::from_millis(20));
+            pass_the_deadline(&state);
+            let expected = format!(
+                "{}\n{}\n{}\n[fc-agent] an unfinished",
+                RESTORE_LINES[0], RESTORE_LINES[1], RESTORE_LINES[2]
+            );
+            assert!(
+                wait_until(
+                    || {
+                        drain_console(&mut console_rd, &mut seen);
+                        seen.ends_with(b"[fc-agent] an unfinished")
+                    },
+                    Duration::from_secs(5)
+                ),
+                "the window's end did not put the lines on the console"
+            );
+            let console = String::from_utf8_lossy(&seen).into_owned();
+            assert_eq!(without_held(&console), (expected, 3));
+            // Each line says how long it was held: the tick and the 20 ms above at least.
+            for line in console.lines().take(3) {
+                let held: f64 = line.rsplit_once(" held_ms=").unwrap().1.parse().unwrap();
+                assert!(held >= 20.0, "{line:?}");
+            }
+            // The window is over: a connection that comes up now carries nothing.
+            sink.connect(&state);
+            write_pipe(
+                &state,
+                b" line\n[fc-agent] exec re-registered after restore\n",
+            );
+            assert_eq!(
+                settled_console(&state, &mut console_rd),
+                " line\n[fc-agent] exec re-registered after restore\n"
+            );
+            assert!(sink.lines().is_empty());
+        }
+    }
+
+    /// A hand-off the output connection refuses (its queue is full or closed) loses
+    /// nothing: the lines go to the console.
+    #[test]
+    fn a_refused_hand_off_puts_the_lines_on_the_console() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.refuse.store(true, Ordering::SeqCst);
+        sink.connect(&state);
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES);
+        state.restore_log_acknowledged();
+        assert_eq!(
+            without_held(&settled_console(&state, &mut console_rd)),
+            (RESTORE_LINES.map(|line| format!("{line}\n")).concat(), 4)
+        );
+        assert!(state.ctl().window.is_none(), "the window stayed open");
+    }
+
+    /// After the hand-off, the window's later progress lines follow on the output
+    /// connection (the restore's background jobs log after the acknowledgement), with no
+    /// second console line. When the window ends they go to the console again.
+    #[test]
+    fn progress_lines_after_the_hand_off_follow_it_until_the_window_ends() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES);
+        state.restore_log_acknowledged();
+        assert!(wait_until(
+            || sink.lines().len() == RESTORE_LINES.len(),
+            Duration::from_secs(5)
+        ));
+        write_lines(&state, &["[fc-agent] journald restarted after restore"]);
+        assert!(
+            wait_until(
+                || sink.lines().len() == RESTORE_LINES.len() + 1,
+                Duration::from_secs(5)
+            ),
+            "a progress line after the hand-off did not follow it"
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
+        );
+        pass_the_deadline(&state);
+        assert!(
+            wait_until(|| state.ctl().window.is_none(), Duration::from_secs(5)),
+            "the window never ended"
+        );
+        write_lines(
+            &state,
+            &["[fc-agent] exec server: accepted connection on vsock port 4998"],
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] exec server: accepted connection on vsock port 4998\n"
+        );
+        assert_eq!(sink.lines().len(), RESTORE_LINES.len() + 1);
+    }
+
+    /// A `[fcvm-vitals]` sample reaches the console inside a window and leaves it open.
+    #[test]
+    fn a_vitals_sample_reaches_the_console_inside_the_window() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(
+            &state,
+            &[
+                RESTORE_LINES[0],
+                "[fcvm-vitals] pileup runnable=12",
+                RESTORE_LINES[1],
+            ],
+        );
+        let mut seen = Vec::new();
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.as_slice() == b"[fcvm-vitals] pileup runnable=12\n"
+                },
+                Duration::from_secs(5)
+            ),
+            "the sample did not reach the console: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        state.restore_log_acknowledged();
+        sink.connect(&state);
+        assert!(wait_until(
+            || sink.lines().len() == 2,
+            Duration::from_secs(5)
+        ));
+        assert_eq!(sink.lines(), RESTORE_LINES[..2]);
+    }
+
+    /// A snapshot's quiesce ends the window: the held lines drain to the console before
+    /// the hold, and the snapshot holds neither them nor an open window.
+    #[test]
+    fn a_snapshot_quiesce_ends_the_restore_log_window() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        let guard = state.quiesce().expect("a pipe console drains");
+        let mut seen = Vec::new();
+        drain_console(&mut console_rd, &mut seen);
+        assert_eq!(
+            without_held(&String::from_utf8_lossy(&seen)),
+            (format!("{}\n{}\n", RESTORE_LINES[0], RESTORE_LINES[1]), 2),
+            "the held lines did not drain before the hold"
+        );
+        assert!(state.ctl().window.is_none());
+        drop(guard);
+        assert!(sink.lines().is_empty());
+    }
+
+    /// `end_restore_log` (a guest that is not restoring after all, a shutdown) puts the
+    /// held lines on the console.
+    #[test]
+    fn ending_the_window_puts_the_held_lines_on_the_console() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        state.end_restore_log();
+        write_lines(&state, &["[fc-agent] shutting down VM (exit_code=0)"]);
+        sink.connect(&state);
+        assert_eq!(
+            without_held(&settled_console(&state, &mut console_rd)),
+            (
+                format!(
+                    "{}\n{}\n[fc-agent] shutting down VM (exit_code=0)\n",
+                    RESTORE_LINES[0], RESTORE_LINES[1]
+                ),
+                2
+            )
+        );
+        assert!(sink.lines().is_empty());
+    }
+
+    /// With no output connection registered (a TTY VM) no window opens: every line goes
+    /// to the console as it is logged.
+    #[test]
+    fn without_an_output_connection_no_window_opens() {
+        let (console_wr, mut console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        state.hold_restore_log(Duration::from_secs(60));
+        assert!(state.ctl().window.is_none());
+        write_lines(&state, &RESTORE_LINES);
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            RESTORE_LINES.map(|line| format!("{line}\n")).concat()
+        );
+    }
+
+    /// Held lines are bounded: past the cap the window ends and they go to the console,
+    /// which has its own bound.
+    #[test]
+    fn held_lines_past_the_cap_end_the_window() {
+        let (state, mut console_rd, _sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        let line = format!("[fc-agent] {}\n", "x".repeat(1000));
+        let lines = HELD_CAP / line.len() + 2;
+        let mut seen = Vec::new();
+        for _ in 0..lines {
+            write_pipe(&state, line.as_bytes());
+            drain_console(&mut console_rd, &mut seen);
+        }
+        let all_arrived = |seen: &[u8]| {
+            let (text, _) = without_held(&String::from_utf8_lossy(seen));
+            text.len() == lines * line.len()
+        };
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    all_arrived(&seen)
+                },
+                Duration::from_secs(10)
+            ),
+            "the console got {} bytes of {} lines",
+            seen.len(),
+            lines
+        );
+        assert!(state.ctl().window.is_none());
+        assert_eq!(state.dropped.load(Ordering::SeqCst), 0);
+        assert!(wait_until(|| state.flushed(), Duration::from_secs(5)));
+    }
+
+    /// A host that does not say it takes the `agent` stream gets every line on the
+    /// console: no window opens for it, and one the cache handshake opened before the
+    /// restore document was read ends, with what it held.
+    ///
+    /// RED WITHOUT `begin_restore`'s check (a window whatever the host says): the lines
+    /// went to the output connection, which such a host prints as container stderr.
+    #[test]
+    fn a_host_that_does_not_take_agent_lines_gets_them_on_the_console() {
+        // No window was open: none opens.
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.begin_restore(false, Duration::from_secs(60));
+        assert!(state.ctl().window.is_none(), "a window opened");
+        write_lines(&state, &RESTORE_LINES);
+        state.restore_log_acknowledged();
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            RESTORE_LINES.map(|line| format!("{line}\n")).concat()
+        );
+        assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+
+        // The handshake opened one before the document was read: it ends.
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        state.begin_restore(false, Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[2..]);
+        state.restore_log_acknowledged();
+        assert_eq!(
+            without_held(&settled_console(&state, &mut console_rd)),
+            (RESTORE_LINES.map(|line| format!("{line}\n")).concat(), 2)
+        );
+        assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+
+        // A host that takes them: the window opens, or stays open.
+        let (state, _console_rd, _sink) = console_with_sink();
+        state.begin_restore(true, Duration::from_secs(60));
+        let first = state.ctl().window;
+        assert!(first.is_some(), "no window for a host that takes the lines");
+        state.begin_restore(true, Duration::from_secs(600));
+        assert_eq!(state.ctl().window, first, "an open window was replaced");
+    }
+
+    /// A window that ends and is followed by another before the writer looked keeps its
+    /// held lines for the second: they reach the host as they were logged, with the time
+    /// they were first held.
+    ///
+    /// RED BEFORE THE FIX: the writer spilled them to its backlog with ` held_ms=`, took
+    /// them back off it for the new window, and handed them to the host with that text
+    /// in them and the time of the second window.
+    #[test]
+    fn lines_held_for_a_window_that_was_replaced_stay_held_as_they_were_logged() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        // A tick, so the writer has held them, and their time is before `replaced`.
+        std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+        let replaced = Instant::now();
+        {
+            // What `end_restore_log` then `hold_restore_log` leave, with the writer
+            // locked out in between.
+            let mut ctl = state.ctl();
+            ctl.window = Some(Instant::now() + Duration::from_secs(60));
+            ctl.generation += 1;
+            ctl.acknowledged = false;
+        }
+        state.wake_writer();
+        write_lines(&state, &RESTORE_LINES[2..]);
+        state.restore_log_acknowledged();
+        sink.connect(&state);
+        assert!(
+            wait_until(|| sink.lines().len() == 4, Duration::from_secs(5)),
+            "{:?}",
+            sink.lines()
+        );
+        assert_eq!(sink.lines(), RESTORE_LINES);
+        let logged = sink.logged.lock().unwrap().clone();
+        assert!(
+            logged[0] < replaced && logged[1] < replaced,
+            "the first window's lines lost the time they were logged at"
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
+        );
+    }
+
+    /// A line spilled while the console was held quiet is still in the writer's backlog
+    /// when the next window opens, with the ` held_ms=` its spill gave it. Held again, it
+    /// is the line as it was logged: the host gets no `held_ms`, and a second spill gives
+    /// it one suffix, not two.
+    ///
+    /// RED BEFORE THE FIX: the host got `... held_ms=<n>`, and the second spill wrote
+    /// `... held_ms=<n> held_ms=<m>`.
+    #[test]
+    fn a_spilled_line_held_again_carries_one_held_suffix_at_most() {
+        for hand_over in [true, false] {
+            let (state, mut console_rd, sink) = console_with_sink();
+            state.hold_restore_log(Duration::from_secs(60));
+            write_lines(&state, &RESTORE_LINES[..2]);
+            assert!(wait_until(
+                || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+                Duration::from_secs(5)
+            ));
+            // The console is held quiet (a snapshot's hold), and the window ends under it.
+            hold_writer(&state);
+            state.end_restore_log();
+            std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+            // The clone's restore opens the next window before the hold goes.
+            state.hold_restore_log(Duration::from_secs(60));
+            state.gate.fetch_sub(1, Ordering::SeqCst);
+            if hand_over {
+                state.restore_log_acknowledged();
+                sink.connect(&state);
+                assert!(
+                    wait_until(|| sink.lines().len() == 2, Duration::from_secs(5)),
+                    "{:?}",
+                    sink.lines()
+                );
+                assert_eq!(sink.lines(), RESTORE_LINES[..2]);
+                assert_eq!(
+                    settled_console(&state, &mut console_rd),
+                    "[fc-agent] restore: 2 progress lines queued for the host over vsock\n"
+                );
+            } else {
+                std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+                state.end_restore_log();
+                let console = settled_console(&state, &mut console_rd);
+                assert_eq!(
+                    console.matches(" held_ms=").count(),
+                    2,
+                    "not one suffix a line: {console:?}"
+                );
+                assert_eq!(
+                    without_held(&console),
+                    (format!("{}\n{}\n", RESTORE_LINES[0], RESTORE_LINES[1]), 2)
+                );
+            }
+        }
+        // Only a number after the suffix makes it one.
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms=1.250"),
+            b"[fc-agent] a"
+        );
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms=x"),
+            b"[fc-agent] a held_ms=x"
+        );
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms="),
+            b"[fc-agent] a held_ms="
+        );
+    }
+
+    /// A restore opens the window before the hold that kept the console quiet across the
+    /// snapshot goes, at both places a clone's hold is released, so no line held behind
+    /// it reaches the console in between.
+    #[test]
+    fn the_window_opens_before_the_snapshots_hold_is_released() {
+        let squeezed = |source: &str| source.split_whitespace().collect::<String>();
+        let console = squeezed(include_str!("console.rs"));
+        let release = &console[console
+            .find("pubfnrelease_source_snapshot_hold(host_takes_agent_lines:bool){")
+            .expect("no release_source_snapshot_hold")..];
+        assert!(
+            release
+                .find("state.begin_restore(host_takes_agent_lines,RESTORE_LOG_WINDOW);")
+                .expect("no window")
+                < release
+                    .find("release_source_hold(None)")
+                    .expect("no release"),
+            "the clone's hold is released before the window opens"
+        );
+        // The watcher passes what the restore document says about the host.
+        assert!(squeezed(include_str!("mmds.rs"))
+            .contains("crate::console::release_source_snapshot_hold(metadata.agent_log);"));
+        let container = squeezed(include_str!("container.rs"));
+        let release = &container[container
+            .find("letmutrelease_console=|why:&str|{")
+            .expect("no release_console in the cache handshake")..];
+        assert!(
+            release
+                .find("crate::console::hold_restore_log();")
+                .expect("no window")
+                < release.find("drop(gate);").expect("no release"),
+            "the handshake's hold is released before the window opens"
+        );
+        // A guest the handshake finds is not a restored clone ends the window.
+        assert!(container
+            .contains("ifresult!=CacheResult::WarmStart{crate::console::end_restore_log();}"));
     }
 }

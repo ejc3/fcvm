@@ -682,6 +682,26 @@ filter and RUST_LOG=fcvm=info: a guest that panics leaves
 nothing else that says why (on x86 Firecracker logs only `Unexpected exit reason on vcpu run:
 Shutdown`; on arm64 the guest resets through PSCI).
 
+A restore's progress lines are not console lines. Every byte on the 8250 is an MMIO write the
+VMM handles in userspace, and a restore printed about 2.7 KB. From the snapshot boundary until
+10 s later, fc-agent's console writer (`fc-agent/src/console.rs`, "Restore log") holds
+fc-agent's own lines that name no failure and sends them on the output vsock connection once
+the host has acknowledged the restore. fcvm logs them under `fcvm::agent` at INFO, each with
+`logged=`, the guest's clock when the line was logged, which is earlier than the log line's own
+timestamp. One console line, `[fc-agent] restore: N progress lines queued for the host over vsock`,
+is then the only fc-agent line a restore puts on the serial console, and the proof that the
+restored console works (the dead-serial check counts it; `tests/test_serial_console.rs` reads
+any `fcvm::console: [fc-agent]` line as that proof, because a restore that falls back puts its
+progress lines there). fc-agent does this only for a host whose restore document carries
+`agent-log` (`RestoreIdentity::write_into`): an fcvm older than the stream would print the
+lines as the container's stderr. The console still gets everything held so far, each
+line ending in `held_ms=`, as soon as fc-agent logs an `ERROR`, `FATAL`, `WARNING`, `Error:` or
+`VITALS` line or anything that is not its own line (a panic, a child's output, a failpoint),
+when the 10 s pass without an acknowledgement and an output connection made after the
+restore's reconnect request, and when that reconnect fails. A guest that
+stops running inside those 10 s without such a line leaves no fc-agent line of the restore;
+the host has no acknowledgement for it. `[fcvm-vitals]` samples always go to the console.
+
 Rules learned the hard way, each from a check that could not fire:
 
 - **Never conclude "no OOM" from a job log.** A job log keeps no guest console line but a crash

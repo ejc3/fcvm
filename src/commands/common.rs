@@ -3094,6 +3094,10 @@ pub struct GuestProxy {
     pub no_proxy: Option<String>,
 }
 
+/// The restore document's key that says this host takes fc-agent's `agent` stream;
+/// fc-agent's `LatestMetadata::agent_log`.
+pub const RESTORE_AGENT_LOG_KEY: &str = "agent-log";
+
 impl RestoreIdentity {
     /// Add this identity to a restore document. "host-ipv6" is always written, null
     /// when there is none, because the guest sets its address to exactly this.
@@ -3113,6 +3117,12 @@ impl RestoreIdentity {
             "https_proxy": self.proxy.https_proxy,
             "no_proxy": self.proxy.no_proxy,
         });
+        // This fcvm's output listener takes fc-agent's own lines (the `agent` stream) and
+        // logs them (`run_output_listener`). fc-agent sends a restore's progress lines
+        // there only when the document says so; without it, as from an fcvm older than
+        // the stream, it writes them to the serial console (fc-agent
+        // `console::release_source_snapshot_hold`).
+        document[RESTORE_AGENT_LOG_KEY] = serde_json::Value::Bool(true);
     }
 }
 
@@ -7463,6 +7473,7 @@ mod tests {
                     "https_proxy": "http://10.0.2.2:3129",
                     "no_proxy": "localhost",
                 },
+                "agent-log": true,
             })
         );
 
@@ -7474,7 +7485,19 @@ mod tests {
                 "restore-epoch": "e",
                 "host-ipv6": null,
                 "proxy": { "http_proxy": null, "https_proxy": null, "no_proxy": null },
+                "agent-log": true,
             })
+        );
+        // Every restore document says this host takes fc-agent's `agent` stream, under
+        // the key fc-agent reads. Without it fc-agent keeps a restore's lines on the
+        // serial console, which is what an fcvm older than the stream needs: it would
+        // print them as the container's stderr.
+        assert!(
+            include_str!("../../fc-agent/src/types.rs").contains(&format!(
+                "#[serde(rename = \"{}\", default)]\n    pub agent_log: bool,",
+                super::RESTORE_AGENT_LOG_KEY
+            )),
+            "fc-agent no longer reads the restore document's agent-log key"
         );
     }
 
