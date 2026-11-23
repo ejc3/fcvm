@@ -74,7 +74,7 @@ CLONE_LOG_DEFERRED = """\
    301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] restore phase=tcp-cleanup epoch=e begin logged=2026-01-01T00:00:10.130000Z
    301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] restore phase=tcp-cleanup epoch=e complete elapsed_ms=10.0 destroyed=1 already_gone=0 logged=2026-01-01T00:00:10.140000Z
    320.00 2026-01-01T00:00:10.220000Z  INFO fcvm::console: [fc-agent] restore phases complete (epoch=e): exec + egress ready elapsed_ms=30.0 held_ms=70.000
-   302.00 2026-01-01T00:00:10.202000Z  INFO fcvm::console: [fc-agent] restore: 5 progress lines sent to the host over vsock
+   302.00 2026-01-01T00:00:10.202000Z  INFO fcvm::console: [fc-agent] restore: 5 progress lines queued for the host over vsock
    400.00 2026-01-01T00:00:10.300000Z  INFO health-monitor: VM healthy, switching to 10s polling
 """
 

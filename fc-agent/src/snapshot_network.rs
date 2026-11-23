@@ -3637,7 +3637,7 @@ mod tests {
     fn a_restored_clone_releases_the_inherited_console_hold_first() {
         let body = function_body(include_str!("mmds.rs"), "async fn apply_restore_epoch(");
         let released = body
-            .find("crate::console::release_source_snapshot_hold()")
+            .find("crate::console::release_source_snapshot_hold(metadata.agent_log)")
             .expect("the restore no longer releases the console hold it inherits");
         let begun = body
             .find("signals.restore_status.begin()")

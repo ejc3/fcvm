@@ -17,10 +17,12 @@
 //!   Guest eprintln!() → fd 2 (pipe) → console-writer thread → /dev/console
 //!   → /dev/ttyS0 → Firecracker UART emulation → host stdout → tracing → log file
 //!
-//! A restore's progress lines do not take that path: the console-writer thread hands them
-//! to the output vsock connection once the host has acknowledged the restore, fcvm logs
-//! them under `fcvm::agent`, and one line on the console says so. That line is the proof
-//! here that the restored serial console works.
+//! A restore's progress lines do not take that path: the console-writer thread queues them
+//! on the output vsock connection once the host has acknowledged the restore, fcvm logs
+//! them under `fcvm::agent`, and one line on the console says so. When fc-agent logs a
+//! warning or an error first, or the restore does not finish within fc-agent's window,
+//! the lines go to the console instead. Either way an fc-agent line under `fcvm::console`
+//! crossed the UART, and that is the proof here that the restored serial console works.
 
 #![cfg(feature = "integration-fast")]
 
@@ -177,19 +179,10 @@ async fn test_serial_console_after_restore() -> Result<()> {
 
     // Assertions
     if was_warm_start {
-        // On warm start, fc-agent writes one line to the console when it hands its
-        // restore progress to the output connection. If UART works, it is in the host log.
-        assert_eq!(
-            restore_log.console_hand_off_lines,
-            1,
-            "fc-agent's restore line not found on the console after warm start: \
-             serial console (UART) is broken after snapshot restore. \
-             fc-agent IS running (VM is healthy, vsock works), but eprintln!() \
-             output to /dev/ttyS0 never reaches Firecracker's stdout.\n\
-             Log: {}",
-            log_path.display()
-        );
-        restore_log.assert_progress_stayed_off_the_console(&log_path);
+        // On warm start an fc-agent line crosses the console: the one line that says the
+        // restore's progress was queued for the host, or that progress itself when the
+        // restore fell back to the console. If UART works, it is in the host log.
+        restore_log.assert_console_after_restore(&log_path);
 
         assert!(
             found_marker,
@@ -321,12 +314,18 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
         .context("restoring the clone")?;
         let clone_console = async {
             common::poll_health_by_pid(clone_pid, 120).await?;
-            anyhow::Ok(
-                wait_for_log_line(&clone_log, Duration::from_secs(30), |l| {
-                    is_console_line(l) && l.contains(RESTORE_HAND_OFF_LINE)
-                })
-                .await,
-            )
+            // Any fc-agent line that crossed the clone's console proves its UART.
+            let on_console = wait_for_log_line(&clone_log, Duration::from_secs(30), |l| {
+                l.contains(AGENT_CONSOLE_LINE)
+            })
+            .await;
+            // The restore's last progress line, by either channel, so the log read
+            // below holds the whole restore. The verdict is on that read, not here.
+            let _ = wait_for_log_line(&clone_log, Duration::from_secs(10), |l| {
+                l.contains(RESTORE_PROGRESS_LINES[3])
+            })
+            .await;
+            anyhow::Ok(on_console)
         }
         .await;
         common::kill_process(clone_pid).await;
@@ -353,27 +352,23 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
     );
     assert!(
         clone_console,
-        "the clone's restore line never reached its console; log at {}",
+        "no fc-agent line reached the clone's console; log at {}",
         clone_log.display()
     );
     let contents = std::fs::read_to_string(&clone_log)
         .with_context(|| format!("reading {}", clone_log.display()))?;
-    let restore_log = RestoreLog::read(&contents);
-    restore_log.assert_progress_stayed_off_the_console(&clone_log);
-    // The clone's VMM restored and did nothing else, so the hand-off line is the first
-    // line of fc-agent's on its console: the restore wrote no other.
-    assert!(
-        restore_log.console_lines_before_hand_off.is_empty(),
-        "the clone's console has fc-agent lines ahead of the restore's one: {restore_log:#?}\n\
-         log at {}",
-        clone_log.display()
-    );
+    // The clone's VMM restored and did nothing else, so with no fallback the hand-off
+    // line is the first line of fc-agent's on its console: the restore wrote no other.
+    RestoreLog::read(&contents).assert_console_after_restore(&clone_log);
     Ok(())
 }
 
-/// What fc-agent writes to the serial console when it hands a restore's progress lines to
-/// the output connection: `[fc-agent] restore: N progress lines sent to the host over vsock`.
-const RESTORE_HAND_OFF_LINE: &str = "progress lines sent to the host over vsock";
+/// What fc-agent writes to the serial console when it queues a restore's progress lines on
+/// the output connection: `[fc-agent] restore: N progress lines queued for the host over vsock`.
+const RESTORE_HAND_OFF_LINE: &str = "progress lines queued for the host over vsock";
+
+/// How fcvm logs a line of fc-agent's that crossed the serial console.
+const AGENT_CONSOLE_LINE: &str = "fcvm::console: [fc-agent]";
 
 /// Lines every restore logs on its way to readiness.
 const RESTORE_PROGRESS_LINES: [&str; 4] = [
@@ -383,9 +378,16 @@ const RESTORE_PROGRESS_LINES: [&str; 4] = [
     "[fc-agent] restore phases complete",
 ];
 
+/// What a line of fc-agent's starts with, after `[fc-agent] `, when fc-agent's console
+/// writer puts it on the console at once and ends the restore's hand-off (`URGENT_WORDS`
+/// in fc-agent/src/console.rs; the reader's test below pins the two lists together).
+const URGENT_WORDS: [&str; 5] = ["FATAL", "ERROR", "Error: ", "WARNING", "VITALS"];
+
 /// Where a restored VM's log has the restore's own lines.
 #[derive(Debug)]
 struct RestoreLog {
+    /// fc-agent's lines on the serial console.
+    console_agent_lines: usize,
     /// fc-agent's lines on the serial console ahead of its hand-off line (all of them when
     /// there is none).
     console_lines_before_hand_off: Vec<String>,
@@ -396,11 +398,19 @@ struct RestoreLog {
     /// The restore progress lines that came over the output connection, each of which
     /// says when the guest logged it.
     progress_from_agent: usize,
+    /// The first console line that shows the restore put its lines on the console, as
+    /// fc-agent documents it does: a line with `held_ms=` (a line it had held), or an
+    /// urgent line of its own, ahead of any hand-off line.
+    fallback: Option<String>,
 }
 
 impl RestoreLog {
     fn read(log: &str) -> Self {
         let is_progress = |line: &str| RESTORE_PROGRESS_LINES.iter().any(|p| line.contains(p));
+        let is_urgent = |line: &str| {
+            line.split_once(&format!("{AGENT_CONSOLE_LINE} "))
+                .is_some_and(|(_, message)| URGENT_WORDS.iter().any(|w| message.starts_with(w)))
+        };
         let agent_console_lines: Vec<&str> = log
             .lines()
             .filter(|line| {
@@ -409,12 +419,18 @@ impl RestoreLog {
                     && !line.contains("[fcvm-vitals]")
             })
             .collect();
+        let console_lines_before_hand_off: Vec<String> = agent_console_lines
+            .iter()
+            .take_while(|line| !line.contains(RESTORE_HAND_OFF_LINE))
+            .map(|line| line.to_string())
+            .collect();
         Self {
-            console_lines_before_hand_off: agent_console_lines
+            console_agent_lines: agent_console_lines.len(),
+            fallback: console_lines_before_hand_off
                 .iter()
-                .take_while(|line| !line.contains(RESTORE_HAND_OFF_LINE))
-                .map(|line| line.to_string())
-                .collect(),
+                .find(|line| line.contains(" held_ms=") || is_urgent(line))
+                .cloned(),
+            console_lines_before_hand_off,
             console_hand_off_lines: agent_console_lines
                 .iter()
                 .filter(|line| line.contains(RESTORE_HAND_OFF_LINE))
@@ -433,6 +449,41 @@ impl RestoreLog {
         }
     }
 
+    /// What a restored VM's log must show about its console.
+    ///
+    /// Always: an fc-agent line crossed the serial console. None means the restored UART
+    /// is dead.
+    ///
+    /// When the restore handed its lines to the host: no progress line on the console,
+    /// one hand-off line, nothing of fc-agent's ahead of it, and the progress lines in
+    /// the log from the output connection.
+    ///
+    /// When it fell back to the console (`fallback`): only the first. fc-agent puts a
+    /// restore's lines on the console when it logs a warning or an error, and when the
+    /// restore is not acknowledged within its window, and those lines crossing the
+    /// console are themselves the proof of the UART. 6 of 3,000 clones in a 128-way ramp
+    /// logged `WARNING: chronyd pid N survived SIGKILL for 2s` during their restore, so a
+    /// test that demanded the hand-off would fail about once in 500 runs on a loaded
+    /// runner, and would blame the UART.
+    fn assert_console_after_restore(&self, log: &std::path::Path) {
+        assert!(
+            self.console_agent_lines > 0,
+            "no fc-agent line crossed the serial console after the restore: the serial \
+             console (UART) is broken after snapshot restore. fc-agent IS running (the VM \
+             is healthy, vsock works), but its output to /dev/ttyS0 never reaches \
+             Firecracker's stdout. {self:#?}\nlog at {}",
+            log.display()
+        );
+        match &self.fallback {
+            Some(line) => println!(
+                "  the restore put its lines on the console, not the output connection; \
+                 the first that shows it: {}",
+                line.trim()
+            ),
+            None => self.assert_progress_stayed_off_the_console(log),
+        }
+    }
+
     /// A restore writes one fc-agent line to the serial console, the hand-off line, and
     /// its progress lines reach fcvm's log over the output connection. Each byte on the
     /// 8250 is an exit to the VMM, and the progress lines were about 2.7 KB of them per
@@ -443,13 +494,19 @@ impl RestoreLog {
     fn assert_progress_stayed_off_the_console(&self, log: &std::path::Path) {
         assert!(
             self.progress_on_console.is_empty(),
-            "a restore wrote its progress to the serial console: {self:#?}\nlog at {}",
+            "a restore wrote its progress to the serial console, with no warning, error \
+             or held line ahead of it that would explain it: {self:#?}\nlog at {}",
             log.display()
         );
         assert_eq!(
             self.console_hand_off_lines,
             1,
             "a restore's one console line is missing or repeated: {self:#?}\nlog at {}",
+            log.display()
+        );
+        assert!(
+            self.console_lines_before_hand_off.is_empty(),
+            "the console has fc-agent lines ahead of the restore's one: {self:#?}\nlog at {}",
             log.display()
         );
         assert!(
@@ -461,13 +518,14 @@ impl RestoreLog {
     }
 }
 
-/// The reader and its verdict on a log of each kind, without a VM: a restore whose lines are
-/// all on the console (fcvm before the restore log), one whose lines were handed to the
-/// host, and one that fell back to the console part of the way.
+/// The reader and its verdict on a log of each kind, without a VM.
 ///
-/// The VM tests above stop at their first failed assertion. On fcvm without the restore
-/// log that is the missing hand-off line, so they never show that
-/// `assert_progress_stayed_off_the_console` can fail. This does.
+/// The VM tests above cannot show that `assert_progress_stayed_off_the_console` fails on
+/// a restore that wrote its progress to the console, or that a restore which fell back
+/// to the console passes without it. This does.
+///
+/// RED BEFORE THE FALLBACK WAS READ: the two fallen-back logs failed the verdict, as a
+/// VM test whose clone logged a warning during its restore did.
 #[test]
 fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     let stamp = "2026-01-01T00:00:10.120000Z  INFO";
@@ -479,56 +537,109 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     ];
     let hand_off = format!(
         "{stamp} fcvm::console: [fc-agent] restore: 4 {RESTORE_HAND_OFF_LINE}\n\
-         {stamp} fcvm::console: [fcvm-vitals] MemAvailable: 1 kB thread [fc-agent]\n"
+         {stamp} firecracker: [fcvm-vitals] MemAvailable: 1 kB thread [fc-agent]\n"
     );
+    let on_console = |lines: &[&str], suffix: &str| -> String {
+        lines
+            .iter()
+            .map(|line| format!("{stamp} fcvm::console: {line}{suffix}\n"))
+            .collect()
+    };
+    let from_agent: String = progress
+        .iter()
+        .map(|line| format!("{stamp} fcvm::agent: {line} logged=2026-01-01T00:00:10.100000Z\n"))
+        .collect();
     let fails = |log: &RestoreLog| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            log.assert_progress_stayed_off_the_console(std::path::Path::new("canned"))
+            log.assert_console_after_restore(std::path::Path::new("canned"))
         }))
         .is_err()
     };
 
-    // Every line on the console, as before the restore log.
-    let on_console: String = progress
-        .iter()
-        .map(|line| format!("{stamp} fcvm::console: {line}\n"))
-        .collect();
-    let log = RestoreLog::read(&on_console);
+    // Every line on the console and nothing that explains it, as before the restore log.
+    let log = RestoreLog::read(&on_console(&progress, ""));
     assert_eq!(log.progress_on_console.len(), 4, "{log:#?}");
-    assert_eq!(log.console_lines_before_hand_off.len(), 4, "{log:#?}");
     assert_eq!(
         (log.console_hand_off_lines, log.progress_from_agent),
         (0, 0)
     );
+    assert_eq!(log.fallback, None);
     assert!(fails(&log), "progress on the console passed: {log:#?}");
 
-    // Handed to the host: one console line, the rest under fcvm::agent with logged=.
-    let handed_over: String = hand_off.clone()
-        + &progress
-            .iter()
-            .map(|line| format!("{stamp} fcvm::agent: {line} logged=2026-01-01T00:00:10.100000Z\n"))
-            .collect::<String>();
-    let log = RestoreLog::read(&handed_over);
+    // Queued for the host: one console line, the rest under fcvm::agent with logged=.
+    let log = RestoreLog::read(&(hand_off.clone() + &from_agent));
     assert!(log.progress_on_console.is_empty(), "{log:#?}");
     assert!(log.console_lines_before_hand_off.is_empty(), "{log:#?}");
     assert_eq!(
         (log.console_hand_off_lines, log.progress_from_agent),
         (1, 4)
     );
+    assert_eq!((log.console_agent_lines, &log.fallback), (1, &None));
     assert!(!fails(&log), "a handed-over restore failed: {log:#?}");
 
     // The hand-off line alone: nothing proves the progress lines reached the log.
     let log = RestoreLog::read(&hand_off);
     assert!(fails(&log), "a log with no progress lines passed: {log:#?}");
 
-    // A restore that fell back: the held lines are on the console, each with held_ms.
-    let fell_back: String = progress
-        .iter()
-        .map(|line| format!("{stamp} fcvm::console: {line} held_ms=12.5\n"))
-        .collect();
-    let log = RestoreLog::read(&fell_back);
+    // An fc-agent line ahead of the hand-off line that is neither held nor urgent.
+    let log = RestoreLog::read(&(on_console(&progress[..1], "") + &hand_off + &from_agent));
+    assert!(
+        fails(&log),
+        "a progress line ahead of the hand-off passed: {log:#?}"
+    );
+
+    // No fc-agent line on the console at all: the UART is dead, whatever came over vsock.
+    let log = RestoreLog::read(&from_agent);
+    assert_eq!(log.console_agent_lines, 0);
+    assert!(fails(&log), "a dead console passed: {log:#?}");
+
+    // Fell back when its window ran out: the held lines are on the console with held_ms.
+    let log = RestoreLog::read(&on_console(&progress, " held_ms=12.5"));
     assert_eq!(log.progress_on_console.len(), 4, "{log:#?}");
-    assert!(fails(&log), "a fallen-back restore passed: {log:#?}");
+    assert!(
+        log.fallback
+            .as_deref()
+            .is_some_and(|l| l.contains(progress[0])),
+        "{log:#?}"
+    );
+    assert!(!fails(&log), "a fallen-back restore failed: {log:#?}");
+
+    // Fell back on a warning: two held lines, the warning, the rest as they were logged.
+    let warning = "[fc-agent] WARNING: chronyd pid 327 survived SIGKILL for 2s";
+    let log = RestoreLog::read(
+        &(on_console(&progress[..2], " held_ms=2427.9")
+            + &on_console(&[warning], "")
+            + &on_console(&progress[2..], "")),
+    );
+    assert!(
+        !fails(&log),
+        "a restore that logged a warning failed: {log:#?}"
+    );
+    // And on a warning with nothing held yet: the warning is what shows it.
+    let log = RestoreLog::read(&(on_console(&[warning], "") + &on_console(&progress, "")));
+    assert_eq!(
+        log.fallback.as_deref().map(str::trim),
+        Some(format!("{stamp} fcvm::console: {warning}").as_str())
+    );
+    assert!(!fails(&log), "{log:#?}");
+    // A warning after the hand-off is no fallback: the restore's lines were handed over.
+    let log = RestoreLog::read(&(hand_off.clone() + &from_agent + &on_console(&[warning], "")));
+    assert_eq!(log.fallback, None);
+    assert!(!fails(&log), "{log:#?}");
+    // Each urgent word counts, and no other line of fc-agent's does.
+    for word in URGENT_WORDS {
+        let line = format!("[fc-agent] {word} x");
+        let log = RestoreLog::read(&(on_console(&[&line], "") + &on_console(&progress, "")));
+        assert!(log.fallback.is_some(), "{word:?} is not read as urgent");
+    }
+    // The words are fc-agent's own.
+    let agent = include_str!("../fc-agent/src/console.rs");
+    assert!(
+        agent.contains(&format!(
+            "const URGENT_WORDS: [&str; 5] = {URGENT_WORDS:?};"
+        )),
+        "fc-agent's urgent words are no longer {URGENT_WORDS:?}"
+    );
 }
 
 /// Whether a line of fcvm's log is a guest console line: fc-agent's lines are logged under

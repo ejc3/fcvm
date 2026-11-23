@@ -64,14 +64,27 @@ impl ProgressOverOutput {
 }
 
 impl crate::console::ProgressSink for ProgressOverOutput {
+    /// Whether the writer holds a connection made after the last reconnect request.
+    ///
+    /// A restore asks for a reconnect when the host has acknowledged it
+    /// (`RestoreStatus::succeed`), and until the writer acts on that it can still hold
+    /// the snapshot's connection, which reaches no host. So a pending request means not
+    /// connected, whatever the writer holds. The flag is read first: the writer says it
+    /// holds nothing before it clears the flag ([`output_writer`]), so a clear flag read
+    /// here is followed by the state of a connection made after the request.
     fn connected(&self) -> bool {
-        *self.armed.borrow()
+        let reconnect_pending = self
+            .output
+            .reconnect_flag
+            .load(std::sync::atomic::Ordering::Acquire);
+        !reconnect_pending && *self.armed.borrow()
     }
 
-    /// Queue the lines behind whatever the container has already written. The writer
-    /// keeps a message it could not write and sends it on the next connection, so a line
-    /// taken here reaches the host unless the connection never comes back. A full or
-    /// closed queue takes nothing, and the caller puts the lines on the console.
+    /// Queue the lines behind whatever the container has already written. Queued is not
+    /// sent: the writer writes them in turn, keeps a message it could not write and
+    /// sends it on the next connection, so a line taken here reaches the host unless
+    /// the connection is lost and never comes back. A full or closed queue takes
+    /// nothing, and the caller puts the lines on the console.
     fn send(&self, lines: &[crate::console::ProgressLine]) -> Result<(), crate::console::Refused> {
         let now = (std::time::Instant::now(), std::time::SystemTime::now());
         self.output
@@ -357,10 +370,16 @@ async fn output_writer(
         publish_armed(&armed_tx, stream.is_some());
         // Check reconnect flag — the single source of truth for reconnection.
         // Both the flag-check path and the Notify-wakeup path converge here.
-        if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            eprintln!("[fc-agent] output vsock reconnect (flag)");
-            drop(stream.take()); // close old connection before reconnecting
+        if reconnect_flag.load(std::sync::atomic::Ordering::Acquire) {
+            // Close the old connection and say so before the flag clears: a reader that
+            // finds the flag clear must not then find the old connection still published
+            // (`ProgressOverOutput::connected`). A request that arrives between the load
+            // and the store is served by the reconnect below, like one that arrived just
+            // before.
+            drop(stream.take());
             publish_armed(&armed_tx, false);
+            reconnect_flag.store(false, std::sync::atomic::Ordering::Release);
+            eprintln!("[fc-agent] output vsock reconnect (flag)");
             stream = try_reconnect().await;
             if stream.is_some() {
                 ever_connected = true;
@@ -369,6 +388,14 @@ async fn output_writer(
                 // for ~3s). Re-arm the flag and keep retrying — the request comes
                 // at most once per restore epoch, so giving up here would leave
                 // output dead for the VM's lifetime.
+                //
+                // A restore's progress lines wait in the console writer for this
+                // connection. It is failing, so they go to the console now, ahead of
+                // the line below, and not when their window runs out. The line keeps
+                // no WARNING prefix: the host of a TTY VM binds no output listener, so
+                // a restored TTY VM's reconnect never succeeds and this line repeats
+                // for as long as it runs.
+                crate::console::end_restore_log();
                 eprintln!("[fc-agent] output vsock reconnect failed, retrying");
                 reconnect_flag.store(true, std::sync::atomic::Ordering::Release);
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -493,6 +520,72 @@ async fn output_writer(
 
 #[cfg(test)]
 mod tests {
+    /// A restore's progress lines are handed over only to a connection made after the
+    /// restore's reconnect request. With the request pending, the writer can still hold
+    /// the snapshot's connection, and lines queued for it would sit in the queue while
+    /// the console said they were queued for the host.
+    ///
+    /// RED WITHOUT THE FLAG CHECK: `connected()` was true with the request pending.
+    #[test]
+    fn a_pending_reconnect_request_means_not_connected() {
+        use crate::console::ProgressSink as _;
+        let (handle, _writer, _reset) = super::create();
+        let (armed_tx, armed_rx) = tokio::sync::watch::channel(true);
+        let sink = super::ProgressOverOutput {
+            output: handle.clone(),
+            armed: armed_rx,
+        };
+        assert!(sink.connected(), "armed with no request pending");
+        handle.reconnect();
+        assert!(
+            !sink.connected(),
+            "the snapshot's connection counted as connected with a reconnect pending"
+        );
+        // The writer says it holds nothing, then clears the flag, then reconnects.
+        armed_tx.send_replace(false);
+        handle
+            .reconnect_flag
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!sink.connected(), "connected with no connection");
+        armed_tx.send_replace(true);
+        assert!(sink.connected(), "the new connection does not count");
+    }
+
+    /// The two orders that close the races around a restore's reconnect, in the writer's
+    /// reconnect branch. The old connection is dropped and unpublished before the request
+    /// flag clears, so `connected()` never reads a clear flag and then the old connection.
+    /// And a failed reconnect ends the restore log window before its own line is logged,
+    /// so the lines waiting for this connection reach the console then.
+    #[test]
+    fn the_reconnect_branch_unpublishes_before_it_clears_the_request() {
+        let source = include_str!("output.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let branch = &code[code
+            .find("if reconnect_flag.load(std::sync::atomic::Ordering::Acquire) {")
+            .expect("the writer's reconnect branch")..];
+        let branch = &branch[..branch.find("continue;").expect("the branch ends")];
+        let at = |needle: &str| {
+            branch
+                .find(needle)
+                .unwrap_or_else(|| panic!("the reconnect branch has no {needle:?}"))
+        };
+        assert!(at("drop(stream.take());") < at("publish_armed(&armed_tx, false);"));
+        assert!(
+            at("publish_armed(&armed_tx, false);")
+                < at("reconnect_flag.store(false, std::sync::atomic::Ordering::Release);"),
+            "the request flag clears before the old connection is unpublished"
+        );
+        assert!(
+            at("reconnect_flag.store(false, std::sync::atomic::Ordering::Release);")
+                < at("try_reconnect().await")
+        );
+        assert!(
+            at("crate::console::end_restore_log();")
+                < at("output vsock reconnect failed, retrying"),
+            "a failed reconnect does not put the waiting lines on the console first"
+        );
+    }
+
     /// A restore's progress lines on the wire: one `agent:<when> <line>` protocol line each,
     /// in order, in one buffer, where `<when>` is the wall-clock time the line was logged
     /// at, read back from the monotonic stamp through the clocks at the hand-off. The host

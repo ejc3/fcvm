@@ -50,10 +50,12 @@
 //! Restore log: every byte the writer puts on the 8250 is an MMIO write the VMM handles
 //! in userspace, and a restore's progress lines were about 2.7 KB of them per clone. From
 //! the snapshot boundary until [`RESTORE_LOG_WINDOW`] later, the writer keeps fc-agent's
-//! progress lines ([`Route::Progress`]) off the console and hands them to the host over
+//! progress lines ([`Route::Progress`]) off the console and queues them for the host on
 //! the output vsock connection once the host has acknowledged the restore and the
 //! connection is re-established ([`ProgressSink`]), each with the time it was logged. One
-//! console line says so, which is also what the host's dead-serial check reads. The
+//! console line says so, which is also what the host's dead-serial check reads. Only
+//! for a host whose restore document says it takes them (`agent-log`): otherwise the
+//! window ends when the document is read. The
 //! console still gets, at once and in order, everything held so far plus the line itself
 //! when a line is not a progress line (an error, a warning, a panic, a child's output),
 //! and everything held when the window ends first: no acknowledgement or no connection
@@ -214,6 +216,29 @@ fn push_console(state: &ConsoleShared, pending: &mut VecDeque<u8>, bytes: &[u8])
     }
 }
 
+/// What [`RestoreLog::spill`] appends to a held line it puts on the console.
+const HELD_SUFFIX: &[u8] = b" held_ms=";
+
+/// `line` (no newline) without a ` held_ms=<n>` at its end, if it has one.
+fn without_held_suffix(line: &[u8]) -> &[u8] {
+    let Some(at) = line
+        .windows(HELD_SUFFIX.len())
+        .rposition(|window| window == HELD_SUFFIX)
+    else {
+        return line;
+    };
+    let number = &line[at + HELD_SUFFIX.len()..];
+    let is_number = !number.is_empty()
+        && number
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'.');
+    if is_number {
+        &line[..at]
+    } else {
+        line
+    }
+}
+
 impl RestoreLog {
     /// Route `fresh`, the bytes just read from the pipe. Called with `write_lock` held.
     fn route(
@@ -225,11 +250,18 @@ impl RestoreLog {
         cursor: &mut LineCursor,
         now: Instant,
     ) {
-        if self.generation.is_some()
-            && (ctl.window.is_none() || self.generation != Some(ctl.generation))
-        {
+        match (self.generation, ctl.window) {
             // A caller ended the window this thread was in.
-            self.spill(state, pending, now);
+            (Some(_), None) => self.spill(state, pending, now),
+            // A caller ended it and another opened before this thread looked. The lines
+            // held for the first stay held for the second, with the times they were
+            // logged at. Spilled, they would be taken back off the backlog below and
+            // held again with ` held_ms=` in their text.
+            (Some(mine), Some(_)) if mine != ctl.generation => {
+                self.generation = Some(ctl.generation);
+                self.forwarding = false;
+            }
+            _ => {}
         }
         let Some(deadline) = ctl.window else {
             push_console(state, pending, fresh);
@@ -255,10 +287,18 @@ impl RestoreLog {
             match classify(line) {
                 Route::Sample => push_console(state, pending, line),
                 Route::Progress => {
-                    self.held_bytes += line.len();
+                    // A line spilled while the console was held quiet is still in the
+                    // backlog a later window takes over, with the suffix the spill gave
+                    // it. It is held as it was logged.
+                    let text = without_held_suffix(&line[..line.len() - 1]);
+                    // The bytes dropped with the suffix are accounted for now.
+                    state
+                        .disposed
+                        .fetch_add((line.len() - 1 - text.len()) as u64, Ordering::SeqCst);
+                    self.held_bytes += text.len() + 1;
                     self.held.push(ProgressLine {
                         logged: now,
-                        bytes: line[..line.len() - 1].to_vec(),
+                        bytes: text.to_vec(),
                     });
                 }
                 Route::Urgent => {
@@ -291,8 +331,10 @@ impl RestoreLog {
         if !self.forwarding {
             self.forwarding = true;
             // The one console line of a restore. The host's dead-serial check counts it.
+            // Queued, not sent: the output writer has them and a connection made after
+            // the restore's reconnect request, and writes them in its turn.
             let line = format!(
-                "[fc-agent] restore: {} progress lines sent to the host over vsock\n",
+                "[fc-agent] restore: {} progress lines queued for the host over vsock\n",
                 self.held.len()
             );
             state
@@ -324,7 +366,8 @@ impl RestoreLog {
     fn spill(&mut self, state: &ConsoleShared, pending: &mut VecDeque<u8>, now: Instant) {
         for line in self.held.drain(..) {
             let held = format!(
-                " held_ms={:.3}\n",
+                "{}{:.3}\n",
+                String::from_utf8_lossy(HELD_SUFFIX),
                 now.saturating_duration_since(line.logged).as_secs_f64() * 1000.0
             );
             // The suffix is the writer's own bytes, counted in as the pipe's are.
@@ -753,6 +796,15 @@ impl ConsoleShared {
         self.wake_writer();
     }
 
+    /// See [`release_source_snapshot_hold`].
+    fn begin_restore(&self, host_takes_agent_lines: bool, window: Duration) {
+        if host_takes_agent_lines {
+            self.hold_restore_log(window);
+        } else {
+            self.end_restore_log();
+        }
+    }
+
     /// See [`restore_log_acknowledged`].
     fn restore_log_acknowledged(&self) {
         {
@@ -1029,8 +1081,17 @@ fn release_source_hold(only: Option<u64>) -> bool {
 /// restored clone. The snapshot holds the gate closed, so a clone of it would
 /// otherwise keep its console quiet until the cap. The lines held behind it are the
 /// restore's first, so the restore log window opens before the hold goes.
-pub fn release_source_snapshot_hold() {
-    hold_restore_log();
+///
+/// `host_takes_agent_lines` is the restore document's `agent-log`: whether the fcvm
+/// that restored this guest takes fc-agent's lines on the output connection. One that
+/// does not say so (an fcvm older than the stream, restoring a snapshot that carries
+/// this agent) would print them as the container's stderr. For it no window opens, and
+/// one the cache handshake opened before the document was read ends: every line of
+/// the restore goes to the console.
+pub fn release_source_snapshot_hold(host_takes_agent_lines: bool) {
+    if let Some(state) = CONSOLE.get() {
+        state.begin_restore(host_takes_agent_lines, RESTORE_LOG_WINDOW);
+    }
     if release_source_hold(None) {
         eprintln!(
             "[fc-agent] console hold released after restore (held since the snapshot boundary)"
@@ -1791,6 +1852,8 @@ mod tests {
         refuse: std::sync::atomic::AtomicBool,
         /// One entry per hand-off: the lines it carried.
         taken: Mutex<Vec<Vec<String>>>,
+        /// When each line handed over says it was logged.
+        logged: Mutex<Vec<Instant>>,
     }
 
     impl ProgressSink for FakeSink {
@@ -1807,6 +1870,10 @@ mod tests {
                     .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
                     .collect(),
             );
+            self.logged
+                .lock()
+                .unwrap()
+                .extend(lines.iter().map(|line| line.logged));
             Ok(())
         }
     }
@@ -1919,7 +1986,7 @@ mod tests {
         );
         assert_eq!(
             settled_console(&state, &mut console_rd),
-            "[fc-agent] restore: 4 progress lines sent to the host over vsock\n"
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
         );
     }
 
@@ -2087,7 +2154,7 @@ mod tests {
         );
         assert_eq!(
             settled_console(&state, &mut console_rd),
-            "[fc-agent] restore: 4 progress lines sent to the host over vsock\n"
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
         );
         pass_the_deadline(&state);
         assert!(
@@ -2239,6 +2306,169 @@ mod tests {
         assert!(wait_until(|| state.flushed(), Duration::from_secs(5)));
     }
 
+    /// A host that does not say it takes the `agent` stream gets every line on the
+    /// console: no window opens for it, and one the cache handshake opened before the
+    /// restore document was read ends, with what it held.
+    ///
+    /// RED WITHOUT `begin_restore`'s check (a window whatever the host says): the lines
+    /// went to the output connection, which such a host prints as container stderr.
+    #[test]
+    fn a_host_that_does_not_take_agent_lines_gets_them_on_the_console() {
+        // No window was open: none opens.
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.begin_restore(false, Duration::from_secs(60));
+        assert!(state.ctl().window.is_none(), "a window opened");
+        write_lines(&state, &RESTORE_LINES);
+        state.restore_log_acknowledged();
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            RESTORE_LINES.map(|line| format!("{line}\n")).concat()
+        );
+        assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+
+        // The handshake opened one before the document was read: it ends.
+        let (state, mut console_rd, sink) = console_with_sink();
+        sink.connect(&state);
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        state.begin_restore(false, Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[2..]);
+        state.restore_log_acknowledged();
+        assert_eq!(
+            without_held(&settled_console(&state, &mut console_rd)),
+            (RESTORE_LINES.map(|line| format!("{line}\n")).concat(), 2)
+        );
+        assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+
+        // A host that takes them: the window opens, or stays open.
+        let (state, _console_rd, _sink) = console_with_sink();
+        state.begin_restore(true, Duration::from_secs(60));
+        let first = state.ctl().window;
+        assert!(first.is_some(), "no window for a host that takes the lines");
+        state.begin_restore(true, Duration::from_secs(600));
+        assert_eq!(state.ctl().window, first, "an open window was replaced");
+    }
+
+    /// A window that ends and is followed by another before the writer looked keeps its
+    /// held lines for the second: they reach the host as they were logged, with the time
+    /// they were first held.
+    ///
+    /// RED BEFORE THE FIX: the writer spilled them to its backlog with ` held_ms=`, took
+    /// them back off it for the new window, and handed them to the host with that text
+    /// in them and the time of the second window.
+    #[test]
+    fn lines_held_for_a_window_that_was_replaced_stay_held_as_they_were_logged() {
+        let (state, mut console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        assert!(wait_until(
+            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+            Duration::from_secs(5)
+        ));
+        // A tick, so the writer has held them, and their time is before `replaced`.
+        std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+        let replaced = Instant::now();
+        {
+            // What `end_restore_log` then `hold_restore_log` leave, with the writer
+            // locked out in between.
+            let mut ctl = state.ctl();
+            ctl.window = Some(Instant::now() + Duration::from_secs(60));
+            ctl.generation += 1;
+            ctl.acknowledged = false;
+        }
+        state.wake_writer();
+        write_lines(&state, &RESTORE_LINES[2..]);
+        state.restore_log_acknowledged();
+        sink.connect(&state);
+        assert!(
+            wait_until(|| sink.lines().len() == 4, Duration::from_secs(5)),
+            "{:?}",
+            sink.lines()
+        );
+        assert_eq!(sink.lines(), RESTORE_LINES);
+        let logged = sink.logged.lock().unwrap().clone();
+        assert!(
+            logged[0] < replaced && logged[1] < replaced,
+            "the first window's lines lost the time they were logged at"
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] restore: 4 progress lines queued for the host over vsock\n"
+        );
+    }
+
+    /// A line spilled while the console was held quiet is still in the writer's backlog
+    /// when the next window opens, with the ` held_ms=` its spill gave it. Held again, it
+    /// is the line as it was logged: the host gets no `held_ms`, and a second spill gives
+    /// it one suffix, not two.
+    ///
+    /// RED BEFORE THE FIX: the host got `... held_ms=<n>`, and the second spill wrote
+    /// `... held_ms=<n> held_ms=<m>`.
+    #[test]
+    fn a_spilled_line_held_again_carries_one_held_suffix_at_most() {
+        for hand_over in [true, false] {
+            let (state, mut console_rd, sink) = console_with_sink();
+            state.hold_restore_log(Duration::from_secs(60));
+            write_lines(&state, &RESTORE_LINES[..2]);
+            assert!(wait_until(
+                || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
+                Duration::from_secs(5)
+            ));
+            // The console is held quiet (a snapshot's hold), and the window ends under it.
+            hold_writer(&state);
+            state.end_restore_log();
+            std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+            // The clone's restore opens the next window before the hold goes.
+            state.hold_restore_log(Duration::from_secs(60));
+            state.gate.fetch_sub(1, Ordering::SeqCst);
+            if hand_over {
+                state.restore_log_acknowledged();
+                sink.connect(&state);
+                assert!(
+                    wait_until(|| sink.lines().len() == 2, Duration::from_secs(5)),
+                    "{:?}",
+                    sink.lines()
+                );
+                assert_eq!(sink.lines(), RESTORE_LINES[..2]);
+                assert_eq!(
+                    settled_console(&state, &mut console_rd),
+                    "[fc-agent] restore: 2 progress lines queued for the host over vsock\n"
+                );
+            } else {
+                std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+                state.end_restore_log();
+                let console = settled_console(&state, &mut console_rd);
+                assert_eq!(
+                    console.matches(" held_ms=").count(),
+                    2,
+                    "not one suffix a line: {console:?}"
+                );
+                assert_eq!(
+                    without_held(&console),
+                    (format!("{}\n{}\n", RESTORE_LINES[0], RESTORE_LINES[1]), 2)
+                );
+            }
+        }
+        // Only a number after the suffix makes it one.
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms=1.250"),
+            b"[fc-agent] a"
+        );
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms=x"),
+            b"[fc-agent] a held_ms=x"
+        );
+        assert_eq!(
+            without_held_suffix(b"[fc-agent] a held_ms="),
+            b"[fc-agent] a held_ms="
+        );
+    }
+
     /// A restore opens the window before the hold that kept the console quiet across the
     /// snapshot goes, at both places a clone's hold is released, so no line held behind
     /// it reaches the console in between.
@@ -2247,15 +2477,20 @@ mod tests {
         let squeezed = |source: &str| source.split_whitespace().collect::<String>();
         let console = squeezed(include_str!("console.rs"));
         let release = &console[console
-            .find("pubfnrelease_source_snapshot_hold(){")
+            .find("pubfnrelease_source_snapshot_hold(host_takes_agent_lines:bool){")
             .expect("no release_source_snapshot_hold")..];
         assert!(
-            release.find("hold_restore_log();").expect("no window")
+            release
+                .find("state.begin_restore(host_takes_agent_lines,RESTORE_LOG_WINDOW);")
+                .expect("no window")
                 < release
                     .find("release_source_hold(None)")
                     .expect("no release"),
             "the clone's hold is released before the window opens"
         );
+        // The watcher passes what the restore document says about the host.
+        assert!(squeezed(include_str!("mmds.rs"))
+            .contains("crate::console::release_source_snapshot_hold(metadata.agent_log);"));
         let container = squeezed(include_str!("container.rs"));
         let release = &container[container
             .find("letmutrelease_console=|why:&str|{")

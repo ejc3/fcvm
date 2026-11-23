@@ -4740,10 +4740,11 @@ async fn cmd_snapshot_run_inner(
     // the restored guest's 8250 driver then waits forever for a TX
     // interrupt the re-created serial device never delivers, and every log
     // line from the VM silently disappears. A healthy restored fc-agent
-    // writes one console line when it hands its restore-progress lines to
-    // this output connection (the lines themselves stay off the console,
+    // writes one console line when it queues its restore-progress lines on
+    // this output connection ("N progress lines queued for the host over
+    // vsock"; the lines themselves stay off the console,
     // fc-agent/src/console.rs), and writes them all to the console when it
-    // cannot hand them over within 10 s, so zero console lines 30 s after
+    // cannot queue them within 10 s, so zero console lines 30 s after
     // this point is proof of a poisoned
     // snapshot. One loud error naming the snapshot instead of a trail of
     // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
