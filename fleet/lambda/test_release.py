@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Offline checks for the lane image's protected tags (release.py) against a model of the
 repository's tag mutability and lifecycle policy."""
+import contextlib
 import copy
 import fcntl
 import fnmatch
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -725,6 +727,32 @@ class PerStackRepository(unittest.TestCase):
         d = self.copied("rev-a")
         run, calls = self.transfer()
         self.assertEqual(release.copy(self.stage, self.prod, d, transfer=run)["status"], "present")
+        self.assertEqual(calls, [])
+
+    def test_a_digest_prod_holds_without_the_copy_tag_is_copied_again(self):
+        # The tag decides: prod's repository holds the digest (a keep-prod- tag keeps it) but from-stage-<hex> was
+        # removed by hand. A rerun copies again instead of refusing on every run.
+        d = self.copied("rev-a")
+        release.select(self.prod, "prod", d, None)
+        self.prod.images[d]["tags"].discard(release.copied(d))
+        run, calls = self.transfer()
+        self.assertEqual(release.copy(self.stage, self.prod, d, transfer=run)["status"], "copied")
+        self.assertEqual(len(calls), 1)
+        self.assertIn(release.copied(d), self.prod.tags_of(d))
+
+    def test_copy_refuses_a_lambda_tile_repo_that_is_not_prods_before_any_call(self):
+        calls = []
+        for ecr in (self.stage, self.prod):
+            for name in ("get", "tagged", "image", "put"):
+                real = getattr(ecr, name)
+                setattr(ecr, name, lambda *a, _real=real, _n=name: calls.append(_n) or _real(*a))
+        d = self.stage.push("rev-a")
+        calls.clear()
+        for url in (self.STAGE_URL, "", self.PROD_URL + ":latest", self.PROD_URL + "/"):
+            with self.subTest(url=url), patch.dict(os.environ, {"LAMBDA_TILE_REPO": url}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, "prod's lane repository"):
+                    release.run(["copy", "--digest", d], ecr=self.prod, source=self.stage)
         self.assertEqual(calls, [])
 
     def test_a_rollback_uses_prods_tags_only(self):

@@ -2813,25 +2813,43 @@ class ProdLaneWorkflowTests(unittest.TestCase):
         self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
         self.assertIn(self.FLAG, coordinator)
 
-    def test_a_promotion_copies_the_tested_lane_image_before_it_releases_and_no_rollback_copies(self):
-        # The promotion's Coordinator step, run by bash with python3 stubbed: the copy into prod's repository comes
-        # first, on prod's credentials, then the release names the same digest. Neither rollback copies.
+    def test_a_promotion_copies_the_tested_lane_image_before_anything_prod_runs_moves(self):
+        # Its own step, right after the credentials and before the host and tile images move: a failed copy changes
+        # nothing prod runs. The Coordinator step then releases the same digest; neither rollback copies.
         promote = (self.WORKFLOWS / "fleet-prod-promote.yml").read_text()
         release = promote.split("\n  release:\n", 1)[1].split("\n  smoke:\n", 1)[0]
-        coordinator, _ = self.step(release, "Coordinator")
-        script = textwrap.dedent(coordinator.split("        run: |\n", 1)[1])
+        names = re.findall(r"^      - (?:name: (.+)|uses: ([^@ ]+))", release, re.M)
+        order = [n or u for n, u in names]
+        self.assertLess(order.index("aws-actions/configure-aws-credentials"), order.index("Copy the lane image into prod's repository"))
+        self.assertLess(order.index("Copy the lane image into prod's repository"), order.index("Host and tile images"))
+        step, _ = self.step(release, "Copy the lane image into prod's repository")
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", step)
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
         lane = "sha256:" + "2" * 64
-        target = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "lambda_digest": lane})
-        out = subprocess.run(["bash", "-c", 'python3() { echo "$*"; }\n' + script],
-                             env={"PATH": os.environ["PATH"], "TARGET": target}, capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.splitlines(), [
-            f"-B fcvm/fleet/lambda/release.py copy --digest {lane}",
-            f"-B fcvm/fleet/coord/publish.py --stack prod --commit {'a' * 40} --digest sha256:{'a' * 64} --lambda-digest {lane}"])
-        without = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}})
-        out = subprocess.run(["bash", "-c", 'python3() { echo "$*"; }\n' + script],
-                             env={"PATH": os.environ["PATH"], "TARGET": without}, capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.splitlines(), [
-            f"-B fcvm/fleet/coord/publish.py --stack prod --commit {'a' * 40} --digest sha256:{'a' * 64}"])
+        def run(target, skopeo=True):
+            bin_ = tempfile.mkdtemp()
+            self.addCleanup(lambda: __import__("shutil").rmtree(bin_))
+            # The script sees jq and, when asked for, a skopeo: nothing else on PATH.
+            os.symlink(__import__("shutil").which("jq"), Path(bin_, "jq"))
+            if skopeo:
+                Path(bin_, "skopeo").write_text("#!/bin/sh\n")
+                os.chmod(Path(bin_, "skopeo"), 0o755)
+            stub = 'python3() { echo "python3 $*"; }\nsudo() { echo "sudo $*"; }\n'
+            return subprocess.run(["/bin/bash", "-c", stub + script], capture_output=True, text=True,
+                                  env={"PATH": bin_, "TARGET": json.dumps(target)})
+        with_lane = {"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "lambda_digest": lane}
+        out = run(with_lane)
+        self.assertEqual((out.returncode, out.stdout.splitlines()), (0, [f"python3 -B fcvm/fleet/lambda/release.py copy --digest {lane}"]))
+        out = run({"coordinator": with_lane["coordinator"]})
+        self.assertEqual((out.returncode, out.stdout), (0, ""))
+        # Without skopeo on the runner it is installed, and a runner that still lacks it fails before the copy.
+        out = run(with_lane, skopeo=False)
+        self.assertIn("sudo apt-get install -y skopeo", out.stdout)
+        self.assertNotIn("release.py copy", out.stdout)
+        self.assertNotEqual(out.returncode, 0)
+        coordinator, _ = self.step(release, "Coordinator")
+        self.assertNotIn("release.py copy", coordinator)
+        self.assertIn(self.FLAG, coordinator)
         rollbacks = promote.split("\n  rollback:\n", 1)[1] + (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
         self.assertNotIn("release.py copy", rollbacks)
 

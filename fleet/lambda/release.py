@@ -469,16 +469,19 @@ def skopeo_copy(source, dest, digest_, tag):
 def copy(source, dest, digest_, transfer=None):
     """Prod CI: copy the digest staging tested from staging's repository into prod's, and check prod's
     repository holds that same digest under `from-stage-<hex>`. Moves no keep- tag: the release that follows
-    selects it for prod. An image prod's repository already holds is not copied again."""
+    selects it for prod. An image prod's repository already holds under that tag is not copied again."""
     own(source, "stage")
     own(dest, "prod")
     tag = copied(digest_)
     status = "present"
-    if dest.get("imageDigest=" + digest_) is None:
+    # The tag decides, not the digest: an image prod's repository holds without it (the tag removed by hand while a
+    # keep-prod- tag keeps the image) is copied again, so a rerun converges.
+    landed = dest.tagged(tag)
+    if landed is None:
         source.image(digest_)  # LookupError when staging's repository does not hold it
         (transfer or skopeo_copy)(source, dest, digest_, tag)
         status = "copied"
-    landed = dest.tagged(tag)
+        landed = dest.tagged(tag)
     if landed is None or landed.digest != digest_ or dest.get("imageDigest=" + digest_) is None:
         raise RuntimeError(f"prod's lane repository holds {landed.digest if landed else 'nothing'} under {tag}, "
                            f"not the digest staging tested ({digest_})")

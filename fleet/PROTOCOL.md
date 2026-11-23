@@ -2200,8 +2200,9 @@ digest instead.
   unless `keep-stage-current` in staging's repository holds it (read on prod CI's credentials). A new lane image alone is a promotion. The release record
   is passed back to the record's compare-and-swap byte for byte, and decide refuses when the record
   names another lane image than prod runs. The promotion copies the set's lane image into prod's
-  repository (`release.py copy`, above), then passes it to `publish.py --stack prod
-  --lambda-digest`, which selects it for prod in prod's repository (keeping the lane image prod
+  repository (`release.py copy`, above) in its own step, before the host and tile images move, so a
+  failed copy changes nothing prod runs; a copy no release selects carries no `keep-` tag and expires.
+  The Coordinator step then passes it to `publish.py --stack prod --lambda-digest`, which selects it for prod in prod's repository (keeping the lane image prod
   runs as previous), releases it with the coordinator, and puts prod's tags back if the release
   fails or is held. A prod release with `--lambda-digest` is refused before any call when
   `LAMBDA_TILE_REPO` is unset or names staging's repository. Neither rollback copies: each returns
@@ -2271,7 +2272,8 @@ digest instead.
   coordinator with D after the selection; R stays as the rollback target.
 - `release.py copy --digest D` (prod CI, `LAMBDA_TILE_REPO` set to prod's repository) copies D from
   staging's repository into prod's as `from-stage-<hex>` and refuses unless prod's repository then
-  holds D; it moves no `keep-` tag. A digest prod's repository already holds is not copied again.
+  holds D under that tag; it moves no `keep-` tag. A digest prod's repository already holds under that
+  tag is not copied again; one it holds without the tag is copied again, so a rerun converges.
 - `release.py rollback --stack S --running R` needs R to be `keep-S-current`, selects
   `keep-S-previous`, and keeps R as previous, all in S's own repository.
 - Selections of one stack run one at a time: the script fails when another holds that stack's
