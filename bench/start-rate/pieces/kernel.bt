@@ -10,21 +10,24 @@
 // and drops the rest without a word, so with more threads than that asleep in mutex_lock the
 // holds of the others would go unsummed. @rtnl_requests and @rtnl_acquired count both ends;
 // rtnl.py refuses a dump in which they differ by over 0.5% (the kernel skips an fentry or
-// fexit run that would nest on one CPU, about 1 in 7000 here). Holds are split by the work function for
+// fexit run that would nest on one CPU, about 1 in 7000 here). The return programs check
+// the lock too: after a skipped return, the thread's next return from mutex_lock on any
+// other mutex would otherwise be taken for the acquisition of this one. Holds are split by the work function for
 // kernel workers (cleanup_net, linkwatch_event, addrconf_dad_work) and by comm otherwise.
 tracepoint:workqueue:workqueue_execute_start { @wq_fn[tid] = (uint64)args->function; }
 tracepoint:workqueue:workqueue_execute_end { delete(@wq_fn[tid]); }
 
 kfunc:vmlinux:mutex_lock, kfunc:vmlinux:mutex_lock_killable, kfunc:vmlinux:mutex_lock_interruptible
 /(uint64)args.lock == kaddr("rtnl_mutex")/ { @rtnl_req[tid] = nsecs; @rtnl_requests = count(); }
-kretfunc:vmlinux:mutex_lock /@rtnl_req[tid]/ {
+kretfunc:vmlinux:mutex_lock /(uint64)args.lock == kaddr("rtnl_mutex") && @rtnl_req[tid]/ {
   @rtnl_wait_us = hist((nsecs - @rtnl_req[tid]) / 1000);
   @rtnl_wait_us_total = sum((nsecs - @rtnl_req[tid]) / 1000);
   delete(@rtnl_req[tid]);
   @rtnl_held[tid] = nsecs;
   @rtnl_acquired = count();
 }
-kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible /@rtnl_req[tid]/ {
+kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex") && @rtnl_req[tid]/ {
   if (retval == 0) {
     @rtnl_wait_us = hist((nsecs - @rtnl_req[tid]) / 1000);
     @rtnl_wait_us_total = sum((nsecs - @rtnl_req[tid]) / 1000);

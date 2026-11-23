@@ -6,6 +6,14 @@
 //! the next guest at the same address. `SOCK_DESTROY` (`CONFIG_INET_DIAG_DESTROY`) drops a
 //! socket at once and sends nothing more. The namespace's reset destroys every one of them
 //! instead of tracking which sockets a VM's processes made.
+//!
+//! What this does not reach: a TCP socket that is not bound, listening or connected is in
+//! none of the kernel's tables, so the listing does not show it. The holder hands such
+//! sockets to the clone's fcvm process (`netns_agent`, `tcp4` and `tcp6`) for health probes
+//! and published ports. One that a process still holds after its lease has ended could be
+//! connected later, to whichever guest then has the address. fcvm closes them when it exits,
+//! and the lease ends only when the clone and its VMM have both exited, so the holder of
+//! such a socket would be a process fcvm passed it to on purpose; fcvm passes it to none.
 
 use super::rtnl::Rtnl;
 use std::io;

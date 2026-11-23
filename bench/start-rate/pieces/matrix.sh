@@ -53,7 +53,7 @@ cell_done() {
     jq -e --argjson cold "$cold" --argjson uffd "$uffd" \
       '.timed.failed == 0 and .teardown.failed == 0 and ((.perf_errors // []) | length) == 0
        and .cold == $cold and .uffd == $uffd' "$1/summary.json" > /dev/null &&
-    [ "$(cat "$1/args" 2> /dev/null)" = "${ARGS:-}" ]
+    [ -f "$1/args" ] && [ "$(cat "$1/args")" = "${ARGS:-}" ]
 }
 
 # Sourced (by test_pieces.py) for its functions only.

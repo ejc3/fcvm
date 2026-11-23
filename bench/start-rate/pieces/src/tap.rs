@@ -295,8 +295,10 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
             "the tracer summed {holds} rtnl_mutex holds for {n} {name} calls: it dropped \
              some, so the hold columns would read short"
         );
+        // The summed hold is of the holds that were summed: divided by the calls it would
+        // read short by the share of holds a probe skipped.
+        let hold = get(&format!("helper_hold_us[{key}]")) / holds;
         let n = n.max(holds);
-        let hold = get(&format!("helper_hold_us[{key}]")) / n;
         helper_hold_us += hold;
         calls.insert(
             name.into(),
@@ -464,6 +466,14 @@ mod tests {
         maps.insert("calls[1074025674]".into(), 395.0);
         maps.insert("helper_holds[1074025674]".into(), 400.0);
         maps.insert("helper_hold_us[1074025674]".into(), 200_000.0);
+        let s = summarize(&maps).unwrap();
+        assert_eq!(s["calls"]["TUNSETIFF"]["calls"], 400.0);
+        assert_eq!(s["calls"]["TUNSETIFF"]["rtnl_hold_us"], 500.0);
+        // The other way round, a few holds missing from the sum: the mean is over the
+        // holds that were summed, not over the calls.
+        maps.insert("calls[1074025674]".into(), 400.0);
+        maps.insert("helper_holds[1074025674]".into(), 395.0);
+        maps.insert("helper_hold_us[1074025674]".into(), 197_500.0);
         let s = summarize(&maps).unwrap();
         assert_eq!(s["calls"]["TUNSETIFF"]["calls"], 400.0);
         assert_eq!(s["calls"]["TUNSETIFF"]["rtnl_hold_us"], 500.0);

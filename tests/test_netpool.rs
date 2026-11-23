@@ -42,12 +42,14 @@ const POISON_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xaa];
 /// - `udp PORT`: send one UDP datagram to the gateway's PORT, as a guest that starts a flow
 ///   through pasta.
 /// - `detach`: close the TAP.
+/// - `fingerprint`: the namespace's fingerprint as the holder would take it, its lines
+///   joined by " | ".
 #[test]
 fn helper_in_the_namespace() {
-    let Ok(tap) = std::env::var("NETPOOL_TEST_TAP") else {
+    let Ok(tap_name) = std::env::var("NETPOOL_TEST_TAP") else {
         return;
     };
-    let mut tap = Some(attach(&tap));
+    let mut tap = Some(attach(&tap_name));
     println!("@@=attached");
     for line in std::io::stdin().lock().lines() {
         let line = line.expect("reading a command");
@@ -71,6 +73,11 @@ fn helper_in_the_namespace() {
             (Some("detach"), _) => {
                 tap = None;
                 println!("@@=detached");
+            }
+            (Some("fingerprint"), _) => {
+                let text = fcvm::network::fingerprint::fingerprint(&tap_name)
+                    .unwrap_or_else(|error| format!("error: {error:#}"));
+                println!("@@={}", text.trim_end().replace('\n', " | "));
             }
             other => println!("@@=unknown {other:?}"),
         }
@@ -394,6 +401,11 @@ impl Pool {
     /// Start `fcvm netpool serve --slots SLOTS` in a data directory of its own and wait
     /// until every namespace is ready.
     async fn start(slots: usize) -> Self {
+        Self::start_with(slots, &[]).await
+    }
+
+    /// [`Self::start`] with `env` in the pool's environment.
+    async fn start_with(slots: usize, env: &[(&str, &str)]) -> Self {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let data_dir = PathBuf::from(format!(
             "/mnt/fcvm-btrfs/netpool-test-{}-{}",
@@ -404,7 +416,8 @@ impl Pool {
         let mut command = tokio::process::Command::new(common::find_fcvm_binary().unwrap());
         command
             .args(["netpool", "serve", "--slots", &slots.to_string()])
-            .env("FCVM_DATA_DIR", &data_dir);
+            .env("FCVM_DATA_DIR", &data_dir)
+            .envs(env.iter().copied());
         common::set_test_pdeathsig(&mut command);
         let child = command.spawn().expect("starting the pool");
         let pid = child.id().unwrap();
@@ -642,6 +655,136 @@ async fn a_namespace_with_a_process_still_on_its_tap_is_destroyed() {
     pool.stop().await;
 }
 
+/// A process still on the TAP after its lease has ended can send frames, and what a frame
+/// leaves in pasta (a flow, the MAC and address pasta learns) is in no fingerprint. Here it
+/// starts a UDP flow through pasta half a second after the lease's end and detaches, well
+/// inside the reset's budget; everything it left in the kernel is gone by then. The pasta
+/// that serves the next tenant must not be the one that saw that datagram: the reset waits
+/// for the TAP to be free before it restarts pasta, where it used to restart pasta at once
+/// and then wait, and the host service's late answer reached the next tenant.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_that_writes_after_its_lease_and_detaches_leaves_the_next_tenant_nothing() {
+    let pool = Pool::start(1).await;
+    let lease = pool.claim().await.expect("a free namespace");
+    let holder = lease.grant.holder_pid;
+    let mut stray = Helper::start(&lease, false).await;
+    let service = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = service.local_addr().unwrap().port();
+    drop(lease);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(stray.command(&format!("udp {port}")).await.0, "sent");
+    let mut datagram = [0u8; 64];
+    let (_, pasta_flow) =
+        tokio::time::timeout(Duration::from_secs(10), service.recv_from(&mut datagram))
+            .await
+            .expect("the stray's datagram never reached the host")
+            .unwrap();
+    assert_eq!(stray.command("detach").await.0, "detached");
+
+    let stats = pool
+        .wait_for("the namespace back", |s| {
+            s.ready == 1 && (s.resets == 1 || s.destroys == 1)
+        })
+        .await;
+    assert_eq!(
+        (stats.resets, stats.destroys),
+        (1, 0),
+        "a TAP that was freed inside the budget got its namespace destroyed"
+    );
+    let lease = pool.claim().await.expect("the recycled namespace");
+    assert_eq!(
+        (lease.grant.holder_pid, lease.grant.generation),
+        (holder, 2)
+    );
+    let mut second = Helper::start(&lease, true).await;
+    let _ = service.send_to(b"a late answer", pasta_flow).await;
+    let (_, frames) = second.command("capture 1500").await;
+    assert_eq!(
+        not_membership_reports(&frames),
+        Vec::<String>::new(),
+        "the next tenant received the answer to a datagram sent after the last lease ended"
+    );
+    second.kill().await;
+    stray.kill().await;
+    drop(lease);
+    pool.stop().await;
+}
+
+/// A namespace whose reset has not finished is not lent. The pool is held at the start of
+/// the reset (failpoint `pool.pre_reset`): the namespace is neither ready nor counted as
+/// reset, a claim gets nothing, and once the reset has run the same namespace is lent as a
+/// recycled one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_namespace_whose_reset_has_not_finished_is_not_lent() {
+    let pool = Pool::start_with(1, &[("FCVM_FAILPOINT", "pool.pre_reset:sleep:1500")]).await;
+    let lease = pool.claim().await.expect("a free namespace");
+    let holder = lease.grant.holder_pid;
+    drop(lease);
+    pool.wait_for("the reset to begin", |s| s.resetting == 1)
+        .await;
+    for _ in 0..10 {
+        assert!(
+            pool.claim().await.is_none(),
+            "a namespace was lent before its reset finished"
+        );
+        let stats = pool.stats().await;
+        assert_eq!((stats.resetting, stats.ready, stats.resets), (1, 0, 0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    pool.wait_for("the namespace back", |s| s.ready == 1 && s.resets == 1)
+        .await;
+    let next = pool.claim().await.expect("the reset namespace");
+    assert_eq!((next.grant.holder_pid, next.grant.generation), (holder, 2));
+    drop(next);
+    pool.stop().await;
+}
+
+/// A pool that is stopping refuses at once: a claimer never waits out its timeout on one.
+/// Sixteen claims are in the pool's backlog when it is told to stop (it is held with
+/// SIGSTOP while they connect). Each is answered or sees its connection closed in well
+/// under the two seconds a claim waits; before, the pool left its accept loop with the
+/// listener open for the whole drain, and the claims it had not yet accepted timed out.
+/// The pool has 48 namespaces so that its drain, 50 ms a namespace, outlasts a claim's
+/// timeout: with a drain shorter than the bound below, the pool's exit closes the listener
+/// in time whatever the code does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claim_on_a_stopping_pool_is_refused_at_once() {
+    let mut pool = Pool::start(48).await;
+    // SAFETY: kill takes no pointers; the pid is this test's own child.
+    unsafe { libc::kill(pool.pid as i32, libc::SIGSTOP) };
+    let claims: Vec<_> = (0..16)
+        .map(|_| {
+            let (socket, key) = (pool.socket.clone(), pool.key.clone());
+            tokio::spawn(async move {
+                let asked = Instant::now();
+                let outcome = client::claim_at(&socket, &key).await;
+                (asked.elapsed(), outcome.map(|lease| lease.is_some()))
+            })
+        })
+        .collect();
+    // Long enough for sixteen connects and requests, short of a claim's own timeout.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // SAFETY: as above.
+    unsafe {
+        libc::kill(pool.pid as i32, libc::SIGTERM);
+        libc::kill(pool.pid as i32, libc::SIGCONT);
+    }
+    for claim in claims {
+        let (waited, outcome) = claim.await.unwrap();
+        assert!(
+            waited < Duration::from_millis(1200),
+            "a claim waited {waited:?} on a stopping pool: {outcome:?}"
+        );
+    }
+    let status = tokio::time::timeout(Duration::from_secs(60), pool.child.wait())
+        .await
+        .expect("the pool did not stop")
+        .unwrap();
+    assert!(status.success(), "the pool ended with {status}");
+    let _ = std::fs::remove_dir_all(&pool.data_dir);
+}
+
 /// Invariant 5: a namespace that does not read as it was built is not lent again. A route
 /// through loopback is something no reset removes.
 #[tokio::test(flavor = "current_thread")]
@@ -713,6 +856,22 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
         .await
         .unwrap()
         .expect("connecting to the first tenant");
+    // The marks are ones the fingerprint reads: the path MTU the tenant reported is on a
+    // cached route, the MAC it answered with on a neighbour and on the bridge's port, its
+    // connection among the sockets. A reset that left one would be caught by the
+    // comparison; these lines are what the comparison would see.
+    let marked = first.command("fingerprint").await.0;
+    for mark in [
+        "cached route 10.0.2.100 mtu=576",
+        "neigh br0 10.0.2.100 ",
+        " learned",
+        "TCP=1 ",
+    ] {
+        assert!(
+            marked.contains(mark),
+            "no {mark:?} in the fingerprint: {marked}"
+        );
+    }
 
     // A flow through pasta: the tenant's datagram reaches a service on the host's loopback,
     // which now knows where to answer.
@@ -950,6 +1109,44 @@ impl Fixture {
         args.extend_from_slice(extra);
         self.run(&args, extra_env).await
     }
+}
+
+/// A clone is never worse off because a pool exists. The pool is stopped (SIGSTOP) and does
+/// not answer the clone's claim; the clone gives up on it after the claim's timeout and
+/// builds its own namespace, where it used to fail. The pool, once it runs again, has lost
+/// nothing: the next clone runs in a namespace of its own.
+#[tokio::test]
+async fn a_clone_comes_up_in_its_own_namespace_when_the_pool_does_not_answer() {
+    let fixture = Fixture::new(1).await;
+    let data_dir = fixture.pool.data_dir.clone();
+    // SAFETY: kill takes no pointers; the pid is this test's own child.
+    unsafe { libc::kill(fixture.pool.pid as i32, libc::SIGSTOP) };
+    let (mut unanswered, unanswered_pid) = fixture.clone("unanswered", &NO_PORTS, &[]).await;
+    let state = healthy(&data_dir, "unanswered", &mut unanswered).await;
+    assert!(
+        state["netpool"].is_null(),
+        "a clone runs in a namespace of a pool that never answered: {state}"
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(fixture.pool.pid as i32, libc::SIGCONT) };
+    common::kill_process(unanswered_pid).await;
+    let _ = unanswered.wait().await;
+
+    // The pool finds the claim of a clone that has gone and ends up with its namespace
+    // free, as it was or built again.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fixture
+        .pool
+        .wait_for("its namespace free again", |s| {
+            s.ready == 1 && s.leased + s.resetting + s.building + s.destroying == 0
+        })
+        .await;
+    let (mut pooled, pooled_pid) = fixture.clone("answered", &NO_PORTS, &[]).await;
+    let state = healthy(&data_dir, "answered", &mut pooled).await;
+    assert!(!state["netpool"].is_null(), "{state}");
+    common::kill_process(pooled_pid).await;
+    let _ = pooled.wait().await;
+    fixture.pool.stop().await;
 }
 
 /// A restored clone runs in a pooled namespace and gives it back; the next clone runs in

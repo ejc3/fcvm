@@ -773,6 +773,12 @@ pub struct NamespaceParams {
     /// namespace back only when every holder of the lease is gone, and the VMM is the
     /// process that must be gone before another VM gets its TAP. Each stays close-on-exec in
     /// this process, so no other child inherits it.
+    ///
+    /// These are descriptor numbers, not owned descriptors, as are the `/proc/self/fd/N`
+    /// paths a lease gives for its namespaces. A number means what it meant only while
+    /// the lease that owns the descriptor is alive and unmoved: a clone spawns its VMM
+    /// while it holds the lease (and again from the same lease after a guest reboot), and
+    /// drops the lease only after the VMM has exited.
     pub keep_fds: Vec<std::os::fd::RawFd>,
 }
 

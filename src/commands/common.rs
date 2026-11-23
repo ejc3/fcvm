@@ -227,6 +227,20 @@ fn subordinate_range_granted_to_root(text: &str) -> bool {
     })
 }
 
+/// What decides the id maps of a holder this process would start, as text: its own uid and
+/// gid and, for a root run started with sudo, the invoker's (`setup_namespace_mappings`).
+/// Two processes with the same text start holders whose user namespaces map the same ids.
+pub(crate) fn holder_id_inputs() -> String {
+    let invoker = crate::setup::sudo_invoker()
+        .map(|user| format!("{}:{}", user.uid.as_raw(), user.gid.as_raw()))
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "uid={} gid={} invoker={invoker}",
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::getgid().as_raw()
+    )
+}
+
 /// The layout `write_id_map_with_invoker` wrote, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvokerIdMap {
@@ -7352,6 +7366,10 @@ mod tests {
         assert!(built.contains("link tap-fc "), "{built}");
         assert!(built.contains("sockets sockstat: TCP=0 "), "{built}");
         assert!(!built.contains("cached route"), "{built}");
+        // Nothing is attached to the TAP; loopback is up and has a carrier.
+        assert!(!agent.carrier("tap-fc").await.expect("the TAP's carrier"));
+        assert!(agent.carrier("lo").await.expect("loopback's carrier"));
+        assert!(agent.carrier("no-such-link").await.is_err());
 
         let mac = "02:00:00:00:00:99";
         in_namespace(
@@ -7460,6 +7478,66 @@ mod tests {
             .expect("the last fingerprint");
         assert_ne!(foreign, built);
         assert!(foreign.contains("192.0.2.0/24"), "{foreign}");
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// Each kind of state the fingerprint reads shows in it when something adds to it, and
+    /// reads as built again when that is taken back: an address, an extra queueing
+    /// discipline, a link's forwarding switch, a policy rule, an nftables table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_change_in_the_namespace_shows_in_its_fingerprint() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network = crate::network::PastaNetwork::isolated("vm-marks".into(), "tap-fc".into());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        let built = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+        const FLIP_FORWARDING: &str =
+            "f=/proc/sys/net/ipv4/conf/br0/forwarding; echo $((1 - $(cat $f))) > $f";
+        let changes: [(&str, &[&str], &[&str]); 5] = [
+            (
+                "an address",
+                &["ip", "addr", "add", "192.0.2.7/32", "dev", "lo"],
+                &["ip", "addr", "del", "192.0.2.7/32", "dev", "lo"],
+            ),
+            (
+                "a queueing discipline",
+                &["tc", "qdisc", "add", "dev", "br0", "clsact"],
+                &["tc", "qdisc", "del", "dev", "br0", "clsact"],
+            ),
+            // Flipped, then flipped back: a new namespace takes the host's value.
+            (
+                "a forwarding switch",
+                &["sh", "-c", FLIP_FORWARDING],
+                &["sh", "-c", FLIP_FORWARDING],
+            ),
+            (
+                "a policy rule",
+                &["ip", "rule", "add", "from", "192.0.2.0/24", "table", "main"],
+                &["ip", "rule", "del", "from", "192.0.2.0/24", "table", "main"],
+            ),
+            (
+                "an nftables table",
+                &["iptables-nft", "-N", "FCVM-FINGERPRINT-TEST"],
+                &["iptables-nft", "-X", "FCVM-FINGERPRINT-TEST"],
+            ),
+        ];
+        for (what, add, remove) in changes {
+            in_namespace(holder_pid, add);
+            let changed = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+            assert_ne!(changed, built, "{what} does not show in the fingerprint");
+            in_namespace(holder_pid, remove);
+            if what == "an nftables table" {
+                // Removing the chain leaves the table iptables made for it.
+                continue;
+            }
+            let back = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+            assert_eq!(back, built, "{what} left a trace after it was removed");
+        }
         stop_holder(holder, holder_pid).await;
     }
 

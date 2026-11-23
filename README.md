@@ -384,7 +384,7 @@ Host services are reachable from VMs via pasta gateways: `10.0.2.2` (IPv4) and `
 
 #### Recycled namespaces (`fcvm netpool serve`)
 
-Building and destroying a rootless namespace holds the kernel's `rtnl_mutex`, one lock for the whole host, for milliseconds. A host that starts and stops many clones can keep a pool of namespaces instead:
+Building and destroying a rootless namespace holds the kernel's `rtnl_mutex`, one lock for the whole host, for milliseconds. A host that starts and stops many clones can keep a pool of namespaces instead: a clone's start then takes a namespace in under a millisecond, and the cleaning happens after the clone has stopped. The pool cleans 114 to 120 namespaces a second (`bench/start-rate/pieces/RESULTS.md`, changelog 6), so that is the rate of starts and stops it sustains; it does not yet raise the rate above building namespaces afresh.
 
 ```bash
 fcvm netpool serve --slots 2000 &     # one per user and data directory; SIGTERM stops it

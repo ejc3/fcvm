@@ -161,6 +161,9 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
 
 ### Measured again, with a helper that stays attached
 
+These rows and the ones above are from different sessions and are not an A/B of the two
+hold times.
+
 Same session as changelog entry 6 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
 `tap-summary` as it is now: the mutex traced through fentry and fexit, the count of calls the
 larger of the two probes' counts, the other devices' link events included. The helper stays
@@ -187,8 +190,6 @@ carrier-off are each handled on their own. The rows above came from a helper att
   it now (two a cycle, the TAP being its only port). So 36 to 69% of the hold with pasta is
   there because pasta is: its neighbour listener among every link notification's receivers,
   and its TAP on the bridge.
-- **The detach costs more after 1.2 s attached than after 20 ms.** The close holds 0.40 to 1.40 ms here
-  against 0.40 to 0.69 for the 20 ms helper, and `TUNSETIFF` 0.38 to 0.91 against 0.31 to 0.48.
 
 ## Changelog
 
@@ -394,4 +395,15 @@ to 106); setup p50 1358 ms (1120 to 1748) and 1483 (1162 to 1662); host CPU per 
 - Outside the barrier the builder holds the mutex 9.19 ms a namespace life where the scripts
   held 12.11, and the ranges do not overlap. Entry 5 read 10.72 against 11.32 and called them
   equal; that tracer could drop holds.
+- The builder's 6.61 ms and the 6.61 ms on CPU are two measurements that happen to agree:
+  the first is the time between the holder's lock and unlock (5.92, 8.15 and 5.76 ms in the
+  three runs), the second counts samples of whichever thread held the mutex (5.99, 8.06 and
+  5.77 ms). About 2.6 ms of the 9.19 is held off CPU.
 - The setup rate did not move, as in entry 5: the ranges overlap.
+- Pending a rerun: after these runs the tracers' return programs were made to check which
+  mutex returned (they went by the thread alone, so after a skipped return the thread's next
+  return from `mutex_lock` on another mutex was counted as taking this one), and `tap-summary`
+  to divide a call's summed hold by the holds summed. The requests and acquisitions of these
+  dumps differ by 14 in 94,849 or less, and the tap cells' two counts by 1.5% or less, which
+  bounds how many holds can be affected but not by how much. The traced figures of entries 6
+  and 7 and the "measured again" tap rows are to be measured again with the corrected tools.

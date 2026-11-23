@@ -810,6 +810,31 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
         .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
+/// What a pool key holds of the host and of the user, beside the network's own shape.
+struct PoolHost {
+    /// The host's global IPv6 address, which pasta is started with.
+    ipv6: Option<String>,
+    /// The ids the holder's user namespace maps (`holder_id_inputs`).
+    id_maps: String,
+    /// A digest of /etc/resolv.conf, which pasta reads once, at its start.
+    resolv_conf: String,
+}
+
+impl PoolHost {
+    fn of(ipv6: Option<String>) -> Self {
+        use sha2::Digest;
+        let resolv_conf = match std::fs::read("/etc/resolv.conf") {
+            Ok(text) => hex::encode(sha2::Sha256::digest(&text)),
+            Err(error) => format!("unreadable: {}", error.kind()),
+        };
+        Self {
+            ipv6,
+            id_maps: crate::commands::common::holder_id_inputs(),
+            resolv_conf,
+        }
+    }
+}
+
 /// Rootless networking using pasta with bridge architecture
 ///
 /// This mode uses user namespaces and pasta (from passt project) for true
@@ -1026,13 +1051,24 @@ impl PastaNetwork {
     /// only to a VM whose key equals the key of the network the pool builds
     /// ([`crate::netpool`]), so a pooled namespace is the one this VM would have built.
     pub fn pool_key(&self) -> String {
+        self.pool_key_of(&PoolHost::of(Self::detect_host_ipv6()))
+    }
+
+    /// [`Self::pool_key`] with the host probed now. A pool lives for days: what it found
+    /// when it started (the host's IPv6 address, its resolver file) may no longer be what a
+    /// clone that starts now finds.
+    pub fn pool_key_now(&self) -> String {
+        self.pool_key_of(&PoolHost::of(Self::probe_host_ipv6()))
+    }
+
+    fn pool_key_of(&self, host: &PoolHost) -> String {
         use sha2::Digest;
         let mut shape = self.shape();
         shape.tap = String::new();
         let args = self.build_pasta_args(
             Path::new("/"),
             0,
-            Self::detect_host_ipv6().as_deref(),
+            host.ipv6.as_deref(),
             nix::unistd::geteuid().is_root(),
         );
         let mut hash = sha2::Sha256::new();
@@ -1041,6 +1077,14 @@ impl PastaNetwork {
             hash.update([0u8]);
             hash.update(arg.as_encoded_bytes());
         }
+        // Who the holder's user namespace maps: a namespace a root pool built for one sudo
+        // invoker does not map another's uid, and that clone's VMM could not open what
+        // its own namespace would let it.
+        hash.update([0u8]);
+        hash.update(host.id_maps.as_bytes());
+        // The resolver file pasta read when it started.
+        hash.update([0u8]);
+        hash.update(host.resolv_conf.as_bytes());
         hex::encode(hash.finalize())
     }
 
@@ -2007,10 +2051,21 @@ impl NetworkManager for PastaNetwork {
         // namespace built the way this VM's would be. Here, before anything names the TAP:
         // a pooled namespace's TAP has the pool's name, not this VM's.
         if self.poolable() {
-            if let Some(lease) = crate::netpool::client::claim(&self.pool_key())
-                .await
-                .context("claiming a pooled namespace")?
-            {
+            // A clone is never worse off because a pool exists: a pool that does not
+            // answer, answers wrongly or is stopping has lent this clone nothing, and the
+            // clone builds its own namespace as it would with no pool.
+            let claimed = match crate::netpool::client::claim(&self.pool_key()).await {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    warn!(
+                        vm_id = %self.vm_id,
+                        error = %format!("{error:#}"),
+                        "the namespace pool gave no answer to use; building this clone's own namespace"
+                    );
+                    None
+                }
+            };
+            if let Some(lease) = claimed {
                 info!(
                     vm_id = %self.vm_id,
                     slot = lease.grant.slot,
@@ -3377,6 +3432,47 @@ mod tests {
         let pooled = PastaNetwork::new("slot".into(), "tap-pool".into(), vec![]);
         assert_eq!(default_clone().pool_key(), pooled.pool_key());
         assert!(default_clone().poolable());
+    }
+
+    /// The key holds who the holder's user namespace maps, the host's IPv6 address and its
+    /// resolver file: a pool built for one sudo invoker, or before the host's address or
+    /// resolvers changed, has another key than a clone that starts now.
+    #[test]
+    fn the_key_holds_the_id_maps_and_the_hosts_address_and_resolvers() {
+        let host = |id_maps: &str, ipv6: Option<&str>, resolv_conf: &str| PoolHost {
+            ipv6: ipv6.map(str::to_string),
+            id_maps: id_maps.to_string(),
+            resolv_conf: resolv_conf.to_string(),
+        };
+        let network = default_clone();
+        let key = |host: &PoolHost| network.pool_key_of(host);
+        let base = host("uid=0 gid=0 invoker=1000:1000", None, "aa");
+        assert_eq!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1000:1000", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1001:1001", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=none", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1000:1000", None, "bb"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host(
+                "uid=0 gid=0 invoker=1000:1000",
+                Some("2001:db8::1"),
+                "aa"
+            ))
+        );
+        // In one process the two public forms agree while the host does not change.
+        assert_eq!(network.pool_key(), network.pool_key_now());
     }
 
     /// A clone whose pasta would be started differently does not match: here one that

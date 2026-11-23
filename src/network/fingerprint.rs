@@ -1,7 +1,10 @@
-//! What a rootless namespace holds, as text: one line per link, address, route, neighbour,
-//! bridge forwarding entry, extra queueing discipline, forwarding switch and cached route
-//! that holds a path MTU or a redirect, plus counts of nftables tables and sockets. Two namespaces built the same way read the same, and a namespace a VM has left
-//! reads as it did when it was built, or it is not reused.
+//! What a rootless namespace holds, as text: one line per link, address, route, policy
+//! rule, neighbour, bridge forwarding entry, extra queueing discipline, per-link network
+//! setting (forwarding, reverse-path filter, proxy neighbour, routes on a link without
+//! carrier) and cached route that holds a path MTU or a redirect, plus counts of nftables
+//! tables and of sockets in use by protocol. Two namespaces built the same way read the
+//! same, and a namespace a VM has left reads as it did when it was built, or it is not
+//! reused.
 //!
 //! The pool does not clean a namespace between VMs by walking a list of what a VM might
 //! have changed. The only writers inside a namespace are its holder, pasta and the guest's
@@ -9,7 +12,32 @@
 //! and this text is the check that nothing else is different. A difference destroys the
 //! namespace.
 //!
-//! Left out, because the kernel changes it on its own and it carries nothing over from one
+//! It is a check of what those three writers can reach, not of everything a process with
+//! `CAP_NET_ADMIN` in the namespace could change. Not read, with the reason:
+//!
+//! - Proxy neighbour entries, legacy xtables rules (iptables-legacy keeps its tables
+//!   outside nftables), traffic-control filters and classes, and a root queueing
+//!   discipline that was replaced: each takes a netlink or setsockopt request from inside
+//!   the namespace, which a guest's frames cannot make. An extra discipline (ingress,
+//!   clsact) is listed.
+//! - A link's attributes beyond its flags, MTU, MAC and bridge: its transmit queue
+//!   length, its offload features, a TAP's virtio-net header size. A VMM sets the header
+//!   size and the offloads on the TAP it attaches to, every time it attaches
+//!   (`TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`), so the next VMM does not run with the last
+//!   one's.
+//! - A bridge's multicast state (its group memberships and querier state) and its STP
+//!   state. Multicast snooping learns groups from the guest's IGMP and MLD reports; the
+//!   entries expire by themselves and decide only which ports a multicast frame is sent
+//!   to, in a bridge whose other port is pasta.
+//! - TCP metrics (the round-trip time and congestion window the kernel remembers per
+//!   destination). Deleting them takes `CAP_NET_ADMIN` in the initial user namespace; they
+//!   shape the namespace's own next connection to an address and are not sent to a guest.
+//! - Sockets that are not bound, listening or connected. The per-protocol counts are of
+//!   hashed sockets; the count of all sockets (`sockets: used`) includes the unconnected
+//!   sockets pasta keeps ready and refills on a timer, so it is not a function of what a
+//!   VM did. See [`super::sock_destroy`] for the one such socket that matters.
+//!
+//! Left out because the kernel changes it on its own and it carries nothing over from one
 //! VM to the next:
 //! - IPv6 link-local addresses and the routes and multicast entries that follow them: they
 //!   appear a moment after a link first has a carrier.
@@ -20,14 +48,13 @@
 //! - Forwarding entries the bridge learned on pasta's port: pasta's own address, learned
 //!   again from its next frame.
 
-use super::rtnl::{Message, Rtnl};
+use super::rtnl::{
+    Message, Rtnl, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH, RTM_GETNETCONF, RTM_GETQDISC,
+    RTM_GETROUTE, RTM_GETRULE,
+};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-
-use super::rtnl::{
-    RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH, RTM_GETNETCONF, RTM_GETQDISC, RTM_GETROUTE,
-};
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
@@ -46,6 +73,13 @@ const NDA_LLADDR: u16 = 2;
 const TCA_KIND: u16 = 1;
 const NETCONFA_IFINDEX: u16 = 1;
 const NETCONFA_FORWARDING: u16 = 2;
+/// The other per-link settings a netconf dump carries: reverse-path filter, proxy
+/// neighbour, and whether routes on a link without carrier are ignored.
+const NETCONFA_OTHER: [(u16, &str); 3] = [
+    (3, "rp_filter"),
+    (5, "proxy_neigh"),
+    (6, "ignore_routes_with_linkdown"),
+];
 
 /// Flags that say how a link is configured, and whether it has a carrier
 /// (`IFF_LOWER_UP`): a TAP with a carrier has a process attached to it.
@@ -116,6 +150,22 @@ fn attr(message: &Message, skip: usize, kind: u16) -> Option<&[u8]> {
 
 fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or(&[])).into_owned()
+}
+
+/// Whether the link `name` of the calling process's network namespace has a carrier
+/// (`IFF_LOWER_UP`). A TAP has one from the moment a process attaches to it until the last
+/// one detaches; the flag does not wait for the kernel's link watch worker.
+pub fn has_carrier(name: &str) -> Result<bool> {
+    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
+    for link in rtnl
+        .dump(RTM_GETLINK, &[0u8; 16])
+        .context("listing links")?
+    {
+        if attr(&link, 16, IFLA_IFNAME).map(cstr).as_deref() == Some(name) {
+            return Ok(u32_at(&link.payload, 8) & 0x1_0000 != 0);
+        }
+    }
+    anyhow::bail!("the namespace has no link {name}")
 }
 
 /// The fingerprint of the calling process's network namespace. `tap` is the VMM's TAP: a
@@ -290,6 +340,33 @@ pub fn fingerprint(tap: &str) -> Result<String> {
             lines.push(format!(
                 "forwarding family={family} {device}={}",
                 u32_at(forwarding, 0)
+            ));
+            for (kind, setting) in NETCONFA_OTHER {
+                if let Some(value) = attr(&conf, 4, kind) {
+                    lines.push(format!(
+                        "{setting} family={family} {device}={}",
+                        u32_at(value, 0)
+                    ));
+                }
+            }
+        }
+    }
+
+    // Policy routing rules, whole: a namespace is built with the kernel's three (local,
+    // main, default) per family and nothing adds one.
+    for family in [libc::AF_INET, libc::AF_INET6] {
+        let mut header = [0u8; 12];
+        header[0] = family as u8;
+        for rule in rtnl
+            .dump(RTM_GETRULE, &header)
+            .with_context(|| format!("listing the policy rules of family {family}"))?
+        {
+            lines.push(format!(
+                "rule family={family} {}",
+                rule.payload
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             ));
         }
     }

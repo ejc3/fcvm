@@ -93,6 +93,7 @@ class MatrixTest(unittest.TestCase):
                             ("perf", summary(perf_errors=["x"]))]:
                 (pathlib.Path(root) / name).mkdir()
                 (pathlib.Path(root) / name / "summary.json").write_text(json.dumps(s))
+                (pathlib.Path(root) / name / "args").write_text("")
             done = {n: self.sh(f"cell_done {root}/{n}").returncode == 0
                     for n in ["ok", "bad", "perf", "missing"]}
             self.assertEqual(done, {"ok": True, "bad": False, "perf": False, "missing": False})
@@ -135,6 +136,12 @@ class MatrixTest(unittest.TestCase):
         bt = (HERE / "kernel.bt").read_text()
         for bt in (bt, (HERE / "tap.bt").read_text()):
             self.assertIn('kfunc:vmlinux:mutex_unlock /(uint64)args.lock == kaddr("rtnl_mutex")', bt)
+            # Every program on a mutex_lock entry or return names the lock: a return program
+            # that went by the thread alone would take another mutex's return for this one.
+            for line in bt.splitlines():
+                if line.startswith(("kretfunc:vmlinux:mutex_lock", "kfunc:vmlinux:mutex_lock")):
+                    block = bt[bt.index(line):bt.index("{", bt.index(line))]
+                    self.assertIn('(uint64)args.lock == kaddr("rtnl_mutex")', block, line)
             self.assertNotIn("probe:rtnl_lock", bt)
             self.assertNotIn("probe:rtnl_unlock", bt)
 
@@ -159,6 +166,9 @@ class MatrixTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             (pathlib.Path(root) / "c").mkdir()
             (pathlib.Path(root) / "c" / "summary.json").write_text(json.dumps(summary()))
+            # A cell that does not say what it ran with is not done, whatever is asked.
+            self.assertNotEqual(self.sh(f"cell_done {root}/c").returncode, 0)
+            (pathlib.Path(root) / "c" / "args").write_text("")
             self.assertEqual(self.sh(f"cell_done {root}/c").returncode, 0)
             self.assertNotEqual(self.sh(f"COLD=1 cell_done {root}/c").returncode, 0)
             self.assertNotEqual(self.sh(f"UFFD_SOCKET=/u cell_done {root}/c").returncode, 0)
@@ -171,6 +181,7 @@ class MatrixTest(unittest.TestCase):
             warm = "--tap-warm-cycles 1 --tap-hold-ms 20"
             # A cell from before the arguments were kept ran with unknown ones.
             self.assertNotEqual(self.sh(f"ARGS='{warm}' cell_done {cell}").returncode, 0)
+            self.assertNotEqual(self.sh(f"cell_done {cell}").returncode, 0)
             (cell / "args").write_text(warm)
             self.assertEqual(self.sh(f"ARGS='{warm}' cell_done {cell}").returncode, 0)
             self.assertNotEqual(self.sh(f"ARGS='{warm} --tap-no-pasta' cell_done {cell}").returncode, 0)

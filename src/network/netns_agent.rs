@@ -26,6 +26,7 @@
 //! | `adopt` with a socket | `ok`: the agent now also serves `tcp4` and `tcp6` on that socket |
 //! | `reset` | `ok` once nothing a VM's use of the namespace left is in it ([`reset`]) |
 //! | `fingerprint` and the VMM's TAP | `ok` and the namespace's [`fingerprint`](super::fingerprint) |
+//! | `carrier` and a link's name | `ok 1` when the link has a carrier (a process is attached to a TAP), `ok 0` when not |
 //!
 //! An adopted socket is a second channel, for a process the owner lends the namespace to
 //! (the pool's lessee): it gets sockets and nothing else, so it cannot rebuild or reset a
@@ -63,6 +64,7 @@ const BUILD: &[u8] = b"build ";
 const ADOPT: &[u8] = b"adopt";
 const RESET: &[u8] = b"reset";
 const FINGERPRINT: &[u8] = b"fingerprint ";
+const CARRIER: &[u8] = b"carrier ";
 
 /// The longest message either side sends. Every message is one `sendmsg` of fewer bytes
 /// than this on a `SOCK_SEQPACKET` socket, so one `recvmsg` returns exactly one message.
@@ -399,13 +401,31 @@ fn answer(channel: &UnixStream, result: Result<Vec<u8>>) -> std::io::Result<()> 
         }
         Err(error) => format!("err {error:#}").into_bytes(),
     };
-    send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
+    send(channel, &fitted(reply))
+}
+
+/// `reply` as it is sent. An `ok` reply that is over the size of a message is replaced by
+/// an `err`: cut short it would read as a whole answer, and a fingerprint that lost its
+/// tail would compare as a namespace with less in it. An `err` reply is cut: its head says
+/// what failed.
+fn fitted(mut reply: Vec<u8>) -> Vec<u8> {
+    if reply.len() <= MAX_MESSAGE {
+        return reply;
+    }
+    if reply.starts_with(b"err ") {
+        reply.truncate(MAX_MESSAGE);
+        return reply;
+    }
+    format!(
+        "err the reply is {} bytes, over the {MAX_MESSAGE} a message holds",
+        reply.len()
+    )
+    .into_bytes()
 }
 
 /// Answer a request that is not served with `err <reason>`, cut to what a reply may hold.
 fn refuse(channel: &UnixStream, reason: &str) -> std::io::Result<()> {
-    let reply = format!("err {reason}").into_bytes();
-    send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
+    send(channel, &fitted(format!("err {reason}").into_bytes()))
 }
 
 /// Answer a request for a socket (`tcp4`, `tcp6`); anything else is refused.
@@ -496,14 +516,36 @@ pub fn serve(owner: &UnixStream) -> Result<()> {
                 answer(owner, built.map(|()| Vec::new())).context("answering a build")?;
             }
             ADOPT => {
+                // A lessee's channel is non-blocking on this side: a lessee that asks and
+                // never reads would otherwise fill its queue and hold the holder in a send,
+                // and with it the pool's reset of this namespace. A reply that cannot be
+                // queued drops the lessee (`served` below).
                 let adopted = passed
                     .context("the request carried no socket")
-                    .map(|socket| lessees.push(UnixStream::from(socket)));
+                    .and_then(|socket| {
+                        let socket = UnixStream::from(socket);
+                        socket
+                            .set_nonblocking(true)
+                            .context("making the lessee's channel non-blocking")?;
+                        lessees.push(socket);
+                        Ok(())
+                    });
                 answer(owner, adopted.map(|()| Vec::new())).context("answering an adopt")?;
             }
             RESET => {
                 answer(owner, reset(&mut lessees).map(|()| Vec::new()))
                     .context("answering a reset")?;
+            }
+            request if request.starts_with(CARRIER) => {
+                let link = String::from_utf8_lossy(&request[CARRIER.len()..]).into_owned();
+                let carrier = super::fingerprint::has_carrier(&link).map(|carrier| {
+                    if carrier {
+                        b" 1".to_vec()
+                    } else {
+                        b" 0".to_vec()
+                    }
+                });
+                answer(owner, carrier).context("answering a carrier request")?;
             }
             request if request.starts_with(FINGERPRINT) => {
                 let tap = String::from_utf8_lossy(&request[FINGERPRINT.len()..]).into_owned();
@@ -816,6 +858,22 @@ impl Client {
     }
 
     /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
+    /// Whether the link `name` in the namespace has a carrier. A TAP has one while a
+    /// process is attached to it.
+    pub async fn carrier(&self, name: &str) -> Result<bool> {
+        let mut request = CARRIER.to_vec();
+        request.extend_from_slice(name.as_bytes());
+        let body = self.request(&request, None, "a link's carrier").await?;
+        match body.as_slice() {
+            b" 1" => Ok(true),
+            b" 0" => Ok(false),
+            other => bail!(
+                "the namespace agent answered a carrier request with {:?}",
+                String::from_utf8_lossy(other)
+            ),
+        }
+    }
+
     pub async fn fingerprint(&self, tap: &str) -> Result<String> {
         let mut request = FINGERPRINT.to_vec();
         request.extend_from_slice(tap.as_bytes());
@@ -949,6 +1007,7 @@ mod tests {
             .unwrap();
         // SAFETY: fcntl with F_GETFD takes no pointers.
         let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
         assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     }
 
@@ -969,6 +1028,7 @@ mod tests {
         for fd in &fds {
             // SAFETY: fcntl with F_GETFD takes no pointers.
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
             assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
         }
         drop(a);
@@ -1054,6 +1114,67 @@ mod tests {
         assert_eq!(next_request(agent.clone()).await, RESET);
         send(&agent, OK).unwrap();
         again.await.unwrap().unwrap();
+    }
+
+    /// A reply over the size of a message is an error, never a reply with its tail cut
+    /// off: a fingerprint short of its last lines would compare as a namespace with less in
+    /// it.
+    #[test]
+    fn a_reply_that_does_not_fit_is_an_error_not_a_cut_reply() {
+        let fits = [OK, &vec![b'x'; MAX_MESSAGE - OK.len()][..]].concat();
+        assert_eq!(fitted(fits.clone()), fits);
+        let over = [OK, &vec![b'x'; MAX_MESSAGE - OK.len() + 1][..]].concat();
+        let reply = String::from_utf8(fitted(over)).unwrap();
+        assert!(
+            reply.starts_with(&format!("err the reply is {} bytes", MAX_MESSAGE + 1)),
+            "{reply}"
+        );
+        let long_error = [&b"err "[..], &vec![b'e'; MAX_MESSAGE][..]].concat();
+        let cut = fitted(long_error);
+        assert_eq!(cut.len(), MAX_MESSAGE);
+        assert!(cut.starts_with(b"err eee"));
+    }
+
+    /// A lessee that asks and never reads its replies is dropped when its queue is full,
+    /// and the holder goes on serving its owner. With a blocking send the holder stopped
+    /// there, and the pool's reset of the namespace with it.
+    #[test]
+    fn a_lessee_that_never_reads_is_dropped_and_the_owner_is_served() {
+        let (owner, agent) = channel().unwrap();
+        let serving = std::thread::spawn(move || serve(&agent));
+        let (lessee, adopted) = channel().unwrap();
+        owner.send_with_fd(ADOPT, adopted.as_raw_fd()).unwrap();
+        assert_eq!(receive(&owner).unwrap().unwrap().0, OK);
+        drop(adopted);
+
+        // Requests the holder answers with an error of about their own size, unread.
+        lessee.set_nonblocking(true).unwrap();
+        let request = vec![b'q'; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut dropped = false;
+        while !dropped && std::time::Instant::now() < deadline {
+            match send(&lessee, &request) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // The holder closed its end.
+                Err(_) => dropped = true,
+            }
+        }
+        assert!(
+            dropped,
+            "the holder kept a lessee whose replies it could not queue"
+        );
+
+        owner
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        send(&owner, TCP4).unwrap();
+        let (reply, socket) = receive(&owner).unwrap().expect("a reply to the owner");
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+        drop(owner);
+        serving.join().unwrap().unwrap();
     }
 
     /// One bad request does not take the namespace down: a request over the size limit is

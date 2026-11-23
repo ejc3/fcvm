@@ -50,6 +50,10 @@ const VERIFY_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a failed build waits before the next attempt.
 const REBUILD_DELAY: Duration = Duration::from_secs(1);
+/// The pause after a failed `accept`.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// The least time between two reports of a claim for another key.
+const KEY_MISS_REPORT: Duration = Duration::from_secs(30);
 
 /// A lease handed to a namespace's task: the claimer's connection and what the table
 /// recorded for it.
@@ -70,6 +74,8 @@ struct Pool {
     resets: tokio::sync::Semaphore,
     /// Held by the one task that is destroying a namespace.
     destroying: tokio::sync::Mutex<()>,
+    /// When a claim for another key was last reported.
+    key_miss_reported: std::cell::Cell<Option<std::time::Instant>>,
     stop: tokio::sync::watch::Sender<bool>,
 }
 
@@ -206,11 +212,35 @@ impl Namespace {
         proto::watch(offer.connection).context("watching the lease")
     }
 
-    /// After a lease: restart pasta, have the holder remove what a VM's use leaves, and
-    /// check the namespace against its fingerprint. An error means it must not be lent
-    /// again.
+    /// After a lease: wait until nothing is attached to the VMM's TAP, restart pasta, have
+    /// the holder remove what a VM's use leaves, and check the namespace against its
+    /// fingerprint. An error means it must not be lent again.
+    ///
+    /// The wait comes first. While a process is attached to the TAP it can send frames,
+    /// and what a frame leaves in the kernel shows in the fingerprint but what it leaves in
+    /// pasta does not: a flow, the MAC and the address pasta learns. So the pasta that
+    /// serves the next VM is started only after the last writer is gone, and cleaning
+    /// happens after that. A TAP that still has a carrier at the end of the budget gets
+    /// the namespace destroyed.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
+        let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
+        let mut pause = Duration::from_millis(1);
+        while self
+            .agent
+            .carrier(proto::TAP)
+            .await
+            .context("reading the TAP's carrier")?
+        {
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "a process is still attached to the namespace's TAP, {VERIFY_BUDGET:?} \
+                     after its lease ended"
+                );
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
         self.network.cleanup().await.context("stopping pasta")?;
         self.agent
             .reset()
@@ -274,6 +304,43 @@ fn difference(built: &str, found: &str) -> String {
     out.join("\n")
 }
 
+impl Pool {
+    /// Say, at most once in [`KEY_MISS_REPORT`], that a clone asked for namespaces this pool
+    /// does not have, and whether the pool itself is out of date: its key is from its
+    /// start, and the host's IPv6 address, its resolver file or the sudo invoker may have
+    /// changed since. A pool whose key no clone asks for serves nothing, and without this
+    /// line nothing says so.
+    fn report_key_miss(&self, asked: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .key_miss_reported
+            .get()
+            .is_some_and(|last| now.duration_since(last) < KEY_MISS_REPORT)
+        {
+            return;
+        }
+        self.key_miss_reported.set(Some(now));
+        let current = slot_network(String::new(), self.dir.clone()).pool_key_now();
+        if current != self.key {
+            warn!(
+                built_for = %self.key,
+                host_now = %current,
+                asked,
+                "the host has changed since this pool started (its IPv6 address, \
+                 /etc/resolv.conf or the invoking user): the pool's namespaces match no \
+                 clone started now. Restart the pool"
+            );
+        } else {
+            warn!(
+                pool = %self.key,
+                asked,
+                "a clone asked for a namespace built otherwise than this pool's (another \
+                 resolver, MTU or user); it builds its own"
+            );
+        }
+    }
+}
+
 /// Resolves at the lease's end: every process that held the connection has exited.
 async fn lease_ended(lease: &AsyncFd<UnixStream>) {
     loop {
@@ -282,8 +349,10 @@ async fn lease_ended(lease: &AsyncFd<UnixStream>) {
         };
         match guard.try_io(|connection| proto::receive(connection.get_ref())) {
             // End-of-file or an error ends the lease. A lessee has nothing to say after
-            // its claim, so a packet is dropped and the wait goes on.
+            // its claim, so a packet is dropped and the wait goes on, an empty or cut one
+            // (`InvalidData`) included: neither is the end of the connection.
             Ok(Ok(Some(_))) => continue,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Ok(_) => return,
             Err(_would_block) => continue,
         }
@@ -299,6 +368,10 @@ async fn lend(pool: &Pool, slot: SlotId, namespace: &mut Namespace) -> String {
         let (offer, offered) = oneshot::channel();
         pool.offers.borrow_mut().insert(slot, offer);
         let offer = tokio::select! {
+            // An offer that has arrived is taken, whatever else is ready: it holds a
+            // claimer's connection, and dropping it would fail a claim the table already
+            // counted.
+            biased;
             offer = offered => offer,
             reason = namespace.died() => {
                 pool.offers.borrow_mut().remove(&slot);
@@ -447,6 +520,7 @@ async fn answer(pool: Rc<Pool>, connection: UnixStream) {
         );
     };
     if key != pool.key {
+        pool.report_key_miss(&key);
         return miss(
             &connection,
             "the pool's namespaces are not built as this clone's would be",
@@ -593,6 +667,7 @@ pub async fn serve(slots: usize) -> Result<()> {
         builds: tokio::sync::Semaphore::new(BUILD_CONCURRENCY),
         resets: tokio::sync::Semaphore::new(RESET_CONCURRENCY),
         destroying: tokio::sync::Mutex::new(()),
+        key_miss_reported: std::cell::Cell::new(None),
         stop,
     });
     info!(slots, socket = %socket_path.display(), key = %pool.key, "namespace pool starting");
@@ -611,14 +686,23 @@ pub async fn serve(slots: usize) -> Result<()> {
                         Ok(connection) => {
                             tokio::task::spawn_local(answer(pool.clone(), connection));
                         }
-                        Err(error) => warn!(%error, "accepting a pool connection"),
+                        Err(error) => {
+                            // Out of descriptors, most likely, and the listener stays
+                            // readable: without a pause this loop would spin on it.
+                            warn!(%error, "accepting a pool connection");
+                            tokio::time::sleep(ACCEPT_RETRY).await;
+                        }
                     },
                     _ = sigterm.recv() => break,
                     _ = sigint.recv() => break,
                 }
             }
             info!("namespace pool stopping: destroying its namespaces one at a time");
+            // Stop listening before the drain, which takes 50 ms a namespace: a clone that
+            // connects from here on is refused at once and builds its own namespace, and
+            // one waiting in the backlog sees the connection close.
             let _ = std::fs::remove_file(&socket_path);
+            drop(listener);
             pool.stop.send_replace(true);
             let drained = async {
                 for task in tasks {
@@ -711,6 +795,25 @@ mod tests {
             text = text.replace(&mac, &name);
         }
         text
+    }
+
+    /// A claimer talks only to a pool that runs as its own user: the reply names namespaces
+    /// it then enters.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_socket_served_by_another_user_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let _listener = listen(&path).unwrap();
+        let connection = super::super::client::connect(&path)
+            .unwrap()
+            .expect("a listening socket");
+        let own = nix::unistd::geteuid().as_raw();
+        super::super::client::require_peer(&connection, own).unwrap();
+        let refused = super::super::client::require_peer(&connection, own + 1).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("not by this user"),
+            "{refused:#}"
+        );
     }
 
     #[test]

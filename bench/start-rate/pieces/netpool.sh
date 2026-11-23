@@ -41,7 +41,7 @@ socket=$(echo "$data_dir"/netpool/*/pool.sock)
 
 cell() {  # OUT C COUNT
   local cell=$1/netpool-c$2-n$3-a$ALIVE
-  [ -f "$cell/summary.json" ] && return 0
+  ARGS="--netpool-socket $socket --steady-secs 5" cell_done "$cell" && return 0
   rm -rf "$cell"
   mkdir -p "$1"
   quiet "netpool C=$2" || return 1
@@ -49,7 +49,9 @@ cell() {  # OUT C COUNT
   make --no-print-directory -C "$repo" bench-start-pieces PIECE=netpool OUT="$cell" COUNT="$3" \
     START_PIECES="$bin" CONCURRENCY="$2" ALIVE="$ALIVE" \
     ARGS="--netpool-socket $socket --steady-secs 5" > "$cell.log" 2>&1
-  echo "exit=$? $(jq -c '{claims_s: .timed.ops_per_s, p50: .timed.latency_ms.p50, p99: .timed.latency_ms.p99,
+  local status=$?
+  [ -d "$cell" ] && printf '%s' "--netpool-socket $socket --steady-secs 5" > "$cell/args"
+  echo "exit=$status $(jq -c '{claims_s: .timed.ops_per_s, p50: .timed.latency_ms.p50, p99: .timed.latency_ms.p99,
     failed: .timed.failed, resets_s: .pool.resets_per_s, reset_ms: .pool.reset_ms_mean, destroys: .pool.destroys}' \
     "$cell/summary.json" 2>&1)"
 }

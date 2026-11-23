@@ -66,7 +66,7 @@ impl Lease {
     }
 }
 
-fn connect(path: &std::path::Path) -> std::io::Result<Option<UnixStream>> {
+pub(super) fn connect(path: &std::path::Path) -> std::io::Result<Option<UnixStream>> {
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: socket takes no pointers.
     let fd = unsafe {
@@ -115,11 +115,39 @@ fn connect(path: &std::path::Path) -> std::io::Result<Option<UnixStream>> {
     Ok(Some(socket))
 }
 
+/// Refuse a connection whose other end does not run as `uid` (`SO_PEERCRED`: the user that
+/// called `listen` on the socket).
+pub(super) fn require_peer(connection: &UnixStream, uid: libc::uid_t) -> Result<()> {
+    // SAFETY: ucred is plain data, valid when zeroed.
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: both pointers are to locals that outlive the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            connection.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the pool's credentials");
+    }
+    anyhow::ensure!(
+        peer.uid == uid,
+        "the namespace pool's socket is served by uid {}, not by this user ({uid})",
+        peer.uid
+    );
+    Ok(())
+}
+
 /// Claim a namespace for a clone whose network has the pool key `key`.
 ///
 /// `None` when no pool serves this data directory for this user, when the pool has no
 /// free namespace, or when its namespaces are not what `key` asks for: the clone then
-/// builds its own. An error is a pool that answered wrongly or not in time.
+/// builds its own. An error is a pool that answered wrongly or not in time; the caller
+/// holds no namespace then either and builds its own (`PastaNetwork::setup`).
 pub async fn claim(key: &str) -> Result<Option<Lease>> {
     let Some(dir) = proto::existing_dir()? else {
         return Ok(None);
@@ -174,6 +202,9 @@ async fn ask(
     let Some(connection) = connect(socket).context("connecting to the namespace pool")? else {
         return Ok(None);
     };
+    // The reply names namespaces this process then enters. A pool is its user's own
+    // (`<data_dir>/netpool/<user>/`), so whatever listens here as another user is not it.
+    require_peer(&connection, nix::unistd::geteuid().as_raw())?;
     let connection = proto::watch(connection).context("registering the pool connection")?;
     let request = serde_json::to_vec(request)?;
     let exchange = async {

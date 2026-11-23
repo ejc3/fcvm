@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -165,11 +165,30 @@ pub fn send(socket: &UnixStream, message: &[u8], fds: &[RawFd]) -> std::io::Resu
 
 /// One packet and the descriptors that came with it, each close-on-exec, or `None` at
 /// end-of-file ([`crate::network::netns_agent::receive_packet`]).
+///
+/// A read of no bytes is end-of-file only when the peer has hung up. A peer can also send
+/// a packet of no bytes, which reads the same; taken for end-of-file it would end a lease
+/// whose holder is running. It is a malformed packet (`InvalidData`).
 pub fn receive(socket: &UnixStream) -> std::io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut buffer = [0u8; MAX_MESSAGE];
     let (len, fds) = crate::network::netns_agent::receive_packet(socket, &mut buffer)?;
     if len == 0 && fds.is_empty() {
-        return Ok(None);
+        let mut poll = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: `poll` is one valid pollfd for the whole call, which does not wait.
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if poll.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR) != 0 {
+            return Ok(None);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "an empty packet",
+        ));
     }
     Ok(Some((buffer[..len].to_vec(), fds)))
 }
@@ -177,7 +196,20 @@ pub fn receive(socket: &UnixStream) -> std::io::Result<Option<(Vec<u8>, Vec<Owne
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+
+    /// A packet of no bytes is not the end of the connection: only a peer that hung up
+    /// is.
+    #[test]
+    fn an_empty_packet_is_not_end_of_file() {
+        let (a, b) = crate::network::netns_agent::channel().unwrap();
+        send(&a, b"", &[]).unwrap();
+        let malformed = receive(&b).unwrap_err();
+        assert_eq!(malformed.kind(), std::io::ErrorKind::InvalidData);
+        send(&a, b"next", &[]).unwrap();
+        assert_eq!(receive(&b).unwrap().unwrap().0, b"next");
+        drop(a);
+        assert!(receive(&b).unwrap().is_none());
+    }
 
     #[test]
     fn resets_are_counted_in_power_of_two_buckets() {

@@ -38,14 +38,15 @@ kretprobe:linkwatch_do_dev /@dev_s[tid]/ {
 // probes on the tun calls above only clear @call, which the next call overwrites.
 kfunc:vmlinux:mutex_lock, kfunc:vmlinux:mutex_lock_killable, kfunc:vmlinux:mutex_lock_interruptible
 /(uint64)args.lock == kaddr("rtnl_mutex")/ { @req[tid] = nsecs; }
-kretfunc:vmlinux:mutex_lock /@req[tid]/ {
+kretfunc:vmlinux:mutex_lock /(uint64)args.lock == kaddr("rtnl_mutex") && @req[tid]/ {
   $us = (nsecs - @req[tid]) / 1000;
   if (@call[tid]) { @helper_wait_us[@call[tid]] = sum($us); }
   @wait_us_total = sum($us);
   delete(@req[tid]);
   @held[tid] = nsecs;
 }
-kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible /@req[tid]/ {
+kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex") && @req[tid]/ {
   if (retval == 0) { @held[tid] = nsecs; }
   delete(@req[tid]);
 }
