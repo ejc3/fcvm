@@ -199,6 +199,15 @@ struct RestoreLog {
     held_bytes: usize,
     /// The first hand-off happened; later progress lines follow it.
     forwarding: bool,
+    /// Bytes that have left the front of the console backlog, ever.
+    taken: u64,
+    /// The lines [`Self::spill`] put in the console backlog that are still whole in it:
+    /// where each starts, as `taken` plus its offset from the backlog's front, and when
+    /// it was logged. A window that takes the backlog over holds them again with these
+    /// times, not the time it took them.
+    spilled: VecDeque<(u64, Instant)>,
+    /// The same for the backlog the open window took over: each line's offset in `inbox`.
+    inbox_logged: VecDeque<(usize, Instant)>,
 }
 
 /// Append console-bound bytes to the writer's backlog, dropping (and counting) what does
@@ -271,6 +280,12 @@ impl RestoreLog {
             // The window opens. What the console has not taken yet (the lines held behind
             // a snapshot's quiesce guard) is routed with what follows.
             self.generation = Some(ctl.generation);
+            self.inbox_logged = self
+                .spilled
+                .drain(..)
+                .map(|(start, logged)| ((start - self.taken) as usize, logged))
+                .collect();
+            self.taken += pending.len() as u64;
             self.inbox.extend(pending.drain(..));
             cursor.cleared();
         }
@@ -296,8 +311,18 @@ impl RestoreLog {
                         .disposed
                         .fetch_add((line.len() - 1 - text.len()) as u64, Ordering::SeqCst);
                     self.held_bytes += text.len() + 1;
+                    // A spilled line keeps the time it was first held at, so the host
+                    // is told when the guest logged it, and a second spill says how
+                    // long it was held in all.
+                    while self.inbox_logged.front().is_some_and(|mark| mark.0 < start) {
+                        self.inbox_logged.pop_front();
+                    }
+                    let logged = match self.inbox_logged.front() {
+                        Some(&(at, logged)) if at == start => logged,
+                        _ => now,
+                    };
                     self.held.push(ProgressLine {
-                        logged: now,
+                        logged,
                         bytes: text.to_vec(),
                     });
                 }
@@ -312,6 +337,8 @@ impl RestoreLog {
             }
         }
         self.inbox.drain(..routed);
+        // Every spilled line was whole, so each has been routed.
+        self.inbox_logged.clear();
         if self.held_bytes + self.inbox.len() > HELD_CAP {
             return self.end(state, ctl, pending, now);
         }
@@ -346,6 +373,15 @@ impl RestoreLog {
         self.held_bytes = 0;
     }
 
+    /// `n` bytes left the front of the console backlog: the console took them, or they
+    /// were dropped.
+    fn console_took(&mut self, n: usize) {
+        self.taken += n as u64;
+        while self.spilled.front().is_some_and(|mark| mark.0 < self.taken) {
+            self.spilled.pop_front();
+        }
+    }
+
     /// End the window from the writer's side: close it for the callers and put what it
     /// holds on the console.
     fn end(
@@ -374,11 +410,17 @@ impl RestoreLog {
             state
                 .enqueued
                 .fetch_add(held.len() as u64 - 1, Ordering::SeqCst);
+            // Remembered only when the backlog takes the whole line.
+            if pending.len() + line.bytes.len() + held.len() <= PENDING_CAP {
+                self.spilled
+                    .push_back((self.taken + pending.len() as u64, line.logged));
+            }
             push_console(state, pending, &line.bytes);
             push_console(state, pending, held.as_bytes());
         }
         push_console(state, pending, &self.inbox);
         self.inbox.clear();
+        self.inbox_logged.clear();
         self.held_bytes = 0;
         self.forwarding = false;
         self.generation = None;
@@ -518,6 +560,15 @@ pub struct ConsoleShared {
     /// An eventfd the writer polls: a caller that changed [`LogCtl`] writes it, so the
     /// writer acts on the change now and not at its next tick.
     wake: OwnedFd,
+    /// Turns of the writer's loop that ran to their end. A test that waits for two more
+    /// knows the writer has routed, and offered the console, everything written and
+    /// asked of it before the wait began (`tests::writer_caught_up`).
+    #[cfg(test)]
+    iterations: AtomicU64,
+    /// Milliseconds the writer sleeps between reading the pipe and counting what it
+    /// read, for the test of that gap.
+    #[cfg(test)]
+    stall_after_read_ms: AtomicU64,
 }
 
 /// RAII guard for the console gate. Dropping it re-enables console writes
@@ -632,6 +683,10 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
         gate: AtomicUsize::new(0),
         write_lock: Mutex::new(LogCtl::default()),
         wake,
+        #[cfg(test)]
+        iterations: AtomicU64::new(0),
+        #[cfg(test)]
+        stall_after_read_ms: AtomicU64::new(0),
     });
 
     let thread_state = state.clone();
@@ -686,6 +741,10 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             match read(&state.pipe_rd, &mut buf) {
                 Ok(0) => break, // all write ends closed (cannot happen: we hold one)
                 Ok(n) => {
+                    #[cfg(test)]
+                    std::thread::sleep(Duration::from_millis(
+                        state.stall_after_read_ms.load(Ordering::SeqCst),
+                    ));
                     state.enqueued.fetch_add(n as u64, Ordering::SeqCst);
                     fresh.extend_from_slice(&buf[..n]);
                     // Route what was read before reading on, so a flood is bounded by
@@ -729,6 +788,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                         Ok(n) => {
                             pending.drain(..n);
                             cursor.consumed(n);
+                            restore_log.console_took(n);
                             state.disposed.fetch_add(n as u64, Ordering::SeqCst);
                             wrote_any = true;
                         }
@@ -739,6 +799,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                             // hold, count it, and keep running — the console may
                             // come back, and producers must never feel this.
                             let len = pending.len() as u64;
+                            restore_log.console_took(pending.len());
                             pending.clear();
                             cursor.cleared();
                             state.dropped.fetch_add(len, Ordering::SeqCst);
@@ -768,6 +829,8 @@ fn writer_loop(state: Arc<ConsoleShared>) {
                 pending.extend(line.as_bytes());
             }
         }
+        #[cfg(test)]
+        state.iterations.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1897,15 +1960,62 @@ mod tests {
         (state, console_rd, sink)
     }
 
+    /// Wait until the writer has routed, and offered the console, every byte written and
+    /// every request made before this call.
+    ///
+    /// The turn of the writer's loop that is under way when the wait begins may have
+    /// read the pipe, or looked at the requests, before the caller's last write or
+    /// request. The turn after it began later, so it reads and sees them all (a turn
+    /// reads up to 64 KiB), and its end is the end of the wait. `flushed()` is no such
+    /// barrier: it is true between the writer's read of the pipe and its count of the
+    /// bytes, with the bytes in neither.
+    fn writer_caught_up(state: &Arc<ConsoleShared>) {
+        let start = state.iterations.load(Ordering::SeqCst);
+        assert!(
+            wait_until(
+                || {
+                    state.wake_writer();
+                    state.iterations.load(Ordering::SeqCst) >= start + 2
+                },
+                Duration::from_secs(10)
+            ),
+            "the writer did not finish two turns of its loop"
+        );
+    }
+
     /// Everything the writer was handed has left it, and this is what the console got.
     fn settled_console(state: &Arc<ConsoleShared>, console_rd: &mut std::fs::File) -> String {
-        assert!(
-            wait_until(|| state.flushed(), Duration::from_secs(5)),
-            "the writer still holds bytes"
-        );
+        writer_caught_up(state);
+        assert!(state.flushed(), "the writer still holds bytes");
         let mut seen = Vec::new();
         drain_console(console_rd, &mut seen);
         String::from_utf8(seen).unwrap()
+    }
+
+    /// `settled_console` waits for bytes the writer has read from the pipe and not yet
+    /// counted. In that gap the pipe is empty and the counters are equal, so `flushed()`
+    /// is true, and a helper that waited on it drained the console before the bytes
+    /// reached it.
+    ///
+    /// RED WITH THE OLD HELPER (wait for `flushed()`, then drain): it returned "".
+    #[test]
+    fn settled_console_waits_for_bytes_the_writer_has_read_and_not_counted() {
+        let (console_wr, mut console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        state.stall_after_read_ms.store(300, Ordering::SeqCst);
+        write_pipe(&state, b"[fc-agent] read and not counted yet\n");
+        assert!(
+            wait_until(|| state.pipe_backlog() == 0, Duration::from_secs(5)),
+            "the writer did not read the pipe"
+        );
+        assert!(
+            state.flushed(),
+            "the gap this test is about did not open: the writer counted the bytes at once"
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] read and not counted yet\n"
+        );
     }
 
     /// `console` without the ` held_ms=<n>` each held line ends in on the console, and how
@@ -1961,17 +2071,14 @@ mod tests {
         // The snapshot was taken under a hold, and the clone logs behind it.
         let guard = state.quiesce().expect("a pipe console drains");
         write_lines(&state, &RESTORE_LINES[..2]);
-        assert!(wait_until(
-            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-            Duration::from_secs(5)
-        ));
+        writer_caught_up(&state);
         state.hold_restore_log(Duration::from_secs(60));
         drop(guard);
         write_lines(&state, &RESTORE_LINES[2..]);
 
         // Neither the acknowledgement alone nor the connection alone hands them over.
         state.restore_log_acknowledged();
-        std::thread::sleep(Duration::from_millis(3 * POLL_TICK_MS as u64));
+        writer_caught_up(&state);
         assert!(sink.lines().is_empty(), "handed over with no connection");
         sink.connect(&state);
         assert!(
@@ -1998,7 +2105,7 @@ mod tests {
         sink.connect(&state);
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[..2]);
-        std::thread::sleep(Duration::from_millis(3 * POLL_TICK_MS as u64));
+        writer_caught_up(&state);
         assert!(sink.lines().is_empty(), "handed over unacknowledged");
         write_lines(
             &state,
@@ -2031,6 +2138,9 @@ mod tests {
             write_lines(&state, &RESTORE_LINES[..2]);
             write_lines(&state, &[urgent]);
             write_lines(&state, &RESTORE_LINES[2..]);
+            // Every line is routed before the acknowledgement: the urgent one ends the
+            // window before anything could be handed over.
+            writer_caught_up(&state);
             state.restore_log_acknowledged();
             sink.connect(&state);
             // The two lines held before it say how long they were held; the lines after
@@ -2122,6 +2232,9 @@ mod tests {
         sink.connect(&state);
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES);
+        // Every line is held before the acknowledgement, so the refused hand-off is of
+        // all four.
+        writer_caught_up(&state);
         state.restore_log_acknowledged();
         assert_eq!(
             without_held(&settled_console(&state, &mut console_rd)),
@@ -2139,6 +2252,8 @@ mod tests {
         sink.connect(&state);
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES);
+        // Every line is held before the acknowledgement, so the hand-off is of all four.
+        writer_caught_up(&state);
         state.restore_log_acknowledged();
         assert!(wait_until(
             || sink.lines().len() == RESTORE_LINES.len(),
@@ -2213,10 +2328,7 @@ mod tests {
         let (state, mut console_rd, sink) = console_with_sink();
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[..2]);
-        assert!(wait_until(
-            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-            Duration::from_secs(5)
-        ));
+        writer_caught_up(&state);
         let guard = state.quiesce().expect("a pipe console drains");
         let mut seen = Vec::new();
         drain_console(&mut console_rd, &mut seen);
@@ -2237,10 +2349,7 @@ mod tests {
         let (state, mut console_rd, sink) = console_with_sink();
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[..2]);
-        assert!(wait_until(
-            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-            Duration::from_secs(5)
-        ));
+        writer_caught_up(&state);
         state.end_restore_log();
         write_lines(&state, &["[fc-agent] shutting down VM (exit_code=0)"]);
         sink.connect(&state);
@@ -2332,10 +2441,7 @@ mod tests {
         sink.connect(&state);
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[..2]);
-        assert!(wait_until(
-            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-            Duration::from_secs(5)
-        ));
+        writer_caught_up(&state);
         state.begin_restore(false, Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[2..]);
         state.restore_log_acknowledged();
@@ -2366,12 +2472,8 @@ mod tests {
         let (state, mut console_rd, sink) = console_with_sink();
         state.hold_restore_log(Duration::from_secs(60));
         write_lines(&state, &RESTORE_LINES[..2]);
-        assert!(wait_until(
-            || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-            Duration::from_secs(5)
-        ));
-        // A tick, so the writer has held them, and their time is before `replaced`.
-        std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+        // The writer has held them, so their time is before `replaced`.
+        writer_caught_up(&state);
         let replaced = Instant::now();
         {
             // What `end_restore_log` then `hold_restore_log` leave, with the writer
@@ -2383,6 +2485,8 @@ mod tests {
         }
         state.wake_writer();
         write_lines(&state, &RESTORE_LINES[2..]);
+        // Every line is held before the acknowledgement, so the hand-off is of all four.
+        writer_caught_up(&state);
         state.restore_log_acknowledged();
         sink.connect(&state);
         assert!(
@@ -2404,25 +2508,29 @@ mod tests {
 
     /// A line spilled while the console was held quiet is still in the writer's backlog
     /// when the next window opens, with the ` held_ms=` its spill gave it. Held again, it
-    /// is the line as it was logged: the host gets no `held_ms`, and a second spill gives
-    /// it one suffix, not two.
+    /// is the line as it was logged, with the time it was first held at: the host gets
+    /// no `held_ms` and that time, and a second spill gives it one suffix, which says
+    /// how long it was held in all.
     ///
-    /// RED BEFORE THE FIX: the host got `... held_ms=<n>`, and the second spill wrote
-    /// `... held_ms=<n> held_ms=<m>`.
+    /// RED BEFORE THE FIXES: the host got `... held_ms=<n>`, and the second spill wrote
+    /// `... held_ms=<n> held_ms=<m>`. With the text fixed and the time not, the host got
+    /// the time the second window took the line, and the second spill's `held_ms`
+    /// counted from there.
     #[test]
-    fn a_spilled_line_held_again_carries_one_held_suffix_at_most() {
+    fn a_spilled_line_held_again_keeps_its_time_and_carries_one_held_suffix() {
         for hand_over in [true, false] {
             let (state, mut console_rd, sink) = console_with_sink();
             state.hold_restore_log(Duration::from_secs(60));
             write_lines(&state, &RESTORE_LINES[..2]);
-            assert!(wait_until(
-                || state.enqueued.load(Ordering::SeqCst) > 0 && state.pipe_backlog() == 0,
-                Duration::from_secs(5)
-            ));
-            // The console is held quiet (a snapshot's hold), and the window ends under it.
+            writer_caught_up(&state);
+            // Both lines are held, with times before this.
+            let held_by = Instant::now();
+            // The console is held quiet (a snapshot's hold), and the window ends under
+            // it: the lines are spilled to the writer's backlog and stay there.
             hold_writer(&state);
             state.end_restore_log();
-            std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+            writer_caught_up(&state);
+            std::thread::sleep(Duration::from_millis(150));
             // The clone's restore opens the next window before the hold goes.
             state.hold_restore_log(Duration::from_secs(60));
             state.gate.fetch_sub(1, Ordering::SeqCst);
@@ -2435,12 +2543,22 @@ mod tests {
                     sink.lines()
                 );
                 assert_eq!(sink.lines(), RESTORE_LINES[..2]);
+                let logged = sink.logged.lock().unwrap().clone();
+                assert!(
+                    logged.iter().all(|at| *at < held_by),
+                    "a spilled line held again took a new time: {:?} after it was first held",
+                    logged
+                        .iter()
+                        .map(|at| at.saturating_duration_since(held_by))
+                        .collect::<Vec<_>>()
+                );
                 assert_eq!(
                     settled_console(&state, &mut console_rd),
                     "[fc-agent] restore: 2 progress lines queued for the host over vsock\n"
                 );
             } else {
-                std::thread::sleep(Duration::from_millis(2 * POLL_TICK_MS as u64));
+                writer_caught_up(&state);
+                let before_the_second_spill = Instant::now();
                 state.end_restore_log();
                 let console = settled_console(&state, &mut console_rd);
                 assert_eq!(
@@ -2452,6 +2570,20 @@ mod tests {
                     without_held(&console),
                     (format!("{}\n{}\n", RESTORE_LINES[0], RESTORE_LINES[1]), 2)
                 );
+                // Held since before `held_by`, through both windows.
+                let at_least = before_the_second_spill
+                    .duration_since(held_by)
+                    .as_secs_f64()
+                    * 1000.0;
+                assert!(at_least >= 150.0);
+                for line in console.lines() {
+                    let held: f64 = line.rsplit_once(" held_ms=").unwrap().1.parse().unwrap();
+                    assert!(
+                        held >= at_least,
+                        "the second spill says {held} ms, and the line was held {at_least} ms \
+                         or more: {line:?}"
+                    );
+                }
             }
         }
         // Only a number after the suffix makes it one.
@@ -2467,6 +2599,73 @@ mod tests {
             without_held_suffix(b"[fc-agent] a held_ms="),
             b"[fc-agent] a held_ms="
         );
+    }
+
+    /// A container that exits inside a restore's window: the output connection is shut
+    /// down, and Shutdown is queued on the channel a restore's progress lines use. The
+    /// window ends before that, so a line logged afterwards goes to the console. Queued
+    /// behind Shutdown, the output writer would never write it, though the connection
+    /// had taken it.
+    ///
+    /// RED WITHOUT THE WINDOW'S END IN `shutdown_with`: the late line was queued behind
+    /// Shutdown and the console never got it. RED WITH THE END AFTER THE SEND: Shutdown
+    /// was already queued when the window ended.
+    #[tokio::test]
+    async fn the_output_shutdown_ends_the_window_before_it_queues_shutdown() {
+        use crate::output::OutputMessage;
+        let (console_wr, mut console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        let (output, sink, messages, armed) = crate::output::test_progress_sink();
+        armed.send_replace(true);
+        state.ctl().sink = Some(Arc::new(sink));
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        // Both lines are held before the acknowledgement, so the hand-off is of both.
+        writer_caught_up(&state);
+        state.restore_log_acknowledged();
+        writer_caught_up(&state);
+        let messages = Mutex::new(messages);
+        let next = || messages.lock().unwrap().try_recv().ok();
+        // In one message or two: the writer can read the lines in two turns.
+        let mut queued = 0;
+        while let Some(message) = next() {
+            let OutputMessage::Lines(lines) = message else {
+                panic!("a message that is not the restore's lines");
+            };
+            queued += lines.lines().count();
+        }
+        assert_eq!(
+            queued, 2,
+            "the restore's lines were not queued for the host"
+        );
+
+        // The container exits, and the agent shuts its output down.
+        output
+            .shutdown_with(|| {
+                assert!(
+                    next().is_none(),
+                    "Shutdown was queued before the window ended"
+                );
+                state.end_restore_log();
+            })
+            .await;
+        write_lines(&state, &[RESTORE_LINES[2]]);
+        let console = settled_console(&state, &mut console_rd);
+        assert!(matches!(next(), Some(OutputMessage::Shutdown)));
+        assert!(
+            next().is_none(),
+            "a line was queued behind Shutdown, where the output writer never writes it"
+        );
+        assert_eq!(
+            console,
+            format!(
+                "[fc-agent] restore: 2 progress lines queued for the host over vsock\n{}\n",
+                RESTORE_LINES[2]
+            )
+        );
+        // The agent's shutdown is this one, with the console's own end of the window.
+        assert!(include_str!("output.rs")
+            .contains("self.shutdown_with(crate::console::end_restore_log)"));
     }
 
     /// A restore opens the window before the hold that kept the console quiet across the

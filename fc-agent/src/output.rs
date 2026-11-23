@@ -139,9 +139,45 @@ impl OutputHandle {
     }
 
     /// Signal shutdown.
+    ///
+    /// The console writer queues a restore's progress lines on this channel
+    /// ([`ProgressOverOutput`]), and the writer task stops at Shutdown: a line queued
+    /// behind it is never written, though the queue took it. So the restore log window
+    /// ends first, under the lock the console writer queues under, and every later
+    /// line goes to the serial console.
     pub async fn shutdown(self) {
+        self.shutdown_with(crate::console::end_restore_log).await
+    }
+
+    /// [`Self::shutdown`], with the end of the restore log window as an argument so a
+    /// test can give it a console of its own.
+    pub(crate) async fn shutdown_with(self, end_restore_log: impl FnOnce()) {
+        end_restore_log();
         let _ = self.tx.send(OutputMessage::Shutdown).await;
     }
+}
+
+/// A handle, the restore log's view of it, the receiving end of its channel and the
+/// switch that says the writer holds a connection, with no writer task.
+#[cfg(test)]
+pub(crate) fn test_progress_sink() -> (
+    OutputHandle,
+    ProgressOverOutput,
+    mpsc::Receiver<OutputMessage>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (tx, rx) = mpsc::channel(16);
+    let (armed_tx, armed_rx) = tokio::sync::watch::channel(false);
+    let handle = OutputHandle {
+        tx,
+        reconnect: Arc::new(Notify::new()),
+        reconnect_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let sink = ProgressOverOutput {
+        output: handle.clone(),
+        armed: armed_rx,
+    };
+    (handle, sink, rx, armed_tx)
 }
 
 /// Where `fc-agent --resume-snapshot-network` asks the running agent to reconnect its
