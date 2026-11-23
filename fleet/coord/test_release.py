@@ -476,7 +476,10 @@ class ReconnectTests(unittest.TestCase):
             except Exception as caught:
                 error = caught
         return dict(error=error, connections=connections, intents=intents, frames=frames,
-                    seats=seats, deadlines=deadlines, output=output.getvalue(), attempts=attempts)
+                    seats=seats, deadlines=deadlines, attempts=attempts,
+                    # Without the commit attribution lines (SmokeCommitTests covers them).
+                    output="".join(line for line in output.getvalue().splitlines(keepends=True)
+                                   if '"tested_commit"' not in line and "not this run's" not in line))
 
     def test_cold_readiness_eof_reuses_the_seat_and_waits_for_a_new_token(self):
         result = self.run_probe("cold")
@@ -1898,7 +1901,7 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()), {"status": "failed", "errorType": "CommandFailed",
                                                       "code": "AccessDeniedException"})
 
-    def test_the_staging_deploy_passes_the_lane_setting_and_runs_as_main_does(self):
+    def test_the_staging_deploy_passes_the_lane_setting_and_follows_the_lane_build(self):
         workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()
         step = workflow.split("- name: Publish and release the staging coordinator", 1)[1].split("\n\n", 1)[0]
         self.assertIn("FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}", step)
@@ -1907,20 +1910,71 @@ class LaneReleaseTests(unittest.TestCase):
         paths = re.findall(r"^      - '([^']+)'", workflow.split("\n  push:\n", 1)[1].split("\n  workflow_", 1)[0], re.M)
         for path in ("fleet/lambda/release.py", ".github/workflows/fleet-lambda-image.yml"):
             self.assertIn(path, paths)
-        # Triggers, concurrency and job conditions are main's: a push or a dispatch, one group. A lane build
-        # does not start a deploy.
+        # A finished lane publish on main starts a staging release (invariant 1 orders it in publish.py).
         triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
-        self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["push", "workflow_dispatch"])
-        self.assertIn("\nconcurrency:\n  group: fleet-coordinator-stage\n  cancel-in-progress: false\n", workflow)
+        self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["push", "workflow_run", "workflow_dispatch"])
+        trigger = triggers.split("\n  workflow_run:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0]
+        self.assertIn('workflows: ["Fleet Lambda lane image"]', trigger)
+        self.assertIn("types: [completed]", trigger)
+        self.assertIn("branches: [main]", trigger)
         for job in ("build", "deploy"):
             condition = workflow.split(f"\n  {job}:\n", 1)[1].split("\n    runs-on:", 1)[0]
-            self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", condition + "\n", job)
+            condition = " ".join(condition.split("if: >-", 1)[1].split())
+            self.assertEqual(condition,
+                             "github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
+                             "(github.event_name != 'workflow_run' || (vars.FLEET_LAMBDA_LANE == 'on' && "
+                             "github.event.workflow_run.conclusion == 'success' && "
+                             "github.event.workflow_run.event == 'push' && "
+                             "github.event.workflow_run.head_branch == 'main' && "
+                             "github.event.workflow_run.head_repository.full_name == github.repository))", job)
+        # Invariant 2: a lane-started run never shares the push deploys' group.
+        group = workflow.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', "
+                      "github.event.workflow_run.id) || 'fleet-coordinator-stage' }}", group)
+        # Invariant 3: every release runs in the deploy job, one at a time in the smokes' queued group.
         deploy = workflow.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        self.assertIn("    concurrency:\n      group: fleet-viewer-smoke\n      cancel-in-progress: false\n", deploy)
+        self.assertIn("      queue: max\n", deploy)
         self.assertIn("fetch-depth: 0", deploy)
-        # One place for the switch, which the step env reads: the repository variable.
+        self.assertIn("run: python3 -B fleet/coord/publish.py", deploy)
+        # The served image reports its commit before it is published (invariant 4's other half).
+        self.assertIn('http://127.0.0.1:24120/version)" = "{\\"commit\\":\\"$GITHUB_SHA\\"}"', workflow)
+        # One place for the switch, which the job conditions and the step env read: the repository variable.
         protocol = (HERE.parent.parent / "fleet/PROTOCOL.md").read_text()
         self.assertEqual(len(protocol.split("- With the repository variable `FLEET_LAMBDA_LANE` set to `on`", 1)), 2)
         self.assertNotRegex(protocol, r"FLEET_LAMBDA_LANE[^\n]*\n?[^\n]*in `fleet-stage-deploy`")
+
+
+class SmokeCommitTests(unittest.TestCase):
+    """Invariant 4: a smoke says which commit it tested. The coordinator reports its build's commit at
+    /version; the smoke compares it with its run's commit (GITHUB_SHA)."""
+
+    RUN = "a" * 40
+
+    def attribute(self, answer):
+        with patch.object(smoke, "get", lambda url, headers=None: answer):
+            return smoke.commit_attribution("https://api.example", {"h": "v"}, self.RUN)
+
+    def test_the_run_commit_is_the_one_tested(self):
+        self.assertEqual(self.attribute((200, {}, json.dumps({"commit": self.RUN}).encode())),
+                         {"tested_commit": self.RUN, "run_commit": self.RUN, "same": True})
+
+    def test_another_commit_is_named(self):
+        other = "e" * 40
+        self.assertEqual(self.attribute((200, {}, json.dumps({"commit": other}).encode())),
+                         {"tested_commit": other, "run_commit": self.RUN, "same": False})
+
+    def test_a_coordinator_that_cannot_say_is_reported_as_unknown(self):
+        for answer in ((404, {}, b""), (200, {}, b"not json"), (200, {}, b'{"commit": null}'),
+                       (200, {}, b'{"commit": "https://example.invalid"}')):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.attribute(answer), {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_the_smoke_prints_it_after_the_access_check(self):
+        source = (HERE / "stage-smoke.py").read_text()
+        body = source.split("\ndef main(", 1)[1]
+        self.assertLess(body.index('step("agents-only endpoint check")'), body.index("commit_attribution(api, headers"))
+        self.assertLess(body.index("commit_attribution(api, headers"), body.index('step("/live connect")'))
 
 
 class ResolveRetransmitTests(unittest.TestCase):

@@ -7,6 +7,9 @@ FROM docker.io/library/ubuntu:24.04
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY fcvm /usr/local/bin/fcvm
+# The commit the image is built from (make image TAG=<commit>): GET /version reports it.
+ARG COMMIT=
+ENV FLEET_COMMIT=$COMMIT
 # --ec2-aggregate-tls writes the certificate file under /run/fcvm-fleet (the task mounts a
 # volume there; the root file system is read-only). The directory is the coordinator's own,
 # so a volume that takes the image's ownership is writable by it.

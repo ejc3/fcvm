@@ -1976,6 +1976,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         sockets: live::SocketCaps::default(),
         access,
         agent_identity,
+        // Baked into the coordinator's image (fleet/coord/Containerfile) from the commit it was built from.
+        commit: std::env::var("FLEET_COMMIT").ok().filter(|c| !c.is_empty()),
     };
     tokio::select! {
         r = live::serve(listener, handle.clone(), cfg) => r?,
