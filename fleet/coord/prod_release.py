@@ -316,12 +316,14 @@ def image_promote(receipt, sleep=None):
         # while the function went on, and that first call may have completed (or been killed holding the lock).
         # The function writes prod's pointer last, after every template moved (ProdPublisher.move), and a later
         # promote-prod answers "unchanged" for exactly that state, so a pointer naming the receipt is the completed
-        # promotion. A pointer still naming what prod ran before the call is held: no rollback, and the next
-        # promotion tries again. Anything else is a failure, and the rollback runs.
+        # promotion (checked first: a rerun can find prod on the receipt before and after). A pointer still naming
+        # what prod ran before the call is held: no rollback, and the next promotion tries again. Anything else is
+        # a failure, and the rollback runs; that includes a prod-status that named no receipt (refused), because
+        # two unreadable answers are not "nothing moved".
         now = image_prod()
-        if now == receipt:
+        if now is not None and now == receipt:
             return "unchanged"
-        if now == before:
+        if before is not None and now == before:
             raise publish.Held("Terraform's lock stayed held before prod's images moved") from None
         raise RuntimeError("Terraform's lock stayed held, and prod's images name neither the release it ran nor the "
                            "promoted one") from None

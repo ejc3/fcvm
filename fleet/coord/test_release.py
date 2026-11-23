@@ -2627,6 +2627,23 @@ class ProdStepTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
             self.assertEqual(prod.main(["image-promote", receipt]), 1)
 
+    def test_a_lock_held_with_prods_images_unreadable_is_a_failure(self):
+        # prod-status refused both times names no receipt at all: two unreadable answers are not "nothing moved".
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        self.answers["prod-status"] = [{"status": "refused", "reason": "x"}] * 2
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), 1)
+
+    def test_a_lock_held_with_prod_already_on_the_receipt_is_that_promotion(self):
+        # A rerun after an earlier attempt completed, with the lock held: prod-status names the receipt before and
+        # after, which is the completed promotion and not a held one.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["prod-status"] = [{"prod": dict(receipt)}, {"prod": dict(receipt)}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=lambda _: None), "unchanged")
+
     def test_an_image_rollback_waits_while_terraforms_lock_is_held(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
         self.answers["prod-status"] = {"prod": new}
@@ -2667,17 +2684,22 @@ class ProdStepTests(unittest.TestCase):
         step = rollback[rollback.index("      - name: The promotion failed\n"):]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
         for outcomes, says in (({"WORKER": "success", "COORDINATOR": "skipped", "IMAGES": "success"}, "was returned to its previous set"),
-                               ({"WORKER": "skipped", "COORDINATOR": "success", "IMAGES": "failure"}, "Host and tile images")):
+                               ({"WORKER": "skipped", "COORDINATOR": "success", "IMAGES": "failure"}, "Host and tile images"),
+                               # A job cancelled before a return step started reports that step skipped too.
+                               ({"WORKER": "skipped", "COORDINATOR": "skipped", "IMAGES": "skipped", "CANCELLED": "true"},
+                                "was cancelled")):
             with self.subTest(**outcomes):
-                out = subprocess.run(["bash", "-c", script], env={"PATH": os.environ["PATH"], **outcomes},
+                out = subprocess.run(["bash", "-c", script],
+                                     env={"PATH": os.environ["PATH"], "CANCELLED": "false", **outcomes},
                                      capture_output=True, text=True)
                 self.assertEqual(out.returncode, 1)
                 self.assertIn(says, out.stdout)
-                if outcomes["IMAGES"] == "failure":
+                if outcomes["IMAGES"] == "failure" or outcomes.get("CANCELLED") == "true":
                     self.assertNotIn("was returned to its previous set", out.stdout)
         for name, id_ in (("Worker", "worker"), ("Coordinator", "coordinator"), ("Host and tile images", "images")):
             self.assertRegex(rollback, r"      - name: " + re.escape(name) + r"\n        id: " + id_ + r"\n")
         self.assertIn("IMAGES: ${{ steps.images.outcome }}", step)
+        self.assertIn("CANCELLED: ${{ cancelled() }}", step)
 
     def test_an_image_rollback_returns_only_to_the_previous_release(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}

@@ -402,14 +402,20 @@ jobs:
           TARGET: ${{ needs.candidate.outputs.target }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
         run: python3 -B fleet/coord/prod_release.py image-rollback "$TARGET" "$PRIOR"
-      # Says prod was returned to its previous set only when every return that ran succeeded.
+      # Says prod was returned to its previous set only when every return that ran succeeded and the job was not
+      # cancelled: a return step the cancellation kept from starting reports skipped, like one whose condition was false.
       - name: The promotion failed
         if: ${{ always() }}
         env:
           WORKER: ${{ steps.worker.outcome }}
           COORDINATOR: ${{ steps.coordinator.outcome }}
           IMAGES: ${{ steps.images.outcome }}
+          CANCELLED: ${{ cancelled() }}
         run: |
+          if [ "$CANCELLED" = true ]; then
+            echo "::error::the promotion failed, and returning prod to its previous set was cancelled (Worker $WORKER, Coordinator $COORDINATOR, Host and tile images $IMAGES): prod may run parts of both sets"
+            exit 1
+          fi
           failed=
           [ "$WORKER" = success ] || [ "$WORKER" = skipped ] || failed="${failed:+$failed, }Worker"
           [ "$COORDINATOR" = success ] || [ "$COORDINATOR" = skipped ] || failed="${failed:+$failed, }Coordinator"
