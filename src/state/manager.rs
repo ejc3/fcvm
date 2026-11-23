@@ -162,12 +162,16 @@ static TEST_LEASE_PREFIX: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 /// Open or create a lock file with world-readable/writable permissions.
 /// Uses fchmod after creation to ensure permissions are set regardless of umask.
 /// This allows both root and non-root processes to coordinate via flock.
+///
+/// Never truncated: a lock file holds nothing, and an O_TRUNC open takes the inode lock for
+/// writing and changes the file. Every start and stop of a VM opens `names.lock`, so at the
+/// teardown of 1000 clones that queued 1,075 waiters for 6 s each.
 fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o666)
         .open(path)?;
     // Force permissions regardless of umask (only effective if we own the file or are root)
@@ -694,6 +698,7 @@ impl StateManager {
         let now = jiff::Timestamp::now().to_string();
         let written = open_lock_file(&stamp).and_then(|mut file| {
             use std::io::Write;
+            file.set_len(0)?;
             file.write_all(now.as_bytes()).map_err(anyhow::Error::from)
         });
         if let Err(error) = written {
