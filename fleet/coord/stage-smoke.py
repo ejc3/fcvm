@@ -1107,6 +1107,17 @@ def commit_attribution(api, headers, run):
     return {"tested_commit": tested, "run_commit": run, "same": tested is not None and tested == run}
 
 
+def commit_lines(tested, released):
+    """The attribution line, and, for a smoke that follows its own run's coordinator release (SMOKE_RELEASED, set
+    by the deploy workflow), a notice when it tests another commit: another run's release replaced this run's,
+    or the coordinator cannot say. A smoke that released nothing (web deploy, release gate, schedule, dispatch)
+    prints the attribution alone."""
+    lines = [tested]
+    if released and tested["run_commit"] and not tested["same"]:
+        lines.append({"notice": "this smoke tests the commit in tested_commit, not the one its run released"})
+    return lines
+
+
 def live_target(target="stage"):
     """Where /live is and how to reach it: staging (or prod) through Access, or a host-image
     acceptance's own coordinator on loopback (SMOKE_LIVE_URL, plain ws://, no Access)."""
@@ -1174,10 +1185,8 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         step("coordinator commit")
         run_commit = os.environ.get("GITHUB_SHA") if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", "")) else None
         tested = commit_attribution(api, headers, run_commit)
-        print(json.dumps(tested), flush=True)
-        if run_commit and not tested["same"]:
-            # Another run's release (a newer commit) replaced this run's, or the coordinator cannot say.
-            print(json.dumps({"notice": "this smoke tests the commit in tested_commit, not this run's"}), flush=True)
+        for line in commit_lines(tested, released=os.environ.get("SMOKE_RELEASED") == "true"):
+            print(json.dumps(line), flush=True)
     def live():
         if stage is None:
             parsed = urllib.parse.urlsplit(live_url)

@@ -1759,10 +1759,14 @@ class LaneReleaseTests(unittest.TestCase):
         def restore_lane(stack, before):
             events.append(("restore", stack, before))
         def is_ancestor(older, newer):
+            # Strict: publish.py never asks about a commit and itself (its `c != commit` guard).
+            assert older != newer, "asked whether a commit is its own ancestor"
             events.append(("ancestry", older, newer))
-            return (older, newer) in {("9" * 40, "a" * 40), ("a" * 40, "e" * 40), ("9" * 40, "e" * 40)} or older == newer
+            return (older, newer) in {("9" * 40, "a" * 40), ("a" * 40, "e" * 40), ("9" * 40, "e" * 40)}
+        github_output = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, github_output.name)
         env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
-               "COORDINATOR_RELEASE": "fcvm-coordinator-release"}
+               "COORDINATOR_RELEASE": "fcvm-coordinator-release", "GITHUB_OUTPUT": github_output.name}
         if lane is not None:
             env["FLEET_LAMBDA_LANE"] = lane
         out = io.StringIO()
@@ -1777,6 +1781,8 @@ class LaneReleaseTests(unittest.TestCase):
                 error = None
             except Exception as caught:
                 error = caught
+        self.printed = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+        self.github_output = Path(github_output.name).read_text()
         return events, error
 
     def release_payload(self):
@@ -1799,12 +1805,45 @@ class LaneReleaseTests(unittest.TestCase):
 
     def test_a_release_of_an_ancestor_of_what_staging_runs_is_skipped(self):
         # Invariant 1: staging runs a descendant (a newer commit's release landed first). Nothing is selected
-        # or released, and the run reports unchanged.
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.NEWER]}], "on")
+        # or released, and the run reports unchanged, also to the workflow (the smoke then does not run).
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.NEWER]}], "on")
         self.assertIsNone(error)
         self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.NEWER)])
+        self.assertEqual(self.printed[-1], {"status": "unchanged", "reason": "staging-runs-a-descendant",
+                                            "commit": "a" * 40, "digest": self.DIGEST})
+        self.assertIn("status=unchanged\n", self.github_output)
+
+    def test_staging_running_this_very_commit_is_released_normally(self):
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": ["a" * 40]},
+                                          {"status": "unchanged", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", "stage", self.RUNNING, "a" * 40),
+                                  ("invoke", self.release_payload())])
+        self.assertIn("status=unchanged\n", self.github_output)
+
+    def test_the_release_status_reaches_the_workflow(self):
+        for lane in (None, "on"):
+            with self.subTest(lane=lane):
+                results = ([] if lane is None else [{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}]) + [
+                    {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}]
+                events, error = self.run_publish(results, lane)
+                self.assertIsNone(error)
+                self.assertIn("status=deployed\n", self.github_output)
+
+    def test_a_lane_answer_with_no_running_commit_releases_nothing(self):
+        # A running image with no commit tag cannot be ordered: the gate fails closed.
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": []}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events, [("invoke", {"action": "lane"})])
+
+    def test_a_failed_fetch_is_not_called_a_missing_commit(self):
+        codes = iter([1, 128])
+        def run(args, **kwargs):
+            return types.SimpleNamespace(returncode=next(codes), stdout="", stderr="")
+        with patch.object(publish.subprocess, "run", side_effect=run), self.assertRaises(RuntimeError) as raised:
+            publish.commit_is_ancestor("a" * 40, "e" * 40)
+        self.assertIn("could not fetch main", str(raised.exception))
+        self.assertNotIn("does not contain", str(raised.exception))
 
     def test_a_running_commit_newer_than_the_checkout_is_fetched_before_ordering(self):
         def git(codes):
@@ -1937,6 +1976,15 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIn("      queue: max\n", deploy)
         self.assertIn("fetch-depth: 0", deploy)
         self.assertIn("run: python3 -B fleet/coord/publish.py", deploy)
+        # The smoke runs only after a release that changed staging; an unchanged run (a lane-started run at the
+        # commit a push already released) builds, finds nothing to do, and runs no smoke.
+        self.assertIn("    outputs:\n      status: ${{ steps.release.outputs.status }}\n", deploy)
+        self.assertIn("      - name: Publish and release the staging coordinator\n        id: release\n", deploy)
+        smoke_job = workflow.split("\n  smoke:\n", 1)[1]
+        condition = " ".join(smoke_job.split("    if:", 1)[1].split("\n    permissions:", 1)[0].split())
+        self.assertEqual(condition, ">- github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
+                                    "needs.deploy.outputs.status == 'deployed'")
+        self.assertIn("      released: true\n", smoke_job)
         # The served image reports its commit before it is published (invariant 4's other half).
         self.assertIn('http://127.0.0.1:24120/version)" = "{\\"commit\\":\\"$GITHUB_SHA\\"}"', workflow)
         # One place for the switch, which the job conditions and the step env read: the repository variable.
@@ -1969,6 +2017,18 @@ class SmokeCommitTests(unittest.TestCase):
                        (200, {}, b'{"commit": "https://example.invalid"}')):
             with self.subTest(answer=answer):
                 self.assertEqual(self.attribute(answer), {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_the_notice_is_for_a_smoke_that_follows_its_own_release(self):
+        other = {"tested_commit": "e" * 40, "run_commit": self.RUN, "same": False}
+        self.assertEqual(smoke.commit_lines(other, released=True),
+                         [other, {"notice": "this smoke tests the commit in tested_commit, not the one its run released"}])
+        # A web deploy, the release gate, the schedule or a dispatch released no coordinator: no notice.
+        self.assertEqual(smoke.commit_lines(other, released=False), [other])
+        same = {"tested_commit": self.RUN, "run_commit": self.RUN, "same": True}
+        self.assertEqual(smoke.commit_lines(same, released=True), [same])
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        self.assertIn("      released:\n        type: boolean\n        default: false\n", workflow)
+        self.assertEqual(workflow.count("SMOKE_RELEASED: ${{ inputs.released }}"), 2)
 
     def test_the_smoke_prints_it_after_the_access_check(self):
         source = (HERE / "stage-smoke.py").read_text()

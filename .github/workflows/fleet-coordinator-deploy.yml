@@ -124,6 +124,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # publish.py's release status: the smoke runs only after a release that changed staging.
+    outputs:
+      status: ${{ steps.release.outputs.status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -147,6 +150,7 @@ jobs:
           role-session-name: fcvm-stage-${{ github.run_id }}
           mask-aws-account-id: true
       - name: Publish and release the staging coordinator
+        id: release
         # FLEET_LAMBDA_LANE (a repository variable) on: the release also selects the lane build paired
         # with this commit for staging and passes it to the release function (fleet/coord/publish.py).
         # Unset: as before.
@@ -162,11 +166,18 @@ jobs:
   # opens or updates the fleet-viewer-smoke issue.
   smoke:
     needs: deploy
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    # Only after a release that changed staging: a lane-started run at a commit a push already released
+    # reports unchanged and smokes nothing.
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      needs.deploy.outputs.status == 'deployed'
     permissions:
       contents: read
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
+    with:
+      # The smoke follows this run's release: it says so when it tests another commit.
+      released: true
     # The smoke's jobs read the Access token from the fleet-stage-deploy environment; a called
     # workflow sees secrets only when its caller passes them.
     secrets: inherit

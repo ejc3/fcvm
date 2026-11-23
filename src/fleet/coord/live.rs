@@ -223,13 +223,13 @@ pub async fn serve(
     Ok(())
 }
 
-/// The latest converged still of the whole image. Cached briefly: it changes at most once
-/// per camera hold. Readable from any origin: it is the public picture.
 /// `{"commit": "<40 hex>"}`, or `null` for a coordinator built without one.
 async fn version(State(app): State<App>) -> Response {
     axum::Json(serde_json::json!({ "commit": app.cfg.commit })).into_response()
 }
 
+/// The latest converged still of the whole image. Cached briefly: it changes at most once
+/// per camera hold. Readable from any origin: it is the public picture.
 async fn poster(State(app): State<App>) -> Response {
     match app.cfg.poster.latest() {
         Some(still) => (

@@ -139,7 +139,9 @@ def lane_state(function):
     running, commits = result.get("lambda_digest", ""), result.get("commits")
     if (result.get("status") != "ok"
             or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running))
-            or not isinstance(commits, list) or not all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}", c) for c in commits)):
+            or not isinstance(commits, list) or not commits
+            or not all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}", c) for c in commits)):
+        # No commit for the running image (it carries no commit tag): the release cannot be ordered.
         if attribution(result):
             print(json.dumps({"lane": attribution(result)}), flush=True)
         raise RuntimeError("the release function did not report what the coordinator runs")
@@ -156,7 +158,8 @@ def commit_is_ancestor(older, newer):
     def known(commit):
         return subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], capture_output=True).returncode == 0
     if not known(newer):
-        subprocess.run(["git", "fetch", "--quiet", "origin", "main"], capture_output=True)
+        if subprocess.run(["git", "fetch", "--quiet", "origin", "main"], capture_output=True).returncode:
+            raise RuntimeError(f"could not fetch main to order this release after {newer}, which staging runs")
         if not known(newer):
             raise RuntimeError(f"staging runs {newer}, which main does not contain: the release cannot be ordered")
     result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
@@ -227,6 +230,7 @@ def main():
         if any(c != commit and commit_is_ancestor(commit, c) for c in commits):
             print(json.dumps({"status": "unchanged", "reason": "staging-runs-a-descendant", "commit": commit,
                               "digest": digest}))
+            output_status("unchanged")
             return
         # The function refuses a lane digest that keep-stage-current does not hold, so the selection
         # comes first; the running digest stays protected as keep-stage-previous.
@@ -247,6 +251,16 @@ def main():
             raise
     print(json.dumps({"status": status, "commit": commit, "digest": digest,
                       **({"lambda_digest": payload["lambda_digest"]} if lane else {})}))
+    output_status(status)
+
+
+def output_status(status):
+    """The release's status for the workflow (the deploy job's `status` output): its smoke runs only after
+    a release that changed staging."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as out:
+            out.write(f"status={status}\n")
 
 
 def main_prod(commit, digest, force):
