@@ -432,7 +432,13 @@ struct RestoreLog {
     /// connection's reconnect. When the console has held lines, only the line fc-agent
     /// wrote directly after the last of them counts, stamped by fcvm within
     /// [`CAUSE_WITH_THE_SPILL`] of it: fc-agent writes the held lines and their cause
-    /// back to back. A warning later in the VM's life explains nothing.
+    /// back to back. A failed reconnect is the exception: it counts anywhere after the
+    /// last held line within that time, because the output task ends the hand-off and
+    /// then logs the failure, and a line another task logs between the two is on the
+    /// console between them. When the console has no held line, only a cause ahead of
+    /// the first progress line counts: fc-agent holds a restore's progress lines until a
+    /// cause comes, so progress on the console with no `held_ms=` and a cause after it
+    /// was never held. A warning later in the VM's life explains nothing.
     fallback_cause: Option<String>,
     /// The first console line with `held_ms=` ahead of any hand-off line: a line the
     /// restore held for the host and then wrote to the console.
@@ -450,10 +456,12 @@ impl RestoreLog {
         };
         // What ends the hand-off without being an urgent line of fc-agent's: a line its
         // writer carries that is not its own, or its output connection failing.
+        let is_failed_reconnect =
+            |line: &str| line.contains("[fc-agent]") && line.contains(RECONNECT_FAILED);
         let is_other_cause = |line: &str| {
-            let agent = line.contains("[fc-agent]");
-            (!agent && FALLBACK_CAUSES.iter().any(|cause| line.contains(cause)))
-                || (agent && line.contains(RECONNECT_FAILED))
+            (!line.contains("[fc-agent]")
+                && FALLBACK_CAUSES.iter().any(|cause| line.contains(cause)))
+                || is_failed_reconnect(line)
         };
         let held_ms =
             |line: &str| -> Option<f64> { line.rsplit_once(" held_ms=")?.1.trim().parse().ok() };
@@ -488,19 +496,33 @@ impl RestoreLog {
             .iter()
             .rposition(|line| held_ms(line).is_some());
         let fallback_cause = match last_held {
-            // Nothing was held when the cause came: any cause ahead of the hand-off.
-            None => writer_lines.iter().copied().find(|line| is_cause(line)),
-            // The line written directly after the held lines, and with them.
-            Some(last) => writer_lines.get(last + 1).copied().filter(|next| {
-                is_cause(next)
-                    && match (stamp(writer_lines[last]), stamp(next)) {
-                        (Some(held), Some(cause)) => {
-                            cause.duration_since(held).unsigned_abs() <= CAUSE_WITH_THE_SPILL
-                        }
-                        // A time the reader cannot read explains nothing.
-                        _ => false,
+            // Nothing was held when the cause came, so no progress line is ahead of it.
+            None => writer_lines
+                .iter()
+                .copied()
+                .take_while(|line| !is_progress(line))
+                .find(|line| is_cause(line)),
+            Some(last) => {
+                let with_the_spill = |line: &str| match (stamp(writer_lines[last]), stamp(line)) {
+                    (Some(held), Some(cause)) => {
+                        cause.duration_since(held).unsigned_abs() <= CAUSE_WITH_THE_SPILL
                     }
-            }),
+                    // A time the reader cannot read explains nothing.
+                    _ => false,
+                };
+                // The line written directly after the held lines, and with them.
+                writer_lines
+                    .get(last + 1)
+                    .copied()
+                    .filter(|next| is_cause(next) && with_the_spill(next))
+                    // Or a failed reconnect with them, other lines between or not.
+                    .or_else(|| {
+                        writer_lines[last + 1..]
+                            .iter()
+                            .copied()
+                            .find(|line| is_failed_reconnect(line) && with_the_spill(line))
+                    })
+            }
         };
         Self {
             console_agent_lines: agent_console_lines.len(),
@@ -592,7 +614,7 @@ impl RestoreLog {
             panic!(
                 "the restore held its progress lines and then wrote them to the console \
                  with `held_ms=`, and no warning, error, panic, failpoint or failed \
-                 reconnect written directly after them explains it: the hand-off to \
+                 reconnect written with them explains it: the hand-off to \
                  the host never happened (fc-agent's window ran out, or the output \
                  connection refused the lines). The UART works. First held line: \
                  {}\n{self:#?}\nlog at {}",
@@ -652,6 +674,10 @@ impl RestoreLog {
 /// window passed on a warning the VM logged later, so one unrelated warning hid a restore
 /// whose hand-off never happens.
 /// RED WHEN FOUR MATCHING LINES COUNTED AS THE PROGRESS: four copies of one marker passed.
+/// RED WHEN ANY CAUSE COUNTED WITH NOTHING HELD: unheld progress passed on a warning after
+/// it, so a restore whose window never opens passed if the VM logged one warning.
+/// RED WHEN A FAILED RECONNECT HAD TO COME DIRECTLY AFTER THE HELD LINES: one line of
+/// another task's between the two failed a restore whose output connection did fail.
 #[test]
 fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     // fcvm's stamp on a line, `ms` after the first.
@@ -818,6 +844,18 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     let log = RestoreLog::read(&(on_console(0, &[warning], "") + &on_console(5, &progress, "")));
     assert!(log.fallback_cause.is_some() && log.held_on_console.is_none());
     assert!(!fails(&log), "{log:#?}");
+    // Progress that was never held, then a warning: fc-agent's window never opened, and
+    // the warning did not put those lines on the console.
+    let log = RestoreLog::read(&(on_console(0, &progress, "") + &on_console(5, &[warning], "")));
+    assert_eq!(
+        (&log.fallback_cause, &log.held_on_console),
+        (&none, &none),
+        "{log:#?}"
+    );
+    assert!(
+        fails(&log),
+        "unheld progress passed on a warning after it: {log:#?}"
+    );
     // A warning after the hand-off is no fallback: the restore's lines were handed over.
     let log = RestoreLog::read(
         &(hand_off.clone() + &from_agent(&progress) + &on_console(900, &[warning], "")),
@@ -862,6 +900,34 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     assert!(
         fails(&log),
         "a warning 45 s after the held lines passed as the cause: {log:#?}"
+    );
+    // A failed reconnect is the cause with a line between it and the held lines: the
+    // output task ends the hand-off and logs the failure in two steps, and another
+    // task's line can land between them. Not one that came much later.
+    let reconnect_failed = "[fc-agent] output vsock reconnect failed, retrying";
+    let log = RestoreLog::read(
+        &(on_console(0, &progress[..2], " held_ms=412.5")
+            + &on_console(1, &progress[2..3], "")
+            + &on_console(2, &[reconnect_failed], "")
+            + &on_console(3, &progress[3..], "")),
+    );
+    assert_eq!(
+        log.fallback_cause.as_deref().map(str::trim),
+        Some(format!("{} fcvm::console: {reconnect_failed}", at(2)).as_str())
+    );
+    assert!(
+        !fails(&log),
+        "a failed reconnect one line after the held lines failed: {log:#?}"
+    );
+    let log = RestoreLog::read(
+        &(on_console(0, &progress[..2], " held_ms=412.5")
+            + &on_console(1, &progress[2..], "")
+            + &on_console(45_000, &[reconnect_failed], "")),
+    );
+    assert_eq!(log.fallback_cause, None, "{log:#?}");
+    assert!(
+        fails(&log),
+        "a failed reconnect 45 s after the held lines passed as the cause: {log:#?}"
     );
     // Lines with no time the reader can read explain nothing either.
     let log = RestoreLog::read(&format!(

@@ -291,6 +291,16 @@ impl RestoreLog {
         }
         self.inbox.extend_from_slice(fresh);
         if now >= deadline {
+            // The window's time can be up in the turn this thread sees it open. The
+            // backlog taken over above then goes back unrouted, to where it was: nothing
+            // is held to go ahead of it. The lines an earlier spill wrote keep the times
+            // they were first held at, for the window that holds them next.
+            let base = self.taken + pending.len() as u64;
+            self.spilled.extend(
+                self.inbox_logged
+                    .drain(..)
+                    .map(|(at, logged)| (base + at as u64, logged)),
+            );
             return self.end(state, ctl, pending, now);
         }
 
@@ -2599,6 +2609,116 @@ mod tests {
             without_held_suffix(b"[fc-agent] a held_ms="),
             b"[fc-agent] a held_ms="
         );
+    }
+
+    /// Two progress lines held by a window that ended under a console hold: they are in
+    /// the writer's backlog with the ` held_ms=` their spill gave them. The console is
+    /// still held. The instant is one after both were first held.
+    fn two_lines_spilled_under_a_hold(
+    ) -> (Arc<ConsoleShared>, std::fs::File, Arc<FakeSink>, Instant) {
+        let (state, console_rd, sink) = console_with_sink();
+        state.hold_restore_log(Duration::from_secs(60));
+        write_lines(&state, &RESTORE_LINES[..2]);
+        writer_caught_up(&state);
+        let held_by = Instant::now();
+        hold_writer(&state);
+        state.end_restore_log();
+        writer_caught_up(&state);
+        std::thread::sleep(Duration::from_millis(150));
+        (state, console_rd, sink, held_by)
+    }
+
+    /// A window whose time is up in the turn the writer sees it open takes the backlog
+    /// over and gives it back unrouted. A spilled line in it keeps the time it was first
+    /// held at: the next window hands it to the host with that time.
+    ///
+    /// RED WITHOUT THE TIMES PUT BACK AT THE DEADLINE IN `route`: the host got both lines
+    /// with the time the third window took them, 150 ms and more after they were first
+    /// held.
+    #[test]
+    fn a_spilled_line_keeps_its_time_through_a_window_that_ends_as_it_opens() {
+        let (state, mut console_rd, sink, held_by) = two_lines_spilled_under_a_hold();
+        // Open and already past its deadline when the writer looks.
+        state.hold_restore_log(Duration::ZERO);
+        writer_caught_up(&state);
+        assert!(state.ctl().window.is_none(), "the window did not end");
+        assert!(sink.lines().is_empty());
+
+        state.hold_restore_log(Duration::from_secs(60));
+        state.gate.fetch_sub(1, Ordering::SeqCst);
+        state.restore_log_acknowledged();
+        sink.connect(&state);
+        assert!(
+            wait_until(|| sink.lines().len() == 2, Duration::from_secs(5)),
+            "{:?}",
+            sink.lines()
+        );
+        assert_eq!(sink.lines(), RESTORE_LINES[..2]);
+        let logged = sink.logged.lock().unwrap().clone();
+        assert!(
+            logged.iter().all(|at| *at < held_by),
+            "a spilled line took a new time: {:?} after it was first held",
+            logged
+                .iter()
+                .map(|at| at.saturating_duration_since(held_by))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            settled_console(&state, &mut console_rd),
+            "[fc-agent] restore: 2 progress lines queued for the host over vsock\n"
+        );
+    }
+
+    /// A window that takes over a backlog larger than it may hold ends in the same turn,
+    /// at the cap. Every whole line was routed first, so a spilled line among them is
+    /// held with its first time, and the spill that follows counts from it.
+    ///
+    /// RED WITH THE TIME NOT KEPT WHEN A SPILLED LINE IS HELD AGAIN (`logged` always
+    /// `now` in `route`): the two lines said they were held 0 ms.
+    #[test]
+    fn a_spilled_line_keeps_its_time_through_a_window_that_ends_at_the_cap() {
+        let (state, mut console_rd, _sink, held_by) = two_lines_spilled_under_a_hold();
+        // More behind them than a window holds, logged while no window was open.
+        let line = format!("[fc-agent] {}\n", "x".repeat(1000));
+        let lines = HELD_CAP / line.len() + 2;
+        for _ in 0..lines {
+            write_pipe(&state, line.as_bytes());
+        }
+        writer_caught_up(&state);
+        // The window's spill is after this, and the lines were first held before
+        // `held_by`.
+        let at_least = held_by.elapsed().as_secs_f64() * 1000.0;
+        state.hold_restore_log(Duration::from_secs(60));
+        writer_caught_up(&state);
+        assert!(state.ctl().window.is_none(), "the window did not end");
+
+        state.gate.fetch_sub(1, Ordering::SeqCst);
+        state.wake_writer();
+        let mut seen = Vec::new();
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    state.flushed()
+                },
+                Duration::from_secs(10)
+            ),
+            "the writer still holds bytes"
+        );
+        drain_console(&mut console_rd, &mut seen);
+        let console = String::from_utf8(seen).unwrap();
+        assert_eq!(state.dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(console.lines().count(), lines + 2);
+        assert!(at_least >= 150.0);
+        for (line, logged) in console.lines().zip(&RESTORE_LINES[..2]) {
+            let (text, held) = line.rsplit_once(" held_ms=").unwrap();
+            assert_eq!(text, *logged, "not one suffix: {line:?}");
+            let held: f64 = held.parse().unwrap();
+            assert!(
+                held >= at_least,
+                "the spill says {held} ms, and the line was held {at_least} ms or more: {line:?}"
+            );
+        }
     }
 
     /// A container that exits inside a restore's window: the output connection is shut
