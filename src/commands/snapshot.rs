@@ -3009,6 +3009,27 @@ fn restore_ipv6_prefix(network_mode: FcNetworkMode, given: Option<&String>) -> O
     }
 }
 
+/// The write set of the snapshot generation in `snapshot_dir`, whose memory image is
+/// `memory`, for a File-backend restore on a Firecracker of version `firecracker`: None when
+/// that build does not take `write_set_path` (or its version cannot be read), so the clone
+/// neither records a set nor sends one.
+fn write_set_for_restore(
+    firecracker: Option<super::common::FirecrackerVersion>,
+    snapshot_dir: &Path,
+    memory: &Path,
+) -> Option<crate::storage::write_set::Target> {
+    if !firecracker.is_some_and(|version| version.write_set) {
+        return None;
+    }
+    crate::storage::write_set::Target::at_restore(
+        snapshot_dir,
+        memory,
+        &snapshot_dir.join("config.json"),
+    )
+    .map_err(|error| warn!(error = %format!("{error:#}"), "no write set for this restore"))
+    .ok()
+}
+
 async fn cmd_snapshot_run_inner(
     args: SnapshotRunArgs,
     attempted_generation: &mut Option<SnapshotGeneration>,
@@ -3931,6 +3952,10 @@ async fn cmd_snapshot_run_inner(
     // `--restore`, so the Firecracker MemoryBackend below is unused for it.
     let is_ch = snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::CloudHypervisor;
 
+    // The generation's write set (storage::write_set), for a File-backend restore on a
+    // Firecracker that takes one: earlier builds refuse `write_set_path`, so a clone on one
+    // neither records a set nor sends one.
+    let mut write_set_target: Option<crate::storage::write_set::Target> = None;
     let memory_backend = if is_ch {
         // Unused by the CH restore path (it reads ch/memory-ranges via --restore); a
         // placeholder so the shared RestoreParams shape is satisfied.
@@ -4139,35 +4164,24 @@ async fn cmd_snapshot_run_inner(
                 },
             }
         } else {
-            // The write set is named for this generation's key, taken now, while the
-            // generation this clone restores is the one on disk (storage::write_set).
-            let write_set = crate::storage::write_set::sidecar_path(
+            // Taken now, while the generation this clone restores is the one on disk.
+            write_set_target = write_set_for_restore(
+                super::common::find_firecracker_with_version(&runtime_config)
+                    .ok()
+                    .map(|(_, version)| version),
+                &paths::snapshot_dir().join(&snapshot_name),
                 &snapshot_config.memory_path,
-                &paths::snapshot_dir()
-                    .join(&snapshot_name)
-                    .join("config.json"),
             );
-            if let Err(error) = &write_set {
-                warn!(error = %format!("{error:#}"), "no write set for this restore");
-            }
             MemoryBackend::File {
                 memory_path: snapshot_config.memory_path.clone(),
-                write_set: write_set.ok(),
+                write_set: write_set_target
+                    .as_ref()
+                    .and_then(|target| target.recorded().map(Path::to_path_buf)),
             }
         }
     };
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
-    // A File-backend clone records the snapshot's write set once (storage::write_set). Only
-    // the File backend carries one: hugepage and NV2 snapshots restore through an implicit
-    // UFFD server (direct_restore_memory), and Cloud Hypervisor through its own directory.
-    let write_set_memory = match &memory_backend {
-        MemoryBackend::File {
-            memory_path,
-            write_set: Some(sidecar),
-        } if !is_ch => Some((memory_path.clone(), sidecar.clone())),
-        _ => None,
-    };
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
         memory_backend,
@@ -4770,26 +4784,31 @@ async fn cmd_snapshot_run_inner(
     // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
     // console, so they get a backend-neutral missing-console error.
     if output_connected {
-        if let (Some((memory, sidecar)), Ok(vmm_pid)) = (
-            write_set_memory
-                .clone()
-                .filter(|(_, sidecar)| !sidecar.is_file()),
-            vm_manager.pid(),
-        ) {
+        // One clone per generation records its write set: it claims the recording and opens
+        // its VMM's maps and pagemap now, then reads them RECORD_AFTER later. Under
+        // FCVM_STRACE_FC the VMM's PID is strace's, so nothing is recorded.
+        let claimed = match (&write_set_target, vm_manager.pid()) {
+            (Some(target), Ok(vmm_pid)) if std::env::var_os("FCVM_STRACE_FC").is_none() => {
+                target.claim(vmm_pid).unwrap_or_else(|error| {
+                    debug!(error = %format!("{error:#}"), "not recording the write set");
+                    None
+                })
+            }
+            _ => None,
+        };
+        if let Some(recording) = claimed {
             let cancel = health_cancel_token.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(crate::storage::write_set::RECORD_AFTER) => {}
                 }
-                let recorded = tokio::task::spawn_blocking(move || {
-                    crate::storage::write_set::record(vmm_pid, &memory, &sidecar)
-                })
-                .await;
-                match recorded {
-                    Ok(Ok(Some(ranges))) => info!(ranges, "recorded the snapshot's write set"),
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => warn!(%error, "could not record the snapshot's write set"),
+                match tokio::task::spawn_blocking(move || recording.record()).await {
+                    Ok(Ok(ranges)) => info!(ranges, "recorded the snapshot's write set"),
+                    Ok(Err(error)) => warn!(
+                        error = %format!("{error:#}"),
+                        "recorded no write set for this snapshot generation"
+                    ),
                     Err(error) => warn!(%error, "the write-set recording task failed"),
                 }
             });
@@ -6560,16 +6579,18 @@ mod tests {
         let source = include_str!("snapshot.rs");
         let code = &source[..source.find("#[cfg(test)]").unwrap()];
         let inner = &code[code.find("async fn cmd_snapshot_run_inner(").unwrap()..];
-        let named = inner.find("write_set::sidecar_path(").unwrap();
+        let named = inner
+            .find("write_set_target = write_set_for_restore(")
+            .unwrap();
         let implicit = inner
             .find("UffdBacking::Minor { .. } => MemoryBackend::UffdMinor")
             .unwrap();
-        let file = inner.find("write_set: write_set.ok(),").unwrap();
+        let file = inner.find("MemoryBackend::File {\n                memory_path: snapshot_config.memory_path.clone(),\n                write_set: write_set_target").unwrap();
         assert!(
             implicit < named && named < file,
-            "the sidecar is named outside the File branch"
+            "the write set is taken outside the File branch"
         );
-        assert_eq!(inner.matches("write_set::sidecar_path(").count(), 1);
+        assert_eq!(inner.matches("write_set_for_restore(").count(), 1);
         let common = include_str!("common.rs");
         assert_eq!(common.matches("write_set_path: write_set.map(").count(), 1);
         let file_arm = common
@@ -6581,6 +6602,39 @@ mod tests {
                 .unwrap()
                 < 1200
         );
+    }
+
+    /// A restore on a Firecracker without `write-set` in its version, or whose version cannot
+    /// be read, neither records a write set nor sends one, even when the generation has one;
+    /// on one with it, the recorded set is sent.
+    #[test]
+    fn a_firecracker_without_the_write_set_neither_records_nor_sends_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = dir.path().join("memory.bin");
+        std::fs::write(&memory, [0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let sidecar = crate::storage::write_set::sidecar_path(
+            dir.path(),
+            &memory,
+            &dir.path().join("config.json"),
+        )
+        .unwrap();
+        std::fs::write(&sidecar, "0 4096\n").unwrap();
+        let version =
+            |text: &str| Some(super::super::common::parse_firecracker_version(text).unwrap());
+        for without in [
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window"),
+            None,
+        ] {
+            assert!(write_set_for_restore(without, dir.path(), &memory).is_none());
+        }
+        let with = write_set_for_restore(
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set"),
+            dir.path(),
+            &memory,
+        )
+        .unwrap();
+        assert_eq!(with.recorded(), Some(sidecar.as_path()));
     }
 
     /// `--stop` pins one VM: the wrapper hands the create the VM id it pinned before the

@@ -1689,7 +1689,7 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 /// Parse Firecracker version from --version output
 ///
 /// Expected format: "Firecracker v1.14.0" or similar
-fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
+pub(crate) fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
     // Find version number pattern vX.Y.Z, with an optional pre-release suffix (-dev).
     let version_re =
         regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
@@ -1712,6 +1712,7 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
         numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
+        write_set: build.first() == Some(&"fcvm") && build.contains(&"write-set"),
     })
 }
 
@@ -1727,6 +1728,9 @@ pub(crate) struct FirecrackerVersion {
     pub drive_overrides: bool,
     /// Whether the build takes `--numa-balancing-after-secs` (`+fcvm.…numa-window`).
     pub numa_window: bool,
+    /// Whether a File-backend load takes `mem_backend.write_set_path` (`+fcvm.…write-set`).
+    /// Earlier builds refuse the field.
+    pub write_set: bool,
 }
 
 /// The context of a snapshot load that failed. A restore that died under its memory server
@@ -9946,6 +9950,29 @@ mod tests {
     /// `--numa-balancing-after-secs`; an older build or upstream would refuse the flag and
     /// not start.
     #[test]
+    fn the_version_says_whether_firecracker_takes_a_write_set() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().write_set,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+other.write-set",
+            "Firecracker v1.17.0",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().write_set,
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
     fn the_version_says_whether_firecracker_takes_the_numa_window() {
         for takes in [
             "Firecracker v1.17.0+fcvm.drive-overrides.numa-window\n",
@@ -10004,6 +10031,7 @@ mod tests {
             prerelease: false,
             drive_overrides: true,
             numa_window: false,
+            write_set: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];

@@ -1,31 +1,41 @@
-//! The pages a File-backend clone writes soon after its restore, recorded once per memory
-//! image and populated writable by Firecracker before the next clone of it runs.
+//! The pages a File-backend clone writes soon after its restore, recorded once per snapshot
+//! generation and populated writable by Firecracker before the next clone of it runs.
 //!
 //! A File-backend restore maps `memory.bin` privately. The guest's first write to a page it has
 //! read then takes a stage-2 fault whose copy-on-write runs the MMU notifier's stage-2 unmap and
-//! a PTE clear-and-flush: two broadcast TLB invalidations per page while the vCPU waits. At 128
-//! clones at once that was 71% of a clone's stage-2 fault time (about 6,400 such pages a clone).
-//! Firecracker (`mem_backend.write_set_path`) instead copies those pages into the clone with
+//! a PTE clear-and-flush: two broadcast TLB invalidations per page while the vCPU waits. Under
+//! load that copy-on-write was 66% of `user_mem_abort`'s time, about 6,700 such pages a clone
+//! (bench/start-rate/RESTORE.md). Firecracker (`mem_backend.write_set_path`, in builds whose
+//! `--version` says `write-set`) instead copies those pages into the clone with
 //! `MADV_POPULATE_WRITE` before the VM runs.
 //!
-//! The set is read from the first clone's own page tables, [`RECORD_AFTER`] after its restore
-//! completes: a page of the private mapping that is present and no longer a file page
-//! (`/proc/<pid>/pagemap` bit 61 clear) is one the guest wrote. It is a hint like the UFFD
-//! working set: the bytes always come from the memory file, so a set from an atypical clone
+//! The set is read from one clone's own page tables, [`RECORD_AFTER`] after its restore
+//! completes: a page of the private mapping of the memory image that is present and no longer a
+//! file page (`/proc/<pid>/pagemap` bit 61 clear) is one the guest wrote. It is a hint like the
+//! UFFD working set: the bytes always come from the memory file, so a set from an atypical clone
 //! costs, per page it lacks, the copy-on-write fault the next clone would have taken anyway,
 //! and per page it has in excess, one private page the next clone would not have held. Every
-//! populated page is private to its clone, so a set larger than [`MAX_SET_FRACTION`] of the image
-//! is not recorded: shared clean pages are what let many clones fit.
+//! populated page is private to its clone, so a set larger than 1/[`MAX_SET_FRACTION`] of the
+//! image is not recorded: shared clean pages are what let many clones fit.
 //!
-//! The sidecar's name carries the snapshot generation's key, the one the UFFD working-set
-//! sidecar is bound to (`uffd::working_set::ImageKey`: the SHA-256 of `config.json` with the
-//! memory image's length and modification time), so a set recorded for one generation is never
-//! applied to another, including a replaced image of the same length written within the
-//! filesystem's timestamp granularity: its `config.json` differs. The key is taken when the
-//! clone restores, and the recording is named for that key, so a generation installed while
-//! the recording clone runs does not receive its set. Two clones that both find no
-//! set record one each: each writes a temporary of a unique name and renames it onto the
-//! sidecar, so a reader sees one whole set, the last one renamed.
+//! Identity, taken when the clone restores ([`Target::at_restore`]):
+//! - The sidecar's name carries the snapshot generation's key, the one the UFFD working-set
+//!   sidecar is bound to (`uffd::working_set::ImageKey`: the SHA-256 of `config.json` with the
+//!   memory image's length and modification time), so a set recorded for one generation is never
+//!   applied to another, including a replaced image of the same length and modification time:
+//!   its `config.json` differs. It sits in the snapshot directory, so it goes with the generation.
+//! - The mapping is matched by the image's path and inode as the restore found them. A clone of
+//!   a generation that is replaced while it runs maps a file that is no longer at that path, so
+//!   it matches nothing and records nothing; the key is checked again before the set is
+//!   published.
+//! - The recorder opens the VMM's `maps` and `pagemap` when its restore completes, before it
+//!   waits. The open files hold that process's address space, so a VMM that exits meanwhile reads
+//!   as nothing mapped, never as another process that reused its PID.
+//!
+//! One clone records per generation: the first to create `<sidecar>.claim` (`create_new`). The
+//! claim stays, so a recording that fails, a set over the bound, or a directory the clone cannot
+//! write is not tried again by every later clone. Nothing is published when no mapping matched
+//! or the set is empty.
 
 use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom};
@@ -42,101 +52,217 @@ const PAGE: u64 = 4096;
 /// more is not recorded.
 pub const MAX_SET_FRACTION: u64 = 4;
 
-/// The write-set sidecar of the snapshot generation whose memory image is `memory` and whose
-/// config is `config`: beside the image, named for the generation's key.
-pub fn sidecar_path(memory: &Path, config: &Path) -> Result<PathBuf> {
-    let key = crate::uffd::ImageKey::of_generation(memory, config)?;
-    let mut name = memory
-        .file_name()
-        .context("the memory image has no file name")?
-        .to_os_string();
-    name.push(format!(".write-set-{key:?}"));
-    Ok(memory.with_file_name(name))
+/// Page-map entries read at a time: 64 KiB.
+const PAGEMAP_CHUNK: usize = 8192;
+
+/// The marker in a sidecar's name, which snapshot export leaves out.
+pub const SIDECAR_MARK: &str = ".write-set-";
+
+/// The write set of one snapshot generation, as a restore found it.
+#[derive(Debug, Clone)]
+pub struct Target {
+    sidecar: PathBuf,
+    memory: PathBuf,
+    config: PathBuf,
+    canonical: PathBuf,
+    inode: u64,
 }
 
-/// Records at `sidecar` the write set of the memory image at `memory` from the process
-/// `vmm_pid`, which maps it privately as guest memory, unless a set is recorded there already.
-/// Returns the number of ranges written, or None when a set existed.
-pub fn record(vmm_pid: u32, memory: &Path, sidecar: &Path) -> Result<Option<usize>> {
-    if sidecar.is_file() {
-        return Ok(None);
+impl Target {
+    /// The write set of the generation whose memory image is `memory` and whose config is
+    /// `config`, with its sidecar in `snapshot_dir`. Taken at restore, while the generation
+    /// being restored is the one on disk.
+    pub fn at_restore(snapshot_dir: &Path, memory: &Path, config: &Path) -> Result<Self> {
+        let canonical = std::fs::canonicalize(memory)
+            .with_context(|| format!("resolving {}", memory.display()))?;
+        let inode = std::fs::metadata(&canonical)?.ino();
+        Ok(Self {
+            sidecar: sidecar_path(snapshot_dir, memory, config)?,
+            memory: memory.to_path_buf(),
+            config: config.to_path_buf(),
+            canonical,
+            inode,
+        })
     }
-    let canonical =
-        std::fs::canonicalize(memory).with_context(|| format!("resolving {}", memory.display()))?;
-    let inode = std::fs::metadata(&canonical)?.ino();
-    let maps = std::fs::read_to_string(format!("/proc/{vmm_pid}/maps"))
-        .with_context(|| format!("reading the memory map of {vmm_pid}"))?;
-    let mut pagemap = std::fs::File::open(format!("/proc/{vmm_pid}/pagemap"))
-        .with_context(|| format!("opening the page map of {vmm_pid}"))?;
-    let runs = written_runs(&maps, &mut pagemap, &canonical, inode)?;
-    let bytes: u64 = runs.iter().map(|(_, length)| length).sum();
-    let image = std::fs::metadata(&canonical)?.len();
-    if bytes > image / MAX_SET_FRACTION {
-        anyhow::bail!(
-            "the clone wrote {bytes} of the image's {image} bytes, more than 1/{MAX_SET_FRACTION}; \
-             no write set is recorded"
+
+    /// The sidecar's path.
+    pub fn sidecar(&self) -> &Path {
+        &self.sidecar
+    }
+
+    /// The sidecar, when a set is recorded.
+    pub fn recorded(&self) -> Option<&Path> {
+        self.sidecar.is_file().then_some(self.sidecar.as_path())
+    }
+
+    /// Claims the recording for this clone, whose VMM is `vmm_pid`, and opens that process's
+    /// `maps` and `pagemap` now, before the wait. None when a set is recorded, another clone
+    /// claimed it, or the claim cannot be made (a directory this clone cannot write).
+    pub fn claim(&self, vmm_pid: u32) -> Result<Option<Recording>> {
+        if self.recorded().is_some() {
+            return Ok(None);
+        }
+        let mut claim = self.sidecar.clone().into_os_string();
+        claim.push(".claim");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("claiming {}", claim.to_string_lossy()))
+            }
+        }
+        let maps = std::fs::File::open(format!("/proc/{vmm_pid}/maps"))
+            .with_context(|| format!("opening the memory map of {vmm_pid}"))?;
+        let pagemap = std::fs::File::open(format!("/proc/{vmm_pid}/pagemap"))
+            .with_context(|| format!("opening the page map of {vmm_pid}"))?;
+        Ok(Some(Recording {
+            target: self.clone(),
+            maps,
+            pagemap,
+        }))
+    }
+}
+
+/// A claimed recording, holding the VMM's `maps` and `pagemap` open.
+pub struct Recording {
+    target: Target,
+    maps: std::fs::File,
+    pagemap: std::fs::File,
+}
+
+impl Recording {
+    /// Reads the pages the VMM wrote and publishes them as the generation's set. Returns the
+    /// number of ranges. Publishes nothing, and says why, when the VMM no longer maps the image
+    /// (it exited, or the generation was replaced), when it wrote nothing, when the set is over
+    /// the bound, or when the generation on disk is no longer the one restored.
+    pub fn record(mut self) -> Result<usize> {
+        let mut maps = String::new();
+        self.maps.read_to_string(&mut maps)?;
+        let runs = written_runs(
+            &maps,
+            &mut self.pagemap,
+            &self.target.canonical,
+            self.target.inode,
+        )?
+        .context("the VMM maps no memory image of the restored generation")?;
+        anyhow::ensure!(
+            !runs.is_empty(),
+            "the VMM wrote no page of the memory image"
         );
+        let bytes: u64 = runs.iter().map(|(_, length)| length).sum();
+        let image = std::fs::metadata(&self.target.canonical)?.len();
+        anyhow::ensure!(
+            bytes <= image / MAX_SET_FRACTION,
+            "the clone wrote {bytes} of the image's {image} bytes, more than \
+             1/{MAX_SET_FRACTION}; no write set is recorded"
+        );
+        let now = sidecar_path(
+            self.target.sidecar.parent().unwrap_or(Path::new(".")),
+            &self.target.memory,
+            &self.target.config,
+        )?;
+        anyhow::ensure!(
+            now == self.target.sidecar,
+            "the snapshot generation changed since the restore; no write set is recorded"
+        );
+        let mut text = String::new();
+        for (offset, length) in &runs {
+            text.push_str(&format!("{offset} {length}\n"));
+        }
+        let mut temporary = self.target.sidecar.clone().into_os_string();
+        temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let temporary = PathBuf::from(temporary);
+        std::fs::write(&temporary, text)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        std::fs::rename(&temporary, &self.target.sidecar).with_context(|| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("installing {}", self.target.sidecar.display())
+        })?;
+        Ok(runs.len())
     }
-    let mut text = String::new();
-    for (offset, length) in &runs {
-        text.push_str(&format!("{offset} {length}\n"));
-    }
-    // A unique temporary and an atomic rename: two clones that record at once write the same
-    // kind of set, and the last rename wins whole.
-    let mut temporary = sidecar.as_os_str().to_os_string();
-    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, sidecar).with_context(|| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("installing {}", sidecar.display())
-    })?;
-    Ok(Some(runs.len()))
+}
+
+/// The write-set sidecar, in `snapshot_dir`, of the generation whose memory image is `memory`
+/// and whose config is `config`: named for the generation's key.
+pub fn sidecar_path(snapshot_dir: &Path, memory: &Path, config: &Path) -> Result<PathBuf> {
+    let key = crate::uffd::ImageKey::of_generation(memory, config)?;
+    Ok(snapshot_dir.join(format!("memory.bin{SIDECAR_MARK}{key:?}")))
+}
+
+/// One line of `/proc/<pid>/maps`: the range, permissions, offset, inode and path (the rest of
+/// the line, which may hold spaces).
+fn maps_line(line: &str) -> Option<(u64, u64, &str, u64, u64, &str)> {
+    let mut rest = line;
+    let mut field = || {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        rest = tail;
+        word
+    };
+    let (range, perms, offset, _dev, inode) = (field(), field(), field(), field(), field());
+    let (start, end) = range.split_once('-')?;
+    Some((
+        u64::from_str_radix(start, 16).ok()?,
+        u64::from_str_radix(end, 16).ok()?,
+        perms,
+        u64::from_str_radix(offset, 16).ok()?,
+        inode.parse().ok()?,
+        rest.strip_prefix(char::is_whitespace)
+            .map(str::trim_start)
+            .unwrap_or(""),
+    ))
 }
 
 /// The runs, in byte offsets of the file `path` (inode `inode`), of the pages that `maps` maps
 /// privately from it and that `pagemap` reports present and no longer file pages: the pages
-/// the process wrote.
+/// the process wrote. None when no mapping of that file is in `maps`.
 fn written_runs(
     maps: &str,
     pagemap: &mut std::fs::File,
     path: &Path,
     inode: u64,
-) -> Result<Vec<(u64, u64)>> {
+) -> Result<Option<Vec<(u64, u64)>>> {
     let mut runs: Vec<(u64, u64)> = Vec::new();
-    for line in maps.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 6 || fields[4].parse::<u64>().ok() != Some(inode) {
+    let mut matched = false;
+    let mut entries = vec![0u8; PAGEMAP_CHUNK * 8];
+    for (start, end, perms, file_offset, line_inode, line_path) in
+        maps.lines().filter_map(maps_line)
+    {
+        if line_inode != inode || Path::new(line_path) != path || !perms.ends_with('p') {
             continue;
         }
-        if Path::new(fields[5]) != path || !fields[1].ends_with('p') {
-            continue;
-        }
-        let (start, end) = fields[0]
-            .split_once('-')
-            .context("a maps line without a range")?;
-        let start = u64::from_str_radix(start, 16)?;
-        let end = u64::from_str_radix(end, 16)?;
-        let file_offset = u64::from_str_radix(fields[2], 16)?;
+        matched = true;
         let pages = (end - start) / PAGE;
-        let mut entries = vec![0u8; (pages * 8) as usize];
-        pagemap.seek(SeekFrom::Start(start / PAGE * 8))?;
-        pagemap.read_exact(&mut entries)?;
-        for (index, entry) in entries.chunks_exact(8).enumerate() {
-            let entry = u64::from_ne_bytes(entry.try_into().unwrap());
-            let present = entry >> 63 & 1 == 1;
-            let file_page = entry >> 61 & 1 == 1;
-            if !present || file_page {
-                continue;
+        let mut done = 0u64;
+        while done < pages {
+            let count = (pages - done).min(PAGEMAP_CHUNK as u64) as usize;
+            let chunk = &mut entries[..count * 8];
+            pagemap.seek(SeekFrom::Start((start / PAGE + done) * 8))?;
+            pagemap.read_exact(chunk)?;
+            for (index, entry) in chunk.chunks_exact(8).enumerate() {
+                let entry = u64::from_ne_bytes(entry.try_into().unwrap());
+                let present = entry >> 63 & 1 == 1;
+                let file_page = entry >> 61 & 1 == 1;
+                if !present || file_page {
+                    continue;
+                }
+                let offset = file_offset + (done + index as u64) * PAGE;
+                match runs.last_mut() {
+                    Some((run_start, run_len)) if *run_start + *run_len == offset => {
+                        *run_len += PAGE
+                    }
+                    _ => runs.push((offset, PAGE)),
+                }
             }
-            let offset = file_offset + index as u64 * PAGE;
-            match runs.last_mut() {
-                Some((run_start, run_len)) if *run_start + *run_len == offset => *run_len += PAGE,
-                _ => runs.push((offset, PAGE)),
-            }
+            done += count as u64;
         }
     }
-    Ok(runs)
+    Ok(matched.then_some(runs))
 }
 
 #[cfg(test)]
@@ -144,89 +270,167 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
-    /// A private mapping of a file in this process, three of whose pages are then written and
-    /// two read: the recorded set is the written pages, in file offsets, as runs.
-    #[test]
-    fn the_written_pages_of_a_private_mapping_are_recorded() {
+    /// A snapshot directory (its name holds a space, as a path in `maps` may) with a memory
+    /// image of `pages` pages and a config.
+    fn generation(pages: usize) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let memory = dir.path().join("memory.bin");
-        std::fs::write(&memory, vec![0x5au8; 16 * PAGE as usize]).unwrap();
-        let file = std::fs::File::open(&memory).unwrap();
-        // Mapped from file offset 4 pages, as a second guest region would be.
-        let length = 12 * PAGE as usize;
-        // SAFETY: a fresh private mapping of an open file, unmapped below.
+        let snapshot = dir.path().join("snap shot");
+        std::fs::create_dir(&snapshot).unwrap();
+        let memory = snapshot.join("memory.bin");
+        std::fs::write(&memory, vec![0x5au8; pages * PAGE as usize]).unwrap();
+        let config = snapshot.join("config.json");
+        std::fs::write(&config, r#"{"generation":1}"#).unwrap();
+        (dir, snapshot, memory, config)
+    }
+
+    /// Maps `pages` pages of `memory` privately from file page `from`, writes the pages
+    /// `written`, reads the pages `read`, and returns the mapping.
+    fn map(memory: &Path, from: usize, pages: usize, written: &[usize], read: &[usize]) -> *mut u8 {
+        let file = std::fs::File::open(memory).unwrap();
+        // SAFETY: a fresh private mapping of an open file, unmapped by the caller.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                length,
+                pages * PAGE as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE,
                 file.as_raw_fd(),
-                4 * PAGE as i64,
+                (from as u64 * PAGE) as i64,
             )
         };
         assert_ne!(base, libc::MAP_FAILED);
         let bytes = base.cast::<u8>();
         // SAFETY: every index lies inside the mapping.
         unsafe {
-            for page in [2usize, 3, 7] {
+            for page in written {
                 *bytes.add(page * PAGE as usize) = 1;
             }
-            for page in [0usize, 9] {
+            for page in read {
                 std::ptr::read_volatile(bytes.add(page * PAGE as usize));
             }
         }
-        let config = dir.path().join("config.json");
-        std::fs::write(&config, "{}").unwrap();
-        let sidecar = sidecar_path(&memory, &config).unwrap();
-        assert_eq!(
-            record(std::process::id(), &memory, &sidecar).unwrap(),
-            Some(2)
-        );
-        let recorded = std::fs::read_to_string(&sidecar).unwrap();
+        bytes
+    }
+
+    /// A private mapping of a file in this process, three of whose pages are then written and
+    /// two read: the recorded set is the written pages, in file offsets, as runs, and a second
+    /// clone records nothing.
+    #[test]
+    fn the_written_pages_of_a_private_mapping_are_recorded() {
+        let (_dir, snapshot, memory, config) = generation(16);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        // Mapped from file offset 4 pages, as a second guest region would be.
+        let bytes = map(&memory, 4, 12, &[2, 3, 7], &[0, 9]);
+        let recording = target.claim(std::process::id()).unwrap().unwrap();
+        assert_eq!(recording.record().unwrap(), 2);
+        let recorded = std::fs::read_to_string(target.sidecar()).unwrap();
         assert_eq!(
             recorded,
             format!("{} {}\n{} {}\n", 6 * PAGE, 2 * PAGE, 11 * PAGE, PAGE)
         );
-        // Recorded once: a second call leaves it.
-        assert_eq!(record(std::process::id(), &memory, &sidecar).unwrap(), None);
+        assert!(target.claim(std::process::id()).unwrap().is_none());
         // SAFETY: the mapping made above.
-        unsafe { libc::munmap(base, length) };
+        unsafe { libc::munmap(bytes.cast(), 12 * PAGE as usize) };
     }
 
-    /// A clone that wrote more than 1/MAX_SET_FRACTION of the image records nothing.
+    /// A clone that wrote more than 1/MAX_SET_FRACTION of the image records nothing, and its
+    /// claim keeps every later clone from trying again.
     #[test]
     fn a_set_over_the_bound_is_not_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = dir.path().join("memory.bin");
-        std::fs::write(&memory, vec![0u8; 8 * PAGE as usize]).unwrap();
-        let file = std::fs::File::open(&memory).unwrap();
-        let length = 8 * PAGE as usize;
-        // SAFETY: a fresh private mapping of an open file, unmapped below.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED);
-        // SAFETY: three pages of the mapping, 3/8 of the image.
-        unsafe {
-            for page in 0..3usize {
-                *base.cast::<u8>().add(page * PAGE as usize) = 1;
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let bytes = map(&memory, 0, 8, &[0, 1, 2], &[]);
+        assert!(target
+            .claim(std::process::id())
+            .unwrap()
+            .unwrap()
+            .record()
+            .is_err());
+        assert!(target.recorded().is_none());
+        assert!(target.claim(std::process::id()).unwrap().is_none());
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
+    /// A VMM that does not map the image (another process's PID, a VMM that mapped another
+    /// generation) records nothing: no empty set is published.
+    #[test]
+    fn a_vmm_that_maps_no_image_records_nothing() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let error = target
+            .claim(std::process::id())
+            .unwrap()
+            .unwrap()
+            .record()
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("maps no memory image"),
+            "{error:#}"
+        );
+        assert!(target.recorded().is_none());
+    }
+
+    /// A VMM that exits between its restore and the recording records nothing, though its
+    /// `maps` and `pagemap` were opened while it ran: the open files hold its address space,
+    /// never another process's.
+    #[test]
+    fn a_vmm_that_exits_before_the_recording_records_nothing() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        // The child inherits the mapping and the pages this process wrote.
+        let bytes = map(&memory, 0, 8, &[1], &[]);
+        // SAFETY: the child only pauses until it is killed.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            loop {
+                // SAFETY: pause is async-signal-safe.
+                unsafe { libc::pause() };
             }
         }
-        let config = dir.path().join("config.json");
-        std::fs::write(&config, "{}").unwrap();
-        let sidecar = sidecar_path(&memory, &config).unwrap();
-        assert!(record(std::process::id(), &memory, &sidecar).is_err());
-        assert!(!sidecar.exists());
+        let recording = target.claim(child as u32).unwrap().unwrap();
+        // SAFETY: the child forked above.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        // Recorded while the child is a zombie, its PID still taken and its maps empty.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(format!("/proc/{child}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(recording.record().is_err());
+        assert!(target.recorded().is_none());
+        // SAFETY: the child forked above.
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
         // SAFETY: the mapping made above.
-        unsafe { libc::munmap(base, length) };
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
+    /// A generation replaced while its clone runs records nothing: the clone maps a file that
+    /// is no longer at the restored path, and the new generation does not receive its set.
+    #[test]
+    fn a_generation_replaced_before_the_recording_records_nothing() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let bytes = map(&memory, 0, 8, &[1], &[]);
+        let recording = target.claim(std::process::id()).unwrap().unwrap();
+        // A new generation installed by rename, as a snapshot create installs one.
+        let fresh = snapshot.join("memory.bin.new");
+        std::fs::write(&fresh, vec![0u8; 8 * PAGE as usize]).unwrap();
+        std::fs::rename(&fresh, &memory).unwrap();
+        std::fs::write(&config, r#"{"generation":2}"#).unwrap();
+        assert!(recording.record().is_err());
+        assert!(!target.sidecar().exists());
+        let next = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        assert!(next.recorded().is_none());
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
     }
 
     /// A set is named for its snapshot generation: another generation whose memory image has
@@ -250,11 +454,23 @@ mod tests {
                 .set_modified(stamp)
                 .unwrap();
             std::fs::write(&config, config_text).unwrap();
-            sidecar_path(&memory, &config).unwrap()
+            sidecar_path(dir.path(), &memory, &config).unwrap()
         };
         let first = generation(&[1u8; 4096], r#"{"generation":1}"#);
         assert_eq!(first, generation(&[1u8; 4096], r#"{"generation":1}"#));
         // A replaced image: same length, same mtime, new config.
         assert_ne!(first, generation(&[2u8; 4096], r#"{"generation":2}"#));
+    }
+
+    /// The path in a maps line is the rest of the line, spaces included.
+    #[test]
+    fn a_maps_path_may_hold_spaces() {
+        let line = "7f00-7f02 rw-p 00004000 fd:01 257  /mnt/a b/memory.bin";
+        let (start, end, perms, offset, inode, path) = maps_line(line).unwrap();
+        assert_eq!(
+            (start, end, perms, offset, inode),
+            (0x7f00, 0x7f02, "rw-p", 0x4000, 257)
+        );
+        assert_eq!(path, "/mnt/a b/memory.bin");
     }
 }

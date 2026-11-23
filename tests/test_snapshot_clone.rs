@@ -9148,6 +9148,7 @@ async fn a_file_clone_records_its_write_set_and_the_next_clone_populates_it() ->
     common::kill_process(baseline_pid).await;
     let snapshot_dir = fcvm::paths::snapshot_dir().join(&snapshot_name);
     let sidecar = fcvm::storage::write_set::sidecar_path(
+        &snapshot_dir,
         &snapshot_dir.join("memory.bin"),
         &snapshot_dir.join("config.json"),
     )?;
@@ -9222,5 +9223,8 @@ async fn a_file_clone_records_its_write_set_and_the_next_clone_populates_it() ->
     }
     .await;
     let _ = common::delete_snapshot(&snapshot_name).await;
-    outcome
+    outcome?;
+    // The set and its claim live in the snapshot directory and go with the generation.
+    anyhow::ensure!(!sidecar.exists(), "the write set outlived its snapshot");
+    Ok(())
 }
