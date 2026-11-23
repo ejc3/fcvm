@@ -3318,6 +3318,34 @@ mod tests {
             .expect("amd64 host_kernel")
     }
 
+    /// Run a host config fragment block the way the build script does, in a directory whose
+    /// `scripts/config` does nothing and whose `make` (the block's `olddefconfig`) leaves
+    /// `after` as the whole .config. `after` is a `printf` format: `\n` separates lines.
+    fn run_fragment_block(block: &str, after: &str) -> std::process::Output {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join(".config"), "").unwrap();
+        std::fs::write(dir.path().join("scripts/config"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            bin.join("make"),
+            format!("#!/bin/sh\nprintf '{after}\\n' > .config\n"),
+        )
+        .unwrap();
+        for f in [dir.path().join("scripts/config"), bin.join("make")] {
+            std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        std::process::Command::new("bash")
+            .args(["-euo", "pipefail", "-c", block])
+            .current_dir(dir.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("KERNEL_ARCH", "x86")
+            .output()
+            .unwrap()
+    }
+
     /// `dpkg-deb` writes each package's compressed archive to a temporary file under `TMPDIR`
     /// before moving it beside the build tree. The build tree is placed on a filesystem with
     /// room (scripts/check-host-kernel-build.sh), but `TMPDIR` stayed `/tmp`: on a gpubox, whose
@@ -3378,34 +3406,67 @@ mod tests {
         assert!(set < build, "the pin must be applied before the build");
 
         // the block, run against a .config: passes when olddefconfig keeps ENA=y, stops when not
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(bin.join("scripts")).unwrap();
-        let run = |after: &str| {
-            std::fs::write(dir.path().join(".config"), "CONFIG_ENA_ETHERNET=m\n").unwrap();
-            std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
-            std::fs::write(dir.path().join("scripts/config"), "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::write(
-                bin.join("make"),
-                format!("#!/bin/sh\nprintf '{after}\\n' > .config\n"),
-            )
-            .unwrap();
-            for f in [dir.path().join("scripts/config"), bin.join("make")] {
-                std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                    .unwrap();
-            }
-            std::process::Command::new("bash")
-                .args(["-euo", "pipefail", "-c", &block])
-                .current_dir(dir.path())
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env("KERNEL_ARCH", "x86")
-                .output()
-                .unwrap()
-        };
-        assert!(run("CONFIG_ENA_ETHERNET=y").status.success());
-        let dropped = run("CONFIG_ENA_ETHERNET=m");
+        assert!(run_fragment_block(&block, "CONFIG_ENA_ETHERNET=y")
+            .status
+            .success());
+        let dropped = run_fragment_block(&block, "CONFIG_ENA_ETHERNET=m");
         assert!(!dropped.status.success());
         assert!(String::from_utf8_lossy(&dropped.stdout).contains("CONFIG_ENA_ETHERNET is not y"));
+    }
+
+    /// `scripts/config --disable X` does not keep X off: `olddefconfig` sets it again when
+    /// another option selects it. IPW2100, IPW2200 and LIBIPW each select WIRELESS_EXT, so with
+    /// those in the base config a fragment naming only CFG80211_WEXT, WIRELESS_EXT and WEXT_CORE
+    /// leaves WEXT_CORE=y (#2037). The check after `olddefconfig` has to stop the build on a
+    /// `=n` line that is still y or m, and pass when the option is absent or "is not set". Both
+    /// host fragments are also run through it with WIRELESS_EXT and WEXT_CORE selected back on.
+    #[test]
+    fn a_fragment_line_at_n_stops_the_build_when_olddefconfig_leaves_the_option_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = amd64_host_kernel();
+        host.config_fragment = Some("f.conf".into());
+        std::fs::write(dir.path().join("f.conf"), "CONFIG_A=n\n").unwrap();
+        let block = host_config_fragment_block(&host, dir.path()).unwrap();
+        assert!(block.contains("scripts/config --disable A"), "{block}");
+        for unset in ["# CONFIG_A is not set", "CONFIG_AB=y"] {
+            let out = run_fragment_block(&block, unset);
+            assert!(out.status.success(), "{unset}: {out:?}");
+        }
+        for set in ["CONFIG_A=y", "CONFIG_A=m"] {
+            let out = run_fragment_block(&block, set);
+            assert!(!out.status.success(), "{set} passed the check");
+            assert!(
+                String::from_utf8_lossy(&out.stdout)
+                    .contains("ERROR: CONFIG_A is set, the fragment says n"),
+                "{set}: {out:?}"
+            );
+        }
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        for arch in ["amd64", "arm64"] {
+            let host = plan.kernel_profiles["nested"][arch]
+                .host_kernel
+                .clone()
+                .unwrap_or_else(|| panic!("{arch} host_kernel"));
+            let block = host_config_fragment_block(&host, repo).unwrap();
+            let off = "CONFIG_ENA_ETHERNET=y\\n# CONFIG_CFG80211_WEXT is not set\\n\
+                       # CONFIG_IPW2100 is not set\\n# CONFIG_IPW2200 is not set";
+            let out = run_fragment_block(&block, off);
+            assert!(out.status.success(), "{arch}: {out:?}");
+            let selected = format!("{off}\\nCONFIG_WIRELESS_EXT=y\\nCONFIG_WEXT_CORE=y");
+            let out = run_fragment_block(&block, &selected);
+            assert!(
+                !out.status.success(),
+                "{arch}: WEXT_CORE=y passed the check"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout)
+                    .contains("ERROR: CONFIG_WIRELESS_EXT is set, the fragment says n"),
+                "{arch}: {out:?}"
+            );
+        }
     }
 
     #[test]

@@ -2640,10 +2640,13 @@ fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
 /// With CONFIG_WEXT_CORE=y every netdev notifier event walks every network namespace under RTNL
 /// (wext_netdev_notifier_call -> wireless_nlevent_flush -> for_each_net): 3.3 to 3.6 ms of hold
 /// per VM namespace life with 2000 to 3000 namespaces alive (#2034). WEXT_CORE is def_bool on
-/// CFG80211_WEXT || WIRELESS_EXT, and the host builds from the running kernel's config, which
-/// sets CFG80211_WEXT=y. Every host kernel therefore has to name a config fragment, list it as a
-/// build input, and set those options to n; the build then fails if olddefconfig leaves
-/// WEXT_CORE set.
+/// CFG80211_WEXT || WIRELESS_EXT. The host builds from the running kernel's config, which
+/// descends from Ubuntu's and sets CFG80211_WEXT=y, and IPW2100=m and IPW2200=m, which select
+/// WIRELESS_EXT themselves and through LIBIPW (Linux 7.3.3,
+/// drivers/net/wireless/intel/ipw2x00/Kconfig). Every host kernel therefore has to name a
+/// config fragment, list it as a build input, and set all three to n. It also sets
+/// WIRELESS_EXT and WEXT_CORE to n, which changes nothing by itself (neither has a prompt)
+/// and makes the build's check after olddefconfig fail if anything still selects them.
 #[test]
 fn every_host_kernel_leaves_wireless_extensions_off() {
     let root = repo_root();
@@ -2670,7 +2673,13 @@ fn every_host_kernel_leaves_wireless_extensions_off() {
                 wrong.push(format!("{name}: {fragment} is not a build input"));
             }
             let text = std::fs::read_to_string(root.join(fragment)).unwrap();
-            for option in ["CFG80211_WEXT", "WIRELESS_EXT", "WEXT_CORE"] {
+            for option in [
+                "CFG80211_WEXT",
+                "IPW2100",
+                "IPW2200",
+                "WIRELESS_EXT",
+                "WEXT_CORE",
+            ] {
                 let line = format!("CONFIG_{option}=n");
                 if !text.lines().any(|l| l.trim() == line) {
                     wrong.push(format!("{name}: {fragment} lacks {line}"));
