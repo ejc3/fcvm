@@ -7048,7 +7048,7 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
         common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
         snapshot_created = true;
 
-        let (serve_child, serve_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+        let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
             &["snapshot", "serve", &snapshot_name],
             &[("FCVM_UFFD_MAX_CLONES", "1")],
         )
@@ -7106,6 +7106,36 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+
+        // The refusal is not a VM the server had. Its log says the refused clone was killed,
+        // and with the admitted clone still running it has no `VM disconnected` or
+        // `VM exited` line: tests and the bench harness read those as the end of a clone the
+        // server served, and `active_vms` as the count of such clones.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let serve_output = loop {
+            let text = tokio::fs::read_to_string(&serve_log).await?;
+            if text.contains("refused clone killed") || text.contains("VM exited") {
+                break text;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the memory server did not log the refused clone's end within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let as_a_served_vm: Vec<&str> = serve_output
+            .lines()
+            .filter(|line| line.contains("VM disconnected") || line.contains("VM exited"))
+            .collect();
+        anyhow::ensure!(
+            as_a_served_vm.is_empty(),
+            "the memory server logged the refused clone as a VM it had served:\n{}",
+            as_a_served_vm.join("\n")
+        );
+        anyhow::ensure!(
+            serve_output.contains("refused clone killed"),
+            "the memory server did not log that it killed the refused clone"
+        );
         Ok(())
     }
     .await;
@@ -7114,6 +7144,173 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
     for (entry, label) in [
         (&mut refused, "refused clone"),
         (&mut first_clone, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
+}
+
+/// Fails as soon as the guest memory of any of `fcvm_pids`' Firecrackers reads a NUMA policy
+/// other than `default`, and never returns otherwise.
+async fn guest_memory_leaves_the_default_policy(fcvm_pids: &[u32]) -> anyhow::Error {
+    loop {
+        for &fcvm_pid in fcvm_pids {
+            let read = common::firecracker_child_of(fcvm_pid)
+                .and_then(common::largest_mapping_numa_policy);
+            if let Some((policy, file)) = read {
+                if policy != "default" {
+                    return anyhow::anyhow!(
+                        "the largest mapping ({file:?}) of the Firecracker of fcvm PID \
+                         {fcvm_pid} has the NUMA policy {policy:?}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The guest memory of a healthy `--uffd-mode minor` clone: the server's memfd, under the
+/// default NUMA policy.
+fn ensure_minor_guest_memory_is_unbound(fcvm_pid: u32, label: &str) -> Result<()> {
+    let firecracker = common::firecracker_child_of(fcvm_pid)
+        .with_context(|| format!("the {label} has no Firecracker"))?;
+    let (policy, file) = common::largest_mapping_numa_policy(firecracker)
+        .with_context(|| format!("reading the {label}'s guest memory mapping"))?;
+    anyhow::ensure!(
+        file.contains("memfd:"),
+        "the {label}'s largest mapping is of {file:?}, not the memory server's memfd"
+    );
+    anyhow::ensure!(
+        policy == "default",
+        "the {label}'s guest memory has the NUMA policy {policy:?}"
+    );
+    Ok(())
+}
+
+/// The clones of a `--uffd-mode minor` serve map one memfd, and a shmem mapping keeps its
+/// NUMA policy in the file, where every clone reads it. A clone that bound its guest memory
+/// for its NUMA window (`NUMA_BALANCING_AFTER_SECS`) would bind every clone's, and its timer
+/// would end every clone's window. So such memory is not bound: a clone's guest memory has
+/// the default policy from its start, and another clone starting does not change it.
+#[tokio::test]
+async fn a_minor_mode_clone_s_numa_policy_is_not_moved_by_another_clone() -> Result<()> {
+    let (baseline_name, first_name, snapshot_name, _) = common::unique_names("minor-numa");
+    let second_name = format!("{first_name}-second");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first: Option<(tokio::process::Child, u32)> = None;
+    let mut second: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        serve = Some(
+            common::spawn_fcvm_with_logs(
+                &["snapshot", "serve", &snapshot_name, "--uffd-mode", "minor"],
+                &format!("{snapshot_name}-serve"),
+            )
+            .await?,
+        );
+        let serve_pid = serve.as_ref().unwrap().1;
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+        // As in `clone_isolation_impl`: a Firecracker named in the environment reaches a
+        // clone only as a flag.
+        let firecracker_bin = std::env::var("FCVM_FIRECRACKER_BIN").ok();
+        let serve_pid_string = serve_pid.to_string();
+        let clone_args = |name: &str| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_string,
+                "--name",
+                name,
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+            if let Some(bin) = &firecracker_bin {
+                args.extend(["--firecracker-bin".to_string(), bin.clone()]);
+            }
+            args
+        };
+
+        // The first clone, watched from its spawn.
+        let args = clone_args(&first_name);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        first = Some(common::spawn_fcvm_with_logs(&args, &first_name).await?);
+        let (first_child, first_pid) = first.as_mut().unwrap();
+        let first_pid = *first_pid;
+        let watched = [first_pid];
+        tokio::select! {
+            bound = guest_memory_leaves_the_default_policy(&watched) => {
+                return Err(bound.context("while the first clone started"));
+            }
+            healthy = common::poll_health(first_child, 120) => healthy?,
+        }
+        ensure_minor_guest_memory_is_unbound(first_pid, "first clone")?;
+
+        // A second clone of the same memfd starts: neither clone's policy moves.
+        let args = clone_args(&second_name);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        second = Some(common::spawn_fcvm_with_logs(&args, &second_name).await?);
+        let (second_child, second_pid) = second.as_mut().unwrap();
+        let second_pid = *second_pid;
+        let watched = [first_pid, second_pid];
+        tokio::select! {
+            bound = guest_memory_leaves_the_default_policy(&watched) => {
+                return Err(bound.context("while the second clone started"));
+            }
+            healthy = common::poll_health(second_child, 120) => healthy?,
+        }
+        ensure_minor_guest_memory_is_unbound(first_pid, "first clone")?;
+        ensure_minor_guest_memory_is_unbound(second_pid, "second clone")?;
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut second, "second clone"),
+        (&mut first, "first clone"),
         (&mut serve, "memory server"),
         (&mut baseline, "baseline VM"),
     ] {

@@ -118,58 +118,47 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
 /// A VM's guest memory starts out of automatic NUMA balancing: fcvm asks Firecracker to bind
 /// it MPOL_LOCAL for `NUMA_BALANCING_AFTER_SECS` after creating or restoring it
 /// (`--numa-balancing-after-secs`), so `/proc/<firecracker>/numa_maps` reports the guest
-/// memory's policy as `local` right after the VM turns healthy, and `default` without it.
+/// memory's policy as `local` for that long, and as `default` without the flag.
+///
+/// The policy returns to `default` when the window ends, so this polls from the spawn and
+/// passes at the first `local` it reads. It does not wait for the VM to turn healthy: on a
+/// host where that takes longer than the window, a read taken afterwards finds `default` in a
+/// correct build. It gives up after 100 s, before nextest ends a test of the default profile
+/// (120 s), so a build without the window fails with what was read, not as a timeout.
 #[tokio::test]
 async fn a_new_vms_guest_memory_starts_out_of_numa_balancing() -> Result<()> {
+    use std::time::{Duration, Instant};
+
     let (vm_name, _, _, _) = common::unique_names("numa-window");
-    let (_child, fcvm_pid) =
+    let (mut child, fcvm_pid) =
         common::spawn_fcvm(&["podman", "run", "--name", &vm_name, common::TEST_IMAGE])
             .await
             .context("spawning fcvm podman run")?;
     let result = async {
-        common::poll_health_by_pid(fcvm_pid, 300).await?;
-        let children = std::fs::read_dir(format!("/proc/{fcvm_pid}/task"))?
-            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("children")).ok())
-            .flat_map(|list| {
-                list.split_whitespace()
-                    .filter_map(|pid| pid.parse::<u32>().ok())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let firecracker = children
-            .into_iter()
-            .find(|pid| {
-                std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                    .is_ok_and(|comm| comm.starts_with("firecracker"))
-            })
-            .context("no Firecracker child of the fcvm process")?;
-        // The guest memory is the VMM's largest mapping.
-        let maps = std::fs::read_to_string(format!("/proc/{firecracker}/maps"))?;
-        let (start, _) = maps
-            .lines()
-            .filter_map(|line| {
-                let (range, _) = line.split_once(' ')?;
-                let (lo, hi) = range.split_once('-')?;
-                let (lo, hi) = (
-                    u64::from_str_radix(lo, 16).ok()?,
-                    u64::from_str_radix(hi, 16).ok()?,
+        let deadline = Instant::now() + Duration::from_secs(100);
+        let mut last_read = None;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!(
+                    "fcvm exited ({status}) before its guest memory's policy read `local` \
+                     (last read: {last_read:?})"
                 );
-                Some((lo, hi - lo))
-            })
-            .max_by_key(|&(_, len)| len)
-            .context("Firecracker has no mappings")?;
-        let numa_maps = std::fs::read_to_string(format!("/proc/{firecracker}/numa_maps"))?;
-        let policy = numa_maps
-            .lines()
-            .find(|line| line.starts_with(&format!("{start:x} ")))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .context("the guest memory mapping is not in numa_maps")?
-            .to_string();
-        anyhow::ensure!(
-            policy == "local",
-            "the guest memory's policy is {policy:?}, so NUMA balancing scans it from the start"
-        );
-        Ok(())
+            }
+            let read = common::firecracker_child_of(fcvm_pid)
+                .and_then(common::largest_mapping_numa_policy);
+            if let Some((policy, _)) = read {
+                if policy == "local" {
+                    return Ok(());
+                }
+                last_read = Some(policy);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the guest memory's policy never read `local` in the 100 s after the spawn \
+                 (last read: {last_read:?}), so NUMA balancing scans it from the start"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
     .await;
     common::kill_process(fcvm_pid).await;

@@ -359,10 +359,10 @@ impl PeerVmm {
             // Both reads named the VMM's PID and its parent's; the pidfd still pinning a live
             // VMM means neither PID was reused under them.
             anyhow::ensure!(self.is_alive(), "the VMM exited before its clone was found");
-            let states = crate::state::StateManager::new(crate::paths::state_dir())
-                .list_vms()
-                .await
-                .context("listing VM states")?;
+            // Through the PID index: the clone's own state, not every VM's.
+            let manager = crate::state::StateManager::new(crate::paths::state_dir());
+            let (states, _) =
+                super::failure::states_of_parent(&manager, parent, parent_start).await?;
             let vm_id = super::failure::clone_of_parent(&states, parent, parent_start)
                 .with_context(|| {
                     format!("no single VM state names fcvm PID {parent} as its process")
@@ -494,6 +494,86 @@ struct SlotGuard(Arc<AtomicUsize>);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How many refused clones can have their refusal recorded at once.
+///
+/// A record is bounded at 2 s and reads the refused clone's own state, but a server at its
+/// cap can be sent any number of clones, and it serves its admitted clones' page faults on
+/// the runtime the records run on. Past this many in flight, a refused clone is killed
+/// without a record.
+const REFUSAL_RECORDS: usize = 4;
+
+/// Clones refused at the concurrent-clone cap, on their way to being killed.
+///
+/// They are kept apart from the clones being served: a refusal is not a VM this server had,
+/// so it is not counted in `active_vms` and its end is not logged as `VM disconnected` and
+/// `VM exited`, which tests and the bench harness read as the end of a served clone.
+struct Refusals {
+    tasks: JoinSet<()>,
+    records: Arc<tokio::sync::Semaphore>,
+}
+
+impl Refusals {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            records: Arc::new(tokio::sync::Semaphore::new(REFUSAL_RECORDS)),
+        }
+    }
+
+    /// Refuse the clone whose VMM is `peer`, which means killing that VMM.
+    ///
+    /// With a record slot free, `reason` is first written where the clone reads it
+    /// (`record_failure`), on a task of its own so the accept loop goes on; the guard kills
+    /// the VMM if that task is dropped before it does. With none free the VMM is killed here
+    /// and now, and the clone reports only that its snapshot load failed. `connection` stays
+    /// open until the kill: closed earlier, the clone's load could fail before the reason is
+    /// written.
+    fn refuse<C: Send + 'static>(
+        &mut self,
+        peer: PeerVmm,
+        vm_id: String,
+        reason: String,
+        connection: C,
+    ) {
+        let Ok(slot) = Arc::clone(&self.records).try_acquire_owned() else {
+            warn!(
+                target: "uffd",
+                vm_id = %vm_id,
+                peer_pid = peer.pid,
+                recording = REFUSAL_RECORDS,
+                "refused clone killed without a recorded reason: that many refusals are \
+                 being recorded already"
+            );
+            peer.kill_now(&reason);
+            drop(connection);
+            return;
+        };
+        let mut guard = PeerTaskGuard::new(peer, vm_id.clone());
+        self.tasks.spawn(async move {
+            let _slot = slot;
+            guard.peer().record_failure(&reason).await;
+            guard.peer().kill_now(&reason);
+            guard.disarm();
+            drop(connection);
+            info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                peer_pid = guard.peer().pid,
+                "refused clone killed"
+            );
+        });
+    }
+
+    /// Wait for every refusal in flight to have killed its VMM.
+    async fn drain(&mut self) {
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(e) = result {
+                error!(target: "uffd", error = %e, "refusal task panicked");
+            }
+        }
     }
 }
 
@@ -1356,6 +1436,7 @@ impl UffdServer {
         info!(target: "uffd", "UFFD server listening, waiting for VM connections...");
 
         let mut vm_tasks: JoinSet<String> = JoinSet::new();
+        let mut refusals = Refusals::new();
         let mut next_vm_id = 0u64;
         // Admitted-clone count. Incremented only here (single accept loop) and decremented by
         // each connection task as it finishes, so it tracks clones that are actually being
@@ -1427,28 +1508,16 @@ impl UffdServer {
                                 // and no signal. A refused clone that merely hangs still holds
                                 // its memory, port and disk. Refusal means killing.
                                 //
-                                // The reason goes into the clone's runtime directory first
-                                // (`record_failure`), so the clone reports the cap instead of
-                                // a snapshot load that failed with "connection closed". The
-                                // record lists VM states, so it runs on a task of its own and
-                                // the accept loop goes on; the guard kills the VMM if the task
-                                // is dropped before it does. The stream stays open until the
-                                // kill: closed earlier, the clone's load could fail before the
-                                // reason is written.
+                                // The reason goes into the clone's runtime directory first,
+                                // so the clone reports the cap instead of a snapshot load
+                                // that failed with "connection closed" (see `Refusals`).
                                 let reason = format!(
                                     "the memory server is at its concurrent-clone cap of {} \
                                      ({} clones running); start another `fcvm snapshot serve` \
                                      or raise {}",
                                     self.max_clones, in_flight, MAX_CLONES_ENV
                                 );
-                                let mut guard = PeerTaskGuard::new(peer, vm_id.clone());
-                                vm_tasks.spawn(async move {
-                                    guard.peer().record_failure(&reason).await;
-                                    guard.peer().kill_now(&reason);
-                                    guard.disarm();
-                                    drop(stream);
-                                    vm_id
-                                });
+                                refusals.refuse(peer, vm_id, reason, stream);
                                 continue;
                             }
                             admitted.fetch_add(1, Ordering::AcqRel);
@@ -1528,6 +1597,14 @@ impl UffdServer {
                     info!(target: "uffd", active_vms = vm_tasks.len(), "VM exited");
                 }
 
+                // Reap a finished refusal. It was not a VM this server had, so nothing
+                // is logged for it here: its task logged the kill.
+                Some(result) = refusals.tasks.join_next() => {
+                    if let Err(e) = result {
+                        error!(target: "uffd", error = %e, "refusal task panicked");
+                    }
+                }
+
                 // Shut down when cancellation token is triggered (Ctrl-C / SIGTERM)
                 _ = cancel.cancelled() => {
                     info!(target: "uffd", "cancellation requested, shutting down server");
@@ -1565,6 +1642,8 @@ impl UffdServer {
                 Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
             }
         }
+        // A refusal still in flight kills its VMM within its record's 2 s bound.
+        refusals.drain().await;
         // Every handler has scheduled its clone's faults by now. Give the writer a bounded
         // time to publish them before the process exits with them only in memory.
         if let Some(persistence) = self.working_set_persistence.clone() {
@@ -8050,6 +8129,39 @@ mod tests {
             panic!("deterministic admitted-task panic");
         });
         assert!(task.await.unwrap_err().is_panic());
+        assert_vmm_was_killed(victim).await;
+    }
+
+    /// A clone refused at the cap is killed on the refusals' own task set, which the served
+    /// clones' count and `VM exited` lines never see, and gives its record slot back.
+    #[tokio::test]
+    async fn a_refused_clone_is_killed_apart_from_the_served_clones() {
+        let victim = spawn_victim();
+        let peer = PeerVmm::from_pid(victim.id()).unwrap();
+        let mut refusals = Refusals::new();
+        refusals.refuse(peer, "vm-refused".into(), "test: at the cap".into(), ());
+        assert_eq!(refusals.tasks.len(), 1);
+        refusals.drain().await;
+        assert_vmm_was_killed(victim).await;
+        assert_eq!(refusals.records.available_permits(), REFUSAL_RECORDS);
+    }
+
+    /// With `REFUSAL_RECORDS` refusals being recorded, the next refused clone is killed at
+    /// once: no task, no record, so the work refusals put on the runtime that serves page
+    /// faults stays bounded however many clones are sent to a server at its cap.
+    #[tokio::test]
+    async fn a_refusal_past_the_record_bound_is_killed_at_once() {
+        let mut refusals = Refusals::new();
+        let _recording = Arc::clone(&refusals.records)
+            .try_acquire_many_owned(REFUSAL_RECORDS as u32)
+            .unwrap();
+        let victim = spawn_victim();
+        let peer = PeerVmm::from_pid(victim.id()).unwrap();
+        refusals.refuse(peer, "vm-over-bound".into(), "test: at the cap".into(), ());
+        assert!(
+            refusals.tasks.is_empty(),
+            "a refusal past the record bound was given a task to record on"
+        );
         assert_vmm_was_killed(victim).await;
     }
 

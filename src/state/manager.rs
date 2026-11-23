@@ -1153,9 +1153,22 @@ impl StateManager {
     /// The state the PID index names for `pid` whose process is still the one that wrote
     /// it, the lowest vm_id of them as the scan would pick. `None` when there is none.
     async fn indexed_state_of_pid(&self, pid: u32) -> Option<VmState> {
+        self.indexed_states_of_pid(pid)
+            .await
+            .into_iter()
+            .find(pid_identity_matches)
+    }
+
+    /// Every state the PID index names for `pid` that still says `pid`, in vm_id order,
+    /// whichever process wrote it. This reads the index directory and those states; no
+    /// other VM's state is opened. Empty when the index names none: a state written
+    /// without `save_state`, or one `save_state` could not enter, is not in it.
+    pub async fn indexed_states_of_pid(&self, pid: u32) -> Vec<VmState> {
         let prefix = format!("{pid}.");
-        let mut vm_ids: Vec<String> = std::fs::read_dir(self.state_dir.join(PID_INDEX_DIR))
-            .ok()?
+        let Ok(entries) = std::fs::read_dir(self.state_dir.join(PID_INDEX_DIR)) else {
+            return Vec::new();
+        };
+        let mut vm_ids: Vec<String> = entries
             .flatten()
             .filter_map(|entry| {
                 entry
@@ -1166,14 +1179,15 @@ impl StateManager {
             })
             .collect();
         vm_ids.sort();
+        let mut states = Vec::new();
         for vm_id in vm_ids {
             if let Ok(state) = self.load_state(&vm_id).await {
-                if state.pid == Some(pid) && pid_identity_matches(&state) {
-                    return Some(state);
+                if state.pid == Some(pid) {
+                    states.push(state);
                 }
             }
         }
-        None
+        states
     }
 
     /// List all VMs

@@ -55,7 +55,8 @@ archives = [
 # guest memory as holes. This build's snapshot load takes drive_overrides, so a clone opens its
 # own disks and needs no mount namespace; its --version says so (+fcvm.drive-overrides).
 # It also takes --numa-balancing-after-secs, which keeps new guest memory out of NUMA
-# balancing for that long (+fcvm.drive-overrides.numa-window; fcvm passes 60).
+# balancing for that long (+fcvm.drive-overrides.numa-window; fcvm passes 60). Guest memory
+# that maps a memfd (a clone of a --uffd-mode minor serve) is left as it is.
 # fcvm builds it for the gnu target, which has no seccomp policy of its own, so the
 # default policy is upstream's unimplemented.json: every syscall of the native
 # architecture allowed, the same program for the API, vCPU and VMM threads. This build
@@ -78,7 +79,7 @@ archives = [
 [firecracker]
 repo = "ejc3/firecracker"
 branch = "agent/uffd-minor-v1.17.0-seccomp-shared"
-commit = "3d58dfac3060c895e279cde7a7866f69121a3ccf"
+commit = "ab1aba6789d6e85c724edaa3e2c5ae04554b67dd"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

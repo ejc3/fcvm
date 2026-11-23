@@ -21,6 +21,13 @@ use crate::utils::{spawn_streaming, strip_firecracker_prefix};
 /// bandwidth loop for 10 min reached 700 GB/s once balancing had placed its memory, against a
 /// steady 434 GB/s without it, and 1000 idle clones cost 20% less CPU with it. So the
 /// exclusion covers a clone's start (a C=128 ramp to 1000 clones takes 20 to 35 s) and ends.
+///
+/// Firecracker binds anonymous guest memory and a private mapping of a snapshot's memory
+/// file. It leaves guest memory that maps a memfd as it is, which is what a clone of a
+/// `--uffd-mode minor` serve has: a shmem mapping keeps its policy in the file, where every
+/// clone of the serve reads it, so one clone's window would begin and end every clone's.
+/// Such a clone has no window and needs none, because the kernel does not scan a shmem
+/// mapping whose file has no policy (`vma_policy_mof`).
 pub const NUMA_BALANCING_AFTER_SECS: u64 = 60;
 
 use super::FirecrackerClient;
