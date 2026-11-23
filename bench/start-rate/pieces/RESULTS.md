@@ -86,13 +86,16 @@ each build (`bench-start-rate-prep`, `bench-start-rate-run COUNT=1000 CONCURRENC
 then 60 s of host busy CPU and `perf stat -a` from 30 s after the last clone was healthy. The
 main arm's fcvm carried the disk-extents-once change, which no idle clone runs.
 
-| arm | idle cores per 1000 clones | KVM exits /VM/s | exits to Firecracker /VM/s | context switches /VM/s |
-|---|---|---|---|---|
-| main | 26.78 | 1116 | 442 | 785 |
-| fc-agent fix | 9.30 | 183 | 26 | 307 |
-| main | 34.50 | 1362 | 436 | 775 |
-| fc-agent fix | 11.66 | 217 | 26 | 307 |
+Two pairs, run in this order. Host load over each 60 s window (`host.tsv`): `load1` still
+carries the clone starts that ended 30 s before the window, so the runnable count is the
+better guide.
 
+| pair | arm | idle cores per 1000 clones | KVM exits /VM/s | exits to Firecracker /VM/s | context switches /VM/s | load1 mean | runnable mean |
+|---|---|---|---|---|---|---|---|
+| 1 | main | 26.78 | 1116 | 442 | 785 | 34.4 | 26.4 |
+| 1 | fc-agent fix | 9.30 | 183 | 26 | 307 | 79.5 | 5.9 |
+| 2 | main | 34.50 | 1362 | 436 | 775 | 119.4 | 29.1 |
+| 2 | fc-agent fix | 11.66 | 217 | 26 | 307 | 129.6 | 5.8 |
 
 Every arm's 1000 clones were healthy; resume to agent-ready p50 was 868 and 949 ms on main,
 933 and 924 ms with the change, so restores still find the reset.

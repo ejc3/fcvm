@@ -118,7 +118,7 @@ pub fn reflink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let source = std::fs::File::open(src)?;
-    let mode = source.metadata()?.permissions().mode() & 0o7777;
+    let mode = source.metadata()?.permissions().mode() & 0o777;
     let target = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1480,6 +1480,16 @@ mod snapshot_dir_tests {
             Err(error) => {
                 let text = format!("{error:#}");
                 assert!(text.contains("Reflink copy failed"), "{text}");
+                // The refusal is the filesystem's, not some other failure.
+                let refused = reflink_file(&dir.path().join("base.raw"), &dir.path().join("probe"))
+                    .expect_err("this filesystem refused the clone above");
+                assert!(
+                    matches!(
+                        refused.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::EXDEV)
+                    ),
+                    "{refused}"
+                );
                 assert!(
                     !vm_dir.join("rootfs.raw").exists(),
                     "a failed clone left its file"
