@@ -195,15 +195,27 @@ def decide():
     smoke = max(covering, key=lambda s: s["end"])
     target = {"coordinator": {"commit": coordinator, "digest": candidate["stage"]["digest"]}, "web_commit": web,
               "generation": verified["generation"], "build_id": verified["build_id"], "smoke_run": smoke["run"]}
-    # With the prod lane on, the set carries staging's lane image: its selection, which a staging release that
-    # failed puts back, so it is the image staging runs.
+    # With the prod lane on, the set carries the lane image staging runs. What a stack runs comes from its
+    # release function (the running task's FLEET_LAMBDA_IMAGE); the lane repository's tags only protect images,
+    # and stay moved after a cancelled deploy or a hand selection. The candidate is read again here, after the
+    # in-progress and smoke checks above, so it describes the staging those checks saw.
     lane = publish.lane_setting("FLEET_LAMBDA_LANE_PROD")
+    prior_lane = None
     if lane:
+        now = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+        if now.get("status") != "ok":
+            raise RuntimeError("a release function refused to describe the releases")
+        if now["stage"]["digest"] != candidate["stage"]["digest"]:
+            raise Skip("staging's coordinator changed while the promotion was deciding")
+        staged = now["stage"].get("lambda_digest")
+        if not staged:
+            raise Skip("staging runs no lane image")
         lane_module, ecr = publish.lane_repository()
-        staged = ecr.tagged(lane_module.current("stage"))
-        if staged is None:
-            raise Skip("staging has selected no lane image")
-        target["lambda_digest"] = staged.digest
+        selection = ecr.tagged(lane_module.current("stage"))
+        if selection is None or selection.digest != staged:
+            raise Skip("staging's lane selection (keep-stage-current) is not the lane image it runs")
+        target["lambda_digest"] = staged
+        prior_lane = now["prod"].get("lambda_digest") or ""
 
     record = candidate.get("release")
     prod_receipt = status["prod"]
@@ -211,6 +223,9 @@ def decide():
         if record["coordinator"]["digest"] != candidate["prod"]["digest"] \
                 or {"generation": record["generation"], "build_id": record["build_id"]} != prod_receipt:
             raise Skip("prod changed outside a promotion: its release record does not describe it")
+        if lane and "lambda_digest" in record and record["lambda_digest"] != prior_lane:
+            raise Skip("prod changed outside a promotion: its record names another lane image than it runs")
+        # Passed back byte for byte: the record's compare-and-swap takes it as the record it replaces.
         prior = entry(record)
     else:
         commits = candidate["prod"]["commits"]
@@ -221,13 +236,11 @@ def decide():
                "coordinator": target["coordinator"]["digest"] != prior["coordinator"]["digest"],
                "web": prior["web_commit"] != web}
     if lane:
-        # Prod's lane image: as its record names it, or, before a record carries one, as prod runs it.
-        if not prior.get("lambda_digest"):
-            prior["lambda_digest"] = publish.lane_running(os.environ["COORDINATOR_RELEASE"])
-        changes["lane"] = target["lambda_digest"] != prior["lambda_digest"]
+        # Against what prod runs (empty before its first lane image), never a value written into `prior`.
+        changes["lane"] = target["lambda_digest"] != prior_lane
     if not any(changes.values()):
         raise Skip("prod already runs the staging set")
-    return target, prior, changes
+    return target, prior, changes, prior_lane
 
 
 def hold(image, deadline=None, clock=time.time, sleep=time.sleep):
@@ -315,14 +328,16 @@ def main(argv):
             output(run="true" if enabled() else "false")
         elif action == "decide":
             try:
-                target, prior, changes = decide()
+                target, prior, changes, prior_lane = decide()
             except Skip as skip:
                 notice(f"nothing promoted: {skip}")
                 output(promote="false")
                 return 0
             output(promote="true", target=target, prior=prior, image=str(changes["image"]).lower(),
                    coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower(),
-                   lane=str(changes.get("lane", False)).lower())
+                   lane=str(changes.get("lane", False)).lower(),
+                   # The lane image prod ran before (empty: none), for a rollback; set only with the prod lane on.
+                   **({"prior_lane": prior_lane} if prior_lane is not None else {}))
         elif action == "hold":
             if rest[:1] != ["--image"] or rest[1:] not in (["true"], ["false"]):
                 raise ValueError("hold --image true|false")

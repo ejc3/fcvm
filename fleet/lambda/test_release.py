@@ -421,6 +421,21 @@ class Selection(unittest.TestCase):
         self.assertTrue(self.protected(p))
         self.assertFalse(self.protected(s_))
 
+    def test_a_reset_to_a_stack_with_no_tags_moves_nothing(self):
+        # A stack's first selection: nothing to put back, and nothing here deletes a tag, so keep-<stack>-current
+        # stays on the image the failed release selected (fleet/PROTOCOL.md says so). It only protects that image;
+        # what the stack runs comes from its release function.
+        a = self.ecr.push("rev-a")
+        before = release.snapshot(self.ecr, "prod")
+        self.assertEqual(before, {"current": None, "previous": None, "next": None})
+        release.select(self.ecr, "prod", a, None)
+        writes = []
+        real_put = self.ecr.put
+        self.ecr.put = lambda tag, image: (writes.append(tag), real_put(tag, image))
+        release.reset(self.ecr, "prod", before)
+        self.assertEqual(writes, [])
+        self.assertEqual(release.tags(self.ecr, "prod")["keep-prod-current"], a)
+
     def test_a_build_pairs_with_a_commit_whose_lane_inputs_it_has(self):
         c0, c1, c2 = "0" * 40, "1" * 40, "2" * 40  # c0 <- c1 <- c2
         order = [c0, c1, c2]

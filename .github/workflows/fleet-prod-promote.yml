@@ -90,6 +90,7 @@ jobs:
       coordinator: ${{ steps.decide.outputs.coordinator }}
       web: ${{ steps.decide.outputs.web }}
       lane: ${{ steps.decide.outputs.lane }}
+      prior_lane: ${{ steps.decide.outputs.prior_lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -361,6 +362,8 @@ jobs:
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+          PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}
           LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
           set -euo pipefail
@@ -369,7 +372,10 @@ jobs:
             echo "::error::prod's previous coordinator image has no commit tag, so the release function cannot return to it"
             exit 1
           fi
-          lane=$(jq -r '.lambda_digest // empty' <<<"$PRIOR")
+          # Leaving a set with a lane image: return to the lane image prod ran before it (read from prod's task
+          # by decide), or, when it ran none, to none (the function removes FLEET_LAMBDA_IMAGE).
+          lane=
+          if [ -n "$(jq -r '.lambda_digest // empty' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi
           python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")" \
             ${lane:+--lambda-digest "$lane"}
       # Waits for prod to sleep: its templates change only then.

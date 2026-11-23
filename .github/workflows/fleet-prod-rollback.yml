@@ -76,15 +76,21 @@ jobs:
           [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm:rollback"
-      # The lane image the previous set ran, when its record names one, returns with the coordinator.
+      # The lane image the previous set ran returns with the coordinator (none when it ran none).
       - name: Coordinator
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          CURRENT: ${{ steps.current.outputs.current }}
           PREVIOUS: ${{ steps.current.outputs.previous }}
           LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
-          lane=$(jq -r '.lambda_digest // empty' <<<"$PREVIOUS")
+          # Leaving a set that names a lane image: return to the previous set's, or, when it names none, to none
+          # (the function removes FLEET_LAMBDA_IMAGE).
+          lane=
+          if [ -n "$(jq -r '.lambda_digest // empty' <<<"$CURRENT")" ]; then
+            lane=$(jq -r '.lambda_digest // "none"' <<<"$PREVIOUS")
+          fi
           python3 -B fleet/coord/publish.py --stack prod --force \
             --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")" \
             ${lane:+--lambda-digest "$lane"}

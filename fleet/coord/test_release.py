@@ -2326,7 +2326,7 @@ class ProdDecideTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_a_smoke_after_both_releases_and_the_verification_promotes_the_set(self):
-        target, prior, changes = prod.decide()
+        target, prior, changes, _ = prod.decide()
         self.assertEqual(target, {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
                                   "generation": 12, "build_id": "factory:new", "smoke_run": self.coordinator_run})
         self.assertEqual(changes, {"image": True, "coordinator": True, "web": True})
@@ -2391,50 +2391,88 @@ class ProdDecideTests(unittest.TestCase):
 
     STAGED, RUNNING = "sha256:" + "2" * 64, "sha256:" + "1" * 64
 
-    def lane_on(self):
-        """The prod lane on: staging's lane selection is STAGED, prod's lane function answers RUNNING."""
+    def lane_on(self, selection=None, stage_runs=None, prod_runs=None):
+        """The prod lane on. What each stack runs comes from the candidate (its running task's lane image);
+        staging's selection (keep-stage-current) is only checked against it."""
         lane = publish.lane_release()
-        staged = lane.Image(self.STAGED, "{}", lane.MEDIA_TYPES[0])
-        ecr = types.SimpleNamespace(tagged=lambda tag: staged if tag == "keep-stage-current" else None)
+        selected = lane.Image(selection or self.STAGED, "{}", lane.MEDIA_TYPES[0])
+        ecr = types.SimpleNamespace(tagged=lambda tag: selected if tag == "keep-stage-current" else None)
         for p in (patch.dict(os.environ, {"FLEET_LAMBDA_LANE_PROD": "on"}),
                   patch.object(prod.publish, "lane_repository", lambda: (lane, ecr))):
             p.start()
             self.addCleanup(p.stop)
-        real = prod.publish.invoke
-        def invoke(function, payload):
-            if payload == {"action": "lane"}:
-                self.calls.append(payload)
-                return {"status": "ok", "lambda_digest": self.RUNNING, "commits": ["a" * 40]}
-            return real(function, payload)
-        p = patch.object(prod.publish, "invoke", invoke)
-        p.start()
-        self.addCleanup(p.stop)
+        self.candidate["stage"]["lambda_digest"] = self.STAGED if stage_runs is None else stage_runs
+        self.candidate["prod"]["lambda_digest"] = self.RUNNING if prod_runs is None else prod_runs or None
 
-    def test_with_the_prod_lane_on_the_set_carries_stagings_lane_image(self):
+    def record(self, **extra):
+        return {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+                "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12, **self.RECEIPT, "smoke_run": 1,
+                **extra, "previous": None}
+
+    def test_with_the_prod_lane_on_the_set_carries_the_lane_image_staging_runs(self):
         self.lane_on()
-        target, prior, changes = prod.decide()
+        target, prior, changes, prior_lane = prod.decide()
         self.assertEqual(target["lambda_digest"], self.STAGED)
-        self.assertEqual(prior["lambda_digest"], self.RUNNING)
+        self.assertNotIn("lambda_digest", prior)
+        self.assertEqual(prior_lane, self.RUNNING)
         self.assertEqual(changes, {"image": True, "coordinator": True, "web": True, "lane": True})
+
+    def test_a_record_without_a_lane_image_is_passed_back_unchanged(self):
+        # The record's compare-and-swap takes prior as the record it replaces: it must be the stored entry, byte
+        # for byte, whatever prod runs.
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record()
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.assertEqual(prior_lane, self.RUNNING)
+
+    def test_before_prods_first_lane_image_nothing_says_null(self):
+        self.lane_on(prod_runs="")
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], self.STAGED)
+        self.assertNotIn(None, (target.get("lambda_digest"), prior_lane))
+        self.assertEqual(prior_lane, "")
+        self.assertNotIn("lambda_digest", prior)
+
+    def test_a_lane_selection_staging_does_not_run_is_not_promoted(self):
+        # The tags stay moved after a cancelled deploy, a hand selection or an unknown running image: the set is
+        # what staging runs, and a selection that differs from it is no set a smoke covered.
+        self.lane_on(selection="sha256:" + "9" * 64)
+        self.skips("not the lane image it runs")
+        self.setUp()
+        self.lane_on(stage_runs="")
+        self.skips("staging runs no lane image")
+
+    def test_prod_running_another_lane_image_than_its_record_names_is_outside_a_promotion(self):
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest="sha256:" + "8" * 64)
+        self.skips("its record names another lane image")
 
     def test_a_new_lane_image_alone_is_a_promotion(self):
         self.lane_on()
-        self.candidate["prod"] = {"digest": self.D, "commits": [self.C]}
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
         self.status["prod"] = dict(self.RECEIPT)
-        self.candidate["release"] = {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
-            "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12, **self.RECEIPT, "smoke_run": 1,
-            "lambda_digest": self.RUNNING, "previous": None}
-        target, prior, changes = prod.decide()
+        self.candidate["release"] = self.record(lambda_digest=self.RUNNING)
+        target, prior, changes, prior_lane = prod.decide()
         self.assertEqual(changes, {"image": False, "coordinator": False, "web": False, "lane": True})
-        self.assertEqual(prior["lambda_digest"], self.RUNNING)
-        self.candidate["release"]["lambda_digest"] = self.STAGED
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.setUp()
+        self.lane_on(prod_runs=self.STAGED)
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest=self.STAGED)
         self.skips("already runs")
 
     def test_with_the_prod_lane_off_the_set_is_todays(self):
-        target, prior, changes = prod.decide()
+        target, prior, changes, prior_lane = prod.decide()
         self.assertNotIn("lambda_digest", target)
         self.assertNotIn("lambda_digest", prior)
         self.assertEqual(set(changes), {"image", "coordinator", "web"})
+        self.assertIsNone(prior_lane)
 
     def test_prod_already_running_the_set_promotes_nothing(self):
         self.candidate["prod"] = {"digest": self.D, "commits": [self.C]}
@@ -2627,6 +2665,13 @@ class ProdLaneTests(unittest.TestCase):
                 self.assertEqual(got, code)
                 self.assertEqual(events[-1], ("restore", "prod", self.BEFORE))
 
+    def test_a_rollback_to_a_set_without_a_lane_image_removes_it(self):
+        # The set returned to ran no lane image: the function removes FLEET_LAMBDA_IMAGE; no tag moves.
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST, "lambda_digest": None}],
+                                     extra=["--force", "--lambda-digest", "none"])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST, "force": True, "lambda_digest": None})])
+
     def test_a_malformed_lane_digest_is_refused_before_anything(self):
         code, events = self.run_prod([], extra=["--force", "--lambda-digest", "latest"])
         self.assertEqual((code, events), (1, []))
@@ -2666,16 +2711,22 @@ class ProdLaneWorkflowTests(unittest.TestCase):
         self.assertIn("(needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true')", coordinator)
         self.assertIn("lane=$(jq -r '.lambda_digest // empty' <<<\"$TARGET\")", coordinator)
         self.assertIn(self.FLAG, coordinator)
+        self.assertIn("      prior_lane: ${{ steps.decide.outputs.prior_lane }}\n", candidate)
         rollback = promote.split("\n  rollback:\n", 1)[1]
         coordinator, _ = self.step(rollback, "Coordinator")
         self.assertIn("needs.candidate.outputs.lane == 'true'", coordinator)
-        self.assertIn("lane=$(jq -r '.lambda_digest // empty' <<<\"$PRIOR\")", coordinator)
+        # Leaving a set with a lane image: return to the one prod ran before (from its task), or to none.
+        self.assertIn("PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}", coordinator)
+        self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
         self.assertIn(self.FLAG, coordinator)
 
     def test_a_manual_rollback_returns_the_lane_image_the_previous_set_ran(self):
         rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
         coordinator, _ = self.step(rollback, "Coordinator")
-        self.assertIn("lane=$(jq -r '.lambda_digest // empty' <<<\"$PREVIOUS\")", coordinator)
+        # Leaving a set that names a lane image: return to the previous set's, or to none.
+        self.assertIn("CURRENT: ${{ steps.current.outputs.current }}", coordinator)
+        self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$CURRENT")" ]; then', coordinator)
+        self.assertIn("lane=$(jq -r '.lambda_digest // \"none\"' <<<\"$PREVIOUS\")", coordinator)
         self.assertIn(self.FLAG, coordinator)
         self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", coordinator)
 

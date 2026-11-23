@@ -295,18 +295,23 @@ def main_prod(commit, digest, force, lambda_digest=None):
     FLEET_LAMBDA_LANE_PROD on), also select that lane image for prod and release it with the coordinator."""
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("a full commit and image digest are required")
-    if lambda_digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", lambda_digest):
-        raise ValueError("--lambda-digest is an image digest")
+    if lambda_digest is not None and lambda_digest != "none" and not re.fullmatch(r"sha256:[0-9a-f]{64}", lambda_digest):
+        raise ValueError("--lambda-digest is an image digest, or none")
     if os.environ["COORDINATOR_RELEASE"] != FUNCTIONS["prod"]:
         raise ValueError("unexpected release function")
     payload = {"commit": commit, "digest": digest, **({"force": True} if force else {})}
     if lambda_digest is None:
         status = release(FUNCTIONS["prod"], payload, digest, "prod")
+    elif lambda_digest == "none":
+        # A rollback to a set that ran no lane image: the function removes FLEET_LAMBDA_IMAGE. No tag moves (tags
+        # only protect images; nothing runs one now).
+        payload["lambda_digest"] = None
+        status = release(FUNCTIONS["prod"], payload, digest, "prod")
     else:
         selected, before = select_prod_lane(lane_running(FUNCTIONS["prod"]), lambda_digest)
         status = release_with_lane(FUNCTIONS["prod"], payload, digest, "prod", "prod", selected, before)
     print(json.dumps({"status": status, "commit": commit, "digest": digest, "force": force,
-                      **({"lambda_digest": lambda_digest} if lambda_digest else {})}))
+                      **({"lambda_digest": payload.get("lambda_digest")} if lambda_digest else {})}))
 
 
 def arguments(argv=None):
@@ -316,7 +321,8 @@ def arguments(argv=None):
     parser.add_argument("--commit")
     parser.add_argument("--digest")
     parser.add_argument("--force", action="store_true", help="prod rollback: skip the viewer hold")
-    parser.add_argument("--lambda-digest", help="prod: the lane image of the set prod takes or returns to")
+    parser.add_argument("--lambda-digest", help="prod: the lane image of the set prod takes or returns to, or none "
+                        "to return to running no lane image")
     args = parser.parse_args(argv)
     if args.stack == "stage" and (args.commit or args.digest or args.force or args.lambda_digest):
         parser.error("staging publishes GITHUB_SHA's image; --commit, --digest, --force and --lambda-digest are for prod")
