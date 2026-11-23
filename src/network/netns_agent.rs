@@ -153,9 +153,9 @@ pub struct Shape {
 /// Build `shape` in the calling process's network namespace, which must hold nothing but
 /// its loopback. The first step that fails is the error, named as the step.
 ///
-/// One netlink request per link, each one `rtnl_mutex` hold: the bridge with its MAC, each
-/// TAP with its MTU, its place on the bridge and its up flag, then the bridge's MTU and up
-/// flag, then the address. Nothing under /proc/sys is opened: a lookup there walks an entry
+/// One netlink request per step, each one `rtnl_mutex` hold: the bridge with its MAC, its
+/// MTU and address generation mode while it is down, each TAP with its MTU, its place on the
+/// bridge and its up flag, then the bridge's up flag, then the address. Nothing under /proc/sys is opened: a lookup there walks an entry
 /// for every other network namespace under one global lock. Nothing in the namespace
 /// forwards at L3 (the TAPs are bridged, and pasta reaches the guest from inside the
 /// namespace), so `ip_forward` stays as it is.
@@ -174,7 +174,27 @@ pub fn build(shape: &Shape) -> Result<()> {
     rtnl.add_bridge(bridge, shape.bridge_mac)
         .with_context(|| format!("creating bridge {bridge}"))?;
     let bridge_index = index(bridge)?;
+    // The bridge's IPv6 address generation goes off in a request of its own, while the
+    // bridge is down. In one request with the up flag the kernel brings the link up first,
+    // and a bridge that has a carrier at that moment gets a link-local address before the
+    // mode is applied. It can have one: a TAP that was just detached still reads as
+    // operational until the kernel's link watch worker has run, so the bridge counts it as a
+    // live port. The address then runs duplicate detection out of the VMM's TAP.
+    //
+    // The MTU is explicit, though the bridge would take its ports' smallest: a bridge whose
+    // MTU was set no longer follows its ports, so this is the value whatever joins it later.
+    let bridge_quiet = LinkChange {
+        mtu: shape.mtu,
+        master: None,
+        up: false,
+        no_ipv6_link_local: true,
+    };
+    rtnl.set_link(bridge_index, &bridge_quiet)
+        .with_context(|| format!("configuring bridge {bridge}"))?;
     // pasta's TAP first, then the VMM's, as the ports were added when pasta made its own.
+    // A TAP takes its mode in the request that brings it up: nothing is attached to it, so
+    // it has no carrier and no queueing discipline yet, and the kernel generates no address
+    // for such a link.
     for tap in shape.pasta_tap.iter().chain(std::iter::once(&shape.tap)) {
         add_tap(tap).with_context(|| format!("creating TAP device {tap}"))?;
         let port = LinkChange {
@@ -186,15 +206,7 @@ pub fn build(shape: &Shape) -> Result<()> {
         rtnl.set_link(index(tap)?, &port)
             .with_context(|| format!("putting {tap} on bridge {bridge}"))?;
     }
-    // The MTU is explicit, though the bridge would take its ports' smallest: a bridge whose
-    // MTU was set no longer follows its ports, so this is the value whatever joins it later.
-    let bridge_up = LinkChange {
-        mtu: shape.mtu,
-        master: None,
-        up: true,
-        no_ipv6_link_local: true,
-    };
-    rtnl.set_link(bridge_index, &bridge_up)
+    rtnl.set_link(bridge_index, &up)
         .with_context(|| format!("bringing bridge {bridge} up"))?;
     rtnl.add_address(bridge_index, shape.bridge_address, shape.bridge_prefix)
         .with_context(|| {
@@ -522,6 +534,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bridge's address generation is turned off before the bridge is brought up, in a
+    /// request of its own. Turned off in the request that brings it up, the bridge got a
+    /// link-local address whenever it had a carrier at that moment, which depends on whether
+    /// the kernel's link watch worker has run since the TAPs were detached: one build in a
+    /// few (`the_holder_builds_the_links_a_rootless_vm_needs` reads the result).
+    #[test]
+    fn the_bridge_stops_generating_addresses_before_it_comes_up() {
+        let source = include_str!("netns_agent.rs");
+        let body = &source[source.find("pub fn build(shape: &Shape)").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let quiet = body
+            .find("let bridge_quiet = LinkChange {")
+            .expect("no quiet request");
+        let request = &body[quiet..quiet + body[quiet..].find("};").unwrap()];
+        assert!(request.contains("up: false"), "{request}");
+        assert!(request.contains("no_ipv6_link_local: true"), "{request}");
+        let sent = body
+            .find("rtnl.set_link(bridge_index, &bridge_quiet)")
+            .unwrap();
+        let ports = body.find("add_tap(tap)").unwrap();
+        let up = body.find("rtnl.set_link(bridge_index, &up)").unwrap();
+        assert!(
+            sent < ports && ports < up,
+            "the bridge's requests are out of order"
+        );
+        assert_eq!(
+            body.matches("rtnl.set_link(bridge_index").count(),
+            2,
+            "another request to the bridge"
+        );
     }
 
     /// The serve loop on a thread, in this process's own namespaces: the protocol without
