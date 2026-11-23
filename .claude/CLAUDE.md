@@ -1843,14 +1843,13 @@ continue. Do not silently begin another repair and review cycle.
 
 When a user-controlled remote is authorized, push each signed, focused-green frozen
 checkpoint before beginning the next pass. A remote checkpoint is recovery and visibility;
-it is not merge authorization and its old checks do not cover later local commits.
+its old checks do not cover later local commits.
 
 **Land the smallest correct PR, then continue on the next stacked PR.** The architecture
 pass must partition the work into a sequence of independently useful, mergeable contracts.
 Once one PR satisfies its stated contract, focused and full tests, CI, and exact-head review,
-report it ready. Merge it only when the user has separately authorized that merge. Push or
-checkpoint authority is not merge authority. Do not hold a ready PR open to add adjacent
-features, speculative hardening, or cleanup that can be expressed safely in a follow-up.
+merge it; the maintainer does not need to be asked first. Do not hold a ready PR open to add
+adjacent features, speculative hardening, or cleanup that can be expressed safely in a follow-up.
 
 Every review finding must be classified before work starts:
 
@@ -2702,10 +2701,20 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
   disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
   owner, so it would get a disk it cannot write or remove). A disk of at most 4096 extents (`REFLINK_MAX_EXTENTS`,
-  counted with FIEMAP) is reflinked as well: the subvolume snapshot's commit, and the parent directory lock it holds
-  through the commit, took 193 ms p50 and 1.8 s p99 with four restores and four snapshots at once on a fleet host,
-  against 17 ms and 192 ms for a reflink of a 684-extent disk. `rm -rf` removes subvolumes, so teardown is unchanged, but
-  btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
+  counted with FIEMAP) is reflinked while one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`: `flock`ed
+  `reflink-slot-N.lock` files beside `disk/`, taken without waiting and freed by the kernel when the clone's process
+  exits) is free, and takes the subvolume snapshot when all 8 are held. Both costs are measured: the subvolume
+  snapshot's commit, and the parent directory lock it holds through the commit, took 193 ms p50 and 1.8 s p99 with
+  four restores and four snapshots at once on a fleet host, against 17 ms and 192 ms for a reflink of a 684-extent
+  disk; but every clone of a snapshot reflinks the same source file and btrfs holds that inode's lock for the whole
+  reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
+  at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
+  relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
+  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
+  against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
+  subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
+  subvolumes, so teardown is unchanged, but btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its
   parent's directory, keeping only the parent's `memory.bin`, which the diff is then written into

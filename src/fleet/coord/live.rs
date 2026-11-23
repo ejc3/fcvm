@@ -1,4 +1,4 @@
-//! The browser side: `GET /live` (WebSocket), `GET /poster.jpg` and `GET /healthz`.
+//! The browser side: `GET /live` (WebSocket), `GET /poster.jpg`, `GET /healthz` and `GET /version`.
 //!
 //! Each socket has a reader (intents, pings, verification) and a writer. The writer sends
 //! the viewer's id, the current snapshot on connect and the latest one whenever the
@@ -178,6 +178,9 @@ pub struct LiveConfig {
     pub access: Option<Arc<super::access_jwt::AccessCheck>>,
     /// The check on the host a dialed agent's hello names; `None` admits any.
     pub agent_identity: Option<Arc<dyn super::agents::AgentIdentity>>,
+    /// The commit this coordinator was built from (`FLEET_COMMIT`, set in its image), which
+    /// `GET /version` reports so a smoke can say which commit it tested.
+    pub commit: Option<String>,
 }
 
 #[derive(Clone)]
@@ -198,6 +201,7 @@ pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
         .route("/agent", get(agent_socket))
         .route("/poster.jpg", get(poster))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/version", get(version))
         .with_state(App {
             handle,
             cfg: Arc::new(cfg),
@@ -217,6 +221,11 @@ pub async fn serve(
     )
     .await?;
     Ok(())
+}
+
+/// `{"commit": "<40 hex>"}`, or `null` for a coordinator built without one.
+async fn version(State(app): State<App>) -> Response {
+    axum::Json(serde_json::json!({ "commit": app.cfg.commit })).into_response()
 }
 
 /// The latest converged still of the whole image. Cached briefly: it changes at most once

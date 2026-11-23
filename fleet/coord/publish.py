@@ -98,12 +98,12 @@ def lane_release():
     return module
 
 
-def lane_setting():
-    """FLEET_LAMBDA_LANE: "on" releases the staging coordinator with the lane image staging selects; unset, empty
-    or "off" releases exactly as without a lane."""
-    value = os.environ.get("FLEET_LAMBDA_LANE", "")
+def lane_setting(name="FLEET_LAMBDA_LANE"):
+    """FLEET_LAMBDA_LANE (staging's release) or FLEET_LAMBDA_LANE_PROD (prod's promotion decision): "on" carries
+    the stack's lane image; unset, empty or "off" releases exactly as without a lane."""
+    value = os.environ.get(name, "")
     if value not in ("", "off", "on"):
-        raise ValueError("FLEET_LAMBDA_LANE is on, off or unset")
+        raise ValueError(f"{name} is on, off or unset")
     return value == "on"
 
 
@@ -127,21 +127,75 @@ def select_lane(stack, running, commit):
     return new, before
 
 
+def select_prod_lane(running, digest):
+    """Select `digest` for prod (the lane image of the set prod takes, or of the set it returns to), keeping
+    `running` as prod's previous. Returns it and prod's tags before the selection."""
+    lane, ecr = lane_repository()
+    before = lane.snapshot(ecr, "prod")
+    lane.select(ecr, "prod", digest, running)
+    return digest, before
+
+
 def restore_lane(stack, before):
     lane, ecr = lane_repository()
     lane.reset(ecr, stack, before)
 
 
-def lane_running(function):
-    """The lane image digest the stack's coordinator runs (None before its first lane release), from the
-    release function, which reads it from the stack's lane pointer."""
+def lane_state(function):
+    """What the stack's coordinator runs, from the release function's read-only `lane` action: the lane image
+    digest (None before its first lane release) and the commit tags of its coordinator image."""
     result = invoke(function, {"action": "lane"})
-    running = result.get("lambda_digest", "")
-    if result.get("status") != "ok" or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running)):
+    running, commits = result.get("lambda_digest", ""), result.get("commits")
+    if (result.get("status") != "ok"
+            or not (running is None or isinstance(running, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", running))
+            or not isinstance(commits, list) or not commits
+            or not all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}", c) for c in commits)):
+        # No commit for the running image (it carries no commit tag): the release cannot be ordered.
         if attribution(result):
             print(json.dumps({"lane": attribution(result)}), flush=True)
-        raise RuntimeError("the release function did not report the running lane image")
-    return running
+        raise RuntimeError("the release function did not report what the coordinator runs")
+    return running, commits
+
+
+def lane_running(function):
+    return lane_state(function)[0]
+
+
+def commit_is_ancestor(older, newer):
+    """Whether `older` is an ancestor of `newer`, a commit staging runs. `newer` must be on main: one this
+    checkout's main lacks (a main commit pushed after the checkout) is fetched first, and one main does not
+    contain after that (another branch's, which a full-history checkout can hold) stops the release."""
+    def on_main(commit):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", commit, "origin/main"],
+                              capture_output=True).returncode == 0
+    if not on_main(newer):
+        if subprocess.run(["git", "fetch", "--quiet", "origin", "main"], capture_output=True).returncode:
+            raise RuntimeError(f"could not fetch main to order this release after {newer}, which staging runs")
+        if not on_main(newer):
+            raise RuntimeError(f"staging runs {newer}, which main does not contain: the release cannot be ordered")
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"git merge-base failed ({result.returncode})")
+    return result.returncode == 0
+
+
+def release_with_lane(function, payload, digest, name, stack, selected, before):
+    """Release with payload["lambda_digest"] = `selected`, the stack's tags having been moved from `before`. A
+    release that fails leaves the coordinator on its old lane image, and the selection must say so (a promotion
+    takes staging's selection; a rollback, prod's record). A call that ended without a result may still have
+    released, so ask what runs; when nothing answers, leave the tags and raise the release's own error."""
+    payload["lambda_digest"] = selected
+    try:
+        return release(function, payload, digest, name)
+    except Exception as failure:
+        try:
+            now = lane_running(function)
+        except Exception:
+            print(json.dumps({"lane": "selection left: the running lane image is unknown"}), flush=True)
+            raise failure from None
+        if now != selected:
+            restore_lane(stack, before)
+        raise
 
 
 def release(function, payload, digest, name):
@@ -158,7 +212,8 @@ def release(function, payload, digest, name):
             print(json.dumps({"status": "held", "reason": reason}), flush=True)
             raise Held("the release was held")
         if status not in ("deployed", "unchanged") or result.get("digest") != digest \
-                or "lambda_digest" in payload and result.get("lambda_digest") != payload["lambda_digest"]:
+                or "lambda_digest" in payload and ("lambda_digest" not in result
+                                                   or result["lambda_digest"] != payload["lambda_digest"]):
             if attribution(result):
                 print(json.dumps({"release": attribution(result)}), flush=True)
             raise RuntimeError(f"{name} release did not complete")
@@ -200,47 +255,78 @@ def main():
     if not lane:
         status = release(function, payload, digest, "staging")
     else:
+        # Releases are ordered here, under the deploy job's fleet-viewer-smoke group (one release at a time):
+        # a commit that is a strict ancestor of one staging runs is not released over it.
+        running, commits = lane_state(function)
+        if any(c != commit and commit_is_ancestor(commit, c) for c in commits):
+            # The order step skips such a release before this step runs; finding it here means staging moved
+            # in between. Fail rather than conclude success for a release this run did not make.
+            raise RuntimeError(f"staging runs a descendant of {commit}: this release was not made")
         # The function refuses a lane digest that keep-stage-current does not hold, so the selection
         # comes first; the running digest stays protected as keep-stage-previous.
-        payload["lambda_digest"], before = select_lane("stage", lane_running(function), commit)
-        try:
-            status = release(function, payload, digest, "staging")
-        except Exception as failure:
-            # A release that failed leaves the coordinator on its old lane image, and the selection must say
-            # so (a promotion takes staging's selection). A call that ended without a result may still have
-            # released, so ask what runs; when nothing answers, leave the tags and report the release error.
-            try:
-                now = lane_running(function)
-            except Exception:
-                print(json.dumps({"lane": "selection left: the running lane image is unknown"}), flush=True)
-                raise failure from None
-            if now != payload["lambda_digest"]:
-                restore_lane("stage", before)
-            raise
+        selected, before = select_lane("stage", running, commit)
+        status = release_with_lane(function, payload, digest, "staging", "stage", selected, before)
     print(json.dumps({"status": status, "commit": commit, "digest": digest,
                       **({"lambda_digest": payload["lambda_digest"]} if lane else {})}))
 
 
-def main_prod(commit, digest, force):
-    """Release an image staging already published to prod; nothing is pushed (the prod role cannot)."""
+def order():
+    """The deploy workflow's order step, before any release call: whether this run's release is skipped
+    because staging runs a descendant of its commit (invariant 1). Writes skip=true|false to $GITHUB_OUTPUT;
+    the release step runs only on skip=false, so a skipped run's release step concludes "skipped", which
+    prod's release discovery (prod_release.released) ignores. Lane off: skip=false, nothing asked."""
+    commit = os.environ["GITHUB_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("a full commit is required")
+    skip = False
+    if lane_setting():
+        if os.environ["COORDINATOR_RELEASE"] != FUNCTIONS["stage"]:
+            raise ValueError("unexpected release function")
+        _, commits = lane_state(os.environ["COORDINATOR_RELEASE"])
+        skip = any(c != commit and commit_is_ancestor(commit, c) for c in commits)
+    print(json.dumps({"order": "skip" if skip else "release", "commit": commit,
+                      **({"reason": "staging-runs-a-descendant"} if skip else {})}))
+    with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+        out.write(f"skip={'true' if skip else 'false'}\n")
+
+
+def main_prod(commit, digest, force, lambda_digest=None):
+    """Release an image staging already published to prod; nothing is pushed (the prod role cannot). With
+    `lambda_digest` (the workflows pass it when the prod set carries one: prod_release.py decide, with
+    FLEET_LAMBDA_LANE_PROD on), also select that lane image for prod and release it with the coordinator."""
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("a full commit and image digest are required")
+    if lambda_digest is not None and lambda_digest != "none" and not re.fullmatch(r"sha256:[0-9a-f]{64}", lambda_digest):
+        raise ValueError("--lambda-digest is an image digest, or none")
     if os.environ["COORDINATOR_RELEASE"] != FUNCTIONS["prod"]:
         raise ValueError("unexpected release function")
     payload = {"commit": commit, "digest": digest, **({"force": True} if force else {})}
-    status = release(FUNCTIONS["prod"], payload, digest, "prod")
-    print(json.dumps({"status": status, "commit": commit, "digest": digest, "force": force}))
+    if lambda_digest is None:
+        status = release(FUNCTIONS["prod"], payload, digest, "prod")
+    elif lambda_digest == "none":
+        # A rollback to a set that ran no lane image: the function removes FLEET_LAMBDA_IMAGE. No tag moves (tags
+        # only protect images; nothing runs one now).
+        payload["lambda_digest"] = None
+        status = release(FUNCTIONS["prod"], payload, digest, "prod")
+    else:
+        selected, before = select_prod_lane(lane_running(FUNCTIONS["prod"]), lambda_digest)
+        status = release_with_lane(FUNCTIONS["prod"], payload, digest, "prod", "prod", selected, before)
+    print(json.dumps({"status": status, "commit": commit, "digest": digest, "force": force,
+                      **({"lambda_digest": payload.get("lambda_digest")} if lambda_digest else {})}))
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description="Publish and release a coordinator image (module docstring).")
     parser.add_argument("--stack", choices=sorted(FUNCTIONS), default="stage")
+    parser.add_argument("--order", action="store_true", help="staging: only decide whether to skip the release")
     parser.add_argument("--commit")
     parser.add_argument("--digest")
     parser.add_argument("--force", action="store_true", help="prod rollback: skip the viewer hold")
+    parser.add_argument("--lambda-digest", help="prod: the lane image of the set prod takes or returns to, or none "
+                        "to return to running no lane image")
     args = parser.parse_args(argv)
-    if args.stack == "stage" and (args.commit or args.digest or args.force):
-        parser.error("staging publishes GITHUB_SHA's image; --commit, --digest and --force are for prod")
+    if args.stack == "stage" and (args.commit or args.digest or args.force or args.lambda_digest):
+        parser.error("staging publishes GITHUB_SHA's image; --commit, --digest, --force and --lambda-digest are for prod")
     if args.stack == "prod" and not (args.commit and args.digest):
         parser.error("prod releases an image staging published: give --commit and --digest")
     return args
@@ -249,8 +335,12 @@ def arguments(argv=None):
 def run(argv=None):
     args = arguments(argv)
     try:
-        if args.stack == "prod":
-            main_prod(args.commit, args.digest, args.force)
+        if args.order:
+            if args.stack != "stage":
+                raise ValueError("--order is for the staging release")
+            order()
+        elif args.stack == "prod":
+            main_prod(args.commit, args.digest, args.force, args.lambda_digest)
         else:
             main()
     except Held:

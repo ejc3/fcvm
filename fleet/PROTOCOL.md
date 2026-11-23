@@ -2182,24 +2182,75 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current` does not
   hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks
   again what runs and, unless the new lane image does, puts the stage's tags back as they were
-  before the selection. Unset or `off`, the release is the one without a lane. Prod's promote and
-  rollback do not carry a lane digest yet.
+  before the selection. Unset or `off`, the release is the one without a lane.
+- **Prod.** With the repository variable `FLEET_LAMBDA_LANE_PROD` on, the set prod takes
+  (`prod_release.py decide`) carries the lane image staging runs as `lambda_digest`. What a stack
+  runs comes from its release function: the prod function's `candidate` action names the lane
+  image each running coordinator task names (`FLEET_LAMBDA_IMAGE`). The lane repository's tags only
+  protect images: decide reads staging's running lane image after its other checks and refuses
+  unless `keep-stage-current` holds it. A new lane image alone is a promotion. The release record
+  is passed back to the record's compare-and-swap byte for byte, and decide refuses when the record
+  names another lane image than prod runs. The promotion passes the set's lane image to
+  `publish.py --stack prod --lambda-digest`, which selects it for prod (keeping the lane image prod
+  runs as previous), releases it with the coordinator, and puts prod's tags back if the release
+  fails or is held. Leaving a set that carries a lane image, a failed promotion's rollback returns
+  to the lane image prod ran before it, or, when it ran none, passes `--lambda-digest none`, and
+  the function removes `FLEET_LAMBDA_IMAGE`. A record entry without `lambda_digest` names no lane
+  image. Off, prod's sets carry no lane image and its releases are the ones without a lane.
+- **Manual rollback.** `fleet-prod-rollback.yml` takes its lane flag from both recorded entries:
+  the previous set's lane image when it names one, else `none` when the current set names one,
+  else no flag, which is today's release. When either entry names a lane image, its first step
+  (`prod_release.py current`) refuses, before any release, when the function could not read the
+  lane image prod runs (`lane_error`), or when prod runs another lane image than the current entry
+  names and is not already on the previous entry's coordinator and lane image (a rollback whose
+  Coordinator step applied and whose later step failed: a rerun finishes it). With neither entry
+  naming one it reads no lane image, as before, and the flagless release leaves
+  `FLEET_LAMBDA_IMAGE` alone: a lane image prod runs that neither entry names (the unsupported
+  switch-off below) stays on the task beside the previous coordinator, and stays unrecorded. The record job writes the restored set with the
+  rolled-back one as its previous, so a second rollback returns to the set the first one left.
+  When the previous entry's lane image is no longer in the lane repository, the Coordinator step
+  fails before any tag moves or any release, but the Worker step has already run and the host and
+  tile image step still runs: the fleet ends on the previous Worker and images with the current
+  coordinator and lane image, the record unchanged, and every rerun fails at the same point.
+  Recover by hand: `publish.py --stack prod --force --commit C --digest D --lambda-digest none`
+  (or a lane image the repository holds) with the previous entry's coordinator, then
+  `prod_release.py record` with that entry, its `lambda_digest` set to what was passed (removed
+  for `none`).
+- **Not supported:** turning `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image. A lane-off
+  promotion writes an entry without `lambda_digest` while the running task keeps its lane image.
+  Return prod to `none` first.
+- **A stack's first selection is not put back.** `release.py reset` restores the tags a
+  selection moved, but a stack's first selection moved tags that did not exist, and nothing here
+  deletes a tag: after a failed or held first release, `keep-<stack>-current` stays on the image
+  it selected. It only protects that image; what the stack runs comes from its release function,
+  and the next selection moves the tag again.
 - **Pairing.** With the lane on, a coordinator deploy carries the lane build paired with its
   commit: the `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line
   (an ancestor or a descendant) with no path of the lane workflow changed in between
   (`release.py paired_build`). When `keep-built` holds an earlier build, or none, the release
   waits up to 25 minutes for this commit's lane build; when it holds a later build with other lane
   inputs, or an image with no `rev-<commit>` tag, it refuses at once. Either refusal changes
-  nothing. A push that changes only lane inputs starts no coordinator deploy: it reaches staging
-  with the next coordinator deploy, or a manual `workflow_dispatch` of
-  `fleet-coordinator-deploy.yml`.
-- **A deploy can be stranded.** Push A changes the coordinator and a lane input; push B, landing
-  while A's deploy waits, changes only lane inputs. B's lane build moves `keep-built` past A, so
-  A's deploy is refused, B starts no deploy, and a rerun of A's run is refused again: staging stays
-  on the coordinator before A. The refusal says so. Recovery: run `fleet-coordinator-deploy.yml`
-  by `workflow_dispatch` at main's head. Do not turn `FLEET_LAMBDA_LANE` on before the stacked
-  release-ordering PR lands; with releases ordered at the point of release, a lane build starts
-  the staging release itself and this case goes away.
+  nothing.
+- **Ordering.** With the lane on, a lane build main publishes starts a staging release at main's
+  head (`workflow_run` in `fleet-coordinator-deploy.yml`), so a push that changes only lane inputs
+  reaches staging. Four rules hold:
+  1. No release of an ancestor over a descendant: under the deploy job's `fleet-viewer-smoke`
+     group, before any release call, the order step (`publish.py --order`) asks the release
+     function which commits the running coordinator image carries, and skips the release step when
+     the run's commit is a strict ancestor of one (`staging-runs-a-descendant`). The skipped release
+     step concludes `skipped`, so prod's release discovery does not take that run for what staging
+     runs. A running commit main does not contain, after a fetch of main (a commit of another branch
+     can be in the full-history checkout), stops the release; an answer with no commit does too.
+  2. A no-op run cannot cancel or displace a real one: a lane-started run has a concurrency group of
+     its own, one per lane run, and a push's deploys keep `fleet-coordinator-stage`.
+  3. At most one release at a time: every release runs in the deploy job, which holds
+     `fleet-viewer-smoke` with `queue: max`.
+  4. A smoke says which commit it tested: the coordinator reports its image's commit at
+     `GET /version` (baked in at build, `FLEET_COMMIT`), and the smoke prints it beside its run's
+     commit (`tested_commit`, `run_commit`, `same`).
+
+  A deploy refused because `keep-built` holds a newer lane build is recovered by that build's own
+  lane-started release; the refusal also names a `workflow_dispatch` at main's head.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of

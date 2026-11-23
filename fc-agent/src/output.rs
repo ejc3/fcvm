@@ -476,25 +476,128 @@ mod tests {
         assert_eq!(lost, Lost::PeerClosed);
     }
 
-    /// Every way the idle wait loses the connection drops the stream and goes round, so
-    /// the top of the loop clears `armed` (the invariant on `ResetWatch`).
-    #[test]
-    fn a_lost_idle_connection_drops_the_stream_whichever_way_it_was_lost() {
-        let source = include_str!("output.rs");
-        let writer = &source[source.find("async fn output_writer(").unwrap()..];
+    /// What is wrong with the idle-loss arm of `output_writer` in `source`, if anything.
+    ///
+    /// The arm must reach its one arm-level `stream = None; continue;` whichever way the
+    /// connection was lost, so no outcome of `match lost` may leave the arm on its own, and
+    /// the top of the loop must then publish `armed` from the stream. Only the code ahead of
+    /// the test module is read: the needles below are in this module's own text.
+    fn idle_loss_arm_violations(source: &str) -> Vec<String> {
+        let code = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("output.rs has a test module")];
+        let writer = &code[code
+            .find("async fn output_writer(")
+            .expect("output_writer is in output.rs")..];
+        let mut violations = Vec::new();
+
+        // The first statement of the writer's loop publishes whether a stream is held.
+        let body = &writer[writer.find("\n    loop {\n").expect("the writer's loop") + 12..];
+        let first = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"));
+        if first != Some("publish_armed(&armed_tx, stream.is_some());") {
+            violations.push(format!(
+                "the top of the writer's loop does not publish `armed` first: {first:?}"
+            ));
+        }
+
         let arm = &writer[writer
             .find("lost = connection_lost(s) => {")
             .expect("the idle wait")..];
-        let arm = &arm[..arm.find("            };\n").unwrap()];
-        let outcome = arm.find("match lost {").unwrap();
-        let dropped = arm
-            .rfind("stream = None;\n                    continue;")
-            .unwrap();
-        assert!(
-            outcome < dropped,
-            "the stream is dropped inside one outcome only"
-        );
-        assert!(writer.contains("publish_armed(&armed_tx, stream.is_some());"));
+        let arm = &arm[..arm.find("            };\n").expect("the idle select ends")];
+        let outcome = arm
+            .find("match lost {")
+            .expect("the arm matches on how it was lost");
+        let Some(dropped) =
+            arm.rfind("\n                    stream = None;\n                    continue;\n")
+        else {
+            violations.push("the arm has no arm-level `stream = None; continue;`".to_string());
+            return violations;
+        };
+        if dropped < outcome {
+            violations
+                .push("the stream is dropped before the outcomes, not after them".to_string());
+            return violations;
+        }
+        // The drop is the arm's last statement.
+        if arm[dropped..].trim()
+            != "stream = None;\n                    continue;\n                }".trim()
+        {
+            violations.push("code follows the arm-level drop".to_string());
+        }
+        // No outcome leaves the arm before the drop.
+        for line in arm[outcome..dropped].lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            for word in line.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if ["continue", "break", "return"].contains(&word) {
+                    violations.push(format!(
+                        "an outcome leaves the arm with `{word}` before the stream is dropped: {line}"
+                    ));
+                }
+            }
+        }
+        violations
+    }
+
+    /// Every way the idle wait loses the connection drops the stream and goes round, so
+    /// the top of the loop clears `armed` (the invariant on `ResetWatch`).
+    ///
+    /// The check reads the writer's code only. It read the whole file before, so the
+    /// `publish_armed` line it looked for matched its own literal, and an outcome that kept
+    /// the stream and went round (`continue` inside `Lost::PeerClosed`) passed: each mutated
+    /// source below is that hole, and must be reported.
+    #[test]
+    fn a_lost_idle_connection_drops_the_stream_whichever_way_it_was_lost() {
+        let source = include_str!("output.rs");
+        assert_eq!(idle_loss_arm_violations(source), Vec::<String>::new());
+
+        let closed = "eprintln!(\"[fc-agent] output vsock closed by the host\");\n";
+        let reset = "reset_tx.send_modify(|gen| *gen += 1);\n";
+        let top =
+            "        publish_armed(&armed_tx, stream.is_some());\n        // Check reconnect flag";
+        let drop_and_go_round = "\n                    stream = None;\n                    continue;\n                }\n            };\n";
+        for (what, from, to) in [
+            (
+                "an outcome that keeps the stream and goes round",
+                closed,
+                format!("{closed}                            continue;\n"),
+            ),
+            (
+                "an outcome that leaves the writer",
+                reset,
+                format!("{reset}                            break;\n"),
+            ),
+            (
+                "an outcome that returns",
+                closed,
+                format!("{closed}                            return;\n"),
+            ),
+            (
+                "an arm that keeps the stream",
+                drop_and_go_round,
+                "\n                    continue;\n                }\n            };\n".to_string(),
+            ),
+            (
+                "a loop that does not publish `armed` at its top",
+                top,
+                "        // Check reconnect flag".to_string(),
+            ),
+        ] {
+            let code_end = source.find("\n#[cfg(test)]\nmod tests {").unwrap();
+            let at = source[..code_end].find(from).unwrap_or_else(|| {
+                panic!("the writer no longer holds the text mutated for: {what}")
+            });
+            let mutated = format!("{}{}{}", &source[..at], to, &source[at + from.len()..]);
+            assert!(
+                !idle_loss_arm_violations(&mutated).is_empty(),
+                "not reported: {what}"
+            );
+        }
     }
 
     #[test]

@@ -1684,6 +1684,7 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         release: (major, minor, patch),
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
+        numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
     })
 }
 
@@ -1697,6 +1698,22 @@ pub(crate) struct FirecrackerVersion {
     /// Whether the build metadata says the snapshot load takes `drive_overrides`
     /// (`+fcvm.drive-overrides`, ejc3/firecracker).
     pub drive_overrides: bool,
+    /// Whether the build takes `--numa-balancing-after-secs` (`+fcvm.…numa-window`).
+    pub numa_window: bool,
+}
+
+/// The context of a snapshot load that failed. A restore that died under its memory server
+/// is told from other failed restores by it (`restore_failure_with_its_memory_server`).
+pub(crate) const LOADING_SNAPSHOT: &str = "loading snapshot";
+
+/// Whether the Firecracker at `bin` takes `--numa-balancing-after-secs`. False when its
+/// version cannot be read: the flag is then left off, which leaves its guest memory under
+/// the default policy.
+pub(crate) fn firecracker_takes_numa_window(bin: &Path) -> bool {
+    crate::version_cache::version_output(bin)
+        .ok()
+        .and_then(|out| parse_firecracker_version(&out).ok())
+        .is_some_and(|version| version.numa_window)
 }
 
 impl FirecrackerVersion {
@@ -4136,7 +4153,7 @@ pub async fn restore_from_snapshot(
                 huge_pages,
             })
             .await
-            .context("loading snapshot")
+            .context(LOADING_SNAPSHOT)
             .map_err(|error| {
                 match firecracker_choice.load_failure_hint(&error, &firecracker_bin) {
                     Some(hint) => error.context(hint),
@@ -5173,7 +5190,7 @@ async fn lock_vm_snapshots(
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
     let lock_path = vm_dir.join("snapshot.lock");
-    let lock_file = std::fs::File::create(&lock_path)
+    let lock_file = open_lock_file(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
     let mut noted_wait = false;
@@ -5255,9 +5272,20 @@ pub async fn acquire_snapshot_dir_lock(
     acquire_flock(&snapshot_sibling(snapshot_dir, "lock"), exclusive).await
 }
 
+/// Open `lock_path` for an flock, created if missing and never truncated: every clone takes
+/// its snapshot's lock, and an O_TRUNC open takes the inode lock for writing and changes the
+/// file each time.
+fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
 /// Take an flock on `lock_path`, created if missing, waiting for it.
 async fn acquire_flock(lock_path: &Path, exclusive: bool) -> Result<std::fs::File> {
-    let lock_file = std::fs::File::create(lock_path)
+    let lock_file = open_lock_file(lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
@@ -7904,6 +7932,48 @@ mod tests {
         );
     }
 
+    /// Taking a snapshot's lock, or a VM's snapshot lock, again does not truncate the lock
+    /// file: every clone takes its snapshot's lock, and an O_TRUNC open takes the inode lock
+    /// for writing and modifies the file (an IN_MODIFY event; creating it is not one).
+    #[tokio::test]
+    async fn taking_a_snapshot_lock_again_truncates_nothing() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_dir = root.path().join("snap");
+        let disk = root.path().join("vm").join("disks").join("rootfs.raw");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        for dir in [root.path(), &root.path().join("vm")] {
+            inotify.add_watch(dir, AddWatchFlags::IN_MODIFY).unwrap();
+        }
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let modified: Vec<_> = match inotify.read_events() {
+            Ok(events) => events.into_iter().map(|e| e.name).collect(),
+            Err(nix::errno::Errno::EAGAIN) => Vec::new(),
+            Err(error) => panic!("reading inotify events: {error}"),
+        };
+        assert!(modified.is_empty(), "lock files modified: {modified:?}");
+    }
+
     /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
     /// unrelated tag's files — snapshot_sibling must APPEND instead.
     #[test]
@@ -9945,6 +10015,32 @@ mod tests {
         assert_eq!(restored_vsock_source_path(None, ancestor), ancestor);
     }
 
+    /// Only an ejc3/firecracker build that says so in its build metadata takes
+    /// `--numa-balancing-after-secs`; an older build or upstream would refuse the flag and
+    /// not start.
+    #[test]
+    fn the_version_says_whether_firecracker_takes_the_numa_window() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().numa_window,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+other.numa-window",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().numa_window,
+                "{other}"
+            );
+        }
+    }
+
     /// Only an ejc3/firecracker build that says so in its build metadata takes drive
     /// overrides; upstream 1.17.0 rejects the field.
     #[test]
@@ -9980,6 +10076,7 @@ mod tests {
             release: (1, 17, 0),
             prerelease: false,
             drive_overrides: true,
+            numa_window: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
@@ -10034,6 +10131,7 @@ mod tests {
 
         let upstream = FirecrackerVersion {
             drive_overrides: false,
+            numa_window: false,
             ..capable
         };
         assert!(snapshot_load_drive_overrides(

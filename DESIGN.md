@@ -653,10 +653,11 @@ ip link set tap-fc master br0
 # Add IP to bridge for health checks
 # A socket made in the namespace then routes to the guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
-
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
 ```
+
+Nothing in the namespace forwards at L3, so the script does not set `ip_forward` and
+opens nothing under /proc/sys (a lookup there walks every other namespace's cached entry
+under a global lock; see `build_bridge_script`).
 
 **Port Forwarding** (unique loopback IPs):
 ```bash
