@@ -4145,6 +4145,11 @@ async fn cmd_snapshot_run_inner(
     };
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
+    // A File-backend clone records the snapshot's write set once (storage::write_set).
+    let write_set_memory = match &memory_backend {
+        MemoryBackend::File { memory_path } => Some(memory_path.clone()),
+        _ => None,
+    };
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
         memory_backend,
@@ -4747,6 +4752,30 @@ async fn cmd_snapshot_run_inner(
     // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
     // console, so they get a backend-neutral missing-console error.
     if output_connected {
+        if let (Some(memory), Ok(vmm_pid)) = (
+            write_set_memory
+                .clone()
+                .filter(|m| crate::storage::write_set::existing(m).is_none()),
+            vm_manager.pid(),
+        ) {
+            let cancel = health_cancel_token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(crate::storage::write_set::RECORD_AFTER) => {}
+                }
+                let recorded = tokio::task::spawn_blocking(move || {
+                    crate::storage::write_set::record(vmm_pid, &memory)
+                })
+                .await;
+                match recorded {
+                    Ok(Ok(Some(ranges))) => info!(ranges, "recorded the snapshot's write set"),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => warn!(%error, "could not record the snapshot's write set"),
+                    Err(error) => warn!(%error, "the write-set recording task failed"),
+                }
+            });
+        }
         let console_lines = vm_manager.console_line_counter();
         let backend = vm_manager.backend();
         let snapshot_name = snapshot_name.clone();

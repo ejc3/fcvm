@@ -4107,9 +4107,14 @@ pub async fn restore_from_snapshot(
                     memory = %memory_path.display(),
                     "loading snapshot with File backend"
                 );
+                let write_set = crate::storage::write_set::existing(memory_path);
+                if let Some(path) = &write_set {
+                    info!(write_set = %path.display(), "populating the recorded write set before resume");
+                }
                 MemBackend {
                     backend_type: "File".to_string(),
                     backend_path: memory_path.display().to_string(),
+                    write_set_path: write_set.map(|p| p.display().to_string()),
                 }
             }
             MemoryBackend::Uffd { socket_path } => {
@@ -4120,6 +4125,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Uffd".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::UffdMinor { socket_path } => {
@@ -4130,6 +4136,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "UffdMinor".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::Prefilled { socket_path, .. } => {
@@ -4140,6 +4147,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Prefilled".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
         };
@@ -10171,6 +10179,7 @@ mod tests {
             snapshot_path: "/snap/vmstate.bin".to_string(),
             mem_backend: MemBackend {
                 backend_path: "/snap/memory.bin".to_string(),
+                write_set_path: None,
                 backend_type: "File".to_string(),
             },
             track_dirty_pages: None,
