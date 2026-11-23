@@ -1,70 +1,82 @@
 # Restore: where the time goes between resume and fc-agent ready
 
-One session on one c8g.metal-48xl (192 cores, kernel 7.0.0-1013-aws), fcvm at 4f67a0fbd, store on
-btrfs in RAM. Guest: nginx:alpine, 1 vCPU, 256 MiB, rootless network, snapshot taken when the
-baseline first reported healthy. Four snapshots, each with its own cells: m2, m3 and m4, and m1,
-whose clones run on a kcompactd pass the snapshot caught (last section). Every cell is
-`make bench-start-rate-run`; traced cells also ran `vcpustat.py` and `s2fault.bt` (README,
-"Restore timeline"). UFFD cells ran after the memory server had recorded a working set.
+One session on one c8g.metal-48xl (192 cores, kernel 7.0.0-1013-aws), fcvm at 4f67a0fbd (built from
+this branch at 320b5a55, which differs from it under bench/start-rate only), store on btrfs in RAM.
+Guest: nginx:alpine, 1 vCPU, 256 MiB, rootless network, snapshot taken when the baseline first
+reported healthy. Five snapshots: m1, m4 and m7, each with its own cells; m2, whose clones run on a
+kcompactd pass the snapshot caught (last section); and fp, used for the fault-path function trace
+alone. Snapshots that carried a pass were taken and not measured further: m3, m5 and m6, and two
+before fp. Every cell is `make bench-start-rate-run`; traced cells also ran `vcpustat.py` and
+`s2fault.bt`, and the function trace ran `faultpath.py` (README, "Restore timeline" and "Fault
+path"). UFFD cells ran after the memory server had recorded a working set.
 
 How to read the numbers:
 
 - A value is the p50 over the cell's clones unless the row says otherwise. Three values in a row
-  are m2, m3, m4.
+  are m1, m4, m7.
 - "Resume to ready" is between two lines of the clone's fcvm process. Steps between fc-agent's
   console lines are the harness's receive times of those lines, which lag the guest by several
   ms (the acknowledgement, which arrives over vsock, is often logged before the console line
   the guest wrote ahead of it). fc-agent's phase record is the guest's own clock.
-- Counts and fault times are the part of `s2fault.bt`'s buckets inside the window (10 ms buckets,
-  the last one in proportion). "Fault to guest entry" is measured per fault, from
+- Counts and fault times are the part of `s2fault.bt`'s buckets inside the window. The buckets
+  are 10 ms wide for the first second and 100 ms wide after it, and they count from the vCPU's
+  first stage-2 fault, not from the resume line. Each clone's buckets are shifted by the time
+  between the two (the "resume stamp to first fault" rows), and a bucket the window starts or
+  ends in counts in proportion. "Fault to guest entry" is measured per fault, from
   `kvm:kvm_guest_fault` on guest memory to the vCPU's next `kvm:kvm_entry`.
-- Ticks are scheduler ticks of 10 ms; a row of ticks is the mean over the cell's clones.
-- The tracers slow a clone: untraced, the same three snapshots take 37.9, 34.8 and 36.1 ms from
+- On-CPU and waiting time run from the later of the resume stamp and the first fault, where the
+  tracer read the vCPU thread's counters, to the ready stamp, read off the line between the two
+  records around it: the first-fault record and the sampler's samples, which come up to 11 ms
+  apart at C=1 and about 40 ms apart in the ramp.
+- The tracers slow a clone: untraced, the same three snapshots take 39.3, 42.8 and 36.1 ms from
   resume to ready on File at C=1 (10 clones each).
 
 ## One clone at a time (C=1, N=30, traced)
 
 | | File | UFFD |
 |---|---|---|
-| resume to ready (ms) | 44.1, 42.5, 44.0 | 27.3, 22.8, 24.1 |
-| vCPU thread on a CPU (ms; samples 4 ms apart bracket the window) | 47.7, 47.6, 48.7 | 31.6, 29.6, 28.4 |
+| resume to ready (ms) | 46.7, 50.1, 43.5 | 29.6, 31.7, 26.9 |
+| resume stamp to the vCPU's first stage-2 fault (ms) | -0.01, -0.01, -0.01 | -0.01, -0.01, -0.01 |
+| vCPU thread on a CPU (ms) | 46.1, 49.5, 43.0 | 28.9, 30.8, 26.2 |
 | vCPU thread runnable, waiting for a CPU (ms) | 0.0 | 0.0 |
-| vCPU thread in a userfault (ms) | 0.0 | 0.1 |
-| stage-2 faults on guest memory in the window | 9,907, 9,509, 9,770 | 7,128, 6,544, 7,059 |
-| fault to guest entry, all of the window's faults (ms) | 21.0, 20.2, 21.3 | 6.2, 5.8, 6.3 |
-| fault to guest entry, per fault (µs) | 2.1, 2.1, 2.2 | 0.9, 0.9, 0.9 |
-| device aborts in the window (console, virtio) | 3,039, 2,962, 2,970 | 2,856, 2,263, 2,039 |
-| ticks: guest / host kernel / VMM user (mean ms) | 9.0 / 27.0 / 0.7, 10.0 / 29.7 / -0.3, 9.3 / 29.7 / 0.0 | 8.7 / 12.0 / 0.3, 8.3 / 10.3 / 0.0, 7.0 / 12.0 / -0.3 |
-| ready to healthy (ms) | 6.5, 6.7, 6.8 | 6.9, 7.5, 6.8 |
+| vCPU thread in a userfault (ms) | 0.0 | 0.2, 0.1, 0.1 |
+| stage-2 faults on guest memory in the window | 10,638, 12,139, 9,669 | 7,576, 9,236, 7,052 |
+| fault to guest entry, all of the window's faults (ms) | 22.2, 25.8, 20.8 | 6.7, 8.7, 6.4 |
+| fault to guest entry, per fault (µs) | 2.1, 2.1, 2.1 | 0.9, 0.9, 0.9 |
+| device aborts in the window (console, virtio) | 2,737, 2,789, 2,970 | 2,917, 2,703, 2,610 |
+| ready to healthy (ms) | 7.2, 7.1, 6.9 | 7.3, 7.4, 7.0 |
 
-All 30 clones of each cell are in every row. The vCPU is on a CPU for the whole window. On File
-about half the window is the host mapping the ten thousand guest pages the restore touches into
-an empty stage-2 table; the rest is guest code and three thousand exits to the VMM for device
-accesses. On UFFD the recorded working set is already in the clone's memory and a fault costs
-0.9 µs.
+All 30 clones of each cell are in every row. The vCPU's first fault comes 0.01 to 0.04 ms before
+fcvm stamps the resume, in every clone of the six cells. The vCPU is on a CPU for the whole
+window: the window less on-CPU, waiting and userfault time is 0.2 to 0.5 ms. On File 47 to 52%
+of the window is the host mapping the ten to twelve thousand guest pages the restore touches into
+an empty stage-2 table; the rest is guest code and under three thousand exits to the VMM for
+device accesses. On UFFD the recorded working set is already in the clone's memory and a fault
+costs 0.9 µs.
 
-Steps on File, console-line times (ms): resume to `detected restore-epoch` 12.6, 11.9, 10.5; to
-tcp-cleanup begin 17.2, 16.7, 19.7; tcp-cleanup 2.1, 1.9, 3.3; to the clock step 5.1, 5.2, 5.4;
-to `snapshot network published` 1.3. The gate, from fc-agent's phase record: verify 0.24, 0.23,
-0.36 ms; UDP rule 0.22, 0.25, 0.26 ms; egress commit 1.74, 1.72, 2.78 ms; publish 0.08, 0.07,
-0.08 ms; all 30 restores of every cell went over nfnetlink (`tcp_gate_netlink`), none through
-an iptables process.
+Steps on File, console-line times (ms): resume to `detected restore-epoch` 8.8, 22.2, 14.9; to
+tcp-cleanup begin 24.1, 15.6, 14.3; tcp-cleanup 3.5, 3.1, 3.5; to the clock step 3.8, 4.7, 4.9;
+to `snapshot network published` 1.4, 3.1, 1.3. The gate, from fc-agent's phase record:
+`tcp_verify_ms` 1.98, 0.23, 0.24; `tcp_gate_arm_ms` 0.24, 0.24, 0.25;
+`tcp_gate_egress_commit_ms` 0.16, 1.79, 2.34; `tcp_reopen_ms` 0.08, 0.07, 0.08; the whole
+`tcp_cleanup_ms` 3.43, 3.12, 3.65. All 30 restores of every cell went over nfnetlink
+(`tcp_gate_netlink`), none through an iptables process.
 
 ## After ready
 
-Per clone, the 2 s that follow its first healthy check (the clones still alive then: 8 or 9 of a
-File cell's 30, 5 of a UFFD cell's):
+Per clone, the 2 s that follow its first healthy check (the clones still alive then: 9 or 10 of a
+File cell's 30, 5 to 7 of a UFFD cell's):
 
 | | File | UFFD |
 |---|---|---|
-| vCPU thread on a CPU (ms) | 240, 217, 244 | 242, 220, 259 |
-| VMM main thread on a CPU (ms) | 24.4, 23.2, 21.7 | 22.9, 22.9, 22.3 |
+| vCPU thread on a CPU (ms) | 239, 232, 218 | 245, 227, 212 |
+| VMM main thread on a CPU (ms) | 23.7, 26.5, 24.6 | 23.1, 24.7, 23.6 |
 
-That is five to eleven times the restore's window. fc-agent's restore-epoch watcher reads the vsock
-transport reset after it has dispatched the restore (29 or 30 of 30 clones in every cell), and
-the reset opens a one-second window of metadata fetches 2 ms apart. The chronyd start (`chronyd
-restarted` 39 to 45 ms after ready on File) and the journald restart (75 to 78 ms after) run in
-the same two seconds.
+That is about five times the restore's window on File and seven to eight times on UFFD. fc-agent's
+restore-epoch watcher reads the vsock transport reset after it has dispatched the restore (29 or 30
+of 30 clones in every cell), and the reset opens a one-second window of metadata fetches 2 ms apart.
+The chronyd start (`chronyd restarted` 39 to 42 ms after ready on File) and the journald restart (73
+to 78 ms after) run in the same two seconds.
 
 ## Ramp: 128 starting at once, to 1000 alive
 
@@ -72,66 +84,100 @@ Untraced cells:
 
 | | File | UFFD |
 |---|---|---|
-| clones healthy per second, whole ramp | 30.9, 32.6, 30.9 | 24.4, 29.0, 20.1 |
-| resume to ready, p50 (ms) | 2,631, 1,270, 2,698 | 99, 73, 140 |
-| resume to ready, p99 (ms) | 4,131, 3,210, 3,833 | 840, 1,213, 2,048 |
-| CPU-seconds per start, all processes / Firecracker (pidstat) | 5.04 / 4.81, 4.60 / 4.30, 5.12 / 4.91 | 5.65 / 5.16, 4.69 / 4.25, 7.73 / 7.21 |
-| cores busy over the ramp, of 192 (pidstat CPU-seconds / ramp seconds) | 156, 150, 158 | 138, 136, 155 |
+| clones healthy per second, whole ramp | 31.9, 30.1, 36.0 | 22.3, 21.9, 30.7 |
+| resume to ready, p50 (ms) | 2,604, 2,260, 1,384 | 125, 211, 73 |
+| resume to ready, p99 (ms) | 3,765, 4,305, 3,548 | 1,802, 1,844, 1,192 |
+| CPU-seconds per start, all processes / Firecracker (pidstat) | 4.82 / 4.63, 5.08 / 4.89, 4.69 / 4.47 | 6.24 / 5.78, 7.33 / 6.82, 4.08 / 3.60 |
+| cores busy over the ramp, of 192 (pidstat CPU-seconds / ramp seconds) | 154, 153, 169 | 139, 161, 125 |
 
 Traced cells (resume to ready window, per clone):
 
 | | File | UFFD |
 |---|---|---|
-| clones in the rows, of 1000 | 1000, 1000, 1000 | 939, 971, 983 (the sampler never saw the VMM of the rest) |
-| window (ms) | 2,522, 1,233, 2,870 | 86, 101, 172 |
-| vCPU thread on a CPU (ms) | 2,402, 1,237, 2,664 | 106, 111, 132 |
-| waiting for a CPU, p50 / p90 (ms) | 89 / 411, 25 / 220, 157 / 595 | 3 / 52, 10 / 128, 38 / 244 |
-| in a userfault, p50 / p90 (ms) | 0 / 0 | 0.1 / 18, 2 / 103, 13 / 237 |
-| stage-2 faults on guest memory in the window | 42,431, 14,418, 52,980 | 7,543, 7,334, 7,599 |
-| fault to guest entry, all of the window's faults (ms) | 2,370, 1,168, 2,644 | 38, 45, 80 |
-| fault to guest entry, per fault (µs) | 51.3, 74.3, 48.8 | 4.9, 5.7, 8.8 |
-| ticks: guest / host kernel (mean ms) | 116 / 2,182, 29 / 957, 143 / 2,316 | 36 / 66, 51 / 64, 76 / 139 |
-| vCPU thread on a CPU in the 2 s after healthy (ms) | 1,304, 1,634, 1,181 | 1,572, 1,438, 1,644 |
+| clones in the rows, of 1000 | 1000, 1000, 1000 | 1000, 1000, 1000 |
+| window (ms) | 2,804, 2,352, 1,413 | 154, 316, 86 |
+| resume stamp to the vCPU's first stage-2 fault, p50 / p99 (ms) | -0.3 / 3.1, -0.1 / 3.2, -0.1 / 4.0 | -0.1 / 0.8, -0.2 / 0.4, -0.1 / 0.2 |
+| vCPU thread on a CPU (ms) | 2,622, 2,104, 1,311 | 112, 218, 72 |
+| waiting for a CPU, p50 / p90 (ms) | 127 / 365, 100 / 662, 70 / 404 | 16 / 166, 25 / 200, 1 / 42 |
+| in a userfault, p50 / p90 (ms) | 0 / 0 | 20 / 176, 57 / 361, 4 / 94 |
+| stage-2 faults on guest memory in the window | 52,830, 37,440, 16,328 | 8,503, 9,984, 7,423 |
+| fault to guest entry, all of the window's faults (ms) | 2,601, 2,234, 1,346 | 74, 220, 44 |
+| fault to guest entry, per fault (µs) | 45.6, 53.1, 78.5 | 7.8, 18.6, 5.6 |
+| on a CPU, mean over the cell (ms): in the guest / outside it | 131 / 2,220, 81 / 1,983, 33 / 1,333 | 67 / 76, 77 / 175, 30 / 54 |
+| vCPU thread on a CPU in the 2 s after healthy (ms) | 1,232, 1,514, 1,703 | 1,596, 1,466, 976 |
 
-Within one snapshot, File: m2's clones take 9,907 faults at 2.1 µs alone and 42,431 at 51.3 µs in
-the ramp; m3's 9,509 at 2.1 µs and 14,418 at 74.3 µs. The File window is the fault path: 92 to
-95% of it is fault-to-entry time, 2 to 6% waiting for a CPU. On UFFD a fault costs 5 to 9 µs in
-the ramp and the window is 86 to 172 ms. On both backends a clone then spends 1.2 to 1.6
-CPU-seconds in the 2 s after it is healthy.
+- Every clone of every cell is in every row. In the UFFD cells 20, 7 and 101 clones have no
+  sample inside their window, and their on-CPU and waiting time is read off the line from the
+  first-fault record to the first sample after ready.
+- The first fault is within a few ms of the resume stamp for all but a few clones: the widest
+  offsets in the six cells are 32.6 ms before the stamp (fcvm stamped the resume late) and
+  12.3 ms after it.
+- "In the guest" is the kernel's tick accounting, which `/proc` gives in whole 10 ms against an
+  exact start: it reads about 5 ms low per clone, and "outside it" as much high.
+- A userfault's time runs until the vCPU thread is back on a CPU after the memory server's wake,
+  so it overlaps the waiting row, and it is inside the fault-to-entry time of the fault that
+  took it.
+
+Within one snapshot, File: m1's clones take 10,638 faults at 2.1 µs alone and 52,830 at 45.6 µs
+in the ramp; m7's 9,669 at 2.1 µs and 16,328 at 78.5 µs. The File window is the fault path:
+fault-to-entry time is 93 to 95% of the cell's summed windows and waiting for a CPU 7 to 10%
+(the two overlap where a fault waits for a CPU), and of 1,366 to 2,351 ms on a CPU, 33 to 131 ms
+are in the guest. On UFFD a fault costs 6 to 19 µs in the ramp, userfault waits included, and
+the window is 86 to 316 ms. On both backends a clone then spends 1.0 to 1.7 CPU-seconds in the
+2 s after it is healthy.
 
 ### What a File fault does in the ramp
 
-A fourth snapshot without a pass, one traced ramp (29.2 clones/s, resume to ready 2,208 ms),
-entry and return probes on the fault path's functions for the vCPU threads of one clone in
-eight. `perf` and bpftrace `profile` samples cannot show this path: arm64 KVM reports every
-sample taken while a vCPU is loaded as guest state, and the kernel stack comes back empty.
+Snapshot fp, one traced ramp (27.0 clones/s, resume to ready 2,399 ms). `faultpath.py` timed the
+fault path's functions from entry to return on the vCPU threads of the 115 clones whose VMM pid
+is a multiple of 8, and the lock waits of every vCPU thread:
+
+```bash
+sudo python3 bench/start-rate/faultpath.py program > $OUT.trace/fault.bt
+sudo BPFTRACE_MAX_MAP_KEYS=100000 bpftrace $OUT.trace/fault.bt > $OUT.trace/fault.txt &
+make bench-start-rate-run PREP=$R/prep/prep.json OUT=$OUT COUNT=1000 CONCURRENCY=128
+# then SIGINT bpftrace
+python3 bench/start-rate/faultpath.py report $OUT.trace/fault.txt
+```
+
+`perf` and bpftrace `profile` samples cannot show this path: arm64 KVM reports every sample
+taken while a vCPU is loaded as guest state, and the kernel stack comes back empty.
+
+The table covers the whole trace, from before the first clone starts until the run has stopped
+its clones: everything the traced vCPUs did, 69,900 stage-2 faults on guest memory per clone, not
+the resume to ready window alone. Times are inclusive.
 
 | function | calls | µs per call | µs per stage-2 fault |
 |---|---|---|---|
-| `user_mem_abort` | 8,808,873 | 47.4 | 47.4 |
-| `handle_mm_fault` (22% of the faults reach it) | 1,944,582 | 197 | 43.5 |
-| `wp_page_copy` | 805,300 | 367 | 33.5 |
-| `kvm_pgtable_stage2_unmap`, from the MMU notifier in `wp_page_copy` | 869,402 | 208 | 20.5 |
-| `ptep_clear_flush`, in `wp_page_copy` | 805,283 | 143 | 13.1 |
-| `do_fault` (`filemap_fault`, `do_read_fault`) | 696,381 | 90 | 7.1 |
-| `do_numa_page` | 409,613 | 50 | 2.3 |
-| `filemap_map_pages` | 268,585 | 29 | 0.9 |
+| `user_mem_abort` | 8,036,815 | 54.2 | 54.2 |
+| `handle_mm_fault` (23% of the faults reach it) | 1,813,387 | 223 | 50.3 |
+| `wp_page_copy` | 768,345 | 372 | 35.5 |
+| `kvm_pgtable_stage2_unmap`, the calls made inside `wp_page_copy` | 768,345 | 205 | 19.6 |
+| `ptep_clear_flush` (every call is inside `wp_page_copy`) | 768,333 | 145 | 13.9 |
+| `do_fault` (`filemap_fault`, `do_read_fault`) | 639,538 | 116 | 9.3 |
+| `do_numa_page` | 370,596 | 88 | 4.1 |
+| `filemap_map_pages` | 259,373 | 28 | 0.9 |
 
-71% of the time is the copy-on-write of a page the guest had read before it wrote it: the
+`kvm_pgtable_stage2_unmap` ran 857,693 times in all; the other 89,348 calls came from other
+MMU-notifier invalidations and are not in its row.
+
+66% of the time is the copy-on-write of a page the guest had read before it wrote it: the
 memory file is mapped `MAP_PRIVATE`, the read mapped the page-cache page read-only, and the write
 replaces it. Replacing a mapped page costs two TLB invalidations, KVM's unmap of the stage-2
 entry through the MMU notifier and the `ptep_clear_flush` of the host mapping. On arm64 both are
-broadcast to every CPU, and with 128 clones doing it at once each takes 143 to 208 µs. About
-6,400 pages per clone go through it. The lock contention tracepoints show no lock in this path:
-the vCPU threads' contended waits were `folio_lruvec_lock` in `__page_cache_release` (121 s over
-615,802 waits) and `rtnl_lock` in `tun_chr_close`, both at exit.
+broadcast to every CPU, and with 128 clones doing it at once each takes 145 to 205 µs. About
+6,700 pages per clone go through it. The lock contention tracepoints show no lock in this path.
+The vCPU threads of all 1000 clones waited 655.7 s on contended locks, 543.9 s of it on
+`rtnl_lock` in `tun_chr_close` (357 waits) and 111.0 s on `folio_lruvec_lock` in
+`__page_cache_release` under `folios_put_refs` (578,094 waits), the TAP's close and the batched
+release of pages being unmapped. The other 48 stacks hold 0.8 s between them.
 
 ## A snapshot can carry a compaction pass
 
-m1's clones take 68.0 ms from resume to ready on File at C=1 (26.9 ms on UFFD) and 18,885 stage-2
-faults in the window, where m2 to m4 take 42.5 to 44.1 ms and 9,509 to 9,907: the guest's
-kcompactd was in a proactive compaction pass when the snapshot was taken, and every clone runs
-the pass on (#2020 has the guest program counters). In the ramp m1 gives UFFD 20.2 clones/s and
-337 ms from resume to ready (traced: 10,469 faults at 17.8 µs), against 20.1 to 29.0 clones/s
-and 73 to 140 ms for the other three. On File its ramp (30.9 clones/s, 2,654 ms) is not apart
-from m2's and m4's.
+m2's clones take 79.6 ms from resume to ready on File at C=1 (53.7 ms on UFFD) and 21,861 stage-2
+faults in the window (18,449 on UFFD), where m1, m4 and m7 take 43.5 to 50.1 ms and 9,669 to 12,139
+on File: the guest's kcompactd was in a proactive compaction pass when the snapshot was taken, and
+every clone runs the pass on (#2020 has the guest program counters). Four of the seven snapshots m1
+to m7 carried one: untraced on File at C=1 they take 59.2 to 69.6 ms from resume to ready, the other
+three 36.1 to 42.8 ms. The ramp does not set m2 apart on either backend: File 30.1 clones/s and
+2,685 ms from resume to ready untraced, UFFD 208 ms, where m4 takes 2,260 ms and 211 ms.

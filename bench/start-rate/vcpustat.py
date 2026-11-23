@@ -5,8 +5,12 @@ Every PERIOD it reads, for each firecracker process first seen less than WINDOW 
   /proc/<pid>/task/<vcpu tid>/schedstat  on-CPU ns, runqueue wait ns
   /proc/<pid>/task/<vcpu tid>/stat       utime, stime, guest_time (ticks), minflt, majflt
   /proc/<pid>/schedstat                  the main (VMM) thread's on-CPU ns
-and appends one JSON line per sample with the wall clock and the process's start time, which
-with the pid names one process across pid reuse. Stop with SIGTERM.
+and appends one JSON line per sample with the wall clock at that process's read and the
+process's start time, which with the pid names one process across pid reuse. Once a second
+it also appends a clock anchor, `{"anchor": true, "mono_ns": .., "wall_ns": ..,
+"spread_ns": ..}`: one reading of the wall clock between two of CLOCK_MONOTONIC, which is
+the clock bpftrace's `nsecs` reads, so restore_timeline.py can place s2fault.bt's times on
+the wall clock of the clones' log lines. Stop with SIGTERM.
 
 usage: vcpustat.py OUT [PERIOD_S [WINDOW_S]]
 """
@@ -34,6 +38,26 @@ def read(path):
             return f.read()
     except OSError:
         return None
+
+
+def clock_anchor(tries=20, tight_ns=20_000, mono=None, wall=None):
+    """The wall clock and CLOCK_MONOTONIC at one instant: the wall clock read between two
+    readings of the monotonic one, and the monotonic time taken as their middle. A reading
+    interrupted between the three calls is wide; the tightest of up to `tries` is kept and
+    its width recorded."""
+    mono = mono or (lambda: time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+    wall = wall or time.time_ns
+    best = None
+    for _ in range(tries):
+        before = mono()
+        w = wall()
+        after = mono()
+        if best is None or after - before < best["spread_ns"]:
+            best = {"anchor": True, "mono_ns": (before + after) // 2, "wall_ns": w,
+                    "spread_ns": after - before}
+        if best["spread_ns"] <= tight_ns:
+            break
+    return best
 
 
 class Sampler:
@@ -71,12 +95,14 @@ class Sampler:
             self.seen.add(pid)
             self.young[pid] = (now, tid, parse_stat(stat)["start"])
 
-    def sample(self, out, now):
-        wall = time.time()
+    def sample(self, out, now, wall_clock=time.time):
         for pid, (first, tid, start) in list(self.young.items()):
             if now - first > self.window:
                 del self.young[pid]
                 continue
+            # Stamped per process, at its own read: a pass over hundreds of VMMs takes tens
+            # of ms, and one stamp for the pass would date the last reads that much early.
+            wall = wall_clock()
             sched = read(f"{self.proc}/{pid}/task/{tid}/schedstat")
             stat = read(f"{self.proc}/{pid}/task/{tid}/stat")
             main = read(f"{self.proc}/{pid}/schedstat")
@@ -100,9 +126,12 @@ def main(argv):
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
     sampler = Sampler(window)
     with open(out_path, "w") as out:
-        last_discover = 0.0
+        last_discover = last_anchor = 0.0
         while not stop:
             now = time.monotonic()
+            if now - last_anchor >= 1.0:
+                out.write(json.dumps(clock_anchor()) + "\n")
+                last_anchor = now
             # A VMM is resumed tens of ms after it starts; find it before that.
             if now - last_discover >= min(0.1, 2 * period):
                 sampler.discover(now)

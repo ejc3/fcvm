@@ -1,6 +1,13 @@
 #!/usr/bin/env bpftrace
-// Per firecracker process, in buckets from its vCPU's first stage-2 fault (10 ms wide for
-// the first second, 100 ms wide after it, to 12 s; restore_timeline.py holds the same rule):
+// Per firecracker pid, taken at its vCPU thread's first stage-2 fault, on guest memory or
+// on a device (its first such exit from the guest after the resume):
+//   @t0     that fault's time, in ns of CLOCK_MONOTONIC (bpftrace's nsecs). vcpustat.py
+//           records the wall clock against the same clock, and restore_timeline.py uses
+//           the pair to place every bucket below on the wall clock of the clone's log lines
+//   @run0, @wait0, @guest0  the vCPU thread's on-CPU, runqueue-wait and guest time then,
+//           in ns (what /proc/<tid>/schedstat and stat read later, minus the rounding)
+// and in buckets from @t0 (10 ms wide for the first second, 100 ms wide after it, to 12 s;
+// restore_timeline.py holds the same rule):
 //   @s2     stage-2 faults on guest memory taken by the vCPU thread
 //   @s2ns   time from each of those faults to the vCPU's next entry into the guest, which
 //           is the host's handling of the fault and any wait inside it
@@ -9,12 +16,21 @@
 // @device counts the device aborts of every guest by page; @execs and @forks count every
 // exec and fork on the host.
 //
+// The maps are keyed by pid alone and nothing is deleted, so two VMMs that had the same pid
+// during one trace would share their buckets. restore_timeline.py leaves out clones that
+// share a pid.
+//
 // Run with BPFTRACE_MAX_MAP_KEYS=300000 (1000 clones x 210 buckets fit). The maps are
 // per-CPU and preallocated, so on 192 CPUs each takes seconds to create: start the
 // workload only after this prints "attached".
 BEGIN { printf("attached\n"); }
 tracepoint:kvm:kvm_guest_fault /comm == "fc_vcpu 0"/ {
-  if (@t0[pid] == 0) { @t0[pid] = nsecs; }
+  if (@t0[pid] == 0) {
+    @t0[pid] = nsecs;
+    @run0[pid] = curtask->se.sum_exec_runtime;
+    @wait0[pid] = curtask->sched_info.run_delay;
+    @guest0[pid] = curtask->gtime;
+  }
   // Firecracker's arm64 guests have RAM from 2 GiB up; an abort below it is a device access.
   if (args->ipa >= 0x80000000) { @fault[tid] = nsecs; }
   else {

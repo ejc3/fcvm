@@ -25,6 +25,23 @@ class ParseStat(unittest.TestCase):
         self.assertEqual(vcpustat.parse_stat(STAT.replace("(fc_vcpu 0)", "(a) b)"))["ut"], 61)
 
 
+class ClockAnchor(unittest.TestCase):
+    def test_the_tightest_reading_is_kept_with_its_width(self):
+        # Three readings: the first interrupted for 5 ms between its calls, the second for
+        # 40 us, the third tight. The loop stops at the first tight one.
+        mono = iter([1_000, 5_001_000, 6_000_000, 6_040_000, 7_000_000, 7_000_400, 9, 9])
+        wall = iter([50_000_000_000, 50_006_000_000, 50_007_000_000, 0])
+        a = vcpustat.clock_anchor(mono=lambda: next(mono), wall=lambda: next(wall))
+        self.assertEqual(a, {"anchor": True, "mono_ns": 7_000_200, "wall_ns": 50_007_000_000,
+                             "spread_ns": 400})
+
+    def test_no_tight_reading_keeps_the_best_of_the_tries(self):
+        mono = iter([0, 900_000, 1_000_000, 1_300_000, 2_000_000, 2_800_000])
+        wall = iter([10, 20, 30])
+        a = vcpustat.clock_anchor(tries=3, mono=lambda: next(mono), wall=lambda: next(wall))
+        self.assertEqual((a["mono_ns"], a["wall_ns"], a["spread_ns"]), (1_150_000, 20, 300_000))
+
+
 class Discover(unittest.TestCase):
     def proc(self, d, pid, comm, threads):
         (d / str(pid) / "task").mkdir(parents=True)
@@ -60,10 +77,13 @@ class Discover(unittest.TestCase):
             s.discover(10.2)
             self.assertEqual(sorted(s.young), [20, 30])
             out = io.StringIO()
-            s.sample(out, 10.3)
+            # The wall clock is read once per process, as each is read: the second process
+            # of a pass is stamped later than the first.
+            clock = iter([1000.000, 1000.030])
+            s.sample(out, 10.3, wall_clock=lambda: next(clock))
             rows = [json.loads(line) for line in out.getvalue().splitlines()]
-            self.assertEqual([(r["pid"], r["start"], r["run"], r["wait"], r["mrun"]) for r in rows],
-                             [(20, 987654, 100, 20, 5), (30, 987654, 100, 20, 5)])
+            self.assertEqual([(r["pid"], r["start"], r["run"], r["wait"], r["mrun"], r["w"]) for r in rows],
+                             [(20, 987654, 100, 20, 5, 1000.000), (30, 987654, 100, 20, 5, 1000.030)])
 
 
 if __name__ == "__main__":
