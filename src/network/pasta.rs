@@ -810,6 +810,10 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
         .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
+/// The host's global IPv6 address as this process first found it
+/// ([`PastaNetwork::detect_host_ipv6`]).
+static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// What a pool key holds of the host and of the user, beside the network's own shape.
 struct PoolHost {
     /// The host's global IPv6 address, which pasta is started with.
@@ -1278,8 +1282,14 @@ impl PastaNetwork {
     /// probe that failed is "no address" for this call and is made again at the next
     /// ([`Self::remembered`]).
     fn detect_host_ipv6() -> Option<String> {
-        static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         Self::remembered(&HOST_IPV6, Self::probe_host_ipv6)
+    }
+
+    /// Probe the host's IPv6 address now unless this process already has its answer, and
+    /// fail when the probe does. For a process whose key and namespaces last for days (the
+    /// namespace pool): it must not start on "no address" because one probe failed.
+    pub fn host_ipv6_known() -> std::io::Result<()> {
+        Self::remembered_or_error(&HOST_IPV6, Self::probe_host_ipv6).map(drop)
     }
 
     /// `probe`'s answer, kept in `kept` once there is one. A probe that fails is logged
@@ -1290,16 +1300,26 @@ impl PastaNetwork {
         kept: &std::sync::OnceLock<Option<String>>,
         probe: impl FnOnce() -> std::io::Result<Option<String>>,
     ) -> Option<String> {
-        if let Some(answer) = kept.get() {
-            return answer.clone();
-        }
-        match probe() {
-            Ok(answer) => kept.get_or_init(|| answer).clone(),
+        match Self::remembered_or_error(kept, probe) {
+            Ok(answer) => answer,
             Err(error) => {
                 warn!(%error, "probing the host's IPv6 address failed; none is assumed for now");
                 None
             }
         }
+    }
+
+    /// [`Self::remembered`] for a caller that must have an answer: the probe's failure is
+    /// its error, and nothing is kept.
+    fn remembered_or_error(
+        kept: &std::sync::OnceLock<Option<String>>,
+        probe: impl FnOnce() -> std::io::Result<Option<String>>,
+    ) -> std::io::Result<Option<String>> {
+        if let Some(answer) = kept.get() {
+            return Ok(answer.clone());
+        }
+        let answer = probe()?;
+        Ok(kept.get_or_init(|| answer).clone())
     }
 
     /// The first global-scope IPv6 address of this network namespace's interfaces that is
@@ -4420,6 +4440,17 @@ mod tests {
         let none = std::sync::OnceLock::new();
         assert_eq!(PastaNetwork::remembered(&none, || Ok(None)), None);
         assert_eq!(none.get(), Some(&None));
+        // A caller that must have an answer gets the failure itself, and nothing is kept.
+        let asked = std::sync::OnceLock::new();
+        let failed = PastaNetwork::remembered_or_error(&asked, interrupted).unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::Interrupted);
+        assert!(asked.get().is_none());
+        assert_eq!(
+            PastaNetwork::remembered_or_error(&asked, found)
+                .unwrap()
+                .as_deref(),
+            Some("2001:db8::1")
+        );
     }
 
     /// pasta creates its PID file while it reads its options and writes the PID last, so

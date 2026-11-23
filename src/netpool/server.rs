@@ -53,6 +53,10 @@ const VERIFY_BUDGET: Duration = Duration::from_secs(2);
 const REBUILD_DELAY: Duration = Duration::from_secs(1);
 /// The pause after a failed `accept`.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// How often, and how far apart, a pool that is starting asks again for the host's IPv6
+/// address when the probe fails.
+const HOST_PROBE_TRIES: u32 = 20;
+const HOST_PROBE_PAUSE: Duration = Duration::from_millis(250);
 /// The least time between two reports of a claim for another key.
 const KEY_MISS_REPORT: Duration = Duration::from_secs(30);
 
@@ -561,6 +565,29 @@ async fn answer(pool: Rc<Pool>, connection: UnixStream) {
     }
 }
 
+/// Have the host's IPv6 address probed before the pool makes its key or builds a
+/// namespace: both use the address as this process first found it, for as long as the pool
+/// runs. A probe that failed would leave a pool whose key says the host has no address,
+/// which no clone on a host that has one ever matches. So the pool waits for an answer,
+/// five seconds at most, and does not start without one.
+async fn host_ipv6_probed() -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match PastaNetwork::host_ipv6_known() {
+            Ok(()) => return Ok(()),
+            Err(error) if tries < HOST_PROBE_TRIES => {
+                tries += 1;
+                warn!(%error, tries, "probing the host's IPv6 address; trying again");
+                tokio::time::sleep(HOST_PROBE_PAUSE).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("probing the host's IPv6 address, which the pool's key holds")
+            }
+        }
+    }
+}
+
 fn listen(path: &Path) -> Result<AsyncFd<UnixStream>> {
     use std::os::unix::ffi::OsStrExt;
     match std::fs::remove_file(path) {
@@ -660,6 +687,7 @@ pub async fn serve(slots: usize) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("removing a previous pool's slot directories"),
     }
+    host_ipv6_probed().await?;
     let key = slot_network(String::new(), dir.clone()).pool_key();
     let socket_path = proto::socket_path(&dir);
     let listener = listen(&socket_path)?;
@@ -736,9 +764,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_claim_that_arrives_with_the_stop_is_refused_not_granted() {
         let scratch = tempfile::tempdir().unwrap();
-        let mut namespace = Namespace::build(scratch.path().join("slot"), "stop-claim".into())
-            .await
-            .expect("building a namespace as the pool does");
+        // Without pasta, a setup asset the unit lanes do not have: nothing here needs it.
+        let mut namespace =
+            Namespace::build_with(scratch.path().join("slot"), "stop-claim".into(), false)
+                .await
+                .expect("building a namespace as the pool does");
         let (stop, _) = tokio::sync::watch::channel(false);
         let pool = Pool {
             dir: scratch.path().to_path_buf(),
@@ -793,6 +823,22 @@ mod tests {
             "the claimer was sent something before its connection closed"
         );
         namespace.destroy().await;
+    }
+
+    /// The pool has the host's address probed, with the probe's failure an error, before it
+    /// makes its key: a key from a failed probe would say the host has no IPv6 address for
+    /// the pool's life.
+    #[test]
+    fn the_pool_probes_the_host_before_it_makes_its_key() {
+        let source = include_str!("server.rs");
+        let start = source.find("pub async fn serve(slots: usize)").unwrap();
+        let body = &source[start..];
+        let probed = body.find("host_ipv6_probed().await?;").expect("no probe");
+        let key = body.find(".pool_key()").expect("no key");
+        assert!(probed < key, "the key is made before the host is probed");
+        let probe = &source[source.find("async fn host_ipv6_probed()").unwrap()..];
+        assert!(probe[..probe.find("\nfn listen(").unwrap()]
+            .contains("PastaNetwork::host_ipv6_known()"));
     }
 
     /// A pooled namespace is built by the code an unpooled clone's is, so the two read the

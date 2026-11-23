@@ -532,10 +532,44 @@ pub fn add_attached_tap(name: &str) -> io::Result<OwnedFd> {
 /// were. The queue holds frames the namespace sent towards the VMM that the VMM had not
 /// read; with the queue kept open across VMMs the kernel never purges them (it does at the
 /// close of a queue), so they would be the next VMM's first frames.
+///
+/// This never waits. Non-blocking mode is a flag of the open file description, which
+/// every VMM that inherited the queue shares with the holder: one that cleared it would
+/// leave a plain read here waiting on an empty queue for ever, with the holder's one
+/// thread in it. So the flag is set again first, and each read follows a poll that says a
+/// frame is there.
 pub fn drain_tap(queue: &OwnedFd) -> io::Result<usize> {
+    let mut on: libc::c_int = 1;
+    // SAFETY: FIONBIO reads one int through the pointer, which outlives the call.
+    if unsafe { libc::ioctl(queue.as_raw_fd(), libc::FIONBIO as _, &mut on) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let mut frame = [0u8; 65536 + 64];
     let mut drained = 0;
     loop {
+        let mut ready = libc::pollfd {
+            fd: queue.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd, and a timeout of zero: the call returns at once.
+        match unsafe { libc::poll(&mut ready, 1, 0) } {
+            0 => return Ok(drained),
+            n if n < 0 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            _ => {}
+        }
+        if ready.revents & libc::POLLIN == 0 {
+            return Err(io::Error::other(format!(
+                "the TAP queue polls as {:#x}",
+                ready.revents
+            )));
+        }
         // SAFETY: `frame` is writable for its whole length.
         let got = unsafe { libc::read(queue.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len()) };
         if got >= 0 {
@@ -554,6 +588,56 @@ pub fn drain_tap(queue: &OwnedFd) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The queue is emptied without waiting even when a tenant cleared non-blocking mode
+    /// on it, and is left non-blocking for the next one. A socket pair stands in for the
+    /// queue: the drain makes no TAP call. Before, the read after the last frame waited
+    /// for ever, and so did the holder, which makes this call on its one thread.
+    #[test]
+    fn a_queue_a_tenant_made_blocking_is_emptied_without_waiting() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is two descriptors long, which is what socketpair writes.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: socketpair returned two new descriptors nothing else owns.
+        let (queue, sender) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        for frame in [&b"one"[..], b"two", b"three"] {
+            // SAFETY: `frame` is readable for its length.
+            let sent =
+                unsafe { libc::write(sender.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+            assert_eq!(sent, frame.len() as isize);
+        }
+        let flags = |fd: &OwnedFd| {
+            // SAFETY: F_GETFL takes no pointer.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            flags
+        };
+        assert_eq!(
+            flags(&queue) & libc::O_NONBLOCK,
+            0,
+            "the stand-in starts blocking"
+        );
+
+        let (done, result) = std::sync::mpsc::channel();
+        let drained = queue.try_clone().unwrap();
+        std::thread::spawn(move || done.send(drain_tap(&drained)));
+        let count = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the drain waited on an empty queue")
+            .expect("draining");
+        assert_eq!(count, 3);
+        assert_ne!(
+            flags(&queue) & libc::O_NONBLOCK,
+            0,
+            "the queue is left non-blocking"
+        );
+        assert_eq!(drain_tap(&queue).unwrap(), 0);
+    }
 
     /// One netlink message: header and payload, padded.
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {

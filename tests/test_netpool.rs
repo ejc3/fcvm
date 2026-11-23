@@ -964,6 +964,54 @@ fn sockets_of(pid: u32) -> Vec<String> {
         .collect()
 }
 
+/// `pid` and every process below it.
+fn tree_of(pid: u32) -> Vec<u32> {
+    let mut tree = vec![pid];
+    let mut next = 0;
+    while next < tree.len() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", tree[next])) else {
+            next += 1;
+            continue;
+        };
+        for task in tasks.flatten() {
+            let list = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+            tree.extend(
+                list.split_whitespace()
+                    .map(|child| child.parse::<u32>().unwrap()),
+            );
+        }
+        next += 1;
+    }
+    tree
+}
+
+/// For each descriptor `pid` has open on the TUN device node, whether it is close-on-exec.
+fn tun_fds_of(pid: u32) -> Vec<bool> {
+    let mut found = Vec::new();
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if std::fs::read_link(fd.path())
+            .is_ok_and(|target| target == std::path::Path::new("/dev/net/tun"))
+        {
+            let info = std::fs::read_to_string(format!(
+                "/proc/{pid}/fdinfo/{}",
+                fd.file_name().to_string_lossy()
+            ))
+            .unwrap_or_default();
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .map(|octal| i32::from_str_radix(octal.trim(), 8).unwrap())
+                .expect("fdinfo has no flags line");
+            found.push(flags & libc::O_CLOEXEC != 0);
+        }
+    }
+    found
+}
+
 /// The Firecracker process that is a child of the fcvm process `pid`.
 fn vmm_of(pid: u32) -> u32 {
     for task in std::fs::read_dir(format!("/proc/{pid}/task"))
@@ -1224,6 +1272,23 @@ async fn clones_run_in_recycled_namespaces() {
         1,
         "the VMM does not hold the lease: {shared:?}"
     );
+    // The TAP's queue goes where the lease goes and nowhere else: of the clone's whole
+    // process tree, fcvm has it, close-on-exec, and the VMM has it. The pool lends the
+    // namespace again when the lease reads end-of-file, so a process with the queue and
+    // without the lease would still be on the TAP when the next VM runs.
+    let mut holders: Vec<(u32, Vec<bool>)> = tree_of(first_pid)
+        .into_iter()
+        .map(|pid| (pid, tun_fds_of(pid)))
+        .filter(|(_, fds)| !fds.is_empty())
+        .collect();
+    holders.sort();
+    let mut expected = vec![(first_pid, vec![true]), (vmm, tun_fds_of(vmm))];
+    expected.sort();
+    assert_eq!(
+        holders, expected,
+        "who has a TAP queue open in the clone's tree"
+    );
+    assert_eq!(tun_fds_of(vmm).len(), 1, "the VMM has one queue");
 
     // With the one namespace lent, a second clone builds its own.
     let (mut second_own, second_own_pid) = fixture.clone("own", &NO_PORTS, &[]).await;
