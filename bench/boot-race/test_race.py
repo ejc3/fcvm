@@ -109,6 +109,21 @@ class Setup(unittest.TestCase):
         render.check_public(text, render.FORBIDDEN_IN_RECORDS)
         self.assertIn("c8g.medium", text)
 
+    def test_a_commit_of_digits_is_not_read_as_an_account(self):
+        import render
+
+        real = race.run_out
+        digits = "1234567890" * 4
+
+        def run_out(args):
+            return digits if args[-2:] == ["rev-parse", "HEAD"] else real(args)
+        with patch.object(race, "run_out", side_effect=run_out):
+            rows = race.setup_rows({"fcvm_bin": "/bin/echo"}, FakeSession())
+        text = json.dumps({"region": race.REGION, "rows": rows})
+        self.assertIn("commit " + digits[:race.COMMIT_PREFIX] + ",", text)
+        render.check_public(text)
+        render.check_public(text, render.FORBIDDEN_IN_RECORDS)
+
 
 class Lock(unittest.TestCase):
     def test_a_second_run_on_the_same_results_refuses_before_touching_anything(self):
