@@ -2182,8 +2182,33 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current` does not
   hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks
   again what runs and, unless the new lane image does, puts the stage's tags back as they were
-  before the selection. Unset or `off`, the release is the one without a lane. Prod's promote and
-  rollback do not carry a lane digest yet.
+  before the selection. Unset or `off`, the release is the one without a lane.
+- **Prod.** With the repository variable `FLEET_LAMBDA_LANE_PROD` on, the set prod takes
+  (`prod_release.py decide`) carries the lane image staging runs as `lambda_digest`. What a stack
+  runs comes from its release function: the prod function's `candidate` action names the lane
+  image each running coordinator task names (`FLEET_LAMBDA_IMAGE`). The lane repository's tags only
+  protect images: decide reads staging's running lane image after its other checks and refuses
+  unless `keep-stage-current` holds it. A new lane image alone is a promotion. The release record
+  is passed back to the record's compare-and-swap byte for byte, and decide refuses when the record
+  names another lane image than prod runs. The promotion passes the set's lane image to
+  `publish.py --stack prod --lambda-digest`, which selects it for prod (keeping the lane image prod
+  runs as previous), releases it with the coordinator, and puts prod's tags back if the release
+  fails or is held. Leaving a set that carries a lane image, a failed promotion's rollback returns
+  to the lane image prod ran before it, or, when it ran none, passes `--lambda-digest none`, and
+  the function removes `FLEET_LAMBDA_IMAGE`. With the lane on, a record entry without
+  `lambda_digest` names no lane image. Off, prod's sets carry no lane image and its releases are
+  the ones without a lane.
+- **Not supported yet, so the prod switch stays off until they are:** a manual rollback
+  (`fleet-prod-rollback.yml`) of a lane image: with the switch on, or a set on either side naming
+  one, it stops before any release and names the recovery by hand. And turning
+  `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image: a lane-off promotion writes an entry
+  without `lambda_digest` while the running task keeps its lane image. Return prod to `none`
+  first.
+- **A stack's first selection is not put back.** `release.py reset` restores the tags a
+  selection moved, but a stack's first selection moved tags that did not exist, and nothing here
+  deletes a tag: after a failed or held first release, `keep-<stack>-current` stays on the image
+  it selected. It only protects that image; what the stack runs comes from its release function,
+  and the next selection moves the tag again.
 - **Pairing.** With the lane on, a coordinator deploy carries the lane build paired with its
   commit: the `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line
   (an ancestor or a descendant) with no path of the lane workflow changed in between

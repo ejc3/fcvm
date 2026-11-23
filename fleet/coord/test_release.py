@@ -1803,14 +1803,14 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.OLDER),
                                   ("select", "stage", self.RUNNING, "a" * 40), ("invoke", self.release_payload())])
 
-    def test_a_release_of_an_ancestor_of_what_staging_runs_is_skipped(self):
-        # Invariant 1: staging runs a descendant (a newer commit's release landed first). Nothing is selected
-        # or released, and the run reports unchanged, also to the workflow (the smoke then does not run).
+    def test_a_release_of_an_ancestor_of_what_staging_runs_fails_the_release_step(self):
+        # Invariant 1 again, under the release step: the order step decides the skip, so a descendant found here
+        # means staging moved between the two steps. Nothing is selected or released, and the step fails rather
+        # than conclude success for a release it did not make (prod's release discovery reads that conclusion).
         events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.NEWER]}], "on")
-        self.assertIsNone(error)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("staging runs a descendant", str(error))
         self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.NEWER)])
-        self.assertEqual(self.printed[-1], {"status": "unchanged", "reason": "staging-runs-a-descendant",
-                                            "commit": "a" * 40, "digest": self.DIGEST})
 
     def test_staging_running_this_very_commit_is_released_normally(self):
         events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": ["a" * 40]},
@@ -2028,7 +2028,9 @@ class LaneReleaseTests(unittest.TestCase):
         # A successful deploy is always smoked, and the smoke knows it follows this run's release.
         smoke_job = workflow.split("\n  smoke:\n", 1)[1]
         self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", smoke_job)
-        self.assertIn("      released: true\n", smoke_job)
+        # The smoke follows this run's release only when the order step did not skip it.
+        self.assertIn("    outputs:\n      skip: ${{ steps.order.outputs.skip }}\n", deploy)
+        self.assertIn("      released: ${{ needs.deploy.outputs.skip == 'false' }}\n", smoke_job)
         # The served image reports its commit before it is published (invariant 4's other half).
         self.assertIn('http://127.0.0.1:24120/version)" = "{\\"commit\\":\\"$GITHUB_SHA\\"}"', workflow)
         # One place for the switch, which the job conditions and the step env read: the repository variable.
@@ -2313,10 +2315,14 @@ class ProdDecideTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.calls = []
+        # A second candidate read (decide re-reads it after its checks with the prod lane on) answers
+        # self.second when set, so a test can tell the two reads apart.
+        self.second = None
         def invoke(function, payload):
             self.calls.append(payload)
             if function == "fcvm-coordinator-release-prod":
-                return copy.deepcopy(self.candidate)
+                reads = sum(1 for c in self.calls if c == {"action": "candidate"})
+                return copy.deepcopy(self.second if reads > 1 and self.second is not None else self.candidate)
             return copy.deepcopy(self.status)
         patches = [patch.object(prod, "api", self.gh.api), patch.object(prod.publish, "invoke", invoke)]
         for p in patches:
@@ -2324,7 +2330,7 @@ class ProdDecideTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_a_smoke_after_both_releases_and_the_verification_promotes_the_set(self):
-        target, prior, changes = prod.decide()
+        target, prior, changes, _ = prod.decide()
         self.assertEqual(target, {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
                                   "generation": 12, "build_id": "factory:new", "smoke_run": self.coordinator_run})
         self.assertEqual(changes, {"image": True, "coordinator": True, "web": True})
@@ -2386,6 +2392,132 @@ class ProdDecideTests(unittest.TestCase):
         self.assertEqual(prod.decide()[0]["coordinator"]["commit"], self.C)
         self.candidate["stage"]["commits"] = ["1" * 40]
         self.skips("not its last successful staging release")
+
+    STAGED, RUNNING = "sha256:" + "2" * 64, "sha256:" + "1" * 64
+
+    def lane_on(self, selection=None, stage_runs=None, prod_runs=None):
+        """The prod lane on. What each stack runs comes from the candidate (its running task's lane image);
+        staging's selection (keep-stage-current) is only checked against it."""
+        lane = publish.lane_release()
+        selected = lane.Image(selection or self.STAGED, "{}", lane.MEDIA_TYPES[0])
+        ecr = types.SimpleNamespace(tagged=lambda tag: selected if tag == "keep-stage-current" else None)
+        for p in (patch.dict(os.environ, {"FLEET_LAMBDA_LANE_PROD": "on"}),
+                  patch.object(prod.publish, "lane_repository", lambda: (lane, ecr))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.candidate["stage"]["lambda_digest"] = self.STAGED if stage_runs is None else stage_runs
+        self.candidate["prod"]["lambda_digest"] = self.RUNNING if prod_runs is None else prod_runs or None
+
+    def record(self, **extra):
+        return {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+                "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12, **self.RECEIPT, "smoke_run": 1,
+                **extra, "previous": None}
+
+    def test_with_the_prod_lane_on_the_set_carries_the_lane_image_staging_runs(self):
+        self.lane_on()
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], self.STAGED)
+        self.assertNotIn("lambda_digest", prior)
+        self.assertEqual(prior_lane, self.RUNNING)
+        self.assertEqual(changes, {"image": True, "coordinator": True, "web": True, "lane": True})
+
+    def test_a_record_without_a_lane_image_is_passed_back_unchanged(self):
+        # The record's compare-and-swap takes prior as the record it replaces: it must be the stored entry, byte
+        # for byte. (Prod runs no lane image, which is what an entry without lambda_digest names.)
+        self.lane_on(prod_runs="")
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record()
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.assertEqual(prior_lane, "")
+
+    def test_before_prods_first_lane_image_nothing_says_null(self):
+        self.lane_on(prod_runs="")
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], self.STAGED)
+        self.assertNotIn(None, (target.get("lambda_digest"), prior_lane))
+        self.assertEqual(prior_lane, "")
+        self.assertNotIn("lambda_digest", prior)
+
+    def test_a_lane_selection_staging_does_not_run_is_not_promoted(self):
+        # The tags stay moved after a cancelled deploy, a hand selection or an unknown running image: the set is
+        # what staging runs, and a selection that differs from it is no set a smoke covered.
+        self.lane_on(selection="sha256:" + "9" * 64)
+        self.skips("not the lane image it runs")
+        self.setUp()
+        self.lane_on(stage_runs="")
+        self.skips("staging runs no lane image")
+
+    def test_prod_running_another_lane_image_than_its_record_names_is_outside_a_promotion(self):
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest="sha256:" + "8" * 64)
+        self.skips("its record names another lane image")
+
+    def test_a_new_lane_image_alone_is_a_promotion(self):
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest=self.RUNNING)
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(changes, {"image": False, "coordinator": False, "web": False, "lane": True})
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.setUp()
+        self.lane_on(prod_runs=self.STAGED)
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest=self.STAGED)
+        self.skips("already runs")
+
+    def test_the_lane_image_comes_from_the_read_after_the_checks(self):
+        self.lane_on(selection="sha256:" + "6" * 64, stage_runs="sha256:" + "7" * 64)
+        self.second = copy.deepcopy(self.candidate)
+        self.second["stage"]["lambda_digest"] = "sha256:" + "6" * 64
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], "sha256:" + "6" * 64)
+        self.assertEqual(self.calls.count({"action": "candidate"}), 2)
+
+    def test_staging_changing_between_the_two_reads_promotes_nothing(self):
+        self.lane_on()
+        self.second = copy.deepcopy(self.candidate)
+        self.second["stage"]["digest"] = "sha256:" + "f" * 64
+        self.skips("changed while the promotion was deciding")
+
+    def test_a_lane_image_the_function_could_not_read_promotes_nothing(self):
+        for stack in ("stage", "prod"):
+            with self.subTest(stack=stack):
+                self.setUp()
+                self.lane_on()
+                self.candidate[stack]["lane_error"] = "pointer-mismatch"
+                self.skips("could not read the lane image " + stack + " runs")
+
+    def test_a_record_without_a_lane_image_means_none(self):
+        # With the lane on, an entry without lambda_digest names no lane image. Prod running one is a change no
+        # promotion recorded (a lane-only promotion whose rollback also failed), not "already runs the set".
+        self.lane_on(prod_runs=self.STAGED)
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record()
+        self.skips("its record names another lane image")
+
+    def test_with_the_prod_lane_off_one_candidate_read_and_no_prior_lane(self):
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(self.calls.count({"action": "candidate"}), 1)
+        self.assertIsNone(prior_lane)
+        out = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, out.name)
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.main(["decide"]), 0)
+        self.assertNotIn("prior_lane", Path(out.name).read_text())
+
+    def test_with_the_prod_lane_off_the_set_is_todays(self):
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertNotIn("lambda_digest", target)
+        self.assertNotIn("lambda_digest", prior)
+        self.assertEqual(set(changes), {"image", "coordinator", "web"})
+        self.assertIsNone(prior_lane)
 
     def test_prod_already_running_the_set_promotes_nothing(self):
         self.candidate["prod"] = {"digest": self.D, "commits": [self.C]}
@@ -2514,6 +2646,182 @@ class PublishProdTests(unittest.TestCase):
             publish.arguments(["--force"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             publish.arguments(["--stack", "prod", "--commit", "a" * 40])
+
+
+class ProdLaneTests(unittest.TestCase):
+    """publish.py --stack prod --lambda-digest D: the lane image of the set prod takes (a promotion) or returns to
+    (a rollback) is selected for prod and released with the coordinator. Without it the release is today's."""
+
+    DIGEST = "sha256:" + "c" * 64
+    RUNNING, STAGED, EARLIER = "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "0" * 64
+    BEFORE = {"current": RUNNING, "previous": EARLIER, "next": RUNNING}
+
+    def run_prod(self, results, extra=()):
+        results, events = list(results), []
+        def invoke(name, payload):
+            events.append(("invoke", payload))
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        def select_prod_lane(running, digest):
+            events.append(("select", running, digest))
+            return digest, dict(self.BEFORE)
+        def restore_lane(stack, before):
+            events.append(("restore", stack, before))
+        with patch.dict(os.environ, {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod"}), patch.object(publish, "invoke", invoke), \
+                patch.object(publish, "select_prod_lane", select_prod_lane), patch.object(publish, "restore_lane", restore_lane), \
+                patch.object(publish, "command", side_effect=AssertionError("prod pushes nothing")), \
+                patch.object(publish.time, "sleep", lambda _: None), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            publish.run(["--stack", "prod", "--commit", "a" * 40, "--digest", self.DIGEST, *extra])
+            raise SystemExit(0)
+        return exit.exception.code, events
+
+    def lane(self, digest):
+        return {"status": "ok", "lambda_digest": digest, "commits": ["9" * 40]}
+
+    def test_without_a_lane_digest_the_release_is_todays(self):
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST}])
+        self.assertEqual((code, events), (0, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST})]))
+
+    def test_a_promotion_carries_the_sets_lane_image(self):
+        code, events = self.run_prod([self.lane(self.RUNNING),
+                                      {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.STAGED}],
+                                     extra=["--lambda-digest", self.STAGED])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", self.RUNNING, self.STAGED),
+                                  ("invoke", {"commit": "a" * 40, "digest": self.DIGEST, "lambda_digest": self.STAGED})])
+
+    def test_a_rollback_carries_the_lane_image_its_record_names(self):
+        code, events = self.run_prod([self.lane(self.STAGED),
+                                      {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.EARLIER}],
+                                     extra=["--force", "--lambda-digest", self.EARLIER])
+        self.assertEqual(code, 0)
+        self.assertEqual(events[1], ("select", self.STAGED, self.EARLIER))
+        self.assertEqual(events[2][1], {"commit": "a" * 40, "digest": self.DIGEST, "force": True, "lambda_digest": self.EARLIER})
+
+    def test_a_held_or_failed_prod_release_puts_the_selection_back(self):
+        for result, code in (({"status": "held", "reason": "viewers"}, publish.HELD),
+                             ({"status": "failed", "step": "rollout"}, 1)):
+            with self.subTest(status=result["status"]):
+                got, events = self.run_prod([self.lane(self.RUNNING), result, self.lane(self.RUNNING)],
+                                            extra=["--lambda-digest", self.STAGED])
+                self.assertEqual(got, code)
+                self.assertEqual(events[-1], ("restore", "prod", self.BEFORE))
+
+    def test_a_rollback_to_a_set_without_a_lane_image_removes_it(self):
+        # The set returned to ran no lane image: the function removes FLEET_LAMBDA_IMAGE; no tag moves.
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST, "lambda_digest": None}],
+                                     extra=["--force", "--lambda-digest", "none"])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST, "force": True, "lambda_digest": None})])
+
+    def test_a_none_release_must_report_the_lane_image_removed(self):
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST}], extra=["--force", "--lambda-digest", "none"])
+        self.assertEqual(code, 1)
+
+    def test_a_malformed_lane_digest_is_refused_before_anything(self):
+        code, events = self.run_prod([], extra=["--force", "--lambda-digest", "latest"])
+        self.assertEqual((code, events), (1, []))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            publish.arguments(["--lambda-digest", self.STAGED])  # staging takes none
+
+    def test_the_prod_selection_takes_the_named_digest(self):
+        calls = []
+        lane = publish.lane_release()
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), \
+                patch.object(lane, "snapshot", lambda ecr, stack: calls.append(("snapshot", stack)) or dict(self.BEFORE)), \
+                patch.object(lane, "select", lambda ecr, stack, new, running: calls.append((stack, new, running)) or {}):
+            self.assertEqual(publish.select_prod_lane(self.STAGED, self.EARLIER), (self.EARLIER, self.BEFORE))
+        self.assertEqual(calls, [("snapshot", "prod"), ("prod", self.EARLIER, self.STAGED)])
+
+
+class ProdLaneWorkflowTests(unittest.TestCase):
+    """The prod workflows carry the set's lane image: decide reads staging's selection with the prod lane on, a
+    promotion releases the target's, and both rollbacks return to the one the earlier set names."""
+
+    WORKFLOWS = HERE.parent.parent / ".github/workflows"
+    FLAG = '${lane:+--lambda-digest "$lane"}'
+
+    def step(self, text, name, after=0):
+        start = text.index(f"      - name: {name}\n", after)
+        return text[start:text.find("\n      - ", start + 10)], start
+
+    def test_a_promotion_decides_and_releases_the_lane_image(self):
+        promote = (self.WORKFLOWS / "fleet-prod-promote.yml").read_text()
+        candidate = promote.split("\n  candidate:\n", 1)[1].split("\n  hold:\n", 1)[0]
+        self.assertIn("      lane: ${{ steps.decide.outputs.lane }}\n", candidate)
+        self.assertIn("          sparse-checkout: |\n            fleet/coord\n            fleet/lambda\n", candidate)
+        self.assertIn("FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}", candidate)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", candidate)
+        release = promote.split("\n  release:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        coordinator, _ = self.step(release, "Coordinator")
+        self.assertIn("(needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true')", coordinator)
+        self.assertIn("lane=$(jq -r '.lambda_digest // empty' <<<\"$TARGET\")", coordinator)
+        self.assertIn(self.FLAG, coordinator)
+        self.assertIn("      prior_lane: ${{ steps.decide.outputs.prior_lane }}\n", candidate)
+        rollback = promote.split("\n  rollback:\n", 1)[1]
+        coordinator, _ = self.step(rollback, "Coordinator")
+        self.assertIn("needs.candidate.outputs.lane == 'true'", coordinator)
+        # Leaving a set with a lane image: return to the one prod ran before (from its task), or to none.
+        self.assertIn("PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}", coordinator)
+        self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
+        self.assertIn(self.FLAG, coordinator)
+
+    def test_a_manual_rollback_has_no_lane_handling_and_is_todays(self):
+        rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        coordinator, _ = self.step(rollback, "Coordinator")
+        self.assertNotIn("lambda", coordinator)
+        self.assertIn('python3 -B fleet/coord/publish.py --stack prod --force \\\n            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" '
+                      '--digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"', coordinator)
+        # The refusal is in `current`, whose failure skips every step after it.
+        current = rollback.split("      - id: current\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}", current)
+        for step in ("Worker", "Coordinator", "Host and tile images"):
+            body, _ = self.step(rollback, step)
+            self.assertIn("steps.current.outcome == 'success'", body)
+
+
+class ManualRollbackRefusalTests(unittest.TestCase):
+    """prod_release.py current, the manual rollback's first step: a lane image is not rolled back by hand yet."""
+
+    def current(self, release, lane=None):
+        out = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, out.name)
+        env = {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod", "GITHUB_OUTPUT": out.name}
+        if lane is not None:
+            env["FLEET_LAMBDA_LANE_PROD"] = lane
+        printed = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(prod.publish, "invoke", lambda f, p: {"status": "ok", "release": release}), \
+                contextlib.redirect_stdout(printed):
+            if lane is None:
+                os.environ.pop("FLEET_LAMBDA_LANE_PROD", None)
+            code = prod.main(["current"])
+        return code, Path(out.name).read_text(), printed.getvalue()
+
+    def entry(self, **extra):
+        return {"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "web_commit": None,
+                "worker_version": None, "generation": 1, "build_id": "b", "smoke_run": None, **extra}
+
+    def test_with_the_switch_off_and_no_lane_image_it_is_todays(self):
+        release = {**self.entry(), "previous": self.entry(generation=0)}
+        code, out, _ = self.current(release)
+        self.assertEqual(code, 0)
+        self.assertIn("current=", out)
+        self.assertIn("previous=", out)
+
+    def test_a_lane_image_in_either_set_or_the_switch_on_stops_before_any_release(self):
+        lane = "sha256:" + "2" * 64
+        cases = [({**self.entry(lambda_digest=lane), "previous": self.entry()}, None),
+                 ({**self.entry(), "previous": self.entry(lambda_digest=lane)}, None),
+                 ({**self.entry(), "previous": self.entry()}, "on")]
+        for release, switch in cases:
+            with self.subTest(switch=switch):
+                code, out, printed = self.current(release, switch)
+                self.assertEqual(code, 1)
+                self.assertNotIn("previous=", out)
+                self.assertIn("a manual rollback of a lane image is not supported yet", printed)
 
 
 class FakeLive:

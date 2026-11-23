@@ -54,9 +54,12 @@ jobs:
           role-session-name: fcvm-prod-rollback-${{ github.run_id }}
           role-duration-seconds: 21600
           mask-aws-account-id: true
+      # A lane image is not rolled back by hand yet: with the prod lane on, or a set naming one, this step
+      # fails, and every step below needs it to succeed.
       - id: current
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}
         run: python3 -B fleet/coord/prod_release.py current
       # Each component is returned whatever the one before it did; any failure still fails the job.
       - name: Worker

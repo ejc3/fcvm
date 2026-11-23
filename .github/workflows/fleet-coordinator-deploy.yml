@@ -124,6 +124,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # Whether the order step skipped the release: the smoke then says it follows no release of this run.
+    outputs:
+      skip: ${{ steps.order.outputs.skip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -178,8 +181,9 @@ jobs:
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
     with:
-      # The smoke follows this run's release: it says so when it tests another commit.
-      released: true
+      # The smoke follows this run's release unless the order step skipped it; then a different commit
+      # under test is no surprise and the smoke prints the attribution alone.
+      released: ${{ needs.deploy.outputs.skip == 'false' }}
     # The smoke's jobs read the Access token from the fleet-stage-deploy environment; a called
     # workflow sees secrets only when its caller passes them.
     secrets: inherit

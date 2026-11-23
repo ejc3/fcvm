@@ -421,6 +421,21 @@ class Selection(unittest.TestCase):
         self.assertTrue(self.protected(p))
         self.assertFalse(self.protected(s_))
 
+    def test_a_reset_to_a_stack_with_no_tags_moves_nothing(self):
+        # A stack's first selection: nothing to put back, and nothing here deletes a tag, so keep-<stack>-current
+        # stays on the image the failed release selected (fleet/PROTOCOL.md says so). It only protects that image;
+        # what the stack runs comes from its release function.
+        a = self.ecr.push("rev-a")
+        before = release.snapshot(self.ecr, "prod")
+        self.assertEqual(before, {"current": None, "previous": None, "next": None})
+        release.select(self.ecr, "prod", a, None)
+        writes = []
+        real_put = self.ecr.put
+        self.ecr.put = lambda tag, image: (writes.append(tag), real_put(tag, image))
+        release.reset(self.ecr, "prod", before)
+        self.assertEqual(writes, [])
+        self.assertEqual(release.tags(self.ecr, "prod")["keep-prod-current"], a)
+
     def test_a_build_pairs_with_a_commit_whose_lane_inputs_it_has(self):
         c0, c1, c2 = "0" * 40, "1" * 40, "2" * 40  # c0 <- c1 <- c2
         order = [c0, c1, c2]
@@ -460,18 +475,52 @@ class Selection(unittest.TestCase):
         a, b = "a" * 40, "b" * 40
         built = self.ecr.push("rev-" + b)
         release.record(self.ecr, built)
-        for case, is_ancestor in (
-                ("in history", lambda x, y: (x, y) in {(a, b), (a, a), (b, b)}),
-                ("after the checkout", lambda x, y: (_ for _ in ()).throw(release.UnknownCommit(b)) if b in (x, y) and x != y else x == y)):
-            with self.subTest(case):
-                with self.assertRaises(RuntimeError) as raised:
-                    release.paired_build(self.ecr, a, is_ancestor=is_ancestor, changed=lambda x, y: True,
-                                         clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
-                self.assertNotIsInstance(raised.exception, release.UnknownCommit)
-                message = str(raised.exception)
-                self.assertIn("newer lane build", message)
-                self.assertIn("a rerun of this run cannot succeed", message)
-                self.assertIn("workflow_dispatch of fleet-coordinator-deploy.yml at main's head", message)
+        with self.assertRaises(RuntimeError) as raised:
+            release.paired_build(self.ecr, a, is_ancestor=lambda x, y: (x, y) in {(a, b), (a, a), (b, b)},
+                                 changed=lambda x, y: True, clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+        message = str(raised.exception)
+        self.assertIn("newer lane build", message)
+        self.assertIn("a rerun of this run cannot succeed", message)
+        self.assertIn("workflow_dispatch of fleet-coordinator-deploy.yml at main's head", message)
+
+    def test_a_build_of_a_commit_the_checkout_lacks_is_named_honestly(self):
+        # keep-built's commit is not in this checkout (main moved after the run started): nothing about its
+        # lane inputs is known, and a rerun fetches main again, so the refusal claims neither.
+        a, b = "a" * 40, "b" * 40
+        built = self.ecr.push("rev-" + b)
+        release.record(self.ecr, built)
+
+        def is_ancestor(x, y):
+            if b in (x, y) and x != y:
+                raise release.UnknownCommit(b)
+            return x == y
+        with self.assertRaises(RuntimeError) as raised:
+            release.paired_build(self.ecr, a, is_ancestor=is_ancestor, changed=lambda x, y: True,
+                                 clock=lambda: 0.0, sleep=lambda t: None, timeout=60)
+        self.assertNotIsInstance(raised.exception, release.UnknownCommit)
+        message = str(raised.exception)
+        self.assertIn(b + ", which this checkout does not contain", message)
+        self.assertNotIn("other lane inputs", message)
+        self.assertNotIn("cannot succeed", message)
+        self.assertIn("workflow_dispatch of fleet-coordinator-deploy.yml at main's head", message)
+
+    def test_every_held_commit_is_asked_before_one_git_cannot_find_decides(self):
+        # Two rev- tags on keep-built's image: one this checkout lacks, one it pairs with. The known one decides,
+        # in either order.
+        a = "a" * 40
+        for unknown in ("0" * 40, "f" * 40):  # sorted before and after the known tag
+            with self.subTest(unknown_first=unknown < a):
+                self.ecr = FakeEcr()
+                built = self.ecr.push("rev-" + a)
+                self.ecr.put("rev-" + unknown, self.ecr.image(built))
+                release.record(self.ecr, built)
+
+                def is_ancestor(x, y):
+                    if unknown in (x, y) and x != y:
+                        raise release.UnknownCommit(unknown)
+                    return x == y
+                self.assertEqual(release.paired_build(self.ecr, a, is_ancestor=is_ancestor, changed=lambda x, y: True,
+                                                      clock=lambda: 0.0, sleep=lambda t: None, timeout=60), built)
 
     def test_a_recorded_image_without_a_commit_tag_is_named_so(self):
         untagged = self.ecr.push("hand-pushed")
