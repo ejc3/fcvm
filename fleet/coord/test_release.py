@@ -1811,7 +1811,6 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.NEWER)])
         self.assertEqual(self.printed[-1], {"status": "unchanged", "reason": "staging-runs-a-descendant",
                                             "commit": "a" * 40, "digest": self.DIGEST})
-        self.assertIn("status=unchanged\n", self.github_output)
 
     def test_staging_running_this_very_commit_is_released_normally(self):
         events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": ["a" * 40]},
@@ -1819,16 +1818,48 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", "stage", self.RUNNING, "a" * 40),
                                   ("invoke", self.release_payload())])
-        self.assertIn("status=unchanged\n", self.github_output)
 
-    def test_the_release_status_reaches_the_workflow(self):
-        for lane in (None, "on"):
-            with self.subTest(lane=lane):
-                results = ([] if lane is None else [{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}]) + [
-                    {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}]
-                events, error = self.run_publish(results, lane)
-                self.assertIsNone(error)
-                self.assertIn("status=deployed\n", self.github_output)
+    def run_order(self, results, lane="on"):
+        results, sent = list(results), []
+        def invoke(function, payload):
+            sent.append(payload)
+            return results.pop(0)
+        def is_ancestor(older, newer):
+            assert older != newer
+            return (older, newer) in {("a" * 40, "e" * 40)}
+        github_output = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, github_output.name)
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_RELEASE": "fcvm-coordinator-release",
+               "GITHUB_OUTPUT": github_output.name}
+        if lane is not None:
+            env["FLEET_LAMBDA_LANE"] = lane
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(publish, "invoke", invoke), \
+                patch.object(publish, "commit_is_ancestor", is_ancestor), \
+                patch.object(publish, "command", side_effect=AssertionError("the order step pushes nothing")), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exit:
+            if lane is None:
+                os.environ.pop("FLEET_LAMBDA_LANE", None)
+            publish.run(["--order"])
+            raise SystemExit(0)
+        return exit.exception.code, sent, Path(github_output.name).read_text()
+
+    def test_the_order_step_skips_the_release_of_an_ancestor_before_any_release_call(self):
+        # The workflow's release step runs only when this says release, so a skipped run's release step
+        # concludes "skipped" and prod's release discovery (prod_release.released) never takes it.
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": [self.NEWER]}])
+        self.assertEqual((code, sent, out), (0, [{"action": "lane"}], "skip=true\n"))
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": [self.OLDER]}])
+        self.assertEqual((code, out), (0, "skip=false\n"))
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": ["a" * 40]}])
+        self.assertEqual((code, out), (0, "skip=false\n"))
+        # Lane off: nothing is asked, nothing skipped.
+        for lane in (None, "off"):
+            code, sent, out = self.run_order([], lane=lane)
+            self.assertEqual((code, sent, out), (0, [], "skip=false\n"))
+        # An answer that cannot order fails the step: the release does not run.
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": []}])
+        self.assertEqual((code, out), (1, ""))
 
     def test_a_lane_answer_with_no_running_commit_releases_nothing(self):
         # A running image with no commit tag cannot be ordered: the gate fails closed.
@@ -1836,30 +1867,38 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIsInstance(error, RuntimeError)
         self.assertEqual(events, [("invoke", {"action": "lane"})])
 
-    def test_a_failed_fetch_is_not_called_a_missing_commit(self):
-        codes = iter([1, 128])
+    def git(self, codes):
+        calls, codes = [], iter(codes)
         def run(args, **kwargs):
+            calls.append(args[:4])
             return types.SimpleNamespace(returncode=next(codes), stdout="", stderr="")
-        with patch.object(publish.subprocess, "run", side_effect=run), self.assertRaises(RuntimeError) as raised:
+        return calls, patch.object(publish.subprocess, "run", side_effect=run)
+
+    def test_a_failed_fetch_is_not_called_a_missing_commit(self):
+        calls, p = self.git([128, 128])  # not in the checkout's main, the fetch fails
+        with p, self.assertRaises(RuntimeError) as raised:
             publish.commit_is_ancestor("a" * 40, "e" * 40)
         self.assertIn("could not fetch main", str(raised.exception))
         self.assertNotIn("does not contain", str(raised.exception))
 
     def test_a_running_commit_newer_than_the_checkout_is_fetched_before_ordering(self):
-        def git(codes):
-            calls, codes = [], iter(codes)
-            def run(args, **kwargs):
-                calls.append(args[:3])
-                return types.SimpleNamespace(returncode=next(codes), stdout="", stderr="")
-            return calls, patch.object(publish.subprocess, "run", side_effect=run)
-        calls, p = git([1, 0, 0, 0])  # not here, fetch, here now, an ancestor
+        calls, p = self.git([128, 0, 0, 0])  # not here, fetch, on main now, an ancestor
         with p:
             self.assertTrue(publish.commit_is_ancestor("a" * 40, "e" * 40))
-        self.assertEqual(calls, [["git", "cat-file", "-e"], ["git", "fetch", "--quiet"], ["git", "cat-file", "-e"],
-                                 ["git", "merge-base", "--is-ancestor"]])
-        calls, p = git([1, 0, 1])  # main does not contain it: refused, not guessed
+        self.assertEqual(calls, [["git", "merge-base", "--is-ancestor", "e" * 40], ["git", "fetch", "--quiet", "origin"],
+                                 ["git", "merge-base", "--is-ancestor", "e" * 40], ["git", "merge-base", "--is-ancestor", "a" * 40]])
+        calls, p = self.git([0, 0])  # on the checkout's main: no fetch
+        with p:
+            self.assertTrue(publish.commit_is_ancestor("a" * 40, "e" * 40))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_running_commit_from_another_branch_stops_the_release(self):
+        # In the checkout (fetch-depth 0 brings every branch) but not on main, even after a fetch: refused,
+        # never ordered as "not an ancestor".
+        calls, p = self.git([1, 0, 1])
         with p, self.assertRaisesRegex(RuntimeError, "main does not contain"):
             publish.commit_is_ancestor("a" * 40, "e" * 40)
+        self.assertEqual(calls[-1], ["git", "merge-base", "--is-ancestor", "e" * 40])
 
     def test_a_lane_answer_without_the_running_commits_releases_nothing(self):
         events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING}], "on")
@@ -1976,6 +2015,16 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIn("      queue: max\n", deploy)
         self.assertIn("fetch-depth: 0", deploy)
         self.assertIn("run: python3 -B fleet/coord/publish.py", deploy)
+        # The order step decides before any release call; the release step runs only when it says release,
+        # so a skipped run's release step concludes "skipped" (prod_release.released ignores it).
+        order = deploy.split("      - name: Order the release (an ancestor of what staging runs is skipped)\n", 1)[1]
+        self.assertIn("        id: order\n", order.split("\n      - name:", 1)[0])
+        self.assertIn("run: python3 -B fleet/coord/publish.py --order", order.split("\n      - name:", 1)[0])
+        release = deploy.split("      - name: Publish and release the staging coordinator\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("        if: steps.order.outputs.skip == 'false'\n", release)
+        self.assertLess(deploy.index("Order the release"), deploy.index("Publish and release the staging coordinator"))
+        self.assertNotIn("outputs.status", workflow)
+        self.assertNotIn("id: release", workflow)
         # A successful deploy is always smoked, and the smoke knows it follows this run's release.
         smoke_job = workflow.split("\n  smoke:\n", 1)[1]
         self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", smoke_job)
@@ -2012,6 +2061,26 @@ class SmokeCommitTests(unittest.TestCase):
                        (200, {}, b'{"commit": "https://example.invalid"}')):
             with self.subTest(answer=answer):
                 self.assertEqual(self.attribute(answer), {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_a_version_request_that_fails_in_transport_is_an_unknown_commit(self):
+        import http.client, socket, urllib.error
+        for error in (TimeoutError("timed out"), socket.timeout("timed out"), ConnectionResetError(),
+                      urllib.error.URLError("unreachable"), http.client.RemoteDisconnected("closed")):
+            with self.subTest(error=type(error).__name__):
+                def get(url, headers=None):
+                    raise error
+                with patch.object(smoke, "get", get):
+                    self.assertEqual(smoke.commit_attribution("https://api.example", {}, self.RUN),
+                                     {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_the_agents_mode_prints_the_agents_record_and_nothing_else(self):
+        source = (HERE / "stage-smoke.py").read_text()
+        body = source.split("\ndef main(", 1)[1]
+        check = body.index('raise AssertionError("the CI token reached the agents-only endpoint")')
+        attribution = body.index("commit_attribution(api, headers")
+        guard = body.rindex("if not agents:", check, attribution)
+        self.assertLess(check, guard)
+        self.assertLess(guard, attribution)
 
     def test_the_notice_is_for_a_smoke_that_follows_its_own_release(self):
         other = {"tested_commit": "e" * 40, "run_commit": self.RUN, "same": False}
@@ -2299,6 +2368,17 @@ class ProdDecideTests(unittest.TestCase):
         self.gh.run("fleet-coordinator-deploy.yml", "1" * 40,
             [release_job("deploy", "Publish and release the staging coordinator", 2000, 2100, status="in_progress")])
         self.skips("in progress")
+
+    def test_a_release_skipped_for_an_ancestor_is_not_what_staging_runs(self):
+        # The descendant deploys, then an ancestor's run finishes later: its order step skipped the release, so
+        # its release step concludes "skipped" and staging still runs the descendant.
+        job = release_job("deploy", "Publish and release the staging coordinator", 2000, 2100)
+        job["steps"] = [{"name": "Order the release (an ancestor of what staging runs is skipped)", "conclusion": "success",
+                         "completed_at": ts(2050)},
+                        {"name": "Publish and release the staging coordinator", "conclusion": "skipped", "completed_at": ts(2050)}]
+        self.gh.run("fleet-coordinator-deploy.yml", "1" * 40, [job])
+        self.assertEqual(prod.released("coordinator")[0], self.C)
+        self.assertEqual(prod.decide()[0]["coordinator"]["commit"], self.C)
 
     def test_a_failed_newer_release_falls_back_and_staging_pointer_must_agree(self):
         self.gh.run("fleet-coordinator-deploy.yml", "1" * 40,

@@ -124,9 +124,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    # publish.py's release status (deployed, unchanged), for reading; nothing gates on it.
-    outputs:
-      status: ${{ steps.release.outputs.status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -149,8 +146,17 @@ jobs:
           aws-region: us-west-1
           role-session-name: fcvm-stage-${{ github.run_id }}
           mask-aws-account-id: true
+      # Invariant 1, decided before any release call: with the lane on, a commit that is a strict ancestor
+      # of one staging runs is not released. The release step below then concludes "skipped", which prod's
+      # release discovery (fleet/coord/prod_release.py released) does not take for what staging runs.
+      - name: Order the release (an ancestor of what staging runs is skipped)
+        id: order
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}
+        run: python3 -B fleet/coord/publish.py --order
       - name: Publish and release the staging coordinator
-        id: release
+        if: steps.order.outputs.skip == 'false'
         # FLEET_LAMBDA_LANE (a repository variable) on: the release also selects the lane build paired
         # with this commit for staging and passes it to the release function (fleet/coord/publish.py).
         # Unset: as before.

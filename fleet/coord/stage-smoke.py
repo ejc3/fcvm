@@ -1095,7 +1095,12 @@ def get(url, headers=None):
 def commit_attribution(api, headers, run):
     """Which commit this smoke tests: the coordinator's GET /version (its image's commit), beside the run's
     commit. A coordinator that cannot say is reported as unknown; a smoke never assumes it tested its run."""
-    code, _, body = get(api + "/version", headers)
+    try:
+        code, _, body = get(api + "/version", headers)
+    except (OSError, http.client.HTTPException):
+        # Informational: a request that fails in transport (a timeout, a reset) leaves the commit unknown and
+        # the smoke goes on. OSError covers urllib's URLError, timeouts and connection errors.
+        code, body = None, b""
     tested = None
     if code == 200:
         try:
@@ -1182,11 +1187,13 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         code, _, _ = get(agents_url, headers)
         if code not in (401, 403, 302):
             raise AssertionError("the CI token reached the agents-only endpoint")
-        step("coordinator commit")
-        run_commit = os.environ.get("GITHUB_SHA") if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", "")) else None
-        tested = commit_attribution(api, headers, run_commit)
-        for line in commit_lines(tested, released=os.environ.get("SMOKE_RELEASED") == "true"):
-            print(json.dumps(line), flush=True)
+        # --agents prints the agents record and nothing else (the release gate reads it).
+        if not agents:
+            step("coordinator commit")
+            run_commit = os.environ.get("GITHUB_SHA") if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", "")) else None
+            tested = commit_attribution(api, headers, run_commit)
+            for line in commit_lines(tested, released=os.environ.get("SMOKE_RELEASED") == "true"):
+                print(json.dumps(line), flush=True)
     def live():
         if stage is None:
             parsed = urllib.parse.urlsplit(live_url)

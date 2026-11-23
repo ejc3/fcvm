@@ -153,14 +153,16 @@ def lane_running(function):
 
 
 def commit_is_ancestor(older, newer):
-    """Whether `older` is an ancestor of `newer`. `newer`, a commit staging runs, may be a main commit pushed after
-    this run's checkout: fetch main once before calling it unknown."""
-    def known(commit):
-        return subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], capture_output=True).returncode == 0
-    if not known(newer):
+    """Whether `older` is an ancestor of `newer`, a commit staging runs. `newer` must be on main: one this
+    checkout's main lacks (a main commit pushed after the checkout) is fetched first, and one main does not
+    contain after that (another branch's, which a full-history checkout can hold) stops the release."""
+    def on_main(commit):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", commit, "origin/main"],
+                              capture_output=True).returncode == 0
+    if not on_main(newer):
         if subprocess.run(["git", "fetch", "--quiet", "origin", "main"], capture_output=True).returncode:
             raise RuntimeError(f"could not fetch main to order this release after {newer}, which staging runs")
-        if not known(newer):
+        if not on_main(newer):
             raise RuntimeError(f"staging runs {newer}, which main does not contain: the release cannot be ordered")
     result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True)
     if result.returncode not in (0, 1):
@@ -230,7 +232,6 @@ def main():
         if any(c != commit and commit_is_ancestor(commit, c) for c in commits):
             print(json.dumps({"status": "unchanged", "reason": "staging-runs-a-descendant", "commit": commit,
                               "digest": digest}))
-            output_status("unchanged")
             return
         # The function refuses a lane digest that keep-stage-current does not hold, so the selection
         # comes first; the running digest stays protected as keep-stage-previous.
@@ -251,17 +252,26 @@ def main():
             raise
     print(json.dumps({"status": status, "commit": commit, "digest": digest,
                       **({"lambda_digest": payload["lambda_digest"]} if lane else {})}))
-    output_status(status)
 
 
-def output_status(status):
-    """The release's status for the workflow (the deploy job's `status` output), for reading only: a call
-    that ended without a result and was retried can report unchanged after a release it made, so nothing
-    may gate on it."""
-    path = os.environ.get("GITHUB_OUTPUT")
-    if path:
-        with open(path, "a") as out:
-            out.write(f"status={status}\n")
+def order():
+    """The deploy workflow's order step, before any release call: whether this run's release is skipped
+    because staging runs a descendant of its commit (invariant 1). Writes skip=true|false to $GITHUB_OUTPUT;
+    the release step runs only on skip=false, so a skipped run's release step concludes "skipped", which
+    prod's release discovery (prod_release.released) ignores. Lane off: skip=false, nothing asked."""
+    commit = os.environ["GITHUB_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("a full commit is required")
+    skip = False
+    if lane_setting():
+        if os.environ["COORDINATOR_RELEASE"] != FUNCTIONS["stage"]:
+            raise ValueError("unexpected release function")
+        _, commits = lane_state(os.environ["COORDINATOR_RELEASE"])
+        skip = any(c != commit and commit_is_ancestor(commit, c) for c in commits)
+    print(json.dumps({"order": "skip" if skip else "release", "commit": commit,
+                      **({"reason": "staging-runs-a-descendant"} if skip else {})}))
+    with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+        out.write(f"skip={'true' if skip else 'false'}\n")
 
 
 def main_prod(commit, digest, force):
@@ -278,6 +288,7 @@ def main_prod(commit, digest, force):
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description="Publish and release a coordinator image (module docstring).")
     parser.add_argument("--stack", choices=sorted(FUNCTIONS), default="stage")
+    parser.add_argument("--order", action="store_true", help="staging: only decide whether to skip the release")
     parser.add_argument("--commit")
     parser.add_argument("--digest")
     parser.add_argument("--force", action="store_true", help="prod rollback: skip the viewer hold")
@@ -292,7 +303,11 @@ def arguments(argv=None):
 def run(argv=None):
     args = arguments(argv)
     try:
-        if args.stack == "prod":
+        if args.order:
+            if args.stack != "stage":
+                raise ValueError("--order is for the staging release")
+            order()
+        elif args.stack == "prod":
             main_prod(args.commit, args.digest, args.force)
         else:
             main()

@@ -2195,10 +2195,12 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   head (`workflow_run` in `fleet-coordinator-deploy.yml`), so a push that changes only lane inputs
   reaches staging. Four rules hold:
   1. No release of an ancestor over a descendant: under the deploy job's `fleet-viewer-smoke`
-     group, publish.py asks the release function which commits the running coordinator image
-     carries, and reports `unchanged` (`staging-runs-a-descendant`) without selecting or releasing
-     when the run's commit is a strict ancestor of one. A running commit the checkout lacks is
-     fetched from main first; one main does not contain stops the release.
+     group, before any release call, the order step (`publish.py --order`) asks the release
+     function which commits the running coordinator image carries, and skips the release step when
+     the run's commit is a strict ancestor of one (`staging-runs-a-descendant`). The skipped release
+     step concludes `skipped`, so prod's release discovery does not take that run for what staging
+     runs. A running commit main does not contain, after a fetch of main (a commit of another branch
+     can be in the full-history checkout), stops the release; an answer with no commit does too.
   2. A no-op run cannot cancel or displace a real one: a lane-started run has a concurrency group of
      its own, one per lane run, and a push's deploys keep `fleet-coordinator-stage`.
   3. At most one release at a time: every release runs in the deploy job, which holds
