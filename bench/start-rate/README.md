@@ -50,8 +50,10 @@ harness's receive times of the marker lines, so they include pipe and scheduling
 time between the clone's log lines (`VM resume completed`, fc-agent's lines, the restore
 acknowledgement, `exec server ready`) and fc-agent's own phase record from the acknowledgement.
 fc-agent sends a restore's progress lines on the output connection after the acknowledgement, each
-with the time the guest logged it (`logged=`), and the steps use that time. A held line that went
-to the serial console carries how long it was held (`held_ms=`) and is placed the same way.
+with `logged=`, the guest's clock when fc-agent's console writer thread took the line off its pipe,
+and the steps use that time. Lines the thread took in one read share a time, so a step between two
+of them can read 0. A held line that went to the serial console carries how long it was held
+(`held_ms=`) and is placed the same way.
 
 ```bash
 python3 bench/start-rate/restore_timeline.py /mnt/fcvm-btrfs/sr/run-c128

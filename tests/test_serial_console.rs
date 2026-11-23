@@ -461,6 +461,76 @@ impl RestoreLog {
     }
 }
 
+/// The reader and its verdict on a log of each kind, without a VM: a restore whose lines are
+/// all on the console (fcvm before the restore log), one whose lines were handed to the
+/// host, and one that fell back to the console part of the way.
+///
+/// The VM tests above stop at their first failed assertion. On fcvm without the restore
+/// log that is the missing hand-off line, so they never show that
+/// `assert_progress_stayed_off_the_console` can fail. This does.
+#[test]
+fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
+    let stamp = "2026-01-01T00:00:10.120000Z  INFO";
+    let progress = [
+        "[fc-agent] detected restore-epoch: e",
+        "[fc-agent] handling restore (epoch=e)",
+        "[fc-agent] restore phase=tcp-cleanup epoch=e begin",
+        "[fc-agent] restore phases complete (epoch=e): exec + egress ready elapsed_ms=9.8",
+    ];
+    let hand_off = format!(
+        "{stamp} fcvm::console: [fc-agent] restore: 4 {RESTORE_HAND_OFF_LINE}\n\
+         {stamp} fcvm::console: [fcvm-vitals] MemAvailable: 1 kB thread [fc-agent]\n"
+    );
+    let fails = |log: &RestoreLog| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.assert_progress_stayed_off_the_console(std::path::Path::new("canned"))
+        }))
+        .is_err()
+    };
+
+    // Every line on the console, as before the restore log.
+    let on_console: String = progress
+        .iter()
+        .map(|line| format!("{stamp} fcvm::console: {line}\n"))
+        .collect();
+    let log = RestoreLog::read(&on_console);
+    assert_eq!(log.progress_on_console.len(), 4, "{log:#?}");
+    assert_eq!(log.console_lines_before_hand_off.len(), 4, "{log:#?}");
+    assert_eq!(
+        (log.console_hand_off_lines, log.progress_from_agent),
+        (0, 0)
+    );
+    assert!(fails(&log), "progress on the console passed: {log:#?}");
+
+    // Handed to the host: one console line, the rest under fcvm::agent with logged=.
+    let handed_over: String = hand_off.clone()
+        + &progress
+            .iter()
+            .map(|line| format!("{stamp} fcvm::agent: {line} logged=2026-01-01T00:00:10.100000Z\n"))
+            .collect::<String>();
+    let log = RestoreLog::read(&handed_over);
+    assert!(log.progress_on_console.is_empty(), "{log:#?}");
+    assert!(log.console_lines_before_hand_off.is_empty(), "{log:#?}");
+    assert_eq!(
+        (log.console_hand_off_lines, log.progress_from_agent),
+        (1, 4)
+    );
+    assert!(!fails(&log), "a handed-over restore failed: {log:#?}");
+
+    // The hand-off line alone: nothing proves the progress lines reached the log.
+    let log = RestoreLog::read(&hand_off);
+    assert!(fails(&log), "a log with no progress lines passed: {log:#?}");
+
+    // A restore that fell back: the held lines are on the console, each with held_ms.
+    let fell_back: String = progress
+        .iter()
+        .map(|line| format!("{stamp} fcvm::console: {line} held_ms=12.5\n"))
+        .collect();
+    let log = RestoreLog::read(&fell_back);
+    assert_eq!(log.progress_on_console.len(), 4, "{log:#?}");
+    assert!(fails(&log), "a fallen-back restore passed: {log:#?}");
+}
+
 /// Whether a line of fcvm's log is a guest console line: fc-agent's lines are logged under
 /// `fcvm::console` (#1104), every other console line under the VMM's own `firecracker` target.
 /// fc-agent's lines that came over the output connection are under `fcvm::agent` and are not

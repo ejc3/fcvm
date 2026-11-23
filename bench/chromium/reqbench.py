@@ -3189,7 +3189,8 @@ PROBE_HOLDER_NS_SECTIONS = (
 )
 
 PROBE_LOG_MARKERS = (
-    # fc-agent's restore narration, straight off the guest serial console:
+    # fc-agent's restore narration in the clone's log, which reaches it over the
+    # output vsock connection (under fcvm::agent) or off the guest serial console:
     # "detected restore-epoch", "handling restore", "ARP cache flushed",
     # "exec re-registered after restore", "restore complete", and the
     # "restore metadata fetch failed" line that fires when MMDS is unreachable.
