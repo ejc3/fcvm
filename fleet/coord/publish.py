@@ -255,8 +255,9 @@ def main():
 
 
 def output_status(status):
-    """The release's status for the workflow (the deploy job's `status` output): its smoke runs only after
-    a release that changed staging."""
+    """The release's status for the workflow (the deploy job's `status` output), for reading only: a call
+    that ended without a result and was retried can report unchanged after a release it made, so nothing
+    may gate on it."""
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
         with open(path, "a") as out:

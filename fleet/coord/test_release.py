@@ -1976,14 +1976,9 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertIn("      queue: max\n", deploy)
         self.assertIn("fetch-depth: 0", deploy)
         self.assertIn("run: python3 -B fleet/coord/publish.py", deploy)
-        # The smoke runs only after a release that changed staging; an unchanged run (a lane-started run at the
-        # commit a push already released) builds, finds nothing to do, and runs no smoke.
-        self.assertIn("    outputs:\n      status: ${{ steps.release.outputs.status }}\n", deploy)
-        self.assertIn("      - name: Publish and release the staging coordinator\n        id: release\n", deploy)
+        # A successful deploy is always smoked, and the smoke knows it follows this run's release.
         smoke_job = workflow.split("\n  smoke:\n", 1)[1]
-        condition = " ".join(smoke_job.split("    if:", 1)[1].split("\n    permissions:", 1)[0].split())
-        self.assertEqual(condition, ">- github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
-                                    "needs.deploy.outputs.status == 'deployed'")
+        self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", smoke_job)
         self.assertIn("      released: true\n", smoke_job)
         # The served image reports its commit before it is published (invariant 4's other half).
         self.assertIn('http://127.0.0.1:24120/version)" = "{\\"commit\\":\\"$GITHUB_SHA\\"}"', workflow)
