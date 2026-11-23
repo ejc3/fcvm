@@ -400,6 +400,20 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// The permission bits an entry contributes to the hash. A symlink contributes none:
+/// Linux ignores a symlink's own permission bits (symlink(7)), and filesystems report
+/// different ones for the same link. EdenFS reports 0770 where the btrfs staging copy
+/// has 0777, so a tree holding a symlink never hashed the same in place and staged, and a
+/// launch from an EdenFS checkout with a symlink in the tree was refused as changed during
+/// the launch. A tree with no symlink was not affected.
+fn hashed_mode(kind: u8, mode: u32) -> u32 {
+    if kind == b'l' {
+        0
+    } else {
+        mode & 0o7777
+    }
+}
+
 /// `links` maps a multiply linked file's (device, inode) to the relative path the walk
 /// first met it at.
 fn hash_entry(
@@ -430,7 +444,7 @@ fn hash_entry(
     };
     hash_bytes(hasher, relative.as_os_str().as_bytes());
     hasher.update([kind]);
-    hasher.update((md.mode() & 0o7777).to_le_bytes());
+    hasher.update(hashed_mode(kind, md.mode()).to_le_bytes());
     if keep_owners {
         hasher.update(md.uid().to_le_bytes());
         hasher.update(md.gid().to_le_bytes());
@@ -506,6 +520,54 @@ mod tests {
         let (staged, resolved) = DiskDirStaging::resolve(staging, &[], &specs).unwrap();
         let key = snapshot_key_extra_disks(&[], &specs, &[], Some(&resolved)).join("\n");
         (key, staged)
+    }
+
+    /// A symlink's permission bits are not content: EdenFS reports 0770 for a link the btrfs
+    /// staging copy holds as 0777, and the two must hash the same. A file's bits still count.
+    #[test]
+    fn a_symlinks_permission_bits_do_not_enter_the_hash() {
+        assert_eq!(hashed_mode(b'l', 0o120770), hashed_mode(b'l', 0o120777));
+        assert_ne!(hashed_mode(b'f', 0o100640), hashed_mode(b'f', 0o100644));
+        assert_eq!(hashed_mode(b'f', 0o104755), 0o4755);
+    }
+
+    /// hash_entry hashes a symlink with no permission bits: its digest equals one built with a
+    /// zero mode, while the link's own lstat mode (0777 here) is not zero, so a hash_entry that
+    /// fed the link's mode in would produce a different digest.
+    #[test]
+    fn hash_entry_hashes_a_symlink_without_its_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink("a.txt", &link).unwrap();
+        let own_mode = std::fs::symlink_metadata(&link).unwrap().mode() & 0o7777;
+        assert_ne!(
+            own_mode, 0,
+            "the link must have mode bits for this test to see them"
+        );
+
+        let mut hashed = Sha256::new();
+        hash_entry(
+            &link,
+            Path::new("link"),
+            false,
+            &mut HashMap::new(),
+            &mut hashed,
+        )
+        .unwrap();
+
+        let mut expected = Sha256::new();
+        hash_bytes(&mut expected, b"link");
+        expected.update([b'l']);
+        expected.update(0u32.to_le_bytes());
+        let mut xattrs = extended_attributes(&link).unwrap();
+        xattrs.retain(|(name, _)| carried_xattr(name, false));
+        expected.update((xattrs.len() as u64).to_le_bytes());
+        for (name, value) in xattrs {
+            hash_bytes(&mut expected, &name);
+            hash_bytes(&mut expected, &value);
+        }
+        hash_bytes(&mut expected, b"a.txt");
+        assert_eq!(hashed.finalize(), expected.finalize());
     }
 
     /// Two trees at one path that differ in one file's bytes get different keys, and the
