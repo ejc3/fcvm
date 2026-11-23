@@ -30,11 +30,30 @@ make bench-start-rate-teardown PREP=/mnt/fcvm-btrfs/sr/prep/prep.json
 - `LAUNCHERS=` is the number of harness threads spawning clones (default 4); `popen_ms` in the summary
   shows whether spawning itself limits the rate.
 
+## The store
+
+Measure with `/mnt/fcvm-btrfs` on local NVMe: a pbox `kvm-96` with `--local-nvme`, btrfs on the
+instance-store RAID0 (`/dev/md127`). A btrfs image on a loop device, even one whose file is in tmpfs,
+caps the store at the loop device's request queue (128). At C=1024 to 2000 alive (UFFD, main at
+bcf21750, stock 7.0.0-1013-aws) the store served 74 to 90 GiB of reads per run of 2000 clones on both
+layouts. In a run of 200 clones after `drop_caches`, each clone's Firecracker read 42.2 MiB (its
+`/proc/<pid>/io` `read_bytes`). Each clone's `rootfs.raw` is an inode of its own, so no clone finds
+another's reads in the page cache; which guest reads these are is not yet measured.
+
+| store | in flight, most | read await | busy | state-file creates and renames blocked > 20 ms, start window |
+|---|---|---|---|---|
+| btrfs on a loop file in tmpfs, c8g.metal-48xl | 124 to 126 of 128 | 6.3 ms | 100% | 1,573 creates, 768 s; 1,158 renames, 412 s |
+| btrfs on NVMe RAID0, c8gd.metal-24xl | 25 per member of 127 | 0.31 ms | 99% | 1,474 creates, 126 s; 785 renames, 54 s |
+
+On the loop store Firecracker threads wait for a request tag, and the state directory's creates and
+renames, each holding the directory's lock, queue behind slow btrfs operations. `host.json` records
+the store's device, its backing file and that file's filesystem, and the device's queue depth.
+
 ## Records (OUT)
 
 | file | what |
 |---|---|
-| `host.json` | instance type, kernel, CPUs, memory, the store's filesystem and backing, source revision, run config |
+| `host.json` | instance type, kernel, CPUs, memory, the store's filesystem, device, backing file and its filesystem, and queue depth, source revision, run config |
 | `samples.jsonl` | one row per clone: spawn time, time to healthy, the receive time of each stage marker, error |
 | `clones/<name>.log` | the clone's own output, each line prefixed with ms since its spawn |
 | `host.tsv` | once a second: load average, running and blocked tasks, MemAvailable |

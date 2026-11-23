@@ -107,11 +107,17 @@ def host_facts(repo):
         if len(parts) > 2 and parts[1] == "/mnt/fcvm-btrfs":
             src = parts[0]
     backing = None
+    backing_fs = None
     if src.startswith("/dev/loop"):
         try:
             backing = Path(f"/sys/block/{Path(src).name}/loop/backing_file").read_text().strip()
-        except OSError:
-            backing = "unknown"
+            backing_fs = sh(["stat", "-f", "-c", "%T", backing]).strip()
+        except (OSError, subprocess.CalledProcessError):
+            backing = backing or "unknown"
+    try:
+        queue_depth = int(Path(f"/sys/class/block/{Path(src).name}/queue/nr_requests").read_text())
+    except (OSError, ValueError):
+        queue_depth = None
     mem_kb = int(
         next(ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemTotal")).split()[1]
     )
@@ -125,6 +131,8 @@ def host_facts(repo):
         "store_fs": store,
         "store_device": src,
         "store_backing_file": backing,
+        "store_backing_fs": backing_fs,
+        "store_queue_depth": queue_depth,
         "source_revision": rev,
         "source_dirty": dirty,
     }
